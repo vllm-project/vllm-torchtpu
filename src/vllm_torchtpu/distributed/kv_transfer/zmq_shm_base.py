@@ -37,14 +37,14 @@ from typing import Any, Optional
 
 import torch
 import zmq
+
+import vllm_torchtpu.distributed.utils as dist_utils
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import \
     KVConnectorMetadata
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
-
-import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
                                                                PoolSpec)
@@ -578,7 +578,12 @@ class ZmqShmKvConnectorBase:
         return host, int(port), side_channel_port
 
     # ---- Polled by the runner each step --------------------------------
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(
+            self,
+            finished_req_ids: set[str] | None = None
+    ) -> tuple[set[str], set[str]]:
+        # finished_req_ids is accepted for signature parity with the worker
+        # interface; the coordinator path tracks completion internally.
         return self._coord_get_finished()
 
     # ====================================================================
