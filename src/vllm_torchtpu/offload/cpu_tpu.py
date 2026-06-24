@@ -93,7 +93,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch_tpu._internal.sync import synchronize as _tpu_sync
-
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec, CanonicalKVCaches,
@@ -102,6 +101,7 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.worker.worker import (OffloadingHandler,
                                               TransferResult, TransferSpec)
+
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -1290,6 +1290,7 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                         OffloadingHandler]]:
         if self._tpu_handlers is None:
             from vllm.v1.kv_cache_interface import AttentionSpec
+
             from vllm_torchtpu.layers.vllm.attention import \
                 PallasAttentionBackend
 
