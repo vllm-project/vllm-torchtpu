@@ -198,7 +198,7 @@ class TestTPUConnector:
             meta, wait_for_completion=False, report_completion=True)
 
         connector.get_finished(set())
-        worker.get_finished.assert_called_once_with()
+        worker.get_finished.assert_called_once_with(set())
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
