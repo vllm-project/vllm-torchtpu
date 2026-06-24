@@ -93,6 +93,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch_tpu._internal.sync import synchronize as _tpu_sync
+
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec, CanonicalKVCaches,
@@ -101,7 +102,6 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.worker.worker import (OffloadingHandler,
                                               TransferResult, TransferSpec)
-
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -917,6 +917,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 # buffer, no cpu_pool tensor, no scatter-now gate (the DMA writes kv_cache
 # directly; there is no scatter HLO to dispatch in lockstep).
 _USE_RAIDEN_OFFLOAD = os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") == "1"
+# Upper bound on the raiden offload flush wait (seconds). Dedicated to the
+# offload path -- intentionally NOT the disagg p2p-pull timeout -- so it can be
+# tuned independently.
+_RAIDEN_OFFLOAD_WAIT_TIMEOUT_S = float(
+    os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
 
 
 class _RaidenOffloadingHandler(OffloadingHandler):
@@ -991,10 +996,22 @@ class _RaidenOffloadingHandler(OffloadingHandler):
             # xla::Future BlockUntilReady it also drains) can deadlock against
             # the concurrently-executing model. The disagg connector likewise
             # reports completion by polling (complete_read) and never blocks.
+            #
+            # ok() is a non-blocking error probe (no Await), valid once
+            # is_ready() is True; it tells a successful transfer from one that
+            # completed with an error. hasattr-guarded so this still works
+            # against a raiden build that predates the accessor (falls back to
+            # the previous always-success behaviour).
+            ok = fut.ok() if hasattr(fut, "ok") else True
+            if not ok:
+                err = (fut.error_message()
+                       if hasattr(fut, "error_message") else "")
+                logger.error("[kv-offload] Raiden transfer job=%s failed: %s",
+                             job_id, err)
             results.append(
                 TransferResult(
                     job_id=job_id,
-                    success=True,
+                    success=ok,
                     transfer_size=num_bytes,
                     transfer_time=1e-9,
                     transfer_type=self.transfer_type,
@@ -1011,16 +1028,26 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         `get_finished()`, which the scheduler relies on to mark jobs done.
         """
         # Flush by POLLING is_ready (never the blocking Await, which can
-        # deadlock against the live model -- see get_finished). Mirrors the
-        # disagg poll pattern.
+        # deadlock against the live model -- see get_finished). Bound the wait
+        # with a dedicated offload timeout so a stalled raiden DMA can't
+        # busy-poll forever; on timeout the jobs stay in _pending and are
+        # reported by a later get_finished().
         remaining = {jid for jid in job_ids if jid in self._pending}
+        deadline = time.perf_counter() + _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S
         while remaining:
             for jid in list(remaining):
                 entry = self._pending.get(jid)
                 if entry is None or entry[0].is_ready():
                     remaining.discard(jid)
-            if remaining:
-                time.sleep(0.0005)
+            if not remaining:
+                break
+            if time.perf_counter() >= deadline:
+                logger.warning(
+                    "[kv-offload] Raiden wait timed out after %.1fs for "
+                    "jobs=%s", _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S,
+                    sorted(remaining))
+                return
+            time.sleep(0.0005)
 
 
 # ---------------------------------------------------------------------------
@@ -1263,7 +1290,6 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                         OffloadingHandler]]:
         if self._tpu_handlers is None:
             from vllm.v1.kv_cache_interface import AttentionSpec
-
             from vllm_torchtpu.layers.vllm.attention import \
                 PallasAttentionBackend
 
