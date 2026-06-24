@@ -26,7 +26,6 @@ from torch_tpu._internal.batch_transfer import (batch_transfer_d2h,
                                                 batch_transfer_d2h_sync,
                                                 batch_transfer_h2d,
                                                 batch_transfer_h2d_sync)
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorRole, SupportsHMA)
