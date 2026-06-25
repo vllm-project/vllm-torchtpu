@@ -254,6 +254,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                layer=layer,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
