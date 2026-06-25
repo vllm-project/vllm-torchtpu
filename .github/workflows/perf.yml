@@ -124,6 +124,11 @@ jobs:
             run_on: ["pr"]
             type: guard
             retention: 14
+          - name: qwen3-0.6b-tp1
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/
+            run_on: ["pr"]
+            type: guard
+            retention: 14
           - name: qwen3-coder-480b-fp8-tp8-ep
             gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-480B-A35B-Instruct-FP8/
             run_on: ["nightly"]
