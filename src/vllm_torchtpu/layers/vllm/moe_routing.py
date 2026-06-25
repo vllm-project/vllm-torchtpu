@@ -34,8 +34,26 @@ def select_experts(
     topk: int,
     renormalize: bool,
     scoring_fn: str,
+    layer=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local routed ids/weights for the non-EP path."""
+    if layer is not None and getattr(layer, "use_grouped_topk", False):
+        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
+            grouped_topk
+        topk_weights, topk_ids = grouped_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=topk,
+            renormalize=renormalize,
+            num_expert_group=getattr(layer, "num_expert_group", 0),
+            topk_group=getattr(layer, "topk_group", 0),
+            scoring_func=scoring_fn,
+            routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
+            e_score_correction_bias=getattr(layer, "e_score_correction_bias",
+                                            None),
+        )
+        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
     topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
         scoring_fn, router_logits),
                                         k=topk,

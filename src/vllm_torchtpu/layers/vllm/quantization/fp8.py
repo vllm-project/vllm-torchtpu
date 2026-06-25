@@ -106,11 +106,16 @@ def _dequantize_fp8_linear(
         block_h, block_w = weight_block_size
 
         out_dim, in_dim = weight_f.shape
-        weight_f = weight_f.reshape(out_dim // block_h, block_h,
-                                    in_dim // block_w, block_w)
-        weight_f = weight_f * weight_scale_inv.to(out_dtype).unsqueeze(
-            1).unsqueeze(3)
-        weight_f = weight_f.reshape(out_dim, in_dim)
+        if out_dim % block_h == 0 and in_dim % block_w == 0:
+            weight_f = weight_f.reshape(out_dim // block_h, block_h,
+                                        in_dim // block_w, block_w)
+            weight_f = weight_f * weight_scale_inv.to(out_dtype).unsqueeze(
+                1).unsqueeze(3)
+            weight_f = weight_f.reshape(out_dim, in_dim)
+        else:
+            scales = weight_scale_inv.to(out_dtype).repeat_interleave(
+                block_h, dim=0).repeat_interleave(block_w, dim=1)
+            weight_f = weight_f * scales[:out_dim, :in_dim]
     else:
         assert weight_scale is not None
         weight_f = weight_f * weight_scale.to(out_dtype)
@@ -615,6 +620,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                layer=layer,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
