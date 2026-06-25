@@ -576,6 +576,19 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
 class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     """Scheduler half for the opt-in Raiden transfer backend."""
 
+    def __init__(self, vllm_config: "VllmConfig"):
+        super().__init__(vllm_config)
+        # Get DP rank and TP size from config and stagger kv_port and side_channel_port
+        dp_rank = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
+        tp_size = vllm_config.parallel_config.tensor_parallel_size if vllm_config.parallel_config else 1
+        port_base = dist_utils.get_kv_ports()
+        if isinstance(port_base, list):
+            self.kv_port = [int(p) + 2 * dp_rank * tp_size for p in port_base]
+        else:
+            self.kv_port = int(port_base) + 2 * dp_rank * tp_size
+        logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
+                    self.kv_ip, self.kv_port)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -673,8 +686,10 @@ class TPURaidenConnectorWorker:
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.dp_rank: int = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
         self.host_ip = dist_utils.get_host_ip()
-        self.kv_transfer_port = int(dist_utils.get_kv_transfer_port())
+        self.kv_transfer_port = int(dist_utils.get_kv_transfer_port()) + (
+            2 * self.dp_rank * self.tp_size)
         self._raiden_transfer_engine: Optional["KVCacheManager"] = None
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
@@ -693,9 +708,9 @@ class TPURaidenConnectorWorker:
         self._failed_block_ids: set[int] = set()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
-            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d",
+            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
             self.host_ip, self.kv_transfer_port, self.is_producer,
-            self.node_id, self.tp_rank, self.tp_size)
+            self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         return None
@@ -963,6 +978,8 @@ class TPUConnectorHMAScheduler(TPUConnectorScheduler):
                 remote_block_ids=params["remote_block_ids"],
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params.get(
+                    "remote_side_channel_port"),
             )
         else:
             self.reqs_to_load[request.request_id] = LoadMeta(
@@ -971,6 +988,8 @@ class TPUConnectorHMAScheduler(TPUConnectorScheduler):
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params.get(
+                    "remote_side_channel_port"),
             )
         load_meta = self.reqs_to_load[request.request_id]
         logger.info(
@@ -1006,10 +1025,12 @@ class TPUConnectorHMAScheduler(TPUConnectorScheduler):
                 uuid=uuid,
                 local_block_ids=computed_per_group,
                 expiration_time=expiration_time)
-            kv_transfer_params = dict(uuid=uuid,
-                                      remote_block_ids=computed_per_group,
-                                      remote_host=self.kv_ip,
-                                      remote_port=self.kv_port)
+            kv_transfer_params = dict(
+                uuid=uuid,
+                remote_block_ids=computed_per_group,
+                remote_host=self.kv_ip,
+                remote_port=self.kv_port,
+                remote_side_channel_port=self.side_channel_port)
             logger.info(
                 "TPUConnectorHMAScheduler Prefill --> send queued | "
                 "req_id=%s | uuid=%s | num_prompt_tokens=%d | "
