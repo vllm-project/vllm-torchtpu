@@ -453,6 +453,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: int | None = None,
         sinks: torch.Tensor | None = None,
+        **kwargs,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -622,9 +623,26 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 output = torch.ones_like(query)
             return output
 
+        query_dim = query.dim()
+        if query_dim == 3:
+            q_len = query.shape[0]
+            q_compute_dim = query.shape[1] * query.shape[2]
+        else:
+            q_len, q_compute_dim = query.shape
+
+        if key.dim() == 3:
+            k_len = key.shape[0]
+            k_compute_dim = key.shape[1] * key.shape[2]
+        else:
+            k_len, k_compute_dim = key.shape
+
+        assert q_compute_dim == self.head_size * self.num_heads
+        assert k_compute_dim == self.head_size * self.num_kv_heads
+
+        query = query.view(q_len, self.num_heads, self.head_size)
+        key = key.view(k_len, self.num_kv_heads, self.head_size)
+        value = value.view(k_len, self.num_kv_heads, self.head_size)
         assert key.shape == value.shape
-        assert query.shape[1:] == (self.num_heads, self.head_size)
-        assert key.shape[1:] == (self.num_kv_heads, self.head_size)
 
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
@@ -662,6 +680,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():
             sync.synchronize(kv_cache)
+
+        if query_dim == 2:
+            outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
 
         if output is not None:
             output.copy_(outputs)
