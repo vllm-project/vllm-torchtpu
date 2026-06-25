@@ -74,13 +74,15 @@ def _make_scheduler(*,
 def _make_raiden_scheduler(*,
                            is_producer: bool = False,
                            dp_rank: int = 0,
-                           tp_size: int = 1):
+                           tp_size: int = 1,
+                           kv_ips: Any = "127.0.0.1",
+                           kv_ports: Any = 9100):
     """Construct a TPURaidenConnectorScheduler with network calls patched."""
     cfg = _make_vllm_config(is_producer=is_producer,
                             dp_rank=dp_rank,
                             tp_size=tp_size)
-    with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value="127.0.0.1"), \
-         patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
+    with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value=kv_ips), \
+         patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=kv_ports):
         return TPURaidenConnectorScheduler(cfg)
 
 
@@ -114,13 +116,16 @@ def _make_worker(*,
 def _make_raiden_worker(*,
                         tp_rank: int = 1,
                         tp_size: int = 4,
-                        is_producer: bool = True) -> TPURaidenConnectorWorker:
-    cfg = _make_vllm_config(is_producer=is_producer)
+                        is_producer: bool = True,
+                        dp_rank: int = 0,
+                        kv_ips: Any = "127.0.0.1",
+                        kv_ports: Any = 9100) -> TPURaidenConnectorWorker:
+    cfg = _make_vllm_config(is_producer=is_producer, dp_rank=dp_rank)
     with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank), \
          patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size), \
          patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
-         patch(f"{_MOD}.dist_utils.get_host_ip", return_value="127.0.0.1"), \
-         patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value="9100"):
+         patch(f"{_MOD}.dist_utils.get_host_ip", return_value=kv_ips), \
+         patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value=kv_ports):
         return TPURaidenConnectorWorker(cfg)
 
 
@@ -625,6 +630,43 @@ class TestTPURaidenConnectorScheduler:
         assert self.consumer.get_finished_count() == 0
 
 
+# ---- test DP configurations --------------------------------------------
+
+    def test_dp_port_configurations_singlehost(self):
+        scheduler = _make_raiden_scheduler(dp_rank=0, tp_size=1)
+        assert scheduler.kv_port == 9100
+
+        scheduler = _make_raiden_scheduler(dp_rank=1, tp_size=1)
+        assert scheduler.kv_port == 9102
+
+        scheduler = _make_raiden_scheduler(dp_rank=0, tp_size=4)
+        assert scheduler.kv_port == 9100
+
+        scheduler = _make_raiden_scheduler(dp_rank=1, tp_size=4)
+        assert scheduler.kv_port == 9108
+
+    def test_dp_port_configurations_multihost(self):
+        scheduler = _make_raiden_scheduler(dp_rank=0,
+                                           tp_size=1,
+                                           kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9100, 9200]
+
+        scheduler = _make_raiden_scheduler(dp_rank=1,
+                                           tp_size=1,
+                                           kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9102, 9202]
+
+        scheduler = _make_raiden_scheduler(dp_rank=0,
+                                           tp_size=4,
+                                           kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9100, 9200]
+
+        scheduler = _make_raiden_scheduler(dp_rank=1,
+                                           tp_size=4,
+                                           kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9108, 9208]
+
+
 class _FakeRaidenEngine:
 
     def __init__(self):
@@ -742,6 +784,19 @@ class TestTPURaidenConnectorWorker:
         with patch(f"{_MOD}.dist_utils.get_raiden_transfer_num_slots",
                    return_value=3):
             assert self.worker._num_raiden_slots(max_blocks=4) == 3
+
+    def test_dp_port_configurations(self):
+        worker = _make_raiden_worker(dp_rank=0, tp_size=1)
+        assert worker.kv_transfer_port == 9100
+
+        worker = _make_raiden_worker(dp_rank=1, tp_size=1)
+        assert worker.kv_transfer_port == 9102
+
+        worker = _make_raiden_worker(dp_rank=0, tp_size=4)
+        assert worker.kv_transfer_port == 9100
+
+        worker = _make_raiden_worker(dp_rank=1, tp_size=4)
+        assert worker.kv_transfer_port == 9108
 
 
 # ---------------------------------------------------------------------------
