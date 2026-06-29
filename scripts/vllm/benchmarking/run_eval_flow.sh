@@ -136,7 +136,7 @@ run_lm_eval() {
         echo "=== Checking Eval Regression for $task ==="
         python3 scripts/vllm/benchmarking/check_regression.py \
           --mode eval \
-          --tolerance 0.02 \
+          --tolerance "$EVAL_TOLERANCE" \
           --results-dir "$RESULTS_DIR" \
           --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
     else
@@ -172,6 +172,7 @@ BENCH_ARGS+=(--port "$PORT")
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
+EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
 
 fail=0
 evalplus_rc=0
