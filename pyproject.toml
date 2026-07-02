@@ -106,3 +106,7 @@ name = "torch-tpu-registry"
 # torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
 # and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
 url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+explicit = true
+
+[tool.uv.sources]
+torch-tpu = { index = "torch-tpu-registry" }

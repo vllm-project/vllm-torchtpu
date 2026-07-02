@@ -21,7 +21,7 @@ IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
 
 echo "--- Building Docker Image: ${IMAGE_TAG}"
 # Run the existing build_image.sh script with target dev
-./docker/build_image.sh --target dev -t "${IMAGE_TAG}" --torch-tpu-registry
+./docker/build_image.sh --target dev -t "${IMAGE_TAG}"
 
 echo "--- Pushing Docker Image to Registry"
 gcloud auth configure-docker us-central1-docker.pkg.dev --quiet

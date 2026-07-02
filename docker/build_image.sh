@@ -3,7 +3,7 @@ set -e
 
 # Usage Examples:
 #
-# 1. Build with default values:
+# 1. Build with default values (prod variant):
 #    ./docker/build_image.sh
 #
 # 2. Build with custom image tag and base image:
@@ -11,21 +11,10 @@ set -e
 #
 # 3. Build with local vLLM source:
 #    ./docker/build_image.sh -s /path/to/vllm/source
-#
-# 4. Build with torch-tpu from registry, using pyproject.toml pin:
-#    ./docker/build_image.sh --torch-tpu-registry
-#
-# To build the prerequisite torch-tpu base image:
-#    cd ../torch_tpu
-#    bash docker/build_image_multistage.sh
-#    cd -
 
 # Default values
 IMAGE_TAG="torchtpu-vllm-local"
 BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
-ARTIFACT_SOURCE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu:nightly-latest"
-USE_TORCH_TPU_REGISTRY=""
-TORCH_TPU_VERSION=""
 VLLM_SOURCE=""
 TARGET="prod"
 
@@ -39,19 +28,6 @@ while [[ $# -gt 0 ]]; do
     -b|--base-image)
       BASE_IMAGE="$2"
       shift 2
-      ;;
-    -a|--artifact-source)
-      ARTIFACT_SOURCE="$2"
-      shift 2
-      ;;
-    --torch-tpu-registry)
-      USE_TORCH_TPU_REGISTRY="1"
-      if [[ $# -gt 1 && "$2" != -* ]]; then
-        TORCH_TPU_VERSION="$2"
-        shift 2
-      else
-        shift
-      fi
       ;;
     -s|--vllm-source)
       VLLM_SOURCE="$2"
@@ -92,17 +68,9 @@ if [ -z "${ACCESS_TOKEN:-}" ]; then
   fi
 fi
 
-if [ -z "$USE_TORCH_TPU_REGISTRY" ]; then
-  echo "Torch TPU Source: artifact"
-  echo "Artifact Source: $ARTIFACT_SOURCE"
-else
-  if [ -z "${ACCESS_TOKEN:-}" ]; then
-    echo "Missing ACCESS_TOKEN and gcloud is unavailable"
-    exit 1
-  fi
-  ARTIFACT_SOURCE="$BASE_IMAGE"
-  echo "Torch TPU Source: registry"
-  echo "Torch TPU Version: ${TORCH_TPU_VERSION:-pyproject.toml}"
+if [ -z "${ACCESS_TOKEN:-}" ]; then
+  echo "Missing ACCESS_TOKEN and gcloud is unavailable. Private registry authentication will fail."
+  exit 1
 fi
 
 # Handle local vllm source directory
@@ -125,10 +93,7 @@ DOCKER_ARGS=(
   -f "${SCRIPT_DIR}/Dockerfile" \
   -t "${IMAGE_TAG}" \
   --target "${TARGET}" \
-  --build-arg ARTIFACT_SOURCE="${ARTIFACT_SOURCE}" \
   --build-arg BASE_IMAGE="${BASE_IMAGE}" \
-  --build-arg USE_TORCH_TPU_REGISTRY="${USE_TORCH_TPU_REGISTRY}" \
-  --build-arg TORCH_TPU_VERSION="${TORCH_TPU_VERSION}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
 )
 
