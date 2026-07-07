@@ -440,3 +440,81 @@ def test_eagle3_correctness_greedy_multi_chunk(
         spec_llm.llm_engine.engine_core.shutdown()
         del spec_llm
         cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(_get_tensor_parallel_size() < 2,
+                    reason="sharded draft (draft_tp == target_tp) needs TP>1")
+@pytest.mark.timeout(1200)
+def test_eagle3_sharded_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """Sharded eagle3 draft: draft_tensor_parallel_size == target tp.
+    Verifies the sharded draft (a) doesn't change greedy output vs a no-spec reference
+    (b) actually proposes + accepts drafts.
+    """
+    tp = _get_tensor_parallel_size()
+    model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    with monkeypatch.context() as mp:
+        mp.setenv("MODEL_IMPL_TYPE", "vllm")
+
+        test_prompts = get_eagle3_test_prompts()
+        kwargs = dict(
+            max_model_len=256,
+            max_num_seqs=4,
+            tensor_parallel_size=tp,
+            enable_prefix_caching=False,
+            # Spec decode + async scheduling isn't supported on TPU yet; the
+            # other eagle3 tests set this too. This test exercises the sharded
+            # DRAFT, orthogonal to the scheduling mode.
+            async_scheduling=False,
+            disable_log_stats=False,
+        )
+
+        # 1. Reference run (no speculation).
+        ref_llm = LLM(model=model_name, **kwargs)
+        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
+        ref_llm.llm_engine.engine_core.shutdown()
+        del ref_llm
+        cleanup_dist_env_and_memory()
+        time.sleep(15)
+
+        # 2. Sharded eagle3 draft (draft_tp == target tp).
+        spec_llm = LLM(
+            model=model_name,
+            speculative_config={
+                "method": "eagle3",
+                "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+                "num_speculative_tokens": 3,
+                "draft_tensor_parallel_size": tp,  # == target tp -> SHARDED
+            },
+            **kwargs,
+        )
+        spec_outputs = spec_llm.generate(test_prompts, sampling_config)
+
+        # (a) Sharded drafting must not change greedy output.
+        misses = 0
+        for ref, spec in zip(ref_outputs, spec_outputs):
+            if ref.outputs[0].text != spec.outputs[0].text:
+                misses += 1
+                print(f"ref:  {ref.outputs[0].text}")
+                print(f"spec: {spec.outputs[0].text}")
+        assert misses == 0
+
+        # (b) The sharded draft actually proposed + got tokens accepted.
+        num_draft_tokens = num_accepted_tokens = 0
+        for metric in spec_llm.get_metrics():
+            if metric.name == "vllm:spec_decode_num_draft_tokens":
+                assert isinstance(metric, Counter)
+                num_draft_tokens += metric.value
+            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                assert isinstance(metric, Counter)
+                num_accepted_tokens += metric.value
+        print(f"sharded eagle3 (tp={tp}, draft_tp={tp}): "
+              f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
+        assert num_draft_tokens > 0, "no draft tokens produced (sharded draft)"
+        assert num_accepted_tokens > 0, "no draft tokens accepted (sharded draft)"
+
+        spec_llm.llm_engine.engine_core.shutdown()
+        del spec_llm
+        cleanup_dist_env_and_memory()

@@ -1,0 +1,327 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
+    build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
+    pcp_local_token_counts as _pcp_local_token_counts
+from vllm_torchtpu.layers.common.gdn_attention import (
+    GdnAttentionConfig, _derive_pcp_rank_major_reorder_indices,
+    _exchange_pcp_token_shards_for_head_shards,
+    _select_replicated_shard_for_pcp_rank, run_jax_gdn_attention_local,
+    run_jax_gdn_attention_pcp_tp_prefill)
+from vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper import \
+    RaggedGatedDeltaRuleImpl
+from vllm_torchtpu.layers.common.utils import (
+    inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
+
+
+def test_pcp_gdn_helpers_are_available():
+    assert callable(_exchange_pcp_token_shards_for_head_shards)
+    assert callable(run_jax_gdn_attention_pcp_tp_prefill)
+
+
+def test_inverse_reorder_for_sharding_round_trips_concatenated_splits():
+    tensor = jnp.arange(2 * 12).reshape(2, 12)
+    split_sizes = [4, 4, 4]
+    reordered = reorder_concatenated_tensor_for_sharding(
+        tensor,
+        split_sizes,
+        n_shards=2,
+        dim=-1,
+    )
+    restored = inverse_reorder_for_sharding(reordered, split_sizes, 2, -1)
+    assert restored.tolist() == tensor.tolist()
+
+
+def test_replicated_pcp_shard_selection_avoids_axis_index_partition_id(
+        monkeypatch):
+    tensor = jnp.arange(2 * 6).reshape(2, 6)
+    calls = {}
+
+    def fail_axis_index(axis_name):
+        raise AssertionError(
+            f"replicated shard selection must not use axis_index({axis_name})")
+
+    original_dynamic_slice = jax.lax.dynamic_slice_in_dim
+
+    def fake_dynamic_slice_in_dim(tensor_arg, start_index, slice_size, axis=0):
+        calls["slice"] = (start_index, slice_size, axis)
+        return original_dynamic_slice(tensor_arg,
+                                      start_index,
+                                      slice_size,
+                                      axis=axis)
+
+    def fake_all_to_all(tensor_arg, *, axis_name, split_axis, concat_axis,
+                        tiled):
+        calls["all_to_all"] = (axis_name, split_axis, concat_axis, tiled)
+        rank_one_shard = original_dynamic_slice(tensor_arg, 2, 2, axis=1)
+        return jnp.concatenate([rank_one_shard] * 3, axis=1)
+
+    monkeypatch.setattr(jax.lax, "axis_index", fail_axis_index)
+    monkeypatch.setattr(jax.lax, "dynamic_slice_in_dim",
+                        fake_dynamic_slice_in_dim)
+    monkeypatch.setattr(jax.lax, "all_to_all", fake_all_to_all)
+
+    shard = _select_replicated_shard_for_pcp_rank(
+        tensor,
+        "pcp",
+        3,
+        axis=1,
+    )
+
+    assert calls["all_to_all"] == ("pcp", 1, 1, True)
+    assert calls["slice"] == (0, 2, 1)
+    assert shard.tolist() == [[2, 3], [8, 9]]
+
+
+def test_derive_pcp_rank_major_reorder_indices_matches_host_order():
+    pcp_size = 2
+    interleave_size = 16
+    lengths = np.array([32, 64], dtype=np.int32)
+    padded_num_tokens = 96
+    local_padded_num_tokens = padded_num_tokens // pcp_size
+    query_start_loc = jnp.array([0, 32, 96], dtype=jnp.int32)
+
+    expected, _ = _build_pcp_rank_major_token_order(
+        lengths,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+    )
+    actual = _derive_pcp_rank_major_reorder_indices(
+        query_start_loc,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        local_padded_num_tokens=local_padded_num_tokens,
+    )
+
+    np.testing.assert_array_equal(np.array(actual), expected.astype(np.int32))
+
+
+def test_derive_pcp_rank_major_reorder_indices_matches_unaligned_host_order():
+    pcp_size = 4
+    interleave_size = 4
+    lengths = np.array([10, 10], dtype=np.int32)
+    padded_num_tokens = int(
+        _pcp_local_token_counts(lengths, pcp_size,
+                                interleave_size).max()) * pcp_size
+    local_padded_num_tokens = padded_num_tokens // pcp_size
+    query_start_loc = jnp.array([0, 10, 20], dtype=jnp.int32)
+
+    expected, _ = _build_pcp_rank_major_token_order(
+        lengths,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+    )
+    actual = _derive_pcp_rank_major_reorder_indices(
+        query_start_loc,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        local_padded_num_tokens=local_padded_num_tokens,
+    )
+
+    np.testing.assert_array_equal(np.array(actual), expected.astype(np.int32))
+
+
+def test_derive_pcp_rank_major_reorder_indices_uses_chunk_offsets():
+    pcp_size = 4
+    interleave_size = 4
+    lengths = np.array([13, 11], dtype=np.int32)
+    token_start_offsets = np.array([7, 22], dtype=np.int32)
+    padded_num_tokens = int(
+        _pcp_local_token_counts(
+            lengths,
+            pcp_size,
+            interleave_size,
+            token_start_offsets_per_req=token_start_offsets,
+        ).max()) * pcp_size
+    local_padded_num_tokens = padded_num_tokens // pcp_size
+    query_start_loc = jnp.array([0, 13, 24], dtype=jnp.int32)
+    seq_lens = jnp.array(token_start_offsets + lengths, dtype=jnp.int32)
+
+    expected, _ = _build_pcp_rank_major_token_order(
+        lengths,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+        token_start_offsets_per_req=token_start_offsets,
+    )
+    actual = _derive_pcp_rank_major_reorder_indices(
+        query_start_loc,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        local_padded_num_tokens=local_padded_num_tokens,
+        seq_lens=seq_lens,
+    )
+
+    np.testing.assert_array_equal(np.array(actual), expected.astype(np.int32))
+
+
+def _require_tpu_devices(min_count, reason):
+    devices = jax.local_devices()
+    if len(devices) < min_count or devices[0].platform != 'tpu':
+        pytest.skip(reason)
+    return devices
+
+
+def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
+    _require_tpu_devices(2, 'GDN PCP numerical test requires two TPU devices.')
+    pcp_size = 2
+    interleave_size = 16
+    lengths = [32]
+    n_kq = 4
+    n_v = 4
+    d_k = 64
+    d_v = 64
+    kernel_size = 4
+    num_tokens = sum(lengths)
+    num_blocks = len(lengths) + 1
+    dim = 2 * n_kq * d_k + n_v * d_v
+
+    rng = jax.random.key(0)
+    keys = jax.random.split(rng, 8)
+    mixed_qkv0 = jax.random.normal(keys[0], (num_tokens, dim),
+                                   dtype=jnp.bfloat16)
+    b0 = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
+    a0 = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
+    conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim),
+                            dtype=jnp.bfloat16)
+    rec_state0 = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
+    conv_weight0 = jax.random.normal(keys[3], (dim, 1, kernel_size),
+                                     dtype=jnp.bfloat16)
+    conv_bias0 = jax.random.normal(keys[4], (dim, ), dtype=jnp.bfloat16)
+    A_log0 = jax.random.normal(keys[5], (n_v, ), dtype=jnp.float32)
+    dt_bias0 = jax.random.normal(keys[6], (n_v, ), dtype=jnp.float32)
+
+    query_start_loc = jnp.array([0, num_tokens], dtype=jnp.int32)
+    state_indices = jnp.array([1], dtype=jnp.int32)
+    distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+    seq_lens = jnp.array(lengths, dtype=jnp.int32)
+
+    padded_num_tokens = int(
+        _pcp_local_token_counts(lengths, pcp_size,
+                                interleave_size).max()) * pcp_size
+    token_order, _ = _build_pcp_rank_major_token_order(
+        np.array(lengths, dtype=np.int32),
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+    )
+    valid = token_order >= 0
+    pad_tokens = padded_num_tokens - num_tokens
+    mixed_qkv_padded = jnp.pad(mixed_qkv0, ((0, pad_tokens), (0, 0)))
+    b_padded = jnp.pad(b0, ((0, pad_tokens), (0, 0)))
+    a_padded = jnp.pad(a0, ((0, pad_tokens), (0, 0)))
+    valid_indices = np.where(valid)[0]
+    src_indices = token_order[valid]
+    packed_qkv = jnp.zeros_like(mixed_qkv_padded).at[valid_indices].set(
+        mixed_qkv_padded[src_indices])
+    packed_b = jnp.zeros_like(b_padded).at[valid_indices].set(
+        b_padded[src_indices])
+    packed_a = jnp.zeros_like(a_padded).at[valid_indices].set(
+        a_padded[src_indices])
+
+    mixed_qkv = jnp.array(np.array(mixed_qkv0))
+    b = jnp.array(np.array(b0))
+    a = jnp.array(np.array(a0))
+    conv_state = jnp.array(np.array(conv_state0))
+    rec_state = jnp.array(np.array(rec_state0))
+    conv_weight = jnp.array(np.array(conv_weight0))
+    conv_bias = jnp.array(np.array(conv_bias0))
+    A_log = jnp.array(np.array(A_log0))
+    dt_bias = jnp.array(np.array(dt_bias0))
+
+    config = GdnAttentionConfig(
+        ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF)
+    (ref_conv, ref_rec), ref_output = run_jax_gdn_attention_local(
+        mixed_qkv,
+        b,
+        a,
+        conv_state,
+        rec_state,
+        conv_weight,
+        conv_bias,
+        A_log,
+        dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        dp_enabled=False,
+        config=config)
+
+    mesh = Mesh(
+        np.array(jax.devices()[:pcp_size]).reshape((pcp_size, )), ('pcp', ))
+
+    def shard_tokens(x):
+        return jax.device_put(x, NamedSharding(mesh, P('pcp', None)))
+
+    def replicate(x):
+        return jax.device_put(x, NamedSharding(mesh, P()))
+
+    (pcp_conv, pcp_rec), pcp_output = run_jax_gdn_attention_pcp_tp_prefill(
+        shard_tokens(packed_qkv),
+        shard_tokens(packed_b),
+        shard_tokens(packed_a),
+        replicate(conv_state0),
+        replicate(rec_state0),
+        replicate(conv_weight0),
+        replicate(conv_bias0),
+        replicate(A_log0),
+        replicate(dt_bias0),
+        replicate(state_indices),
+        replicate(query_start_loc),
+        replicate(distribution),
+        replicate(seq_lens),
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        mesh=mesh,
+        config=config)
+
+    pcp_output_np = np.array(pcp_output)
+    pcp_output_seq = np.zeros((padded_num_tokens, pcp_output_np.shape[1]),
+                              dtype=pcp_output_np.dtype)
+    pcp_output_seq[token_order[valid]] = pcp_output_np[valid]
+
+    np.testing.assert_allclose(pcp_output_seq[:num_tokens],
+                               np.array(ref_output),
+                               rtol=5e-2,
+                               atol=5e-2)
+    np.testing.assert_allclose(np.array(pcp_conv),
+                               np.array(ref_conv),
+                               rtol=5e-2,
+                               atol=5e-2)
+    np.testing.assert_allclose(np.array(pcp_rec),
+                               np.array(ref_rec),
+                               rtol=5e-2,
+                               atol=5e-2)

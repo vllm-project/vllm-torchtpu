@@ -979,6 +979,9 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         n = len(dst_ids)
         sizes = [1] * n  # one major-dim slice (= one kernel block) per segment
         if self.tpu_to_cpu:
+            # Barrier so the D2h store reads these blocks only after the
+            # forward step's in-place KV write to them has completed.
+            _tpu_sync(wait=True)
             fut = self._mgr.D2h(src_ids.tolist(), dst_ids.tolist(), sizes)
         else:
             fut = self._mgr.H2d(src_ids.tolist(), dst_ids.tolist(), sizes)

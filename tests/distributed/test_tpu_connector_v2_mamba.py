@@ -23,6 +23,7 @@ def test_mamba_state_8tp_to_2tp_builds_pull_meta():
         block_size=256,
         tp_rank=0,
         total_num_kv_heads=0,
+        total_num_mamba_key_heads=32,
         total_num_mamba_heads=32,
     )
 
@@ -30,7 +31,13 @@ def test_mamba_state_8tp_to_2tp_builds_pull_meta():
     assert pull_meta.p_ranks == (0, 1, 2, 3)
     assert pull_meta.fa_heads_by_rank == {}
     assert pull_meta.mamba_source_block_ids == (5, )
-    assert pull_meta.mamba_heads_by_rank == {
+    assert pull_meta.mamba_key_heads_by_rank == {
+        0: (0, 1, 2, 3),
+        1: (4, 5, 6, 7),
+        2: (8, 9, 10, 11),
+        3: (12, 13, 14, 15),
+    }
+    assert pull_meta.mamba_value_heads_by_rank == {
         0: (0, 1, 2, 3),
         1: (4, 5, 6, 7),
         2: (8, 9, 10, 11),
@@ -39,7 +46,8 @@ def test_mamba_state_8tp_to_2tp_builds_pull_meta():
     assert pull_meta.fa_head_mappings_by_rank == {}
     assert {
         rank: head_mapping_rows(mappings)
-        for rank, mappings in pull_meta.mamba_head_mappings_by_rank.items()
+        for rank, mappings in
+        pull_meta.mamba_value_head_mappings_by_rank.items()
     } == {
         rank: tuple((rank * 4 + i, i, rank * 4 + i, None) for i in range(4))
         for rank in range(4)
@@ -82,6 +90,7 @@ def test_mamba_state_lowering_with_manual_pull_meta():
         block_size=256,
         tp_rank=0,
         total_num_kv_heads=0,
+        total_num_mamba_key_heads=32,
         total_num_mamba_heads=32,
     )
     destination = mod.LocalDecodeAllocation(

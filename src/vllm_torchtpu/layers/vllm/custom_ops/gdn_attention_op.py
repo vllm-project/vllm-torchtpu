@@ -17,18 +17,25 @@ import functools
 import jax
 import torch
 from einops import rearrange
+from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.common.gdn_attention import (GdnAttentionConfig,
-                                                       run_jax_gdn_attention)
+from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
+                                           get_pcp_rank, get_pcp_world_size)
+from vllm_torchtpu.layers.common.gdn_attention import (
+    GdnAttentionConfig, run_jax_gdn_attention,
+    run_jax_gdn_attention_pcp_tp_prefill)
 from vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
+from vllm_torchtpu.layers.common.sequence_layout import \
+    is_pcp_streaming_attention_metadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
+from vllm_torchtpu.utils import get_dp_size
 
 
 def gdn_attention_core_tpu(
@@ -53,6 +60,7 @@ def gdn_attention_core_tpu(
     d_v: int,
     kernel_size: int,
     config: GdnAttentionConfig,
+    dp_enabled: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     (new_conv_state, new_recurrent_state), output = run_jax_gdn_attention(
         mixed_qkv,
@@ -74,9 +82,63 @@ def gdn_attention_core_tpu(
         d_v=d_v,
         kernel_size=kernel_size,
         mesh=mesh,
+        dp_enabled=dp_enabled,
         config=config,
     )
 
+    return new_conv_state, new_recurrent_state, output
+
+
+def gdn_attention_core_tpu_pcp_prefill(
+    mixed_qkv: jax.Array,
+    b: jax.Array,
+    a: jax.Array,
+    conv_state: jax.Array,
+    recurrent_state: jax.Array,
+    conv_weight: jax.Array,
+    conv_bias: jax.Array | None,
+    A_log: jax.Array,
+    dt_bias: jax.Array,
+    state_indices: jax.Array,
+    query_start_loc: jax.Array,
+    distribution: jax.Array,
+    seq_lens: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    config: GdnAttentionConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    (new_conv_state,
+     new_recurrent_state), output = run_jax_gdn_attention_pcp_tp_prefill(
+         mixed_qkv,
+         b,
+         a,
+         conv_state,
+         recurrent_state,
+         conv_weight,
+         conv_bias,
+         A_log,
+         dt_bias,
+         state_indices,
+         query_start_loc,
+         distribution,
+         seq_lens,
+         n_kq=n_kq,
+         n_v=n_v,
+         d_k=d_k,
+         d_v=d_v,
+         kernel_size=kernel_size,
+         pcp_size=pcp_size,
+         interleave_size=interleave_size,
+         mesh=mesh,
+         config=config,
+     )
     return new_conv_state, new_recurrent_state, output
 
 
@@ -86,50 +148,148 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gdn_op = self._build_gdn_op()
+        self.gdn_pcp_op = (self._build_gdn_op(
+            pcp_streaming=True) if self._pcp_streaming_enabled() else None)
 
-    def _build_gdn_op(self):
+    @staticmethod
+    def _pcp_streaming_enabled() -> bool:
         vllm_context = get_vllm_model_wrapper_context()
+        parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
+                                  None)
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        return isinstance(pcp_size, int) and pcp_size > 1
+
+    def _build_gdn_op(self, *, pcp_streaming: bool = False):
+        ragged_gated_delta_rule_impl = RaggedGatedDeltaRuleImpl(
+            envs.RAGGED_GATED_DELTA_RULE_IMPL)
         config = GdnAttentionConfig(
-            ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl(
-                envs.RAGGED_GATED_DELTA_RULE_IMPL))
+            ragged_gated_delta_rule_impl=ragged_gated_delta_rule_impl)
         local_num_v_heads = self.num_v_heads // self.tp_size
-        wrapped_fn = functools.partial(
-            gdn_attention_core_tpu,
-            mesh=vllm_context.mesh,
-            n_kq=self.num_k_heads // self.tp_size,
-            n_v=local_num_v_heads,
-            d_k=self.head_k_dim,
-            d_v=self.head_v_dim,
-            kernel_size=self.conv_kernel_size,
-            config=config,
-        )
+        local_num_kq_heads = self.num_k_heads // self.tp_size
+        has_conv_bias = self.conv1d.bias is not None
+        vllm_context = get_vllm_model_wrapper_context()
+        parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
+                                  None)
+        dp_enabled = (parallel_config is not None
+                      and get_dp_size(parallel_config) > 1)
+        if pcp_streaming:
+            interleave_size = getattr(parallel_config,
+                                      "cp_kv_cache_interleave_size", 0)
+            if not isinstance(interleave_size, int) or interleave_size <= 0:
+                raise ValueError("GDN PCP streaming requires "
+                                 "cp_kv_cache_interleave_size > 0.")
+            pcp_mesh = get_or_create_pcp_mesh(axis_name="pcp")
+            pcp_size = get_pcp_world_size()
+            if pcp_size != pcp_mesh.shape["pcp"]:
+                raise ValueError(
+                    f"PCP world size {pcp_size} does not match mesh shape "
+                    f"{pcp_mesh.shape['pcp']}.")
+            if local_num_kq_heads % pcp_size != 0:
+                raise ValueError("local GDN K/Q heads "
+                                 f"{local_num_kq_heads} must be divisible by "
+                                 f"pcp_size={pcp_size}.")
+            if local_num_v_heads % pcp_size != 0:
+                raise ValueError(
+                    f"local GDN V heads {local_num_v_heads} must be divisible "
+                    f"by pcp_size={pcp_size}.")
+            op_name = ("pallas::gdn_attention_pcp_"
+                       f"{self.prefix.replace('.', '_')}")
+            wrapped_fn = functools.partial(
+                gdn_attention_core_tpu_pcp_prefill,
+                mesh=pcp_mesh,
+                n_kq=local_num_kq_heads,
+                n_v=local_num_v_heads,
+                d_k=self.head_k_dim,
+                d_v=self.head_v_dim,
+                kernel_size=self.conv_kernel_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                config=config,
+            )
+            input_partition_specs = (
+                PartitionSpec("pcp"),  # mixed_qkv
+                PartitionSpec("pcp"),  # b
+                PartitionSpec("pcp"),  # a
+                PartitionSpec(),  # conv_state
+                PartitionSpec(),  # recurrent_state
+                PartitionSpec(),  # conv_weight
+                PartitionSpec() if has_conv_bias else None,  # conv_bias
+                PartitionSpec(),  # A_log
+                PartitionSpec(),  # dt_bias
+                PartitionSpec(),  # state_indices
+                PartitionSpec(),  # query_start_loc
+                PartitionSpec(),  # request_distribution
+                PartitionSpec(),  # seq_lens
+            )
+            gdn_jax_op = pallas.jax_op(
+                op_name,
+                wrapped_fn,
+                donate_argnums=(3, 4),
+                mesh=pcp_mesh,
+                input_partition_specs=input_partition_specs,
+            )
 
-        op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"
-        gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
+            def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
+                          *args, **kwargs):
+                num_tokens = mixed_qkv.size(0)
+                out_shape = (num_tokens * pcp_size,
+                             local_num_v_heads * self.head_v_dim)
+                return torch.empty_like(conv_state), torch.empty_like(
+                    recurrent_state), torch.empty(out_shape,
+                                                  dtype=mixed_qkv.dtype,
+                                                  device=mixed_qkv.device)
 
-        def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state, *args,
-                      **kwargs):
-            num_tokens = mixed_qkv.size(0)
-            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-            return torch.empty_like(conv_state), torch.empty_like(
-                recurrent_state), torch.empty(out_shape,
-                                              dtype=mixed_qkv.dtype,
-                                              device=mixed_qkv.device)
+            gdn_jax_op.register_fake(_fake_gdn)
+        else:
+            op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"
+            wrapped_fn = functools.partial(
+                gdn_attention_core_tpu,
+                mesh=vllm_context.mesh,
+                n_kq=local_num_kq_heads,
+                n_v=local_num_v_heads,
+                d_k=self.head_k_dim,
+                d_v=self.head_v_dim,
+                kernel_size=self.conv_kernel_size,
+                config=config,
+                dp_enabled=dp_enabled,
+            )
+            gdn_jax_op = pallas.jax_op(op_name,
+                                       wrapped_fn,
+                                       donate_argnums=(3, 4))
 
-        gdn_jax_op.register_fake(_fake_gdn)
+            def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
+                          *args, **kwargs):
+                num_tokens = mixed_qkv.size(0)
+                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+                return torch.empty_like(conv_state), torch.empty_like(
+                    recurrent_state), torch.empty(out_shape,
+                                                  dtype=mixed_qkv.dtype,
+                                                  device=mixed_qkv.device)
 
-        def gdn_impl(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
-                     conv_state: torch.Tensor, recurrent_state: torch.Tensor,
-                     conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
-                     A_log: torch.Tensor, dt_bias: torch.Tensor,
-                     state_indices: torch.Tensor,
-                     query_start_loc: torch.Tensor,
-                     request_distribution: torch.Tensor,
-                     seq_lens: torch.Tensor) -> torch.Tensor:
+            gdn_jax_op.register_fake(_fake_gdn)
+
+        def gdn_impl(
+            mixed_qkv: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            conv_state: torch.Tensor,
+            recurrent_state: torch.Tensor,
+            conv_weight: torch.Tensor,
+            conv_bias: torch.Tensor | None,
+            A_log: torch.Tensor,
+            dt_bias: torch.Tensor,
+            state_indices: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            seq_lens: torch.Tensor,
+        ) -> torch.Tensor:
             new_conv, new_rec, outputs = gdn_jax_op(
                 mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
                 conv_bias, A_log, dt_bias, state_indices, query_start_loc,
                 request_distribution, seq_lens)
+            if pcp_streaming:
+                outputs = outputs.reshape(-1,
+                                          local_num_v_heads * self.head_v_dim)
 
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
@@ -200,7 +360,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # Recurrent-state slot id per persistent-batch position.
             # Compact-mamba: the mamba pool has only `_mamba_num_blocks` slots
             # (< attention `num_blocks`), so the slot id is carried explicitly
-            # in `mamba_state_indices` (∈ [0, _mamba_num_blocks)) rather than
+            # in `mamba_state_indices` (in [0, _mamba_num_blocks)) rather than
             # derived from the attention `block_tables[:, 0]`. Fall back to
             # `block_tables[:, 0]` only when compact sizing was skipped and
             # mamba shares the attention block pool (uniform layout).
@@ -218,11 +378,39 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 state_indices = block_tables_2d[:, 0].to(torch.int32)
 
             # Execute the TorchTPU custom op
-            core_attn_out = self.gdn_op(
-                mixed_qkv, b, a, conv_state, recurrent_state,
-                self.conv1d.weight, self.conv1d.bias, self.A_log, self.dt_bias,
-                state_indices, attn_metadata.query_start_loc,
-                attn_metadata.request_distribution, attn_metadata.seq_lens)
+            use_pcp_streaming = is_pcp_streaming_attention_metadata(
+                attn_metadata)
+            if not use_pcp_streaming:
+                core_attn_out = self.gdn_op(
+                    mixed_qkv, b, a, conv_state, recurrent_state,
+                    self.conv1d.weight, self.conv1d.bias, self.A_log,
+                    self.dt_bias, state_indices, attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution, attn_metadata.seq_lens)
+            else:
+                gdn_pcp_op = getattr(self, "gdn_pcp_op", None)
+                if gdn_pcp_op is None:
+                    raise RuntimeError(
+                        "GDN PCP prefill op was not initialized during model "
+                        "loading.")
+                core_attn_out = gdn_pcp_op(
+                    mixed_qkv, b, a, conv_state, recurrent_state,
+                    self.conv1d.weight, self.conv1d.bias, self.A_log,
+                    self.dt_bias, state_indices, attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution, attn_metadata.seq_lens)
+            if core_attn_out.shape[0] != num_tokens:
+                if not use_pcp_streaming:
+                    raise RuntimeError(
+                        "GDN op returned an incompatible output shape.")
+                start = get_pcp_rank() * num_tokens
+                core_attn_out = core_attn_out[start:start + num_tokens]
+            if use_pcp_streaming:
+                local_core_attn_out = torch.empty(
+                    tuple(core_attn_out.shape),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+                local_core_attn_out.copy_(core_attn_out)
+                core_attn_out = local_core_attn_out
 
         # ============================================================
         # Part 3: Output Projection

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from .common import LayerType, TensorLayout, check_non_negative, check_positive
 
@@ -33,6 +35,32 @@ class HeadSegment:
             raise ValueError(
                 "global_heads count must match local_head_count, got "
                 f"{len(self.global_heads)} and {self.local_head_count}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "global_heads": list(self.global_heads),
+            "local_head_start": self.local_head_start,
+            "local_head_count": self.local_head_count,
+            "head_bytes": self.head_bytes,
+            "base_offset_bytes": self.base_offset_bytes,
+            "stride_bytes": self.stride_bytes,
+            "num_segments": self.num_segments,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "HeadSegment":
+        return cls(
+            name=str(data["name"]),
+            global_heads=tuple(int(head) for head in data["global_heads"]),
+            local_head_start=int(data["local_head_start"]),
+            local_head_count=int(data["local_head_count"]),
+            head_bytes=int(data["head_bytes"]),
+            base_offset_bytes=int(data["base_offset_bytes"]),
+            stride_bytes=(None if data["stride_bytes"] is None else int(
+                data["stride_bytes"])),
+            num_segments=int(data["num_segments"]),
+        )
 
 
 SUPPORTED_TOKEN_FIRST_LAYOUT_IDS = frozenset({
@@ -83,15 +111,39 @@ class TokenFirstLayoutSpec:
                 "token_stride_bytes cannot cover num_heads/head_stride_bytes/"
                 "live_head_bytes")
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "block_size": self.block_size,
+            "block_bytes": self.block_bytes,
+            "block_stride_bytes": self.block_stride_bytes,
+            "token_stride_bytes": self.token_stride_bytes,
+            "head_stride_bytes": self.head_stride_bytes,
+            "live_head_bytes": self.live_head_bytes,
+            "num_heads": self.num_heads,
+            "layout_id": self.layout_id,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "TokenFirstLayoutSpec":
+        return cls(
+            block_size=int(data["block_size"]),
+            block_bytes=int(data["block_bytes"]),
+            block_stride_bytes=int(data["block_stride_bytes"]),
+            token_stride_bytes=int(data["token_stride_bytes"]),
+            head_stride_bytes=int(data["head_stride_bytes"]),
+            live_head_bytes=int(data["live_head_bytes"]),
+            num_heads=int(data["num_heads"]),
+            layout_id=str(
+                data.get("layout_id", "pallas_batched_rpa_token_first_v1")),
+        )
+
 
 @dataclass(frozen=True)
 class KVCacheRegion:
     """One physical HBM cache tensor exposed by a connector worker."""
 
-    rank: int
     layer_name: str
     layer_type: LayerType
-    base_addr: int
     block_size: int | None
     block_bytes: int
     layout: TensorLayout
@@ -103,12 +155,26 @@ class KVCacheRegion:
     live_head_bytes: int | None = None
     block_stride_bytes: int | None = None
     block_id_index: int | None = None
+    block_id_group_index: int | None = None
     head_segments: tuple[HeadSegment, ...] = ()
+    physical_region_id: str | None = None
+    region_base_offset_bytes: int = 0
+    rank: int = 0
+    base_addr: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "head_segments", tuple(self.head_segments))
         check_non_negative("rank", self.rank)
         check_non_negative("base_addr", self.base_addr)
+        if self.physical_region_id is None:
+            object.__setattr__(self, "physical_region_id", self.layer_name)
+        else:
+            object.__setattr__(self, "physical_region_id",
+                               str(self.physical_region_id))
+        if not self.physical_region_id:
+            raise ValueError("physical_region_id must be non-empty")
+        check_non_negative("region_base_offset_bytes",
+                           self.region_base_offset_bytes)
         check_positive("block_bytes", self.block_bytes)
         check_positive("num_heads", self.num_heads)
         if self.block_size is not None:
@@ -127,6 +193,11 @@ class KVCacheRegion:
                     f"{self.block_stride_bytes} and {self.block_bytes}")
         if self.block_id_index is not None:
             check_non_negative("block_id_index", self.block_id_index)
+        if self.block_id_group_index is None:
+            object.__setattr__(
+                self, "block_id_group_index",
+                0 if self.block_id_index is None else self.block_id_index)
+        check_non_negative("block_id_group_index", self.block_id_group_index)
         inferred_head_bytes = self._init_token_first_layout()
         if inferred_head_bytes is None:
             if self.block_bytes % self.num_heads != 0:
@@ -254,3 +325,75 @@ class KVCacheRegion:
         if self.head_stride_bytes is not None:
             return self.head_stride_bytes
         return self.token_head_bytes
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "layer_name":
+            self.layer_name,
+            "layer_type":
+            self.layer_type.value,
+            "block_size":
+            self.block_size,
+            "block_bytes":
+            self.block_bytes,
+            "layout":
+            self.layout.value,
+            "num_heads":
+            self.num_heads,
+            "head_bytes":
+            self.head_bytes,
+            "token_first_layout": (None if self.token_first_layout is None else
+                                   self.token_first_layout.to_dict()),
+            "token_stride_bytes":
+            self.token_stride_bytes,
+            "head_stride_bytes":
+            self.head_stride_bytes,
+            "live_head_bytes":
+            self.live_head_bytes,
+            "block_stride_bytes":
+            self.block_stride_bytes,
+            "block_id_group_index":
+            self.block_id_group_index,
+            "head_segments":
+            [segment.to_dict() for segment in self.head_segments],
+            "physical_region_id":
+            self.physical_region_id,
+            "region_base_offset_bytes":
+            self.region_base_offset_bytes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "KVCacheRegion":
+        for obsolete_key in ("rank", "base_addr", "block_id_index"):
+            if obsolete_key in data:
+                raise ValueError("KVCacheRegion metadata contains obsolete "
+                                 f"field {obsolete_key}")
+        token_first_layout = data["token_first_layout"]
+        return cls(
+            layer_name=str(data["layer_name"]),
+            layer_type=LayerType(data["layer_type"]),
+            block_size=(None if data["block_size"] is None else int(
+                data["block_size"])),
+            block_bytes=int(data["block_bytes"]),
+            layout=TensorLayout(data["layout"]),
+            num_heads=int(data["num_heads"]),
+            head_bytes=(None if data["head_bytes"] is None else int(
+                data["head_bytes"])),
+            token_first_layout=(
+                None if token_first_layout is None else
+                TokenFirstLayoutSpec.from_mapping(token_first_layout)),
+            token_stride_bytes=(None if data["token_stride_bytes"] is None else
+                                int(data["token_stride_bytes"])),
+            head_stride_bytes=(None if data["head_stride_bytes"] is None else
+                               int(data["head_stride_bytes"])),
+            live_head_bytes=(None if data["live_head_bytes"] is None else int(
+                data["live_head_bytes"])),
+            block_stride_bytes=(None if data["block_stride_bytes"] is None else
+                                int(data["block_stride_bytes"])),
+            block_id_group_index=int(data["block_id_group_index"]),
+            head_segments=tuple(
+                HeadSegment.from_mapping(segment)
+                for segment in data["head_segments"]),
+            physical_region_id=str(data["physical_region_id"]),
+            region_base_offset_bytes=int(data["region_base_offset_bytes"]),
+        )

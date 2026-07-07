@@ -55,6 +55,38 @@ def reorder_concatenated_tensor_for_sharding(concatenated_tensor: jax.Array,
     return reordered_tensor.reshape(old_shape)
 
 
+def inverse_reorder_for_sharding(reordered_tensor: jax.Array,
+                                 split_sizes: list[int], n_shards: int,
+                                 dim: int):
+    """Inverse of reorder_concatenated_tensor_for_sharding."""
+    if dim < 0:
+        dim += reordered_tensor.ndim
+
+    old_shape = reordered_tensor.shape
+    shard_split_sizes = []
+    for split_size in split_sizes:
+        assert split_size % n_shards == 0
+        shard_split_sizes.append(split_size // n_shards)
+
+    shard_size = sum(shard_split_sizes)
+    new_shape = old_shape[:dim] + (n_shards, shard_size) + old_shape[dim + 1:]
+    reshaped = reordered_tensor.reshape(new_shape)
+
+    split_tensors = []
+    start_offset = 0
+    for shard_split_size in shard_split_sizes:
+        split_tensor = jax.lax.slice_in_dim(reshaped,
+                                            start_offset,
+                                            start_offset + shard_split_size,
+                                            axis=dim + 1)
+        split_shape = (old_shape[:dim] + (n_shards * shard_split_size, ) +
+                       old_shape[dim + 1:])
+        split_tensors.append(split_tensor.reshape(split_shape))
+        start_offset += shard_split_size
+
+    return jnp.concatenate(split_tensors, axis=dim)
+
+
 def slice_sharded_tensor_for_concatenation(sharded_tensor: jax.Array,
                                            split_sizes: list[int],
                                            n_shards: int):

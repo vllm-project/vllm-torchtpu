@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+import enum
+import importlib.util
+import logging
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,6 +19,120 @@ from vllm_torchtpu.distributed.kv_transfer.v2.pcp_policy import (
     PcpReshardingPolicy, PcpTokenTransfer)
 from vllm_torchtpu.distributed.kv_transfer.v2.planner import (
     ContiguousHeadTPTransferPlanner, TPTransferPlanner)
+
+
+def _load_v2_module(monkeypatch: Any, *, stub_zmq: bool = True):
+    root = Path(__file__).parents[2]
+    v2_dir = root / "src/vllm_torchtpu/distributed/kv_transfer/v2"
+
+    vllm = types.ModuleType("vllm")
+    vllm_config = types.ModuleType("vllm.config")
+    vllm_config.VllmConfig = type("VllmConfig", (), {})
+    vllm_logger = types.ModuleType("vllm.logger")
+    vllm_logger._VllmLogger = logging.Logger
+    vllm_logger.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.config", vllm_config)
+    monkeypatch.setitem(sys.modules, "vllm.logger", vllm_logger)
+
+    if stub_zmq or importlib.util.find_spec("zmq") is None:
+        zmq = types.ModuleType("zmq")
+
+        class FakeZmqContext:
+
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+            def destroy(self, linger=0):
+                self.linger = linger
+
+        zmq.Context = FakeZmqContext
+        monkeypatch.setitem(sys.modules, "zmq", zmq)
+
+    base_name = "vllm.distributed.kv_transfer.kv_connector.v1.base"
+    for name in [
+            "vllm.distributed",
+            "vllm.distributed.kv_transfer",
+            "vllm.distributed.kv_transfer.kv_connector",
+            "vllm.distributed.kv_transfer.kv_connector.v1",
+    ]:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    base = types.ModuleType(base_name)
+    base.KVConnectorRole = enum.Enum("KVConnectorRole", "SCHEDULER WORKER")
+    base.KVConnectorMetadata = type("KVConnectorMetadata", (), {})
+    base.SupportsHMA = type("SupportsHMA", (), {})
+
+    class KVConnectorBase_V1:
+
+        def __init__(self, vllm_config, role, kv_cache_config=None):
+            self._vllm_config = vllm_config
+            self._role = role
+            self._kv_cache_config = kv_cache_config
+            self._connector_metadata = None
+
+    base.KVConnectorBase_V1 = KVConnectorBase_V1
+    monkeypatch.setitem(sys.modules, base_name, base)
+
+    for name, package_path in [
+        ("vllm_torchtpu", root / "src/vllm_torchtpu"),
+        ("vllm_torchtpu.distributed", root / "src/vllm_torchtpu/distributed"),
+        ("vllm_torchtpu.distributed.kv_transfer",
+         root / "src/vllm_torchtpu/distributed/kv_transfer"),
+        ("vllm_torchtpu.distributed.kv_transfer.v2", v2_dir),
+    ]:
+        package = types.ModuleType(name)
+        package.__path__ = [str(package_path)]
+        monkeypatch.setitem(sys.modules, name, package)
+
+    tpu_envs = types.ModuleType("vllm_torchtpu.envs")
+    tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL = True
+    monkeypatch.setitem(sys.modules, "vllm_torchtpu.envs", tpu_envs)
+
+    def get_loopback_host() -> str:
+        return "127.0.0.1"
+
+    def get_kv_port() -> int:
+        return 9100
+
+    def get_no_coord_workers() -> int:
+        return 0
+
+    def get_default_pull_timeout() -> float:
+        return 120.0
+
+    def get_side_channel_port() -> str:
+        return "9600"
+
+    def get_node_id() -> int:
+        return 0
+
+    dist_utils = types.ModuleType("vllm_torchtpu.distributed.utils")
+    dist_utils.get_host_ip = get_loopback_host
+    dist_utils.get_kv_ips = get_loopback_host
+    dist_utils.get_kv_ports = get_kv_port
+    dist_utils.get_kv_transfer_port = get_kv_port
+    dist_utils.get_kv_coord_executor_max_workers = get_no_coord_workers
+    dist_utils.get_p2p_wait_pull_timeout = get_default_pull_timeout
+    dist_utils.get_side_channel_port = get_side_channel_port
+    dist_utils.get_node_id = get_node_id
+    monkeypatch.setitem(sys.modules, "vllm_torchtpu.distributed.utils",
+                        dist_utils)
+
+    for name in tuple(sys.modules):
+        if name.startswith("vllm_torchtpu.distributed.kv_transfer.v2."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    module_name = "vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        v2_dir / "tpu_connector.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return module
 
 
 def load_v2_module():
@@ -103,15 +223,17 @@ def manual_pull_meta(
 
     fa_head_mappings_by_rank = build_head_mappings(mod,
                                                    fa_mapping_rows_by_rank)
-    mamba_head_mappings_by_rank = build_head_mappings(
+    mamba_value_head_mappings_by_rank = build_head_mappings(
         mod, mamba_mapping_rows_by_rank)
     return mod.PullMeta(
         req_id=req_id,
         p_ranks=p_ranks,
         fa_heads_by_rank=heads_by_rank(fa_mapping_rows_by_rank),
-        mamba_heads_by_rank=heads_by_rank(mamba_mapping_rows_by_rank),
+        mamba_key_heads_by_rank=heads_by_rank(mamba_mapping_rows_by_rank),
+        mamba_value_heads_by_rank=heads_by_rank(mamba_mapping_rows_by_rank),
         fa_head_mappings_by_rank=fa_head_mappings_by_rank,
-        mamba_head_mappings_by_rank=mamba_head_mappings_by_rank,
+        mamba_key_head_mappings_by_rank=mamba_value_head_mappings_by_rank,
+        mamba_value_head_mappings_by_rank=mamba_value_head_mappings_by_rank,
         fa_source_block_ids=fa_source_block_ids,
         mamba_source_block_ids=mamba_source_block_ids,
         fa_block_refs_by_rank={
@@ -228,6 +350,7 @@ def build_block_size_case(
         block_size=destination_block_size,
         tp_rank=0,
         total_num_kv_heads=1,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
     destination = mod.LocalDecodeAllocation(
@@ -305,6 +428,7 @@ def build_fa_pcp_case(
         block_size=destination_block_size,
         tp_rank=destination_tp_rank,
         total_num_kv_heads=total_num_kv_heads,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
     return metadata, topology, destination

@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
+from vllm_torchtpu.layers.common import gdn_attention
 from vllm_torchtpu.layers.common.gdn_attention import (
     GdnAttentionConfig, RaggedGatedDeltaRuleImpl, run_jax_gdn_attention_local)
 
@@ -165,7 +168,8 @@ class GDNAttentionTest(parameterized.TestCase):
         run_jax_gdn_attention_local_jitted = jax.jit(
             run_jax_gdn_attention_local,
             static_argnames=[
-                "n_kq", "n_v", "d_k", "d_v", "kernel_size", "config"
+                "n_kq", "n_v", "d_k", "d_v", "kernel_size", "dp_enabled",
+                "config"
             ],
         )
 
@@ -188,6 +192,7 @@ class GDNAttentionTest(parameterized.TestCase):
             d_k=kq_head_dim,
             d_v=v_head_dim,
             kernel_size=kernel_size,
+            dp_enabled=False,
         )
 
         # Run ref
@@ -211,3 +216,85 @@ class GDNAttentionTest(parameterized.TestCase):
                                    new_states_chunked[1],
                                    rtol=2e-2,
                                    atol=2e-2)
+
+    def test_chunked_kernel_v3_pd_routes_to_fused_conv1d_gdn(self):
+        n_kq = 1
+        n_v = 1
+        d_k = 4
+        d_v = 4
+        kernel_size = 4
+        max_reqs = 1
+        num_tokens = 2
+        qkv_dim = 2 * n_kq * d_k + n_v * d_v
+
+        mixed_qkv = jnp.zeros((num_tokens, qkv_dim), dtype=jnp.float32)
+        b = jnp.zeros((num_tokens, n_v), dtype=jnp.float32)
+        a = jnp.zeros((num_tokens, n_v), dtype=jnp.float32)
+        conv_state = jnp.zeros((max_reqs + 1, kernel_size - 1, qkv_dim),
+                               dtype=jnp.float32)
+        recurrent_state = jnp.zeros((max_reqs + 1, n_v, d_k, d_v),
+                                    dtype=jnp.float32)
+        conv_weight = jnp.zeros((qkv_dim, 1, kernel_size), dtype=jnp.float32)
+        conv_bias = jnp.zeros((qkv_dim, ), dtype=jnp.float32)
+        A_log = jnp.zeros((n_v, ), dtype=jnp.float32)
+        dt_bias = jnp.zeros((n_v, ), dtype=jnp.float32)
+        query_start_loc = jnp.array([0, num_tokens])
+        state_indices = jnp.arange(1, max_reqs + 1)
+        distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+        seq_lens = jnp.asarray([num_tokens], dtype=jnp.int32)
+
+        expected_conv_state = jnp.ones_like(conv_state)
+        expected_recurrent_state = jnp.ones_like(recurrent_state)
+        expected_output = jnp.ones((num_tokens, n_v * d_v), dtype=jnp.float32)
+        config = GdnAttentionConfig(
+            ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.
+            CHUNKED_KERNEL_V3_PD)
+
+        with patch.object(
+                gdn_attention.gdn_v3_wrapper,
+                "fused_conv1d_gdn",
+                return_value=((expected_conv_state, expected_recurrent_state),
+                              expected_output),
+        ) as mock_fused, patch.object(
+                gdn_attention.causal_conv1d,
+                "ragged_causal_conv1d",
+                side_effect=AssertionError(
+                    "V3 config should use fused Conv1D+GDN."),
+        ) as mock_v2_conv:
+            new_states, output = run_jax_gdn_attention_local(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                conv_state=conv_state,
+                recurrent_state=recurrent_state,
+                conv_weight=conv_weight,
+                conv_bias=conv_bias,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                distribution=distribution,
+                seq_lens=seq_lens,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                dp_enabled=False,
+                config=config,
+            )
+
+        self.assertIs(new_states[0], expected_conv_state)
+        self.assertIs(new_states[1], expected_recurrent_state)
+        self.assertIs(output, expected_output)
+        mock_v2_conv.assert_not_called()
+        mock_fused.assert_called_once()
+        self.assertIs(mock_fused.call_args.args[0], mixed_qkv)
+        self.assertIs(mock_fused.call_args.args[3], conv_state)
+        self.assertIs(mock_fused.call_args.args[4], recurrent_state)
+        self.assertEqual(mock_fused.call_args.kwargs["n_kq"], n_kq)
+        self.assertEqual(mock_fused.call_args.kwargs["n_v"], n_v)
+        self.assertEqual(mock_fused.call_args.kwargs["d_k"], d_k)
+        self.assertEqual(mock_fused.call_args.kwargs["d_v"], d_v)
+        self.assertEqual(mock_fused.call_args.kwargs["kernel_size"],
+                         kernel_size)

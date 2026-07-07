@@ -67,22 +67,4 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states
-        gathered = dp.all_gather(hidden_states, dim=0)
-        hidden_shape = tuple(hidden_states.shape)
-        expected_tokens = dp.world_size * hidden_shape[0]
-        if gathered.shape[0] != expected_tokens:
-            raise RuntimeError(
-                "TPU DP combine expected all_gather to preserve equal per-rank "
-                f"token counts: got {gathered.shape[0]} tokens, expected "
-                f"{expected_tokens} ({dp.world_size} DP ranks * "
-                f"{hidden_shape[0]} local tokens).")
-        if hidden_shape[0] % dp.world_size != 0:
-            raise RuntimeError(
-                "TPU DP combine requires DP-gathered token count to be "
-                f"divisible by DP size: got {hidden_shape[0]} tokens across "
-                f"{dp.world_size} DP ranks.")
-        hidden_states = gathered.reshape((dp.world_size, ) +
-                                         hidden_shape).sum(dim=0)
-        per_rank = hidden_states.shape[0] // dp.world_size
-        start = dp.rank_in_group * per_rank
-        return hidden_states[start:start + per_rank]
+        return dp.reduce_scatter(hidden_states, dim=0)

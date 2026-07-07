@@ -40,14 +40,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
 from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
 
 logger = init_logger(__name__)
-
-# TODO(ranlihao): add more flexible topology map
-TPU_TOPOLOGY_MAP = {
-    16: "2,2,2,2",
-}
 
 
 class AsyncResultFuture(Future):
@@ -397,10 +393,10 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         all_args_to_update_environment_variables = []
         total_chips = len(worker_node_and_tpu_ids)
-        topology = TPU_TOPOLOGY_MAP.get(total_chips, None)
+        topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(total_chips, None)
         if topology is None:
             raise ValueError(
-                f'Cannot find topology for {total_chips} chips. The supported number of chips are {list(TPU_TOPOLOGY_MAP.keys())}'
+                f'Cannot find topology for {total_chips} chips. The supported number of chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}'
             )
         master_port = str(get_open_port())
         for i, (node_id, _) in enumerate(worker_node_and_tpu_ids):

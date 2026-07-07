@@ -17,6 +17,7 @@ from typing import Any, Callable
 import torch
 import torch._guards
 import torch.fx as fx
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
@@ -39,6 +40,13 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/common/attention_interface.py",
     "vllm_torchtpu/kernels/ragged_paged_attention/v3",
     "vllm_torchtpu/kernels/experimental/batched_rpa",
+    "vllm_torchtpu/layers/vllm/custom_ops/gdn_attention_op.py",
+    "vllm_torchtpu/layers/common/gdn_attention.py",
+    "vllm_torchtpu/layers/common/ragged_gated_delta_rule_wrapper.py",
+    "vllm_torchtpu/layers/common/ragged_gated_delta_rule_ref.py",
+    "vllm_torchtpu/kernels/gdn",
+    "vllm_torchtpu/kernels/causal_conv1d",
+    "vllm_torchtpu/kernels/experimental/pcp_streaming_rpa",
 )
 
 
@@ -195,12 +203,24 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `_tpu_backend` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `_tpu_backend` create its own.
-        with torch._guards.tracing(None):
+        # `_tpu_backend` calls detect_fake_mode(), which asserts a single
+        # FakeTensorMode. The Dynamo tracing context's mode differs from the
+        # example inputs' mode, so run under a context built from the example
+        # inputs' own fake mode (consistent for detect_fake_mode). We also ensure
+        # that mode has a ShapeEnv: with enable_serialization the bundled
+        # AOTAutogradCache key computation (FxGraphCache._check_can_cache)
+        # bypasses with "No shape env" when the tracing context has none, which
+        # is fatal for these static graphs. An (empty) ShapeEnv yields empty
+        # guards -- correct for static shapes -- and lets the artifact cache work.
+        from torch._subclasses.fake_tensor import FakeTensor
+        fake_mode = next(
+            (t.fake_mode for t in example_inputs if isinstance(t, FakeTensor)),
+            None)
+        if fake_mode is not None and fake_mode.shape_env is None:
+            fake_mode.shape_env = ShapeEnv()
+        tracing_ctx = (torch._guards.TracingContext(fake_mode)
+                       if fake_mode is not None else None)
+        with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
         if was_wrapped:

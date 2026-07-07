@@ -84,6 +84,90 @@ jobs:
     with:
       halt-for-connection: ${{ inputs.halt-for-connection }}
 
+  run_qwen35_p4d2_disagg_correctness:
+    needs: check_changes
+    if: github.repository == 'google-pytorch/torchtpu-vllm' && github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
+    name: "Run Qwen3.5 P4D2 Disagg Correctness"
+    runs-on: linux-x86-tpu7x-224-4tpu
+    timeout-minutes: 240
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
+      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      env:
+        HF_HOME: /local_hf_cache
+        SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
+
+    env:
+      FORCE_COLOR: "1"
+      UV_NO_CACHE: "1"
+      TQDM_MININTERVAL: "30"
+
+    steps:
+      - name: Redirect torch_tpu cache off /dev/shm
+        run: |
+          mkdir -p /tmp/torch_tpu_cache
+          ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
+
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Mark git directory as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Save installed packages list
+        run: |
+          mkdir -p /tmp/qwen35_p4d2_disagg_ci
+          uv pip list > /tmp/qwen35_p4d2_disagg_ci/pip_list_before_venv.txt
+
+      - name: Wait For Connection
+        uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
+        with:
+          halt-dispatch-input: ${{ inputs.halt-for-connection || 'no' }}
+
+      - name: Setup Virtual Environment
+        run: |
+          uv venv
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Keyring for Auth
+        run: |
+          uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
+          echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
+
+      - name: Install crc32c for gsutil
+        run: uv pip install crc32c
+
+      - name: Copy model to local cache
+        run: |
+          mkdir -p /local_hf_cache/hub
+          gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ /local_hf_cache/hub/
+
+      - name: Run Qwen3.5 P4D2 disagg correctness
+        env:
+          MODEL_PATH: Qwen/Qwen3.5-35B-A3B-FP8
+          MODEL_IMPL_TYPE: vllm
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          USE_CURRENT_PY_ENV: "1"
+          VLLM_SRC: ${{ github.workspace }}
+          TORCHTPU_VLLM_SRC: ${{ github.workspace }}
+          RUN_ROOT: /tmp/qwen35_p4d2_disagg_ci
+        run: |
+          uv pip install ".[test,benchmarking]"
+          bash scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
+
+      - name: Upload disagg logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen35-p4d2-disagg-correctness-logs
+          path: /tmp/qwen35_p4d2_disagg_ci/
+          retention-days: 14
+          if-no-files-found: warn
+
   # This check exists as a target for branch protection. The tests on TPU are
   # not always run, but if they *are* run we want to make sure they pass before
   # the PR is merged, and it turns out to be a little difficult to represent
@@ -98,7 +182,13 @@ jobs:
   # As a result, it's easier to just have this job with a static name that
   # always runs and have it check whether the other jobs we ran were successful.
   presubmit_tpu_gate:
-    needs: [check_changes, run_tests, run_perf_eval]
+    needs:
+      [
+        check_changes,
+        run_tests,
+        run_perf_eval,
+        run_qwen35_p4d2_disagg_correctness,
+      ]
     # always() = always run whether or not previous jobs succeeded
     # !cancelled() = only run if the job wasn't explicitly cancelled
     if: false && github.repository == 'vllm-project/vllm-torchtpu' && always() && !cancelled()
@@ -110,10 +200,12 @@ jobs:
           CHECK_CHANGES_RESULT="${{ needs.check_changes.result }}"
           RUN_TESTS_RESULT="${{ needs.run_tests.result }}"
           PERF_EVAL_RESULT="${{ needs.run_perf_eval.result }}"
+          QWEN35_P4D2_RESULT="${{ needs.run_qwen35_p4d2_disagg_correctness.result }}"
 
           echo "check_changes result: $CHECK_CHANGES_RESULT"
           echo "run_tests result: $RUN_TESTS_RESULT"
           echo "run_perf_eval result: $PERF_EVAL_RESULT"
+          echo "run_qwen35_p4d2_disagg_correctness result: $QWEN35_P4D2_RESULT"
 
           if [ "$CHECK_CHANGES_RESULT" = "failure" ]; then
             echo "check_changes failed"
@@ -137,6 +229,16 @@ jobs:
 
           if [ "$PERF_EVAL_RESULT" = "cancelled" ]; then
             echo "perf/eval was cancelled"
+            exit 1
+          fi
+
+          if [ "$QWEN35_P4D2_RESULT" = "failure" ]; then
+            echo "qwen35 p4d2 disagg correctness failed"
+            exit 1
+          fi
+
+          if [ "$QWEN35_P4D2_RESULT" = "cancelled" ]; then
+            echo "qwen35 p4d2 disagg correctness was cancelled"
             exit 1
           fi
 

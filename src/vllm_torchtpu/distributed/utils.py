@@ -158,18 +158,39 @@ def get_kv_shm_pool_gb() -> float:
     return float(gb_str)
 
 
+def _get_kv_transfer_namespace() -> str:
+    namespace = os.getenv("TPU_KV_TRANSFER_NAMESPACE", "").strip()
+    if not namespace:
+        return ""
+    safe_chars = []
+    for char in namespace:
+        if char.isalnum() or char in ("_", "-"):
+            safe_chars.append(char)
+        else:
+            safe_chars.append("_")
+    return "".join(safe_chars)
+
+
 def get_ipc_socket_path(node_id: int, dp_rank: int = 0) -> str:
     """Per-host intra-process IPC endpoint used between rank-0 coordinator
     and the other TP ranks."""
-    # One socket per host id; workers on the same host share it.
+    # One socket per host id and DP namespace; same-host P/D disaggregation
+    # may also set TPU_KV_TRANSFER_NAMESPACE for independent engines.
     prefix = os.getenv("TPU_IPC_SOCKET_DIR", "/tmp")
-    return f"ipc://{prefix}/tpu_conn_node{node_id}_{dp_rank}.sock"
+    namespace = _get_kv_transfer_namespace()
+    suffix = f"_{namespace}" if namespace else ""
+    return f"ipc://{prefix}/tpu_conn{suffix}_node{node_id}_{dp_rank}.sock"
 
 
 def get_shm_name(node_id: int, dp_rank: int = 0) -> str:
-    """Name for the per-host SharedMemory block. Scoped by host id so
-    a single host can run multiple disjoint nodes if ever needed."""
-    return f"tpu_conn_kv_node{node_id}_{dp_rank}"
+    """Name for the per-host SharedMemory block.
+
+    Scoped by host id, DP rank, and optional engine namespace so same-host
+    prefill/decode processes do not attach to each other's staging pool.
+    """
+    namespace = _get_kv_transfer_namespace()
+    suffix = f"_{namespace}" if namespace else ""
+    return f"tpu_conn_kv{suffix}_node{node_id}_{dp_rank}"
 
 
 def get_kv_warmup_enabled() -> bool:

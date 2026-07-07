@@ -41,6 +41,9 @@ class RaggedGatedDeltaRuleImpl(enum.Enum):
     # Full kernel path: fused Pallas recurrent-scan prefill kernel + fused Pallas
     # decode kernel.
     CHUNKED_KERNEL_PD = 'chunked_kernel_pd'
+    # V3 fuses Conv1D and GDN, so it is routed at the GDN attention layer rather
+    # than through this Conv1D-after wrapper.
+    CHUNKED_KERNEL_V3_PD = 'chunked_kernel_v3_pd'
 
     @property
     def prefill_impl(self) -> str:
@@ -49,6 +52,10 @@ class RaggedGatedDeltaRuleImpl(enum.Enum):
                 RaggedGatedDeltaRuleImpl.CHUNKED_JAX_PD,
         ):
             return 'jax'
+        elif self == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
+            raise ValueError(
+                'chunked_kernel_v3_pd is a fused Conv1D+GDN implementation '
+                'and must be routed by gdn_attention.')
         else:
             return 'recurrent_scan_v2'
 
@@ -59,6 +66,10 @@ class RaggedGatedDeltaRuleImpl(enum.Enum):
                 RaggedGatedDeltaRuleImpl.CHUNKED_JAX_PD,
         ):
             return 'jax'
+        elif self == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
+            raise ValueError(
+                'chunked_kernel_v3_pd is a fused Conv1D+GDN implementation '
+                'and must be routed by gdn_attention.')
         else:
             return 'fused'
 

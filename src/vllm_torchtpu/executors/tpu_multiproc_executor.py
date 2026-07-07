@@ -9,6 +9,8 @@ instead of all 14 shapes sharing a single window and timing out.
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+_NUM_BLOCKS_OVERRIDE_TOL = 4
+
 
 class TpuMultiprocExecutor(MultiprocExecutor):
 
@@ -25,10 +27,16 @@ class TpuMultiprocExecutor(MultiprocExecutor):
             # Compact-mamba sizing sets `num_gpu_blocks_override` on the worker's
             # cache_config during the RPC above; workers are separate processes, so
             # copy it to the engine-side config here.
-            overrides = self.collective_rpc("get_num_gpu_blocks_override")
-            assert len(set(overrides)) == 1
-            self.vllm_config.cache_config.num_gpu_blocks_override = (
-                overrides[0])
+            overrides = [
+                ovr
+                for ovr in self.collective_rpc("get_num_gpu_blocks_override")
+                if ovr is not None
+            ]
+            if overrides:
+                assert max(overrides) - min(
+                    overrides) <= _NUM_BLOCKS_OVERRIDE_TOL
+                self.vllm_config.cache_config.num_gpu_blocks_override = min(
+                    overrides)
 
         return specs
 

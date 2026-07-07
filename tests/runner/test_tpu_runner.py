@@ -124,6 +124,8 @@ class TestTPURunner:
         self.runner._mamba_num_blocks = None
         self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
                                              is not None)
+        self.runner._unified_block_pool = False
+        self.runner.kv_cache_raw_tensors = []
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
             self.runner)
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
@@ -893,6 +895,7 @@ class TestAttentionMetadataBuilder:
         runner.block_size = 16
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
+        runner._unified_block_pool = False
         runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
 
         block_tables = []
@@ -908,12 +911,13 @@ class TestAttentionMetadataBuilder:
         runner.input_batch.block_table = block_tables
         return runner
 
-    def _make_builder(self, runner, kv_cache_group_id=0):
-        spec = FullAttentionSpec(block_size=16,
-                                 num_kv_heads=2,
-                                 head_size=128,
-                                 dtype=torch.bfloat16,
-                                 page_size_padded=16384)
+    def _make_builder(self, runner, kv_cache_group_id=0, spec=None):
+        if spec is None:
+            spec = FullAttentionSpec(block_size=16,
+                                     num_kv_heads=2,
+                                     head_size=128,
+                                     dtype=torch.bfloat16,
+                                     page_size_padded=16384)
         return AttentionMetadataBuilder(
             kv_cache_spec=spec,
             layer_names=["attn.0"],
@@ -1028,6 +1032,32 @@ class TestAttentionMetadataBuilder:
 
         # cdiv(32, 16) = 2; flattened length = target_num_reqs * 2 = 8.
         assert meta.block_tables.shape == (4 * 2, )
+
+    def test_unified_mamba_state_indices_derive_from_block_table(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_block_pool = True
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(2, 8)],
+            dtypes=[torch.bfloat16],
+            page_size_padded=256,
+        )
+        builder = self._make_builder(runner, spec=mamba_spec)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 33, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert torch.equal(meta.mamba_state_indices,
+                           torch.tensor([0, 6, 8, 12], dtype=torch.int32))
 
 
 class TestCompactMambaSlotPool:

@@ -12,11 +12,17 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType)
 
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
+    PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
+    invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
+    pcp_streaming_jax_op)
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, ragged_paged_attention, ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import (is_floating_dtype,
                                                       quantize_kv)
+from vllm_torchtpu.layers.common.sequence_layout import \
+    is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
@@ -485,6 +491,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
         self.rpa_kernel = None
+        # Populated by initialize_kernel() before torch.compile traces the
+        # model. Forward can then reuse the custom op without resolving a PCP
+        # mesh from inside Dynamo's fullgraph capture.
+        self._kernel_config_cache: dict = {}
 
     @classmethod
     def _allocate_kernel_instance_id(cls) -> int:
@@ -498,43 +508,84 @@ class PallasAttentionBackendImpl(AttentionImpl):
         k_scale: float | None,
         v_scale: float | None,
         skip_kv_update: bool = False,
+        use_pcp_streaming: bool = False,
+        cp_kv_cache_interleave_size: int = 0,
     ):
+        ctx = get_vllm_model_wrapper_context()
+        vllm_config = getattr(ctx, "vllm_config", None)
+        max_model_len = (getattr(vllm_config.model_config, "max_model_len",
+                                 None) if use_pcp_streaming
+                         and vllm_config is not None else None)
+        config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
+                      k_scale, v_scale, use_pcp_streaming,
+                      cp_kv_cache_interleave_size, max_model_len)
+        existing = self._kernel_config_cache.get(config_key)
+        if existing is not None:
+            return existing
+
         # Reuse an existing custom op if one with the same config already exists.
         # `_kernel_op_prefix` is included so subclasses (e.g. the batched RPA
         # variant) don't collide with the base impl in the shared registry.
         # `skip_kv_update` is part of the key so KV-sharing (read-only) layers
         # get their own kernel variant and never share an op with KV-owning
         # layers of an otherwise-identical config.
-        ctx = get_vllm_model_wrapper_context()
-        mesh = ctx.mesh
-        registry_key = (self._kernel_op_prefix,
-                        self.sliding_window, self.scale, self.logits_soft_cap,
-                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update)
+        mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(
+            ctx.mesh, use_pcp_streaming)
+        registry_key = (self._kernel_op_prefix, self.sliding_window,
+                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
+                        k_scale, v_scale, skip_kv_update, use_pcp_streaming,
+                        cp_kv_cache_interleave_size, max_model_len)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
+            self._kernel_config_cache[config_key] = existing
             return existing
 
         kernel_instance_id = self._allocate_kernel_instance_id()
         op_name = f"{self._kernel_op_prefix}_{kernel_instance_id}"
 
-        # Prepare wrapper function with static arguments
-        wrapped_fn = functools.partial(
-            self._kernel_entry,
-            mesh=mesh,
-            sliding_window=self.sliding_window,
-            sm_scale=self.scale,
-            soft_cap=self.logits_soft_cap,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            skip_kv_update=skip_kv_update,
-        )
+        if use_pcp_streaming:
+            wrapped_fn = make_pcp_streaming_rpa_kernel(
+                mesh=mesh,
+                sliding_window=self.sliding_window,
+                sm_scale=self.scale,
+                soft_cap=self.logits_soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                skip_kv_update=skip_kv_update,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                max_model_len=max_model_len,
+            )
+        else:
+            # Prepare wrapper function with static arguments.
+            wrapped_fn = functools.partial(
+                self._kernel_entry,
+                mesh=mesh,
+                sliding_window=self.sliding_window,
+                sm_scale=self.scale,
+                soft_cap=self.logits_soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                skip_kv_update=skip_kv_update,
+            )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
         # This prevents torch.compile from tracing into the Pallas kernel internals.
-        rpa_kernel_op = pallas.jax_op(op_name,
-                                      wrapped_fn,
-                                      donate_argnums=(0, ))
+        if use_pcp_streaming:
+            rpa_kernel_op = pcp_streaming_jax_op(
+                op_name,
+                wrapped_fn,
+                donate_argnums=(0, ),
+                mesh=op_mesh,
+                input_partition_specs=input_partition_specs)
+        else:
+            rpa_kernel_op = pallas.jax_op(
+                op_name,
+                wrapped_fn,
+                donate_argnums=(0, ),
+                mesh=op_mesh,
+                input_partition_specs=(input_partition_specs))
 
         # We must overwrite the default fake implementation as vLLM uses dynamic
         # dimensions for the query.
@@ -545,12 +596,38 @@ class PallasAttentionBackendImpl(AttentionImpl):
         rpa_kernel_op.register_fake(_fake_rpa_op)
 
         def rpa_kernel_impl(kv_cache, *args, **kwargs):
-            new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
+            if use_pcp_streaming:
+                new_kv_cache, output = invoke_pcp_streaming_op(
+                    rpa_kernel_op, kv_cache, args, kwargs)
+            else:
+                new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
             kv_cache.copy_(new_kv_cache)
             return output
 
         self._kernel_registry[registry_key] = rpa_kernel_impl
+        self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
+
+    def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
+        unsupported_features = []
+        if self.sinks is not None:
+            unsupported_features.append("attention sinks")
+        if self.logits_soft_cap is not None:
+            unsupported_features.append("logits soft cap")
+        if skip_kv_update:
+            unsupported_features.append("skip_kv_update")
+        if unsupported_features:
+            raise NotImplementedError(
+                "PCP streaming attention does not support: "
+                f"{', '.join(unsupported_features)}.")
+
+    @staticmethod
+    def _select_kernel_mesh(default_mesh, use_pcp_streaming: bool):
+        if not use_pcp_streaming:
+            return default_mesh, None, None
+
+        pcp_mesh = get_pcp_streaming_mesh()
+        return pcp_mesh, pcp_mesh, PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
 
     def initialize_kernel(self, layer: AttentionLayer) -> None:
         """Pre-build the RPA kernel before torch.compile traces the model.
@@ -571,6 +648,25 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # writing. See `PallasAttentionBackendImpl.__init__` and the runner's
         # cache aliasing for how the shared cache tensor is set up.
         skip_kv_update = self.kv_sharing_target_layer_name is not None
+        ctx = get_vllm_model_wrapper_context()
+        vllm_config = getattr(ctx, "vllm_config", None)
+        parallel_config = (None if vllm_config is None else
+                           vllm_config.parallel_config)
+        pcp_configured = (parallel_config is not None and getattr(
+            parallel_config, "prefill_context_parallel_size", 1) > 1)
+        if pcp_configured:
+            self._validate_pcp_streaming_support(skip_kv_update)
+            self.rpa_kernel = self._build_rpa_kernel(
+                q_scale,
+                k_scale,
+                v_scale,
+                skip_kv_update=skip_kv_update,
+                use_pcp_streaming=True,
+                cp_kv_cache_interleave_size=getattr(
+                    parallel_config, "cp_kv_cache_interleave_size", 0),
+            )
+            return
+
         self.rpa_kernel = self._build_rpa_kernel(q_scale,
                                                  k_scale,
                                                  v_scale,
@@ -653,11 +749,32 @@ class PallasAttentionBackendImpl(AttentionImpl):
             key, value = quantize_kv(self.kv_cache_quantized_dtype, key, value,
                                      k_scale_value, v_scale_value)
 
-        assert self.rpa_kernel is not None, (
-            "rpa_kernel not initialized. Call initialize_kernel() before "
-            "the first forward pass.")
-
         sink = self.sinks
+        ctx = get_vllm_model_wrapper_context()
+        vllm_config = getattr(ctx, "vllm_config", None)
+        parallel_config = (None if vllm_config is None else
+                           vllm_config.parallel_config)
+        use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+        pcp_configured = (parallel_config is not None and getattr(
+            parallel_config, "prefill_context_parallel_size", 1) > 1)
+        if pcp_configured and not use_pcp_streaming:
+            raise RuntimeError(
+                "PCP is configured, but attention metadata does not use "
+                "the PCP streaming sequence layout.")
+        skip_kv_update = self.kv_sharing_target_layer_name is not None
+        if use_pcp_streaming:
+            self._validate_pcp_streaming_support(skip_kv_update)
+        cp_kv_cache_interleave_size = (getattr(
+            parallel_config, "cp_kv_cache_interleave_size", 0)
+                                       if use_pcp_streaming else 0)
+        rpa_kernel = self._build_rpa_kernel(
+            None,
+            layer._k_scale_float if self.kv_cache_quantized_dtype else None,
+            layer._v_scale_float if self.kv_cache_quantized_dtype else None,
+            skip_kv_update=skip_kv_update,
+            use_pcp_streaming=use_pcp_streaming,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        )
 
         # TODO (geyuhao) the support of this API is pending discussion.
         # This line will only influence performance, not functionality
@@ -665,7 +782,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # pallas.set_buffer_donor_(kv_cache, True)
 
         # Call the operator
-        outputs = self.rpa_kernel(
+        outputs = rpa_kernel(
             kv_cache,
             query,
             key,

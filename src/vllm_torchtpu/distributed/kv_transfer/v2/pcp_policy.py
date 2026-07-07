@@ -127,32 +127,38 @@ class PcpReshardingPolicy:
         token_transfers: list[PcpTokenTransfer] = []
         source_block_size = source_region.lowering_units_per_block
         destination_block_size = destination_region.lowering_units_per_block
+        source_token_offset = metadata.fa_token_offset
+        destination_token_offset = destination.fa_token_offset
+        source_window_start = source_token_offset
+        source_window_end = source_token_offset + source_num_tokens
         for block_ref in pull_meta.fa_block_refs_by_rank.get(p_rank, ()):
-            logical_token_start = (block_ref.logical_block_index *
-                                   source_block_size)
-            if logical_token_start >= source_num_tokens:
+            block_start = block_ref.logical_block_index * source_block_size
+            block_end = block_start + source_block_size
+            logical_token_start = max(block_start, source_window_start)
+            logical_token_end = min(block_end, source_window_end)
+            if logical_token_start >= logical_token_end:
                 continue
 
-            num_tokens = min(
-                source_block_size,
-                source_num_tokens - logical_token_start,
-            )
-            destination_block_index = (logical_token_start //
+            destination_logical_token = (
+                destination_token_offset +
+                (logical_token_start - source_token_offset))
+            destination_block_index = (destination_logical_token //
                                        destination_block_size)
             if destination_block_index >= len(destination.fa_block_ids):
                 raise ValueError(
                     "destination block ids do not cover num_tokens")
-            destination_token = logical_token_start % destination_block_size
+            destination_token = (destination_logical_token %
+                                 destination_block_size)
             destination_block = destination.fa_block_ids[
                 destination_block_index]
 
             token_transfers.append(
                 PcpTokenTransfer(
                     source_block=block_ref.block_id,
-                    source_token=0,
+                    source_token=logical_token_start - block_start,
                     destination_block=destination_block,
                     destination_token=destination_token,
-                    num_tokens=num_tokens,
+                    num_tokens=logical_token_end - logical_token_start,
                 ))
 
         return tuple(token_transfers)

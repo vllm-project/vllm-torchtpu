@@ -20,6 +20,10 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.platforms.tpu_block_size_utils import \
+    update_tpu_block_size_and_slot_config
+from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -39,6 +43,11 @@ else:
 
 logger = init_logger(__name__)
 
+# TODO(ranlihao): add more flexible topology map
+TPU_MULTIHOST_TOPOLOGY_MAP = {
+    16: "2,2,2,2",
+}
+
 # ---------------------------------------------------------------------------
 # Modules/attrs whose @torch.compile(dynamic=True) wrappers must be removed.
 # Each entry is (module_path, function_name).
@@ -52,6 +61,13 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
+
+
+def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
+    multimodal_config = model_config.multimodal_config
+    if multimodal_config is None:
+        return False
+    return bool(multimodal_config.language_model_only)
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -88,6 +104,76 @@ def _unwrap_dynamic_compile_fns() -> None:
                          module_path, fn_name)
 
 
+def _patch_scheduler_mamba_external_kv() -> None:
+    """Allow vLLM's mamba-align scheduler path to coexist with TPU PD loads.
+
+    vLLM 0.22.1 asserts when `num_external_computed_tokens > 0` reaches
+    `_mamba_block_aligned_split`, and then calls that split even for async KV
+    load scheduling where `num_new_tokens == 0`. TPU PD decode uses external
+    computed tokens for producer-restored KV, so mirror the local vLLM patch:
+    count those tokens in the split boundary and skip the split while
+    `load_kv_async` is scheduling the remote load.
+    """
+    import inspect
+    import textwrap
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler, "_tpu_mamba_external_kv_patch", False):
+        return
+
+    def _mamba_block_aligned_split(
+        self,
+        request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        num_computed_tokens = (request.num_computed_tokens +
+                               num_new_local_computed_tokens +
+                               num_external_computed_tokens)
+        if num_computed_tokens < max(request.num_prompt_tokens,
+                                     request.num_tokens - 1):
+            block_size = self.cache_config.block_size
+            last_cache_position = (request.num_tokens -
+                                   request.num_tokens % block_size)
+            if self.use_eagle:
+                last_cache_position = max(last_cache_position - block_size, 0)
+            num_computed_tokens_after_sched = (num_computed_tokens +
+                                               num_new_tokens)
+            if num_computed_tokens_after_sched < last_cache_position:
+                num_new_tokens = num_new_tokens // block_size * block_size
+            elif (num_computed_tokens < last_cache_position <
+                  num_computed_tokens_after_sched):
+                num_new_tokens = last_cache_position - num_computed_tokens
+        return num_new_tokens
+
+    schedule_source = inspect.getsource(Scheduler.schedule)
+    old_guard = "                if self.need_mamba_block_aligned_split:\n"
+    new_guard = ("                if self.need_mamba_block_aligned_split "
+                 "and not load_kv_async:\n")
+    if old_guard in schedule_source:
+        schedule_source = schedule_source.replace(old_guard, new_guard, 1)
+        patched_namespace = {}
+        exec(
+            compile(
+                textwrap.dedent(schedule_source),
+                inspect.getsourcefile(Scheduler.schedule)
+                or "<vllm_scheduler_patch>", "exec"),
+            Scheduler.schedule.__globals__,
+            patched_namespace,
+        )
+        Scheduler.schedule = patched_namespace["schedule"]
+    elif new_guard not in schedule_source:
+        raise RuntimeError(
+            "Unsupported vLLM Scheduler.schedule mamba split guard")
+
+    Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
+    Scheduler._tpu_mamba_external_kv_patch = True
+    logger.info(
+        "Applied TPU patch: allow mamba-align scheduler with external KV.")
+
+
 def apply_tpu_patches() -> None:
     """Apply all module-level patches required for TorchTPU.
 
@@ -98,17 +184,25 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_no_ep_tp_scope,
+                               _patch_rowparallel_defer_bias,
+                               _patch_vllm_disable_compile_ranges,
                                _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
     _register_custom_ops()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
+    _patch_vllm_disable_compile_ranges()
     _patch_disable_sequence_parallel_moe()
     _patch_moe_no_ep_tp_scope()
+    _patch_rowparallel_defer_bias()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    # Register the out-of-tree TPU vision-attention CustomOp by importing the
+    # module: its @CustomOp.register_oot makes vLLM instantiate our
+    # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
+    import vllm_torchtpu.layers.vllm.vision_attention  # noqa: F401
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
 
@@ -135,7 +229,8 @@ class TpuPlatform(Platform):
         "REQUANTIZE_BLOCK_SIZE", "REQUANTIZE_WEIGHT_DTYPE",
         "MOE_REQUANTIZE_BLOCK_SIZE", "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES", "TORCH_TPU_TOPOLOGY"
+        "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY"
     ]
 
     @classmethod
@@ -302,6 +397,16 @@ class TpuPlatform(Platform):
                 "Pathways is not supported by torchtpu-vllm. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         cls._initialize_sharding_config(vllm_config)
+        parallel_config = vllm_config.parallel_config
+        scheduler_config = vllm_config.scheduler_config
+        pcp_config = PcpStaticSupportValidator.validate_platform_config(
+            vllm_config,
+            multihost_backend=envs.TPU_MULTIHOST_BACKEND,
+        )
+        pcp_size = pcp_config.pcp_size
+        if pcp_config.enabled:
+            logger.info("Using vLLM native multiprocess PCP world; PCP is not "
+                        "represented as a JAX mesh axis.")
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
@@ -377,6 +482,8 @@ class TpuPlatform(Platform):
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
+        if envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:
+            update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
         min_page_size = backend_cls.get_min_page_size(vllm_config)
         if min_page_size > cache_config.block_size:
@@ -398,6 +505,10 @@ class TpuPlatform(Platform):
         if not multihost_backend:  # Single host
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
+                if pcp_size > 1:
+                    ensure_pcp_local_rank_remap(
+                        parallel_config.world_size_across_dp,
+                        get_topology=cls._get_tpu_topology)
                 # Single-host DP uses one torch_tpu slice across all DP*TP
                 # workers; the worker spawn shim exposes a DP-adjusted chip
                 # ordinal to TorchTPU for physical binding.
@@ -420,33 +531,54 @@ class TpuPlatform(Platform):
                     parallel_config.world_size_across_dp)
             else:
                 os.environ.pop("TORCH_TPU_DP_SIZE", None)
-                cls._prepare_singlehost_tpu_env(parallel_config.world_size)
-            if (parallel_config.data_parallel_size == 1
+                torch_tpu_world_size = parallel_config.world_size
+                if pcp_size > 1:
+                    logger.info(
+                        "Preparing TorchTPU bootstrap env for native PCP "
+                        "multiprocess world_size=%d.", torch_tpu_world_size)
+                    ensure_pcp_local_rank_remap(
+                        torch_tpu_world_size,
+                        get_topology=cls._get_tpu_topology)
+                cls._prepare_singlehost_tpu_env(torch_tpu_world_size)
+            if (pcp_size <= 1 and parallel_config.data_parallel_size == 1
                     and parallel_config.pipeline_parallel_size == 1
                     and parallel_config.tensor_parallel_size == 1):
                 logger.info("Force using UniProcExecutor for TPU on \
                         single host without tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "uni"
             else:
-                logger.info("Force using TpuMultiprocExecutor for TPU on \
-                        single host with tensor/pipeline parallelism.")
+                logger.info(
+                    "Force using TpuMultiprocExecutor for TPU on single host "
+                    "with tensor/pipeline/PCP parallelism.")
                 from vllm_torchtpu.executors.tpu_multiproc_executor import \
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            from vllm_torchtpu.executors.ray_distributed_executor import \
-                RayDistributedExecutor
-            parallel_config.distributed_executor_backend = RayDistributedExecutor
-            logger.info(
-                "Force using RayDistributedExecutor for TPU on multihost.")
+            # TODO(ranlihao): Use the vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND to determine which executor to use.
+            # use_ray_v2 = vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+            use_ray_v2 = False
+            if use_ray_v2:
+                from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
+                    RayDistributedExecutorV2
+                parallel_config.distributed_executor_backend = RayDistributedExecutorV2
+                logger.info(
+                    "Force using RayDistributedExecutorV2 for TPU on multihost."
+                )
+            else:
+                from vllm_torchtpu.executors.ray_distributed_executor import \
+                    RayDistributedExecutor
+                parallel_config.distributed_executor_backend = RayDistributedExecutor
+                logger.info(
+                    "Force using RayDistributedExecutor for TPU on multihost.")
         else:
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
                 "Using uniproc_executor.")
             parallel_config.distributed_executor_backend = "uni"
 
-        if scheduler_config.is_multimodal_model and not \
-            scheduler_config.disable_chunked_mm_input:
+        if (scheduler_config.is_multimodal_model
+                and not _is_language_model_only_config(model_config)
+                and not scheduler_config.disable_chunked_mm_input):
             logger.warning("TPU does not support running Multimodal models"\
             " without setting `--disable_chunked_mm_input`. " \
             "Forcing --disable_chunked_mm_input.")
@@ -456,6 +588,7 @@ class TpuPlatform(Platform):
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
+                "TPUConnectorV2",
                 "TPURaidenConnector",
                 "TPUConnectorHMA",
                 "OffloadingConnector",
@@ -466,6 +599,12 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
+            if (kv_transfer_config.kv_connector == "TPUConnectorV2"
+                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                raise ValueError("TPUConnectorV2 requires "
+                                 "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+            if kv_transfer_config.kv_connector == "TPUConnectorV2":
+                _patch_scheduler_mamba_external_kv()
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

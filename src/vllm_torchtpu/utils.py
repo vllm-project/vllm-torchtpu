@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 import time
 from functools import wraps
 from typing import Any, Callable, List, NamedTuple, Tuple, Union
@@ -40,6 +41,11 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
     else:
         assert tp_size % num_kv_heads == 0
         return tp_size
+
+
+def get_dp_size(parallel_config) -> int:
+    return int(os.environ.get("TORCH_TPU_DP_SIZE", "0")) or int(
+        getattr(parallel_config, "data_parallel_size", 1) or 1)
 
 
 def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:

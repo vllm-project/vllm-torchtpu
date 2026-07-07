@@ -21,6 +21,8 @@ class BlockSelection:
     source_blocks: tuple[int, ...]
     destination_blocks: tuple[int, ...]
     num_tokens: int
+    source_token_offset: int = 0
+    destination_token_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,7 +89,14 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
                 destination_tp_rank=topology.full_attn_tp_rank,
             )
             fa_block_refs = {}
-        mamba_mappings = self._map_heads_to_source_ranks(
+        mamba_key_mappings = self._map_heads_to_source_ranks(
+            total_heads=topology.total_num_mamba_key_heads,
+            source_pcp_size=metadata.kv_source_layout.linear_attn_pcp_size,
+            source_tp_size=metadata.kv_source_layout.linear_attn_tp_size,
+            destination_tp_size=topology.local_layout.linear_attn_tp_size,
+            destination_tp_rank=topology.linear_attn_tp_rank,
+        )
+        mamba_value_mappings = self._map_heads_to_source_ranks(
             total_heads=topology.total_num_mamba_heads,
             source_pcp_size=metadata.kv_source_layout.linear_attn_pcp_size,
             source_tp_size=metadata.kv_source_layout.linear_attn_tp_size,
@@ -95,24 +104,35 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             destination_tp_rank=topology.linear_attn_tp_rank,
         )
         fa_heads = self._global_heads_by_rank(fa_mappings)
-        mamba_heads = self._global_heads_by_rank(mamba_mappings)
-        p_ranks = tuple(sorted(set(fa_mappings) | set(mamba_mappings)))
+        mamba_key_heads = self._global_heads_by_rank(mamba_key_mappings)
+        mamba_value_heads = self._global_heads_by_rank(mamba_value_mappings)
+        p_ranks = tuple(
+            sorted(
+                set(fa_mappings) | set(mamba_key_mappings)
+                | set(mamba_value_mappings)))
 
         pull_meta = PullMeta(
             req_id=metadata.req_id,
             p_ranks=p_ranks,
             fa_heads_by_rank=fa_heads,
-            mamba_heads_by_rank=mamba_heads,
+            mamba_key_heads_by_rank=mamba_key_heads,
+            mamba_value_heads_by_rank=mamba_value_heads,
             fa_head_mappings_by_rank=fa_mappings,
-            mamba_head_mappings_by_rank=mamba_mappings,
+            mamba_key_head_mappings_by_rank=mamba_key_mappings,
+            mamba_value_head_mappings_by_rank=mamba_value_mappings,
             fa_source_block_ids=metadata.fa_block_ids,
             mamba_source_block_ids=metadata.mamba_block_ids,
             fa_block_refs_by_rank=fa_block_refs,
         )
         logger.info(
-            "TPUConnectorV2 pull meta built | req_id=%s | d_tp_rank=%s | "
+            "TPUConnectorV2 logical pull meta built | req_id=%s | "
+            "d_tp_rank=%s | "
             "p_ranks=%s | fa_blocks=%s | mamba_blocks=%s | "
-            "fa_heads_by_rank=%s | mamba_heads_by_rank=%s | "
+            "fa_heads_by_rank=%s | "
+            "mamba_state0_q_key_heads_by_rank=%s | "
+            "mamba_state0_k_key_heads_by_rank=%s | "
+            "mamba_state0_v_value_heads_by_rank=%s | "
+            "mamba_state1_value_heads_by_rank=%s | "
             "fa_block_refs_by_rank=%s",
             metadata.req_id,
             topology.tp_rank,
@@ -120,7 +140,10 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             self._block_ids_summary(pull_meta.fa_source_block_ids),
             self._block_ids_summary(pull_meta.mamba_source_block_ids),
             pull_meta.fa_heads_by_rank,
-            pull_meta.mamba_heads_by_rank,
+            pull_meta.mamba_key_heads_by_rank,
+            pull_meta.mamba_key_heads_by_rank,
+            pull_meta.mamba_value_heads_by_rank,
+            pull_meta.mamba_value_heads_by_rank,
             self._block_refs_summary(pull_meta.fa_block_refs_by_rank),
         )
         return pull_meta
@@ -143,12 +166,22 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             p_rank: self._lower_rank(metadata, destination, pull_meta, p_rank)
             for p_rank in pull_meta.p_ranks
         }
-        fa_ops_by_head, mamba_ops_by_head = self._ops_by_layer_type_and_head(
-            plans)
+        (
+            fa_ops_by_head,
+            mamba_state0_q_ops_by_key_head,
+            mamba_state0_k_ops_by_key_head,
+            mamba_state0_v_ops_by_value_head,
+            mamba_state1_ops_by_value_head,
+        ) = self._ops_by_layer_type_and_head(plans)
         logger.info(
-            "TPUConnectorV2 lowering summary | req_id=%s | d_rank=%s | "
+            "TPUConnectorV2 physical lowering summary | req_id=%s | "
+            "d_rank=%s | "
             "d_tp_rank=%s | p_ranks=%s | total_ops=%d | ops_by_p_rank=%s | "
-            "fa_ops_by_head=%s | mamba_ops_by_head=%s",
+            "fa_ops_by_head=%s | "
+            "mamba_state0_q_ops_by_key_head=%s | "
+            "mamba_state0_k_ops_by_key_head=%s | "
+            "mamba_state0_v_ops_by_value_head=%s | "
+            "mamba_state1_ops_by_value_head=%s",
             metadata.req_id,
             destination.rank,
             topology.tp_rank,
@@ -159,7 +192,10 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
                 for p_rank, plan in plans.items()
             },
             fa_ops_by_head,
-            mamba_ops_by_head,
+            mamba_state0_q_ops_by_key_head,
+            mamba_state0_k_ops_by_key_head,
+            mamba_state0_v_ops_by_value_head,
+            mamba_state1_ops_by_value_head,
         )
         return plans
 
@@ -325,9 +361,13 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
     @staticmethod
     def _ops_by_layer_type_and_head(
         plans: dict[int, RankTransferPlan],
-    ) -> tuple[dict[int, int], dict[int, int]]:
+    ) -> tuple[dict[int, int], dict[int, int], dict[int, int], dict[int, int],
+               dict[int, int]]:
         fa_ops_by_head: dict[int, int] = {}
-        mamba_ops_by_head: dict[int, int] = {}
+        mamba_state0_q_ops_by_key_head: dict[int, int] = {}
+        mamba_state0_k_ops_by_key_head: dict[int, int] = {}
+        mamba_state0_v_ops_by_value_head: dict[int, int] = {}
+        mamba_state1_ops_by_value_head: dict[int, int] = {}
         for plan in plans.values():
             for op in plan.ops:
                 if op.global_head is None:
@@ -336,10 +376,22 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
                     fa_ops_by_head[op.global_head] = (
                         fa_ops_by_head.get(op.global_head, 0) + 1)
                 elif is_linear_state_layer(op.layer_type):
-                    mamba_ops_by_head[op.global_head] = (
-                        mamba_ops_by_head.get(op.global_head, 0) + 1)
-        return dict(sorted(fa_ops_by_head.items())), dict(
-            sorted(mamba_ops_by_head.items()))
+                    if op.segment_name == "q":
+                        target = mamba_state0_q_ops_by_key_head
+                    elif op.segment_name == "k":
+                        target = mamba_state0_k_ops_by_key_head
+                    elif op.segment_name == "v":
+                        target = mamba_state0_v_ops_by_value_head
+                    else:
+                        target = mamba_state1_ops_by_value_head
+                    target[op.global_head] = target.get(op.global_head, 0) + 1
+        return (
+            dict(sorted(fa_ops_by_head.items())),
+            dict(sorted(mamba_state0_q_ops_by_key_head.items())),
+            dict(sorted(mamba_state0_k_ops_by_key_head.items())),
+            dict(sorted(mamba_state0_v_ops_by_value_head.items())),
+            dict(sorted(mamba_state1_ops_by_value_head.items())),
+        )
 
     @staticmethod
     def _range_intersection(left: range, right: range) -> range:
@@ -408,7 +460,7 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             )
             if source_region.head_segments:
                 head_mappings = self._head_mappings_from_segments(
-                    source_region.head_segments)
+                    source_region.head_segments, destination_region)
             if not head_mappings:
                 continue
 
@@ -419,6 +471,9 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
                     destination_block_size=destination_region.
                     lowering_units_per_block,
                     num_tokens=block_selection.num_tokens,
+                    source_token_offset=block_selection.source_token_offset,
+                    destination_token_offset=(
+                        block_selection.destination_token_offset),
             ):
                 source_block, source_token, dest_block, dest_token, count = (
                     token_range)
@@ -460,14 +515,17 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             destination_blocks = destination.mamba_block_ids
             source_num_tokens = metadata.mamba_num_tokens
             destination_num_tokens = destination.mamba_num_tokens
+            source_token_offset = 0
+            destination_token_offset = 0
 
-            if source_region.block_id_index is not None:
-                if destination_region.block_id_index != source_region.block_id_index:
+            if source_region.block_id_group_index is not None:
+                if (destination_region.block_id_group_index
+                        != source_region.block_id_group_index):
                     raise ValueError(
-                        "source and destination block_id_index must match, got "
-                        f"{source_region.block_id_index} and "
-                        f"{destination_region.block_id_index}")
-                block_id_index = source_region.block_id_index
+                        "source and destination block_id_group_index must "
+                        f"match, got {source_region.block_id_group_index} "
+                        f"and {destination_region.block_id_group_index}")
+                block_id_index = source_region.block_id_group_index
                 if block_id_index >= len(source_blocks):
                     raise ValueError(
                         f"source mamba_block_ids has no index {block_id_index}"
@@ -486,6 +544,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             destination_blocks = destination.fa_block_ids
             source_num_tokens = metadata.fa_num_tokens
             destination_num_tokens = destination.fa_num_tokens
+            source_token_offset = metadata.fa_token_offset
+            destination_token_offset = destination.fa_token_offset
 
         if source_num_tokens is None:
             source_num_tokens = (len(source_blocks) *
@@ -500,6 +560,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             source_blocks=source_blocks,
             destination_blocks=destination_blocks,
             num_tokens=source_num_tokens,
+            source_token_offset=source_token_offset,
+            destination_token_offset=destination_token_offset,
         )
 
     @staticmethod
@@ -509,15 +571,20 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
         p_rank: int,
     ) -> tuple[HeadMapping, ...]:
         if is_linear_state_layer(layer_type):
-            return pull_meta.mamba_head_mappings_by_rank.get(p_rank, ())
+            return pull_meta.mamba_value_head_mappings_by_rank.get(p_rank, ())
         return pull_meta.fa_head_mappings_by_rank.get(p_rank, ())
 
     @staticmethod
     def _head_mappings_from_segments(
-        segments: tuple[HeadSegment, ...], ) -> tuple[HeadMapping, ...]:
+        segments: tuple[HeadSegment, ...],
+        destination_region: KVCacheRegion,
+    ) -> tuple[HeadMapping, ...]:
         mappings: list[HeadMapping] = []
         for segment in segments:
             for head in segment.global_heads:
+                if (ContiguousHeadTPTransferPlanner._find_head_segment(
+                        destination_region, head, segment.name) is None):
+                    continue
                 mappings.append(
                     HeadMapping(
                         global_head=head,
@@ -534,24 +601,31 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
         destination_blocks: tuple[int, ...],
         destination_block_size: int,
         num_tokens: int,
+        source_token_offset: int = 0,
+        destination_token_offset: int = 0,
     ) -> tuple[tuple[int, int, int, int, int], ...]:
         check_positive("source_block_size", source_block_size)
         check_positive("destination_block_size", destination_block_size)
         check_non_negative("num_tokens", num_tokens)
+        check_non_negative("source_token_offset", source_token_offset)
+        check_non_negative("destination_token_offset",
+                           destination_token_offset)
 
         ranges: list[tuple[int, int, int, int, int]] = []
         cursor = 0
         while cursor < num_tokens:
-            source_index = cursor // source_block_size
-            destination_index = cursor // destination_block_size
+            source_cursor = source_token_offset + cursor
+            destination_cursor = destination_token_offset + cursor
+            source_index = source_cursor // source_block_size
+            destination_index = destination_cursor // destination_block_size
             if source_index >= len(source_blocks):
                 raise ValueError("source block ids do not cover num_tokens")
             if destination_index >= len(destination_blocks):
                 raise ValueError(
                     "destination block ids do not cover num_tokens")
 
-            source_token = cursor % source_block_size
-            destination_token = cursor % destination_block_size
+            source_token = source_cursor % source_block_size
+            destination_token = destination_cursor % destination_block_size
             count = min(
                 source_block_size - source_token,
                 destination_block_size - destination_token,
@@ -618,6 +692,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             ),
             layer_name=layer_name,
             layer_type=source_region.layer_type,
+            source_region_id=str(source_region.physical_region_id),
+            destination_region_id=str(destination_region.physical_region_id),
             source_base_addr=source_region.base_addr,
             destination_base_addr=destination_region.base_addr,
             global_head=head_mapping.global_head,

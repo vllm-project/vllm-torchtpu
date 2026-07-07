@@ -7,3 +7,4 @@ import os
 # compiling. This file is imported by Python before vLLM imports torch.
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
                       "false")
+os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")

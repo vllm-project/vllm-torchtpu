@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import logging
 
 from .tpu_connector_v2_test_utils import (head_mapping_rows, load_v2_module,
                                           qwen35_4tp_layer_layout)
@@ -55,6 +56,7 @@ def _build_qwen35_4tp_pull_meta(mod, destination_tp_size, destination_tp_rank):
         block_size=1056,
         tp_rank=destination_tp_rank,
         total_num_kv_heads=2,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
     return planner.build_pull_meta(metadata, topology)
@@ -109,7 +111,7 @@ def test_qwen35_35b_4tp_to_1tp_fa_pull_meta_uses_source_owners():
     }
 
 
-def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke():
+def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke(caplog):
     mod = load_v2_module()
     planner = mod.ContiguousHeadTPTransferPlanner()
     raw_layout = qwen35_4tp_layer_layout()
@@ -294,6 +296,7 @@ def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke():
         block_size=256,
         tp_rank=1,
         total_num_kv_heads=official_num_key_value_heads,
+        total_num_mamba_key_heads=official_linear_num_key_heads,
         total_num_mamba_heads=official_linear_num_value_heads,
     )
     destination = mod.LocalDecodeAllocation(
@@ -304,12 +307,17 @@ def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke():
         mamba_block_ids=(50, 51, 52),
     )
 
+    caplog.set_level(logging.INFO,
+                     logger="vllm_torchtpu.distributed.kv_transfer.v2.planner")
     pull_meta = planner.build_pull_meta(metadata, topology)
     assert pull_meta.p_ranks == (1, )
     assert pull_meta.fa_source_block_ids == (2, 3)
     assert pull_meta.mamba_source_block_ids == (5, 6, 7)
     assert pull_meta.fa_heads_by_rank == {1: (0, )}
-    assert pull_meta.mamba_heads_by_rank == {
+    assert pull_meta.mamba_key_heads_by_rank == {
+        1: tuple(range(4, 8)),
+    }
+    assert pull_meta.mamba_value_heads_by_rank == {
         1: tuple(range(8, 16)),
     }
     assert {
@@ -320,7 +328,8 @@ def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke():
     }
     assert {
         rank: head_mapping_rows(mappings)
-        for rank, mappings in pull_meta.mamba_head_mappings_by_rank.items()
+        for rank, mappings in
+        pull_meta.mamba_value_head_mappings_by_rank.items()
     } == {
         1: tuple((8 + i, i, i, None) for i in range(8)),
     }
@@ -451,3 +460,26 @@ def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke():
     assert len(third_conv) == state0_ops_per_layer
     assert third_conv[0].src_addr == source_raw_base + 7 * page_bytes
     assert third_conv[0].dst_addr == dest_raw_base + 52 * page_bytes
+
+    pull_log = next(
+        record.getMessage() for record in caplog.records
+        if "TPUConnectorV2 logical pull meta built" in record.getMessage())
+    assert "TPUConnectorV2 pull meta built" not in pull_log
+    assert ("mamba_state0_q_key_heads_by_rank={1: (4, 5, 6, 7)}" in pull_log)
+    assert ("mamba_state0_k_key_heads_by_rank={1: (4, 5, 6, 7)}" in pull_log)
+    assert ("mamba_state0_v_value_heads_by_rank={1: (8, 9, 10, 11, 12, "
+            "13, 14, 15)}" in pull_log)
+    assert ("mamba_state1_value_heads_by_rank={1: (8, 9, 10, 11, 12, "
+            "13, 14, 15)}" in pull_log)
+
+    lowering_log = next(
+        record.getMessage() for record in caplog.records
+        if "TPUConnectorV2 physical lowering summary" in record.getMessage())
+    assert "TPUConnectorV2 lowering summary" not in lowering_log
+    assert "mamba_ops_by_head" not in lowering_log
+    assert "mamba_state0_q_ops_by_key_head={4: 30, 5: 30, 6: 30, 7: 30}" in lowering_log
+    assert "mamba_state0_k_ops_by_key_head={4: 30, 5: 30, 6: 30, 7: 30}" in lowering_log
+    assert ("mamba_state0_v_ops_by_value_head={8: 30, 9: 30, 10: 30, "
+            "11: 30, 12: 30, 13: 30, 14: 30, 15: 30}" in lowering_log)
+    assert ("mamba_state1_ops_by_value_head={8: 30, 9: 30, 10: 30, "
+            "11: 30, 12: 30, 13: 30, 14: 30, 15: 30}" in lowering_log)

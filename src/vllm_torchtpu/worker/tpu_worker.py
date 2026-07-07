@@ -14,8 +14,11 @@ import torch
 import torch_tpu  # noqa: F401
 from torch_tpu._internal.profiler import profiler_api
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
+                                          get_kv_transfer_group,
+                                          has_kv_transfer_group)
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
+                                             get_tensor_model_parallel_rank,
                                              init_distributed_environment)
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -27,8 +30,23 @@ from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
+DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
+
+
+def _get_kv_connector_handshake_metadata_key() -> int:
+    return int(get_tensor_model_parallel_rank())
+
+
+def _debug_tpu_local_rank_offset() -> int:
+    value = os.environ.get(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "0") or "0"
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{DEBUG_TPU_LOCAL_RANK_OFFSET_ENV} must be an int, "
+                         f"got {value!r}") from exc
 
 
 class TPUWorker(WorkerBase):
@@ -124,14 +142,18 @@ class TPUWorker(WorkerBase):
         # already inherited from the parent process (set by
         # prepare_tpu_environment() in tpu_platform.py).
         pc = self.parallel_config
-        dp_size = int(os.environ.get("TORCH_TPU_DP_SIZE",
-                                     "0")) or pc.data_parallel_size
+        dp_size = utils.get_dp_size(pc)
+        pcp_size = getattr(pc, "prefill_context_parallel_size", 1)
+        if not isinstance(pcp_size, int):
+            pcp_size = 1
+        binding = get_tpu_worker_binding(pc,
+                                         self.rank,
+                                         self.local_rank,
+                                         env=os.environ,
+                                         use_spawned_pcp_local_rank=True)
         if dp_size > 1:
             per_engine_world = pc.world_size
-            dp_rank = getattr(pc, "data_parallel_index", None)
-            if dp_rank is None:
-                dp_rank = pc.data_parallel_rank
-            dp_rank = int(dp_rank or 0)
+            dp_rank = binding.dp_rank
 
             # TorchTPU uses independent per-engine tpu_dist worlds unless EP
             # needs a unified DP*TP world for expert collectives.
@@ -145,53 +167,106 @@ class TPUWorker(WorkerBase):
                 pc.data_parallel_rank = 0
                 pc.data_parallel_rank_local = 0
 
-            tpu_chip_rank = dp_rank * per_engine_world + self.local_rank
-            tpu_global_rank = dp_rank * per_engine_world + self.rank
-            global_world = per_engine_world * dp_size
             master_addr = os.environ.get("TORCH_TPU_DP_MASTER_ADDR",
                                          "localhost")
             master_port = os.environ["TORCH_TPU_DP_MASTER_PORT"]
-
-            os.environ["RANK"] = str(tpu_global_rank)
-            # Single-host TorchTPU indexes chips in the unified DP*TP slice.
-            os.environ["LOCAL_RANK"] = str(tpu_chip_rank)
-            os.environ["WORLD_SIZE"] = str(global_world)
-            os.environ["LOCAL_WORLD_SIZE"] = str(global_world)
+            os.environ.update(binding.as_env())
             os.environ["MASTER_ADDR"] = str(master_addr)
             os.environ["MASTER_PORT"] = str(master_port)
 
             if pc.enable_expert_parallel:
-                init_rank = self.rank
-                init_world = per_engine_world
+                init_rank = binding.init_rank
+                init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
             else:
-                init_rank = self.rank
-                init_world = per_engine_world
+                init_rank = binding.init_rank
+                init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
+            local_rank_for_init = binding.init_local_rank
+            dist_world_size = binding.world_size
             logger.info(
                 "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
                 "self.rank=%d self.local_rank=%d -> tpu_rank=%d "
                 "tpu_local_rank=%d global_world=%d "
-                "(vllm_init_rank=%d vllm_init_world=%d)", dp_size, dp_rank,
-                per_engine_world, self.rank, self.local_rank, tpu_global_rank,
-                tpu_chip_rank, global_world, init_rank, init_world)
-            local_rank_env = tpu_chip_rank
+                "init_local_rank=%d pcp_remap=%s source=%s "
+                "(vllm_init_rank=%d vllm_init_world=%d)",
+                dp_size,
+                dp_rank,
+                per_engine_world,
+                self.rank,
+                self.local_rank,
+                binding.rank,
+                binding.local_rank,
+                binding.world_size,
+                binding.init_local_rank,
+                binding.pcp_local_rank_remap,
+                binding.pcp_remap_source,
+                init_rank,
+                init_world,
+            )
         else:
-            global_world = pc.world_size
             dist_init_method = self.distributed_init_method
             parsed = urlparse(dist_init_method)
             if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
                 raise ValueError(
                     "Expected tcp://<host>:<port> distributed_init_method, "
                     f"got: {dist_init_method!r}")
-            local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
-            local_rank_env = self.local_rank
-            init_rank = self.rank
-            init_world = pc.world_size
-            os.environ["RANK"] = str(self.rank)
-            os.environ["LOCAL_RANK"] = str(self.local_rank)
-            os.environ["WORLD_SIZE"] = str(pc.world_size)
-            os.environ["LOCAL_WORLD_SIZE"] = str(local_world)
+            if pcp_size > 1:
+                logger.info(
+                    "PCP native-rank TPU binding | rank=%d "
+                    "native_local_rank=%d local_rank_env=%d "
+                    "tpu_local_rank_env=%d local_world=%s "
+                    "tpu_local_world=%d remap=%s source=%s",
+                    self.rank,
+                    self.local_rank,
+                    binding.init_local_rank,
+                    binding.local_rank,
+                    binding.world_size,
+                    binding.local_world_size,
+                    binding.pcp_local_rank_remap,
+                    binding.pcp_remap_source,
+                )
+                init_rank = binding.init_rank
+                init_world = binding.init_world_size
+                local_rank_for_init = binding.init_local_rank
+                dist_world_size = binding.world_size
+                os.environ.update(binding.as_env())
+            else:
+                local_world = os.environ.get(
+                    "LOCAL_WORLD_SIZE") or pc.world_size
+                local_rank_for_init = int(self.local_rank)
+                debug_local_rank_offset = _debug_tpu_local_rank_offset()
+                tpu_local_rank_env = (local_rank_for_init +
+                                      debug_local_rank_offset)
+                tpu_local_world = int(local_world)
+                if debug_local_rank_offset:
+                    tpu_local_world = max(
+                        tpu_local_world,
+                        debug_local_rank_offset + pc.world_size)
+                    logger.info(
+                        "DEBUG TPU local rank offset applied: rank=%d "
+                        "local_rank=%d %s=%d -> tpu_local_rank=%d "
+                        "tpu_local_world=%d", self.rank, self.local_rank,
+                        DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
+                        debug_local_rank_offset, tpu_local_rank_env,
+                        tpu_local_world)
+                init_rank = self.rank
+                init_world = pc.world_size
+                dist_world_size = pc.world_size
+                os.environ["RANK"] = str(self.rank)
+                os.environ["LOCAL_RANK"] = str(tpu_local_rank_env)
+                os.environ["WORLD_SIZE"] = str(pc.world_size)
+                os.environ["LOCAL_WORLD_SIZE"] = str(tpu_local_world)
+            if int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"):
+                logger.info(
+                    "TPU local-rank offset binding | rank=%d local_rank=%d "
+                    "offset=%d -> tpu_local_rank=%d tpu_local_world=%d",
+                    self.rank,
+                    self.local_rank,
+                    int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"),
+                    binding.local_rank,
+                    binding.local_world_size,
+                )
             os.environ.setdefault("MASTER_ADDR", parsed.hostname)
             os.environ.setdefault("MASTER_PORT", str(parsed.port))
 
@@ -200,13 +275,13 @@ class TPUWorker(WorkerBase):
 
         from vllm.platforms import current_platform
         dist_backend = current_platform.get_worker_distributed_backend(
-            global_world)
+            dist_world_size)
 
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
                 world_size=init_world,
                 rank=init_rank,
-                local_rank=local_rank_env,
+                local_rank=local_rank_for_init,
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
             )
@@ -216,6 +291,7 @@ class TPUWorker(WorkerBase):
                 tensor_parallel_size,
                 pipeline_model_parallel_size=self.parallel_config.
                 pipeline_parallel_size,
+                prefill_context_model_parallel_size=pcp_size,
             )
 
         # TODO: Enable PP support. The old JAX-based PP init
@@ -427,7 +503,11 @@ class TPUWorker(WorkerBase):
             reshard_fn=reshard_fn,
         )
 
-    # Ray executor doesn't need handshake metadata — kv_parameters go
-    # through the proxy server.
-    def get_kv_connector_handshake_metadata(self) -> None:
-        pass
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        metadata = connector.get_handshake_metadata()
+        if metadata is None:
+            return None
+        return {_get_kv_connector_handshake_metadata_key(): metadata}

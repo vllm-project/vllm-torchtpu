@@ -134,6 +134,7 @@ def test_full_attention_head_first_lowering():
         block_size=4,
         tp_rank=0,
         total_num_kv_heads=2,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
     destination = mod.LocalDecodeAllocation(
@@ -207,6 +208,7 @@ def test_full_attention_rejects_block_first_multi_head():
         block_size=4,
         tp_rank=0,
         total_num_kv_heads=2,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
     destination = mod.LocalDecodeAllocation(

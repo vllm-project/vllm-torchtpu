@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 import pytest
 
 from . import tpu_connector_v2_test_utils as utils
@@ -23,7 +25,8 @@ def test_full_attention_4pcp_to_2tp_builds_pull_meta():
         2: (1, ),
         3: (1, ),
     }
-    assert pull_meta.mamba_heads_by_rank == {}
+    assert pull_meta.mamba_key_heads_by_rank == {}
+    assert pull_meta.mamba_value_heads_by_rank == {}
     # Mapping tuple is:
     #   (global_head, source_head, destination_head, segment_name)
     # Global head 1 is source head 1 on each PCP rank, and becomes local head
@@ -100,6 +103,38 @@ def test_full_attention_4pcp_to_2tp_e2e_smoke():
             (13_000 + 101 * 40 + 10, 100_000 + 203 * 80 + 40, 10, 20, 20, 2,
              1),
         ],
+    }
+
+
+def test_full_attention_4pcp_to_2tp_offsets_external_token_window():
+    mod = utils.load_v2_module()
+    planner = mod.ContiguousHeadTPTransferPlanner()
+    metadata, topology, destination = utils.build_fa_pcp_case(mod)
+    metadata = replace(metadata, fa_num_tokens=6, fa_token_offset=6)
+    destination = replace(destination, fa_num_tokens=6, fa_token_offset=6)
+
+    pull_meta = planner.build_pull_meta(metadata, topology)
+    plans = planner.lower(metadata, topology, destination, pull_meta)
+
+    assert {
+        rank: [(
+            op.src_addr,
+            op.dst_addr,
+            op.segment_bytes,
+            op.src_stride_bytes,
+            op.dst_stride_bytes,
+            op.num_segments,
+            op.global_head,
+        ) for op in plan.ops]
+        for rank, plan in plans.items()
+    } == {
+        0: [(10_000 + 101 * 40 + 10, 100_000 + 202 * 80, 10, 20, 20, 2, 1)],
+        1:
+        [(11_000 + 101 * 40 + 10, 100_000 + 202 * 80 + 40, 10, 20, 20, 2, 1)],
+        # rank2 owns [4, 6) and [12, 14), both outside [6, 12).
+        2: [],
+        3:
+        [(13_000 + 100 * 40 + 10, 100_000 + 201 * 80 + 40, 10, 20, 20, 2, 1)],
     }
 
 
@@ -205,6 +240,7 @@ def test_rejects_invalid_fa_pcp_layout(
         block_size=topology.block_size,
         tp_rank=0,
         total_num_kv_heads=topology.total_num_kv_heads,
+        total_num_mamba_key_heads=topology.total_num_mamba_key_heads,
         total_num_mamba_heads=topology.total_num_mamba_heads,
     )
 

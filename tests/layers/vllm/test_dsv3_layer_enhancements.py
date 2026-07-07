@@ -4,9 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.vllm.moe_routing import select_experts
 from vllm_torchtpu.layers.vllm.quantization.fp8 import _dequantize_fp8_linear
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
+    set_vllm_model_wrapper_context
 
 
 def test_pallas_attention_init_kwargs():
@@ -27,8 +30,7 @@ def test_pallas_attention_init_kwargs():
     assert backend.head_size == 256
 
 
-@patch("vllm_torchtpu.layers.vllm.attention._pallas_rpa_kernel_default")
-def test_pallas_attention_forward_2d_reshape(mock_pallas_rpa):
+def test_pallas_attention_forward_2d_reshape():
     """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors to 3D and restores 2D output."""
     q_len = 10
     num_heads = 4
@@ -45,30 +47,42 @@ def test_pallas_attention_forward_2d_reshape(mock_pallas_rpa):
         kv_cache_quantized_dtype=None,
     )
 
-    # Directly mock rpa_kernel to return 3D tensor
-    backend.rpa_kernel = MagicMock(
-        return_value=torch.ones(q_len, num_heads, head_size))
-
     # 2D query/key/value tensors [q_len, num_heads * head_size]
     query = torch.ones(q_len, num_heads * head_size)
     key = torch.ones(q_len, num_heads * head_size)
     value = torch.ones(q_len, num_heads * head_size)
     kv_cache = torch.ones(1, 1, 1, 1, 1)
 
-    attn_metadata = MagicMock()
+    attn_metadata = AttentionMetadata(
+        input_positions=torch.arange(q_len, dtype=torch.int32),
+        block_tables=torch.zeros(1, dtype=torch.int32),
+        seq_lens=torch.tensor([q_len], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, q_len], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+    )
     layer_mock = MagicMock()
     layer_mock._k_scale_float = 1.0
     layer_mock._v_scale_float = 1.0
 
+    def fake_kernel(_kv_cache, query, *_args):
+        return torch.ones_like(query)
+
     # Execute forward pass
-    out = backend.forward(
-        query=query,
-        key=key,
-        value=value,
-        kv_cache=kv_cache,
-        attn_metadata=attn_metadata,
-        layer=layer_mock,
-    )
+    with patch.object(PallasAttentionBackendImpl,
+                      "_build_rpa_kernel",
+                      return_value=fake_kernel), patch(
+                          "vllm_torchtpu.layers.vllm.attention.sync."
+                          "synchronize",
+                          lambda *_args, **_kwargs: None,
+                      ), set_vllm_model_wrapper_context(mesh=MagicMock()):
+        out = backend.forward(
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            layer=layer_mock,
+        )
 
     # Verify output is restored to 2D [q_len, num_heads * head_size]
     assert out.dim() == 2

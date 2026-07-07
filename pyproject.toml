@@ -25,7 +25,8 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     "vllm==0.22.1",
-    "torch-tpu==0.1.1.dev20260605101937",
+    "torch==2.11.0",
+    "torch-tpu==0.1.1.dev20260630090312",
     # jaxlib 0.10.0 is required by the fused GDN prefill scan kernel
     # (recurrent_scan_v2 / chunked_kernel_pd): jaxlib 0.9.2's Mosaic rejects its
     # tiled-squeeze. Verified compatible with the pinned torch-tpu wheel.
@@ -94,7 +95,6 @@ keyring-provider = "subprocess"
 # We override the numba version to >=0.62.1 to allow resolution to succeed.
 override-dependencies = [
     "numba>=0.62.1",
-    "torch==2.10.0",
     # Restrict fastapi version due to https://github.com/vllm-project/vllm/pull/45629
     # TODO(shobhitbehl): Remove this pin after the fix is released in vLLM 0.23.0 or later.
     "fastapi<0.137",
@@ -106,3 +106,7 @@ name = "torch-tpu-registry"
 # torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
 # and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
 url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+explicit = true
+
+[tool.uv.sources]
+torch-tpu = { index = "torch-tpu-registry" }

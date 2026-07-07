@@ -3,10 +3,12 @@
 set -euo pipefail
 
 PORT="${PORT:-8000}"
+HOST=""
 CONFIG_NAME=""
 RESULTS_DIR=""
 RUN_LM_EVAL=0
 RUN_EVALPLUS=0
+START_SERVER=1
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -27,12 +29,26 @@ while [[ $# -gt 0 ]]; do
             RUN_EVALPLUS=1
             shift
             ;;
+        --host)
+            HOST="$2"
+            START_SERVER=0
+            shift 2
+            ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-evalplus] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
 done
+
+if [ -z "$HOST" ]; then
+    HOST="localhost"
+fi
 
 if [ -z "$CONFIG_NAME" ]; then
     echo "ERROR: --config is required"
@@ -42,7 +58,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Register cleanup trap
-trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT
+if [ "$START_SERVER" = "1" ]; then
+    trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT
+fi
 
 if [ -z "$RESULTS_DIR" ]; then
     RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
@@ -72,7 +90,7 @@ run_evalplus() {
         evalplus.evaluate "$dataset" \
             --model "$model" \
             --backend openai \
-            --base_url "http://localhost:$PORT/v1" \
+            --base_url "http://$HOST:$PORT/v1" \
             --root "$root" \
             --greedy \
             --n_samples 1 \
@@ -95,7 +113,7 @@ run_lm_eval() {
 
     local lm_eval_args=(
         --model local-chat-completions
-        --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/chat/completions,num_concurrent=128"
+        --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
         --tasks "$task"
         --apply_chat_template
         --limit 100
@@ -129,17 +147,27 @@ run_lm_eval() {
 # ========================================================
 # 1. Initial Cleanup
 # ========================================================
-echo "=== Initial Cleanup ==="
-bash "$SCRIPT_DIR/cleanup_server.sh"
+if [ "$START_SERVER" = "1" ]; then
+    echo "=== Initial Cleanup ==="
+    bash "$SCRIPT_DIR/cleanup_server.sh"
+fi
 
 # ========================================================
 # 2. Run Benchmarks (starts server and keeps it alive)
 # ========================================================
 echo "Running benchmarks for $CONFIG_NAME..."
-./scripts/vllm/benchmarking/run_benchmarks.sh \
-  --config "$CONFIG_NAME" \
-  --results-dir "$RESULTS_DIR" \
-  --keep-alive
+BENCH_ARGS=(
+  --config "$CONFIG_NAME"
+  --results-dir "$RESULTS_DIR"
+)
+if [ "$START_SERVER" = "1" ]; then
+  BENCH_ARGS+=(--keep-alive)
+else
+  BENCH_ARGS+=(--host "$HOST")
+fi
+BENCH_ARGS+=(--port "$PORT")
+
+./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
 
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")

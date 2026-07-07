@@ -1,29 +1,42 @@
 # Dockerfile for torchtpu-vllm.
-# This Dockerfile builds an image for running vLLM on Google Cloud TPUs.
-# By default it installs torch-tpu from an artifact image.
-# With USE_TORCH_TPU_REGISTRY set, it installs torch-tpu from the private registry,
-# using TORCH_TPU_VERSION or the torch-tpu pin in pyproject.toml.
+# This Dockerfile builds images for running vLLM on Google Cloud TPUs.
+# It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
-ARG ARTIFACT_SOURCE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu:nightly-latest"
 ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
 
-# Stage 1: The Siphon
-FROM $ARTIFACT_SOURCE AS artifact-source
-
-# Stage 2: The Runtime
+# Variant 1: The Runtime (Base Image with pre-installed dependencies)
+# This variant provides the core runtime environment with all external dependencies
+# (including torch-tpu) pre-installed.
 FROM $BASE_IMAGE AS base
-
-ARG USE_TORCH_TPU_REGISTRY=""
-ARG TORCH_TPU_VERSION=""
 
 # Install curl for health checks (minimal for base)
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-# Create the overrides file explicitly to pass to uv pip install
-RUN printf "numba>=0.62.1\ntorch==2.10.0\ntorchvision==0.25.0\nfastapi<0.137\n" > /tmp/overrides.txt
+WORKDIR /root/torchtpu-vllm
+
+# Copy pyproject.toml to extract dependencies and read settings
+COPY pyproject.toml .
+
+# Install all dependencies from pyproject.toml. We mount the gcloud token secret
+# to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gcloud_token \
+    set -eu; \
+    TOKEN=""; \
+    if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
+    if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
+    export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
+    export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
+    uv pip install --system \
+      --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
+      --extra-index-url https://pypi.org/simple \
+      --index-strategy unsafe-best-match \
+      -r pyproject.toml
 
 
-# Stage 2.5: The CI Environment (with tools)
+# Variant 2: The CI Environment (CI/CD Variant)
+# This variant builds on top of the runtime base, installing additional packages
+# and testing tools needed for CI/CD pipelines.
 FROM base AS ci
 
 # Install tools needed for CI (git, gcloud, lsof, fuser)
@@ -43,84 +56,42 @@ WORKDIR /root/torchtpu-vllm
 RUN git config --global --add safe.directory /root/torchtpu-vllm
 RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 
-RUN pip install uv
-
-# Copy pyproject.toml to install dependencies
-COPY pyproject.toml .
-
-# Hide torch-tpu to allow resolution of other dependencies.
-RUN cp pyproject.toml /tmp/pyproject.toml && sed -i '/torch-tpu==/d' pyproject.toml
-
 ARG VLLM_SOURCE
 # Copy vllm source (might be empty if not provided)
 COPY vllm /root/torchtpu-vllm/vllm
 
-# Install vllm from source if requested
+# Install vllm from source if requested.
+# If VLLM_SOURCE is provided, we build it in editable mode.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gcloud_token \
     if [ -n "$VLLM_SOURCE" ]; then \
-      TOKEN=""; \
-      if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
       sed -i 's/vllm==[^"]*/vllm/' pyproject.toml && \
       VLLM_TARGET_DEVICE="tpu" uv pip install --system \
-        --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
         -e /root/torchtpu-vllm/vllm ; \
     fi
 
-# Install dependencies directly from pyproject.toml
-# We use cache mount for uv to speed up downloads!
-# This layer will be cached!
-RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --override /tmp/overrides.txt --index-url https://pypi.org/simple -r pyproject.toml
 
-# Install torch-tpu either from a fresh artifact image or the pinned registry version.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gcloud_token \
-    --mount=from=artifact-source,source=/,target=/artifact-source,ro \
-    set -eu; \
-    if [ -z "${USE_TORCH_TPU_REGISTRY}" ]; then \
-        set -- /artifact-source/opt/wheels/*.whl; \
-        if [ ! -e "$1" ]; then echo "No torch-tpu wheels found in ARTIFACT_SOURCE" >&2; exit 1; fi; \
-        uv pip install --system --no-deps --no-config --index-url https://pypi.org/simple "$@"; \
-    else \
-        if [ -z "${TORCH_TPU_VERSION}" ]; then TORCH_TPU_VERSION="$(sed -nE 's/^[[:space:]]*"torch-tpu==([^"]+)".*/\1/p' /tmp/pyproject.toml | head -n1)"; fi; \
-        if [ -z "${TORCH_TPU_VERSION}" ]; then echo "Could not resolve torch-tpu version from pyproject.toml" >&2; exit 1; fi; \
-        TOKEN=""; \
-        if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
-        if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
-        uv pip install --system --no-deps --no-config \
-          --index-url https://pypi.org/simple \
-          --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
-          "torch-tpu==${TORCH_TPU_VERSION}"; \
-    fi
-
-
-# Stage 3: Developer Image (Editable)
+# Variant 3: Developer Image (Dev Variant with test/benchmark tools)
+# This variant contains all source code and is intended for active development.
+# It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --override /tmp/overrides.txt --index-url https://pypi.org/simple -e ".[test,benchmarking]"
-
+    uv pip install --system -e ".[test,benchmarking]"
 
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
 CMD ["/bin/bash"]
 
-# Stage 4: Production/Full Image (Regular Install)
+
+# Variant 4: Production/Full Image (Production/Minimal Variant)
+# This variant copies all source code and installs the package regularly
+# without extra dev/testing tools, starting directly from the runtime base.
 FROM base AS prod
 WORKDIR /root/torchtpu-vllm
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gcloud_token \
-    set -eu; \
-    TOKEN=""; \
-    if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --override /tmp/overrides.txt \
-      --index-url https://pypi.org/simple \
-      --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
-      .
+    uv pip install --system .
 
 RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
