@@ -4,6 +4,7 @@ import importlib.util
 import logging
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +20,35 @@ from vllm_torchtpu.distributed.kv_transfer.v2.pcp_policy import (
     PcpReshardingPolicy, PcpTokenTransfer)
 from vllm_torchtpu.distributed.kv_transfer.v2.planner import (
     ContiguousHeadTPTransferPlanner, TPTransferPlanner)
+
+
+class _RecordingLogHandler(logging.Handler):
+
+    def __init__(self):
+        super().__init__(logging.INFO)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+@contextmanager
+def _capture_logger_messages(logger):
+    handler = _RecordingLogHandler()
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield handler.messages
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
+def _assert_log_messages(messages, *fragments):
+    text = "\n".join(messages)
+    for fragment in fragments:
+        assert fragment in text
 
 
 def _load_v2_module(monkeypatch: Any, *, stub_zmq: bool = True):

@@ -59,7 +59,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Register cleanup trap
 if [ "$START_SERVER" = "1" ]; then
-    trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT
+    trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT TERM
 fi
 
 if [ -z "$RESULTS_DIR" ]; then

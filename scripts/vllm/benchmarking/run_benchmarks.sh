@@ -212,6 +212,11 @@ start_vllm_server() {
         return
     fi
 
+    if curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; then
+        echo "WARNING: Port $PORT is already occupied! Running cleanup_server.sh before launching new server..."
+        bash "$SCRIPT_DIR/cleanup_server.sh"
+    fi
+
     $server_cmd >> "$RESULTS_DIR/server.log" 2>&1 &
     SERVER_PID=$!
     echo "Server started (pid=$SERVER_PID)"
@@ -369,7 +374,7 @@ echo "================================================"
 export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
 
 if [ "$START_SERVER" = "1" ]; then
-    trap stop_vllm_server EXIT
+    trap stop_vllm_server EXIT INT TERM
     start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
 fi
 

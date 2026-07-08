@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-import logging
 
-from .tpu_connector_v2_test_utils import (head_mapping_rows, load_v2_module,
+from vllm_torchtpu.distributed.kv_transfer.v2.planner import \
+    logger as planner_logger
+
+from .tpu_connector_v2_test_utils import (_capture_logger_messages,
+                                          head_mapping_rows, load_v2_module,
                                           qwen35_4tp_layer_layout)
 
 
@@ -111,7 +114,7 @@ def test_qwen35_35b_4tp_to_1tp_fa_pull_meta_uses_source_owners():
     }
 
 
-def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke(caplog):
+def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke():
     mod = load_v2_module()
     planner = mod.ContiguousHeadTPTransferPlanner()
     raw_layout = qwen35_4tp_layer_layout()
@@ -307,33 +310,32 @@ def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke(caplog):
         mamba_block_ids=(50, 51, 52),
     )
 
-    caplog.set_level(logging.INFO,
-                     logger="vllm_torchtpu.distributed.kv_transfer.v2.planner")
-    pull_meta = planner.build_pull_meta(metadata, topology)
-    assert pull_meta.p_ranks == (1, )
-    assert pull_meta.fa_source_block_ids == (2, 3)
-    assert pull_meta.mamba_source_block_ids == (5, 6, 7)
-    assert pull_meta.fa_heads_by_rank == {1: (0, )}
-    assert pull_meta.mamba_key_heads_by_rank == {
-        1: tuple(range(4, 8)),
-    }
-    assert pull_meta.mamba_value_heads_by_rank == {
-        1: tuple(range(8, 16)),
-    }
-    assert {
-        rank: head_mapping_rows(mappings)
-        for rank, mappings in pull_meta.fa_head_mappings_by_rank.items()
-    } == {
-        1: ((0, 0, 0, None), )
-    }
-    assert {
-        rank: head_mapping_rows(mappings)
-        for rank, mappings in
-        pull_meta.mamba_value_head_mappings_by_rank.items()
-    } == {
-        1: tuple((8 + i, i, i, None) for i in range(8)),
-    }
-    plans = planner.lower(metadata, topology, destination, pull_meta)
+    with _capture_logger_messages(planner_logger) as messages:
+        pull_meta = planner.build_pull_meta(metadata, topology)
+        assert pull_meta.p_ranks == (1, )
+        assert pull_meta.fa_source_block_ids == (2, 3)
+        assert pull_meta.mamba_source_block_ids == (5, 6, 7)
+        assert pull_meta.fa_heads_by_rank == {1: (0, )}
+        assert pull_meta.mamba_key_heads_by_rank == {
+            1: tuple(range(4, 8)),
+        }
+        assert pull_meta.mamba_value_heads_by_rank == {
+            1: tuple(range(8, 16)),
+        }
+        assert {
+            rank: head_mapping_rows(mappings)
+            for rank, mappings in pull_meta.fa_head_mappings_by_rank.items()
+        } == {
+            1: ((0, 0, 0, None), )
+        }
+        assert {
+            rank: head_mapping_rows(mappings)
+            for rank, mappings in
+            pull_meta.mamba_value_head_mappings_by_rank.items()
+        } == {
+            1: tuple((8 + i, i, i, None) for i in range(8)),
+        }
+        plans = planner.lower(metadata, topology, destination, pull_meta)
 
     assert tuple(plans) == (1, )
     ops = plans[1].ops
@@ -461,9 +463,8 @@ def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke(caplog):
     assert third_conv[0].src_addr == source_raw_base + 7 * page_bytes
     assert third_conv[0].dst_addr == dest_raw_base + 52 * page_bytes
 
-    pull_log = next(
-        record.getMessage() for record in caplog.records
-        if "TPUConnectorV2 logical pull meta built" in record.getMessage())
+    pull_log = next(msg for msg in messages
+                    if "TPUConnectorV2 logical pull meta built" in msg)
     assert "TPUConnectorV2 pull meta built" not in pull_log
     assert ("mamba_state0_q_key_heads_by_rank={1: (4, 5, 6, 7)}" in pull_log)
     assert ("mamba_state0_k_key_heads_by_rank={1: (4, 5, 6, 7)}" in pull_log)
@@ -472,9 +473,8 @@ def test_qwen35_35b_4tp_tpu_blockpool_e2e_smoke(caplog):
     assert ("mamba_state1_value_heads_by_rank={1: (8, 9, 10, 11, 12, "
             "13, 14, 15)}" in pull_log)
 
-    lowering_log = next(
-        record.getMessage() for record in caplog.records
-        if "TPUConnectorV2 physical lowering summary" in record.getMessage())
+    lowering_log = next(msg for msg in messages
+                        if "TPUConnectorV2 physical lowering summary" in msg)
     assert "TPUConnectorV2 lowering summary" not in lowering_log
     assert "mamba_ops_by_head" not in lowering_log
     assert "mamba_state0_q_ops_by_key_head={4: 30, 5: 30, 6: 30, 7: 30}" in lowering_log

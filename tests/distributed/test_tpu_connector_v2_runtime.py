@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import logging
 import socket
 import sys
 import threading
 import types
-from contextlib import contextmanager
 
 import pytest
 
-from .tpu_connector_v2_test_utils import _load_v2_module
+from .tpu_connector_v2_test_utils import (_assert_log_messages,
+                                          _capture_logger_messages,
+                                          _load_v2_module)
 
 
 def test_v2_connector_requires_unified_block_pool(monkeypatch):
@@ -110,35 +110,6 @@ class _RecordingWriteSession:
 
     def discard(self):
         self.discards += 1
-
-
-class _RecordingLogHandler(logging.Handler):
-
-    def __init__(self):
-        super().__init__(logging.INFO)
-        self.messages = []
-
-    def emit(self, record):
-        self.messages.append(record.getMessage())
-
-
-@contextmanager
-def _capture_logger_messages(logger):
-    handler = _RecordingLogHandler()
-    old_level = logger.level
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    try:
-        yield handler.messages
-    finally:
-        logger.removeHandler(handler)
-        logger.setLevel(old_level)
-
-
-def _assert_log_messages(messages, *fragments):
-    text = "\n".join(messages)
-    for fragment in fragments:
-        assert fragment in text
 
 
 def test_v2_pull_start_extends_live_entry(monkeypatch):

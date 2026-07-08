@@ -53,8 +53,14 @@ fi
 # Disable exit on error temporarily to copy results back even if the test fails
 set +e
 
+CONTAINER_NAME="vllm-torchtpu-ci"
+echo "--- Cleaning up any existing container: ${CONTAINER_NAME}"
+docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true' EXIT INT TERM
+
 echo "--- Running command in Docker container"
-docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \
+docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16g --device /dev/fuse \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
   -e HF_HOME=/local_hf_cache \

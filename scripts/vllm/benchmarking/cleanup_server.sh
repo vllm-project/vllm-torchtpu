@@ -10,23 +10,24 @@ echo "Cleaning up vLLM server..."
 
 # 1. Try to kill processes gracefully
 pkill -TERM -f "vllm serve" 2>/dev/null || true
+pkill -TERM -f "vllm" 2>/dev/null || true
 sleep 2
 
-# 2. Force kill process occupying port 8000
+# 2. Force kill process occupying port 8000 and any remaining vllm processes
 echo "Checking for processes occupying port 8000..."
 if command -v lsof >/dev/null; then
   lsof -ti:8000 | xargs kill -9 2>/dev/null || true
-else
-  pkill -9 -f "vllm" 2>/dev/null || true
 fi
+pkill -9 -f "vllm serve" 2>/dev/null || true
+pkill -9 -f "vllm" 2>/dev/null || true
 
-# 3. Force kill processes occupying TPU devices (/dev/vfio/*)
+# 3. Force kill processes occupying TPU devices (/dev/vfio/* and /dev/accel*)
 # This targets the EngineCore processes in vLLM V1.
-echo "Checking for processes occupying TPU devices (/dev/vfio/*)..."
-if command -v lsof >/dev/null; then
-  lsof -t /dev/vfio/* | xargs kill -9 2>/dev/null || true
-elif command -v fuser >/dev/null; then
-  fuser -k -9 /dev/vfio/* 2>/dev/null || true
+echo "Checking for processes occupying TPU devices (/dev/vfio/* and /dev/accel*)..."
+if command -v fuser >/dev/null; then
+  fuser -k -9 /dev/vfio/* /dev/accel* 2>/dev/null || true
+elif command -v lsof >/dev/null; then
+  lsof -t /dev/vfio/* /dev/accel* | xargs kill -9 2>/dev/null || true
 else
   echo "lsof/fuser not found. Scanning /proc to find TPU users..."
   for pid_dir in /proc/[0-9]*; do
