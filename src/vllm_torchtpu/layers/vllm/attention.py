@@ -98,6 +98,7 @@ def _pallas_rpa_kernel_impl(
     soft_cap: float | None = None,
     shard: bool = True,
     kv_block_cap: int | None = None,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -125,6 +126,7 @@ def _pallas_rpa_kernel_impl(
         soft_cap=soft_cap,
         shard=shard,
         kv_block_cap=kv_block_cap,
+        use_causal_mask=use_causal_mask,
     )
     return new_kv_cache, outputs
 
@@ -148,6 +150,7 @@ def _pallas_rpa_kernel_default(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -173,6 +176,7 @@ def _pallas_rpa_kernel_default(
         rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
+        use_causal_mask=use_causal_mask,
     )
 
 
@@ -202,6 +206,7 @@ def _pallas_rpa_kernel_local(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -231,6 +236,7 @@ def _pallas_rpa_kernel_local(
         soft_cap=soft_cap,
         shard=False,
         kv_block_cap=_DRAFT_KV_BLOCK_CAP,
+        use_causal_mask=use_causal_mask,
     )
 
 
@@ -253,6 +259,7 @@ def _pallas_rpa_kernel_batched(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -274,6 +281,7 @@ def _pallas_rpa_kernel_batched(
         rpa_func=ragged_paged_attention_batched,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
+        use_causal_mask=use_causal_mask,
     )
 
 
@@ -469,6 +477,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self.sliding_window = sliding_window
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.use_causal_mask = kwargs.get("use_causal_mask", True)
 
         if alibi_slopes is not None:
             raise NotImplementedError("Alibi slopes is not supported.")
@@ -532,10 +541,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # layers of an otherwise-identical config.
         mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(
             ctx.mesh, use_pcp_streaming)
-        registry_key = (self._kernel_op_prefix, self.sliding_window,
-                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
-                        k_scale, v_scale, skip_kv_update, use_pcp_streaming,
-                        cp_kv_cache_interleave_size, max_model_len)
+        registry_key = (self._kernel_op_prefix,
+                        self.sliding_window, self.scale, self.logits_soft_cap,
+                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
+                        use_pcp_streaming, cp_kv_cache_interleave_size,
+                        max_model_len, self.use_causal_mask)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -570,6 +580,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
+                use_causal_mask=self.use_causal_mask,
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -842,6 +853,67 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if output is not None:
             output.copy_(outputs)
         return outputs
+
+    def do_kv_cache_update(
+        self,
+        kv_cache: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """
+        Scatter context K/V into the TPU KV cache layout.
+        key, value shape: [num_tokens, num_kv_heads, head_size]
+        slot_mapping shape: [num_tokens]
+        """
+        if slot_mapping.shape[0] == 0:
+            return
+
+        with torch.no_grad():
+            block_size = kv_cache.shape[1]
+            num_blocks = kv_cache.shape[0]
+            cache_head_size = kv_cache.shape[-1]
+            out_of_bounds_slot = num_blocks * block_size
+
+            # 1. Identify padding tokens
+            is_padding = (slot_mapping == out_of_bounds_slot)
+
+            # 2. Reroute padding to a safe, valid index (0) to avoid OOB crash
+            safe_slot_mapping = torch.where(is_padding, 0, slot_mapping)
+            block_indices = safe_slot_mapping // block_size
+            block_offsets = safe_slot_mapping % block_size
+
+            # 3. Handle specific Pallas layouts based on head size
+            use_hd64 = (self.head_size == 64)
+            if use_hd64:
+                # hd64: K and V are concatenated into a 128-dim head
+                kv_update = torch.cat([key, value],
+                                      dim=-1)  # [tokens, nkv, 128]
+                kv_view = kv_cache.view(num_blocks, block_size,
+                                        self.num_kv_heads, 1, cache_head_size)
+
+                # Zero out padding updates
+                valid_mask = (~is_padding).view(-1, 1, 1)
+                kv_update = torch.where(valid_mask, kv_update,
+                                        torch.zeros_like(kv_update))
+
+                # Scatter
+                kv_view[block_indices, block_offsets, :, 0, :128] = kv_update
+            else:
+                # standard v3: explicit K/V dimension
+                kv_update = torch.stack([key, value],
+                                        dim=2)  # [tokens, nkv, 2, head_size]
+                kv_view = kv_cache.view(num_blocks, block_size,
+                                        self.num_kv_heads, 2, cache_head_size)
+
+                # Zero out padding updates
+                valid_mask = (~is_padding).view(-1, 1, 1, 1)
+                kv_update = torch.where(valid_mask, kv_update,
+                                        torch.zeros_like(kv_update))
+
+                # Scatter
+                kv_view[block_indices,
+                        block_offsets, :, :, :self.head_size] = kv_update
 
 
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):

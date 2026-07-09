@@ -45,6 +45,7 @@ def ref_ragged_paged_attention_hd64(
     k_scale: float | None = None,
     v_scale: float | None = None,
     skip_kv_update: bool = False,
+    use_causal_mask: bool = True,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -144,7 +145,10 @@ def ref_ragged_paged_attention_hd64(
         q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
             jnp.int32, attn.shape, 1)
         kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
-        mask = q_span < kv_span
+        if use_causal_mask:
+            mask = q_span < kv_span
+        else:
+            mask = False
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
@@ -282,6 +286,7 @@ def _ragged_paged_attention_kernel(
     chunk_prefill_size: int | None = None,
     bkv_p,
     bq_sz,
+    use_causal_mask: bool = True,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -400,7 +405,10 @@ def _ragged_paged_attention_kernel(
                   lax.broadcasted_iota(jnp.int32, s.shape, 0) //
                   num_q_heads_per_kv_head)
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        mask = k_span <= q_span
+        if use_causal_mask:
+            mask = k_span <= q_span
+        else:
+            mask = True
 
         if sliding_window is not None and strict_sliding_window:
             mask = jnp.logical_and(mask, q_span - sliding_window < k_span)
@@ -1336,6 +1344,7 @@ def static_validate_inputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "debug_mode",
+        "use_causal_mask",
     ),
     donate_argnames=("kv_cache", ),
 )
@@ -1370,6 +1379,7 @@ def ragged_paged_attention_hd64(
     # Debug params.
     debug_mode: bool = False,
     skip_kv_update: bool = False,
+    use_causal_mask: bool = True,
 ):
     """A variant of ragged paged attention for head_dim=64.
 
@@ -1549,6 +1559,7 @@ def ragged_paged_attention_hd64(
                 chunk_prefill_size=chunk_prefill_size,
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
+                use_causal_mask=use_causal_mask,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
