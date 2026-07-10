@@ -54,40 +54,6 @@ fi
 # Ensure cache directory exists on the host
 mkdir -p "${PERSIST_DIR}/models/hub"
 
-# ==========================================
-# 1. Cache Setup (TorchTPU Compilations)
-# ==========================================
-GCS_CACHE_BASE="gs://ullm-ci-cache/torchtpu_cache"
-echo "[INFO] Probing TorchTPU version from docker image..."
-TORCH_TPU_VERSION=$(docker run --rm --net=host "${IMAGE_TAG}" python3 -c "import importlib.metadata; print(importlib.metadata.version('torch-tpu'))")
-if [ -z "${TORCH_TPU_VERSION}" ] || [ "${TORCH_TPU_VERSION}" = "unknown" ]; then
-  echo "[ERROR] Failed to detect TorchTPU version from docker image ${IMAGE_TAG}."
-  exit 1
-fi
-echo "[INFO] Detected TorchTPU Version: ${TORCH_TPU_VERSION}"
-
-# Centralized GCS cache path (avoiding duplicate 'tpu' prefix)
-CACHE_NAMESPACE="torchtpu${TORCH_TPU_VERSION}_${TPU_VERSION:-tpu6e}"
-FINAL_CACHE_PATH="${GCS_CACHE_BASE}/${CACHE_NAMESPACE}"
-
-LOCAL_TORCHTPU_CACHE_DIR="${PERSIST_DIR}/torchtpu_cache/${CACHE_NAMESPACE}"
-
-if ! mkdir -p "$LOCAL_TORCHTPU_CACHE_DIR"; then
-  echo "[ERROR] Failed to create $LOCAL_TORCHTPU_CACHE_DIR on persistent disk."
-  exit 1
-fi
-# Use Docker (running as root) to fix permissions without requiring sudo on the host
-docker run --rm -v "$LOCAL_TORCHTPU_CACHE_DIR":"$LOCAL_TORCHTPU_CACHE_DIR" "${IMAGE_TAG}" chmod -R 777 "$LOCAL_TORCHTPU_CACHE_DIR" 2>/dev/null || true
-echo "[INFO] Pulling TorchTPU Cache from GCS to local directory..."
-gcloud storage rsync \
-  --recursive \
-  --no-clobber \
-  --delete-unmatched-destination-objects \
-  --exclude=".*_.gstmp$" \
-  --no-user-output-enabled \
-  "$FINAL_CACHE_PATH" "$LOCAL_TORCHTPU_CACHE_DIR" || \
-  echo "[WARN] Failed to pull TorchTPU Cache from GCS. Proceeding with cold start."
-
 # Ensure results directory exists on the persistent disk (always mountable)
 rm -rf "${PERSIST_DIR}/perf_eval_results"
 mkdir -p "${PERSIST_DIR}/perf_eval_results"
@@ -110,11 +76,8 @@ echo "--- Running command in Docker container"
 docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16g --device /dev/fuse \
   -v "${PERSIST_DIR}/models:/local_hf_cache" \
   -v "${PERSIST_DIR}/perf_eval_results:/perf_eval_results" \
-  -v "$LOCAL_TORCHTPU_CACHE_DIR":"$LOCAL_TORCHTPU_CACHE_DIR" \
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
-  -e VLLM_CACHE_ROOT="$LOCAL_TORCHTPU_CACHE_DIR" \
-  -e VLLM_XLA_CACHE_PATH="$LOCAL_TORCHTPU_CACHE_DIR" \
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e FORCE_COLOR="1" \
@@ -155,21 +118,6 @@ cp -r "${PERSIST_DIR}/perf_eval_results/"* perf_eval_results/ 2>/dev/null || tru
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 
 echo "[INFO] Docker finished with exit code ${DOCKER_EXIT_CODE}."
-# Use Docker (running as root) to fix permissions without requiring sudo on the host
-docker run --rm -v "$LOCAL_TORCHTPU_CACHE_DIR":"$LOCAL_TORCHTPU_CACHE_DIR" "${IMAGE_TAG}" chmod -R 777 "$LOCAL_TORCHTPU_CACHE_DIR" 2>/dev/null || true
-
-if [ $DOCKER_EXIT_CODE -eq 0 ]; then
-  echo "[INFO] Syncing local TorchTPU Cache back to GCS..."
-  gcloud storage rsync \
-    --recursive \
-    --no-clobber \
-    --exclude=".*_.gstmp$" \
-    --no-user-output-enabled \
-    "$LOCAL_TORCHTPU_CACHE_DIR" "$FINAL_CACHE_PATH" || \
-    echo "[WARN] Failed to sync TorchTPU Cache back to GCS."
-else
-  echo "[WARN] Docker exited with non-zero code ${DOCKER_EXIT_CODE}. Skipping syncing local TorchTPU Cache back to GCS to avoid potential cache corruption."
-fi
 
 echo "--- Cleaning up pulled Docker image"
 docker rmi "${IMAGE_TAG}" || true

@@ -9,6 +9,7 @@ RESULTS_DIR=""
 RUN_LM_EVAL=0
 RUN_EVALPLUS=0
 START_SERVER=1
+SKIP_DB_UPLOAD_FLAG=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -38,6 +39,11 @@ while [[ $# -gt 0 ]]; do
             PORT="$2"
             shift 2
             ;;
+        --skip-db-upload)
+            SKIP_DB_UPLOAD_FLAG=1
+            shift
+            ;;
+
         *)
             echo "Unknown argument: $1"
             echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-evalplus] [--host HOST] [--port PORT]"
@@ -53,6 +59,12 @@ fi
 if [ -z "$CONFIG_NAME" ]; then
     echo "ERROR: --config is required"
     exit 1
+fi
+
+# If running in Buildkite CI, only upload to Spanner if on main branch and not a PR.
+if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
+    echo "Running on PR or non-main branch in Buildkite. Skipping Spanner upload."
+    SKIP_DB_UPLOAD_FLAG=1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -215,5 +227,17 @@ if [ "$RUN_EVALPLUS" = "1" ]; then
           --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || { echo "::error::EvalPlus regression check failed! See logs above for details."; fail=1; }
     fi
 fi
+
+# ========================================================
+# 6. Upload results to Spanner
+# ========================================================
+echo "=== Uploading results to Spanner ==="
+UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")
+if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "$SKIP_DB_UPLOAD_FLAG" = "1" ]; then
+    UPLOAD_ARGS+=("--skip-db-upload")
+fi
+
+
+python3 scripts/vllm/benchmarking/upload_results.py "${UPLOAD_ARGS[@]}" || echo "Warning: Spanner upload failed"
 
 exit "$fail"

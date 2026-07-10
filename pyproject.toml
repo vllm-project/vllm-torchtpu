@@ -27,18 +27,6 @@ dependencies = [
     "vllm==0.22.1",
     "torch==2.11.0",
     "torch-tpu==0.1.1.dev20260630090312",
-    # Required for N-gram speculative decoding
-    # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
-    # cpu.txt, ...) except tpu.txt, so it's missing
-    # when installing vllm as a plain PyPI dependency for our TPU platform.
-    "numba==0.65.0",
-    # Some multimodal-capable checkpoints (e.g. Gemma4) import torchvision at
-    # class-definition time in their HF processor module, so this is needed
-    # even for text-only serving. Pinned to match torch==2.11.0 exactly (see
-    # torchvision's own METADATA). NOTE: torch-tpu's custom torch build is
-    # incompatible with torchvision's compiled `nms` op specifically (see
-    # README troubleshooting tip) - plain import and non-nms ops are fine.
-    "torchvision==0.26.0",
     # jaxlib 0.10.0 is required by the fused GDN prefill scan kernel
     # (recurrent_scan_v2 / chunked_kernel_pd): jaxlib 0.9.2's Mosaic rejects its
     # tiled-squeeze. Verified compatible with the pinned torch-tpu wheel.
@@ -103,7 +91,10 @@ include = ["vllm_torchtpu*"]
 
 [tool.uv]
 keyring-provider = "subprocess"
+# vLLM 0.17.1 pins numba==0.61.2, which conflicts with our requirements.
+# We override the numba version to >=0.62.1 to allow resolution to succeed.
 override-dependencies = [
+    "numba>=0.62.1",
     # Restrict fastapi version due to https://github.com/vllm-project/vllm/pull/45629
     # TODO(shobhitbehl): Remove this pin after the fix is released in vLLM 0.23.0 or later.
     "fastapi<0.137",

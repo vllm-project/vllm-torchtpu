@@ -135,7 +135,7 @@ def _test_correctness_helper(
             cleanup_dist_env_and_memory()
 
 
-@pytest.mark.timeout(1200)
+@pytest.mark.timeout(1800)
 def test_ngram_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -232,7 +232,7 @@ def _test_performance_helper(
         assert acceptance_rate >= min_acceptance_rate, f"Expected at least {min_acceptance_rate:.2%} acceptance rate for {speculative_config['method']}, got {acceptance_rate:.2%}"
 
 
-@pytest.mark.timeout(500)
+@pytest.mark.timeout(1800)
 def test_ngram_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -315,7 +315,7 @@ def _force_multi_chunk_cap(self, cap: int = 2):
         runner.num_reqs_most_model_len = cap
 
 
-@pytest.mark.timeout(1200)
+@pytest.mark.timeout(1800)
 def test_sd_correctness_greedy_multi_chunk(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,

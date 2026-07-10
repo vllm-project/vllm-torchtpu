@@ -16,9 +16,6 @@
 import argparse
 import os
 
-# Disable TPU compilation cache to save disk space (important for CI runners).
-os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "disabled")
-
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
                       "false")
