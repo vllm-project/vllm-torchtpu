@@ -13,6 +13,7 @@
 # limitations under the License.
 """Shared pytest configuration for all tests."""
 
+import argparse
 import os
 
 # Disable TPU compilation cache to save disk space (important for CI runners).
@@ -44,9 +45,9 @@ def pytest_addoption(parser):
     """Add --use-tpu command line option."""
     parser.addoption(
         "--use-tpu",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run tests on TPU device instead of CPU",
+        help="Run tests on TPU device instead of CPU (use --no-use-tpu for CPU)",
     )
 
 

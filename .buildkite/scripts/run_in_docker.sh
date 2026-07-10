@@ -44,8 +44,15 @@ echo "--- Pulling Docker Image: ${IMAGE_TAG}"
 gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 docker pull "${IMAGE_TAG}"
 
+# Ensure persistent disk directory is writable, fallback to /tmp/persist on CPU agents
+PERSIST_DIR="/mnt/disks/persist"
+if ! mkdir -p "${PERSIST_DIR}" 2>/dev/null; then
+  echo "[WARN] ${PERSIST_DIR} not writable or available; falling back to /tmp/persist"
+  PERSIST_DIR="/tmp/persist"
+fi
+
 # Ensure cache directory exists on the host
-mkdir -p /mnt/disks/persist/models/hub
+mkdir -p "${PERSIST_DIR}/models/hub"
 
 # ==========================================
 # 1. Cache Setup (TorchTPU Compilations)
@@ -63,7 +70,7 @@ echo "[INFO] Detected TorchTPU Version: ${TORCH_TPU_VERSION}"
 CACHE_NAMESPACE="torchtpu${TORCH_TPU_VERSION}_${TPU_VERSION:-tpu6e}"
 FINAL_CACHE_PATH="${GCS_CACHE_BASE}/${CACHE_NAMESPACE}"
 
-LOCAL_TORCHTPU_CACHE_DIR="/mnt/disks/persist/torchtpu_cache/${CACHE_NAMESPACE}"
+LOCAL_TORCHTPU_CACHE_DIR="${PERSIST_DIR}/torchtpu_cache/${CACHE_NAMESPACE}"
 
 if ! mkdir -p "$LOCAL_TORCHTPU_CACHE_DIR"; then
   echo "[ERROR] Failed to create $LOCAL_TORCHTPU_CACHE_DIR on persistent disk."
@@ -82,9 +89,9 @@ gcloud storage rsync \
   echo "[WARN] Failed to pull TorchTPU Cache from GCS. Proceeding with cold start."
 
 # Ensure results directory exists on the persistent disk (always mountable)
-rm -rf /mnt/disks/persist/perf_eval_results
-mkdir -p /mnt/disks/persist/perf_eval_results
-chmod 777 /mnt/disks/persist/perf_eval_results 2>/dev/null || true
+rm -rf "${PERSIST_DIR}/perf_eval_results"
+mkdir -p "${PERSIST_DIR}/perf_eval_results"
+chmod 777 "${PERSIST_DIR}/perf_eval_results" 2>/dev/null || true
 
 # Ensure a clean results directory exists in the workspace
 rm -rf perf_eval_results
@@ -101,8 +108,8 @@ trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true' EXIT INT TERM
 
 echo "--- Running command in Docker container"
 docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16g --device /dev/fuse \
-  -v /mnt/disks/persist/models:/local_hf_cache \
-  -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
+  -v "${PERSIST_DIR}/models:/local_hf_cache" \
+  -v "${PERSIST_DIR}/perf_eval_results:/perf_eval_results" \
   -v "$LOCAL_TORCHTPU_CACHE_DIR":"$LOCAL_TORCHTPU_CACHE_DIR" \
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
@@ -143,7 +150,7 @@ DOCKER_EXIT_CODE=$?
 set -e
 
 echo "--- Copying test results back to workspace for artifact upload"
-cp -r /mnt/disks/persist/perf_eval_results/* perf_eval_results/ 2>/dev/null || true
+cp -r "${PERSIST_DIR}/perf_eval_results/"* perf_eval_results/ 2>/dev/null || true
 # Clean up any broken symlinks on the host to prevent buildkite-agent upload failures
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 

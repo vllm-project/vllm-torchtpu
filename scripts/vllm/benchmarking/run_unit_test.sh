@@ -3,6 +3,7 @@
 set -euo pipefail
 
 NIGHTLY=${1:-"false"} # Default is not nightly
+shift || true         # Remaining arguments are passed to pytest
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -21,8 +22,8 @@ TEST_DIR="$REPO_DIR/tests"
 cd "$(mktemp -d)"
 
 echo "Running pytest..."
-if [ "$NIGHTLY" = "yes" ]; then
-  pytest "$TEST_DIR" -sv --timeout=300
+if [ "$NIGHTLY" = "yes" ] || [ "$NIGHTLY" = "1" ]; then
+  pytest "$TEST_DIR" -sv --timeout=300 "$@"
 else
-  pytest "$TEST_DIR" -sv --timeout=300 -m "not nightly"
+  pytest "$TEST_DIR" -sv --timeout=300 -m "not nightly" "$@"
 fi
