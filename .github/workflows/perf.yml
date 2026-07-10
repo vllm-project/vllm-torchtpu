@@ -55,8 +55,8 @@ permissions:
 
 jobs:
   check_changes:
-    if: github.repository == 'google-pytorch/torchtpu-vllm' && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    if: false && github.repository == 'vllm-project/vllm-torchtpu' && github.event_name == 'pull_request'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       should_run: ${{ steps.filter.outputs.src }}
     steps:
@@ -84,7 +84,8 @@ jobs:
     name: "Perf and Eval (${{ matrix.config.name }})"
     needs: check_changes
     if: |
-      github.repository == 'google-pytorch/torchtpu-vllm' &&
+      false &&
+      github.repository == 'vllm-project/vllm-torchtpu' &&
       always() && (
         github.event_name == 'workflow_dispatch' ||
         github.event_name == 'schedule' ||

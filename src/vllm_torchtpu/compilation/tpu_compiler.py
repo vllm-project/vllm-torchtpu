@@ -8,7 +8,6 @@ pipeline. Each shape bucket gets its own compiled executable.
 
 import copy
 import hashlib
-import logging
 import os
 import pickle
 from pathlib import Path
@@ -23,8 +22,9 @@ from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # Type alias for the compile range tuple
 Range = tuple[int, int]

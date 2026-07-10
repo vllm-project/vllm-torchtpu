@@ -50,7 +50,7 @@ permissions:
 
 jobs:
   build:
-    if: github.repository == 'google-pytorch/torchtpu-vllm'
+    if: false && github.repository == 'vllm-project/vllm-torchtpu'
     defaults:
       run:
         shell: bash
@@ -117,7 +117,7 @@ jobs:
         python3 -m twine upload --repository-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry dist/*.tar.gz
 
   run-tests:
-    if: github.repository == 'google-pytorch/torchtpu-vllm'
+    if: false && github.repository == 'vllm-project/vllm-torchtpu'
     needs: build
     uses: ./.github/workflows/tests.yml
     name: "Run Tests"

@@ -15,3 +15,4 @@ RANDOM_RANGE_RATIO="0.8"
 # CUSTOM AttentionBackend. Same flag as the nightly short config. Unset to
 # ablate (defaults to FLASH_ATTN / default RPA v3).
 ATTENTION_BACKEND="CUSTOM"
+EVAL_TOLERANCE="0.02"

@@ -15,3 +15,4 @@ GPU_MEMORY_UTILIZATION=0.9
 # Extra arguments for vllm serve
 EXTRA_SERVE_ARGS="--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EVAL_TOLERANCE="0.02"

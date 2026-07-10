@@ -17,3 +17,4 @@ RANDOM_RANGE_RATIO="0.8"
 # runs use the same kernel the baselines were calibrated against. Unset to
 # ablate (defaults to FLASH_ATTN / default RPA v3).
 ATTENTION_BACKEND="CUSTOM"
+EVAL_TOLERANCE="0.02"

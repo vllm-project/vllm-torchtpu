@@ -1,6 +1,6 @@
 site_name: vLLM TPU
 site_url: !ENV READTHEDOCS_CANONICAL_URL
-repo_url: https://github.com/google-pytorch/torchtpu-vllm
+repo_url: https://github.com/vllm-project/vllm-torchtpu
 edit_uri: edit/main/docs/
 docs_dir: docs
 strict: true

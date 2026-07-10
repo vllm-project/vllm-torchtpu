@@ -106,6 +106,7 @@ CONCURRENCY_OPTIONS="1"
 RANDOM_RANGE_RATIO=""
 BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
+EVAL_TOLERANCE=""
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
@@ -116,6 +117,10 @@ if [ -z "$MODEL" ]; then
 fi
 if [ -z "$RANDOM_RANGE_RATIO" ]; then
     echo "ERROR: Config must set RANDOM_RANGE_RATIO"
+    exit 1
+fi
+if [ -z "$EVAL_TOLERANCE" ]; then
+    echo "ERROR: Config must set EVAL_TOLERANCE"
     exit 1
 fi
 if ! [[ "$BENCHMARK_WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
@@ -336,7 +341,8 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "capture_profile": $capture_profile_json,
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
-    "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS
+    "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "eval_tolerance": $EVAL_TOLERANCE
 }
 EOF
 
