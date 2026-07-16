@@ -458,8 +458,6 @@ class TpuPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         apply_tpu_patches()
-        _apply_model_specific_patches(
-            getattr(vllm_config, "model_config", None))
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
