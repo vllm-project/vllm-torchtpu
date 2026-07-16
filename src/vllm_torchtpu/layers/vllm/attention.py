@@ -854,66 +854,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             output.copy_(outputs)
         return outputs
 
-    def do_kv_cache_update(
-        self,
-        kv_cache: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """
-        Scatter context K/V into the TPU KV cache layout.
-        key, value shape: [num_tokens, num_kv_heads, head_size]
-        slot_mapping shape: [num_tokens]
-        """
-        if slot_mapping.shape[0] == 0:
-            return
 
-        with torch.no_grad():
-            block_size = kv_cache.shape[1]
-            num_blocks = kv_cache.shape[0]
-            cache_head_size = kv_cache.shape[-1]
-            out_of_bounds_slot = num_blocks * block_size
-
-            # 1. Identify padding tokens
-            is_padding = (slot_mapping == out_of_bounds_slot)
-
-            # 2. Reroute padding to a safe, valid index (0) to avoid OOB crash
-            safe_slot_mapping = torch.where(is_padding, 0, slot_mapping)
-            block_indices = safe_slot_mapping // block_size
-            block_offsets = safe_slot_mapping % block_size
-
-            # 3. Handle specific Pallas layouts based on head size
-            use_hd64 = (self.head_size == 64)
-            if use_hd64:
-                # hd64: K and V are concatenated into a 128-dim head
-                kv_update = torch.cat([key, value],
-                                      dim=-1)  # [tokens, nkv, 128]
-                kv_view = kv_cache.view(num_blocks, block_size,
-                                        self.num_kv_heads, 1, cache_head_size)
-
-                # Zero out padding updates
-                valid_mask = (~is_padding).view(-1, 1, 1)
-                kv_update = torch.where(valid_mask, kv_update,
-                                        torch.zeros_like(kv_update))
-
-                # Scatter
-                kv_view[block_indices, block_offsets, :, 0, :128] = kv_update
-            else:
-                # standard v3: explicit K/V dimension
-                kv_update = torch.stack([key, value],
-                                        dim=2)  # [tokens, nkv, 2, head_size]
-                kv_view = kv_cache.view(num_blocks, block_size,
-                                        self.num_kv_heads, 2, cache_head_size)
-
-                # Zero out padding updates
-                valid_mask = (~is_padding).view(-1, 1, 1, 1)
-                kv_update = torch.where(valid_mask, kv_update,
-                                        torch.zeros_like(kv_update))
-
-                # Scatter
-                kv_view[block_indices,
-                        block_offsets, :, :, :self.head_size] = kv_update
 
 
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
