@@ -4,6 +4,8 @@
 # you may not use this file except in compliance with the License.
 """Composite wrappers for PCP streaming RPA."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -13,8 +15,9 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import \
     wrapper as batched_rpa_wrapper
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import \
     get_dtype_packing
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import \
-    pcp_streaming_attention_page_groups_packed_local_from_metadata
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    pcp_streaming_attention_page_groups_packed_local_from_metadata)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import \
     _reshape_metadata_page_indices_jax
 
@@ -44,6 +47,7 @@ def _update_local_paged_kv_cache(
                 f"{packed_kv.shape[1:]} vs {kv_cache.shape[2:]}.")
         packed_kv = packed_kv.reshape(
             (packed_kv.shape[0], *kv_cache.shape[2:]))
+    packed_kv = packed_kv.astype(kv_cache.dtype)
     page_size = kv_cache.shape[1]
     valid = slot_ids >= 0
     page = jnp.where(valid, slot_ids // page_size, kv_cache.shape[0])
@@ -55,14 +59,9 @@ def _reshape_packed_kv_cache_for_attention(kv_cache: jax.Array) -> jax.Array:
     expected_packing = get_dtype_packing(kv_cache.dtype)
     if kv_cache.shape[3] == expected_packing:
         return kv_cache
-    packed_heads = kv_cache.shape[2] * kv_cache.shape[3]
-    if packed_heads % expected_packing != 0:
-        raise ValueError(
-            "KV cache layout cannot be reshaped to dtype packing: "
-            f"shape={kv_cache.shape}, expected_packing={expected_packing}.")
-    return kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1],
-                            packed_heads // expected_packing, expected_packing,
-                            kv_cache.shape[4])
+    raise ValueError("KV cache layout packing does not match dtype packing: "
+                     f"shape={kv_cache.shape}, "
+                     f"expected_packing={expected_packing}.")
 
 
 def _select_replicated_shard_for_pcp_rank(
@@ -290,6 +289,8 @@ def sharded_pcp_ragged_paged_attention(
     max_context_tokens: int | None = None,
     update_kv_cache: bool = True,
     cp_kv_cache_interleave_size: int = 0,
+    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    q_compute_size: int | None = None,
     return_local_shards: bool = False,
 ):
     """Runs streaming PCP RPA over local Q/K/V shards."""
@@ -375,6 +376,19 @@ def sharded_pcp_ragged_paged_attention(
         q_per_kv = q_local.shape[1] // k_local.shape[1]
         q_streaming = q_local.reshape(q_local.shape[0], k_local.shape[1],
                                       q_per_kv, q_local.shape[2])
+        q_packing = get_dtype_packing(q_local.dtype)
+        q_per_kv_padded = math.ceil(q_per_kv / q_packing) * q_packing
+        if q_per_kv_padded != q_per_kv:
+            q_streaming = jnp.pad(
+                q_streaming,
+                (
+                    (0, 0),
+                    (0, 0),
+                    (0, q_per_kv_padded - q_per_kv),
+                    (0, 0),
+                ),
+                constant_values=0,
+            )
         attention_kv_cache = _reshape_packed_kv_cache_for_attention(kv_cache)
         output = pcp_streaming_attention_page_groups_packed_local_from_metadata(
             q_streaming,
@@ -386,14 +400,16 @@ def sharded_pcp_ragged_paged_attention(
             pcp_size=pcp_size,
             interleave_size=cp_kv_cache_interleave_size,
             sm_scale=sm_scale,
-            collective_id=23,
             max_context_tokens=max_context_tokens,
+            q_block_size=q_block_size,
+            q_compute_size=q_compute_size,
             kv_pages_per_block=1,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=PCP_AXIS_NAME,
         )
+        output = output[:, :, :q_per_kv, :]
         output = output.reshape(q_local.shape)
         return output, kv_cache
 

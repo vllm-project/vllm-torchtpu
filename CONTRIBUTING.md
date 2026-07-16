@@ -12,10 +12,10 @@ We also believe in the power of community support; thus, answering queries, offe
 Finally, one of the most impactful ways to support us is by raising awareness about TorchTPU-vLLM. Talk about it in your blog posts and highlight how it's driving your projects. Express your support on social media if you're using TorchTPU-vLLM, or simply offer your appreciation by starring our repository.
 
 ## Getting Started
-We recommend filtering on the “Good First Issue” tag in the [Issues](https://github.com/google-pytorch/torchtpu-vllm/issues) section of GitHub if it's your first time contributing.
+We recommend filtering on the “Good First Issue” tag in the [Issues](https://github.com/vllm-project/vllm-torchtpu/issues) section of GitHub if it's your first time contributing.
 
 ## Issues
-If you encounter a bug or have a feature request, please search [existing issues](https://github.com/google-pytorch/torchtpu-vllm/issues) first to see if it has already been reported. If not, please [file a new issue](https://github.com/google-pytorch/torchtpu-vllm/issues/new/choose), providing as much relevant information as possible.
+If you encounter a bug or have a feature request, please search [existing issues](https://github.com/vllm-project/vllm-torchtpu/issues) first to see if it has already been reported. If not, please [file a new issue](https://github.com/vllm-project/vllm-torchtpu/issues/new/choose), providing as much relevant information as possible.
 
 ## Directory Structure
 We choose to follow a similar directory structure as vLLM:
@@ -29,7 +29,7 @@ We choose to follow a similar directory structure as vLLM:
   * `vllm` contains model implementations/functionalities that are only used by vLLM models
 
 ## Testing
-When checking in a new feature, we expect that you add relevant unit tests as well as CI tests. You can read more about the latter [here](https://github.com/google-pytorch/torchtpu-vllm/tree/main/.buildkite#adding-a-new-feature-to-ci).
+When checking in a new feature, we expect that you add relevant unit tests as well as CI tests. You can read more about the latter [here](https://github.com/vllm-project/vllm-torchtpu/tree/main/.buildkite#adding-a-new-feature-to-ci).
 
 ## Setting up linting, formatting, and static type checking
 

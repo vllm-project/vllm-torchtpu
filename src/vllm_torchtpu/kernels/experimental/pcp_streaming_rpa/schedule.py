@@ -388,13 +388,14 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     num_lanes: int = 1,
     kv_pages_per_block: int = 1,
 ):
-    """Build packed_schedule and active_page_groups with pure JAX ops.
+    """Build current/history packed schedules with pure JAX ops.
 
     Compiled-safe scheduler for PCP query metadata. It supports compact
     per-rank Q tiles with arbitrary live q_len/q_start values while the schedule
-    shape remains static from the compile bucket. Callers must keep the narrow
-    metadata path constraints: num_lanes=1, kv_pages_per_block=1, and
-    page_size==interleave_size.
+    shapes remain static from the compile bucket. The current schedule covers
+    KV pages that overlap the active query cycle; the history schedule covers
+    earlier KV pages. Callers must keep the narrow metadata path constraints:
+    num_lanes=1, kv_pages_per_block=1, and page_size==interleave_size.
     """
     import jax.numpy as jnp
 
@@ -616,6 +617,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
 
     tile_req_ids = []
     tile_kv_lens = []
+    tile_q_global_bases = []
     tile_q_global_starts = []
     tile_q_sizes = []
     tile_q_hbm_offsets = []
@@ -669,6 +671,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
                                pcp_size_i32 * pcp_size_i32)
             tile_req_ids.append(jnp.asarray(req_idx, dtype=jnp.int32))
             tile_kv_lens.append(kv_len)
+            tile_q_global_bases.append(q_global_base)
             tile_q_global_starts.append(jnp.stack(q_global_starts))
             tile_q_sizes.append(jnp.stack(q_sizes))
             tile_q_hbm_offsets.append(jnp.stack(q_hbm_offsets))
@@ -684,90 +687,128 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
 
     tile_req_ids = jnp.stack(tile_req_ids)
     tile_kv_lens = jnp.stack(tile_kv_lens)
+    tile_q_global_bases = jnp.stack(tile_q_global_bases)
     tile_q_global_starts = jnp.stack(tile_q_global_starts)
     tile_q_sizes = jnp.stack(tile_q_sizes)
     tile_q_hbm_offsets = jnp.stack(tile_q_hbm_offsets)
     tile_scheduled_steps = jnp.stack(tile_scheduled_steps)
     tile_effective_pages_by_rank = jnp.stack(tile_effective_pages_by_rank)
-    tile_start_steps = jnp.cumsum(tile_scheduled_steps) - tile_scheduled_steps
-    global_actual_steps = jnp.sum(tile_scheduled_steps, dtype=jnp.int32)
 
-    step_ids = jnp.arange(max_steps, dtype=jnp.int32)
-    in_tile = jnp.logical_and(
-        step_ids[None, :] >= tile_start_steps[:, None],
-        step_ids[None, :] < (tile_start_steps + tile_scheduled_steps)[:, None],
+    def _pack_schedule(tile_page_starts, tile_effective_pages_by_rank,
+                       tile_scheduled_steps):
+        tile_start_steps = jnp.cumsum(
+            tile_scheduled_steps) - tile_scheduled_steps
+        global_actual_steps = jnp.sum(tile_scheduled_steps, dtype=jnp.int32)
+
+        step_ids = jnp.arange(max_steps, dtype=jnp.int32)
+        in_tile = jnp.logical_and(
+            step_ids[None, :] >= tile_start_steps[:, None],
+            step_ids[None, :]
+            < (tile_start_steps + tile_scheduled_steps)[:, None],
+        )
+        step_has_tile = jnp.any(in_tile, axis=0)
+        step_tile_idx = jnp.argmax(in_tile.astype(jnp.int32), axis=0)
+
+        plan_start = tile_start_steps[step_tile_idx]
+        plan_req_id = tile_req_ids[step_tile_idx]
+        plan_kv_len = tile_kv_lens[step_tile_idx]
+        plan_q_global_start = tile_q_global_starts[step_tile_idx]
+        plan_q_size = tile_q_sizes[step_tile_idx]
+        plan_q_hbm_offset = tile_q_hbm_offsets[step_tile_idx]
+        plan_page_start = tile_page_starts[step_tile_idx]
+        plan_effective_by_rank = tile_effective_pages_by_rank[step_tile_idx]
+
+        step_offset = step_ids - plan_start
+        global_page = plan_page_start + step_offset
+        src_rank = jnp.mod(global_page, pcp_size_i32)
+        local_page_idx = global_page // pcp_size_i32
+        safe_local_page_idx = jnp.clip(local_page_idx, 0, pages_per_seq - 1)
+        page_idx = block_tables[plan_req_id, safe_local_page_idx]
+
+        step_has_tile_2d = step_has_tile[:, None]
+        valid_page = jnp.logical_and(
+            step_has_tile_2d,
+            global_page[:, None] < plan_effective_by_rank,
+        )
+        page_valid_len = jnp.minimum(page_size_i32,
+                                     plan_kv_len - global_page * page_size_i32)
+        kv_valid_len = jnp.where(valid_page,
+                                 jnp.maximum(page_valid_len[:, None], 0), 0)
+        is_first = jnp.logical_and(valid_page, step_offset[:, None] == 0)
+        is_last = jnp.logical_and(
+            valid_page,
+            global_page[:, None] == plan_effective_by_rank - 1,
+        )
+        q_global_start = plan_q_global_start
+        kv_global_start = jnp.broadcast_to(
+            global_page[:, None] * page_size_i32, (max_steps, pcp_size))
+        q_hbm_offset = plan_q_hbm_offset
+        q_tile_size = plan_q_size
+
+        req_id_field = jnp.where(valid_page, plan_req_id[:, None], -1)
+        kv_page_rank_field = jnp.where(
+            step_has_tile_2d,
+            jnp.broadcast_to(src_rank[:, None], (max_steps, pcp_size)),
+            -1,
+        )
+        kv_page_idx_field = jnp.where(
+            step_has_tile_2d,
+            jnp.where(valid_page, page_idx[:, None], 0),
+            -1,
+        )
+        zero_2d = jnp.zeros((max_steps, pcp_size), dtype=jnp.int32)
+        logical_fields = (
+            req_id_field,
+            kv_page_rank_field,
+            kv_page_idx_field,
+            is_first.astype(jnp.int32),
+            is_last.astype(jnp.int32),
+            is_first.astype(jnp.int32),
+            jnp.where(step_has_tile_2d, q_global_start, zero_2d),
+            jnp.where(step_has_tile_2d, kv_global_start, zero_2d),
+            kv_valid_len,
+            jnp.where(step_has_tile_2d, q_hbm_offset, zero_2d),
+            jnp.where(step_has_tile_2d, q_tile_size, zero_2d),
+            jnp.where(step_has_tile_2d, q_hbm_offset, zero_2d),
+        )
+        logical = jnp.stack(logical_fields, axis=-1)[:, :, None, :]
+        packed_shape = (max_steps, pcp_size, num_lanes,
+                        ScheduleField.PACKED_NUM_FIELDS)
+        packed = jnp.zeros(packed_shape, dtype=jnp.int32)
+        packed = packed.at[..., :ScheduleField.NUM_FIELDS].set(logical)
+        active_page_groups = jnp.asarray([global_actual_steps // pcp_size],
+                                         dtype=jnp.int32)
+        return packed, active_page_groups
+
+    history_cut_pages = ((tile_q_global_bases //
+                          (page_size_i32 * pcp_size_i32)) * pcp_size_i32)
+    history_effective_pages_by_rank = jnp.minimum(tile_effective_pages_by_rank,
+                                                  history_cut_pages[:, None])
+    history_max_effective_pages = jnp.max(history_effective_pages_by_rank,
+                                          axis=1)
+    history_scheduled_steps = (
+        (history_max_effective_pages + pcp_size_i32 - 1) // pcp_size_i32 *
+        pcp_size_i32)
+    current_remaining_pages_by_rank = jnp.maximum(
+        tile_effective_pages_by_rank - history_cut_pages[:, None], 0)
+    current_max_remaining_pages = jnp.max(current_remaining_pages_by_rank,
+                                          axis=1)
+    current_scheduled_steps = (
+        (current_max_remaining_pages + pcp_size_i32 - 1) // pcp_size_i32 *
+        pcp_size_i32)
+
+    current_schedule, current_active_page_groups = _pack_schedule(
+        history_cut_pages,
+        tile_effective_pages_by_rank,
+        current_scheduled_steps,
     )
-    step_has_tile = jnp.any(in_tile, axis=0)
-    step_tile_idx = jnp.argmax(in_tile.astype(jnp.int32), axis=0)
-
-    plan_start = tile_start_steps[step_tile_idx]
-    plan_req_id = tile_req_ids[step_tile_idx]
-    plan_kv_len = tile_kv_lens[step_tile_idx]
-    plan_q_global_start = tile_q_global_starts[step_tile_idx]
-    plan_q_size = tile_q_sizes[step_tile_idx]
-    plan_q_hbm_offset = tile_q_hbm_offsets[step_tile_idx]
-    plan_effective_by_rank = tile_effective_pages_by_rank[step_tile_idx]
-
-    step_offset = step_ids - plan_start
-    src_rank = jnp.mod(step_offset, pcp_size_i32)
-    global_page = step_offset
-    local_page_idx = global_page // pcp_size_i32
-    safe_local_page_idx = jnp.clip(local_page_idx, 0, pages_per_seq - 1)
-    page_idx = block_tables[plan_req_id, safe_local_page_idx]
-
-    step_has_tile_2d = step_has_tile[:, None]
-    valid_page = jnp.logical_and(step_has_tile_2d, global_page[:, None]
-                                 < plan_effective_by_rank)
-    page_valid_len = jnp.minimum(page_size_i32,
-                                 plan_kv_len - global_page * page_size_i32)
-    kv_valid_len = jnp.where(valid_page, jnp.maximum(page_valid_len[:, None],
-                                                     0), 0)
-    is_first = jnp.logical_and(valid_page, global_page[:, None] == 0)
-    is_last = jnp.logical_and(
-        valid_page,
-        global_page[:, None] == plan_effective_by_rank - 1,
+    history_schedule, history_active_page_groups = _pack_schedule(
+        jnp.zeros_like(history_cut_pages),
+        history_effective_pages_by_rank,
+        history_scheduled_steps,
     )
-    q_global_start = plan_q_global_start
-    kv_global_start = jnp.broadcast_to(global_page[:, None] * page_size_i32,
-                                       (max_steps, pcp_size))
-    q_hbm_offset = plan_q_hbm_offset
-    q_tile_size = plan_q_size
-
-    req_id_field = jnp.where(valid_page, plan_req_id[:, None], -1)
-    kv_page_rank_field = jnp.where(
-        step_has_tile_2d,
-        jnp.broadcast_to(src_rank[:, None], (max_steps, pcp_size)),
-        -1,
-    )
-    kv_page_idx_field = jnp.where(
-        step_has_tile_2d,
-        jnp.where(valid_page, page_idx[:, None], 0),
-        -1,
-    )
-    zero_2d = jnp.zeros((max_steps, pcp_size), dtype=jnp.int32)
-    logical_fields = (
-        req_id_field,
-        kv_page_rank_field,
-        kv_page_idx_field,
-        is_first.astype(jnp.int32),
-        is_last.astype(jnp.int32),
-        is_first.astype(jnp.int32),
-        jnp.where(step_has_tile_2d, q_global_start, zero_2d),
-        jnp.where(step_has_tile_2d, kv_global_start, zero_2d),
-        kv_valid_len,
-        jnp.where(step_has_tile_2d, q_hbm_offset, zero_2d),
-        jnp.where(step_has_tile_2d, q_tile_size, zero_2d),
-        jnp.where(step_has_tile_2d, q_hbm_offset, zero_2d),
-    )
-    logical = jnp.stack(logical_fields, axis=-1)[:, :, None, :]
-    packed_shape = (max_steps, pcp_size, num_lanes,
-                    ScheduleField.PACKED_NUM_FIELDS)
-    packed = jnp.zeros(packed_shape, dtype=jnp.int32)
-    packed = packed.at[..., :ScheduleField.NUM_FIELDS].set(logical)
-
-    active_page_groups = jnp.asarray([global_actual_steps // pcp_size],
-                                     dtype=jnp.int32)
-    return packed, active_page_groups
+    return (current_schedule, current_active_page_groups, history_schedule,
+            history_active_page_groups)
 
 
 def _validate_inputs(

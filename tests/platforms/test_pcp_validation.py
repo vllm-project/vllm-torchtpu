@@ -56,8 +56,6 @@ def test_from_vllm_config_records_kv_role():
 @pytest.mark.parametrize(
     ("config", "multihost_backend", "error_type", "message"),
     [
-        (_vllm_config(async_scheduling=True), "", ValueError,
-         "async scheduling"),
         (_vllm_config(is_kv_producer=False), "", NotImplementedError,
          "KV consumer"),
         (_vllm_config(dcp_size=2), "", NotImplementedError, "DCP"),
@@ -85,3 +83,13 @@ def test_static_validator_accepts_supported_pcp_platform_config():
 
     assert config.enabled
     assert config.pcp_size == 4
+
+
+def test_static_validator_accepts_pcp_async_non_speculative_config():
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(async_scheduling=True),
+        multihost_backend="",
+    )
+
+    assert config.enabled
+    assert config.async_scheduling is True

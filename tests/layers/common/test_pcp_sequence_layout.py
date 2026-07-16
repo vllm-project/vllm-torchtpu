@@ -264,8 +264,6 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
          "pipeline parallelism"),
         (_eligibility(speculative_enabled=True), NotImplementedError,
          "speculative decoding"),
-        (_eligibility(async_scheduling=True), NotImplementedError,
-         "async scheduling"),
         (_eligibility(is_kv_producer=False), NotImplementedError,
          "KV consumer"),
         (_eligibility(interleave_size=0), ValueError, "interleave_size > 0"),
@@ -278,6 +276,18 @@ def test_evaluate_runner_chunk_rejects_unsupported_runtime_config(
                   computed=[0],
                   prompt=[64],
                   scheduled=[64])
+
+
+def test_evaluate_runner_chunk_accepts_async_non_speculative_runtime_config():
+    decision = _evaluate(
+        eligibility=_eligibility(async_scheduling=True),
+        computed=[0],
+        prompt=[64],
+        scheduled=[64],
+    )
+
+    assert decision.mode is PcpSequenceLayoutMode.STREAMING
+    assert decision.local_required_tokens == 16
 
 
 def _planner_runner_stub(*, scheduled, computed, prompt, token_paddings):
@@ -343,10 +353,34 @@ def test_pcp_sequence_layout_planner_returns_partial_plan(monkeypatch):
     assert plan.local_num_tokens == 9
     assert plan.token_slice == slice(256, 512)
     assert plan.requires_hidden_state_gather is True
+    assert plan.local_index_for_request_major_token(0) is None
+    assert plan.local_index_for_request_major_token(16) == 0
+    assert plan.local_index_for_request_major_token(24) == 8
     torch.testing.assert_close(
         plan.logits_indices_cpu,
         torch.tensor([264] + [-1] * 7, dtype=torch.int32),
     )
+    torch.testing.assert_close(
+        plan.logits_local_indices_cpu,
+        torch.tensor([8] + [0] * 7, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        plan.logits_owner_mask_cpu,
+        torch.tensor([True] + [False] * 7, dtype=torch.bool),
+    )
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.common.pcp_sequence_layout."
+        "_pcp_all_reduce_sum", lambda tensor: tensor)
+    hidden_states = torch.arange(256 * 2, dtype=torch.float32).reshape(256, 2)
+    selected = planner.maybe_select_logits_hidden_states(
+        hidden_states,
+        plan,
+        plan.logits_indices_cpu,
+    )
+    expected = torch.zeros((8, 2), dtype=torch.float32)
+    expected[0] = hidden_states[8]
+    torch.testing.assert_close(selected, expected)
 
 
 def test_pcp_sequence_layout_planner_returns_all_when_disabled():

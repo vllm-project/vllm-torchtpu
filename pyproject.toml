@@ -26,7 +26,7 @@ dependencies = [
     "pathwaysutils",
     "vllm==0.22.1",
     "torch==2.11.0",
-    "torch-tpu==0.1.1.dev20260630090312",
+    "torch-tpu==0.1.1.dev20260714090201",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing

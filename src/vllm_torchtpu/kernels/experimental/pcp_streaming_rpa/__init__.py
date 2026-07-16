@@ -14,11 +14,7 @@
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
     PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
-    pcp_streaming_attention_page_groups,
-    pcp_streaming_attention_page_groups_local,
-    pcp_streaming_attention_page_groups_packed_local,
-    pcp_streaming_attention_page_groups_packed_local_from_metadata,
-    pcp_streaming_attention_single_page_group)
+    pcp_streaming_attention_page_groups_packed_local_from_metadata)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
     PCP_AXIS_NAME, compute_pcp_local_mapping,
     sharded_pcp_ragged_paged_attention)
@@ -27,10 +23,6 @@ __all__ = [
     "PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE",
     "PCP_AXIS_NAME",
     "compute_pcp_local_mapping",
-    "pcp_streaming_attention_page_groups",
-    "pcp_streaming_attention_page_groups_local",
-    "pcp_streaming_attention_page_groups_packed_local",
     "pcp_streaming_attention_page_groups_packed_local_from_metadata",
-    "pcp_streaming_attention_single_page_group",
     "sharded_pcp_ragged_paged_attention",
 ]

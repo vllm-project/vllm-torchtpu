@@ -315,6 +315,7 @@ def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
         num_reqs_most_model_len=16,
         num_tokens_paddings=[16, 32, 64, 128],
         device=device,
+        _dp_lockstep_enabled=lambda: False,
     )
 
     chunks = []
@@ -457,6 +458,7 @@ def test_propose_without_aux_hidden_state(device):
         num_reqs_most_model_len=16,
         num_tokens_paddings=[16],
         device=device,
+        _dp_lockstep_enabled=lambda: False,
     )
 
     aux = torch.full((16, hidden_size), 111.0, device=device)
@@ -528,3 +530,144 @@ def test_propose_empty_batch():
     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
     assert proposer.propose([], [], None,
                             SimpleNamespace(num_scheduled_tokens={})) == []
+
+
+def test_propose_pads_to_coordinated_chunk_bound(device):
+    """Under EP-DP lockstep, a rank with fewer chunks than the coordinated
+    bound must pad with run_dp_dummy_draft chunks so draft-forward counts pair
+    across DP ranks."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 1
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1),
+        max_num_reqs=16,
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=16,
+        num_tokens_paddings=[16],
+        device=device,
+        # Lockstep ON with a coordinated bound of 3 chunks; this rank has 1.
+        _dp_lockstep_enabled=lambda: True,
+        _dp_step_num_chunks=3,
+        _dp_target_bucket=16,
+    )
+
+    chunk = _make_chunk(
+        input_ids=torch.zeros(16, dtype=torch.int32, device=device),
+        position_ids=torch.zeros(16, dtype=torch.int32, device=device),
+        query_start_loc_np=np.arange(2, dtype=np.int32),
+        start_index=0,
+        num_reqs=1,
+        device=device,
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+    )
+    proposer.draft_chunks = [chunk]
+
+    class _StubDraft:
+
+        model = SimpleNamespace(use_aux_hidden_state=True)
+
+        def combine_hidden_states(self, x):
+            return x
+
+        def compute_logits(self, hidden):
+            return torch.zeros((hidden.shape[0], 4), device=device)
+
+    proposer.draft_model = _StubDraft()
+    proposer._prepare_draft_inputs = lambda *a, **k: (
+        torch.zeros(16, dtype=torch.int32, device=device),
+        torch.zeros(16, dtype=torch.int32, device=device),
+        torch.zeros(1, dtype=torch.int64, device=device),
+        np.zeros(1, dtype=np.int32),
+    )
+    proposer._forward_draft = lambda **k: (
+        torch.zeros((16, 8), device=device),
+        torch.zeros((16, 8), device=device),
+    )
+    dummy_chunks = []
+    proposer.run_dp_dummy_draft = lambda n: dummy_chunks.append(n)
+
+    proposer.propose(
+        sampled_token_ids=[[0]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+
+    # coordinated bound 3 − 1 real chunk = 2 padding chunks.
+    assert dummy_chunks == [2]
+
+
+def test_loop_bucket_constant_under_sharded_lockstep():
+    """Sharded EP-DP lockstep pins the loop bucket to pad(max_num_reqs) so
+    collective shapes match across DP ranks regardless of per-rank load;
+    the replicated draft keeps the per-chunk bucket."""
+    proposer = _make_proposer(draft_tp=2, target_tp=2)
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[16, 32, 64, 128],
+        max_num_reqs=50,
+        _dp_lockstep_enabled=lambda: True,
+    )
+    assert proposer._loop_bucket(1) == 64
+    assert proposer._loop_bucket(33) == 64
+
+    rep = _make_proposer(draft_tp=1, target_tp=2)
+    rep.runner = SimpleNamespace(num_tokens_paddings=[16, 32, 64, 128])
+    assert rep._loop_bucket(1) == 16
+    assert rep._loop_bucket(33) == 64
+
+
+def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
+    """Sharded draft under EP-DP lockstep: each padding chunk must replay the
+    real propose's collective trace — combine (1/chunk), first-pass forward
+    @bucket, K lm-head gathers @constant loop bucket, K-1 loop forwards @that
+    bucket — not just K bare forwards."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    monkeypatch.setattr(e3.sync, "synchronize", lambda *a, **k: None)
+
+    proposer = _make_proposer(draft_tp=2, target_tp=2)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        _dp_target_bucket=64,
+        num_reqs_max_model_len=16,
+        max_num_reqs=16,
+        num_tokens_paddings=[16, 32, 64],
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        _dp_lockstep_enabled=lambda: True,
+    )
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(fc_input_size=24),
+    )
+    proposer._draft_uses_aux_hidden_state = lambda: True
+
+    combine, fwd, tok_shapes = [], [], []
+    proposer._draft_combine_hidden_states = lambda *a: combine.append(a)
+
+    def fake_forward(**kw):
+        fwd.append(kw)
+        return (torch.zeros((kw["num_tokens_padded"], 8)), None)
+
+    proposer._forward_draft = fake_forward
+
+    def fake_propose_token(h):
+        tok_shapes.append(tuple(h.shape))
+        return torch.zeros(h.shape[0], dtype=torch.int32)
+
+    proposer._draft_propose_token = fake_propose_token
+
+    proposer.run_dp_dummy_draft(2)
+
+    # One combine per chunk, at the coordinated bucket width (aux thirds).
+    assert len(combine) == 2
+    assert all(t.shape == (64, 8) for t in combine[0])
+    # K forwards per chunk: first pass @bucket=64, then K-1 loop @p=16
+    # (constant loop bucket = pad(max_num_reqs)).
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 16, 16] * 2
+    assert [f["step_idx"] for f in fwd] == [0, 1, 2] * 2
+    # Loop steps carry the loop metadata tensors (shape parity with propose).
+    assert all(
+        f.get("loop_query_start_loc") is not None for f in fwd
+        if f["step_idx"] > 0)
+    # K lm-head gathers per chunk, all at the constant loop bucket.
+    assert tok_shapes == [(16, 8)] * 6

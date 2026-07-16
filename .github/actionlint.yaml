@@ -2,3 +2,4 @@ self-hosted-runner:
   labels:
     - "linux-x86-n4-16"
     - "linux-x86-tpu7x-224-4tpu"
+    - "blacksmith-2vcpu-ubuntu-2404"

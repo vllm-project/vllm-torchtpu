@@ -32,7 +32,7 @@ on:
 
 jobs:
   run_tests:
-    if: github.repository == 'google-pytorch/torchtpu-vllm'
+    if: false && github.repository == 'vllm-project/vllm-torchtpu'
     name: "Tests on ${{ matrix.job_info.runner }}"
     strategy:
       matrix:

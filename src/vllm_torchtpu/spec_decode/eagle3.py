@@ -473,9 +473,6 @@ class Eagle3Proposer:
 
         K = self.speculative_config.num_speculative_tokens
 
-        # Import here to avoid circular import at module load time.
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
         chunks = self.draft_chunks
         if not chunks:
             raise RuntimeError(
@@ -553,8 +550,17 @@ class Eagle3Proposer:
             # draft forward hits a precompiled trace with no per-num_reqs
             # recompile.
             padded_nr_per_chunk = [
-                _get_padded_token_len(runner.num_tokens_paddings, c.num_reqs)
-                for c in chunks
+                self._loop_bucket(c.num_reqs) for c in chunks
+            ]
+            loop_hidden = [
+                _maybe_pad_dim0(h, p)
+                for h, p in zip(hidden_carry_per_chunk, padded_nr_per_chunk)
+            ]
+            loop_positions = [
+                _maybe_pad_dim1(pos, p) if
+                (getattr(runner, "uses_mrope", False) and pos.ndim == 2) else
+                _maybe_pad_dim0(pos, p) for pos, p in zip(
+                    positions_carry_per_chunk, padded_nr_per_chunk)
             ]
             loop_hidden = [
                 _maybe_pad_dim0(h, p)
@@ -625,6 +631,14 @@ class Eagle3Proposer:
                         draft_tokens_per_chunk[ci].append(
                             self._draft_propose_token(last_hidden))
                     loop_hidden[ci] = hidden
+
+        # EP-DP lockstep: pad this rank's draft-forward count up to the
+        # step's coordinated chunk bound so ranks with fewer chunks still
+        # run the same number of draft forwards as their peers.
+        if runner._dp_lockstep_enabled():
+            extra_chunks = runner._dp_step_num_chunks - len(chunks)
+            if extra_chunks > 0:
+                self.run_dp_dummy_draft(extra_chunks)
 
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
@@ -819,8 +833,7 @@ class Eagle3Proposer:
         # rows re-write request (num_reqs-1)'s seed to its own slot (idempotent),
         # so draft_input_ids stays correct, and the padded gather tail re-reads a
         # real row that propose() slices off.
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-        p = _get_padded_token_len(runner.num_tokens_paddings, num_reqs)
+        p = self._loop_bucket(num_reqs)
         if next_tokens_device is None and device_seed is None:
             # Pure sync: build the padded index + values on the host (free H2D,
             # no recompile), then scatter at the constant [p] shape.
@@ -1031,6 +1044,8 @@ class Eagle3Proposer:
                 attn_metadata,
                 draft_vllm_cfg,
                 num_tokens=num_tokens,
+                num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(
+                    num_tokens),
         ), set_vllm_model_wrapper_context(mesh=self.runner.mesh):
             out = self.draft_model(**kwargs)
 
@@ -1075,6 +1090,25 @@ class Eagle3Proposer:
         if self._draft_uses_aux_hidden_state():
             return self.draft_model.model.fc_input_size
         return self._draft_hidden_size()
+
+    def _dp_lockstep_sharded(self) -> bool:
+        """True when the draft is TP-SHARDED under EP-DP lockstep.
+
+        In that one topology the draft's internal collectives are part of the
+        cross-rank collective program, so every rank must execute the same collective trace.
+        The replicated (draft_tp=1) draft has no collectives and needs none of this.
+        """
+        return (not self._draft_replicated
+                and self.runner._dp_lockstep_enabled())
+
+    def _loop_bucket(self, num_reqs: int) -> int:
+        """Loop-phase token bucket p (carries, lm-head gathers, loop forwards).
+        """
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+        runner = self.runner
+        if self._dp_lockstep_sharded():
+            num_reqs = runner.max_num_reqs
+        return _get_padded_token_len(runner.num_tokens_paddings, num_reqs)
 
     def _precompile_combine_hidden_states(self) -> None:
         if self.speculative_config.method == "mtp":

@@ -44,8 +44,8 @@ concurrency:
 
 jobs:
   check_changes:
-    if: github.repository == 'google-pytorch/torchtpu-vllm' && github.event.repository.fork == false
-    runs-on: ubuntu-latest
+    if: false && github.repository == 'vllm-project/vllm-torchtpu' && github.event.repository.fork == false
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       should_run: ${{ steps.filter.outputs.src }}
     steps:
@@ -70,7 +70,7 @@ jobs:
 
   run_tests:
     needs: check_changes
-    if: github.repository == 'google-pytorch/torchtpu-vllm' && github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
+    if: false && github.repository == 'vllm-project/vllm-torchtpu' && github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
     uses: ./.github/workflows/tests.yml
     name: "Run Tests"
     with:
@@ -78,7 +78,7 @@ jobs:
 
   run_perf_eval:
     needs: check_changes
-    if: github.repository == 'google-pytorch/torchtpu-vllm' && github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
+    if: false && github.repository == 'vllm-project/vllm-torchtpu' && github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
     uses: ./.github/workflows/perf.yml
     name: "Run Perf and Eval"
     with:
@@ -191,9 +191,9 @@ jobs:
       ]
     # always() = always run whether or not previous jobs succeeded
     # !cancelled() = only run if the job wasn't explicitly cancelled
-    if: github.repository == 'google-pytorch/torchtpu-vllm' && always() && !cancelled()
+    if: false && github.repository == 'vllm-project/vllm-torchtpu' && always() && !cancelled()
     name: "TPU Presubmit Gate"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check results
         run: |

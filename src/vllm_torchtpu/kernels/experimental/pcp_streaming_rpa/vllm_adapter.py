@@ -14,6 +14,8 @@ from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import \
+    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
     PCP_AXIS_NAME, sharded_pcp_ragged_paged_attention)
 
@@ -230,6 +232,8 @@ def make_pcp_streaming_rpa_kernel(
     skip_kv_update: bool,
     cp_kv_cache_interleave_size: int,
     max_model_len: int | None = None,
+    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    q_compute_size: int | None = None,
 ) -> Callable[..., tuple[jax.Array, jax.Array]]:
     """Build a PCP streaming RPA entry with only tensor args in its signature."""
     if soft_cap is not None:
@@ -268,6 +272,8 @@ def make_pcp_streaming_rpa_kernel(
             max_context_tokens=max_model_len,
             update_kv_cache=True,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            q_block_size=q_block_size,
+            q_compute_size=q_compute_size,
         )
         return new_kv_cache, output
 

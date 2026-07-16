@@ -1,0 +1,76 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+x-unit-test-defaults: &unit_test_defaults
+  env:
+    MODEL_IMPL_TYPE: "vllm"
+  commands:
+    - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
+
+x-tests-plugin-defaults: &tests_plugin_defaults
+  test-runner: pytest
+  install-client: false
+  oidc-lifetime: 7200
+
+steps:
+  - group: "Unit Tests on TPU"
+    depends_on: "build_docker"
+    steps:
+      - label: "Unit Tests - Speculative Decoding (PR)"
+        key: "unit_tests_spec_decode_pr"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") != "1"'
+        agents:
+          queue: "tpu_v7x_2_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=300 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - General (PR)"
+        key: "unit_tests_general_pr"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") != "1"'
+        agents:
+          queue: "tpu_v7x_8_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - Speculative Decoding (Nightly)"
+        key: "unit_tests_spec_decode_nightly"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_2_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - General (Nightly)"
+        key: "unit_tests_general_nightly"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_8_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 --junit-xml={{resultPath}} {{testExamples}}"

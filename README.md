@@ -45,9 +45,6 @@ export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 # Install keyring and Google Artifact Registry plugin for persistent auth
 uv tool install keyring --with keyrings.google-artifactregistry-auth
 
-# Use CPU Torch when building vLLM's editable TPU package.
-export UV_TORCH_BACKEND=cpu
-
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git ../vllm
 

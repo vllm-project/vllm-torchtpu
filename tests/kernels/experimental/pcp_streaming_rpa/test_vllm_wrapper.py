@@ -8,7 +8,10 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import \
+    kernel as pcp_kernel
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import \
     wrapper as pcp_wrapper
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
@@ -128,6 +131,60 @@ def test_sharded_wrapper_uses_real_metadata_streaming_entry():
     source = inspect.getsource(pcp_wrapper)
 
     assert "pcp_streaming_attention_page_groups_packed_local_from_metadata" in source
+
+
+@pytest.mark.parametrize(
+    ("kv_dtype", "kv_heads", "q_per_kv", "packed_kv_groups", "k_scale",
+     "v_scale"),
+    [
+        (jnp.bfloat16, 1, 1, 1, None, None),
+        (jnp.bfloat16, 2, 1, 2, None, None),
+        (jnp.bfloat16, 2, 2, 2, None, None),
+        (jnp.float8_e4m3fn, 1, 2, 1, 0.5, 0.5),
+        (jnp.float8_e4m3fn, 2, 1, 1, 0.5, 0.5),
+        (jnp.float8_e4m3fn, 3, 2, 2, 0.5, 0.5),
+    ],
+)
+def test_packed_kv_layout_validation_accepts_unified_head_matrix(
+        kv_dtype, kv_heads, q_per_kv, packed_kv_groups, k_scale, v_scale):
+    local_tokens = 32
+    page_size = 16
+    head_dim = 128
+    kv_packing = pcp_wrapper.get_dtype_packing(kv_dtype)
+    q_local = jnp.zeros((local_tokens, kv_heads, q_per_kv, head_dim),
+                        dtype=jnp.bfloat16)
+    kv_cache_local = jnp.zeros(
+        (2, page_size, packed_kv_groups, kv_packing, head_dim),
+        dtype=kv_dtype,
+    )
+
+    assert pcp_kernel._validate_packed_kv_layout(q_local,
+                                                 kv_cache_local,
+                                                 k_scale=k_scale,
+                                                 v_scale=v_scale) == (
+                                                     kv_heads,
+                                                     packed_kv_groups,
+                                                     kv_packing,
+                                                 )
+
+
+def test_packed_kv_layout_validation_rejects_fp8_without_scales():
+    q_local = jnp.zeros((32, 1, 2, 128), dtype=jnp.bfloat16)
+    kv_cache_local = jnp.zeros((2, 16, 1, 4, 128), dtype=jnp.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="FP8 KV cache requires"):
+        pcp_kernel._validate_packed_kv_layout(q_local, kv_cache_local)
+
+
+def test_packed_kv_layout_validation_rejects_wrong_physical_group_count():
+    q_local = jnp.zeros((32, 3, 2, 128), dtype=jnp.bfloat16)
+    kv_cache_local = jnp.zeros((2, 16, 1, 4, 128), dtype=jnp.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="packed layout does not match"):
+        pcp_kernel._validate_packed_kv_layout(q_local,
+                                              kv_cache_local,
+                                              k_scale=0.5,
+                                              v_scale=0.5)
 
 
 def test_update_local_paged_kv_cache_accepts_equivalent_tail_layout(
@@ -441,12 +498,9 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
     assert new_cache.shape == (local_kv_cache_num_blocks, page_size, 2, 1, 128)
 
 
-def test_reshape_packed_kv_cache_for_attention_restores_dtype_packing():
+def test_reshape_packed_kv_cache_for_attention_rejects_ambiguous_layout():
     kv_cache = jnp.arange(2 * 4 * 16 * 1 * 8,
                           dtype=jnp.bfloat16).reshape(2, 4, 16, 1, 8)
 
-    out = pcp_wrapper._reshape_packed_kv_cache_for_attention(kv_cache)
-
-    assert out.shape == (2, 4, 8, 2, 8)
-    np.testing.assert_array_equal(np.asarray(out.reshape(kv_cache.shape)),
-                                  np.asarray(kv_cache))
+    with pytest.raises(ValueError, match="packing does not match"):
+        pcp_wrapper._reshape_packed_kv_cache_for_attention(kv_cache)

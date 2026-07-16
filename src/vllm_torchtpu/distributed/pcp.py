@@ -68,6 +68,16 @@ def all_gather_equal_tokens(tensor: torch.Tensor,
     return torch.cat(list(gathered), dim=dim)
 
 
+def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
+    """Sum a tensor across the native PCP group."""
+    group = get_pcp_group()
+    if group is None or int(group.world_size) == 1:
+        return tensor
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    return group.all_reduce(tensor)
+
+
 def _get_current_global_rank() -> int:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return int(torch.distributed.get_rank())

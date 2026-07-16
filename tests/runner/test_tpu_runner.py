@@ -223,6 +223,29 @@ class TestTPURunner:
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
 
+    @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=4096)
+    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
+           return_value=(3 * 1024 * 1024, 3 * 1024 * 1024))
+    def test_compact_mamba_sizing_raises_when_mamba_exceeds_budget(
+            self, mock_mem_info, mock_get_page_size):
+        """Mamba slots alone (3 * 17 * 66560 = 3,394,560 B) exceed the 3 MiB
+        KV budget, so compact sizing cannot fit. Raise instead of falling back
+        to the uniform layout, which pads every block to the mamba page and
+        silently shrinks the block pool ~50x."""
+        layers = {}
+        mock_attn = MagicMock(spec=Attention)
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers['attn_0'] = mock_attn
+        for i in range(3):
+            layers[f'mamba_{i}'] = DummyMamba()
+
+        with pytest.raises(ValueError, match="does not fit"):
+            self.runner._update_mamba_page_size_padded(layers)
+
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))

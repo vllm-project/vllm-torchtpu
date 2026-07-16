@@ -77,33 +77,23 @@ Important fields include:
 
 ## Kernel Execution
 
-For each lane and page group, the kernel:
+The metadata entry splits execution into two Pallas calls:
 
-1. Loads the schedule row for the current rank and loads the local Q tile if
-   `LOAD_Q` is set.
-2. Loads the local KV page for this rank into one of two VMEM slots.
-3. Runs `pcp_size` ring rounds. In each round it consumes the current VMEM KV
-   slot, asynchronously sends it to the next rank, waits for the previous
-   transfer as needed, and swaps slots.
-4. Updates online-softmax state `(m, l, acc)` for every consumed page.
-5. Stores `acc / l` back to HBM when the group contains the last KV page for
-   that Q tile.
+1. The current-chunk causal pass starts at the first current page group,
+   streams only current-chunk KV pages through the ring, and produces
+   online-softmax state `(m, l, acc)`.
+2. The history no-causal pass consumes historical page groups through the same
+   ring structure, reuses the state from the current pass, and writes `acc / l`
+   back to HBM.
 
-The single-head and multi-head kernels share the same ring structure. The
-multi-head path consumes a packed batched-RPA KV-cache layout and reuses the
-same ring transfer for all local KV heads.
+Both passes use the packed batched-RPA KV-cache layout and reuse each ring
+transfer for all local KV heads.
 
 ## Entry Points
 
 - `pcp_streaming_attention_page_groups_packed_local_from_metadata`: production
   metadata-driven entry. It builds a JAX schedule from vLLM metadata, then runs
-  the packed-local kernel.
-- `pcp_streaming_attention_page_groups_packed_local`: runs an already-built
-  schedule against a local packed KV-cache shard.
-- `pcp_streaming_attention_page_groups_local`: test/debug entry for the
-  unpacked KV-cache layout.
-- `pcp_streaming_attention_page_groups`: test/debug entry for tensors that
-  still have an explicit leading PCP-rank dimension.
+  the split current/history packed-local kernels.
 
 ## Current Constraints
 

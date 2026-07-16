@@ -12,6 +12,7 @@ import torch
 
 from vllm_torchtpu.distributed.pcp import \
     all_gather_equal_tokens as _pcp_all_gather_equal_tokens
+from vllm_torchtpu.distributed.pcp import all_reduce_sum as _pcp_all_reduce_sum
 from vllm_torchtpu.distributed.pcp import get_pcp_rank as _get_native_pcp_rank
 from vllm_torchtpu.distributed.pcp import \
     get_pcp_world_size as _get_native_pcp_world_size
@@ -284,10 +285,6 @@ class PcpSequenceLayoutEligibility:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support speculative "
                 "decoding yet.")
-        if self.async_scheduling:
-            raise NotImplementedError(
-                "PCP partial sequence layout does not support async scheduling "
-                "yet.")
         if self.interleave_size <= 0:
             raise ValueError("PCP partial sequence layout requires "
                              "cp_kv_cache_interleave_size > 0.")
@@ -361,6 +358,9 @@ class PcpPreparedBatch:
     local_total_num_scheduled_tokens: int
     local_padded_total_num_scheduled_tokens: int
     logits_indices_cpu: torch.Tensor
+    logits_local_indices_cpu: torch.Tensor
+    logits_owner_mask_cpu: torch.Tensor
+    request_major_to_packed_token_indices: np.ndarray
 
 
 class PcpSequenceLayoutPlanner:
@@ -384,6 +384,10 @@ class PcpSequenceLayoutPlanner:
     @property
     def backend_preinit_world_size(self) -> int:
         return self.eligibility.pcp_size
+
+    @property
+    def uses_selected_logits_hidden_states(self) -> bool:
+        return self.enabled
 
     def reserve_host_token_capacity(self, runner: Any,
                                     required_num_tokens: int) -> None:
@@ -447,7 +451,11 @@ class PcpSequenceLayoutPlanner:
             local_padded_num_tokens=(
                 prepared.local_padded_total_num_scheduled_tokens),
             logits_indices_cpu=prepared.logits_indices_cpu,
+            logits_local_indices_cpu=prepared.logits_local_indices_cpu,
+            logits_owner_mask_cpu=prepared.logits_owner_mask_cpu,
             requires_hidden_state_gather=True,
+            _request_major_to_packed_token_indices=(
+                prepared.request_major_to_packed_token_indices),
         )
 
     def prepare_dummy(
@@ -482,6 +490,28 @@ class PcpSequenceLayoutPlanner:
         if plan is None or not plan.requires_hidden_state_gather:
             return hidden_states
         return _pcp_all_gather_equal_tokens(hidden_states, dim=0)
+
+    def maybe_select_logits_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        plan: SequenceLayoutPlan | None,
+        logits_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        del logits_indices
+        if plan is None:
+            return None
+        if (plan.logits_local_indices_cpu is None
+                or plan.logits_owner_mask_cpu is None):
+            return None
+
+        local_indices = plan.logits_local_indices_cpu.to(hidden_states.device,
+                                                         non_blocking=True)
+        owner_mask = plan.logits_owner_mask_cpu.to(hidden_states.device,
+                                                   non_blocking=True)
+        selected = torch.index_select(hidden_states, 0, local_indices)
+        selected = torch.where(owner_mask.unsqueeze(1), selected,
+                               torch.zeros_like(selected))
+        return _pcp_all_reduce_sum(selected)
 
 
 def _ensure_host_token_buffer_capacity(runner: Any,
@@ -638,7 +668,7 @@ def prepare_pcp_sequence_layout(
     if runner.uses_mrope:
         mrope_slice = runner.mrope_positions.cpu[:, :(
             padded_total_num_scheduled_tokens)].numpy()
-    _apply_pcp_rank_major_token_order(
+    request_major_to_packed_token_indices = _apply_pcp_rank_major_token_order(
         runner.input_ids_cpu[:padded_total_num_scheduled_tokens].numpy(),
         runner.positions_np[:padded_total_num_scheduled_tokens],
         num_scheduled_tokens_per_req,
@@ -668,6 +698,20 @@ def prepare_pcp_sequence_layout(
                                     dtype=torch.int32,
                                     device="cpu")
     logits_indices_cpu[:num_reqs] = torch.from_numpy(pcp_logits_indices)
+    logits_owner_mask_np = ((pcp_logits_indices >= local_start) &
+                            (pcp_logits_indices < local_end))
+    logits_local_indices_np = np.zeros(num_reqs, dtype=np.int32)
+    logits_local_indices_np[logits_owner_mask_np] = (
+        pcp_logits_indices[logits_owner_mask_np] - local_start)
+    logits_local_indices_cpu = torch.zeros((padded_num_reqs, ),
+                                           dtype=torch.int32,
+                                           device="cpu")
+    logits_local_indices_cpu[:num_reqs] = torch.from_numpy(
+        logits_local_indices_np)
+    logits_owner_mask_cpu = torch.zeros((padded_num_reqs, ),
+                                        dtype=torch.bool,
+                                        device="cpu")
+    logits_owner_mask_cpu[:num_reqs] = torch.from_numpy(logits_owner_mask_np)
 
     if os.environ.get("VLLM_TPU_DEBUG_PCP_LAYOUT") == "1":
         layout_debug = _debug_pcp_layout_window(
@@ -703,4 +747,8 @@ def prepare_pcp_sequence_layout(
         local_padded_total_num_scheduled_tokens=(
             local_padded_total_num_scheduled_tokens),
         logits_indices_cpu=logits_indices_cpu,
+        logits_local_indices_cpu=logits_local_indices_cpu,
+        logits_owner_mask_cpu=logits_owner_mask_cpu,
+        request_major_to_packed_token_indices=(
+            request_major_to_packed_token_indices),
     )

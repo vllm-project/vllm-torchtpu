@@ -61,6 +61,7 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
+_tpu_patches_applied = False
 
 
 def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
@@ -240,6 +241,11 @@ def apply_tpu_patches() -> None:
     module-level state is re-initialized on import in spawned processes.
     All patches are idempotent.
     """
+    global _tpu_patches_applied
+    if _tpu_patches_applied:
+        return
+    _tpu_patches_applied = True
+
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_no_ep_tp_scope,
@@ -452,6 +458,8 @@ class TpuPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         apply_tpu_patches()
+        _apply_model_specific_patches(
+            getattr(vllm_config, "model_config", None))
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(

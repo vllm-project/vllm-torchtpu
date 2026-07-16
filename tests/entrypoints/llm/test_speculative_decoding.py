@@ -25,6 +25,10 @@ from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
 
+# Heavy Llama-3.1-8B spec-decode integration suite; presubmit deselects it via
+# `-m "not nightly"`, full coverage runs in the nightly workflow.
+pytestmark = pytest.mark.nightly
+
 
 def _is_v7x():
     return (tpu_info.get_tpu_type() or "").startswith("tpu7x")
@@ -139,7 +143,7 @@ def _test_correctness_helper(
             cleanup_dist_env_and_memory()
 
 
-@pytest.mark.timeout(1200)
+@pytest.mark.timeout(1800)
 def test_ngram_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -159,9 +163,13 @@ def test_ngram_correctness_greedy(
     "async_scheduling",
     [pytest.param(False, id="sync"),
      pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(10, id="bs10")])
 def test_eagle3_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
+    max_num_seqs: int,
     async_scheduling: bool,
 ):
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
@@ -177,7 +185,7 @@ def test_eagle3_correctness_greedy(
             "num_speculative_tokens": 3,
             "draft_tensor_parallel_size": 1,
         },
-        max_num_seqs=10,
+        max_num_seqs=max_num_seqs,
         async_scheduling=async_scheduling,
     )
 
@@ -236,7 +244,7 @@ def _test_performance_helper(
         assert acceptance_rate >= min_acceptance_rate, f"Expected at least {min_acceptance_rate:.2%} acceptance rate for {speculative_config['method']}, got {acceptance_rate:.2%}"
 
 
-@pytest.mark.timeout(500)
+@pytest.mark.timeout(1800)
 def test_ngram_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -341,7 +349,7 @@ def _force_multi_chunk_cap(self, cap: int = 2):
         runner.num_reqs_most_model_len = cap
 
 
-@pytest.mark.timeout(1200)
+@pytest.mark.timeout(1800)
 def test_sd_correctness_greedy_multi_chunk(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,

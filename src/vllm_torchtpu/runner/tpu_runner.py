@@ -90,6 +90,7 @@ if TYPE_CHECKING:
 class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
     logits_list: list[torch.Tensor]
+    pooler_output_list: list[Any]
     num_reqs_list: list[int]
     spec_decode_metadata_list: list["SpecDecodeMetadata | None"]
     # Per-chunk draft inputs (token ids, positions, attn ctx, aux
@@ -211,7 +212,7 @@ def _torch_tpu_wrapper():
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
 #      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
-#      gather_logprobs) so dummy_run and execute_model trace identically.
+#      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
@@ -244,6 +245,31 @@ class TPUModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
+        self.is_pooling_model = (self.model_config is not None and
+                                 self.model_config.runner_type == "pooling")
+
+        if self.is_pooling_model:
+            from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+            from vllm.v1.worker.tpu_input_batch import InputBatch
+
+            def get_pooling_metadata(batch):
+                reqs = batch.requests[:batch.num_reqs]
+                pooling_params = [r.pooling_params for r in reqs]
+                pooling_states = [
+                    PoolingStates(r.req_id, r.num_computed_tokens)
+                    for r in reqs
+                ]
+                prompt_lens = torch.tensor(
+                    [r.prompt_token_ids_len for r in reqs], dtype=torch.int32)
+                return PoolingMetadata(
+                    prompt_lens=prompt_lens,
+                    prompt_token_ids=None,
+                    prompt_token_ids_cpu=None,
+                    pooling_params=pooling_params,
+                    pooling_states=pooling_states,
+                )
+
+            InputBatch.get_pooling_metadata = get_pooling_metadata
 
         # Parent already set: vllm_config, *_config, device, pin_memory, dtype,
         # max_model_len, max_num_reqs, max_num_tokens, num_query_heads,
@@ -290,6 +316,12 @@ class TPUModelRunner(GPUModelRunner):
         self._unified_block_pool: bool = (
             tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
+
+        # EP-DP lockstep state, refreshed each step by execute_model /
+        # execute_dummy_batch: the coordinated (max-across-ranks) token
+        # bucket and chunk count.
+        self._dp_target_bucket: int | None = None
+        self._dp_step_num_chunks: int = 0
 
         # TPU env-var flags.
         self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
@@ -1064,8 +1096,9 @@ class TPUModelRunner(GPUModelRunner):
                 `_maybe_set_num_blocks_override`.
 
         On success: sets `cache_config.num_gpu_blocks_override` (attention
-        block count) and `_mamba_num_blocks`. On any precondition-fail path:
-        leaves both unset so the caller falls back to uniform sizing.
+        block count) and `_mamba_num_blocks`. Raises when the KV budget cannot
+        hold the mamba slots; the remaining precondition-fail paths leave both
+        unset so the caller falls back to uniform sizing.
         """
         if self._uniform_mamba_layout:
             logger.info("Compact mamba sizing skipped.")
@@ -1093,27 +1126,27 @@ class TPUModelRunner(GPUModelRunner):
         avail_per_tensor = avail // group_size
         mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
                             unpadded_mamba_page_size_bytes)
+        # Falling back to the uniform layout here would pad every block to the
+        # mamba page and silently shrink the pool by ~50x, which surfaces as a
+        # throughput collapse rather than a misconfiguration. Fail loudly.
         attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
         if attn_per_tensor_avail <= 0:
-            # Mamba alone saturates the budget — pathological config. Skip the
-            # override and let the uniform fallback run; if the model genuinely
-            # doesn't fit it will OOM there too, and we want that signal.
-            logger.warning(
-                "Compact-mamba sizing skipped: mamba alone (mamba_num_blocks="
-                "%d × num_mamba_groups=%d × mamba_unpadded=%d) exceeds "
-                "per-tensor budget %d. Lower `gpu_memory_utilization` or "
-                "`max_num_seqs`.", mamba_num_blocks, num_mamba_groups,
-                unpadded_mamba_page_size_bytes, avail_per_tensor)
-            return
+            raise ValueError(
+                f"Compact-mamba KV sizing does not fit: mamba slots alone need "
+                f"{mamba_per_tensor} B per KVCacheTensor (mamba_num_blocks="
+                f"{mamba_num_blocks} x num_mamba_groups={num_mamba_groups} x "
+                f"mamba_unpadded={unpadded_mamba_page_size_bytes}), but the "
+                f"per-tensor KV budget is {avail_per_tensor} B. Raise "
+                f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
         attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
                                                     attn_page_size_bytes)
         if attn_num_blocks <= 0:
-            logger.warning(
-                "Compact-mamba sizing skipped: attn_num_blocks=0 "
-                "(avail_per_tensor=%d, mamba_per_tensor=%d).",
-                avail_per_tensor, mamba_per_tensor)
-            return
+            raise ValueError(
+                f"Compact-mamba KV sizing does not fit: no attention blocks "
+                f"remain (avail_per_tensor={avail_per_tensor} B, "
+                f"mamba_per_tensor={mamba_per_tensor} B). Raise "
+                f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
         self._mamba_num_blocks = int(mamba_num_blocks)
@@ -1266,6 +1299,7 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_cur_input_indices_list = []
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
+        layout_plan = getattr(self, "_last_sequence_layout_plan", None)
 
         # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
         # starts at `position * stride`.
@@ -1289,8 +1323,16 @@ class TPUModelRunner(GPUModelRunner):
             src_start = (self._pre_async_results.req_id_to_index_copy[req_id] *
                          stride)
             for j in range(n_sched):
-                token_in_tpu_cur_input_indices_list.append(acc_cur_len -
-                                                           n_sched + j)
+                request_major_index = acc_cur_len - n_sched + j
+                if layout_plan is None:
+                    cur_input_index = request_major_index
+                else:
+                    cur_input_index = (
+                        layout_plan.local_index_for_request_major_token(
+                            request_major_index))
+                    if cur_input_index is None:
+                        continue
+                token_in_tpu_cur_input_indices_list.append(cur_input_index)
                 token_in_tpu_pre_next_tokens_indices_list.append(src_start + j)
 
         if len(token_in_tpu_cur_input_indices_list) > 0:
@@ -1456,16 +1498,15 @@ class TPUModelRunner(GPUModelRunner):
         return placeholder_req_id_to_index
 
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk,
-                                          state, next_tokens_tpu_chunks,
-                                          next_token_indices):
+                                          state):
         """Async-spec substitution assembler.
 
         From the already-proposed on-device ``drafts`` (the unified eagle3
         propose call in ``sample_tokens``), builds the per-request
-        ``[bonus, draft_1..K]`` substitution source (appended to
-        ``next_tokens_tpu_chunks``) and the stride-``1+K``
+        ``[bonus, draft_1..K]`` substitution source and the stride-``1+K``
         ``next_token_indices``, and computes the per-request rejected count.
-        Returns ``(spec_decode_num_rejected_tokens, num_draft_per_req)``.
+        Returns ``(next_tokens_tpu_chunks, next_token_indices,
+        spec_decode_num_rejected_tokens, num_draft_per_req)``.
         """
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             assemble_spec_next_tokens, compute_num_rejected)
@@ -1473,6 +1514,8 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens")
         K = self.speculative_config.num_speculative_tokens
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
@@ -1513,25 +1556,26 @@ class TPUModelRunner(GPUModelRunner):
             req_offset += num_reqs
         spec_num_rejected = (torch.cat(num_rejected_chunks)
                              if num_rejected_chunks else None)
-        return spec_num_rejected, num_draft_per_req
+        return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                num_draft_per_req)
 
     def _assemble_async_prefill_bootstrap(self, drafts,
                                           combined_selected_tokens,
-                                          combined_real_lens,
-                                          next_tokens_tpu_chunks,
-                                          next_token_indices):
+                                          combined_real_lens):
         """Async eagle3 bootstrap assembler for the prefill / pure-non-spec step.
 
         From the already-proposed prompt-context ``drafts`` (the unified eagle3
         propose call in ``sample_tokens``, device_seed path), parks a
         stride-(1+K) `[bonus, draft_1..K]` source so the NEXT step substitutes
-        REAL prompt-context drafts. Returns (spec_num_rejected=zeros,
-        num_draft_per_req).
+        REAL prompt-context drafts. Returns ``(next_tokens_tpu_chunks,
+        next_token_indices, spec_num_rejected=zeros, num_draft_per_req)``.
         """
         assert drafts is not None, (
             "async prefill bootstrap requires the eagle3 drafts proposed "
             "earlier in sample_tokens")
         K = self.speculative_config.num_speculative_tokens
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
@@ -1549,7 +1593,8 @@ class TPUModelRunner(GPUModelRunner):
             req_offset += n
         spec_num_rejected = (torch.cat(num_rejected_chunks)
                              if num_rejected_chunks else None)
-        return spec_num_rejected, num_draft_per_req
+        return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                num_draft_per_req)
 
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput",
                         start_index: int, num_decode_reqs: int):
@@ -2004,6 +2049,22 @@ class TPUModelRunner(GPUModelRunner):
                         use_max_model_len=True,
                         dp_lockstep=True)
 
+    def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
+        """Idle-rank EP-DP pairing: emit the same cross-DP collective stream a
+        busy rank does — ALL target dummy forwards, then ALL draft dummy
+        forwards.
+        """
+        # Set before any dummy fires: both _run_dp_dummy_chunk and the draft
+        # run_dp_dummy_draft read _dp_target_bucket for the coordinated, equal-token shape.
+        self._dp_target_bucket = bucket
+        # Phase 1: all TARGET dummy forwards.
+        for _ in range(num_chunks):
+            self._run_dp_dummy_chunk(bucket)
+        # Phase 2: all DRAFT dummy forwards (num_chunks * K).
+        spec = self.speculative_config
+        if num_chunks > 0 and spec is not None and spec.use_eagle():
+            self.drafter.run_dp_dummy_draft(num_chunks)
+
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
             return None
@@ -2074,10 +2135,16 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks = self._count_input_chunks(scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens, local_num_chunks)
+        # Retained for the spec-decode propose phase (sample_tokens): under
+        # EP-DP locksteps every rank must run the same number of draft forwards per step,
+        # and the coordinated chunk count from this one all-reduce is the shared
+        # bound — no additional draft-side collective is needed.
+        self._dp_step_num_chunks = target_num_chunks
 
         start_index = 0
         chunk_index = 0
         logits_list = []
+        pooler_output_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
         draft_chunks: list[DraftChunkInputs] = []
@@ -2168,13 +2235,45 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                 )
 
-            hidden_states = _get_sequence_layout_planner_for_runner(
-                self).finalize_hidden_states(
+            sequence_layout_planner = _get_sequence_layout_planner_for_runner(
+                self)
+            layout_plan = getattr(self, "_last_sequence_layout_plan", None)
+            sample_hidden_states = (
+                sequence_layout_planner.maybe_select_logits_hidden_states(
+                    hidden_states, layout_plan, logits_indices))
+            if sample_hidden_states is None:
+                hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
-                    getattr(self, "_last_sequence_layout_plan", None),
+                    layout_plan,
                 )
-            logits = self.compute_selected_logits(hidden_states,
-                                                  logits_indices)
+                logits = self.compute_selected_logits(hidden_states,
+                                                      logits_indices)
+            else:
+                logits = self.compute_logits_from_hidden_states(
+                    sample_hidden_states)
+
+            if self.is_pooling_model:
+                pooling_metadata = self.input_batch.get_pooling_metadata()
+                # num_scheduled_tokens_np, seq_lens_cpu for this chunk
+                req_ids = self.input_batch.req_ids[start_index:start_index +
+                                                   num_reqs]
+                num_scheduled_tokens_np = np.array([
+                    scheduler_output.num_scheduled_tokens[req_id]
+                    for req_id in req_ids
+                ],
+                                                   dtype=np.int32)
+                seq_lens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
+                    start_index:start_index + num_reqs]
+                pooling_metadata.build_pooling_cursor(
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    seq_lens_cpu=seq_lens_cpu,
+                    device=self.device,
+                )
+                pooler_output = self.model.pooler(
+                    hidden_states=hidden_states,
+                    pooling_metadata=pooling_metadata,
+                )
+                pooler_output_list.append(pooler_output)
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -2204,10 +2303,15 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=logits_list,
+            pooler_output_list=pooler_output_list,
             num_reqs_list=num_reqs_list,
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
         )
+
+        if self.is_pooling_model:
+            return self.sample_tokens(None)
+
         return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2272,9 +2376,17 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_offset = 0
         combined_logprobs: list[Any] = []
 
-        use_spec = any(md is not None
-                       for md in state.spec_decode_metadata_list)
-        if use_spec:
+        # True if the step has drafts to verify (a request carried drafts in
+        # from the previous step). Not the same as self.speculative_config, the
+        # static "spec configured" flag: on prefill/first-decode steps spec is
+        # configured but no drafts exist yet, so is_spec_step is False there.
+        is_spec_step = any(md is not None
+                           for md in state.spec_decode_metadata_list)
+        if self.is_pooling_model:
+            req_ids = cast(
+                list[str],
+                self.input_batch.req_ids[:self.input_batch.num_reqs])
+        elif is_spec_step:
             if needs_logprobs:
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
@@ -2554,7 +2666,7 @@ class TPUModelRunner(GPUModelRunner):
         eagle3_drafts = None
         if (self.speculative_config and self.speculative_config.use_eagle()
                 and combined_selected_tokens):
-            if use_spec:
+            if is_spec_step:
                 eagle3_drafts = (
                     self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
@@ -2589,11 +2701,10 @@ class TPUModelRunner(GPUModelRunner):
             # and the per-request rejected count to park.
             spec_num_rejected = None
             num_draft_per_req = None
-            if use_spec:
-                spec_num_rejected, num_draft_per_req = (
-                    self._assemble_async_spec_substitution(
-                        eagle3_drafts, next_tokens_per_chunk, state,
-                        next_tokens_tpu_chunks, next_token_indices))
+            if is_spec_step:
+                (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                 num_draft_per_req) = (self._assemble_async_spec_substitution(
+                     eagle3_drafts, next_tokens_per_chunk, state))
             elif (self.speculative_config
                   and self.speculative_config.use_eagle()
                   and next_tokens_tpu_chunks):
@@ -2602,16 +2713,15 @@ class TPUModelRunner(GPUModelRunner):
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
                 # prompt-context drafts so the NEXT step's verify gets real
                 # drafts instead of placeholders.
-                next_tokens_tpu_chunks.clear()
-                next_token_indices.clear()
-                spec_num_rejected, num_draft_per_req = (
-                    self._assemble_async_prefill_bootstrap(
-                        eagle3_drafts, combined_selected_tokens,
-                        combined_selected_tokens_real_lens,
-                        next_tokens_tpu_chunks, next_token_indices))
-            req_id_to_index_copy = self._update_placeholder(
-                discard_sampled_tokens_req_indices, request_seq_lens,
-                next_token_indices, num_draft_per_req)
+                (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                 num_draft_per_req) = (self._assemble_async_prefill_bootstrap(
+                     eagle3_drafts, combined_selected_tokens,
+                     combined_selected_tokens_real_lens))
+            req_id_to_index_copy = {}
+            if not self.is_pooling_model:
+                req_id_to_index_copy = self._update_placeholder(
+                    discard_sampled_tokens_req_indices, request_seq_lens,
+                    next_token_indices, num_draft_per_req)
             if next_tokens_tpu_chunks:
                 if len(next_tokens_tpu_chunks) == 1:
                     next_tokens_tpu = next_tokens_tpu_chunks[0]
@@ -2646,6 +2756,15 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 self._pre_async_results = None
 
+        pooler_output = []
+        if self.is_pooling_model:
+            for out in state.pooler_output_list:
+                # Move to CPU as expected by vLLM
+                if isinstance(out, torch.Tensor):
+                    pooler_output.extend(list(out.cpu().unbind(dim=0)))
+                else:
+                    pooler_output.extend(out)
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
             # Snapshot of the req_id_to_index for the VLLM scheduler.
@@ -2655,7 +2774,7 @@ class TPUModelRunner(GPUModelRunner):
             logprobs=logprobs,
             prompt_logprobs_dict={req_id: None
                                   for req_id in req_ids},
-            pooler_output=[],
+            pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
         )
 
@@ -2667,22 +2786,24 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self.scheduler_config.async_scheduling:
             final_output = async_output.get_output()
-            for i, req_state, seq_len, req_id in request_seq_lens:
-                if i in discard_sampled_tokens_req_indices:
-                    continue
-                valid_tokens = final_output.sampled_token_ids[i]
-                if not valid_tokens:
-                    continue
-                req_idx = self.input_batch.req_id_to_index[req_id]
+            if not self.is_pooling_model:
+                for i, req_state, seq_len, req_id in request_seq_lens:
+                    if i in discard_sampled_tokens_req_indices:
+                        continue
+                    valid_tokens = final_output.sampled_token_ids[i]
+                    if not valid_tokens:
+                        continue
+                    req_idx = self.input_batch.req_id_to_index[req_id]
 
-                # Update the persistent batch.
-                start_tok_idx = self.input_batch.num_tokens_no_spec[req_idx]
-                end_tok_idx = start_tok_idx + len(valid_tokens)
-                self.input_batch.token_ids_cpu[
-                    req_idx, start_tok_idx:end_tok_idx] = valid_tokens
-                self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+                    # Update the persistent batch.
+                    start_tok_idx = self.input_batch.num_tokens_no_spec[
+                        req_idx]
+                    end_tok_idx = start_tok_idx + len(valid_tokens)
+                    self.input_batch.token_ids_cpu[
+                        req_idx, start_tok_idx:end_tok_idx] = valid_tokens
+                    self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
 
-                req_state.output_token_ids.extend(valid_tokens)
+                    req_state.output_token_ids.extend(valid_tokens)
 
             if (self.speculative_config
                     and self.speculative_config.method == "ngram"):
@@ -2931,6 +3052,17 @@ class TPUModelRunner(GPUModelRunner):
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
+    def _precompile_compute_logits_from_hidden_states(self) -> None:
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("compute_logits_from_hidden_states"):
+            for num_reqs in self.num_reqs_paddings:
+                dummy_hidden = torch.zeros((num_reqs, hsize),
+                                           device=self.device,
+                                           dtype=self._hidden_states_dtype)
+                out = self.compute_logits_from_hidden_states(dummy_hidden)
+                sync.synchronize(out, wait=True)
+                logger.info("  -- num_seqs: %d", num_reqs)
+
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
             arange = self.structured_decode_arange.to(self.device)
@@ -3138,6 +3270,9 @@ class TPUModelRunner(GPUModelRunner):
         """Compile sampling-path subgraphs so their bottom-HBM reservations
         are visible to vLLM's available-memory probe in profile_run."""
         self._precompile_compute_selected_logits()
+        if (_get_sequence_layout_planner_for_runner(
+                self).uses_selected_logits_hidden_states):
+            self._precompile_compute_logits_from_hidden_states()
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
@@ -4012,8 +4147,15 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
             indices_do_sample: torch.Tensor) -> torch.Tensor:
+        if self.is_pooling_model:
+            return torch.empty((0, ), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_logits_from_hidden_states(
+            self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.compute_logits(hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(

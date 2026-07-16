@@ -97,13 +97,10 @@ TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT:-9600}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 DECODE_TP="${DECODE_TP:-2}"
-PREFILL_VISIBLE="${PREFILL_VISIBLE:-0,1}"
-PREFILL_BOUNDS="${PREFILL_BOUNDS:-1,2,1}"
-DECODE_VISIBLE="${DECODE_VISIBLE:-2}"
-DECODE_BOUNDS="${DECODE_BOUNDS:-1,1,1}"
 # Temporary same-host P4/D2 test hook. This is intentionally DEBUG-prefixed:
 # it offsets TorchTPU's physical LOCAL_RANK binding for the decode server and
 # is not a CUDA_VISIBLE_DEVICES-style remapping mechanism.
+PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET="${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET:-0}"
 DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET="${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET:-4}"
 
 BLOCK_SIZE="${BLOCK_SIZE:-2112}"
@@ -266,8 +263,8 @@ ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}
 MAMBA_CACHE_MODE=${MAMBA_CACHE_MODE}
 ASYNC_SCHEDULING=${ASYNC_SCHEDULING}
 BIND_HOST=${SERVE_HOST} PREFILL_PORT=${PREFILL_PORT} DECODE_PORT=${DECODE_PORT} PROXY_PORT=${PROXY_PORT}
-PREFILL_VISIBLE=${PREFILL_VISIBLE} PREFILL_BOUNDS=${PREFILL_BOUNDS} NAMESPACE=${prefill_namespace}
-DECODE_VISIBLE=${DECODE_VISIBLE} DECODE_BOUNDS=${DECODE_BOUNDS} DEBUG_TPU_LOCAL_RANK_OFFSET=${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET} NAMESPACE=${decode_namespace}
+PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET=${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET} TPU_KV_TRANSFER_NAMESPACE=${prefill_namespace}
+DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET=${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET} TPU_KV_TRANSFER_NAMESPACE=${decode_namespace}
 KV_PORT=${KV_PORT}
 TPU_KV_TRANSFER_PORT=${TPU_KV_TRANSFER_PORT}
 TPU_SIDE_CHANNEL_PORT=${TPU_SIDE_CHANNEL_PORT}
@@ -315,8 +312,8 @@ EOF
 prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --tensor-parallel-size "${PREFILL_TP}" --kv-transfer-config "${p_kv}")
 decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --tensor-parallel-size "${DECODE_TP}" --kv-transfer-config "${d_kv}")
 
-prefill_cmd="${common_env}"$'\n'"export TPU_VISIBLE_CHIPS='${PREFILL_VISIBLE}'; export TPU_CHIPS_PER_HOST_BOUNDS='${PREFILL_BOUNDS}'; unset DEBUG_TPU_LOCAL_RANK_OFFSET; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
-decode_cmd="${common_env}"$'\n'"export TPU_VISIBLE_CHIPS='${DECODE_VISIBLE}'; export TPU_CHIPS_PER_HOST_BOUNDS='${DECODE_BOUNDS}'; export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"

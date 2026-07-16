@@ -7,8 +7,8 @@ on:
 
 jobs:
   pre-commit:
-    if: github.repository == 'google-pytorch/torchtpu-vllm'
-    runs-on: ubuntu-latest
+    if: github.repository == 'vllm-project/vllm-torchtpu'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python

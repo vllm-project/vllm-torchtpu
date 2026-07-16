@@ -95,11 +95,6 @@ class PcpStaticSupportValidator:
             raise NotImplementedError(
                 "PCP runner path does not support KV consumer/decode workers "
                 "yet. Disable PCP on decode workers.")
-        if config.async_scheduling:
-            raise ValueError(
-                "PCP runner path does not support async scheduling yet. "
-                "Set async_scheduling=False when using "
-                "prefill_context_parallel_size > 1.")
         if config.dcp_size > 1:
             raise NotImplementedError(
                 "PCP runner path does not support DCP yet.")

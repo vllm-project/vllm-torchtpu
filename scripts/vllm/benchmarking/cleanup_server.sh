@@ -10,7 +10,7 @@ echo "Cleaning up vLLM server..."
 
 # 1. Try to kill processes gracefully
 pkill -TERM -f "vllm serve" 2>/dev/null || true
-pkill -TERM -f "python.*vllm" 2>/dev/null || true
+pkill -TERM -f "vllm" 2>/dev/null || true
 sleep 2
 
 # 2. Force kill process occupying port 8000 and any remaining vllm processes
@@ -19,7 +19,7 @@ if command -v lsof >/dev/null; then
   lsof -ti:8000 | xargs kill -9 2>/dev/null || true
 fi
 pkill -9 -f "vllm serve" 2>/dev/null || true
-pkill -9 -f "python.*vllm" 2>/dev/null || true
+pkill -9 -f "vllm" 2>/dev/null || true
 
 # 3. Force kill processes occupying TPU devices (/dev/vfio/* and /dev/accel*)
 # This targets the EngineCore processes in vLLM V1.

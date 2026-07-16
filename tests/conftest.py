@@ -33,6 +33,11 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 # cache (TpuCompilerAdaptor, correctly keyed) already provides reuse.
 os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
 
+# Disable vLLM background usage telemetry in tests to prevent background threads
+# and IPC sockets from hanging multi-process worker teardown.
+os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
+os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
+
 import pytest
 import torch
 
