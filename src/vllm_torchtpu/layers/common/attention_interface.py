@@ -14,7 +14,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
-import vllm_torchtpu.kernels.mla.v1.kernel as mla_v1_kernel
+import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
@@ -38,7 +38,7 @@ get_kv_cache_shape = rpa_default.get_kv_cache_shape
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 
-mla_ragged_paged_attention = mla_v1_kernel.mla_ragged_paged_attention
+mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 
 
 def sharded_flash_attention(
@@ -523,6 +523,9 @@ def mla_attention(
         num_kv_pages_per_block = min(min(pages_per_seq, bkv_p), 4)
         num_queries_per_block = min(min(max_num_tokens, bq_sz), 4)
 
+        # tpu-inference kernel expects ql_nope in (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
+        q = q.transpose((1, 0, 2))
+
         out, new_cache = mla_ragged_paged_attention(
             q,
             q_rope,
@@ -539,6 +542,9 @@ def mla_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale)
+
+        # tpu-inference kernel returns out in (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
+        out = out.transpose((1, 0, 2))
 
         return out, new_cache
 
