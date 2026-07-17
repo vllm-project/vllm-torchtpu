@@ -913,6 +913,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
+        # Derive weight_block_size explicitly from weight_scale layout when requant_block_size is unspecified.
+        # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream linear kernels and dequantization
+        # pipelines properly recognize scale broadcast granularity right across tensor-parallel shards.
         if requant_block_size is None:
             if weight_scale.ndim == 1:
                 if weight_scale.shape[0] == weight.shape[0]:

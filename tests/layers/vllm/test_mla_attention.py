@@ -164,3 +164,55 @@ def test_vllm_multi_head_latent_attention_wrapper():
         )
         assert wrapper.hidden_size == 1024
         assert wrapper.num_heads == 16
+
+
+def test_pallas_mla_backend_impl():
+    impl = PallasMLAttentionBackendImpl(
+        num_heads=16,
+        head_size=576,
+        scale=0.125,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type="DECODER",
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        qk_head_dim=192,
+        v_head_dim=128,
+    )
+    assert impl.num_heads == 16
+    assert impl.kv_lora_rank == 512
+
+    # Test _get_kv_scales
+    layer = MagicMock()
+    layer._q_scale_float = None
+    layer._k_scale_float = None
+    layer._v_scale_float = None
+    layer._q_scale = torch.tensor(1.5)
+    layer._k_scale = torch.tensor(2.0)
+    layer._v_scale = torch.tensor(2.5)
+    q_scale, k_scale, v_scale = impl._get_kv_scales(layer)
+    assert q_scale == 1.5
+    assert k_scale == 2.0
+    assert v_scale == 2.5
+
+    # Test forward with empty kv_cache (probe check)
+    layer.num_heads = 16
+    layer.v_head_dim = 128
+    q_nope = torch.ones((4, 16 * 128))
+    q_pe = torch.ones((4, 16 * 64))
+    empty_kv_cache = torch.empty((0, ))
+    out = impl.forward(
+        layer=layer,
+        q=(q_nope, q_pe),
+        kv_c_normed=torch.ones((4, 512)),
+        k_pe=torch.ones((4, 64)),
+        kv_cache=empty_kv_cache,
+        attn_metadata=MagicMock(),
+    )
+    assert out.shape == (4, 16 * 128)

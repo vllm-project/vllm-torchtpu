@@ -176,15 +176,14 @@ def apply_tpu_patches() -> None:
     _tpu_patches_applied = True
 
     import vllm_torchtpu as tpu_plugin
-    from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
-                               _patch_disable_sequence_parallel_moe,
-                               _patch_mla_prefill_backend,
-                               _patch_moe_no_ep_tp_scope,
-                               _patch_rowparallel_defer_bias,
-                               _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
+    from vllm_torchtpu import (  # isort: skip
+        _patch_default_moe_runner_select_forward, _patch_disable_dp_ubatch,
+        _patch_disable_sequence_parallel_moe, _patch_mla_prefill_backend,
+        _patch_moe_no_ep_tp_scope, _patch_multiproc_worker_global_rank_env,
+        _patch_rowparallel_defer_bias, _patch_vllm_disable_compile_ranges,
+        _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
@@ -196,10 +195,9 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_mla_prefill_backend()
-    from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -464,6 +462,11 @@ class TpuPlatform(Platform):
             AttentionBackendEnum.FLASH_ATTN,
             "vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend",
         )
+        if hasattr(AttentionBackendEnum, "FLASH_ATTN_MLA"):
+            register_backend(
+                AttentionBackendEnum.FLASH_ATTN_MLA,
+                "vllm_torchtpu.layers.vllm.attention.PallasMLAttentionBackend",
+            )
         # Experimental batched RPA — opt in via `--attention-backend CUSTOM`.
         register_backend(
             AttentionBackendEnum.CUSTOM,
@@ -522,7 +525,12 @@ class TpuPlatform(Platform):
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
                              attn_selector_config: "AttentionSelectorConfig",
                              **kwargs) -> str:
-        if getattr(attn_selector_config, "use_mla", False):
+        backend_name = getattr(selected_backend, "name", None)
+        has_mla = hasattr(AttentionBackendEnum,
+                          "FLASH_ATTN_MLA") and (selected_backend == getattr(
+                              AttentionBackendEnum, "FLASH_ATTN_MLA"))
+        if (has_mla or backend_name == "FLASH_ATTN_MLA"
+                or getattr(attn_selector_config, "use_mla", False)):
             logger.info("Using TPU Pallas MLA attention backend.")
             return "vllm_torchtpu.layers.vllm.attention.PallasMLAttentionBackend"
 

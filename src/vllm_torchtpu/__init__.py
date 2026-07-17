@@ -422,6 +422,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP "
                     "block sizes.")
 
+
 def _patch_mla_prefill_backend() -> None:
     """Disable FlashAttnPrefillBackend for MLA on TPU.
 
