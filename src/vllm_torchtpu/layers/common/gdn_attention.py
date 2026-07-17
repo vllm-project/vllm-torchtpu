@@ -545,7 +545,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
     )
-    out_specs = ((conv_state_spec, recurrent_state_spec), replicated_spec)
+    out_specs = ((conv_state_spec, recurrent_state_spec), token_spec)
 
     def _pcp_prefill_fn(
         local_qkv,
@@ -655,13 +655,14 @@ def run_jax_gdn_attention_pcp_tp_prefill(
              config=config,
          ))
 
-        seq_output = jax.lax.all_gather(seq_output_shard,
-                                        axis_name=pcp_axis,
-                                        axis=-1,
-                                        tiled=True)
-
-        packed_output = seq_output[gather_indices]
-        packed_output = jnp.where(valid_mask[:, None], packed_output, 0.0)
+        packed_output_shard = seq_output_shard[gather_indices]
+        packed_output_shard = jnp.where(valid_mask[:, None],
+                                        packed_output_shard, 0.0)
+        packed_output = jax.lax.all_to_all(packed_output_shard,
+                                           axis_name=pcp_axis,
+                                           split_axis=0,
+                                           concat_axis=1,
+                                           tiled=True)
         return (new_conv_shard, new_rec_shard), packed_output
 
     mapped_fn = jax.shard_map(

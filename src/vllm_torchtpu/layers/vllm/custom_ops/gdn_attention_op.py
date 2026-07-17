@@ -331,7 +331,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             output_partition_specs = (
                 PartitionSpec(None, None, "pcp"),  # new_conv_state
                 PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec(),  # output
+                PartitionSpec("pcp"),  # output
             )
             gdn_jax_op = pcp_streaming_jax_op(
                 op_name,
@@ -345,8 +345,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
                 num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens * pcp_size,
-                             local_num_v_heads * self.head_v_dim)
+                out_shape = (num_tokens, local_num_v_heads * self.head_v_dim)
                 return torch.empty_like(conv_state), torch.empty_like(
                     recurrent_state), torch.empty(out_shape,
                                                   dtype=mixed_qkv.dtype,
