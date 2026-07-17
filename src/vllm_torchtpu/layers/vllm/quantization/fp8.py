@@ -330,6 +330,35 @@ def _quantize_and_format_moe_weights(
     return w13, w13_scale, w2, w2_scale
 
 
+def _format_single_moe_weight_and_scale(
+    w: torch.Tensor,
+    scale: torch.Tensor | None,
+    activation: str,
+    is_w13: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if is_w13 and activation == "swigluoai":
+        w1 = w[:, ::2, :]
+        w3 = w[:, 1::2, :]
+        w = torch.cat([w1, w3], dim=1)
+
+        if scale is not None:
+            s1 = scale[:, ::2, :]
+            s3 = scale[:, 1::2, :]
+            scale = torch.cat([s1, s3], dim=1)
+
+    w = w.transpose(1, 2).contiguous()
+
+    if scale is not None:
+        s = scale.transpose(1, 2).contiguous().to(torch.float32)
+        scale = torch.empty(s.shape[0],
+                            s.shape[1],
+                            1,
+                            s.shape[2],
+                            dtype=s.dtype,
+                            device=s.device).copy_(s.unsqueeze(2))
+    return w, scale
+
+
 def _process_fp8_moe_weights(
     layer: FusedMoE,
     *,
@@ -337,7 +366,7 @@ def _process_fp8_moe_weights(
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
            | None]:
-    """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
+    """Dequantize and requantize FP8 MoE weights in chunks for the TPU GMM kernel.
 
     Returns (w13_weight, w13_scale, w2_weight, w2_scale,
              requant_dtype_name, requant_block_size).
@@ -357,40 +386,93 @@ def _process_fp8_moe_weights(
                 f"block size, got {name}.shape={tuple(weight.shape)} and "
                 f"block_size={weight_block_size}.")
 
-    # Dequantize from checkpoint FP8 to float32
-    w13 = dequantize_tensor(
-        layer.w13_weight.data,
-        layer.w13_weight_scale_inv.data,
-        axis=(1, 2),
-        out_dtype=torch.float32,
-    )
-    w2 = dequantize_tensor(
-        layer.w2_weight.data,
-        layer.w2_weight_scale_inv.data,
-        axis=(1, 2),
-        out_dtype=torch.float32,
-    )
     padded_intermediate = layer.moe_config.intermediate_size_per_partition
     unpadded_intermediate = (
         layer.moe_config.intermediate_size_per_partition_unpadded)
-    if padded_intermediate != unpadded_intermediate:
+    need_masking = (padded_intermediate != unpadded_intermediate)
+    local_real = 0
+    if need_masking:
         full_intermediate = unpadded_intermediate * layer.tp_size
         local_start = padded_intermediate * layer.tp_rank
         local_real = max(
             0, min(padded_intermediate, full_intermediate - local_start))
-        if local_real < padded_intermediate:
-            w13[:, local_real:padded_intermediate, :] = 0
-            w13[:, padded_intermediate + local_real:2 *
-                padded_intermediate, :] = 0
-            w2[:, :, local_real:padded_intermediate] = 0
+        if local_real >= padded_intermediate:
+            need_masking = False
 
-    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
-        w13,
-        w2,
-        quant_dtype=requant_dtype,
-        block_size=requant_block_size,
-        activation=activation,
-    )
+    num_experts = layer.w13_weight.data.shape[0]
+    chunk_size = 16
+
+    w13_list, w13_scale_list = [], []
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        w13_chunk = dequantize_tensor(
+            layer.w13_weight.data[start:end],
+            layer.w13_weight_scale_inv.data[start:end],
+            axis=(1, 2),
+            out_dtype=torch.float32,
+        )
+        if need_masking and local_real < padded_intermediate:
+            w13_chunk[:, local_real:padded_intermediate, :] = 0
+            w13_chunk[:, padded_intermediate + local_real:2 *
+                      padded_intermediate, :] = 0
+
+        if requant_block_size is not None and w13_chunk.shape[-1] % requant_block_size != 0:
+            raise ValueError(
+                f"Re-quantization block size mismatch: contracting "
+                f"dimension {w13_chunk.shape[-1]} is not divisible by "
+                f"block_size={requant_block_size}.")
+
+        w13_q, w13_s = quantize_tensor(w13_chunk,
+                                       quant_dtype=requant_dtype,
+                                       axis=-1,
+                                       block_size=requant_block_size)
+        del w13_chunk
+        w13_q, w13_s = _format_single_moe_weight_and_scale(w13_q, w13_s, activation, is_w13=True)
+        if w13_q.device.type == "tpu":
+            sync.synchronize(w13_q, wait=True)
+            if w13_s is not None:
+                sync.synchronize(w13_s, wait=True)
+        w13_list.append(w13_q)
+        w13_scale_list.append(w13_s)
+
+    w13 = torch.cat(w13_list, dim=0) if len(w13_list) > 1 else w13_list[0]
+    w13_scale = torch.cat(w13_scale_list, dim=0) if w13_scale_list and w13_scale_list[0] is not None else None
+    del w13_list, w13_scale_list
+
+    w2_list, w2_scale_list = [], []
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        w2_chunk = dequantize_tensor(
+            layer.w2_weight.data[start:end],
+            layer.w2_weight_scale_inv.data[start:end],
+            axis=(1, 2),
+            out_dtype=torch.float32,
+        )
+        if need_masking and local_real < padded_intermediate:
+            w2_chunk[:, :, local_real:padded_intermediate] = 0
+
+        if requant_block_size is not None and w2_chunk.shape[-1] % requant_block_size != 0:
+            raise ValueError(
+                f"Re-quantization block size mismatch: contracting "
+                f"dimension {w2_chunk.shape[-1]} is not divisible by "
+                f"block_size={requant_block_size}.")
+
+        w2_q, w2_s = quantize_tensor(w2_chunk,
+                                     quant_dtype=requant_dtype,
+                                     axis=-1,
+                                     block_size=requant_block_size)
+        del w2_chunk
+        w2_q, w2_s = _format_single_moe_weight_and_scale(w2_q, w2_s, activation, is_w13=False)
+        if w2_q.device.type == "tpu":
+            sync.synchronize(w2_q, wait=True)
+            if w2_s is not None:
+                sync.synchronize(w2_s, wait=True)
+        w2_list.append(w2_q)
+        w2_scale_list.append(w2_s)
+
+    w2 = torch.cat(w2_list, dim=0) if len(w2_list) > 1 else w2_list[0]
+    w2_scale = torch.cat(w2_scale_list, dim=0) if w2_scale_list and w2_scale_list[0] is not None else None
+    del w2_list, w2_scale_list
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
@@ -401,7 +483,7 @@ def _quantize_bf16_moe_weights(
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
            | None]:
-    """Quantize BF16 MoE weights to FP8 for the TPU GMM kernel.
+    """Quantize BF16 MoE weights to FP8 in chunks for the TPU GMM kernel.
 
     Same output format as _process_fp8_moe_weights but starts from BF16
     weights instead of dequantizing from FP8 first.
@@ -409,16 +491,50 @@ def _quantize_bf16_moe_weights(
     desired_quant_dtype, requant_dtype, requant_block_size = (
         _get_moe_quant_config("[MoE online FP8]: quantizing BF16 MoE weights"))
 
-    w13 = layer.w13_weight.data.to(torch.float32)
-    w2 = layer.w2_weight.data.to(torch.float32)
+    num_experts = layer.w13_weight.data.shape[0]
+    chunk_size = 16
 
-    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
-        w13,
-        w2,
-        quant_dtype=requant_dtype,
-        block_size=requant_block_size,
-        activation=activation,
-    )
+    w13_list, w13_scale_list = [], []
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        w13_chunk = layer.w13_weight.data[start:end].to(torch.float32)
+        w13_q, w13_s = quantize_tensor(w13_chunk,
+                                       quant_dtype=requant_dtype,
+                                       axis=-1,
+                                       block_size=requant_block_size)
+        del w13_chunk
+        w13_q, w13_s = _format_single_moe_weight_and_scale(w13_q, w13_s, activation, is_w13=True)
+        if w13_q.device.type == "tpu":
+            sync.synchronize(w13_q, wait=True)
+            if w13_s is not None:
+                sync.synchronize(w13_s, wait=True)
+        w13_list.append(w13_q)
+        w13_scale_list.append(w13_s)
+
+    w13 = torch.cat(w13_list, dim=0) if len(w13_list) > 1 else w13_list[0]
+    w13_scale = torch.cat(w13_scale_list, dim=0) if w13_scale_list and w13_scale_list[0] is not None else None
+    del w13_list, w13_scale_list
+
+    w2_list, w2_scale_list = [], []
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        w2_chunk = layer.w2_weight.data[start:end].to(torch.float32)
+        w2_q, w2_s = quantize_tensor(w2_chunk,
+                                     quant_dtype=requant_dtype,
+                                     axis=-1,
+                                     block_size=requant_block_size)
+        del w2_chunk
+        w2_q, w2_s = _format_single_moe_weight_and_scale(w2_q, w2_s, activation, is_w13=False)
+        if w2_q.device.type == "tpu":
+            sync.synchronize(w2_q, wait=True)
+            if w2_s is not None:
+                sync.synchronize(w2_s, wait=True)
+        w2_list.append(w2_q)
+        w2_scale_list.append(w2_s)
+
+    w2 = torch.cat(w2_list, dim=0) if len(w2_list) > 1 else w2_list[0]
+    w2_scale = torch.cat(w2_scale_list, dim=0) if w2_scale_list and w2_scale_list[0] is not None else None
+    del w2_list, w2_scale_list
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 

@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     DP_SCHED_ENABLED: bool = False
     DP_SCHED_BUFFER_PREFILL: bool = False
     DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS: int = 10000
+    MLA_XPOSE_N_TILE_SIZE: int = 160
 
 
 def env_with_choices(
@@ -239,6 +240,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # has waited this long (bounds TTFT).
     "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS":
     lambda: int(os.getenv("DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS") or "10000"),
+    # Tile size for MLA transpose pipeline.
+    "MLA_XPOSE_N_TILE_SIZE":
+    lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
 }
 
 

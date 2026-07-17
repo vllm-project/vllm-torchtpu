@@ -18,7 +18,7 @@ from typing import Any
 import jax
 import torch
 from torch.nn import Parameter
-from torch_tpu._internal import pallas
+from torch_tpu._internal import pallas, sync
 from vllm.config import CacheConfig
 from vllm.model_executor.layers.attention.attention import \
     get_attention_context
@@ -192,6 +192,14 @@ class VllmMLAAttention(MLAAttention):
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
         for key in kv_b_proj_params.keys():
             delattr(self.kv_b_proj, key)
+
+        if self.W_UK_T.device.type == "tpu":
+            sync.synchronize(self.W_UK_T, wait=True)
+            if hasattr(self, "W_UK_T_scale"):
+                sync.synchronize(self.W_UK_T_scale, wait=True)
+            sync.synchronize(self.W_UV, wait=True)
+            if hasattr(self, "W_UV_scale"):
+                sync.synchronize(self.W_UV_scale, wait=True)
 
         q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype is not None:
