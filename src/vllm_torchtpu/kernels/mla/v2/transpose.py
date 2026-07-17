@@ -61,7 +61,7 @@ def prev_closest_valid_divisor(number: int,
 
     Raises ValueError if no divisor of 'number' satisfies both constraints.
     The exception is if min(number, divider) < multiple_of and number <= divider: return
-      'number' itself.  
+      'number' itself.
     This is because Pallas accepts a sublane tile equal to the full array
     dimension.
     """

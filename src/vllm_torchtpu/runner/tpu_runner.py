@@ -67,7 +67,8 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 PallasAttentionBackend)
+                                                 PallasAttentionBackend,
+                                                 PallasMLAttentionBackend)
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
@@ -747,8 +748,6 @@ class TPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
-                from vllm_torchtpu.layers.vllm.attention import \
-                    PallasMLAttentionBackend
                 page_size_padded = (
                     self._hybrid_uniform_page_size_bytes
                     if self._hybrid_uniform_page_size_bytes is not None else
@@ -4032,8 +4031,12 @@ class TPUModelRunner(GPUModelRunner):
                                         dtype=dtype).to(self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
-                    from vllm_torchtpu.layers.vllm.attention import \
-                        PallasMLAttentionBackend
+                    # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
+                    # Because MLA maps all attention heads onto a single joint compressed latent key-value
+                    # representation (`num_kv_heads=1`), the physical KV cache dimension never splits
+                    # across tensor parallel ranks (`tp_size`) during SPMD graph execution (`self.use_spmd`).
+                    # Each device partition consistently retains a complete, unsliced replication of the
+                    # compressed latent cache structure across multi-chip execution loops.
                     kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,

@@ -18,6 +18,8 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
+from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
+                                                       get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.sharding import ShardingAxisName
 from vllm_torchtpu.logger import init_logger
@@ -480,18 +482,51 @@ def mla_attention(
         q_scale: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        sm_scale: float | None = None) -> Tuple[jax.Array, jax.Array]:
-    """
-    Main shared interface for MLA attention. Computes the sharded attention
-    output and kv cache update.
+        sm_scale: float | None = None,
+        decode_batch_size: int | None = None) -> Tuple[jax.Array, jax.Array]:
+    """Main shared interface for Multi-Head Latent Attention (MLA).
+
+    Computes sharded MLA paged attention and applies in-place KV cache updates across
+    the device mesh using custom Pallas kernels.
+
+    Args:
+        q_TNA: NOPE query activations in token-major format `(T, N, A)` (`[num_tokens, num_heads, lkv_dim]`).
+        q_rope_TNH: RoPE query activations in token-major format `(T, N, H)` (`[num_tokens, num_heads, rope_dim]`).
+        k_SA: New compressed latent keys to insert into the KV cache `(S, A)` (`[num_tokens, lkv_dim]`).
+        k_rope_SH: New RoPE keys to insert into the KV cache `(S, H)` (`[num_tokens, rope_dim]`).
+        kv_cache: Persistent paged latent KV cache tensor residing across devices.
+        md: Attention metadata containing block tables, sequence lengths, and layout indices.
+        mesh: JAX execution device mesh dictating parallel shard routing.
+        num_attention_heads: Total number of attention heads across the layer.
+        qk_nope_head_dim: Inner compressed projection dimension (`lkv_dim`).
+        query_tnh_sharding: Optional partition layout for incoming queries (`ATTN_DATA`, `ATTN_HEAD`).
+        keyvalue_skh_sharding: Optional partition layout for incoming KV activations.
+        attn_o_tnh_sharding: Optional partition layout for returned attention outputs (`ATTN_DATA`, `ATTN_HEAD`).
+        q_scale: Optional scalar activation quantization scale for queries.
+        k_scale: Optional scalar parameter quantization scale for latent keys.
+        v_scale: Optional scalar parameter quantization scale for latent values.
+        sm_scale: Softmax temperature scale factor.
+        decode_batch_size: Optional explicit batch dimension for decoding loops.
+
+    Returns:
+        Tuple of `(updated_kv_cache, output_TNA)` in token-major sequence layout `(T, N, D)`.
+
+    Note on Sharding Axis Names (`ATTN_DATA` / `ATTN_HEAD`):
+        `ATTN_DATA` denotes batch/data parallelism along the sequence length axis (`T` and `S`),
+        while `ATTN_HEAD` denotes tensor parallelism across individual head partitions (`N`).
+        Keeping the interface token-major `(T, N, A)` (`P(ATTN_DATA, ATTN_HEAD, None)`) guarantees
+        strict partition equivalence across sequence slices between query activations, `seq_lens`,
+        and block metadata during multi-device sharded execution.
     """
     in_specs = (
         query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
-                                ShardingAxisName.ATTN_HEAD, None),  # q
-        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
-                                ShardingAxisName.ATTN_HEAD, None),  # q_rope
-        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k
-        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_rope
+                                ShardingAxisName.ATTN_HEAD, None),  # q_TNA
+        query_tnh_sharding
+        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+             None),  # q_rope_TNH
+        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_SA
+        keyvalue_skh_sharding
+        or P(ShardingAxisName.ATTN_DATA, None),  # k_rope_SH
         P(ShardingAxisName.ATTN_DATA),  # kv_cache
         P(ShardingAxisName.ATTN_DATA),  # md.seq_lens
         P(ShardingAxisName.ATTN_DATA),  # md.block_tables
@@ -501,27 +536,36 @@ def mla_attention(
     out_specs = (
         attn_o_tnh_sharding
         or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-             None),  # attn output
+             None),  # attn output in token-major sequence format (T, N, D)
         P(ShardingAxisName.ATTN_DATA),  # kv cache
     )
 
     def _mla_ragged_paged_attention(q, q_rope, k, k_rope, cache, seq_lens,
                                     block_tables, query_start_loc,
                                     request_distribution):
-        from vllm_torchtpu.kernels.ragged_paged_attention.v3.tuned_block_sizes import \
-            get_tuned_block_sizes
-        max_num_tokens = q.shape[0]
-        max_num_seqs = seq_lens.shape[0]
-        pages_per_seq = block_tables.shape[0] // max_num_seqs
+        max_num_tokens = q.shape[
+            0]  # q is in token-major sequence format (T, N, A)
+        actual_r_dim = q_rope.shape[2]
+        kv_dtype_str = "float8_e4m3fn" if any(
+            x in str(cache.dtype).lower()
+            for x in ("fp8", "e4m3")) else "bfloat16"
 
-        bkv_p, bq_sz = get_tuned_block_sizes(q.dtype, cache.dtype,
-                                             num_attention_heads, 1,
-                                             qk_nope_head_dim, cache.shape[1],
-                                             max_num_tokens, pages_per_seq)
-        num_kv_pages_per_block = min(min(pages_per_seq, bkv_p), 4)
-        num_queries_per_block = min(min(max_num_tokens, bq_sz), 4)
+        tuning_key = TuningKey(
+            case="batched_decode",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=num_attention_heads,
+            actual_lkv_dim=qk_nope_head_dim,
+            actual_r_dim=actual_r_dim,
+            kv_dtype=kv_dtype_str,
+        )
+        tuned = get_tuned_params(tuning_key)
+        eff_decode_batch_size = decode_batch_size or tuned.decode_batch_size
 
-        # tpu-inference kernel expects ql_nope in (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
+        # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
+        num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block, 1, 1)
+        num_queries_per_blocks = (tuned.num_queries_per_block, 16, 16)
+
+        # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
         q = q.transpose((1, 0, 2))
 
         out, new_cache = mla_ragged_paged_attention(
@@ -535,13 +579,14 @@ def mla_attention(
             query_start_loc,
             request_distribution,
             sm_scale=sm_scale or 1.0,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
+            num_kv_pages_per_block=num_kv_pages_per_blocks,
+            num_queries_per_block=num_queries_per_blocks,
+            decode_batch_size=eff_decode_batch_size,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale)
 
-        # tpu-inference kernel returns out in (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
+        # tpu-inference kernel returns out in head-major (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
         out = out.transpose((1, 0, 2))
 
         return out, new_cache

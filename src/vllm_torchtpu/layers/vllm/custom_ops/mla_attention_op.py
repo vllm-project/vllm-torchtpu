@@ -11,14 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA).
 
-import functools
+Note on File Location (`vllm-torchtpu` convention):
+    Per repository practice, out-of-tree structural wrappers (`_oot`) and custom operations strictly reside
+    within `layers/vllm/custom_ops/*_op.py` (parallel to `gdn_attention_op.py`). This establishes clear boundary
+    segregation between standard vLLM execution backends (`layers/vllm/attention.py`) and out-of-tree
+    platform wrappers.
+"""
+
 from typing import Any
 
-import jax
 import torch
 from torch.nn import Parameter
-from torch_tpu._internal import pallas, sync
+from torch_tpu._internal import sync
 from vllm.config import CacheConfig
 from vllm.model_executor.layers.attention.attention import \
     get_attention_context
@@ -33,58 +39,11 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import \
     DeepseekScalingRotaryEmbedding
 from vllm.v1.attention.backend import AttentionType
 
-from vllm_torchtpu.layers.common.attention_interface import mla_attention
-from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    get_vllm_model_wrapper_context
 
 
-def mla_attention_core_tpu(
-    kv_cache: jax.Array,
-    q_nope: jax.Array,
-    q_pe: jax.Array,
-    kv_c_normed: jax.Array,
-    k_pe: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    query_start_loc: jax.Array,
-    request_distribution: jax.Array,
-    *,
-    mesh: jax.sharding.Mesh,
-    num_attention_heads: int,
-    qk_nope_head_dim: int,
-    sm_scale: float,
-    q_scale: float | None = None,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
-) -> tuple[jax.Array, jax.Array]:
-    metadata = AttentionMetadata(
-        input_positions=None,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
-        request_distribution=request_distribution,
-    )
-    new_kv_cache, outputs = mla_attention(
-        q_nope,
-        q_pe,
-        kv_c_normed,
-        k_pe,
-        kv_cache,
-        metadata,
-        mesh,
-        num_attention_heads,
-        qk_nope_head_dim,
-        sm_scale=sm_scale,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
-    return new_kv_cache, outputs
-
-
-class VllmMLAAttention(MLAAttention):
+class VllmTPUMLAAttention(MLAAttention):
+    """TPU-optimized out-of-tree wrapper for Multi-Head Latent Attention."""
 
     def __init__(
         self,
@@ -120,48 +79,6 @@ class VllmMLAAttention(MLAAttention):
             self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(
                 self.kv_cache_dtype.lower().strip())
 
-    def _build_mla_op(self,
-                      q_scale: float | None = None,
-                      k_scale: float | None = None,
-                      v_scale: float | None = None):
-        vllm_context = get_vllm_model_wrapper_context()
-        wrapped_fn = functools.partial(
-            mla_attention_core_tpu,
-            mesh=vllm_context.mesh,
-            num_attention_heads=self.num_heads,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            sm_scale=self.scale,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-
-        op_name = f"pallas::mla_attention_{self.layer_name.replace('.', '_')}"
-        mla_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(0, ))
-
-        def _fake_mla(kv_cache, q_nope, q_pe, kv_c_normed, k_pe, *args,
-                      **kwargs):
-            num_tokens = q_nope.size(0)
-            out_shape = (num_tokens, self.num_heads, self.kv_lora_rank)
-            return torch.empty_like(kv_cache), torch.empty(
-                out_shape, dtype=q_nope.dtype, device=q_nope.device)
-
-        mla_jax_op.register_fake(_fake_mla)
-
-        def mla_impl(kv_cache: torch.Tensor, q_nope: torch.Tensor,
-                     q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
-                     k_pe: torch.Tensor, seq_lens: torch.Tensor,
-                     block_tables: torch.Tensor, query_start_loc: torch.Tensor,
-                     request_distribution: torch.Tensor) -> torch.Tensor:
-            new_kv, outputs = mla_jax_op(kv_cache, q_nope, q_pe, kv_c_normed,
-                                         k_pe, seq_lens, block_tables,
-                                         query_start_loc, request_distribution)
-
-            kv_cache.copy_(new_kv)
-            return outputs
-
-        return mla_impl
-
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
 
@@ -187,11 +104,13 @@ class VllmMLAAttention(MLAAttention):
                                     requires_grad=False)
             self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
 
-        # Delete kv_b_proj_params as the dequantized weights are now stored
-        # in self.W_UK_T and self.W_UV.
+        # Safely detach and clear kv_b_proj parameter buffers without breaking PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
         for key in kv_b_proj_params.keys():
-            delattr(self.kv_b_proj, key)
+            if key in self.kv_b_proj._parameters:
+                self.kv_b_proj._parameters[key] = None
+            elif hasattr(self.kv_b_proj, key):
+                delattr(self.kv_b_proj, key)
 
         if self.W_UK_T.device.type == "tpu":
             sync.synchronize(self.W_UK_T, wait=True)
@@ -201,29 +120,11 @@ class VllmMLAAttention(MLAAttention):
             if hasattr(self, "W_UV_scale"):
                 sync.synchronize(self.W_UV_scale, wait=True)
 
-        q_scale = k_scale = v_scale = None
-        if self.kv_cache_quantized_dtype is not None:
-            q_scale = getattr(self, "_q_scale_float", None)
-            if q_scale is None and hasattr(self, "_q_scale"):
-                q_scale = self._q_scale.item() if not isinstance(
-                    self._q_scale, torch.Tensor
-                ) or self._q_scale.ndim == 0 else self._q_scale.tolist()
-            k_scale = getattr(self, "_k_scale_float", None)
-            if k_scale is None and hasattr(self, "_k_scale"):
-                k_scale = self._k_scale.item() if not isinstance(
-                    self._k_scale, torch.Tensor
-                ) or self._k_scale.ndim == 0 else self._k_scale.tolist()
-            v_scale = getattr(self, "_v_scale_float", None)
-            if v_scale is None and hasattr(self, "_v_scale"):
-                v_scale = self._v_scale.item() if not isinstance(
-                    self._v_scale, torch.Tensor
-                ) or self._v_scale.ndim == 0 else self._v_scale.tolist()
-            if v_scale is None:
-                v_scale = k_scale
-
-        self.mla_op = self._build_mla_op(q_scale=q_scale,
-                                         k_scale=k_scale,
-                                         v_scale=v_scale)
+        q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
+        self.mla_op = self.impl._build_mla_op(self,
+                                              q_scale=q_scale,
+                                              k_scale=k_scale,
+                                              v_scale=v_scale)
 
     def forward(self,
                 q: tuple[torch.Tensor, torch.Tensor],
@@ -231,94 +132,29 @@ class VllmMLAAttention(MLAAttention):
                 k_pe: torch.Tensor,
                 output: torch.Tensor | None = None,
                 **kwargs) -> torch.Tensor:
-        if self.calculate_kv_scales:
+        if getattr(self, "calculate_kv_scales", False):
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe,
                                                 self.layer_name)
 
-        # Get the attention metadata and kv cache
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
-        q_nope, q_pe = q
-        input_dtype = q_nope.dtype
+        return self.impl.forward(
+            layer=self,
+            q=q,
+            kv_c_normed=kv_c_normed,
+            k_pe=k_pe,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            output=output,
+        )
 
-        # For determine_available_memory case.
-        if kv_cache.numel() == 0:
-            out_shape = (q_nope.shape[0], self.num_heads * self.v_head_dim)
-            if output is None:
-                output = torch.ones(out_shape,
-                                    dtype=input_dtype,
-                                    device=q_nope.device)
-            else:
-                output.fill_(1)
-            return output
 
-        # (B, N, P) x (N, P, L) -> (B, N, L)
-        q_nope_t = q_nope.transpose(0, 1)
-        ql_nope = torch.bmm(q_nope_t.to(torch.float32),
-                            self.W_UK_T.to(torch.float32))
-        if hasattr(self, "W_UK_T_scale"):
-            ql_nope = ql_nope * self.W_UK_T_scale.to(torch.float32)
-        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
-
-        q_scale = k_scale = v_scale = None
-        if self.kv_cache_quantized_dtype is not None:
-            from vllm_torchtpu.layers.common.quantization import quantize_kv
-            q_scale = getattr(self, "_q_scale_float", None)
-            if q_scale is None and hasattr(self, "_q_scale"):
-                q_scale = self._q_scale.item() if not isinstance(
-                    self._q_scale, torch.Tensor
-                ) or self._q_scale.ndim == 0 else self._q_scale.tolist()
-            k_scale = getattr(self, "_k_scale_float", None)
-            if k_scale is None and hasattr(self, "_k_scale"):
-                k_scale = self._k_scale.item() if not isinstance(
-                    self._k_scale, torch.Tensor
-                ) or self._k_scale.ndim == 0 else self._k_scale.tolist()
-            v_scale = getattr(self, "_v_scale_float", None)
-            if v_scale is None and hasattr(self, "_v_scale"):
-                v_scale = self._v_scale.item() if not isinstance(
-                    self._v_scale, torch.Tensor
-                ) or self._v_scale.ndim == 0 else self._v_scale.tolist()
-            if v_scale is None:
-                v_scale = k_scale
-
-            kv_c_normed, _ = quantize_kv(self.kv_cache_quantized_dtype,
-                                         kv_c_normed,
-                                         value=None,
-                                         k_scale=k_scale)
-            k_pe, _ = quantize_kv(self.kv_cache_quantized_dtype,
-                                  k_pe,
-                                  value=None,
-                                  k_scale=k_scale)
-
-        ql_nope = ql_nope.view(-1, self.num_heads, self.kv_lora_rank)
-        q_pe = q_pe.view(-1, self.num_heads, self.qk_rope_head_dim)
-        kv_c_normed = kv_c_normed.view(-1, self.kv_lora_rank)
-        k_pe = k_pe.view(-1, self.qk_rope_head_dim)
-
-        # Call mla_op
-        outputs = self.mla_op(kv_cache, ql_nope, q_pe, kv_c_normed, k_pe,
-                              attn_metadata.seq_lens,
-                              attn_metadata.block_tables,
-                              attn_metadata.query_start_loc,
-                              attn_metadata.request_distribution)
-
-        outputs_t = outputs.reshape(-1, self.num_heads,
-                                    self.kv_lora_rank).transpose(0, 1)
-        out_proj = torch.bmm(outputs_t.to(torch.float32),
-                             self.W_UV.to(torch.float32))
-        if hasattr(self, "W_UV_scale"):
-            out_proj = out_proj * self.W_UV_scale.to(torch.float32)
-        outputs = out_proj.transpose(0, 1).to(input_dtype).reshape(
-            -1, self.num_heads * self.v_head_dim)
-
-        if outputs is not output and output is not None:
-            output.copy_(outputs)
-
-        return outputs
+# Backward compatibility alias right in case legacy external imports reference old name
+VllmMLAAttention = VllmTPUMLAAttention
 
 
 @MultiHeadLatentAttentionWrapper.register_oot
-class VllmMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
+class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
     def __init__(
         self,
@@ -365,7 +201,7 @@ class VllmMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             self.topk_tokens = self.indexer.topk_tokens
             self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
-        self.mla_attn = VllmMLAAttention(
+        self.mla_attn = VllmTPUMLAAttention(
             num_heads=self.num_heads,
             scale=scale,
             qk_nope_head_dim=self.qk_nope_head_dim,
@@ -457,8 +293,19 @@ class VllmMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         return self.o_proj(attn_out)[0]
 
 
+VllmMultiHeadLatentAttentionWrapper = VllmTPUMultiHeadLatentAttentionWrapper
+
+
 @DeepseekScalingRotaryEmbedding.register_oot
 class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
+    """TPU-compatible DeepSeek Scaling RoPE implementation.
+
+    Why this replacement is mandatory on TPU:
+        Upstream `DeepseekScalingRotaryEmbedding` relies on CUDA-specific ops or fragmented,
+        un-coalesced slice sequences that degrade JAX graph capture and lead to dynamic compilation
+        stalls. This class utilizes pure-PyTorch tensor transformations (`index_select`, `chunk(2)`,
+        and repeated interleaves) with eager device synchronization for zero-overhead static compilation.
+    """
 
     def forward_native(
         self,
