@@ -14,6 +14,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.v1.kernel as mla_v1_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
@@ -36,6 +37,8 @@ get_kv_cache_shape = rpa_default.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
+
+mla_ragged_paged_attention = mla_v1_kernel.mla_ragged_paged_attention
 
 
 def sharded_flash_attention(
@@ -461,3 +464,92 @@ def attention(
     )
 
     return kv_cache, output
+
+
+def mla_attention(
+        q_TNA: jax.Array,
+        q_rope_TNH: jax.Array,
+        k_SA: jax.Array,
+        k_rope_SH: jax.Array,
+        kv_cache: jax.Array,
+        md: AttentionMetadata,
+        mesh: Mesh,
+        num_attention_heads: int,
+        qk_nope_head_dim: int,
+        query_tnh_sharding: Any | None = None,
+        keyvalue_skh_sharding: Any | None = None,
+        attn_o_tnh_sharding: Any | None = None,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        sm_scale: float | None = None) -> Tuple[jax.Array, jax.Array]:
+    """
+    Main shared interface for MLA attention. Computes the sharded attention
+    output and kv cache update.
+    """
+    in_specs = (
+        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
+                                ShardingAxisName.ATTN_HEAD, None),  # q
+        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
+                                ShardingAxisName.ATTN_HEAD, None),  # q_rope
+        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k
+        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_rope
+        P(ShardingAxisName.ATTN_DATA),  # kv_cache
+        P(ShardingAxisName.ATTN_DATA),  # md.seq_lens
+        P(ShardingAxisName.ATTN_DATA),  # md.block_tables
+        P(ShardingAxisName.ATTN_DATA),  # md.query_start_loc
+        P(ShardingAxisName.ATTN_DATA),  # md.distribution
+    )
+    out_specs = (
+        attn_o_tnh_sharding
+        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+             None),  # attn output
+        P(ShardingAxisName.ATTN_DATA),  # kv cache
+    )
+
+    def _mla_ragged_paged_attention(q, q_rope, k, k_rope, cache, seq_lens,
+                                    block_tables, query_start_loc,
+                                    request_distribution):
+        from vllm_torchtpu.kernels.ragged_paged_attention.v3.tuned_block_sizes import \
+            get_tuned_block_sizes
+        max_num_tokens = q.shape[0]
+        max_num_seqs = seq_lens.shape[0]
+        pages_per_seq = block_tables.shape[0] // max_num_seqs
+
+        bkv_p, bq_sz = get_tuned_block_sizes(q.dtype, cache.dtype,
+                                             num_attention_heads, 1,
+                                             qk_nope_head_dim, cache.shape[1],
+                                             max_num_tokens, pages_per_seq)
+        num_kv_pages_per_block = min(min(pages_per_seq, bkv_p), 4)
+        num_queries_per_block = min(min(max_num_tokens, bq_sz), 4)
+
+        out, new_cache = mla_ragged_paged_attention(
+            q,
+            q_rope,
+            k,
+            k_rope,
+            cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            sm_scale=sm_scale or 1.0,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale)
+
+        return out, new_cache
+
+    output_TNA, kv_cache = jax.jit(
+        shard_map.shard_map(_mla_ragged_paged_attention,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))(q_TNA, q_rope_TNH, k_SA,
+                                              k_rope_SH, kv_cache, md.seq_lens,
+                                              md.block_tables,
+                                              md.query_start_loc,
+                                              md.request_distribution)
+    return kv_cache, output_TNA

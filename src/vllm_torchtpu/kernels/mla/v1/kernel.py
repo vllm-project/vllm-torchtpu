@@ -1064,6 +1064,9 @@ def prepare_outputs(
         "sliding_window",
         "soft_cap",
         "mask_value",
+        "q_scale",
+        "k_scale",
+        "v_scale",
         "chunk_prefill_size",
         "num_kv_pages_per_block",
         "num_queries_per_block",
@@ -1089,6 +1092,9 @@ def mla_ragged_paged_attention(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1101,8 +1107,6 @@ def mla_ragged_paged_attention(
         jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
         jax.
         Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
-        jax.
-        Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, r_dim]
 ]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1282,6 +1286,9 @@ def mla_ragged_paged_attention(
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
                 mask_value=mask_value,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 chunk_prefill_size=chunk_prefill_size,
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
