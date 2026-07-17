@@ -281,6 +281,44 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
+def _patch_mla_prefill_backend() -> None:
+    """Disable FlashAttnPrefillBackend for MLA on TPU.
+
+    On TPU, MLA prefill is handled entirely by the custom Pallas MLA kernel.
+    Provide a dummy prefill backend so vLLM doesn't crash trying to initialize FlashAttention.
+    """
+    from vllm.v1.attention.backends.mla.prefill import selector
+
+    if getattr(selector, "_tpu_mla_prefill_patch", False):
+        return
+
+    class TPUDummyMLAPrefillBackend:
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def forward(self, *args, **kwargs):
+            pass
+
+    selector.get_mla_prefill_backend = lambda vllm_config: TPUDummyMLAPrefillBackend
+    selector._tpu_mla_prefill_patch = True
+
+    try:
+        from vllm.model_executor.layers.attention import mla_attention
+        mla_attention.get_mla_prefill_backend = lambda vllm_config: TPUDummyMLAPrefillBackend
+    except Exception:
+        pass
+
+    try:
+        from vllm.v1.attention.backends.mla.prefill.flash_attn import \
+            FlashAttnPrefillBackend
+        FlashAttnPrefillBackend.__init__ = lambda self, *args, **kwargs: None
+    except Exception:
+        pass
+
+    logger.info("Applied TPU patch: dummy MLA prefill backend.")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations

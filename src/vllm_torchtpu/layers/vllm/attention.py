@@ -10,7 +10,8 @@ from torch_tpu._internal import pallas, sync
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
-                                       AttentionLayer, AttentionType)
+                                       AttentionLayer, AttentionType,
+                                       MLAAttentionImpl)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -840,3 +841,146 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+
+
+class PallasMLAttentionBackend(AttentionBackend):
+    supported_kv_cache_dtypes = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ]
+
+    @staticmethod
+    def get_name() -> str:
+        return "FLASH_ATTN_MLA"
+
+    @staticmethod
+    def is_mla() -> bool:
+        return True
+
+    @staticmethod
+    def get_impl_cls() -> type["PallasMLAttentionBackendImpl"]:
+        return PallasMLAttentionBackendImpl
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> tuple[int, ...]:
+        if (isinstance(cache_dtype_str, str)
+                and cache_dtype_str.lower().strip() == "auto"):
+            return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
+        kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        if not is_floating_dtype(kv_dtype):
+            raise NotImplementedError(
+                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
+        kv_packing = get_dtype_packing(kv_dtype)
+        return (
+            num_blocks,
+            cdiv(block_size, kv_packing),
+            kv_packing,
+            cdiv(head_size, 128) * 128,
+        )
+
+    @staticmethod
+    def get_kv_cache_page_size_bytes(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        shape = PallasMLAttentionBackend.get_kv_cache_shape(
+            1,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype,
+        )
+        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
+        return num_elements * torch.empty((), dtype=dtype).element_size()
+
+    @staticmethod
+    def swap_blocks(
+        src_kv_cache: torch.Tensor,
+        dst_kv_cache: torch.Tensor,
+        src_to_dst: torch.Tensor,
+    ) -> None:
+        raise RuntimeError("swap_blocks is not used for the TPU backend.")
+
+    @staticmethod
+    def get_page_size(vllm_config: VllmConfig) -> int:
+        return 1024
+
+
+class PallasMLAttentionBackendImpl(MLAAttentionImpl):
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None,
+        attn_type: str,
+        kv_sharing_target_layer_name: str | None,
+        # MLA Specific Arguments
+        q_lora_rank: int | None = None,
+        kv_lora_rank: int | None = None,
+        qk_nope_head_dim: int | None = None,
+        qk_rope_head_dim: int | None = None,
+        qk_head_dim: int | None = None,
+        v_head_dim: int | None = None,
+        **kwargs,
+    ) -> None:
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads
+
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_head_dim
+        self.v_head_dim = v_head_dim
+
+    def forward_mha(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        k_scale: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        pass
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        pass
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        pass
