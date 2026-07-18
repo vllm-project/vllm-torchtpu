@@ -4,7 +4,6 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
-import importlib
 import os
 import time
 from typing import Dict, Tuple
@@ -332,35 +331,6 @@ class TPUWorker(WorkerBase):
             return
         jax_parallel_state.connect(self.prev_worker_ip, self.rank - 1)
 
-    def _estimate_kv_connector_hbm_reserve(self) -> int:
-        """HBM bytes the active KV offload spec needs reserved upfront.
-
-        The configured spec is resolved dynamically from
-        kv_connector_extra_config (same lookup as vllm's OffloadingSpecFactory).
-        Any spec class implementing
-        `estimate_hbm_reserve_bytes(vllm_config) -> int` is asked for its
-        reserve; tpu_worker stays agnostic to connector type and spec class.
-        Returns 0 when no connector is configured, the spec can't be resolved,
-        or the spec doesn't advertise an HBM reserve.
-        """
-        kv_tc = self.vllm_config.kv_transfer_config
-        if kv_tc is None:
-            return 0
-        extra = kv_tc.kv_connector_extra_config or {}
-        spec_name = extra.get("spec_name")
-        spec_module_path = extra.get("spec_module_path")
-        if not spec_name or not spec_module_path:
-            return 0
-        try:
-            spec_module = importlib.import_module(spec_module_path)
-            spec_cls = getattr(spec_module, spec_name)
-        except (ImportError, AttributeError):
-            return 0
-        estimator = getattr(spec_cls, "estimate_hbm_reserve_bytes", None)
-        if estimator is None:
-            return 0
-        return estimator(self.vllm_config)
-
     def determine_available_memory(self) -> int:
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
@@ -374,7 +344,8 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes. Ask the active connector how much
         # to reserve and subtract from the KV-cache budget. Returns 0 if no
         # connector needs a reserve. The connector owns the size formula.
-        kv_connector_hbm_reserve = self._estimate_kv_connector_hbm_reserve()
+        kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
+            self.vllm_config)
         available = budget.available - kv_connector_hbm_reserve
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)

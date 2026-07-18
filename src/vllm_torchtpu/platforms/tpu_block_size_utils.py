@@ -21,14 +21,19 @@ def unified_block_pool_enabled(vllm_config: "VllmConfig") -> bool:
     blocks).
 
     Opt-in only, via TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL. Never engages for
-    kv-transfer deployments: the KV connector addresses the typed-view
-    layout by byte offsets and does not understand the pool, so the same
+    P/D kv-transfer deployments: those connectors address the typed-view
+    layout by byte offsets and do not understand the pool, so the same
     env keeps those deployments on the typed-view layout (see
-    unified_kv_layout_enabled).
+    unified_kv_layout_enabled). The OffloadingConnector is the exception:
+    its TPU spec transfers whole pool rows (dtype-agnostic block copies),
+    which is exactly the pool layout — hybrid CPU offloading REQUIRES the
+    pool (see TPUCPUOffloadingSpec).
     """
     from vllm_torchtpu import envs as tpu_envs
+    kv_transfer_config = vllm_config.kv_transfer_config
     return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-            and vllm_config.kv_transfer_config is None)
+            and (kv_transfer_config is None
+                 or kv_transfer_config.kv_connector == "OffloadingConnector"))
 
 
 def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:

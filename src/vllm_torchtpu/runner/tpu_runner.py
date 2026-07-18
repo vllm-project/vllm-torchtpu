@@ -1133,11 +1133,14 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         gpu_mem_util = cache_config.gpu_memory_utilization
-        # Shares utils.compute_hbm_budget() with
-        # TPUWorker.determine_available_memory(), so the pinned block counts
-        # match the KV-cache budget vLLM is given (incl. the headroom knob).
+        # Match TPUWorker.determine_available_memory(), including HBM that a
+        # connector allocates after profile_run (such as the offload H2D
+        # staging pool). Otherwise num_gpu_blocks_override fills that reserve
+        # back up with KV blocks and defeats the worker-side subtraction.
         budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
-        avail = budget.available
+        connector_reserve = utils.estimate_kv_connector_hbm_reserve(
+            self.vllm_config)
+        avail = budget.available - connector_reserve
         if avail <= 0:
             return
 
@@ -1388,12 +1391,15 @@ class TPUModelRunner(GPUModelRunner):
         OOM. Pinning to `num_blocks_tpu` preserves the headroom the
         single-step formula silently removes.
 
-        `avail` comes from `utils.compute_hbm_budget`, the same helper
-        `TPUWorker.determine_available_memory()` uses, so it reserves both the
-        `gpu_memory_utilization` cap and the `TPU_KV_CACHE_HEADROOM_MIB`
-        headroom, and the block count pinned here matches the KV-cache budget
-        the worker hands vLLM. No safety margin is applied beyond those two
-        knobs.
+        `avail` mirrors `TPUWorker.determine_available_memory()`: the
+        `utils.compute_hbm_budget` result (which reserves the
+        `gpu_memory_utilization` cap and `TPU_KV_CACHE_HEADROOM_MIB`
+        headroom) minus `utils.estimate_kv_connector_hbm_reserve` (HBM a
+        connector allocates after profile_run, such as the offload H2D
+        staging pool). The block count pinned here therefore matches the
+        KV-cache budget the worker hands vLLM; otherwise
+        num_gpu_blocks_override would fill the connector reserve back up
+        with KV blocks and defeat the worker-side subtraction.
 
         Skipped only if the user has explicitly set `num_gpu_blocks_override`.
 
@@ -1416,10 +1422,10 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         gpu_mem_util = cache_config.gpu_memory_utilization
-        # Shares utils.compute_hbm_budget() with
-        # TPUWorker.determine_available_memory(), so the pinned block count
-        # matches the KV-cache budget vLLM is given.
-        avail = utils.compute_hbm_budget([self.device], gpu_mem_util).available
+        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
+        connector_reserve = utils.estimate_kv_connector_hbm_reserve(
+            self.vllm_config)
+        avail = budget.available - connector_reserve
         if avail <= 0:
             return
 

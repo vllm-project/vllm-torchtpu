@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import importlib
 import os
 import time
 from functools import wraps
@@ -172,6 +173,33 @@ def compute_hbm_budget(devices: Any,
                      cap=cap,
                      headroom=headroom,
                      available=available)
+
+
+def estimate_kv_connector_hbm_reserve(vllm_config: Any) -> int:
+    """Return HBM allocated after profiling by the configured KV connector.
+
+    Offloading specs can advertise an estimate_hbm_reserve_bytes classmethod
+    through the same metadata used by vLLM's spec factory. Keep this lookup
+    shared so worker budgeting and runner block-count overrides cannot
+    disagree about the available KV-cache memory.
+    """
+    kv_tc = vllm_config.kv_transfer_config
+    if kv_tc is None:
+        return 0
+    extra = kv_tc.kv_connector_extra_config or {}
+    spec_name = extra.get("spec_name")
+    spec_module_path = extra.get("spec_module_path")
+    if not spec_name or not spec_module_path:
+        return 0
+    try:
+        spec_module = importlib.import_module(spec_module_path)
+        spec_cls = getattr(spec_module, spec_name)
+    except (ImportError, AttributeError):
+        return 0
+    estimator = getattr(spec_cls, "estimate_hbm_reserve_bytes", None)
+    if estimator is None:
+        return 0
+    return int(estimator(vllm_config))
 
 
 def get_padded_head_dim(head_dim: int) -> int:
