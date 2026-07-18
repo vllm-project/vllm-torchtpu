@@ -95,7 +95,7 @@ import torch
 from torch_tpu._internal.sync import synchronize as _tpu_sync
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec, CanonicalKVCaches,
                                      GPULoadStoreSpec, LoadStoreSpec)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
@@ -242,6 +242,17 @@ def _pad_to_power_of_2(ids: np.ndarray) -> tuple[np.ndarray, int]:
     return padded, n
 
 
+def _model_is_hybrid(vllm_config: VllmConfig) -> bool:
+    """Single source of truth for hybrid detection in this module.
+
+    Keyed on model_config.is_hybrid — the same signal tpu_platform gates
+    the unified block pool on — so the handler mapping and the HBM
+    reserve estimate can never disagree. getattr-with-default because
+    estimate_hbm_reserve_bytes runs against lightweight configs in tests.
+    """
+    return bool(getattr(vllm_config.model_config, "is_hybrid", False))
+
+
 def expand_block_ids(
     block_ids: np.ndarray,
     block_size_factor: int,
@@ -273,27 +284,6 @@ def expand_block_ids(
         output_end_idx = output_idx + len(indices)
         output[output_idx:output_end_idx] = base_block_id + indices
         output_idx = output_end_idx
-
-
-def _kv_config_is_hybrid(kv_cache_config: KVCacheConfig) -> bool:
-    """Whether the KV cache config mixes attention and mamba groups."""
-    from vllm.v1.kv_cache_interface import MambaSpec
-    return any(
-        isinstance(group.kv_cache_spec, MambaSpec)
-        for group in kv_cache_config.kv_cache_groups)
-
-
-_KV_H2D_POOL_MAX_BLOCKS_DEFAULT = 2048
-# Hybrid pool rows are full attention pages sized to fit the mamba slot
-# (MiB-scale), so the H2D staging buffer needs far fewer rows to stay
-# within a few GiB of HBM.
-_KV_H2D_POOL_MAX_BLOCKS_HYBRID_DEFAULT = 512
-
-
-def _h2d_pool_max_blocks(hybrid: bool) -> int:
-    default = (_KV_H2D_POOL_MAX_BLOCKS_HYBRID_DEFAULT
-               if hybrid else _KV_H2D_POOL_MAX_BLOCKS_DEFAULT)
-    return int(os.environ.get("KV_H2D_POOL_MAX_BLOCKS", str(default)))
 
 
 def expand_hybrid_pool_block_ids(
@@ -346,6 +336,67 @@ def expand_hybrid_pool_block_ids(
         "hybrid transfer spec has unused CPU blocks", group_sizes,
         block_indices, len(cpu_block_ids), factor)
     return np.asarray(gpu_block_ids, dtype=np.int64), cpu_rows
+
+
+def _expand_transfer_ids(
+    transfer_spec: TransferSpec,
+    tpu_to_cpu: bool,
+    src_block_size_factor: int,
+    dst_block_size_factor: int,
+    hybrid_num_groups: "int | None",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand (src, dst) scheduler-block specs to flat per-row ID arrays.
+
+    Shared by the torch and raiden handlers so their row mapping can never
+    drift apart. Non-hybrid: expand each side by its block-size factor,
+    skipping the partial leading rows of the first source block. Hybrid
+    unified block pool: the GPU-side spec carries per-KV-group segments
+    (GPULoadStoreSpec.group_sizes / block_indices); route them through
+    expand_hybrid_pool_block_ids.
+    """
+    src_spec, dst_spec = transfer_spec
+    assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+    assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+    src_blocks = src_spec.block_ids
+    dst_blocks = dst_spec.block_ids
+    assert src_blocks.ndim == 1 and dst_blocks.ndim == 1
+
+    if hybrid_num_groups is not None:
+        gpu_spec, cpu_blocks, cpu_factor = ((src_spec, dst_blocks,
+                                             dst_block_size_factor)
+                                            if tpu_to_cpu else
+                                            (dst_spec, src_blocks,
+                                             src_block_size_factor))
+        assert isinstance(gpu_spec, GPULoadStoreSpec), (
+            "hybrid pool offloading requires grouped GPU load/store specs "
+            f"(group_sizes/block_indices), got {type(gpu_spec).__name__}")
+        assert len(
+            gpu_spec.group_sizes) == hybrid_num_groups, (gpu_spec.group_sizes,
+                                                         hybrid_num_groups)
+        gpu_rows, cpu_rows = expand_hybrid_pool_block_ids(
+            gpu_spec.block_ids,
+            gpu_spec.group_sizes,
+            gpu_spec.block_indices,
+            cpu_blocks,
+            cpu_factor,
+        )
+        return (gpu_rows, cpu_rows) if tpu_to_cpu else (cpu_rows, gpu_rows)
+
+    src_sub_count = src_blocks.size * src_block_size_factor
+    dst_sub_count = dst_blocks.size * dst_block_size_factor
+    src_skip = -dst_blocks.size % src_block_size_factor
+    assert dst_sub_count == src_sub_count - src_skip
+
+    # expand_block_ids writes compactly with the skip already applied, so
+    # both sides expand to exactly dst_sub_count entries.
+    src_expanded = np.empty(dst_sub_count, dtype=np.int64)
+    dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
+    expand_block_ids(src_blocks,
+                     src_block_size_factor,
+                     src_expanded,
+                     skip_count=src_skip)
+    expand_block_ids(dst_blocks, dst_block_size_factor, dst_expanded)
+    return src_expanded, dst_expanded
 
 
 # ---------------------------------------------------------------------------
@@ -494,19 +545,12 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.src_block_size_factor = src_block_size_factor // min_factor
         self.dst_block_size_factor = dst_block_size_factor // min_factor
 
-        # Hybrid unified-block-pool mode: transfer specs carry per-KV-group
-        # segments (GPULoadStoreSpec.group_sizes / block_indices) and every
-        # group's GPU block IDs address rows of the same pool tensors, so
-        # row mapping goes through expand_hybrid_pool_block_ids instead of
-        # the flat expansion. Device rows are scheduler blocks (factor 1).
+        # Hybrid unified-block-pool mode: every KV group's GPU block IDs
+        # address rows of the same pool tensors, and row mapping goes
+        # through the grouped path of _expand_transfer_ids. Requires device
+        # rows at scheduler-block granularity (device factor 1), asserted
+        # at the get_handlers choke point.
         self._hybrid_num_groups = hybrid_num_groups
-        if hybrid_num_groups is not None:
-            gpu_factor = (self.src_block_size_factor
-                          if src_tensors[0].device.type != "cpu" else
-                          self.dst_block_size_factor)
-            assert gpu_factor == 1, (
-                "hybrid pool offloading requires device rows at scheduler-"
-                f"block granularity, got device factor {gpu_factor}")
 
         self.block_size_in_bytes = [
             t.element_size() * t.stride(0) * min_factor for t in src_tensors
@@ -547,8 +591,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._h2d_max_padded: int = 0
         if not self.tpu_to_cpu:
             ref = self.dst_tensors
-            max_pool_blocks = _h2d_pool_max_blocks(
-                hybrid=self._hybrid_num_groups is not None)
+            max_pool_blocks = int(
+                os.environ.get("KV_H2D_POOL_MAX_BLOCKS", "2048"))
             max_n = min(ref[0].shape[0], max_pool_blocks)
             max_padded = 1
             while max_padded < max_n:
@@ -677,58 +721,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
     # -- OffloadingHandler interface -----------------------------------------
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        src_spec, dst_spec = transfer_spec
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1
-        assert dst_blocks.ndim == 1
-
-        if self._hybrid_num_groups is not None:
-            # Hybrid pool mode: the GPU-side spec carries per-group
-            # segments; map them to flat pool/CPU row pairs.
-            gpu_spec = src_spec if self.tpu_to_cpu else dst_spec
-            cpu_blocks = dst_blocks if self.tpu_to_cpu else src_blocks
-            group_sizes = getattr(gpu_spec, "group_sizes", None)
-            block_indices = getattr(gpu_spec, "block_indices", None)
-            assert group_sizes is not None and block_indices is not None, (
-                "hybrid pool offloading requires grouped GPU load/store "
-                "specs (group_sizes/block_indices)")
-            assert len(group_sizes) == self._hybrid_num_groups, (
-                group_sizes, self._hybrid_num_groups)
-            cpu_factor = (self.dst_block_size_factor
-                          if self.tpu_to_cpu else self.src_block_size_factor)
-            gpu_rows, cpu_rows = expand_hybrid_pool_block_ids(
-                gpu_spec.block_ids,
-                group_sizes,
-                block_indices,
-                cpu_blocks,
-                cpu_factor,
-            )
-            src_ids, dst_ids = ((gpu_rows, cpu_rows) if self.tpu_to_cpu else
-                                (cpu_rows, gpu_rows))
-            n = len(dst_ids)
-        else:
-            src_sub_count = src_blocks.size * self.src_block_size_factor
-            dst_sub_count = dst_blocks.size * self.dst_block_size_factor
-            src_skip = -dst_blocks.size % self.src_block_size_factor
-            assert dst_sub_count == src_sub_count - src_skip
-
-            src_expanded = np.empty(src_sub_count, dtype=np.int64)
-            dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
-            expand_block_ids(
-                src_blocks,
-                self.src_block_size_factor,
-                src_expanded,
-                skip_count=src_skip,
-            )
-            expand_block_ids(dst_blocks, self.dst_block_size_factor,
-                             dst_expanded)
-            src_ids = src_expanded[src_skip:]
-            dst_ids = dst_expanded
-            n = len(dst_ids)
+        src_ids, dst_ids = _expand_transfer_ids(transfer_spec, self.tpu_to_cpu,
+                                                self.src_block_size_factor,
+                                                self.dst_block_size_factor,
+                                                self._hybrid_num_groups)
+        n = len(dst_ids)
 
         if self.tpu_to_cpu:
             # ── D2H: Pallas gather (main) → lazy copy_ + sync (worker thread)
@@ -1047,8 +1044,13 @@ class _RaidenOffloadingHandler(OffloadingHandler):
     lives inside raiden (DmaMapped), so there is no `cpu_pool` tensor here.
     """
 
-    def __init__(self, mgr, tpu_to_cpu: bool, src_block_size_factor: int,
-                 dst_block_size_factor: int, bytes_per_kernel_block: int):
+    def __init__(self,
+                 mgr,
+                 tpu_to_cpu: bool,
+                 src_block_size_factor: int,
+                 dst_block_size_factor: int,
+                 bytes_per_kernel_block: int,
+                 hybrid_num_groups: "int | None" = None):
         self._mgr = mgr
         self.tpu_to_cpu = tpu_to_cpu
         self.src_block_size_factor = src_block_size_factor
@@ -1056,41 +1058,20 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         self._bytes_per_kernel_block = bytes_per_kernel_block
         self.transfer_type = ("GPU", "CPU") if tpu_to_cpu else ("CPU", "GPU")
         self._pending: dict[int, tuple] = {}
-
-    def _expand_kernel_ids(
-            self,
-            transfer_spec: TransferSpec) -> tuple[np.ndarray, np.ndarray]:
-        """Expand (src, dst) scheduler block IDs to kernel-block IDs.
-
-        Mirrors SingleDirectionOffloadingHandler.transfer_async so D2H/H2D
-        granularity matches the torch path exactly.
-        """
-        src_spec, dst_spec = transfer_spec
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1 and dst_blocks.ndim == 1
-
-        src_sub_count = src_blocks.size * self.src_block_size_factor
-        dst_sub_count = dst_blocks.size * self.dst_block_size_factor
-        src_skip = -dst_blocks.size % self.src_block_size_factor
-        assert dst_sub_count == src_sub_count - src_skip
-
-        src_expanded = np.empty(src_sub_count, dtype=np.int64)
-        dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
-        expand_block_ids(src_blocks,
-                         self.src_block_size_factor,
-                         src_expanded,
-                         skip_count=src_skip)
-        expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_expanded)
-        return src_expanded[src_skip:], dst_expanded
+        # Hybrid unified-block-pool mode: same grouped row mapping as the
+        # torch handler (see _expand_transfer_ids). Raiden host slots stay
+        # uniform because every pool row has identical bytes.
+        self._hybrid_num_groups = hybrid_num_groups
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        # src/dst are kernel-block IDs. D2H: src=device blocks, dst=host slots;
-        # H2D: src=host slots, dst=device blocks — matching D2h/H2d's
+        # src/dst are kernel-block IDs, expanded by the same mapping as the
+        # torch path. D2H: src=device blocks, dst=host slots; H2D: src=host
+        # slots, dst=device blocks — matching D2h/H2d's
         # (src_offsets_major_dim, dst_offsets_major_dim) contract.
-        src_ids, dst_ids = self._expand_kernel_ids(transfer_spec)
+        src_ids, dst_ids = _expand_transfer_ids(transfer_spec, self.tpu_to_cpu,
+                                                self.src_block_size_factor,
+                                                self.dst_block_size_factor,
+                                                self._hybrid_num_groups)
         n = len(dst_ids)
         sizes = [1] * n  # one major-dim slice (= one kernel block) per segment
         if self.tpu_to_cpu:
@@ -1216,8 +1197,6 @@ class CpuTpuOffloadingHandlers:
         assert kv_caches.tensors
         assert cpu_block_size % gpu_block_size == 0
         assert gpu_block_size % kernel_block_size == 0
-        assert hybrid_num_groups is None or not _USE_RAIDEN_OFFLOAD, (
-            "hybrid pool offloading is not supported on the raiden path")
 
         cpu_block_size_factor = cpu_block_size // kernel_block_size
         gpu_block_size_factor = gpu_block_size // kernel_block_size
@@ -1269,7 +1248,8 @@ class CpuTpuOffloadingHandlers:
             # KVCacheManager over the device KV-cache views; two direct-DMA
             # handlers share it. host_blocks_to_allocate matches the scheduler's
             # CPU pool sized in kernel blocks, so CPU block IDs map 1:1 to
-            # raiden host slots after expand_block_ids.
+            # raiden host slots after _expand_transfer_ids (hybrid pool rows
+            # stay uniform, so raiden's per-slot byte accounting is unchanged).
             from tpu_raiden.api.torch import kv_cache_manager as _kcm
             device_tensors = [[t] for t in tpu_tensors]
             # raiden holds raw pointers / PJRT aliases to these device buffers
@@ -1291,6 +1271,7 @@ class CpuTpuOffloadingHandlers:
                 src_block_size_factor=gpu_block_size_factor,
                 dst_block_size_factor=cpu_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
+                hybrid_num_groups=hybrid_num_groups,
             )
             self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
                 self._raiden_mgr,
@@ -1298,6 +1279,7 @@ class CpuTpuOffloadingHandlers:
                 src_block_size_factor=cpu_block_size_factor,
                 dst_block_size_factor=gpu_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
+                hybrid_num_groups=hybrid_num_groups,
             )
             logger.info(
                 "[kv-offload] RAIDEN direct-DMA offload: %d host kernel blocks",
@@ -1351,16 +1333,15 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                  kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
         self._tpu_handlers: CpuTpuOffloadingHandlers | None = None
-        self.is_hybrid_model: bool = _kv_config_is_hybrid(kv_cache_config)
-        if self.is_hybrid_model:
-            assert not _USE_RAIDEN_OFFLOAD, (
-                "hybrid CPU offloading is not supported with "
-                "VLLM_TPU_OFFLOAD_RAIDEN=1")
-            from vllm_torchtpu.platforms.tpu_block_size_utils import \
-                unified_block_pool_enabled
-            assert unified_block_pool_enabled(vllm_config), (
-                "hybrid CPU offloading requires the unified block pool "
-                "(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)")
+        # Hybrid without the unified block pool is rejected at config time
+        # by TpuPlatform.check_and_update_config.
+        self.is_hybrid_model: bool = _model_is_hybrid(vllm_config)
+        assert self.is_hybrid_model == any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            for group in kv_cache_config.kv_cache_groups), (
+                "model_config.is_hybrid disagrees with MambaSpec presence "
+                "in kv_cache_groups; hybrid handler mapping would not match "
+                "the HBM reserve estimate")
 
     @property
     def prewarm_shapes(self) -> list[int]:
@@ -1399,8 +1380,8 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         if _USE_RAIDEN_OFFLOAD:
             return 0
         model_config = vllm_config.model_config
-        is_hybrid = bool(getattr(model_config, "is_hybrid", False))
-        max_pool_blocks = _h2d_pool_max_blocks(hybrid=is_hybrid)
+        is_hybrid = _model_is_hybrid(vllm_config)
+        max_pool_blocks = int(os.environ.get("KV_H2D_POOL_MAX_BLOCKS", "2048"))
         max_padded = 1
         while max_padded < max_pool_blocks:
             max_padded <<= 1

@@ -210,10 +210,19 @@ class TestTpuPlatform:
             assert unified_block_pool_enabled(vllm_config)
             assert unified_kv_layout_enabled(vllm_config)
 
-            # kv-transfer never runs the pool (the connector addresses the
-            # typed views), but keeps the unified layout family.
+            # P/D kv-transfer never runs the pool (those connectors address
+            # the typed views), but keeps the unified layout family.
             vllm_config.kv_transfer_config = MagicMock()
+            vllm_config.kv_transfer_config.kv_connector = "TPUConnectorV2"
             assert not unified_block_pool_enabled(vllm_config)
+            assert unified_kv_layout_enabled(vllm_config)
+
+            # The OffloadingConnector is the exception: its TPU spec
+            # transfers whole pool rows, and hybrid CPU offloading REQUIRES
+            # the pool, so the same env keeps it on the pool layout.
+            vllm_config.kv_transfer_config.kv_connector = (
+                "OffloadingConnector")
+            assert unified_block_pool_enabled(vllm_config)
             assert unified_kv_layout_enabled(vllm_config)
 
     @pytest.mark.parametrize(
@@ -325,6 +334,72 @@ class TestTpuPlatform:
                     MagicMock(PallasAttentionBackend=mock_pallas)
                 }):
             TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("is_hybrid", "pool_env", "expect_error", "expect_mamba_patch"),
+        [
+            # Hybrid CPU offloading transfers whole pool rows; without the
+            # unified block pool there is no uniform per-block row to copy.
+            (True, False, True, False),
+            # With the pool, hybrid offloading also needs the scheduler
+            # patch (same _mamba_block_aligned_split assert as PD disagg).
+            (True, True, False, True),
+            # Dense offloading works on either layout, no patch needed.
+            (False, True, False, False),
+            (False, False, False, False),
+        ],
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
+    )
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
+    def test_check_and_update_config_gates_hybrid_offloading_on_pool(
+            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
+            mock_apply_patches, vllm_config, monkeypatch, is_hybrid, pool_env,
+            expect_error, expect_mamba_patch):
+        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+        vllm_config.model_config.is_hybrid = is_hybrid
+        vllm_config.cache_config.block_size = 256
+        vllm_config.cache_config.cache_dtype = "auto"
+        if is_hybrid:
+            vllm_config.cache_config.enable_prefix_caching = True
+            vllm_config.cache_config.mamba_cache_mode = "align"
+        vllm_config.kv_transfer_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector = "OffloadingConnector"
+
+        if pool_env:
+            monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+        else:
+            monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL",
+                               raising=False)
+
+        mock_pallas = MagicMock()
+        mock_pallas.get_page_size.return_value = 256
+        mock_pallas.get_min_page_size.return_value = 16
+
+        with patch.dict(
+                'sys.modules', {
+                    'vllm_torchtpu.layers.vllm.attention':
+                    MagicMock(PallasAttentionBackend=mock_pallas)
+                }), patch(
+                    "vllm_torchtpu.platforms.tpu_platform."
+                    "_patch_scheduler_mamba_external_kv") as mock_mamba_patch, \
+                patch("vllm_torchtpu.platforms.tpu_platform."
+                      "update_tpu_block_size_and_slot_config"):
+            if expect_error:
+                with pytest.raises(ValueError, match="unified block\\s+pool"):
+                    TpuPlatform.check_and_update_config(vllm_config)
+            else:
+                TpuPlatform.check_and_update_config(vllm_config)
+
+        if expect_mamba_patch:
+            mock_mamba_patch.assert_called_once_with()
+        else:
+            mock_mamba_patch.assert_not_called()
 
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(

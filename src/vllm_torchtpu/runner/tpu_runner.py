@@ -520,6 +520,12 @@ class TPUModelRunner(GPUModelRunner):
             return
         kv_connector = get_kv_transfer_group()
         assert scheduler_output.kv_connector_metadata is not None
+        # Upstream parity (gpu_model_runner calls this before every forward;
+        # base-class default is a no-op): lets connectors with async saves
+        # fence in-flight stores whose source blocks the scheduler is about
+        # to reuse (OffloadingConnector jobs_to_flush) before the forward
+        # overwrites them.
+        kv_connector.handle_preemptions(scheduler_output.kv_connector_metadata)
         kv_connector.bind_connector_metadata(
             scheduler_output.kv_connector_metadata)
         # forward_context is unused by TPUConnector; pass None.
@@ -1071,6 +1077,23 @@ class TPUModelRunner(GPUModelRunner):
                                                 int(uniform_page_size_bytes),
                                                 group_size)
 
+    def _available_kv_cache_hbm(self) -> int:
+        """KV-cache HBM budget for the block-count override paths.
+
+        Matches `TPUWorker.determine_available_memory()`: the
+        `utils.compute_hbm_budget` result (which reserves the
+        `gpu_memory_utilization` cap and `TPU_KV_CACHE_HEADROOM_MIB`
+        headroom) minus `utils.estimate_kv_connector_hbm_reserve` (HBM a
+        connector allocates after profile_run, such as the offload H2D
+        staging pool). Sizing overrides against this budget keeps them from
+        filling the connector reserve back up with KV blocks and defeating
+        the worker-side subtraction.
+        """
+        budget = utils.compute_hbm_budget(
+            [self.device], self.cache_config.gpu_memory_utilization)
+        return budget.available - utils.estimate_kv_connector_hbm_reserve(
+            self.vllm_config)
+
     def _maybe_set_compact_mamba_num_blocks_override(
             self, attn_page_size_bytes: int,
             unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
@@ -1132,15 +1155,7 @@ class TPUModelRunner(GPUModelRunner):
         if group_size <= 0:
             return
 
-        gpu_mem_util = cache_config.gpu_memory_utilization
-        # Match TPUWorker.determine_available_memory(), including HBM that a
-        # connector allocates after profile_run (such as the offload H2D
-        # staging pool). Otherwise num_gpu_blocks_override fills that reserve
-        # back up with KV blocks and defeats the worker-side subtraction.
-        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
-        connector_reserve = utils.estimate_kv_connector_hbm_reserve(
-            self.vllm_config)
-        avail = budget.available - connector_reserve
+        avail = self._available_kv_cache_hbm()
         if avail <= 0:
             return
 
@@ -1391,15 +1406,9 @@ class TPUModelRunner(GPUModelRunner):
         OOM. Pinning to `num_blocks_tpu` preserves the headroom the
         single-step formula silently removes.
 
-        `avail` mirrors `TPUWorker.determine_available_memory()`: the
-        `utils.compute_hbm_budget` result (which reserves the
-        `gpu_memory_utilization` cap and `TPU_KV_CACHE_HEADROOM_MIB`
-        headroom) minus `utils.estimate_kv_connector_hbm_reserve` (HBM a
-        connector allocates after profile_run, such as the offload H2D
-        staging pool). The block count pinned here therefore matches the
-        KV-cache budget the worker hands vLLM; otherwise
-        num_gpu_blocks_override would fill the connector reserve back up
-        with KV blocks and defeat the worker-side subtraction.
+        `avail` comes from `_available_kv_cache_hbm`, so the block count
+        pinned here matches the KV-cache budget
+        `TPUWorker.determine_available_memory()` hands vLLM.
 
         Skipped only if the user has explicitly set `num_gpu_blocks_override`.
 
@@ -1421,11 +1430,7 @@ class TPUModelRunner(GPUModelRunner):
         if cache_config.num_gpu_blocks_override is not None:
             return
 
-        gpu_mem_util = cache_config.gpu_memory_utilization
-        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
-        connector_reserve = utils.estimate_kv_connector_hbm_reserve(
-            self.vllm_config)
-        avail = budget.available - connector_reserve
+        avail = self._available_kv_cache_hbm()
         if avail <= 0:
             return
 

@@ -104,6 +104,18 @@ class DummyMamba(MambaBase):
         return "dummy"
 
 
+class _FakeReserveSpec:
+    """Offloading-spec stand-in resolved via kv_connector_extra_config by
+    utils.estimate_kv_connector_hbm_reserve (same lookup as vLLM's
+    OffloadingSpecFactory)."""
+
+    RESERVE_BYTES = 1024 * 1024 * 1024  # 1 GiB
+
+    @classmethod
+    def estimate_hbm_reserve_bytes(cls, vllm_config):
+        return cls.RESERVE_BYTES
+
+
 class TestTPURunner:
 
     def setup_method(self):
@@ -165,6 +177,11 @@ class TestTPURunner:
         self.runner._maybe_set_compact_mamba_num_blocks_override = (
             TPUModelRunner._maybe_set_compact_mamba_num_blocks_override.
             __get__(self.runner))
+        # Both override paths read the budget through this helper; bind the
+        # real one so the mock runner exercises the actual budget math
+        # (compute_hbm_budget minus the KV-connector HBM reserve).
+        self.runner._available_kv_cache_hbm = (
+            TPUModelRunner._available_kv_cache_hbm.__get__(self.runner))
         # Compact-mamba state starts unset (matches real __init__).
         self.runner._mamba_num_blocks = None
         self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
@@ -246,6 +263,67 @@ class TestTPURunner:
 
         with pytest.raises(ValueError, match="does not fit"):
             self.runner._update_mamba_page_size_padded(layers)
+
+    @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=4096)
+    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
+           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
+    def test_kv_connector_reserve_shrinks_num_blocks_override(
+            self, mock_mem_info, mock_get_page_size):
+        """The KV-connector HBM reserve (e.g. the offload H2D staging pool)
+        must come out of the budget the block-count overrides size against,
+        or the pinned blocks fill the reserve back up and defeat the
+        worker-side subtraction. End-to-end through the same
+        kv_connector_extra_config spec lookup the worker uses."""
+        kv_tc = MagicMock()
+        kv_tc.kv_connector_extra_config = {
+            "spec_name": "_FakeReserveSpec",
+            "spec_module_path": "tests.runner.test_tpu_runner",
+        }
+        self.runner.vllm_config.kv_transfer_config = kv_tc
+
+        layers = {}
+        mock_attn = MagicMock(spec=Attention)
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers['attn_0'] = mock_attn
+        for i in range(3):
+            layers[f'mamba_{i}'] = DummyMamba()
+
+        self.runner._update_mamba_page_size_padded(layers)
+
+        # Same sizing as test_update_mamba_page_size_padded, but avail is
+        # reduced by the 1 GiB reserve:
+        #   avail = 10 GiB * 0.9 - 1 GiB = 8,589,934,592
+        #   attn_num_blocks = (8,589,934,592 - 3 * 17 * 66560) // 4096
+        #                   = 2,096,323  (vs 2,358,467 with no reserve)
+        assert self.runner.cache_config.num_gpu_blocks_override == 2096323
+
+    def test_maybe_setup_kv_connector_fences_preemptions_before_bind(self):
+        """Upstream parity: handle_preemptions must run before
+        bind_connector_metadata / start_load_kv so connectors with async
+        saves (OffloadingConnector jobs_to_flush) can fence in-flight
+        stores before the forward overwrites their source blocks."""
+        self.runner.maybe_setup_kv_connector = (
+            TPUModelRunner.maybe_setup_kv_connector.__get__(self.runner))
+        connector = MagicMock()
+        scheduler_output = MagicMock()
+        meta = scheduler_output.kv_connector_metadata
+
+        with patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                   return_value=True), \
+                patch('vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group',
+                      return_value=connector):
+            self.runner.maybe_setup_kv_connector(scheduler_output)
+
+        connector.handle_preemptions.assert_called_once_with(meta)
+        connector.bind_connector_metadata.assert_called_once_with(meta)
+        connector.start_load_kv.assert_called_once_with(None)
+        names = [c[0] for c in connector.mock_calls]
+        assert names.index('handle_preemptions') < names.index(
+            'bind_connector_metadata') < names.index('start_load_kv')
 
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',

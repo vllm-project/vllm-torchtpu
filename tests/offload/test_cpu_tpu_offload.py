@@ -19,6 +19,10 @@ Covers the pieces that don't require a real TPU:
 - `expand_hybrid_pool_block_ids` grouped row mapping for the unified
   block pool (attention + mamba segments, partial first offloaded block,
   null-prefixed mamba segments, empty groups).
+- `_expand_transfer_ids` non-hybrid flat path: the partial-first-block
+  skip must not shift the compactly-written source expansion (regression).
+- `TPUCPUOffloadingSpec.__init__` consistency assert: model_config.is_hybrid
+  must agree with MambaSpec presence in kv_cache_groups.
 
 Heavy dependencies (real Pallas kernels, torch_tpu DMA, vllm config
 plumbing) are mocked at construction time so the tests run on a host
@@ -136,33 +140,21 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
         # 1500 rounds up to 2048
         self.assertEqual(reserve_1500, reserve_2048)
 
-    def test_hybrid_uses_attention_layer_count_and_hybrid_pool_default(self):
+    def test_hybrid_uses_attention_layer_count(self):
         """Hybrid (unified block pool) staging is one buffer per attention
-        layer position at the pool page, with the smaller hybrid
-        KV_H2D_POOL_MAX_BLOCKS default (512 vs 2048)."""
+        layer position at the pool page. The pool cap is NOT specialized
+        for hybrid — launch configs set KV_H2D_POOL_MAX_BLOCKS lower
+        (recipes use 512) since hybrid pool pages are MiB-scale."""
         from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         num_layers, num_attn = 60, 15
-        with patch.dict(os.environ, {"KV_H2D_POOL_MAX_BLOCKS": "2048"}):
-            dense = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
-                self._make_vllm_config(num_layers=num_layers))
-            hybrid = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
-                self._make_vllm_config(num_layers=num_layers,
-                                       is_hybrid=True,
-                                       num_attn_layers=num_attn))
+        dense = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
+            self._make_vllm_config(num_layers=num_layers))
+        hybrid = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
+            self._make_vllm_config(num_layers=num_layers,
+                                   is_hybrid=True,
+                                   num_attn_layers=num_attn))
         # Same pool cap: only the layer count differs (60 vs 15 buffers).
         self.assertEqual(dense * num_attn, hybrid * num_layers)
-
-        orig = os.environ.pop("KV_H2D_POOL_MAX_BLOCKS", None)
-        try:
-            hybrid_default = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
-                self._make_vllm_config(num_layers=num_layers,
-                                       is_hybrid=True,
-                                       num_attn_layers=num_attn))
-            # Default hybrid pool cap is 512 (vs 2048 explicit above).
-            self.assertEqual(hybrid, 4 * hybrid_default)
-        finally:
-            if orig is not None:
-                os.environ["KV_H2D_POOL_MAX_BLOCKS"] = orig
 
     def test_raiden_defaults_to_zero_reserve(self):
         from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
@@ -464,6 +456,60 @@ class TestExpandHybridPoolBlockIds(unittest.TestCase):
                          cpu=[3, 4, 5],
                          factor=1)
 
+    def test_too_few_cpu_blocks_assert(self):
+        with self.assertRaises(AssertionError):
+            self._expand(gpu=[1, 2],
+                         group_sizes=[2],
+                         block_indices=[0],
+                         cpu=[3],
+                         factor=1)
+
+
+class TestExpandTransferIdsFlat(unittest.TestCase):
+    """Non-hybrid `_expand_transfer_ids` flat path.
+
+    `expand_block_ids` writes compactly with the skip already applied, so
+    the source expansion must be consumed as-is — slicing off the leading
+    `src_skip` entries again would drop valid rows and read uninitialized
+    tail memory (regression test)."""
+
+    @staticmethod
+    def _expand(src, dst, tpu_to_cpu, src_factor, dst_factor):
+        from vllm_torchtpu.offload.cpu_tpu import _expand_transfer_ids
+        src_ids, dst_ids = _expand_transfer_ids((src, dst), tpu_to_cpu,
+                                                src_factor, dst_factor, None)
+        return list(src_ids), list(dst_ids)
+
+    def test_h2d_partial_first_cpu_block(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        # 3 GPU blocks from 2 CPU blocks at factor 2: skip row 0 of CPU
+        # block 5, then rows 11, 12, 13 map onto GPU blocks 7, 8, 9.
+        src_ids, dst_ids = self._expand(
+            CPULoadStoreSpec([5, 6]),
+            GPULoadStoreSpec([7, 8, 9], group_sizes=[3], block_indices=[1]),
+            tpu_to_cpu=False,
+            src_factor=2,
+            dst_factor=1,
+        )
+        self.assertEqual(src_ids, [11, 12, 13])
+        self.assertEqual(dst_ids, [7, 8, 9])
+
+    def test_d2h_full_blocks(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        src_ids, dst_ids = self._expand(
+            GPULoadStoreSpec([1, 2, 3, 4], group_sizes=[4], block_indices=[0]),
+            CPULoadStoreSpec([3, 7]),
+            tpu_to_cpu=True,
+            src_factor=1,
+            dst_factor=2,
+        )
+        self.assertEqual(src_ids, [1, 2, 3, 4])
+        self.assertEqual(dst_ids, [6, 7, 14, 15])
+
 
 class TestHybridTransferAsyncMapping(unittest.TestCase):
     """`transfer_async` in hybrid pool mode must route grouped GPU specs
@@ -512,18 +558,6 @@ class TestHybridTransferAsyncMapping(unittest.TestCase):
         self.assertEqual(list(t.src_ids), [10, 11, 12, 20])
         self.assertEqual(list(t.dst_ids), [5, 9, 2, 40])
 
-    def test_h2d_load_with_factor_2_partial_block(self):
-        from vllm.v1.kv_offload.base import GPULoadStoreSpec
-        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-
-        h = self._make_h2d_handler(cpu_factor=2, num_groups=1)
-        src = CPULoadStoreSpec([5, 6])
-        dst = GPULoadStoreSpec([7, 8, 9], group_sizes=[3], block_indices=[1])
-        self.assertTrue(h.transfer_async(2, (src, dst)))
-        t = h._transfer_map[2]
-        self.assertEqual(list(t.src_ids), [11, 12, 13])
-        self.assertEqual(list(t.dst_ids), [7, 8, 9])
-
     def test_ungrouped_spec_asserts_in_hybrid_mode(self):
         from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec
         from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
@@ -539,6 +573,54 @@ class TestHybridTransferAsyncMapping(unittest.TestCase):
         dst = _FlatGpuSpec([1])
         with self.assertRaises(AssertionError):
             h.transfer_async(3, (src, dst))
+
+
+class TestHybridSpecConsistencyAssert(unittest.TestCase):
+    """TPUCPUOffloadingSpec.__init__ cross-checks model_config.is_hybrid
+    against MambaSpec presence in kv_cache_groups: the hybrid handler
+    mapping and the HBM reserve estimate key on the former, the transfer
+    specs on the latter, so a disagreement must fail at construction."""
+
+    @staticmethod
+    def _make_spec(is_hybrid: bool, with_mamba_group: bool):
+        from vllm.v1.kv_cache_interface import MambaSpec
+        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.is_hybrid = is_hybrid
+        kv_cache_config = MagicMock()
+        attn_group = MagicMock()
+        attn_group.kv_cache_spec = object()
+        groups = [attn_group]
+        if with_mamba_group:
+            mamba_group = MagicMock()
+            mamba_group.kv_cache_spec = MagicMock(spec=MambaSpec)
+            groups.append(mamba_group)
+        kv_cache_config.kv_cache_groups = groups
+
+        # Bypass the base spec's block-size / eviction-policy plumbing;
+        # only the hybrid consistency check is under test.
+        with patch.object(CPUOffloadingSpec, "__init__",
+                          lambda self, *a, **k: None):
+            return TPUCPUOffloadingSpec(vllm_config, kv_cache_config)
+
+    def test_hybrid_with_mamba_group_ok(self):
+        spec = self._make_spec(is_hybrid=True, with_mamba_group=True)
+        self.assertTrue(spec.is_hybrid_model)
+
+    def test_dense_without_mamba_group_ok(self):
+        spec = self._make_spec(is_hybrid=False, with_mamba_group=False)
+        self.assertFalse(spec.is_hybrid_model)
+
+    def test_hybrid_without_mamba_group_asserts(self):
+        with self.assertRaises(AssertionError):
+            self._make_spec(is_hybrid=True, with_mamba_group=False)
+
+    def test_dense_with_mamba_group_asserts(self):
+        with self.assertRaises(AssertionError):
+            self._make_spec(is_hybrid=False, with_mamba_group=True)
 
 
 class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
@@ -647,6 +729,54 @@ class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
         mgr.h2d.assert_called_once_with([1, 2], [3, 5], [1, 1])
         mgr.d2h.assert_not_called()
         self.assertEqual(handler._pending[8], (fut, 2 * 64))
+
+
+class TestRaidenHybridPoolMapping(unittest.TestCase):
+    """`_RaidenOffloadingHandler` in hybrid pool mode routes grouped GPU
+    specs through expand_hybrid_pool_block_ids, matching the torch
+    handler's row mapping exactly."""
+
+    def _make_handler(self, tpu_to_cpu: bool, cpu_factor=1, num_groups=2):
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenOffloadingHandler
+
+        mgr = MagicMock(spec=["d2h", "h2d"])
+        handler = _RaidenOffloadingHandler(
+            mgr,
+            tpu_to_cpu=tpu_to_cpu,
+            src_block_size_factor=1 if tpu_to_cpu else cpu_factor,
+            dst_block_size_factor=cpu_factor if tpu_to_cpu else 1,
+            bytes_per_kernel_block=64,
+            hybrid_num_groups=num_groups,
+        )
+        return handler, mgr
+
+    def test_d2h_store_grouped_mapping(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        mgr.d2h.return_value = MagicMock()
+        src = GPULoadStoreSpec([5, 9, 2, 40],
+                               group_sizes=[3, 1],
+                               block_indices=[0, 3])
+        dst = CPULoadStoreSpec([10, 11, 12, 20])
+        with patch("vllm_torchtpu.offload.cpu_tpu._tpu_sync"):
+            self.assertTrue(handler.transfer_async(1, (src, dst)))
+        mgr.d2h.assert_called_once_with([5, 9, 2, 40], [10, 11, 12, 20],
+                                        [1, 1, 1, 1])
+
+    def test_h2d_load_grouped_mapping_factor_2(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        handler, mgr = self._make_handler(tpu_to_cpu=False,
+                                          cpu_factor=2,
+                                          num_groups=1)
+        mgr.h2d.return_value = MagicMock()
+        src = CPULoadStoreSpec([5, 6])
+        dst = GPULoadStoreSpec([7, 8, 9], group_sizes=[3], block_indices=[1])
+        self.assertTrue(handler.transfer_async(2, (src, dst)))
+        mgr.h2d.assert_called_once_with([11, 12, 13], [7, 8, 9], [1, 1, 1])
 
 
 if __name__ == "__main__":
