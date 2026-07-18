@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
                                           get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
+                                             get_pp_group,
                                              get_tensor_model_parallel_rank,
                                              init_distributed_environment)
 from vllm.v1 import utils as vllm_utils
@@ -36,8 +37,9 @@ logger = init_logger(__name__)
 DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
 
 
-def _get_kv_connector_handshake_metadata_key() -> int:
-    return int(get_tensor_model_parallel_rank())
+def _get_kv_connector_handshake_metadata_key() -> tuple[int, int]:
+    return (get_pp_group().rank_in_group,
+            int(get_tensor_model_parallel_rank()))
 
 
 def _debug_tpu_local_rank_offset() -> int:

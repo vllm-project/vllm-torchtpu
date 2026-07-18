@@ -46,14 +46,14 @@ export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 uv tool install keyring --with keyrings.google-artifactregistry-auth
 
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
 # plugin alongside torchtpu-vllm.
 sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
-# Install vLLM in editable mode (forcing the 0.22.1 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
+# Install vLLM in editable mode (forcing the 0.23.0 base version to prevent .dev prerelease mismatch during dependency resolution)
+SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
 
 # Install TorchTPU-vLLM and dependencies
 uv pip install --pre -e .
@@ -61,7 +61,7 @@ uv pip install --pre -e .
 
 #### Option B: Using `pip`
 
-> **Note:** Currently, `vllm==0.22.1` is supported.
+> **Note:** Currently, `vllm==0.23.0` is supported.
 
 ```bash
 python3.12 -m venv ~/pip_venv --symlinks
@@ -75,14 +75,14 @@ pip install keyring keyrings.google-artifactregistry-auth
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
 # plugin alongside torchtpu-vllm.
 sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
-# Install vLLM in editable mode (forcing the 0.22.1 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
+# Install vLLM in editable mode (forcing the 0.23.0 base version to prevent .dev prerelease mismatch during dependency resolution)
+SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
 
 # Install TorchTPU-vLLM and dependencies
 pip install --pre -e .
