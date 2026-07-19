@@ -337,14 +337,15 @@ def _process_fp8_moe_weights(
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
            | None]:
-    """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
+    """Dequantize and requantize FP8 MoE weights on CPU without JAX.
 
     Returns (w13_weight, w13_scale, w2_weight, w2_scale,
              requant_dtype_name, requant_block_size).
     """
     desired_quant_dtype, requant_dtype, requant_block_size = (
         _get_moe_quant_config(
-            "[MoE requantization]: re-quantizing MoE weights"))
+            "[MoE requantization]: re-quantizing MoE weights via simple PyTorch CPU"
+        ))
 
     # Validate block alignment
     block_h, block_w = weight_block_size
@@ -357,19 +358,27 @@ def _process_fp8_moe_weights(
                 f"block size, got {name}.shape={tuple(weight.shape)} and "
                 f"block_size={weight_block_size}.")
 
-    # Dequantize from checkpoint FP8 to float32
+    target_device = layer.w13_weight.data.device
+
+    # Move directly to host CPU memory before processing to prevent TPU HBM OOM
+    w13_fp8_cpu = layer.w13_weight.data.to("cpu", copy=False)
+    w13_scale_inv_cpu = layer.w13_weight_scale_inv.data.to("cpu", copy=False)
+    w2_fp8_cpu = layer.w2_weight.data.to("cpu", copy=False)
+    w2_scale_inv_cpu = layer.w2_weight_scale_inv.data.to("cpu", copy=False)
+
     w13 = dequantize_tensor(
-        layer.w13_weight.data,
-        layer.w13_weight_scale_inv.data,
+        w13_fp8_cpu,
+        w13_scale_inv_cpu,
         axis=(1, 2),
         out_dtype=torch.float32,
     )
     w2 = dequantize_tensor(
-        layer.w2_weight.data,
-        layer.w2_weight_scale_inv.data,
+        w2_fp8_cpu,
+        w2_scale_inv_cpu,
         axis=(1, 2),
         out_dtype=torch.float32,
     )
+
     padded_intermediate = layer.moe_config.intermediate_size_per_partition
     unpadded_intermediate = (
         layer.moe_config.intermediate_size_per_partition_unpadded)
@@ -392,7 +401,14 @@ def _process_fp8_moe_weights(
         activation=activation,
     )
 
-    return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
+    return (
+        w13.to(target_device),
+        w13_scale.to(target_device),
+        w2.to(target_device),
+        w2_scale.to(target_device),
+        desired_quant_dtype,
+        requant_block_size,
+    )
 
 
 def _quantize_bf16_moe_weights(
@@ -401,16 +417,19 @@ def _quantize_bf16_moe_weights(
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
            | None]:
-    """Quantize BF16 MoE weights to FP8 for the TPU GMM kernel.
+    """Quantize BF16 MoE weights to FP8 directly on CPU without JAX.
 
     Same output format as _process_fp8_moe_weights but starts from BF16
     weights instead of dequantizing from FP8 first.
     """
     desired_quant_dtype, requant_dtype, requant_block_size = (
-        _get_moe_quant_config("[MoE online FP8]: quantizing BF16 MoE weights"))
+        _get_moe_quant_config(
+            "[MoE online FP8]: quantizing BF16 MoE weights via simple PyTorch CPU"
+        ))
 
-    w13 = layer.w13_weight.data.to(torch.float32)
-    w2 = layer.w2_weight.data.to(torch.float32)
+    target_device = layer.w13_weight.data.device
+    w13 = layer.w13_weight.data.to("cpu", copy=False).to(torch.float32)
+    w2 = layer.w2_weight.data.to("cpu", copy=False).to(torch.float32)
 
     w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
         w13,
@@ -420,7 +439,14 @@ def _quantize_bf16_moe_weights(
         activation=activation,
     )
 
-    return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
+    return (
+        w13.to(target_device),
+        w13_scale.to(target_device),
+        w2.to(target_device),
+        w2_scale.to(target_device),
+        desired_quant_dtype,
+        requant_block_size,
+    )
 
 
 @register_quantization_config(get_tpu_quant_method(FP8))

@@ -595,9 +595,9 @@ class TpuPlatform(Platform):
                              attn_selector_config: "AttentionSelectorConfig",
                              **kwargs) -> str:
         backend_name = getattr(selected_backend, "name", None)
-        has_mla = hasattr(AttentionBackendEnum, "FLASH_ATTN_MLA") and (
-            selected_backend == getattr(AttentionBackendEnum,
-                                        "FLASH_ATTN_MLA"))
+        has_mla = hasattr(AttentionBackendEnum,
+                          "FLASH_ATTN_MLA") and (selected_backend == getattr(
+                              AttentionBackendEnum, "FLASH_ATTN_MLA"))
         if (has_mla or backend_name == "FLASH_ATTN_MLA"
                 or getattr(attn_selector_config, "use_mla", False)):
             logger.info("Using TPU Pallas MLA attention backend.")
