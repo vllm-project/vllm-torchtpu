@@ -225,9 +225,8 @@ class TPUModelRunner(GPUModelRunner):
     def _is_async_drafter(self) -> bool:
         if not self.speculative_config:
             return False
-        return (self.speculative_config.use_eagle() or 
-                self.speculative_config.method == "dflash")
-
+        return (self.speculative_config.use_eagle()
+                or self.speculative_config.method == "dflash")
 
     def __init__(
         self,
@@ -2830,8 +2829,7 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = self.scheduler_config.async_scheduling
         eagle3_drafts = None
-        if (self._is_async_drafter
-                and combined_selected_tokens):
+        if (self._is_async_drafter and combined_selected_tokens):
             if is_spec_step:
                 eagle3_drafts = (
                     self.spec_decode_manager.propose_draft_token_ids(
@@ -2871,8 +2869,7 @@ class TPUModelRunner(GPUModelRunner):
                 (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
                  num_draft_per_req) = (self._assemble_async_spec_substitution(
                      eagle3_drafts, next_tokens_per_chunk, state))
-            elif (self._is_async_drafter
-                  and next_tokens_tpu_chunks):
+            elif (self._is_async_drafter and next_tokens_tpu_chunks):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real

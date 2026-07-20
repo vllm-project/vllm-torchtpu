@@ -855,8 +855,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
         return outputs
 
 
-
-
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)

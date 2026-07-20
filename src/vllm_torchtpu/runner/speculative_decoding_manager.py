@@ -108,10 +108,9 @@ class SpeculativeDecodingManager:
         # validation also rejects ngram+async at engine construction).
         if (return_device or next_tokens_per_chunk is not None
                 or device_seed is not None):
-            assert (
-                self.runner._is_async_drafter
-            ), ("device-seeded draft proposing is only supported with eagle3 or dflash"
-                )
+            assert (self.runner._is_async_drafter), (
+                "device-seeded draft proposing is only supported with an async drafter"
+            )
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
