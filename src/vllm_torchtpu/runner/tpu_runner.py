@@ -2514,7 +2514,8 @@ class TPUModelRunner(GPUModelRunner):
 
         # Hand the per-chunk draft inputs to the drafter.
         if self.speculative_config and (self.speculative_config.use_eagle()
-                                        or self.speculative_config.method == "dflash"):
+                                        or self.speculative_config.method
+                                        == "dflash"):
             self.drafter.draft_chunks = state.draft_chunks
 
         # Prepare inputs, the requests might be split into multiple
@@ -3013,7 +3014,8 @@ class TPUModelRunner(GPUModelRunner):
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self.speculative_config and (self.speculative_config.use_eagle()
-                                        or self.speculative_config.method == "dflash"):
+                                        or self.speculative_config.method
+                                        == "dflash"):
             self.drafter.load_model(self.model)
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_attention_kernels()
@@ -3309,10 +3311,11 @@ class TPUModelRunner(GPUModelRunner):
                     next_tokens = torch.zeros(nlen,
                                               dtype=torch.int64,
                                               device=self.device)
-                    with set_vllm_model_wrapper_context(mesh=self.mesh, vllm_config=self.vllm_config):
+                    with set_vllm_model_wrapper_context(
+                            mesh=self.mesh, vllm_config=self.vllm_config):
                         out = _substitute_placeholder_token(
-                            input_ids, cur_input_indices, pre_next_tokens_indices,
-                            next_tokens)
+                            input_ids, cur_input_indices,
+                            pre_next_tokens_indices, next_tokens)
                     sync.synchronize(out, wait=True)
                     logger.info("  -- num_tokens: %d, next_len: %d",
                                 num_tokens, nlen)
@@ -3340,9 +3343,9 @@ class TPUModelRunner(GPUModelRunner):
         step by ``input_batch.all_greedy``, so both are reachable and must be
         pre-compiled here.
         """
-        if not (self.speculative_config is not None
-                and (self.speculative_config.use_eagle()
-                     or self.speculative_config.method == "dflash")):
+        if not (self.speculative_config is not None and
+                (self.speculative_config.use_eagle()
+                 or self.speculative_config.method == "dflash")):
             return
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
@@ -3467,9 +3470,9 @@ class TPUModelRunner(GPUModelRunner):
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
-            if (self.speculative_config and
-                (self.speculative_config.use_eagle()
-                 or self.speculative_config.method == "dflash")):
+            if (self.speculative_config
+                    and (self.speculative_config.use_eagle()
+                         or self.speculative_config.method == "dflash")):
                 self.drafter.precompile()
                 self._precompile_rejection_sampler()
                 # The isolated precompile above emits standalone fused programs;
@@ -3509,9 +3512,9 @@ class TPUModelRunner(GPUModelRunner):
             return  # escape hatch / A-B toggle
         if self.enforce_eager:
             return
-        if not (self.speculative_config
-                and (self.speculative_config.use_eagle()
-                     or self.speculative_config.method == "dflash")):
+        if not (self.speculative_config and
+                (self.speculative_config.use_eagle()
+                 or self.speculative_config.method == "dflash")):
             return
         if self.input_batch.num_reqs != 0:
             logger.warning("skip spec-decode warmup: input_batch not empty")
@@ -4335,7 +4338,6 @@ class TPUModelRunner(GPUModelRunner):
             top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
-
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
