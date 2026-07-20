@@ -105,7 +105,7 @@ All contributions during this pre-public phase must strictly follow this 4-step 
   ```
 
 - **UI Override (Temporary Pre-Public Option):** During this pre-public stage, repository collaborators can also manually click the DCO check details in the GitHub PR UI and click "Set DCO to PASS" to manually override and pass the check when necessary.
-3. **Push & Open PR with Assignees:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`:
+1. **Push & Open PR with Assignees:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`:
 
    ```bash
    git push origin HEAD
