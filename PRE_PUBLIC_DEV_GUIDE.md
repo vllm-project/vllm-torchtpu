@@ -92,7 +92,7 @@ All contributions during this pre-public phase must strictly follow this 4-step 
 
 2. **Commit with DCO Sign-off (-s):**
 
-```bash
+   ```bash
    git commit -s -m "feat(kernel): add experimental TPU attention layer"
    ```
 
@@ -105,10 +105,10 @@ All contributions during this pre-public phase must strictly follow this 4-step 
   ```
 
 - **UI Override (Temporary Pre-Public Option):** During this pre-public stage, repository collaborators can also manually click the DCO check details in the GitHub PR UI and click "Set DCO to PASS" to manually override and pass the check when necessary.
-1. **Push & Open PR with Assignees:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`:
+3. **Push & Open PR with Assignees:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`:
 
    ```bash
-git push origin HEAD
+   git push origin HEAD
    gh pr create --fill --assignee reviewer1,reviewer2
    gh pr edit --add-reviewer reviewer3
 
@@ -150,14 +150,14 @@ After the PR is merged into `main`:
    [Buildkite Scheduled Builds](https://buildkite.com/tpu-commons/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build)
 2. **Verify Main Branch CI Runs (GitHub CLI):** Confirm that recent workflow runs on `main` remain green and stable:
 
-```bash
+   ```bash
    gh run list --branch main --limit 5
    ```
 
-1. **Clean Up Local Environment:** Sync your local workspace and delete obsolete feature branches:
+3. **Clean Up Local Environment:** Sync your local workspace and delete obsolete feature branches:
 
    ```bash
-git checkout main
+   git checkout main
    git pull origin main
    git branch -d username/feature-name
    git remote prune origin
