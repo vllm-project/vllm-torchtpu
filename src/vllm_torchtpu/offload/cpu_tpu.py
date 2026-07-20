@@ -107,6 +107,20 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Upper bound on offload flush waits (seconds) — bounds both the torch
+# handler's H2D flush drain and the raiden handler's poll loop in wait().
+# Dedicated to the offload path — intentionally NOT the disagg p2p-pull
+# timeout — so it can be tuned independently.
+_OFFLOAD_WAIT_TIMEOUT_S = float(
+    os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
+# Sleep between poll iterations in the wait() loops (seconds). Yields the
+# GIL so the DMA worker thread (torch path) can signal completion; smaller
+# values detect completion sooner at the cost of more CPU while waiting.
+# Not a correctness knob — loop exit is governed by transfer state and
+# _OFFLOAD_WAIT_TIMEOUT_S.
+_OFFLOAD_WAIT_POLL_INTERVAL_S = float(
+    os.environ.get("VLLM_TPU_OFFLOAD_WAIT_POLL_INTERVAL_S", "0.0005"))
+
 
 # ---------------------------------------------------------------------------
 # Module-level patches: route scatter dispatch through a scheduler-driven
@@ -573,6 +587,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # in `transfer_async` works on both directions' instances.
         self._req_id_by_job_id: dict[int, str] = {}
 
+        # TransferResults collected early by a wait()-driven H2D flush
+        # drain; re-emitted by the next get_finished() call so the
+        # scheduler still sees every completion.
+        self._flushed_results: list[TransferResult] = []
+
         # Lightweight diagnostics — printed sparingly to spot stalls.
 
         # Single background DMA worker for this direction. The FIFO queue
@@ -828,7 +847,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             self._start_h2d_dma(t)
         return True
 
-    def flush_pending_scatters(self, scatter_now_req_ids: set[str]) -> None:
+    def flush_pending_scatters(self,
+                               scatter_now_req_ids: set[str],
+                               force: bool = False) -> None:
         """Dispatch H2D scatter HLOs for deferred chunks whose owning
         request has been promoted to the active batch on ALL ranks.
 
@@ -840,6 +861,14 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         that lets each rank dispatch its scatter in lockstep with the
         others. Transfers whose req_id isn't in the set stay in
         `_pending_scatters` for a later step's flush.
+
+        `force=True` (used only by wait()'s flush drain) dispatches every
+        parked scatter, bypassing the scatter-now gate. An early dispatch
+        is safe (the data just lands sooner; the promotion step's flush
+        then finds nothing left), and it is the only way to unpark
+        last-chunk scatters of requests that will never be promoted
+        (finished/aborted), which would otherwise hold `_h2d_buffer_free`
+        cleared forever and wedge the H2D pipeline.
 
         For chunked transfers, re-submits the next chunk to the worker
         after this chunk's scatter is enqueued — preserving the libtpu
@@ -863,14 +892,15 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # `scatter_now_req_ids` until `finished_recving` is reported,
         # which only happens on the last chunk's `get_finished`.
         to_flush = [
-            ps for ps in self._pending_scatters if
-            (not ps.is_last_chunk or ps.transfer.req_id in scatter_now_req_ids)
+            ps for ps in self._pending_scatters
+            if (force or not ps.is_last_chunk
+                or ps.transfer.req_id in scatter_now_req_ids)
         ]
-        to_keep = [
+        to_keep = ([] if force else [
             ps for ps in self._pending_scatters
             if (ps.is_last_chunk
                 and ps.transfer.req_id not in scatter_now_req_ids)
-        ]
+        ])
 
         if not to_flush:
             # Nothing to dispatch on this rank this step. Return early
@@ -900,7 +930,10 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._pending_scatters = to_keep
 
     def get_finished(self) -> list[TransferResult]:
-        results: list[TransferResult] = []
+        # Start from results collected early by a wait()-driven flush
+        # drain; the scheduler still needs them reported via this call.
+        results: list[TransferResult] = self._flushed_results
+        self._flushed_results = []
         while self._transfers:
             t = self._transfers[0]
 
@@ -983,26 +1016,61 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         Mirrors the CUDA reference impl in
         vllm/v1/kv_offload/cpu/gpu_worker.py:wait — purely a flush
-        primitive. Internal-state cleanup (popping from `_transfers`,
-        deleting from `_transfer_map`, building TransferResults) is left
-        to the next `get_finished()` call. Removing transfers here would
-        prevent `get_finished()` from emitting their TransferResults,
-        which the scheduler relies on to mark jobs complete.
+        primitive. TransferResults are still emitted by `get_finished()`
+        (directly, or via `_flushed_results` for transfers the H2D drain
+        below collects), which the scheduler relies on to mark jobs
+        complete.
+
+        D2H: block on each transfer's dma_done — the worker task ends
+        with the cpu_pool host scatter, so dma_done ⇒ fully landed.
+
+        H2D: the scheduler legitimately flushes load jobs too — it names
+        ALL pending jobs (stores AND loads) once every tracked request
+        has finished, and on reset_cache, because there may be no future
+        engine step to run get_finished / flush_pending_scatters (see
+        offloading/scheduler.py build_connector_meta). Drain the chunk
+        pipeline here: collect DMA-complete chunks via get_finished
+        (re-buffering their results) and force-dispatch parked scatters
+        past the scatter-now gate. The gate bypass is safe — every rank
+        completes this wait before its next forward, so scatter-before-
+        forward ordering still holds on all ranks; an early dispatch
+        just lands the data sooner. Bounded by the offload wait timeout
+        so a stalled DMA can't hang the engine (timed-out jobs stay in
+        `_transfer_map` and are reported by a later get_finished, as
+        before).
         """
-        for jid in job_ids:
-            t = self._transfer_map.get(jid)
-            if t is None:
-                continue
-            if self.tpu_to_cpu:
-                # Worker task ends with the cpu_pool host scatter, so
-                # dma_done.is_set() implies the D2H is fully landed.
+        if self.tpu_to_cpu:
+            for jid in job_ids:
+                t = self._transfer_map.get(jid)
+                if t is None:
+                    continue
                 t.dma_done.wait()
-            else:
-                # H2D skips non-ready transfers rather than waiting; the
-                # OffloadingConnector only ever calls wait() for D2H flush.
-                raise AssertionError(
-                    f"wait() called on H2D handler for job={jid}; "
-                    "OffloadingConnector should never invoke this path.")
+            return
+
+        remaining = {jid for jid in job_ids if jid in self._transfer_map}
+        deadline = time.perf_counter() + _OFFLOAD_WAIT_TIMEOUT_S
+        while True:
+            # Collect DMA-complete chunks (queues their pending scatters,
+            # pops finished transfers) and re-buffer the TransferResults
+            # for the next real get_finished() call.
+            self._flushed_results = self.get_finished()
+            # Dispatch every parked scatter: frees the device buffer so
+            # queued DMAs and next chunks can proceed, and unparks
+            # last-chunk scatters of never-promoted requests. Must run at
+            # least once even if `remaining` starts empty — a last-chunk
+            # scatter parks in the same get_finished() that pops its
+            # transfer, so an aborted request's scatter can be holding
+            # `_h2d_buffer_free` with no `_transfer_map` entry left.
+            self.flush_pending_scatters(set(), force=True)
+            remaining = {jid for jid in remaining if jid in self._transfer_map}
+            if not remaining:
+                return
+            if time.perf_counter() >= deadline:
+                logger.warning(
+                    "[kv-offload] H2D flush wait timed out after %.1fs "
+                    "for jobs=%s", _OFFLOAD_WAIT_TIMEOUT_S, sorted(remaining))
+                return
+            time.sleep(_OFFLOAD_WAIT_POLL_INTERVAL_S)
 
     def shutdown(self) -> None:
         """Tear down the worker thread cleanly.
@@ -1029,11 +1097,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 # buffer, no cpu_pool tensor, no scatter-now gate (the DMA writes kv_cache
 # directly; there is no scatter HLO to dispatch in lockstep).
 _USE_RAIDEN_OFFLOAD = os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") == "1"
-# Upper bound on the raiden offload flush wait (seconds). Dedicated to the
-# offload path -- intentionally NOT the disagg p2p-pull timeout -- so it can be
-# tuned independently.
-_RAIDEN_OFFLOAD_WAIT_TIMEOUT_S = float(
-    os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
 
 
 class _RaidenOffloadingHandler(OffloadingHandler):
@@ -1132,7 +1195,7 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         # busy-poll forever; on timeout the jobs stay in _pending and are
         # reported by a later get_finished().
         remaining = {jid for jid in job_ids if jid in self._pending}
-        deadline = time.perf_counter() + _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S
+        deadline = time.perf_counter() + _OFFLOAD_WAIT_TIMEOUT_S
         while remaining:
             for jid in list(remaining):
                 entry = self._pending.get(jid)
@@ -1143,10 +1206,9 @@ class _RaidenOffloadingHandler(OffloadingHandler):
             if time.perf_counter() >= deadline:
                 logger.warning(
                     "[kv-offload] Raiden wait timed out after %.1fs for "
-                    "jobs=%s", _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S,
-                    sorted(remaining))
+                    "jobs=%s", _OFFLOAD_WAIT_TIMEOUT_S, sorted(remaining))
                 return
-            time.sleep(0.0005)
+            time.sleep(_OFFLOAD_WAIT_POLL_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------

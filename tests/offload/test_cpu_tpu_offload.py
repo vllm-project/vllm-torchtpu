@@ -14,6 +14,11 @@ Covers the pieces that don't require a real TPU:
   used by `_h2d_task` / `_d2h_task`.
 - `transfer_async` H2D chunking math: `chunks_total = ceil(len(src_ids)
   / chunk_size)` at the boundary cases.
+- `wait()` flush semantics: D2H blocks on dma_done; H2D drains the chunk
+  pipeline (force-dispatching parked scatters past the scatter-now gate,
+  re-buffering TransferResults for exactly-once reporting via
+  `get_finished`), unparks orphaned last-chunk scatters of aborted
+  requests, and times out instead of hanging on a stalled DMA.
 - `utils.estimate_kv_connector_hbm_reserve` dynamic spec resolution
   (no kv_connector / missing metadata / unimportable module → 0).
 - `expand_hybrid_pool_block_ids` grouped row mapping for the unified
@@ -29,6 +34,7 @@ plumbing) are mocked at construction time so the tests run on a host
 without a TPU.
 """
 import os
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -299,6 +305,7 @@ class TestMultiChunkH2D(unittest.TestCase):
         h._h2d_buffer_free = threading.Event()
         h._h2d_buffer_free.set()
         h._pending_scatters = []
+        h._flushed_results = []
         h._dma_worker = MagicMock()
         h.transfer_type = ("CPU", "GPU")
         h.total_block_size_in_bytes = 1
@@ -367,6 +374,215 @@ class TestMultiChunkH2D(unittest.TestCase):
             "Intermediate chunks were not eligible for flush despite the "
             "owning req_id correctly being absent from `scatter_now_req_ids` "
             "(the request is still in WAITING_FOR_REMOTE_KVS).")
+
+
+class TestWaitFlushDrain(unittest.TestCase):
+    """`wait()` is the connector's flush primitive, and the scheduler
+    legitimately names H2D *load* jobs in it (it flushes ALL pending jobs
+    once every tracked request has finished, and on reset_cache). There
+    may be no future engine step to run `get_finished` /
+    `flush_pending_scatters` afterwards, so the H2D handler must drain
+    its chunk pipeline inside `wait()` itself (regression: this used to
+    be an `AssertionError` crash on the H2D path).
+
+    Same TPU-free construction pattern as TestMultiChunkH2D: `__init__`
+    is bypassed and `_start_h2d_dma` is stubbed to signal `dma_done`
+    immediately. The stub also clears `_h2d_buffer_free`, mirroring the
+    real worker task, so the tests verify the drain releases the buffer.
+    """
+
+    def _make_h2d_handler(self):
+        import threading
+        from collections import deque
+
+        from vllm_torchtpu.offload.cpu_tpu import \
+            SingleDirectionOffloadingHandler
+
+        h = SingleDirectionOffloadingHandler.__new__(
+            SingleDirectionOffloadingHandler)
+        h.tpu_to_cpu = False
+        h.src_tensors = []
+        h.dst_tensors = []
+        h._transfer_map = {}
+        h._transfers = deque()
+        h._req_id_by_job_id = {}
+        h._h2d_buffer_free = threading.Event()
+        h._h2d_buffer_free.set()
+        h._pending_scatters = []
+        h._flushed_results = []
+        h._dma_worker = MagicMock()
+        h.transfer_type = ("CPU", "GPU")
+        h.total_block_size_in_bytes = 1
+        h._dispatched_chunks: list[int] = []
+
+        def fake_start(t):
+            h._dispatched_chunks.append(t.chunks_done)
+            ev = threading.Event()
+            ev.set()
+            t.dma_done = ev
+            # Mirror the real _h2d_task: the DMA claims the buffer; only
+            # a scatter dispatch (flush_pending_scatters) releases it.
+            h._h2d_buffer_free.clear()
+            t.device_buffer = [MagicMock()]
+            t.dst_ids_i32 = MagicMock()
+            t.dst_ids_i32.to = lambda dtype: MagicMock()
+
+        h._start_h2d_dma = fake_start
+        return h
+
+    @staticmethod
+    def _make_transfer(job_id: int, chunks_total: int, req_id: str = "req-A"):
+        import numpy as np
+
+        from vllm_torchtpu.offload.cpu_tpu import Transfer
+        n_ids = 2 * chunks_total
+        return Transfer(
+            job_id=job_id,
+            num_bytes=0,
+            n=n_ids,
+            dma_done=None,
+            src_ids=np.arange(n_ids, dtype=np.int64),
+            dst_ids=np.arange(n_ids, dtype=np.int64),
+            chunks_total=chunks_total,
+            chunks_done=0,
+            req_id=req_id,
+        )
+
+    def _submit(self, h, t):
+        h._transfer_map[t.job_id] = t
+        h._transfers.append(t)
+        h._start_h2d_dma(t)
+
+    def test_h2d_wait_drains_chunked_transfer(self):
+        """wait() must complete a multi-chunk load without any engine
+        step's get_finished/flush cycle, and the TransferResult must
+        still be reported by the NEXT get_finished — exactly once."""
+        h = self._make_h2d_handler()
+        t = self._make_transfer(job_id=1, chunks_total=4)
+        self._submit(h, t)
+
+        h.wait({1})
+
+        self.assertNotIn(1, h._transfer_map)
+        self.assertEqual(h._dispatched_chunks, list(range(t.chunks_total)))
+        self.assertEqual(h._pending_scatters, [])
+        self.assertTrue(h._h2d_buffer_free.is_set())
+
+        results = h.get_finished()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].job_id, 1)
+        self.assertTrue(results[0].success)
+        # Exactly once: the re-buffered result must not be re-emitted.
+        self.assertEqual(h.get_finished(), [])
+
+    def test_h2d_wait_unparks_orphaned_last_chunk_scatter(self):
+        """A last-chunk scatter parks in the same get_finished() that
+        pops its transfer from `_transfer_map`. If the owning request is
+        then aborted (never promoted, so never in `scatter_now_req_ids`),
+        the parked scatter holds `_h2d_buffer_free` with no map entry
+        left — wait() must still force-dispatch it even though none of
+        the named jobs are in `_transfer_map` anymore."""
+        h = self._make_h2d_handler()
+        t = self._make_transfer(job_id=1, chunks_total=1)
+        self._submit(h, t)
+
+        # Engine step: result reported, last-chunk scatter parked behind
+        # the scatter-now gate (req never promoted → empty set).
+        results = h.get_finished()
+        self.assertEqual([r.job_id for r in results], [1])
+        h.flush_pending_scatters(set())
+        self.assertEqual(len(h._pending_scatters), 1)
+        self.assertFalse(h._h2d_buffer_free.is_set())
+
+        h.wait({1})
+
+        self.assertEqual(h._pending_scatters, [])
+        self.assertTrue(h._h2d_buffer_free.is_set())
+        # The result was already consumed above; wait() must not
+        # resurrect it.
+        self.assertEqual(h.get_finished(), [])
+
+    def test_h2d_wait_times_out_on_stalled_dma(self):
+        """A DMA that never completes must not hang the engine: wait()
+        returns after the timeout and leaves the job in `_transfer_map`
+        for a later get_finished to report."""
+        import threading
+
+        h = self._make_h2d_handler()
+        t = self._make_transfer(job_id=1, chunks_total=1)
+        h._transfer_map[1] = t
+        h._transfers.append(t)
+        t.dma_done = threading.Event()  # never set — stalled DMA
+
+        with patch("vllm_torchtpu.offload.cpu_tpu._OFFLOAD_WAIT_TIMEOUT_S",
+                   0.05):
+            h.wait({1})  # must return, not hang
+
+        self.assertIn(1, h._transfer_map)
+
+    def test_h2d_wait_ignores_unknown_jobs(self):
+        h = self._make_h2d_handler()
+        h.wait({999})  # must not raise or hang
+        self.assertTrue(h._h2d_buffer_free.is_set())
+
+    def test_d2h_wait_blocks_until_dma_done(self):
+        """D2H wait blocks on each named transfer's dma_done (set only
+        after the host-pool scatter, so set ⇒ fully landed) and skips
+        job ids it doesn't know about."""
+        import threading
+
+        from vllm_torchtpu.offload.cpu_tpu import (
+            SingleDirectionOffloadingHandler, Transfer)
+
+        h = SingleDirectionOffloadingHandler.__new__(
+            SingleDirectionOffloadingHandler)
+        h.tpu_to_cpu = True
+        h._transfer_map = {}
+
+        ev = threading.Event()
+        t = Transfer(job_id=1, num_bytes=0, n=1, dma_done=ev)
+        h._transfer_map[1] = t
+
+        # Signal completion from a worker-like thread shortly after wait
+        # starts blocking.
+        threading.Timer(0.02, ev.set).start()
+        start = time.monotonic()
+        h.wait({1, 999})  # 999 unknown → skipped
+        self.assertGreaterEqual(time.monotonic() - start, 0.015)
+        self.assertTrue(ev.is_set())
+
+    def test_force_flush_dispatches_real_scatter_data(self):
+        """force=True must dispatch a gated last-chunk scatter (the
+        non-force flush with an empty scatter-now set keeps it parked),
+        actually writing the staged data into the KV cache rows."""
+        from vllm_torchtpu.offload.cpu_tpu import _PendingScatter
+
+        h = self._make_h2d_handler()
+        kv_cache = torch.zeros(8, 4)
+        h.dst_tensors = [kv_cache]
+
+        t = self._make_transfer(job_id=1, chunks_total=1, req_id="req-A")
+        staged = torch.full((2, 4), 5.0)
+        h._pending_scatters.append(
+            _PendingScatter(
+                transfer=t,
+                device_buffer=[staged],
+                dst_ids_i32=torch.tensor([2, 3], dtype=torch.int32),
+                is_last_chunk=True,
+            ))
+        h._h2d_buffer_free.clear()
+
+        h.flush_pending_scatters(set())  # gated: req-A not promoted
+        self.assertEqual(len(h._pending_scatters), 1)
+        self.assertFalse(h._h2d_buffer_free.is_set())
+        self.assertTrue(torch.all(kv_cache == 0))
+
+        h.flush_pending_scatters(set(), force=True)
+        self.assertEqual(h._pending_scatters, [])
+        self.assertTrue(h._h2d_buffer_free.is_set())
+        self.assertTrue(torch.equal(kv_cache[2:4], staged))
+        self.assertTrue(torch.all(kv_cache[:2] == 0))
+        self.assertTrue(torch.all(kv_cache[4:] == 0))
 
 
 class TestExpandHybridPoolBlockIds(unittest.TestCase):
@@ -537,6 +753,7 @@ class TestHybridTransferAsyncMapping(unittest.TestCase):
         h._h2d_buffer_free = threading.Event()
         h._h2d_buffer_free.set()
         h._pending_scatters = []
+        h._flushed_results = []
         h._dma_worker = MagicMock()
         h.transfer_type = ("CPU", "GPU")
         h.total_block_size_in_bytes = 1
