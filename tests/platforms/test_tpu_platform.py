@@ -336,17 +336,15 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
-        ("is_hybrid", "pool_env", "expect_error", "expect_mamba_patch"),
+        ("is_hybrid", "pool_env", "expect_error"),
         [
             # Hybrid CPU offloading transfers whole pool rows; without the
             # unified block pool there is no uniform per-block row to copy.
-            (True, False, True, False),
-            # With the pool, hybrid offloading also needs the scheduler
-            # patch (same _mamba_block_aligned_split assert as PD disagg).
-            (True, True, False, True),
-            # Dense offloading works on either layout, no patch needed.
-            (False, True, False, False),
-            (False, False, False, False),
+            (True, False, True),
+            (True, True, False),
+            # Dense offloading works on either layout.
+            (False, True, False),
+            (False, False, False),
         ],
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
@@ -360,7 +358,7 @@ class TestTpuPlatform:
     def test_check_and_update_config_gates_hybrid_offloading_on_pool(
             self, mock_vllm_envs, mock_prepare_env, mock_sharding,
             mock_apply_patches, vllm_config, monkeypatch, is_hybrid, pool_env,
-            expect_error, expect_mamba_patch):
+            expect_error):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = is_hybrid
         vllm_config.cache_config.block_size = 256
@@ -396,10 +394,10 @@ class TestTpuPlatform:
             else:
                 TpuPlatform.check_and_update_config(vllm_config)
 
-        if expect_mamba_patch:
-            mock_mamba_patch.assert_called_once_with()
-        else:
-            mock_mamba_patch.assert_not_called()
+        # OffloadingConnector never needs the mamba external-KV scheduler
+        # patch: vLLM 0.23.0 accepts external computed tokens in
+        # _mamba_block_aligned_split and skips the split during async loads.
+        mock_mamba_patch.assert_not_called()
 
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(

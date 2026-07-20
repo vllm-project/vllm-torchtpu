@@ -514,8 +514,9 @@ class TestWaitFlushDrain(unittest.TestCase):
         h._transfers.append(t)
         t.dma_done = threading.Event()  # never set — stalled DMA
 
-        with patch("vllm_torchtpu.offload.cpu_tpu._OFFLOAD_WAIT_TIMEOUT_S",
-                   0.05):
+        with patch(
+                "vllm_torchtpu.offload.cpu_tpu._RAIDEN_OFFLOAD_WAIT_TIMEOUT_S",
+                0.05):
             h.wait({1})  # must return, not hang
 
         self.assertIn(1, h._transfer_map)
