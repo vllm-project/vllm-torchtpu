@@ -10,9 +10,6 @@ import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
-from vllm_torchtpu.spec_decode.dflash import DFlashProposer
-from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
-
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -111,9 +108,11 @@ class SpeculativeDecodingManager:
         # validation also rejects ngram+async at engine construction).
         if (return_device or next_tokens_per_chunk is not None
                 or device_seed is not None):
-            assert (self.runner.speculative_config.use_eagle()
-                    or self.runner.speculative_config.method == "dflash"), (
-                "device-seeded draft proposing is only supported with eagle3 or dflash")
+            assert (
+                self.runner.speculative_config.use_eagle()
+                or self.runner.speculative_config.method == "dflash"
+            ), ("device-seeded draft proposing is only supported with eagle3 or dflash"
+                )
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
