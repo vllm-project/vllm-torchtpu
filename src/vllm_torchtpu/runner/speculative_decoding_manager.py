@@ -109,8 +109,7 @@ class SpeculativeDecodingManager:
         if (return_device or next_tokens_per_chunk is not None
                 or device_seed is not None):
             assert (
-                self.runner.speculative_config.use_eagle()
-                or self.runner.speculative_config.method == "dflash"
+                self.runner._is_async_drafter
             ), ("device-seeded draft proposing is only supported with eagle3 or dflash"
                 )
         if self.runner.speculative_config.method == "ngram":
@@ -122,8 +121,7 @@ class SpeculativeDecodingManager:
                 self.runner.input_batch.token_ids_cpu,
             )
             return None
-        elif (self.runner.speculative_config.use_eagle()
-              or self.runner.speculative_config.method == "dflash"):
+        elif (self.runner._is_async_drafter):
             result = self.runner.drafter.propose(
                 sampled_token_ids[:num_reqs]
                 if sampled_token_ids else sampled_token_ids,
