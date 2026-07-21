@@ -13,6 +13,6 @@
 # limitations under the License.
 """SparseCore Sparse MLA Attention kernel."""
 
-from vllm_torchtpu.kernels.mla.sparse.kernel import mla_ragged_paged_attention
+from vllm_torchtpu.kernels.mla.sparse.kernel import sparse_ragged_paged_attention
 
-__all__ = ["mla_ragged_paged_attention"]
+__all__ = ["sparse_ragged_paged_attention"]
