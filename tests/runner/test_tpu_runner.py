@@ -279,8 +279,8 @@ class TestTPURunner:
         kv_connector_extra_config spec lookup the worker uses."""
         kv_tc = MagicMock()
         kv_tc.kv_connector_extra_config = {
-            "spec_name": "_FakeReserveSpec",
-            "spec_module_path": "tests.runner.test_tpu_runner",
+            "spec_name": _FakeReserveSpec.__name__,
+            "spec_module_path": _FakeReserveSpec.__module__,
         }
         self.runner.vllm_config.kv_transfer_config = kv_tc
 

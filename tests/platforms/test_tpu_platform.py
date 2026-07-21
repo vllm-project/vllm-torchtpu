@@ -383,21 +383,13 @@ class TestTpuPlatform:
                 'sys.modules', {
                     'vllm_torchtpu.layers.vllm.attention':
                     MagicMock(PallasAttentionBackend=mock_pallas)
-                }), patch(
-                    "vllm_torchtpu.platforms.tpu_platform."
-                    "_patch_scheduler_mamba_external_kv") as mock_mamba_patch, \
-                patch("vllm_torchtpu.platforms.tpu_platform."
-                      "update_tpu_block_size_and_slot_config"):
+                }), patch("vllm_torchtpu.platforms.tpu_platform."
+                          "update_tpu_block_size_and_slot_config"):
             if expect_error:
                 with pytest.raises(ValueError, match="unified block\\s+pool"):
                     TpuPlatform.check_and_update_config(vllm_config)
             else:
                 TpuPlatform.check_and_update_config(vllm_config)
-
-        # OffloadingConnector never needs the mamba external-KV scheduler
-        # patch: vLLM 0.23.0 accepts external computed tokens in
-        # _mamba_block_aligned_split and skips the split during async loads.
-        mock_mamba_patch.assert_not_called()
 
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
