@@ -606,19 +606,47 @@ def mla_attention(
     return kv_cache, output_TNA
 
 
+def _update_kv_cache_slots(cache, kv_c, k_pe, seq_lens, block_tables,
+                           query_start_loc):
+    """Scatter the current step's latents into the paged FP8 MLA cache.
+
+    Mirrors the dense MLA kernel's fused insert: sequence s's new tokens
+    land at positions kv_len - q_len .. kv_len - 1; values stored
+    verbatim in FP8.
+    """
+    page_size = cache.shape[1] * cache.shape[2]
+    num_tokens = kv_c.shape[0]
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_id = jnp.searchsorted(query_start_loc[1:], tok,
+                              side="right").astype(jnp.int32)
+    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
+    local = tok - query_start_loc[seq_id]
+    pos = seq_lens[seq_id] - q_len + local
+    valid = tok < query_start_loc[-1]
+    bt = block_tables.reshape(seq_lens.shape[0], -1)
+    page = jnp.where(valid, bt[seq_id, pos // page_size], jnp.int32(2**30))
+    slot = pos % page_size
+    kv_new = jnp.concatenate([kv_c, k_pe], axis=-1)  # (T, 576) fp8
+    return cache.at[page, slot // 4, slot % 4, :kv_new.shape[-1]].set(kv_new)
+
+
 def sparse_mla_attention(
         q_TNA: jax.Array,
         q_rope_TNH: jax.Array,
+        k_SA: jax.Array,
+        k_rope_SH: jax.Array,
         kv_cache: jax.Array,
         topk_indices: jax.Array,
+        seq_lens: jax.Array,
         block_tables: jax.Array,
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
         mesh: Mesh,
         query_tnh_sharding: Any | None = None,
+        keyvalue_skh_sharding: Any | None = None,
         attn_o_tnh_sharding: Any | None = None,
         sm_scale: float | None = None,
-        k_scale: float | None = None) -> jax.Array:
+        k_scale: float | None = None) -> tuple[jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
     Contract notes:
@@ -627,13 +655,8 @@ def sparse_mla_attention(
         transpose (the v2 kernel wants (N, T, L); this one does not).
       * `q` must be bf16 (pre-quantization): the kernel dequantizes the
         gathered KV to bf16 and has no q-scale plumbing.
-      * The kernel only READS the cache; new-token insertion must have
-        happened before this call (Stage-A: the dense op's fused insert
-        runs first). No cache is returned.
-      * The kernel gathers from two packed uint8 caches (512 B fp8 nope
-        row + 128 B byte-split bf16 rope row per token). Stage-A converts
-        the resident fp8 float cache into that form on the fly below; a
-        native uint8 cache + slot writer replaces the conversion later.
+      * Fused KV-cache insert: writes current step's `k_SA` and `k_rope_SH`
+        into `kv_cache` before SparseCore gather execution.
       * Per-token kv_lens derive from the "-1" tail padding in
         `topk_indices`; every token must have at least one valid entry.
     """
@@ -643,8 +666,12 @@ def sparse_mla_attention(
         query_tnh_sharding
         or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
              None),  # q_rope_TNH
+        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_SA
+        keyvalue_skh_sharding
+        or P(ShardingAxisName.ATTN_DATA, None),  # k_rope_SH
         P(ShardingAxisName.ATTN_DATA),  # kv_cache
         P(ShardingAxisName.ATTN_DATA),  # topk_indices
+        P(ShardingAxisName.ATTN_DATA),  # seq_lens
         P(ShardingAxisName.ATTN_DATA),  # block_tables
         P(ShardingAxisName.ATTN_DATA),  # query_start_loc
         P(ShardingAxisName.ATTN_DATA),  # request_distribution
@@ -652,30 +679,31 @@ def sparse_mla_attention(
     out_specs = (
         attn_o_tnh_sharding
         or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-             None))  # attn output (T, N, D)
+             None),  # attn output (T, N, D)
+        P(ShardingAxisName.ATTN_DATA),  # updated kv cache
+    )
 
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
 
-    def _sparse_mla_ragged_paged_attention(q, q_rope, cache, topk_idx,
-                                           block_tables_, query_start_loc_,
+    def _sparse_mla_ragged_paged_attention(q, q_rope, k, k_rope, cache,
+                                           topk_idx, seq_lens_, block_tables_,
+                                           query_start_loc_,
                                            request_distribution_):
         lkv_dim = q.shape[-1]  # kv_lora_rank (512 for GLM-5.2)
         rope_dim = q_rope.shape[-1]  # 64
         # (T, N, L) + (T, N, H) -> (T, N, L + H); token-major, no transpose.
         q = jnp.concatenate([q, q_rope], axis=-1)
 
+        # ---- Fused Cache Write -------------------------------------------
+        cache = _update_kv_cache_slots(cache, k, k_rope, seq_lens_,
+                                       block_tables_, query_start_loc_)
+        # ------------------------------------------------------------------
+
         # ---- Stage-A cache shim ------------------------------------------
-        # Convert the resident fp8 float cache (written by the dense op's
-        # fused insert; layout (pages, ps//4, 4, 640) float8, token t of a
-        # page at [p, t//4, t%4, :]) into the packed uint8 pair the sparse
-        # kernel gathers from:
-        #   nope: (pages, page_size, 4, 128) u8 -- token's 512 fp8 bytes,
-        #         exactly one SparseCore gather row; dequantized in-kernel
-        #         with the per-tensor k_scale.
-        #   rope: (pages, page_size//4, 4, 128) u8 -- 64 bf16 per token,
-        #         byte-split hi[0:64] / lo[64:128] as csa_gather expects.
-        # Full-cache transform per call: bring-up only; a native uint8
-        # cache + slot writer replaces this.
+        # Convert the resident fp8 float cache (written by fused insert above;
+        # layout (pages, ps//4, 4, 640) float8) into packed uint8 pair for csa_gather:
+        #   nope: (pages, page_size, 4, 128) u8
+        #   rope: (pages, page_size//4, 4, 128) u8
         assert cache.dtype == jnp.float8_e4m3fn, (
             "Stage-A sparse shim requires --kv-cache-dtype fp8 (got "
             f"{cache.dtype}); the nope conversion is a pure bitcast.")
@@ -716,15 +744,16 @@ def sparse_mla_attention(
         # attention-weighted ROPE keys, which are not part of the value.
         # Slice to the latent so the shape matches the registered fake
         # (T, N, kv_lora_rank) and the downstream W_UV projection.
-        return out[..., :lkv_dim]
+        return out[..., :lkv_dim], cache
 
-    output_TNA = jax.jit(
+    output_TNA, updated_cache = jax.jit(
         shard_map.shard_map(_sparse_mla_ragged_paged_attention,
                              mesh=mesh,
                              in_specs=in_specs,
                              out_specs=out_specs,
-                             check_rep=False))(q_TNA, q_rope_TNH, kv_cache,
-                                               topk_indices, block_tables,
-                                               query_start_loc,
+                             check_rep=False))(q_TNA, q_rope_TNH, k_SA,
+                                               k_rope_SH, kv_cache,
+                                               topk_indices, seq_lens,
+                                               block_tables, query_start_loc,
                                                request_distribution)
-    return output_TNA
+    return updated_cache, output_TNA
