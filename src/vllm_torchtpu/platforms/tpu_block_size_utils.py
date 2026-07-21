@@ -16,40 +16,11 @@ else:
 logger = init_logger(__name__)
 
 
-def unified_block_pool_enabled(vllm_config: "VllmConfig") -> bool:
-    """Whether this deployment runs on the unified block pool (attention KV
-    and mamba state served from one attention-shaped pool of fungible
-    blocks).
-
-    Opt-in only, via TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL. Never engages for
-    P/D kv-transfer deployments: those connectors address the typed-view
-    layout by byte offsets and do not understand the pool, so the same
-    env keeps those deployments on the typed-view layout (see
-    unified_kv_layout_enabled). The OffloadingConnector is the exception:
-    its TPU spec transfers whole pool rows (dtype-agnostic block copies),
-    which is exactly the pool layout — hybrid CPU offloading REQUIRES the
-    pool (see TPUCPUOffloadingSpec).
-    """
-    from vllm_torchtpu import envs as tpu_envs
-    kv_transfer_config = vllm_config.kv_transfer_config
-    return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-            and (kv_transfer_config is None
-                 or kv_transfer_config.kv_connector == "OffloadingConnector"))
-
-
 def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
-    """Whether hybrid KV materialization uses the unified layout family:
-    one shared buffer per kv_cache_tensor whose blocks are fungible between
-    attention KV and mamba state.
-
-    The env alone selects the family so kv-transfer deployments (where the
-    pool never engages) still run the typed-view layout whose byte offsets
-    the KV connector addresses; pool-enabled deployments run the pooled
-    layout on top of the same family.
-    """
+    """Whether the deployment uses the attention-shaped unified KV pool."""
+    del vllm_config
     from vllm_torchtpu import envs as tpu_envs
-    return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-            or unified_block_pool_enabled(vllm_config))
+    return tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
 
 
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
@@ -211,21 +182,18 @@ def _derive_tpu_block_slot_config(
         )
         user_specified = getattr(vllm_config.cache_config,
                                  "user_specified_block_size", False)
-        if user_specified and (input_block_size >= mamba_fit_block_size
-                               or vllm_config.kv_transfer_config is not None):
+        if user_specified and input_block_size < mamba_fit_block_size:
+            raise ValueError(
+                "Explicit TPU block size is below Mamba fit floor for the "
+                "unified KV pool: "
+                f"block_size={input_block_size}, "
+                f"mamba_fit_block_size={mamba_fit_block_size}")
+        if user_specified:
             # An explicit block size that already contains the mamba slot
             # is honored: the fit size is a floor, not a mandate.
-            # Disaggregated deployments rely on this to run one shared,
-            # TP-independent block size on both roles (the KV connector
-            # requires prefill/decode block sizes to nest, which the
-            # per-role fit sizes do not guarantee).
-            # The fit floor only binds when the unified block pool serves
-            # mamba state from attention-shaped slots; the pool never
-            # engages for kv-transfer deployments (see
-            # unified_block_pool_enabled), where state is materialized per
-            # mamba group with its own padded page. A below-fit user block
-            # is therefore legal there — reshard geometries such as the
-            # Stage-3 1024-token decode page depend on this.
+            # Disaggregated deployments may also provide an explicit shared
+            # block size so the P/D geometries nest. The production pooled
+            # path requires a size at or above the Mamba fit floor.
             final_block_size = _align_block_to_backend(input_block_size,
                                                        supported)
             block_size_source = "user_block_size"

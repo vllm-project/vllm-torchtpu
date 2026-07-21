@@ -276,7 +276,6 @@ class TestTPURunner:
         self.runner._mamba_num_blocks = None
         self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
                                              is not None)
-        self.runner._unified_block_pool = False
         self.runner._unified_kv_layout = False
         self.runner.kv_cache_raw_tensors = []
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
@@ -1131,7 +1130,6 @@ class TestAttentionMetadataBuilder:
         runner.block_size = 16
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
-        runner._unified_block_pool = False
         runner._unified_kv_layout = False
         runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
 
@@ -1297,41 +1295,9 @@ class TestAttentionMetadataBuilder:
         assert torch.equal(meta.mamba_state_indices,
                            torch.tensor([0, 6, 0, 0], dtype=torch.int32))
 
-    def test_pool_mamba_state_indices_derive_from_padded_device_table(self):
-        runner = self._make_runner_mock(max_num_blocks_per_req=4)
-        runner._unified_block_pool = True
-        runner._mamba_align_mode = True
-        mamba_spec = MambaSpec(
-            block_size=16,
-            shapes=[(2, 8)],
-            dtypes=[torch.bfloat16],
-            page_size_padded=256,
-        )
-        builder = self._make_builder(runner, spec=mamba_spec)
-
-        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
-            num_reqs=2,
-            start_index=0,
-            use_max_model_len=True,
-            seq_lens=torch.tensor([1, 33, 0, 0], dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
-            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
-        )
-
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
-
-        # Derived from the zero-padded device block table: req0 (seq_len 1)
-        # -> block offset 0 -> bt[0, 0] = 0; req1 (seq_len 33) -> offset
-        # (33-1)//16 = 2 -> bt[1, 2] = 6. Padded tail rows (only 2 real
-        # reqs) resolve to the null block 0, never a stale block id — the
-        # GDN op scans the full target_num_reqs every step.
-        assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 6, 0, 0], dtype=torch.int32))
-
     def test_unified_mamba_state_indices_use_cp_adjusted_block_size(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
-        runner._unified_block_pool = True
+        runner._unified_kv_layout = True
         mamba_spec = MambaSpec(
             block_size=16,
             shapes=[(2, 8)],

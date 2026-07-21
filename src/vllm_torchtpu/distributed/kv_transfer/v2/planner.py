@@ -716,7 +716,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             region, global_head, segment_name)
         if segment is not None:
             local_segment_head = segment.global_heads.index(global_head)
-            block_offset = block_id * region.physical_block_stride_bytes
+            block_offset = (block_id * region.physical_block_stride_bytes +
+                            region.region_base_offset_bytes)
             stride_bytes = segment.stride_bytes or segment.head_bytes
             return LayoutOffset(
                 offset_bytes=(block_offset + segment.base_offset_bytes +
@@ -728,7 +729,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             raise ValueError(f"local_head={local_head} is out of range for "
                              f"num_heads={region.num_heads}")
 
-        block_offset = block_id * region.physical_block_stride_bytes
+        block_offset = (block_id * region.physical_block_stride_bytes +
+                        region.region_base_offset_bytes)
         if region.layout == TensorLayout.HEAD_FIRST:
             assert region.head_bytes is not None
             head_offset = local_head * region.head_bytes

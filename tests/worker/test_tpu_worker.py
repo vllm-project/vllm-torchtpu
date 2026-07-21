@@ -119,3 +119,19 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     assert worker.cache_config.num_gpu_blocks == 2048
     worker.model_runner.initialize_kv_cache.assert_called_once_with(
         kv_cache_config)
+
+
+@patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")
+@patch("vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+       return_value=3)
+@patch("vllm_torchtpu.worker.tpu_worker.get_kv_transfer_group")
+@patch("vllm_torchtpu.worker.tpu_worker.has_kv_transfer_group",
+       return_value=True)
+def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
+        _has_group, get_group, _get_tp_rank, get_pp_group):
+    metadata = object()
+    get_group.return_value.get_handshake_metadata.return_value = metadata
+    get_pp_group.return_value.rank_in_group = 2
+    worker = TPUWorker.__new__(TPUWorker)
+
+    assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}

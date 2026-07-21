@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 from .tpu_connector_v2_test_utils import (head_mapping_rows, layout,
                                           load_v2_module, mamba_state_regions,
                                           manual_pull_meta)
@@ -77,6 +79,20 @@ def test_mamba_state_lowering_with_manual_pull_meta():
         base_addr=20_000_000,
         block_stride_bytes=destination_stride,
     )
+    source_regions = {
+        name:
+        replace(
+            region,
+            region_base_offset_bytes=111 if name.endswith(".state0") else 222)
+        for name, region in source_regions.items()
+    }
+    destination_regions = {
+        name:
+        replace(
+            region,
+            region_base_offset_bytes=333 if name.endswith(".state0") else 444)
+        for name, region in destination_regions.items()
+    }
     metadata = mod.ConnectorMetadataV2(
         req_id=2,
         block_size=256,
@@ -134,8 +150,8 @@ def test_mamba_state_lowering_with_manual_pull_meta():
         op.global_head,
         op.segment_name,
     ) for op in state0_ops] == [(
-        10_000_000 + source_block_id * source_stride + i * 256,
-        20_000_000 + destination_block_id * destination_stride + i * 256,
+        10_000_000 + source_block_id * source_stride + 111 + i * 256,
+        20_000_000 + destination_block_id * destination_stride + 333 + i * 256,
         256,
         2_048,
         8_192,
@@ -143,8 +159,8 @@ def test_mamba_state_lowering_with_manual_pull_meta():
         i,
         "q",
     ) for i in range(2)] + [(
-        10_000_000 + source_block_id * source_stride + 512 + i * 256,
-        20_000_000 + destination_block_id * destination_stride + 2_048 +
+        10_000_000 + source_block_id * source_stride + 111 + 512 + i * 256,
+        20_000_000 + destination_block_id * destination_stride + 333 + 2_048 +
         i * 256,
         256,
         2_048,
@@ -153,8 +169,8 @@ def test_mamba_state_lowering_with_manual_pull_meta():
         i,
         "k",
     ) for i in range(2)] + [(
-        10_000_000 + source_block_id * source_stride + 1_024 + i * 256,
-        20_000_000 + destination_block_id * destination_stride + 4_096 +
+        10_000_000 + source_block_id * source_stride + 111 + 1_024 + i * 256,
+        20_000_000 + destination_block_id * destination_stride + 333 + 4_096 +
         i * 256,
         256,
         2_048,
@@ -164,13 +180,12 @@ def test_mamba_state_lowering_with_manual_pull_meta():
         "v",
     ) for i in range(4)]
 
-    assert [
-        (op.src_addr, op.dst_addr, op.segment_bytes, op.global_head)
-        for op in state1_ops
-    ] == [(
-        10_000_000 + 6_144 + source_block_id * source_stride + i * 65_536,
-        20_000_000 + 24_576 + destination_block_id * destination_stride +
-        i * 65_536,
-        65_536,
-        i,
-    ) for i in range(4)]
+    assert [(op.src_addr, op.dst_addr, op.segment_bytes, op.global_head)
+            for op in state1_ops] == [(
+                10_000_000 + 6_144 + source_block_id * source_stride + 222 +
+                i * 65_536,
+                20_000_000 + 24_576 +
+                destination_block_id * destination_stride + 444 + i * 65_536,
+                65_536,
+                i,
+            ) for i in range(4)]

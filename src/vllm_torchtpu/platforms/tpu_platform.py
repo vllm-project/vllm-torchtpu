@@ -21,8 +21,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_block_pool_enabled, unified_kv_layout_enabled,
-    update_tpu_block_size_and_slot_config)
+    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
 from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
@@ -630,7 +629,7 @@ class TpuPlatform(Platform):
         # KV cache. Set before workers spawn — torch_tpu reads this env once
         # per process at first compile. Respect an explicit user setting of
         # the same key.
-        if unified_block_pool_enabled(vllm_config):
+        if unified_kv_layout_enabled(vllm_config):
             sc_ar = "xla_tpu_enable_sparse_core_collective_offload_all_reduce"
             xla_opts = os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", "")
             if sc_ar not in xla_opts:

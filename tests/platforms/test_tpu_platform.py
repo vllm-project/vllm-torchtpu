@@ -186,36 +186,22 @@ class TestTpuPlatform:
         # test_tpu_block_size_utils.py).
         mock_update.assert_called_once_with(vllm_config, mock_pallas)
 
-    def test_unified_block_pool_enablement_contract(self, vllm_config):
-        from vllm_torchtpu.platforms.tpu_block_size_utils import (
-            unified_block_pool_enabled, unified_kv_layout_enabled)
+    def test_unified_kv_layout_enablement_contract(self, vllm_config):
+        from vllm_torchtpu.platforms.tpu_block_size_utils import \
+            unified_kv_layout_enabled
         vllm_config.model_config.is_hybrid = True
 
-        # No env: neither the pool nor the unified layout engages, even for
-        # single-server hybrid models.
+        # No env: ordinary non-unified allocation remains selected.
         vllm_config.kv_transfer_config = None
-        assert not unified_block_pool_enabled(vllm_config)
         assert not unified_kv_layout_enabled(vllm_config)
 
         with patch.dict("os.environ",
                         {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"}):
-            # Env opt-in: pool + unified layout.
-            assert unified_block_pool_enabled(vllm_config)
+            # The same env selects the pooled layout for local and transfer
+            # deployments.
             assert unified_kv_layout_enabled(vllm_config)
 
-            # P/D kv-transfer never runs the pool (those connectors address
-            # the typed views), but keeps the unified layout family.
             vllm_config.kv_transfer_config = MagicMock()
-            vllm_config.kv_transfer_config.kv_connector = "TPUConnectorV2"
-            assert not unified_block_pool_enabled(vllm_config)
-            assert unified_kv_layout_enabled(vllm_config)
-
-            # The OffloadingConnector is the exception: its TPU spec
-            # transfers whole pool rows, and hybrid CPU offloading REQUIRES
-            # the pool, so the same env keeps it on the pool layout.
-            vllm_config.kv_transfer_config.kv_connector = (
-                "OffloadingConnector")
-            assert unified_block_pool_enabled(vllm_config)
             assert unified_kv_layout_enabled(vllm_config)
 
     @pytest.mark.parametrize(

@@ -107,12 +107,13 @@ def _integration_model_constants(*, decode_tp_size: int = 2) -> dict[str, Any]:
         dest_fa_token_bytes - dest_local_kv_heads * fa_head_bytes_per_token)
     fa_source_block_ids = tuple(range(1, 9))
     fa_dest_block_ids = (0, 1)
-    mamba_source_block_ids = (3, 4)
+    mamba_source_block_ids = (9, 10)
     mamba_dest_block_ids = (2, 3)
     fa_num_tokens = source_block_size * len(fa_source_block_ids)
     mamba_num_tokens = source_block_size * len(mamba_source_block_ids)
     max_source_block = max(fa_source_block_ids + mamba_source_block_ids)
     max_dest_block = max(fa_dest_block_ids + mamba_dest_block_ids)
+    unused_dest_block_id = max_dest_block + 1
     source_page_padding_bytes = source_page_bytes - source_gdn_used_bytes
     dest_page_padding_bytes = dest_page_bytes - (dest_conv_state_bytes +
                                                  dest_recurrent_state_bytes)
@@ -192,10 +193,11 @@ def _integration_model_constants(*, decode_tp_size: int = 2) -> dict[str, Any]:
         "fa_dest_block_ids": fa_dest_block_ids,
         "mamba_source_block_ids": mamba_source_block_ids,
         "mamba_dest_block_ids": mamba_dest_block_ids,
+        "unused_dest_block_id": unused_dest_block_id,
         "fa_num_tokens": fa_num_tokens,
         "mamba_num_tokens": mamba_num_tokens,
         "source_size": (max_source_block + 1) * source_page_bytes,
-        "dst_size": (max_dest_block + 1) * dest_page_bytes,
+        "dst_size": (unused_dest_block_id + 1) * dest_page_bytes,
     }
 
 
@@ -261,14 +263,25 @@ def _fill_fa_pages(buffer: bytearray, rank: int, constants: dict[str,
 
 def _fill_gdn_pages(buffer: bytearray, rank: int,
                     constants: dict[str, Any]) -> None:
-    # state0 logical view per page: [kernel_size - 1, dim].
+    # Unified physical page: [state1 SSM][state0 conv][padding].
+    # state0 logical view: [kernel_size - 1, dim].
     # dim is Q heads, K heads, then V heads, each bf16 head occupying 256 B.
-    # state1 logical view per page: [n_v, d_k, d_v] in fp32 bytes.
+    # state1 logical view: [n_v, d_k, d_v] in fp32 bytes.
     conv_head_bytes = constants["linear_key_head_dim"] * 2
     for block_id in constants["mamba_source_block_ids"]:
         page_base = block_id * constants["source_page_bytes"]
+        recurrent_base = page_base
+        for local_value in range(constants["source_local_value_heads"]):
+            offset = (recurrent_base +
+                      local_value * constants["source_recurrent_head_bytes"])
+            seed = _gdn_recurrent_seed(rank, block_id, local_value)
+            buffer[offset:offset +
+                   constants["source_recurrent_head_bytes"]] = (_pattern_bytes(
+                       seed, constants["source_recurrent_head_bytes"]))
+
+        conv_base = page_base + constants["source_recurrent_state_bytes"]
         for slot in range(constants["conv_segments"]):
-            slot_base = page_base + slot * constants["source_conv_stride_bytes"]
+            slot_base = conv_base + slot * constants["source_conv_stride_bytes"]
             for local_key in range(constants["source_local_key_heads"]):
                 q_offset = slot_base + local_key * conv_head_bytes
                 q_seed = _gdn_conv_seed(rank, block_id, slot, 0, local_key)
@@ -291,15 +304,6 @@ def _fill_gdn_pages(buffer: bytearray, rank: int,
                 v_seed = _gdn_conv_seed(rank, block_id, slot, 2, local_value)
                 buffer[v_offset:v_offset + conv_head_bytes] = (_pattern_bytes(
                     v_seed, conv_head_bytes))
-
-        recurrent_base = page_base + constants["source_conv_state_bytes"]
-        for local_value in range(constants["source_local_value_heads"]):
-            offset = (recurrent_base +
-                      local_value * constants["source_recurrent_head_bytes"])
-            seed = _gdn_recurrent_seed(rank, block_id, local_value)
-            buffer[offset:offset +
-                   constants["source_recurrent_head_bytes"]] = (_pattern_bytes(
-                       seed, constants["source_recurrent_head_bytes"]))
 
 
 def _make_tpu_group_env(*, world_size: int, local_rank_base: int,
@@ -495,8 +499,9 @@ def _integration_region_source_buffers(
 ) -> dict[str, bytearray]:
     source = _integration_source_buffer(p_rank, constants["source_size"])
     return {
-        layer_name: bytearray(source)
-        for layer_name in metadata.kv_caches[p_rank]
+        physical_region_id: bytearray(source)
+        for physical_region_id in _page_bytes_by_physical_region(
+            metadata.kv_caches[p_rank])
     }
 
 
@@ -518,7 +523,7 @@ def _integration_destination_tensors_by_region(
 ) -> dict[str, Any]:
     return {
         region_id: _integration_filled_tpu_tensor(constants["dst_size"], 0xA5)
-        for region_id in destination.kv_caches
+        for region_id in _page_bytes_by_physical_region(destination.kv_caches)
     }
 
 
@@ -572,7 +577,7 @@ def _integration_source_page_views(
 ) -> tuple[Any, dict[str, Any], dict[str, int]]:
     return _integration_tpu_region_views_from_buffers(
         _integration_region_source_buffers(metadata, p_rank, constants),
-        _page_bytes_by_layer(metadata.kv_caches[p_rank]),
+        _page_bytes_by_physical_region(metadata.kv_caches[p_rank]),
     )
 
 
@@ -583,9 +588,10 @@ def _integration_destination_page_views(
     return _integration_tpu_region_views_from_buffers(
         {
             region_id: bytearray([0xA5]) * constants["dst_size"]
-            for region_id in destination.kv_caches
+            for region_id in _page_bytes_by_physical_region(
+                destination.kv_caches)
         },
-        _page_bytes_by_layer(destination.kv_caches),
+        _page_bytes_by_physical_region(destination.kv_caches),
     )
 
 
@@ -607,11 +613,18 @@ def _register_engine_regions(engine: Any, tensors: dict[str, Any],
         )
 
 
-def _page_bytes_by_layer(regions: dict[str, Any]) -> dict[str, int]:
-    return {
-        layer_name: region.physical_block_stride_bytes
-        for layer_name, region in regions.items()
-    }
+def _page_bytes_by_physical_region(regions: dict[str, Any]) -> dict[str, int]:
+    page_bytes_by_region: dict[str, int] = {}
+    for region in regions.values():
+        physical_region_id = str(region.physical_region_id)
+        page_bytes = region.physical_block_stride_bytes
+        existing = page_bytes_by_region.setdefault(physical_region_id,
+                                                   page_bytes)
+        if existing != page_bytes:
+            raise ValueError("logical regions sharing a physical region must "
+                             "use the same page stride: "
+                             f"physical_region_id={physical_region_id!r}")
+    return page_bytes_by_region
 
 
 def _integration_expected_region_bytes(
@@ -621,8 +634,9 @@ def _integration_expected_region_bytes(
     constants: dict[str, Any],
 ) -> dict[str, bytearray]:
     expected = {
-        layer_name: bytearray([0xA5]) * constants["dst_size"]
-        for layer_name in destination.kv_caches
+        physical_region_id: bytearray([0xA5]) * constants["dst_size"]
+        for physical_region_id in _page_bytes_by_physical_region(
+            destination.kv_caches)
     }
     source_buffers = {
         p_rank: _integration_region_source_buffers(metadata, p_rank, constants)
@@ -642,23 +656,24 @@ def _integration_expected_region_bytes(
     for p_rank, plan in plans.items():
         for op in plan.ops:
             for segment_idx in range(op.num_segments):
-                src_layer = op.source_region_id
-                dst_layer = op.destination_region_id
+                src_region_id = op.source_region_id
+                dst_region_id = op.destination_region_id
                 src_offset = (op.src_offset_bytes +
                               segment_idx * op.src_stride_bytes)
                 dst_offset = (op.dst_offset_bytes +
                               segment_idx * op.dst_stride_bytes)
-                assert src_layer in metadata.kv_caches[p_rank]
-                assert dst_layer in destination.kv_caches
+                assert src_region_id in source_buffers[p_rank]
+                assert dst_region_id in expected
                 assert src_offset + op.segment_bytes <= source_sizes[p_rank][
-                    src_layer]
+                    src_region_id]
                 assert dst_offset + op.segment_bytes <= destination_sizes[
-                    dst_layer]
-                expected[dst_layer][dst_offset:dst_offset +
-                                    op.segment_bytes] = (
-                                        source_buffers[p_rank][src_layer]
-                                        [src_offset:src_offset +
-                                         op.segment_bytes])
+                    dst_region_id]
+                expected[dst_region_id][dst_offset:dst_offset +
+                                        op.segment_bytes] = (
+                                            source_buffers[p_rank]
+                                            [src_region_id]
+                                            [src_offset:src_offset +
+                                             op.segment_bytes])
     return expected
 
 
@@ -681,6 +696,7 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
                                                                        Any]):
     fa_layer = "model.layers.0.self_attn"
     gdn_layers = tuple(f"model.layers.{idx}.linear_attn" for idx in (1, 2))
+    physical_region_id = "__raw_kv_cache_0"
     c = constants
     source_regions_by_rank = {}
     for p_rank in range(c["prefill_workers"]):
@@ -703,7 +719,7 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
                 block_stride_bytes=c["source_page_bytes"],
                 block_id_group_index=2,
                 head_segments=(),
-                physical_region_id=fa_layer,
+                physical_region_id=physical_region_id,
                 region_base_offset_bytes=0,
             )
         }
@@ -763,8 +779,8 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
                     ),
                 ),
                 block_id_group_index=group_index,
-                physical_region_id=f"{layer_name}.state0",
-                region_base_offset_bytes=0,
+                physical_region_id=physical_region_id,
+                region_base_offset_bytes=c["source_recurrent_state_bytes"],
             )
             source_regions[f"{layer_name}.state1"] = mod.KVCacheRegion(
                 layer_name=f"{layer_name}.state1",
@@ -787,12 +803,12 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
                     local_head_start=0,
                     local_head_count=c["source_local_value_heads"],
                     head_bytes=c["source_recurrent_head_bytes"],
-                    base_offset_bytes=c["source_conv_state_bytes"],
+                    base_offset_bytes=0,
                     stride_bytes=None,
                     num_segments=1,
                 ), ),
                 block_id_group_index=group_index,
-                physical_region_id=f"{layer_name}.state1",
+                physical_region_id=physical_region_id,
                 region_base_offset_bytes=0,
             )
         source_regions_by_rank[p_rank] = source_regions
@@ -816,7 +832,7 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
             block_stride_bytes=c["dest_page_bytes"],
             block_id_group_index=2,
             head_segments=(),
-            physical_region_id=fa_layer,
+            physical_region_id=physical_region_id,
             region_base_offset_bytes=0,
         )
     }
@@ -876,8 +892,8 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
                 ),
             ),
             block_id_group_index=group_index,
-            physical_region_id=f"{layer_name}.state0",
-            region_base_offset_bytes=0,
+            physical_region_id=physical_region_id,
+            region_base_offset_bytes=c["dest_recurrent_state_bytes"],
         )
         dest_regions[f"{layer_name}.state1"] = mod.KVCacheRegion(
             layer_name=f"{layer_name}.state1",
@@ -900,12 +916,12 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
                 local_head_start=0,
                 local_head_count=c["dest_local_value_heads"],
                 head_bytes=c["dest_recurrent_head_bytes"],
-                base_offset_bytes=c["dest_conv_state_bytes"],
+                base_offset_bytes=0,
                 stride_bytes=None,
                 num_segments=1,
             ), ),
             block_id_group_index=group_index,
-            physical_region_id=f"{layer_name}.state1",
+            physical_region_id=physical_region_id,
             region_base_offset_bytes=0,
         )
 
@@ -1012,6 +1028,72 @@ def test_integration_layout_uses_fp8_packed_fa_pages_and_gdn_page_stride(
                     constants["dest_page_bytes"])
 
 
+def test_integration_layout_shares_unified_gdn_physical_pools(monkeypatch):
+    mod = _load_v2_module(monkeypatch, stub_zmq=False)
+    constants = _integration_model_constants()
+    metadata, _, destination, constants = _integration_layout(
+        mod, decode_tp_rank=0, constants=constants)
+
+    source_regions = metadata.kv_caches[0]
+    source_attention = source_regions["model.layers.0.self_attn"]
+    destination_attention = destination.kv_caches["model.layers.0.self_attn"]
+    for layer_index in (1, 2):
+        layer_name = f"model.layers.{layer_index}.linear_attn"
+        conv = source_regions[f"{layer_name}.state0"]
+        ssm = source_regions[f"{layer_name}.state1"]
+        assert conv.physical_region_id == source_attention.physical_region_id
+        assert conv.physical_region_id == ssm.physical_region_id
+        assert conv.region_base_offset_bytes == constants[
+            "source_recurrent_state_bytes"]
+        assert ssm.region_base_offset_bytes == 0
+
+        conv = destination.kv_caches[f"{layer_name}.state0"]
+        ssm = destination.kv_caches[f"{layer_name}.state1"]
+        assert (conv.physical_region_id ==
+                destination_attention.physical_region_id)
+        assert conv.physical_region_id == ssm.physical_region_id
+        assert conv.region_base_offset_bytes == constants[
+            "dest_recurrent_state_bytes"]
+        assert ssm.region_base_offset_bytes == 0
+
+
+def test_integration_p4d2_plan_preserves_unified_pool_padding(monkeypatch):
+    mod = _load_v2_module(monkeypatch, stub_zmq=False)
+    constants = _integration_model_constants()
+    metadata, topology, destination, constants = _integration_layout(
+        mod, decode_tp_rank=0, constants=constants)
+    planner = mod.ContiguousHeadTPTransferPlanner()
+    pull_meta = planner.build_pull_meta(metadata, topology)
+    plans = planner.lower(metadata, topology, destination, pull_meta)
+
+    expected = _integration_expected_region_bytes(plans, metadata, destination,
+                                                  constants)
+    sentinel_page = bytes([0xA5]) * constants["dest_page_bytes"]
+    for layer_offset, layer_index in enumerate((1, 2)):
+        physical_region_id = "__raw_kv_cache_0"
+        destination_block_id = constants["mamba_dest_block_ids"][layer_offset]
+        source_block_id = constants["mamba_source_block_ids"][layer_offset]
+        page_base = destination_block_id * constants["dest_page_bytes"]
+        page = expected[physical_region_id][page_base:page_base +
+                                            constants["dest_page_bytes"]]
+
+        recurrent_head_bytes = constants["dest_recurrent_head_bytes"]
+        assert page[:recurrent_head_bytes] == _pattern_bytes(
+            _gdn_recurrent_seed(0, source_block_id, 0), recurrent_head_bytes)
+        conv_base = constants["dest_recurrent_state_bytes"]
+        conv_head_bytes = constants["linear_key_head_dim"] * 2
+        assert page[conv_base:conv_base + conv_head_bytes] == _pattern_bytes(
+            _gdn_conv_seed(0, source_block_id, 0, 0, 0), conv_head_bytes)
+        assert page[constants["dest_gdn_used_bytes"]:] == bytes(
+            [0xA5]) * constants["dest_page_padding_bytes"]
+
+        untouched_block_id = constants["unused_dest_block_id"]
+        untouched_base = untouched_block_id * constants["dest_page_bytes"]
+        assert expected[
+            physical_region_id][untouched_base:untouched_base +
+                                constants["dest_page_bytes"]] == sentinel_page
+
+
 def test_integration_layout_supports_fa_4pcp_gdn_4tp_to_decode_1tp(
         monkeypatch):
     mod = _load_v2_module(monkeypatch, stub_zmq=False)
@@ -1044,16 +1126,19 @@ def test_integration_region_page_placement_is_contiguous(monkeypatch):
     metadata, _, destination, constants = _integration_layout(
         mod, decode_tp_rank=0, constants=constants)
 
+    source_page_bytes = _page_bytes_by_physical_region(metadata.kv_caches[0])
+    destination_page_bytes = _page_bytes_by_physical_region(
+        destination.kv_caches)
     source_offsets = _contiguous_region_placements(
         _integration_region_source_buffers(metadata, 0, constants),
-        _page_bytes_by_layer(metadata.kv_caches[0]),
+        source_page_bytes,
     )
     dest_offsets = _contiguous_region_placements(
         {
             region_id: bytearray([0xA5]) * constants["dst_size"]
-            for region_id in destination.kv_caches
+            for region_id in destination_page_bytes
         },
-        _page_bytes_by_layer(destination.kv_caches),
+        destination_page_bytes,
     )
 
     assert sorted(source_offsets.values()) == [
@@ -1063,14 +1148,12 @@ def test_integration_region_page_placement_is_contiguous(monkeypatch):
     assert sorted(dest_offsets.values()) == [
         index * constants["dst_size"] for index in range(len(dest_offsets))
     ]
-    assert all(
-        offset %
-        metadata.kv_caches[0][region_id].physical_block_stride_bytes == 0
-        for region_id, offset in source_offsets.items())
-    assert all(
-        offset %
-        destination.kv_caches[region_id].physical_block_stride_bytes == 0
-        for region_id, offset in dest_offsets.items())
+    assert all(offset % source_page_bytes[region_id] == 0
+               for region_id, offset in source_offsets.items())
+    assert all(offset % destination_page_bytes[region_id] == 0
+               for region_id, offset in dest_offsets.items())
+    assert len(source_offsets) == 1
+    assert len(dest_offsets) == 1
 
 
 @pytest.mark.parametrize("decode_tp_size", (1, 2))
@@ -1106,7 +1189,8 @@ def test_zmq_prefill_decode_fa_4pcp_gdn_4tp_to_decode_tp(
                     region_id: memoryview(buffer)
                     for region_id, buffer in source_buffers.items()
                 },
-                _page_bytes_by_layer(source_metadata.kv_caches[p_rank]),
+                _page_bytes_by_physical_region(
+                    source_metadata.kv_caches[p_rank]),
             )
             producer.start()
             producers.append(producer)
@@ -1120,7 +1204,8 @@ def test_zmq_prefill_decode_fa_4pcp_gdn_4tp_to_decode_tp(
             )
             destination_buffers = {
                 region_id: bytearray([0xA5]) * constants["dst_size"]
-                for region_id in destination.kv_caches
+                for region_id in _page_bytes_by_physical_region(
+                    destination.kv_caches)
             }
             consumer = strided.StridedKVTransferEngine(
                 local_dp_rank=0,
@@ -1137,7 +1222,7 @@ def test_zmq_prefill_decode_fa_4pcp_gdn_4tp_to_decode_tp(
                         region_id: memoryview(buffer)
                         for region_id, buffer in destination_buffers.items()
                     },
-                    _page_bytes_by_layer(destination.kv_caches),
+                    _page_bytes_by_physical_region(destination.kv_caches),
                 )
                 destination = mod.TPUConnectorV2Worker.apply_local_destination_region_metadata(
                     destination, consumer.local_regions_metadata())
@@ -1251,7 +1336,7 @@ def _prefill_worker_process(p_rank: int, group_env: dict[str, str],
         _register_engine_regions(
             engine,
             source_tensors,
-            _page_bytes_by_layer(metadata.kv_caches[p_rank]),
+            _page_bytes_by_physical_region(metadata.kv_caches[p_rank]),
         )
         engine.start()
         ready_q.put(
@@ -1300,7 +1385,7 @@ def _decode_worker_process(decode_tp_rank: int, kv_transfer_params: dict,
         _register_engine_regions(
             engine,
             dst_tensors,
-            _page_bytes_by_layer(destination.kv_caches),
+            _page_bytes_by_physical_region(destination.kv_caches),
         )
         destination = mod.TPUConnectorV2Worker.apply_local_destination_region_metadata(
             destination, engine.local_regions_metadata())
@@ -1481,7 +1566,7 @@ def _run_multiprocess_prefill_decode_integration(
                 ]
                 assert all(offset % constants["source_page_bytes"] == 0
                            for offset in offsets.values())
-                assert len(metadata["regions"]) == 5
+                assert len(metadata["regions"]) == 1
                 remote_metadata[rank] = metadata
                 prefill_backing_offsets[rank] = offsets
             elif kind == "prefill_error":
@@ -1531,7 +1616,7 @@ def _run_multiprocess_prefill_decode_integration(
             assert result["destination_backing_matches"] is True
             assert result["plan_ranks"] == expected_plan_ranks[result["rank"]]
             assert result["num_plans"] == len(result["plan_ranks"])
-            assert result["num_destination_regions"] == 5
+            assert result["num_destination_regions"] == 1
             assert result[
                 "destination_metadata_has_no_obsolete_region_fields"] is True
             assert result["destination_backing_device"].startswith("tpu")
@@ -1551,7 +1636,7 @@ def _run_multiprocess_prefill_decode_integration(
                 device.startswith("tpu")
                 for device in result["final_dst_devices"].values())
             assert result["decode_metadata"]["tcp_port"] > 0
-            assert len(result["decode_metadata"]["regions"]) == 5
+            assert len(result["decode_metadata"]["regions"]) == 1
     finally:
         stop_event.set()
         for proc in decode_processes:

@@ -1201,17 +1201,12 @@ class TestTPURaidenConnectorWorker:
             worker._construct_raiden_transfer_engine = MagicMock(
                 return_value=engine)
 
-            with patch(
-                    f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
-                    True,
-                    create=True), patch(
-                        f"{_MOD}.tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION",
-                        True,
-                        create=True), patch(
-                            f"{_MOD}.tpu_envs."
-                            "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK",
-                            True,
-                            create=True), patch(f"{_MOD}.logger.info") as log:
+            with patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+                       True,
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION",
+                           True,
+                           create=True), patch(f"{_MOD}.logger.info") as log:
                 worker.register_runner(runner)
 
             construct_call = worker._construct_raiden_transfer_engine.call_args
@@ -1323,22 +1318,18 @@ class TestTPURaidenConnectorWorker:
                                 f"{_MOD}.tpu_envs."
                                 "TPU_RAIDEN_CONTROLLER_ADDRESS",
                                 "controller.test:27000",
-                                create=True
-                            ), patch(
-                                f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
-                                "prefill-job" if is_producer else "decode-job",
                                 create=True), patch(
-                                    f"{_MOD}.tpu_envs."
-                                    "TPU_RAIDEN_ENGINE_ID",
-                                    "engine7",
+                                    f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
+                                    "prefill-job"
+                                    if is_producer else "decode-job",
                                     create=True), patch(
                                         f"{_MOD}.tpu_envs."
-                                        "TPU_RAIDEN_TRANSFER_PARALLELISM",
-                                        8,
+                                        "TPU_RAIDEN_ENGINE_ID",
+                                        "engine7",
                                         create=True), patch(
                                             f"{_MOD}.tpu_envs."
-                                            "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK",
-                                            True,
+                                            "TPU_RAIDEN_TRANSFER_PARALLELISM",
+                                            8,
                                             create=True):
                 worker.register_runner(runner)
 

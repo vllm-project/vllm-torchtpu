@@ -289,6 +289,8 @@ class StridedKVTransferEngine:
     ) -> RegisteredMemoryRegion:
         """Register one local raw tensor/buffer under an explicit descriptor."""
         metadata = _require_registered_region(region)
+        if _is_torch_tensor(buffer):
+            _validate_registered_tensor(buffer)
         buffer_size = _buffer_nbytes(buffer)
         if metadata.nbytes > buffer_size:
             raise ValueError("registered region nbytes exceeds buffer size: "
@@ -495,8 +497,9 @@ class DestinationPageWriteSession:
             if not isinstance(region, _LocalMemoryRegion):
                 raise TypeError("regions must contain only local regions")
         self._pages: dict[tuple[int, str, int], _CachedDestinationPage] = {}
-        self._tensor_write_cache: dict[int, tuple[_LocalMemoryRegion,
-                                                  bytearray]] = {}
+        self._tensor_write_patches: dict[int, tuple[_LocalMemoryRegion,
+                                                    list[tuple[int,
+                                                               bytes]]]] = {}
         self._held_tensor_write_regions: dict[int, _LocalMemoryRegion] = {}
 
     def scatter(self, compact_buffer: Any,
@@ -530,16 +533,18 @@ class DestinationPageWriteSession:
             for page in tuple(self._pages.values()):
                 if page.dirty:
                     _write_region_page(page)
-            for region, raw in tuple(self._tensor_write_cache.values()):
-                _copy_bytes_to_tensor(raw, region.buffer)
+            for region, patches in tuple(self._tensor_write_patches.values()):
+                for offset_bytes, payload in sorted(patches):
+                    _copy_bytes_to_tensor_range(payload, region.buffer,
+                                                offset_bytes)
         finally:
             self._pages.clear()
-            self._tensor_write_cache.clear()
+            self._tensor_write_patches.clear()
             self._release_tensor_write_locks()
 
     def discard(self) -> None:
         self._pages.clear()
-        self._tensor_write_cache.clear()
+        self._tensor_write_patches.clear()
         self._release_tensor_write_locks()
 
     def _write_to_tensor_cache(self, region: _LocalMemoryRegion,
@@ -547,25 +552,30 @@ class DestinationPageWriteSession:
                                payload: memoryview) -> None:
         _check_range("destination", region_offset, len(payload),
                      region.metadata.nbytes)
-        raw = self._cached_write_bytes(region)
-        _check_range("destination", region_offset, len(payload), len(raw))
-        raw[region_offset:region_offset + len(payload)] = payload
+        itemsize = _tensor_element_size(region.buffer)
+        _check_tensor_byte_alignment("destination", region_offset,
+                                     len(payload), itemsize)
+        patches = self._staged_tensor_writes(region)
+        end = region_offset + len(payload)
+        for other_offset, other_payload in patches:
+            other_end = other_offset + len(other_payload)
+            if region_offset < other_end and other_offset < end:
+                raise ValueError("overlapping destination tensor ranges: "
+                                 f"[{region_offset}, {end}) and "
+                                 f"[{other_offset}, {other_end})")
+        patches.append((region_offset, bytes(payload)))
 
-    def _cached_write_bytes(self, region: _LocalMemoryRegion) -> bytearray:
+    def _staged_tensor_writes(
+            self, region: _LocalMemoryRegion) -> list[tuple[int, bytes]]:
         key = id(region.buffer)
-        cached = self._tensor_write_cache.get(key)
+        cached = self._tensor_write_patches.get(key)
         if cached is not None:
             return cached[1]
         region.write_lock.acquire()
         self._held_tensor_write_regions[key] = region
-        try:
-            raw = bytearray(_tensor_to_bytes(region.buffer))
-        except Exception:
-            self._held_tensor_write_regions.pop(key, None)
-            region.write_lock.release()
-            raise
-        self._tensor_write_cache[key] = (region, raw)
-        return raw
+        patches: list[tuple[int, bytes]] = []
+        self._tensor_write_patches[key] = (region, patches)
+        return patches
 
     def _release_tensor_write_locks(self) -> None:
         for region in reversed(tuple(
@@ -852,6 +862,20 @@ def _require_torch() -> Any:
     return torch
 
 
+def _validate_registered_tensor(tensor: Any) -> None:
+    torch = _require_torch()
+    supported_dtypes = {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.bfloat16,
+    }
+    if tensor.dtype not in supported_dtypes:
+        raise TypeError("ZMQ tensor regions support only FP8/BF16, got "
+                        f"{tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError("ZMQ tensor regions must be contiguous")
+
+
 def _tensor_to_bytes(tensor: Any) -> bytes:
     torch = _require_torch()
     if not tensor.is_contiguous():
@@ -875,20 +899,25 @@ def _tensor_slice_to_bytes(tensor: Any, offset: int, length: int) -> bytes:
     return typed_tensor.cpu().contiguous().view(torch.uint8).numpy().tobytes()
 
 
-def _copy_bytes_to_tensor(payload: bytearray, tensor: Any) -> None:
+def _copy_bytes_to_tensor_range(
+    payload: bytes | bytearray | memoryview,
+    tensor: Any,
+    offset_bytes: int,
+) -> None:
     torch = _require_torch()
     if not tensor.is_contiguous():
         raise ValueError("torch tensor byte buffers must be contiguous")
-    expected_size = tensor.numel() * tensor.element_size()
-    if len(payload) != expected_size:
-        raise ValueError("payload size mismatch for destination tensor: got "
-                         f"{len(payload)}, expected {expected_size}")
-    cpu_bytes = torch.frombuffer(payload, dtype=torch.uint8)
-    if tensor.dtype == torch.uint8:
-        cpu_tensor = cpu_bytes.reshape(tensor.shape)
-    else:
-        cpu_tensor = cpu_bytes.view(tensor.dtype).reshape(tensor.shape)
-    tensor.copy_(cpu_tensor.to(device=tensor.device))
+    itemsize = _tensor_element_size(tensor)
+    payload_bytes = bytearray(payload)
+    _check_tensor_byte_alignment("destination", offset_bytes,
+                                 len(payload_bytes), itemsize)
+    _check_range("destination", offset_bytes, len(payload_bytes),
+                 tensor.numel() * itemsize)
+    cpu_bytes = torch.frombuffer(payload_bytes, dtype=torch.uint8)
+    cpu_typed = cpu_bytes.view(tensor.dtype)
+    element_offset = offset_bytes // itemsize
+    target = tensor.reshape(-1).narrow(0, element_offset, cpu_typed.numel())
+    target.copy_(cpu_typed.to(device=tensor.device))
 
 
 def _tensor_element_size(tensor: Any) -> int:

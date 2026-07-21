@@ -150,12 +150,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # Default compact-mamba path: the runner provides a per-request
             # physical slot id from the compact slot pool.
             mamba_state_indices = ctx.mamba_state_indices
-        elif runner._unified_block_pool or (runner._unified_kv_layout
-                                            and runner._mamba_align_mode):
+        elif runner._unified_kv_layout:
             # The pool keys mamba state by vLLM block ids in every cache
-            # mode (it has no compact slot pool); the typed-view layout does
-            # so in align mode only (its none mode carries compact slot ids
-            # in the ctx branch above). Derive the current physical state
+            # mode (it has no compact slot pool). Derive the current physical
+            # state
             # slot on device from the zero-padded `block_tables_dev` (padded
             # tail rows resolve to the null block, never a stale id — the
             # GDN op scans the full length every step), avoiding a

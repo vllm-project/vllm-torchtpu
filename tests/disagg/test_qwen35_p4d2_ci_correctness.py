@@ -371,6 +371,9 @@ def test_planner_log_check_accepts_current_positive_total_ops(
 
 def test_ci_wrapper_uses_hugging_face_model_and_existing_p4d2_launcher():
     text = CI_SCRIPT.read_text(encoding="utf-8")
+    launcher_text = P4D2_LAUNCHER.read_text(encoding="utf-8")
+    removed_alias_env = "_".join(
+        ("TPU", "VLLM", "KV", "CACHE", "ALIAS", "FALLBACK"))
 
     assert "Qwen/Qwen3.5-35B-A3B-FP8" in text
     assert "launch_qwen35_p4d2_v2_baseline.sh" in text
@@ -378,6 +381,10 @@ def test_ci_wrapper_uses_hugging_face_model_and_existing_p4d2_launcher():
     assert "smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py" in text
     assert "prefix_cache_e2e_divergence.log" in text
     assert "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL" in text
+    assert "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL" in launcher_text
+    assert "--kv-cache-dtype fp8" in launcher_text
+    assert removed_alias_env not in text
+    assert removed_alias_env not in launcher_text
     assert 'ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"' in text
     assert "export ASYNC_SCHEDULING" in text
     assert "gsutil" not in text
@@ -392,6 +399,16 @@ def test_p4d2_ci_runs_launcher_default_single_client_correctness():
     assert "MAX_NUM_SEQS" not in text
     assert ('export P4D2_CONCURRENT_REQUESTS="${P4D2_CONCURRENT_REQUESTS:-1}"'
             in text)
+
+
+def test_qwen35_p4d2_launcher_uses_automatic_block_size_by_default():
+    text = P4D2_LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'BLOCK_SIZE="${BLOCK_SIZE:-}"' in text
+    assert 'if [[ -n "${BLOCK_SIZE}" ]]; then' in text
+    assert 'common_args+=(--block-size "${BLOCK_SIZE}")' in text
+    assert 'block_size_label="${BLOCK_SIZE:-auto}"' in text
+    assert 'BLOCK_SIZE=${block_size_label}' in text
 
 
 def test_qwen35_p4d2_launcher_enables_batched_rpa_backend():

@@ -137,7 +137,7 @@ class TestAttentionMetadataBuilderPlumbing:
 
     def test_build_mamba_state_indices_from_current_block_table_entry(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
-        runner._unified_block_pool = True
+        runner._unified_kv_layout = True
         runner._mamba_align_mode = True
         builder = self._make_mamba_builder(runner)
 
@@ -165,12 +165,8 @@ class TestAttentionMetadataBuilderPlumbing:
                                 dtype=torch.int32)
         assert torch.equal(meta.mamba_state_indices, expected)
 
-    def test_unified_none_mode_uses_first_block_fallback(self):
-        # Typed-view layout in none mode: compact slot ids arrive via the
-        # builder ctx, so the builder itself yields no indices. (The pool
-        # has no compact slot pool and derives indices in every mode.)
+    def test_unified_none_mode_derives_state_indices_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
-        runner._unified_block_pool = False
         runner._unified_kv_layout = True
         runner._mamba_align_mode = False
         builder = self._make_mamba_builder(runner)
@@ -187,4 +183,13 @@ class TestAttentionMetadataBuilderPlumbing:
         meta = builder.build(common_prefix_len=0,
                              common_attn_metadata=self._make_cm(4))
 
-        assert meta.mamba_state_indices is None
+        block_tables = (
+            runner.input_batch.block_table[0].get_cpu_tensor.return_value)
+        expected = torch.tensor([
+            block_tables[0, 0],
+            block_tables[1, 0],
+            block_tables[2, 1],
+            block_tables[3, 3],
+        ],
+                                dtype=torch.int32)
+        assert torch.equal(meta.mamba_state_indices, expected)

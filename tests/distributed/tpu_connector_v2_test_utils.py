@@ -58,11 +58,45 @@ def _load_v2_module(monkeypatch: Any, *, stub_zmq: bool = True):
     vllm = types.ModuleType("vllm")
     vllm_config = types.ModuleType("vllm.config")
     vllm_config.VllmConfig = type("VllmConfig", (), {})
+    vllm_v1 = types.ModuleType("vllm.v1")
+    kv_cache_interface = types.ModuleType("vllm.v1.kv_cache_interface")
+
+    class AttentionSpec:
+
+        def __init__(self, *, block_size, num_kv_heads, head_size, dtype,
+                     page_size_padded):
+            self.block_size = block_size
+            self.num_kv_heads = num_kv_heads
+            self.head_size = head_size
+            self.dtype = dtype
+            self.page_size_padded = page_size_padded
+
+        @property
+        def page_size_bytes(self):
+            return self.page_size_padded
+
+    class MambaSpec:
+
+        def __init__(self, *, block_size, shapes, dtypes, page_size_padded):
+            self.block_size = block_size
+            self.shapes = tuple(shapes)
+            self.dtypes = tuple(dtypes)
+            self.page_size_padded = page_size_padded
+
+        @property
+        def page_size_bytes(self):
+            return self.page_size_padded
+
+    kv_cache_interface.AttentionSpec = AttentionSpec
+    kv_cache_interface.MambaSpec = MambaSpec
     vllm_logger = types.ModuleType("vllm.logger")
     vllm_logger._VllmLogger = logging.Logger
     vllm_logger.init_logger = logging.getLogger
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     monkeypatch.setitem(sys.modules, "vllm.config", vllm_config)
+    monkeypatch.setitem(sys.modules, "vllm.v1", vllm_v1)
+    monkeypatch.setitem(sys.modules, "vllm.v1.kv_cache_interface",
+                        kv_cache_interface)
     monkeypatch.setitem(sys.modules, "vllm.logger", vllm_logger)
 
     if stub_zmq or importlib.util.find_spec("zmq") is None:

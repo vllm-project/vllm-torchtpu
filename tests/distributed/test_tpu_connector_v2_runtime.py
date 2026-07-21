@@ -14,7 +14,7 @@ from .tpu_connector_v2_test_utils import (_assert_log_messages,
                                           _load_v2_module)
 
 
-def test_v2_connector_requires_unified_block_pool(monkeypatch):
+def test_v2_connector_requires_unified_layout(monkeypatch):
     mod = _load_v2_module(monkeypatch)
     sys.modules[
         "vllm_torchtpu.envs"].TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL = False
@@ -1335,7 +1335,13 @@ def test_v2_worker_auto_installs_strided_transfer_engine(monkeypatch):
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
         parallel_config=types.SimpleNamespace(data_parallel_rank=2,
-                                              tensor_parallel_size=4))
+                                              tensor_parallel_size=4),
+        model_config=types.SimpleNamespace(
+            hf_config=types.SimpleNamespace(num_key_value_heads=8,
+                                            linear_num_key_heads=8,
+                                            linear_num_value_heads=16,
+                                            linear_key_head_dim=8,
+                                            linear_value_head_dim=8)))
     worker = mod.TPUConnectorV2Worker(config)
     host = _local_test_host()
     kv_transfer_port = _pick_strided_base_port()
@@ -1343,26 +1349,34 @@ def test_v2_worker_auto_installs_strided_transfer_engine(monkeypatch):
     worker.host_ip = host
     worker.kv_transfer_port = kv_transfer_port
 
-    class MambaSpec:
-        pass
-
-    raw_mamba = torch.zeros(64, dtype=torch.int8)
-    fa_cache = raw_mamba.view(torch.uint8).as_strided((2, 16), (32, 1), 0)
-    conv_state = raw_mamba.view(torch.bfloat16).as_strided((2, 2), (16, 1), 0)
-    ssm_state = raw_mamba.view(torch.float32).as_strided((2, 2), (8, 1), 4)
-    mamba_cache = [conv_state, ssm_state]
+    manager_page_bytes = 4096
+    attention_spec = mod.AttentionSpec(
+        block_size=128,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=manager_page_bytes,
+    )
+    mamba_spec = mod.MambaSpec(
+        block_size=128,
+        shapes=((3, 64), (4, 8, 16)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=manager_page_bytes,
+    )
+    pool = torch.empty((8, 16, 2, 2, 8), dtype=torch.float8_e4m3fn)
+    mamba_cache = [pool]
     runner = types.SimpleNamespace(
-        kv_caches=[fa_cache, mamba_cache],
-        kv_cache_raw_tensors=[raw_mamba],
+        kv_caches=[pool, mamba_cache],
+        kv_cache_raw_tensors=[pool],
         kv_cache_config=types.SimpleNamespace(kv_cache_groups=(
             types.SimpleNamespace(layer_names=("model.layers.0.self_attn", ),
-                                  kv_cache_spec=object()),
+                                  kv_cache_spec=attention_spec),
             types.SimpleNamespace(layer_names=("model.layers.1.linear_attn", ),
-                                  kv_cache_spec=MambaSpec()),
+                                  kv_cache_spec=mamba_spec),
         )),
     )
     worker.named_kv_caches = {
-        "model.layers.0.self_attn": fa_cache,
+        "model.layers.0.self_attn": pool,
         "model.layers.1.linear_attn": mamba_cache,
     }
 
@@ -1383,12 +1397,12 @@ def test_v2_worker_auto_installs_strided_transfer_engine(monkeypatch):
     assert worker.strided_transfer_engine.regions == [
         {
             "buffer":
-            raw_mamba,
+            pool,
             "region":
             mod.RegisteredMemoryRegion(
                 region_id="__raw_kv_cache_0",
-                nbytes=raw_mamba.numel() * raw_mamba.element_size(),
-                page_bytes=32,
+                nbytes=pool.nbytes,
+                page_bytes=manager_page_bytes,
             ),
         },
     ]
@@ -1400,15 +1414,17 @@ def test_v2_worker_auto_installs_strided_transfer_engine(monkeypatch):
     assert fa_region.physical_region_id == "__raw_kv_cache_0"
     assert fa_region.block_id_group_index == 0
     assert fa_region.region_base_offset_bytes == 0
-    assert fa_region.block_stride_bytes == 32
+    assert fa_region.block_stride_bytes == manager_page_bytes
     assert state0_region.physical_region_id == "__raw_kv_cache_0"
     assert state0_region.block_id_group_index == 1
-    assert state0_region.region_base_offset_bytes == 0
-    assert state0_region.block_stride_bytes == 32
+    assert state0_region.region_base_offset_bytes == 4 * 8 * 16 * 4
+    assert state0_region.block_stride_bytes == manager_page_bytes
+    assert {segment.name
+            for segment in state0_region.head_segments} == {"q", "k", "v"}
     assert state1_region.physical_region_id == "__raw_kv_cache_0"
     assert state1_region.block_id_group_index == 1
-    assert state1_region.region_base_offset_bytes == 16
-    assert state1_region.block_stride_bytes == 32
+    assert state1_region.region_base_offset_bytes == 0
+    assert state1_region.block_stride_bytes == manager_page_bytes
 
 
 def test_v2_decode_worker_installs_client_engine_without_starting_server(
@@ -1460,11 +1476,18 @@ def test_v2_decode_worker_installs_client_engine_without_starting_server(
     worker.host_ip = host
     worker.kv_transfer_port = kv_transfer_port
     worker.group_is_mamba = (False, )
+    attention_spec = mod.AttentionSpec(
+        block_size=1,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=6,
+    )
     runner = types.SimpleNamespace(
-        kv_caches=[torch.zeros(6, dtype=torch.uint8)],
-        kv_cache_config=types.SimpleNamespace(
-            kv_cache_groups=(types.SimpleNamespace(
-                layer_names=("model.layers.0.self_attn", )), )),
+        kv_caches=[torch.empty(6, dtype=torch.float8_e4m3fn)],
+        kv_cache_config=types.SimpleNamespace(kv_cache_groups=(
+            types.SimpleNamespace(layer_names=("model.layers.0.self_attn", ),
+                                  kv_cache_spec=attention_spec), )),
     )
     worker.named_kv_caches = {"model.layers.0.self_attn": runner.kv_caches[0]}
 

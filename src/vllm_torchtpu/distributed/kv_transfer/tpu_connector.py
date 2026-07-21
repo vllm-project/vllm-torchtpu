@@ -1280,16 +1280,6 @@ class TPURaidenConnectorWorker:
                     self._model_config_int("linear_key_head_dim", 1)),
             ),
         )
-        alias_fallback = getattr(tpu_envs, "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK",
-                                 True)
-        expected_binding = (rpm.BINDING_PRIVATE_TYPED
-                            if alias_fallback else rpm.BINDING_ALIASED_RAW)
-        if manifest.binding != expected_binding:
-            raise ValueError(
-                "Raiden pool admission binding does not match the alias "
-                f"fallback setting: resolved={manifest.binding} "
-                f"expected={expected_binding}")
-
         # Hard-fail before manager construction if the pools point at storage
         # that the model kernels do not actually use.
         verified_storages = rpm.verify_storage_binding(

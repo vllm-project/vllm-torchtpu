@@ -1,17 +1,13 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import prod
 from typing import Any, TypeAlias
 
 import torch
-from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         EncoderOnlyAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.worker.utils import AttentionGroup
-
-from vllm_torchtpu import envs as tpu_envs
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
@@ -130,146 +126,43 @@ def _pool_attention_geometry(
 def allocate_raw_kv_cache_tensors(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
-    pool_geometry: tuple[AttentionSpec, Any, int] | None = None,
+    pool_geometry: tuple[AttentionSpec, Any, int],
     cache_dtype: str | torch.dtype = "auto",
 ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
     layer_to_raw: dict[str, torch.Tensor] = {}
     raw_tensors: list[torch.Tensor] = []
-    if pool_geometry is not None:
-        pool_page_bytes = max(group.kv_cache_spec.page_size_bytes
-                              for group in kv_cache_config.kv_cache_groups)
+    pool_page_bytes = max(group.kv_cache_spec.page_size_bytes
+                          for group in kv_cache_config.kv_cache_groups)
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        if pool_geometry is not None:
-            # The unified pool is BORN as the stock attention-shaped KV
-            # cache (one kernel block per vLLM block): attention consumes
-            # it natively and the pool adapters address the mamba byte
-            # regions through it, so the buffer carries the tiled layout
-            # every compiled graph expects and no reshape or relayout
-            # ever touches it.
-            spec, attn_backend, kernel_block_size = pool_geometry
-            assert spec.block_size % kernel_block_size == 0, (
-                spec.block_size, kernel_block_size)
-            split = spec.block_size // kernel_block_size
-            assert kv_cache_tensor.size % pool_page_bytes == 0, (
-                kv_cache_tensor.size, pool_page_bytes)
-            num_blocks = kv_cache_tensor.size // pool_page_bytes
-            # Born at the attention KERNEL's block granularity (a manager
-            # block = `split` consecutive kernel blocks, upstream's
-            # map_to_kernel_blocks contract), so the kernel consumes the
-            # pool natively; the mamba adapters take the manager view via
-            # a free leading-dim reshape inside the compiled graph.
-            shape = attn_backend.get_kv_cache_shape(
-                num_blocks * split,
-                kernel_block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                cache_dtype_str=cache_dtype,
-            )
-            if spec.dtype in _FP8_DTYPES:
-                # fp8 pools are born uninitialized: fp8 cannot zero-fill,
-                # zero-fill of a >HBM/2 buffer needs a 2x transient anyway,
-                # and fp8 cache slots are overwritten before use (same
-                # contract as the typed fp8 cache views).
-                raw = torch.empty(tuple(shape),
-                                  dtype=spec.dtype,
-                                  device=device)
-            else:
-                raw = torch.zeros(tuple(shape),
-                                  dtype=spec.dtype,
-                                  device=device)
-            # Fit-size block sizing guarantees the attention manager page
-            # IS the pool page (the mamba slot fits inside it).
-            fa_page_bytes = (raw.numel() * raw.element_size() //
-                             (num_blocks * split))
-            assert fa_page_bytes * split == pool_page_bytes, (fa_page_bytes,
-                                                              split,
-                                                              pool_page_bytes)
+        # The unified pool is born as the stock attention-shaped KV cache.
+        # Attention consumes it natively; Mamba adapters address their byte
+        # regions inside each manager page without creating typed aliases.
+        spec, attn_backend, kernel_block_size = pool_geometry
+        assert spec.block_size % kernel_block_size == 0, (spec.block_size,
+                                                          kernel_block_size)
+        split = spec.block_size // kernel_block_size
+        assert kv_cache_tensor.size % pool_page_bytes == 0, (
+            kv_cache_tensor.size, pool_page_bytes)
+        num_blocks = kv_cache_tensor.size // pool_page_bytes
+        shape = attn_backend.get_kv_cache_shape(
+            num_blocks * split,
+            kernel_block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            cache_dtype_str=cache_dtype,
+        )
+        if spec.dtype in _FP8_DTYPES:
+            raw = torch.empty(tuple(shape), dtype=spec.dtype, device=device)
         else:
-            raw = torch.zeros(kv_cache_tensor.size,
-                              dtype=torch.int8,
-                              device=device)
+            raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
+        fa_page_bytes = (raw.numel() * raw.element_size() //
+                         (num_blocks * split))
+        assert fa_page_bytes * split == pool_page_bytes, (fa_page_bytes, split,
+                                                          pool_page_bytes)
         raw_tensors.append(raw)
         for layer_name in kv_cache_tensor.shared_by:
             layer_to_raw[layer_name] = raw
     return layer_to_raw, raw_tensors
-
-
-def _kv_cache_alias_fallback_enabled() -> bool:
-    return tpu_envs.TPU_VLLM_KV_CACHE_ALIAS_FALLBACK
-
-
-def _typed_kv_cache_view(
-    raw_int8: torch.Tensor,
-    dtype: torch.dtype,
-    shape: tuple[int, ...],
-    stride: tuple[int, ...] | None = None,
-    storage_offset_bytes: int = 0,
-) -> torch.Tensor:
-    if raw_int8.dtype != torch.int8:
-        raise TypeError(f"typed KV cache view expects int8 raw storage, got "
-                        f"{raw_int8.dtype}")
-    if _kv_cache_alias_fallback_enabled():
-        if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # torch_tpu cannot materialize fp8 zero_ on TPU. Cache slots that
-            # use fp8 are overwritten before use, so allocate them uninitialized
-            # while preserving zero initialization for supported dtypes.
-            return torch.empty(shape, dtype=dtype, device=raw_int8.device)
-        return torch.zeros(shape, dtype=dtype, device=raw_int8.device)
-
-    dtype_size = get_dtype_size(dtype)
-    base_offset_bytes = raw_int8.storage_offset() * raw_int8.element_size()
-    absolute_offset_bytes = base_offset_bytes + storage_offset_bytes
-    if absolute_offset_bytes % dtype_size != 0:
-        raise ValueError(
-            f"storage offset {absolute_offset_bytes} bytes is not aligned "
-            f"to dtype {dtype} size {dtype_size}")
-
-    if stride is None:
-        stride = torch.empty(shape, dtype=dtype).stride()
-    num_elements = _num_elements_reachable(shape, stride)
-    if storage_offset_bytes + num_elements * dtype_size > raw_int8.numel():
-        raise ValueError(
-            f"typed KV cache view shape={shape} stride={stride} dtype={dtype} "
-            f"offset_bytes={storage_offset_bytes} exceeds raw int8 buffer "
-            f"with {raw_int8.numel()} bytes")
-
-    base = raw_int8.view(dtype)
-    storage_offset = absolute_offset_bytes // dtype_size
-    return base.as_strided(shape, stride, storage_offset)
-
-
-def _num_elements_reachable(
-    shape: tuple[int, ...],
-    stride: tuple[int, ...],
-) -> int:
-    if len(shape) == 0:
-        return 1
-    if 0 in shape:
-        return 0
-    if stride == torch.empty(shape).stride():
-        return prod(shape)
-    return 1 + sum((size - 1) * step for size, step in zip(shape, stride))
-
-
-def make_attention_cache_view(
-    *,
-    raw: torch.Tensor,
-    spec: AttentionSpec,
-    attn_backend: Any,
-    num_blocks: int,
-    kernel_block_size: int,
-    cache_dtype: str | torch.dtype,
-) -> torch.Tensor:
-    num_blocks_per_kv_block = spec.block_size // kernel_block_size
-    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-    shape = attn_backend.get_kv_cache_shape(
-        kernel_num_blocks,
-        kernel_block_size,
-        spec.num_kv_heads,
-        spec.head_size,
-        cache_dtype_str=cache_dtype,
-    )
-    return _typed_kv_cache_view(raw, spec.dtype, tuple(shape))
 
 
 def make_attention_cache_tensor(
@@ -291,32 +184,6 @@ def make_attention_cache_tensor(
         cache_dtype_str=cache_dtype,
     )
     return torch.zeros(shape, dtype=spec.dtype, device=device)
-
-
-def make_mamba_cache_views(
-    *,
-    raw: torch.Tensor,
-    spec: MambaSpec,
-    num_blocks: int,
-) -> list[torch.Tensor]:
-    states: list[torch.Tensor] = []
-    storage_offset_bytes = 0
-    for shape, dtype in zip(spec.shapes, spec.dtypes):
-        dtype_size = get_dtype_size(dtype)
-        num_element_per_page = spec.page_size_bytes // dtype_size
-        target_shape = (num_blocks, *shape)
-        dense_stride = torch.empty(target_shape, dtype=dtype).stride()
-        target_stride = (num_element_per_page, *dense_stride[1:])
-        state = _typed_kv_cache_view(
-            raw,
-            dtype,
-            target_shape,
-            stride=target_stride,
-            storage_offset_bytes=storage_offset_bytes,
-        )
-        states.append(state)
-        storage_offset_bytes += dense_stride[0] * dtype_size
-    return states
 
 
 def _can_allocate_attention_cache_directly(
@@ -377,8 +244,6 @@ def materialize_kv_cache_tensors(
     kernel_block_sizes: Sequence[int],
     device: torch.device,
     cache_dtype: str | torch.dtype,
-    mamba_num_blocks: int | None = None,
-    unified_block_pool: bool = False,
 ) -> MaterializedKVCache:
     kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
         kv_cache_config=kv_cache_config,
@@ -412,9 +277,10 @@ def materialize_kv_cache_tensors(
                     )
         return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=[])
 
-    pool_geometry = (_pool_attention_geometry(kv_cache_config, attn_groups,
-                                              kernel_block_size_by_gid)
-                     if unified_block_pool else None)
+    pool_geometry = _pool_attention_geometry(kv_cache_config, attn_groups,
+                                             kernel_block_size_by_gid)
+    if pool_geometry is None:
+        raise ValueError("unified hybrid KV layout requires an attention pool")
     layer_to_raw, raw_tensors = allocate_raw_kv_cache_tensors(
         kv_cache_config,
         device,
@@ -422,60 +288,21 @@ def materialize_kv_cache_tensors(
         cache_dtype=cache_dtype)
     kv_caches: dict[str, LayerKVCache] = {}
 
-    if pool_geometry is not None:
-        # Unified pool: the buffer was born attention-shaped, attention
-        # consumes it directly and the mamba "view" IS the pool tensor (the
-        # GDN op gathers/scatters the ssm and conv byte-regions through the
-        # pool adapters). Every layer sharing the buffer holds the same
-        # object so torch.compile dedupes them to a single graph input --
-        # otherwise each layer's fresh view is a distinct ~pool-sized
-        # parameter (N mamba layers per buffer -> N copies at compile ->
-        # HBM OOM at scale).
-        for group_list in attn_groups:
-            for group in group_list:
-                gid = group.kv_cache_group_id
-                if kernel_block_size_by_gid.get(gid) is None:
-                    continue
-                spec = group.kv_cache_spec
-                for layer_name in group.layer_names:
-                    raw = layer_to_raw[layer_name]
-                    if isinstance(spec, MambaSpec):
-                        kv_caches[layer_name] = [raw]
-                    elif isinstance(spec, AttentionSpec):
-                        kv_caches[layer_name] = raw
-                    else:
-                        raise NotImplementedError(
-                            f"Unsupported KV cache spec: {type(spec)!r}")
-        return MaterializedKVCache(kv_caches=kv_caches,
-                                   raw_tensors=raw_tensors)
-
+    # Every layer sharing a hybrid buffer holds the exact same pool object.
+    # This preserves the native attention layout and gives torch.compile one
+    # persistent graph input instead of per-layer typed aliases or clones.
     for group_list in attn_groups:
         for group in group_list:
             gid = group.kv_cache_group_id
-            kernel_block_size = kernel_block_size_by_gid.get(gid)
-            if kernel_block_size is None:
+            if kernel_block_size_by_gid.get(gid) is None:
                 continue
             spec = group.kv_cache_spec
             for layer_name in group.layer_names:
                 raw = layer_to_raw[layer_name]
-                assert raw.numel() % spec.page_size_bytes == 0
-                num_blocks = raw.numel() // spec.page_size_bytes
-                if isinstance(spec, AttentionSpec):
-                    kv_caches[layer_name] = make_attention_cache_view(
-                        raw=raw,
-                        spec=spec,
-                        attn_backend=group.backend,
-                        num_blocks=num_blocks,
-                        kernel_block_size=kernel_block_size,
-                        cache_dtype=cache_dtype,
-                    )
-                elif isinstance(spec, MambaSpec):
-                    kv_caches[layer_name] = make_mamba_cache_views(
-                        raw=raw,
-                        spec=spec,
-                        num_blocks=mamba_num_blocks
-                        if mamba_num_blocks is not None else num_blocks,
-                    )
+                if isinstance(spec, MambaSpec):
+                    kv_caches[layer_name] = [raw]
+                elif isinstance(spec, AttentionSpec):
+                    kv_caches[layer_name] = raw
                 else:
                     raise NotImplementedError(
                         f"Unsupported KV cache spec: {type(spec)!r}")

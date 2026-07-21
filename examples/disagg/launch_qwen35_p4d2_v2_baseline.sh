@@ -103,7 +103,8 @@ DECODE_TP="${DECODE_TP:-2}"
 PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET="${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET:-0}"
 DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET="${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET:-4}"
 
-BLOCK_SIZE="${BLOCK_SIZE:-2304}"
+BLOCK_SIZE="${BLOCK_SIZE:-}"
+block_size_label="${BLOCK_SIZE:-auto}"
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-128}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
@@ -208,7 +209,6 @@ common_args=(
   --max-model-len "${MAX_MODEL_LEN}"
   --enable-expert-parallel
   --disable-custom-all-reduce
-  --block-size "${BLOCK_SIZE}"
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-dtype fp8
   --language-model-only
@@ -222,6 +222,10 @@ common_args=(
   --no-enable-log-requests
   --compilation-config "${compilation_config}"
 )
+
+if [[ -n "${BLOCK_SIZE}" ]]; then
+  common_args+=(--block-size "${BLOCK_SIZE}")
+fi
 
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
   common_args+=(--enable-prefix-caching)
@@ -256,7 +260,7 @@ CONNECTOR=TPUConnectorV2
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector
 PREFILL_TP=${PREFILL_TP}
 DECODE_TP=${DECODE_TP}
-BLOCK_SIZE=${BLOCK_SIZE}
+BLOCK_SIZE=${block_size_label}
 NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
 ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}

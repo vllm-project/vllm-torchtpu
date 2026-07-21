@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -9,9 +10,11 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
+import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole, SupportsHMA)
+from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
@@ -1347,7 +1350,7 @@ class TPUConnectorV2Worker:
         groups = getattr(getattr(runner, "kv_cache_config", None),
                          "kv_cache_groups", ())
         self.group_is_mamba = [
-            type(getattr(group, "kv_cache_spec", None)).__name__ == "MambaSpec"
+            isinstance(getattr(group, "kv_cache_spec", None), MambaSpec)
             for group in groups
         ]
 
@@ -1427,18 +1430,51 @@ class TPUConnectorV2Worker:
         if not named_kv_caches:
             return
         raw_tensors = tuple(getattr(runner, "kv_cache_raw_tensors", ()) or ())
+        groups = tuple(
+            getattr(getattr(runner, "kv_cache_config", None),
+                    "kv_cache_groups", ()) or ())
+        layer_specs = {
+            layer_name: group.kv_cache_spec
+            for group in groups
+            for layer_name in group.layer_names
+        }
         for layer_name, cache in named_kv_caches.items():
-            if isinstance(cache, (list, tuple)):
-                for idx, tensor in enumerate(cache):
-                    region_id = f"{layer_name}.state{idx}"
-                    self._register_named_mamba_region(engine, tensor,
-                                                      region_id, raw_tensors)
+            try:
+                spec = layer_specs[layer_name]
+            except KeyError as exc:
+                raise ValueError("named KV cache layer is missing from KV "
+                                 f"cache groups: {layer_name}") from exc
+            if isinstance(spec, MambaSpec):
+                if not isinstance(cache, (list, tuple)) or len(cache) != 1:
+                    raise ValueError(
+                        "pooled Mamba cache must contain exactly one raw pool")
+                states = self._make_pooled_mamba_registration_views(
+                    cache[0], spec, raw_tensors)
+                for state_index, state in enumerate(states):
+                    self._register_named_mamba_region(
+                        engine,
+                        state,
+                        f"{layer_name}.state{state_index}",
+                        raw_tensors,
+                    )
+            elif isinstance(spec, AttentionSpec):
+                if isinstance(cache, (list, tuple)):
+                    raise TypeError("attention KV cache must be a tensor")
+                self._register_named_region(engine,
+                                            cache,
+                                            layer_name,
+                                            raw_tensors,
+                                            physical_page_bytes=int(
+                                                spec.page_size_bytes))
             else:
-                self._register_named_region(engine, cache, layer_name,
-                                            raw_tensors)
+                raise TypeError(f"unsupported KV cache spec: {type(spec)!r}")
 
-    def _register_named_region(self, engine: Any, tensor: Any, region_id: str,
-                               raw_tensors: Sequence[Any]) -> None:
+    def _register_named_region(self,
+                               engine: Any,
+                               tensor: Any,
+                               region_id: str,
+                               raw_tensors: Sequence[Any],
+                               physical_page_bytes: int | None = None) -> None:
         nbytes = self._buffer_nbytes(tensor)
         page_bytes = self._infer_page_bytes_from_shape(tensor, nbytes)
         template = self._infer_kv_cache_region(tensor=tensor,
@@ -1449,13 +1485,21 @@ class TPUConnectorV2Worker:
         if raw_index is not None:
             raw = raw_tensors[raw_index]
             raw_nbytes = self._buffer_nbytes(raw)
-            num_blocks = self._num_blocks_from_shape(tensor)
-            if raw_nbytes % num_blocks != 0:
-                raise ValueError(
-                    "raw KV cache tensor nbytes must be divisible "
-                    f"by tensor num_blocks: nbytes={raw_nbytes} "
-                    f"num_blocks={num_blocks}")
-            raw_page_bytes = raw_nbytes // num_blocks
+            if physical_page_bytes is None:
+                num_blocks = self._num_blocks_from_shape(tensor)
+                if raw_nbytes % num_blocks != 0:
+                    raise ValueError(
+                        "raw KV cache tensor nbytes must be divisible "
+                        f"by tensor num_blocks: nbytes={raw_nbytes} "
+                        f"num_blocks={num_blocks}")
+                raw_page_bytes = raw_nbytes // num_blocks
+            else:
+                raw_page_bytes = int(physical_page_bytes)
+                if raw_page_bytes <= 0 or raw_nbytes % raw_page_bytes != 0:
+                    raise ValueError(
+                        "raw KV cache tensor nbytes must be divisible by "
+                        "the physical page size: "
+                        f"nbytes={raw_nbytes} page_bytes={raw_page_bytes}")
             raw_region_id = self._raw_region_id(raw_index)
             self._register_raw_region_once(engine, raw, raw_region_id,
                                            raw_nbytes, raw_page_bytes)
@@ -1493,6 +1537,72 @@ class TPUConnectorV2Worker:
         self._registered_region_metadata[region_id] = region
         self._kv_cache_region_templates[region_id] = template
 
+    def _make_pooled_mamba_registration_views(
+        self,
+        pool: torch.Tensor,
+        spec: MambaSpec,
+        raw_tensors: Sequence[Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raw_index = self._raw_tensor_index(pool, raw_tensors)
+        if raw_index is None:
+            raise ValueError("pooled Mamba cache must share raw pool storage")
+        raw = raw_tensors[raw_index]
+        if not isinstance(raw, torch.Tensor):
+            raise TypeError("pooled Mamba raw storage must be a torch tensor")
+        raw_nbytes = self._buffer_nbytes(raw)
+        if (self._buffer_nbytes(pool) != raw_nbytes
+                or self._tensor_storage_offset_bytes(pool)
+                != self._tensor_storage_offset_bytes(raw)):
+            raise ValueError(
+                "pooled Mamba cache must cover the complete raw pool")
+
+        shapes = tuple(spec.shapes)
+        dtypes = tuple(spec.dtypes)
+        if len(shapes) != 2 or len(dtypes) != 2:
+            raise ValueError("pooled Mamba cache requires conv and SSM states")
+        conv_shape, ssm_shape = shapes
+        conv_dtype, ssm_dtype = dtypes
+        conv_itemsize = torch.empty((), dtype=conv_dtype).element_size()
+        ssm_itemsize = torch.empty((), dtype=ssm_dtype).element_size()
+        conv_bytes = math.prod(conv_shape) * conv_itemsize
+        ssm_bytes = math.prod(ssm_shape) * ssm_itemsize
+        manager_page_bytes = int(spec.page_size_bytes)
+        if conv_bytes + ssm_bytes > manager_page_bytes:
+            raise ValueError("Mamba states exceed unified manager page: "
+                             f"states={conv_bytes + ssm_bytes} "
+                             f"page={manager_page_bytes}")
+        if manager_page_bytes <= 0 or raw_nbytes % manager_page_bytes != 0:
+            raise ValueError("raw pool nbytes must be divisible by Mamba "
+                             "manager page size: "
+                             f"nbytes={raw_nbytes} "
+                             f"page={manager_page_bytes}")
+        num_manager_blocks = raw_nbytes // manager_page_bytes
+
+        states = []
+        for shape, dtype, itemsize, offset_bytes in (
+            (conv_shape, conv_dtype, conv_itemsize, ssm_bytes),
+            (ssm_shape, ssm_dtype, ssm_itemsize, 0),
+        ):
+            if manager_page_bytes % itemsize != 0:
+                raise ValueError(
+                    "Mamba manager page must align to state dtype: "
+                    f"page={manager_page_bytes} dtype={dtype}")
+            pool_offset_bytes = self._tensor_storage_offset_bytes(pool)
+            absolute_offset_bytes = pool_offset_bytes + offset_bytes
+            if absolute_offset_bytes % itemsize != 0:
+                raise ValueError(
+                    "Mamba state offset must align to state dtype: "
+                    f"offset={absolute_offset_bytes} dtype={dtype}")
+            target_shape = (num_manager_blocks, *tuple(shape))
+            dense_stride = torch.empty(target_shape, dtype=dtype).stride()
+            state = pool.view(dtype).as_strided(
+                target_shape,
+                (manager_page_bytes // itemsize, *dense_stride[1:]),
+                absolute_offset_bytes // itemsize,
+            )
+            states.append(state)
+        return states[0], states[1]
+
     def _register_named_mamba_region(self, engine: Any, tensor: Any,
                                      region_id: str,
                                      raw_tensors: Sequence[Any]) -> None:
@@ -1504,13 +1614,8 @@ class TPUConnectorV2Worker:
                                                page_bytes=state_page_bytes)
         raw_index = self._raw_tensor_index(tensor, raw_tensors)
         if raw_index is None:
-            region = RegisteredMemoryRegion(region_id=region_id,
-                                            nbytes=nbytes,
-                                            page_bytes=state_page_bytes)
-            engine.register_local_region(buffer=tensor, region=region)
-            self._registered_region_metadata[region_id] = region
-            self._kv_cache_region_templates[region_id] = template
-            return
+            raise ValueError(
+                "pooled Mamba registration view must share raw pool storage")
         raw = raw_tensors[raw_index]
         raw_nbytes = self._buffer_nbytes(raw)
         num_blocks = self._num_blocks_from_shape(tensor)
