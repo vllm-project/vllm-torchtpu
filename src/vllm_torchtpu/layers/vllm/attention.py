@@ -1083,11 +1083,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def _build_sparse_mla_op(self, layer: Any):
         """Build the GLM-5.2 sparse (DSA) MLA custom op for `layer`.
 
-        The sparse kernel is read-only w.r.t. the KV cache (the dense
-        op's fused insert runs first in Stage-A), so the op neither
-        donates nor returns the cache. Queries must be bf16
-        (pre-quantization); the kernel dequantizes gathered KV to bf16
-        and has no q-scale plumbing.
+        Fused KV-cache update & sparse attention evaluation in one pass.
+        Queries must be bf16 (pre-quantization); the kernel dequantizes gathered
+        KV to bf16.
         """
         from vllm_torchtpu.layers.common.attention_interface import \
             sparse_mla_attention
@@ -1104,16 +1102,22 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kv_cache: jax.Array,
             q_nope: jax.Array,
             q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
             topk_indices: jax.Array,
+            seq_lens: jax.Array,
             block_tables: jax.Array,
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
-        ) -> jax.Array:
+        ) -> tuple[jax.Array, jax.Array]:
             return sparse_mla_attention(
                 q_nope,
                 q_pe,
+                kv_c_normed,
+                k_pe,
                 kv_cache,
                 topk_indices,
+                seq_lens,
                 block_tables,
                 query_start_loc,
                 request_distribution,
@@ -1125,27 +1129,32 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         op_name = ("pallas::sparse_mla_attention_"
                    f"{layer.layer_name.replace('.', '_')}")
         sparse_mla_jax_op = pallas.jax_op(op_name,
-                                          sparse_mla_attention_core_tpu)
+                                          sparse_mla_attention_core_tpu,
+                                          donate_argnums=(0, ))
 
-        def _fake_sparse_mla(kv_cache, q_nope, q_pe, topk_indices, *args,
-                             **kwargs):
+        def _fake_sparse_mla(kv_cache, q_nope, q_pe, kv_c_normed, k_pe,
+                             topk_indices, *args, **kwargs):
             num_tokens = q_nope.size(0)
             out_shape = (num_tokens, layer.num_heads, layer.kv_lora_rank)
-            return torch.empty(out_shape,
-                               dtype=q_nope.dtype,
-                               device=q_nope.device)
+            return torch.empty_like(kv_cache), torch.empty(
+                out_shape, dtype=q_nope.dtype, device=q_nope.device)
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla)
 
         def sparse_mla_impl(kv_cache: torch.Tensor, q_nope: torch.Tensor,
-                            q_pe: torch.Tensor, topk_indices: torch.Tensor,
-                            block_tables: torch.Tensor,
+                            q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
+                            k_pe: torch.Tensor, topk_indices: torch.Tensor,
+                            seq_lens: torch.Tensor, block_tables: torch.Tensor,
                             query_start_loc: torch.Tensor,
                             request_distribution: torch.Tensor
                             ) -> torch.Tensor:
-            return sparse_mla_jax_op(kv_cache, q_nope, q_pe, topk_indices,
-                                     block_tables, query_start_loc,
-                                     request_distribution)
+            new_kv, outputs = sparse_mla_jax_op(kv_cache, q_nope, q_pe,
+                                                kv_c_normed, k_pe,
+                                                topk_indices, seq_lens,
+                                                block_tables, query_start_loc,
+                                                request_distribution)
+            kv_cache.copy_(new_kv)
+            return outputs
 
         return sparse_mla_impl
 
@@ -1225,26 +1234,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         if topk_indices is not None:
-            # Stage-A sparse bring-up: run the dense op FIRST purely for
-            # its fused KV-cache insert (cache layout and content stay
-            # identical to the validated dense-only fp8 run), then the
-            # sparse op reads the just-updated cache. This also provides
-            # the numerical oracle: with the causal arange top-k
-            # placeholder and prompts shorter than index_topk, sparse
-            # output must match this (discarded) dense output. Remove the
-            # double-run once a native uint8 sparse cache + slot writer
-            # land.
-            layer.mla_op(
-                kv_cache,
-                ql_nope_flat,
-                q_pe_flat,
-                kv_c_normed_flat,
-                k_pe_flat,
-                attn_metadata.seq_lens,
-                attn_metadata.block_tables,
-                attn_metadata.query_start_loc,
-                attn_metadata.request_distribution,
-            )
+            if (not hasattr(layer, "sparse_mla_op")
+                    or layer.sparse_mla_op is None):
+                layer.sparse_mla_op = self._build_sparse_mla_op(layer)
 
             ql_nope_sparse_flat = ql_nope_sparse.view(
                 -1, layer.num_heads, layer.kv_lora_rank)
@@ -1254,7 +1246,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 kv_cache,
                 ql_nope_sparse_flat,
                 q_pe_sparse_flat,
+                kv_c_normed_flat,
+                k_pe_flat,
                 topk_indices,
+                attn_metadata.seq_lens,
                 attn_metadata.block_tables,
                 attn_metadata.query_start_loc,
                 attn_metadata.request_distribution,
