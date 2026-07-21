@@ -125,6 +125,7 @@ class VllmTPUMLAAttention(MLAAttention):
                                               q_scale=q_scale,
                                               k_scale=k_scale,
                                               v_scale=v_scale)
+        self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
 
     def forward(self,
                 q: tuple[torch.Tensor, torch.Tensor],
@@ -276,21 +277,26 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         topk_indices = None
-        if self.indexer and self.is_sparse:
+        if self.indexer and self.is_sparse and not self.skip_topk:
             # _topk_indices = self.indexer(hidden_states, q_c, positions,
             #                              self.indexer_rope_emb)
 
-            # Bring-up placeholder until the indexer is enabled. Matches the
-            # real buffer's shape/dtype: int32[num_tokens, index_topk] (see
-            # DeepseekV2Model.__init__ topk_indices_buffer). arange selects
-            # positions 0..topk-1, so while seq_len <= topk this is
-            # dense-equivalent and the output can be diffed against the dense
-            # path by dropping the `topk_indices=` kwarg below.
-            topk_indices = torch.arange(
-                self.topk_tokens,
-                dtype=torch.int32,
-                device=hidden_states.device).unsqueeze(0).expand(
-                    hidden_states.shape[0], -1).contiguous()
+            # Bring-up placeholder until the TPU indexer lands: CAUSAL
+            # arange top-k. Row t selects positions [0 .. min(pos_t,
+            # topk-1)] and pads the tail with -1. The kernel requires
+            # valid-first, "-1"-tail rows: it derives each token's kv_len
+            # as the count of non-(-1) entries and masks gathered slots
+            # beyond it. While seq_len <= index_topk this is exactly dense
+            # causal attention, so sparse output can be validated against
+            # the dense path.
+            topk = torch.arange(self.topk_tokens,
+                                dtype=torch.int32,
+                                device=hidden_states.device)
+            topk_indices = torch.where(
+                topk.unsqueeze(0) <= positions.to(torch.int32).unsqueeze(1),
+                topk.unsqueeze(0).expand(hidden_states.shape[0], -1),
+                topk.new_full((), -1),
+            ).contiguous()
 
         if llama_4_scaling is not None:
             q_nope *= llama_4_scaling
