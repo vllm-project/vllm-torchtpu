@@ -240,9 +240,18 @@ def test_prepare_dflash_inputs(device):
 
     sampled_token_ids = [[101, 102, 103], [201, 202]]
     num_rejected_tokens_np = np.array([1, 0], dtype=np.int32)
+    next_tokens_device = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, -1, -1]],
+        dtype=torch.int32,
+        device=device)
 
-    input_ids, position_ids = proposer._prepare_dflash_inputs(
-        chunk, sampled_token_ids, num_rejected_tokens_np)
+    input_ids, position_ids, seq_lens = proposer._prepare_dflash_inputs(
+        chunk,
+        sampled_token_ids,
+        num_rejected_tokens_np,
+        None,
+        None,
+        next_tokens_device=next_tokens_device)
 
     assert input_ids.shape == (8, )
     assert position_ids.shape == (8, )
@@ -253,7 +262,7 @@ def test_prepare_dflash_inputs(device):
                      device=device))
     assert torch.equal(
         position_ids,
-        torch.tensor([12, 13, 14, 15, 42, 43, 44, 45],
+        torch.tensor([13, 14, 15, 16, 42, 43, 44, 45],
                      dtype=torch.int32,
                      device=device))
 
@@ -324,7 +333,8 @@ def test_propose_unit(device):
 
     proposer._prepare_dflash_inputs = mock.MagicMock(
         return_value=(torch.zeros(8, dtype=torch.int32, device=device),
-                      torch.zeros(8, dtype=torch.int32, device=device)))
+                      torch.zeros(8, dtype=torch.int32, device=device),
+                      torch.zeros(2, dtype=torch.int32, device=device)))
     proposer._update_draft_kv_cache_from_target = mock.MagicMock()
 
     logits = torch.zeros((8, 1000), dtype=torch.float32, device=device)
@@ -345,6 +355,9 @@ def test_propose_unit(device):
         discard_sampled_tokens_req_indices=[],
         num_rejected_tokens_np=np.array([0, 0]),
         scheduler_output=None,
+        next_tokens_per_chunk=[
+            torch.zeros((2, 4), dtype=torch.int32, device=device)
+        ],
     )
 
     assert draft_tokens == [[500, 501, 502], [600, 601, 602]]
