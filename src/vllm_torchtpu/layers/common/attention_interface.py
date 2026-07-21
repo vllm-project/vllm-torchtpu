@@ -14,6 +14,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.sparse.kernel as mla_sparse_kernel
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
@@ -41,6 +42,7 @@ ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 
 mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
+sparse_mla_ragged_paged_attention = mla_sparse_kernel.sparse_ragged_paged_attention
 
 
 def sharded_flash_attention(
@@ -596,6 +598,111 @@ def mla_attention(
                             out_specs=out_specs,
                             check_rep=False))(q_TNA, q_rope_TNH, k_SA,
                                               k_rope_SH, kv_cache, md.seq_lens,
+                                              md.block_tables,
+                                              md.query_start_loc,
+                                              md.request_distribution)
+    return kv_cache, output_TNA
+
+
+def sparse_mla_attention(
+    q_TNA: jax.Array,
+    q_rope_TNH: jax.Array,
+    k_SA: jax.Array,
+    k_rope_SH: jax.Array,
+    kv_cache: jax.Array,
+    topk_indices: jax.Array,
+    md: AttentionMetadata,
+    mesh: Mesh,
+    num_attention_heads: int,
+    qk_nope_head_dim: int,
+    query_tnh_sharding: Any | None = None,
+    keyvalue_skh_sharding: Any | None = None,
+    attn_o_tnh_sharding: Any | None = None,
+    sm_scale: float | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Sharded wrapper for the sparse (DSA) MLA Pallas kernel.
+
+    Differences from `mla_attention` that are load-bearing:
+      * The kernel takes a SINGLE `q` of shape (T, N, nope+rope) in
+        token-major order. There is no separate rope argument, and no
+        head-major transpose (the v2 kernel wants (N, T, L); this one does
+        not).
+      * The kernel does NOT update the KV cache -- it returns only the
+        attention output -- so `kv_cache` is threaded through unchanged and a
+        separate cache-write step is still required.
+      * The kernel takes no q/k/v scales; the DSV4 cache format packs
+        per-token scales alongside the values and dequantizes internally.
+    """
+    in_specs = (
+        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
+                                ShardingAxisName.ATTN_HEAD, None),  # q_TNA
+        query_tnh_sharding
+        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+             None),  # q_rope_TNH
+        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_SA
+        keyvalue_skh_sharding
+        or P(ShardingAxisName.ATTN_DATA, None),  # k_rope_SH
+        P(ShardingAxisName.ATTN_DATA),  # kv_cache
+        P(ShardingAxisName.ATTN_DATA),  # topk_indices
+        P(ShardingAxisName.ATTN_DATA),  # md.seq_lens
+        P(ShardingAxisName.ATTN_DATA),  # md.block_tables
+        P(ShardingAxisName.ATTN_DATA),  # md.query_start_loc
+        P(ShardingAxisName.ATTN_DATA),  # md.distribution
+    )
+    out_specs = (
+        attn_o_tnh_sharding
+        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+             None),  # attn output (T, N, D)
+        P(ShardingAxisName.ATTN_DATA),  # kv cache (passthrough)
+    )
+
+    def _sparse_mla_ragged_paged_attention(q, q_rope, k, k_rope, cache,
+                                           topk_idx, seq_lens, block_tables,
+                                           query_start_loc,
+                                           request_distribution):
+        # (T, N, L) + (T, N, H) -> (T, N, L + H); no transpose.
+        q = jnp.concatenate([q, q_rope], axis=-1)
+        num_tokens, num_q_heads, _ = q.shape
+
+        # Sinks must be -inf: a zero sink contributes exp(0)=1 to the softmax
+        # denominator. The kernel pads the remaining heads with finfo.min.
+        attention_sinks = jnp.full((num_attention_heads, ),
+                                   jnp.finfo(jnp.float32).min,
+                                   dtype=jnp.float32)
+        # SWA accumulators are unused for full-window attention but required.
+        # The kernel asserts swa_accumution.dtype == q.dtype.
+        swa_accumution = jnp.zeros_like(q)
+        swa_l = jnp.zeros((num_tokens, num_q_heads), dtype=jnp.float32)
+        swa_m = jnp.zeros((num_tokens, num_q_heads), dtype=jnp.float32)
+
+        # NOTE: `cache` is passed for both nope and rope. The kernel asserts
+        # both are uint8 in DSV4 packed format (448 fp8 + 7 fp8 scales /
+        # 64 bf16); the current MLA cache is a single float tensor, so this
+        # is the first expected failure point.
+        out = sparse_mla_ragged_paged_attention(
+            q,
+            cache,  # cache_kv_nope
+            cache,  # cache_kv_rope
+            topk_idx,
+            block_tables,  # page_indices
+            query_start_loc,  # cu_q_lens
+            request_distribution,  # distribution
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            sm_scale=sm_scale or 1.0,
+        )
+        return out, cache
+
+    output_TNA, kv_cache = jax.jit(
+        shard_map.shard_map(_sparse_mla_ragged_paged_attention,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))(q_TNA, q_rope_TNH, k_SA,
+                                              k_rope_SH, kv_cache,
+                                              topk_indices, md.seq_lens,
                                               md.block_tables,
                                               md.query_start_loc,
                                               md.request_distribution)

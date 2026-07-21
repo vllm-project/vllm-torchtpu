@@ -146,6 +146,7 @@ class VllmTPUMLAAttention(MLAAttention):
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
             output=output,
+            topk_indices=kwargs.get("topk_indices"),
         )
 
 
@@ -274,9 +275,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        topk_indices = None
         if self.indexer and self.is_sparse:
-            _topk_indices = self.indexer(hidden_states, q_c, positions,
-                                         self.indexer_rope_emb)
+            # _topk_indices = self.indexer(hidden_states, q_c, positions,
+            #                              self.indexer_rope_emb)
+
+            # Bring-up placeholder until the indexer is enabled. Matches the
+            # real buffer's shape/dtype: int32[num_tokens, index_topk] (see
+            # DeepseekV2Model.__init__ topk_indices_buffer). arange selects
+            # positions 0..topk-1, so while seq_len <= topk this is
+            # dense-equivalent and the output can be diffed against the dense
+            # path by dropping the `topk_indices=` kwarg below.
+            topk_indices = torch.arange(
+                self.topk_tokens,
+                dtype=torch.int32,
+                device=hidden_states.device).unsqueeze(0).expand(
+                    hidden_states.shape[0], -1).contiguous()
 
         if llama_4_scaling is not None:
             q_nope *= llama_4_scaling
@@ -288,6 +302,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             k_pe,
             output_shape=(hidden_states.shape[0],
                           self.num_heads * self.v_head_dim),
+            topk_indices=topk_indices,
         )
 
         return self.o_proj(attn_out)[0]
