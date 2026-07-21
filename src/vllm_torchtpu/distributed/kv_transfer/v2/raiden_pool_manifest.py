@@ -342,12 +342,20 @@ def build_qwen35_pool_manifest(
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
     gdn_geometry: GdnHeadGeometry,
+    mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
     Canonical pool order (must match on both transfer peers because pool
     indices travel on the wire): model layer order; within a GDN layer, conv
     before ssm.
+
+    ``mamba_group_ordinal_by_layer`` (opt-in, state-reshard deployments):
+    suffixes GDN pool tags with the layer's mamba kv-cache-group ordinal
+    (``gdn.conv.g0`` ...). Each group has its own block table, so state
+    transfers must address slots per group; the suffix is pure vLLM policy —
+    raiden keeps treating tags as opaque. Both peers must configure it
+    identically (enforced by the manifest identity check at plan time).
     """
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
@@ -366,8 +374,15 @@ def build_qwen35_pool_manifest(
                 raise ManifestError(
                     f"GDN layer {layer_name} must have (conv, ssm) states: "
                     f"got {len(cache)}")
-            flat.append((TAG_GDN_CONV, layer_name, cache[0]))
-            flat.append((TAG_GDN_SSM, layer_name, cache[1]))
+            suffix = ""
+            if mamba_group_ordinal_by_layer is not None:
+                ordinal = mamba_group_ordinal_by_layer.get(layer_name)
+                if ordinal is None:
+                    raise ManifestError(
+                        f"GDN layer {layer_name} has no mamba group ordinal")
+                suffix = f".g{int(ordinal)}"
+            flat.append((TAG_GDN_CONV + suffix, layer_name, cache[0]))
+            flat.append((TAG_GDN_SSM + suffix, layer_name, cache[1]))
         else:
             flat.append((TAG_FA, layer_name, cache))
 
@@ -418,7 +433,7 @@ def build_qwen35_pool_manifest(
                     f"GDN state {layer_name} nbytes {nbytes} is not "
                     f"divisible by num_blocks {num_blocks}")
             live_stride = nbytes // num_blocks
-            if tag == TAG_GDN_CONV:
+            if tag.startswith(TAG_GDN_CONV):
                 regions = _gdn_conv_regions(conv_shape=shape,
                                             itemsize=itemsize,
                                             geometry=gdn_geometry)

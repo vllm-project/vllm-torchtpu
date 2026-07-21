@@ -89,6 +89,10 @@ class SendMeta:
     # Exact transfer extent for controller-planned PCP striping. Legacy send
     # paths leave this unset.
     num_tokens: int | None = None
+    # Uniform-mamba-layout source state slots, one per mamba kv-cache group
+    # ordinal (the block holding the final recurrent state); None for FA-only
+    # Stage-3 models and all legacy paths.
+    mamba_state_block_ids: list[int] | None = None
 
 
 @dataclass

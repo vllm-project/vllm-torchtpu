@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
     TPU_GDN_CONV_STATE_TILE_PAD: bool = False
+    TPU_KV_RESHARD_DST_PAGE_TOKENS: int = 0
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
@@ -197,6 +198,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # materialized cache shape, so both producer and consumer must agree.
     "TPU_GDN_CONV_STATE_TILE_PAD":
     env_bool("TPU_GDN_CONV_STATE_TILE_PAD"),
+    # Destination (decode-side) page geometry in tokens, required on the
+    # producer: the byte-span lowering splits declarations at destination
+    # page boundaries at registration time. 0 means unset.
+    "TPU_KV_RESHARD_DST_PAGE_TOKENS":
+    lambda: int(os.getenv("TPU_KV_RESHARD_DST_PAGE_TOKENS") or "0"),
     # Raiden admission gates: construct a Raiden KVCacheManager and
     # register the pool manifest derived from the live typed KV caches.
     # This does not switch the V2 strided transfer transport.
