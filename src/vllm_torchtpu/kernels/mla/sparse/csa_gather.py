@@ -266,7 +266,8 @@ def csa_gather(
 
   Args:
     nope_cache: (total_pages, page_size, 4, 128) uint8. Each (4, 128) uint8 is
-      token's nope + nope scales. It encodes 448 fp8 + 7 e8m0 scales + padding.
+      token's nope. It encodes 512 fp8 values (per-tensor k_scale applied by
+      the attention kernel; no inline scales).
     rope_cache: (total_pages, page_size // 4, 4, 128) uint8. Each (1, 128) uint8
       is token's rope. It encodes 64 bf16.
     indices: (N,) int32. Token indices into the caches.
