@@ -202,6 +202,58 @@ def apply_tpu_patches() -> None:
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
+    _patch_gdn_conv_state_tile_padding()
+
+
+def _round_up_conv_rows(rows: int) -> int:
+    return ((rows + 3) // 4) * 4
+
+
+def _patch_gdn_conv_state_tile_padding() -> None:
+    """Pad GDN conv-state rows to a multiple of 4 (E0-GDN calibration).
+
+    XLA hoists a 3-row bf16 conv state's tap dim out of the tiled minors
+    (minor_to_major [2,0,1]), interleaving *blocks* inside tiles — one
+    block's bytes are then not a contiguous raw range, which forecloses
+    raw-byte state resharding. At >=4 rows (multiples of 4 measured) the
+    standard block-major layout is chosen and every block is raw-contained.
+    The pad rows are dead: ragged_causal_conv1d reads rows [0, kernel-1)
+    and writes rows [0, kernel-2], so numerics are unchanged.
+
+    ``TPU_GDN_CONV_STATE_TILE_PAD=1`` enables this on both peers before model
+    cache shapes are derived. The default keeps the upstream shape, including
+    for Raiden, so the layout change is explicit and independently reversible.
+    """
+    if not envs.TPU_GDN_CONV_STATE_TILE_PAD:
+        return
+    try:
+        from vllm.model_executor.layers.mamba import mamba_utils
+    except ImportError:
+        return
+    calculator = mamba_utils.MambaStateShapeCalculator
+    original = calculator.gated_delta_net_state_shape.__func__
+    if getattr(original, "_tpu_conv_tile_padded", False):
+        return
+
+    # Wrap the single choke point every gated-delta-net variant resolves
+    # its state shapes through (model classmethods for both the
+    # ForConditionalGeneration and --language-model-only CausalLM classes,
+    # and therefore the layer kv-cache specs and the materialized tensors).
+    def padded(cls, *args, **kwargs):
+        conv_shape, temporal_shape = original(cls, *args, **kwargs)
+        if mamba_utils.is_conv_state_dim_first():
+            conv_dim, rows = conv_shape
+            conv_shape = (conv_dim, _round_up_conv_rows(rows))
+        else:
+            rows, conv_dim = conv_shape
+            conv_shape = (_round_up_conv_rows(rows), conv_dim)
+        return conv_shape, temporal_shape
+
+    padded._tpu_conv_tile_padded = True
+    calculator.gated_delta_net_state_shape = classmethod(padded)
+    logger.info(
+        "Applied TPU patch: GDN conv-state rows padded to a multiple of 4 "
+        "(raw-contained state layout for reshard).")
 
 
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:

@@ -86,6 +86,14 @@ def gdn_attention_core_tpu(
         config=config,
     )
 
+    if new_conv_state.shape != conv_state.shape:
+        # Tile-padded conv cache: the kernel emits kernel_size-1 tap rows;
+        # carry the dead pad rows through so the output aliases the donated
+        # input buffer shape.
+        import jax.numpy as jnp
+        new_conv_state = jnp.concatenate(
+            [new_conv_state, conv_state[:, new_conv_state.shape[1]:, :]],
+            axis=1)
     return new_conv_state, new_recurrent_state, output
 
 
@@ -186,6 +194,15 @@ def gdn_attention_core_tpu_pcp_prefill(
          mesh=mesh,
          config=config,
      )
+
+    if new_conv_state.shape != conv_state.shape:
+        # Tile-padded conv cache: the kernel emits kernel_size-1 tap rows;
+        # carry the dead pad rows through so the output aliases the donated
+        # input buffer shape.
+        import jax.numpy as jnp
+        new_conv_state = jnp.concatenate(
+            [new_conv_state, conv_state[:, new_conv_state.shape[1]:, :]],
+            axis=1)
     return new_conv_state, new_recurrent_state, output
 
 

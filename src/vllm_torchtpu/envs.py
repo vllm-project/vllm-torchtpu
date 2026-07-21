@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
+    TPU_GDN_CONV_STATE_TILE_PAD: bool = False
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
@@ -192,6 +193,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reinterpret-cast + in-place update path needed for aliased TPU writes.
     "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK":
     env_bool("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", default=True),
+    # Opt-in GDN conv-state layout for raw-byte resharding. This changes the
+    # materialized cache shape, so both producer and consumer must agree.
+    "TPU_GDN_CONV_STATE_TILE_PAD":
+    env_bool("TPU_GDN_CONV_STATE_TILE_PAD"),
     # Raiden admission gates: construct a Raiden KVCacheManager and
     # register the pool manifest derived from the live typed KV caches.
     # This does not switch the V2 strided transfer transport.

@@ -413,6 +413,17 @@ def test_qwen35_p4d2_launcher_uses_v3_gdn_by_default():
             in launcher_text)
 
 
+def test_qwen35_p4d2_launcher_propagates_explicit_gdn_layout_flag():
+    launcher_text = P4D2_LAUNCHER.read_text(encoding="utf-8")
+
+    assert ('TPU_GDN_CONV_STATE_TILE_PAD="${TPU_GDN_CONV_STATE_TILE_PAD:-0}"'
+            in launcher_text)
+    assert (
+        'export TPU_GDN_CONV_STATE_TILE_PAD="${TPU_GDN_CONV_STATE_TILE_PAD}";'
+        in launcher_text)
+    assert "TPU_GDN_CONV_STATE_TILE_PAD=${TPU_GDN_CONV_STATE_TILE_PAD}" in launcher_text
+
+
 def test_ci_workflow_warms_hf_cache_from_gcs_before_running():
     text = CI_WORKFLOW.read_text(encoding="utf-8")
 

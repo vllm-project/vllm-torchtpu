@@ -19,8 +19,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.model_executor.layers.mamba import mamba_utils
 from vllm.v1.core.sched.scheduler import Scheduler
 
+from vllm_torchtpu.platforms import tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
@@ -58,6 +60,52 @@ def test_debug_tpu_local_rank_offset_env(monkeypatch):
     monkeypatch.setenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "not-an-int")
     with pytest.raises(ValueError, match=DEBUG_TPU_LOCAL_RANK_OFFSET_ENV):
         _debug_tpu_local_rank_offset()
+
+
+def test_gdn_conv_state_tile_padding_is_explicitly_gated():
+
+    class ShapeCalculator:
+
+        @classmethod
+        def gated_delta_net_state_shape(cls):
+            return (3, 12288), (64, 128, 128)
+
+    original = ShapeCalculator.gated_delta_net_state_shape.__func__
+    with patch.object(mamba_utils, "MambaStateShapeCalculator",
+                      ShapeCalculator), patch.object(
+                          tpu_platform.envs,
+                          "TPU_GDN_CONV_STATE_TILE_PAD",
+                          False,
+                      ):
+        tpu_platform._patch_gdn_conv_state_tile_padding()
+
+    assert ShapeCalculator.gated_delta_net_state_shape.__func__ is original
+    assert ShapeCalculator.gated_delta_net_state_shape()[0] == (3, 12288)
+
+
+def test_gdn_conv_state_tile_padding_rounds_rows_when_enabled():
+
+    class ShapeCalculator:
+
+        @classmethod
+        def gated_delta_net_state_shape(cls):
+            return (3, 12288), (64, 128, 128)
+
+    with patch.object(mamba_utils, "MambaStateShapeCalculator",
+                      ShapeCalculator), patch.object(
+                          mamba_utils,
+                          "is_conv_state_dim_first",
+                          return_value=False,
+                      ), patch.object(
+                          tpu_platform.envs,
+                          "TPU_GDN_CONV_STATE_TILE_PAD",
+                          True,
+                      ):
+        tpu_platform._patch_gdn_conv_state_tile_padding()
+
+    conv_shape, temporal_shape = ShapeCalculator.gated_delta_net_state_shape()
+    assert conv_shape == (4, 12288)
+    assert temporal_shape == (64, 128, 128)
 
 
 def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(

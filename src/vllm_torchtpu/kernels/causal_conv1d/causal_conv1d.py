@@ -489,6 +489,9 @@ def ragged_causal_conv1d(
     conv_state_dtype = conv_state.dtype
     # TODO(mhhuang): Remove the need for upcast.
     conv_state = conv_state.astype(jnp.float32)
+    if conv_state.ndim >= 2 and conv_state.shape[1] > kernel_size - 1:
+        # Tile-padded conv cache rows beyond kernel_size-1 are dead.
+        conv_state = conv_state[:, :kernel_size - 1, ...]
     conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
