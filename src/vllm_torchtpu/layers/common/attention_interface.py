@@ -659,26 +659,20 @@ def sparse_mla_attention(
         `topk_indices`; every token must have at least one valid entry.
     """
     in_specs = (
-        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
-                                ShardingAxisName.ATTN_HEAD, None),  # q_TNA
-        query_tnh_sharding
-        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-             None),  # q_rope_TNH
-        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_SA
-        keyvalue_skh_sharding
-        or P(ShardingAxisName.ATTN_DATA, None),  # k_rope_SH
-        P(ShardingAxisName.ATTN_DATA),  # kv_cache
-        P(ShardingAxisName.ATTN_DATA),  # topk_indices
-        P(ShardingAxisName.ATTN_DATA),  # seq_lens
-        P(ShardingAxisName.ATTN_DATA),  # block_tables
-        P(ShardingAxisName.ATTN_DATA),  # query_start_loc
-        P(ShardingAxisName.ATTN_DATA),  # request_distribution
+        query_tnh_sharding or P(None, None, None),  # q_TNA
+        query_tnh_sharding or P(None, None, None),  # q_rope_TNH
+        keyvalue_skh_sharding or P(None, None),  # k_SA
+        keyvalue_skh_sharding or P(None, None),  # k_rope_SH
+        P(None),  # kv_cache
+        P(None),  # topk_indices
+        P(None),  # seq_lens
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+        P(None),  # request_distribution
     )
     out_specs = (
-        attn_o_tnh_sharding
-        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-             None),  # attn output (T, N, D)
-        P(ShardingAxisName.ATTN_DATA),  # updated kv cache
+        attn_o_tnh_sharding or P(None, None, None),  # attn output (T, N, D)
+        P(None),  # updated kv cache
     )
 
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
@@ -712,17 +706,18 @@ def sparse_mla_attention(
         page_size = cache.shape[1] * cache.shape[2]
         flat = cache.reshape(pages, page_size, cache.shape[-1])
 
-        nope_u8 = jax.lax.bitcast_convert_type(
-            flat[..., :lkv_dim], jnp.uint8).reshape(pages, page_size, 4, 128)
+        nope_u8 = jax.lax.bitcast_convert_type(flat[..., :lkv_dim],
+                                               jnp.uint8).reshape(
+                                                   pages, page_size, 4, 128)
 
         rope_bf16 = flat[..., lkv_dim:lkv_dim + rope_dim].astype(jnp.bfloat16)
         if dequant_scale != 1.0:
             rope_bf16 = rope_bf16 * jnp.bfloat16(dequant_scale)
         rope_u16 = jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16)
-        rope_u8 = jnp.concatenate(
-            [(rope_u16 >> 8).astype(jnp.uint8),
-             (rope_u16 & 0xFF).astype(jnp.uint8)],
-            axis=-1).reshape(pages, page_size // 4, 4, 128)
+        rope_u8 = jnp.concatenate([(rope_u16 >> 8).astype(jnp.uint8),
+                                   (rope_u16 & 0xFF).astype(jnp.uint8)],
+                                  axis=-1).reshape(pages, page_size // 4, 4,
+                                                   128)
         # ------------------------------------------------------------------
 
         out = sparse_mla_ragged_paged_attention(
@@ -746,12 +741,12 @@ def sparse_mla_attention(
 
     output_TNA, updated_cache = jax.jit(
         shard_map.shard_map(_sparse_mla_ragged_paged_attention,
-                             mesh=mesh,
-                             in_specs=in_specs,
-                             out_specs=out_specs,
-                             check_rep=False))(q_TNA, q_rope_TNH, k_SA,
-                                               k_rope_SH, kv_cache,
-                                               topk_indices, seq_lens,
-                                               block_tables, query_start_loc,
-                                               request_distribution)
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))(q_TNA, q_rope_TNH, k_SA,
+                                              k_rope_SH, kv_cache,
+                                              topk_indices, seq_lens,
+                                              block_tables, query_start_loc,
+                                              request_distribution)
     return updated_cache, output_TNA

@@ -1141,13 +1141,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla)
 
-        def sparse_mla_impl(kv_cache: torch.Tensor, q_nope: torch.Tensor,
-                            q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
-                            k_pe: torch.Tensor, topk_indices: torch.Tensor,
-                            seq_lens: torch.Tensor, block_tables: torch.Tensor,
-                            query_start_loc: torch.Tensor,
-                            request_distribution: torch.Tensor
-                            ) -> torch.Tensor:
+        def sparse_mla_impl(
+                kv_cache: torch.Tensor, q_nope: torch.Tensor,
+                q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
+                k_pe: torch.Tensor, topk_indices: torch.Tensor,
+                seq_lens: torch.Tensor, block_tables: torch.Tensor,
+                query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor) -> torch.Tensor:
             new_kv, outputs = sparse_mla_jax_op(kv_cache, q_nope, q_pe,
                                                 kv_c_normed, k_pe,
                                                 topk_indices, seq_lens,
@@ -1194,7 +1194,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)
         # without dynamic `.to(torch.float32)` casting right before `torch.bmm`.
         q_nope_t = q_nope.transpose(0, 1)
-        ql_nope = torch.bmm(q_nope_t.to(torch.float32), layer.W_UK_T.to(torch.float32))
+        ql_nope = torch.bmm(q_nope_t.to(torch.float32),
+                            layer.W_UK_T.to(torch.float32))
         if hasattr(layer, "W_UK_T_scale"):
             ql_nope = ql_nope * layer.W_UK_T_scale.to(torch.float32)
         ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
@@ -1238,10 +1239,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     or layer.sparse_mla_op is None):
                 layer.sparse_mla_op = self._build_sparse_mla_op(layer)
 
-            ql_nope_sparse_flat = ql_nope_sparse.view(
-                -1, layer.num_heads, layer.kv_lora_rank)
-            q_pe_sparse_flat = q_pe_sparse.view(
-                -1, layer.num_heads, layer.qk_rope_head_dim)
+            ql_nope_sparse_flat = ql_nope_sparse.view(-1, layer.num_heads,
+                                                      layer.kv_lora_rank)
+            q_pe_sparse_flat = q_pe_sparse.view(-1, layer.num_heads,
+                                                layer.qk_rope_head_dim)
             outputs = layer.sparse_mla_op(
                 kv_cache,
                 ql_nope_sparse_flat,
@@ -1275,7 +1276,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         outputs_t = outputs.reshape(-1, layer.num_heads,
                                     layer.kv_lora_rank).transpose(0, 1)
-        out_proj = torch.bmm(outputs_t.to(torch.float32), layer.W_UV.to(torch.float32))
+        out_proj = torch.bmm(outputs_t.to(torch.float32),
+                             layer.W_UV.to(torch.float32))
         if hasattr(layer, "W_UV_scale"):
             out_proj = out_proj * layer.W_UV_scale.to(torch.float32)
         outputs = out_proj.transpose(0, 1).to(input_dtype).reshape(
