@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper as ragged_gated_delta_rule_wrapper
@@ -469,6 +470,118 @@ def _derive_pcp_rank_major_reorder_indices(
     return jnp.where(valid_mask, reorder_indices, -1).astype(jnp.int32)
 
 
+def _derive_pcp_ragged_exchange_descriptors(
+    reorder_indices: jnp.ndarray,
+    *,
+    pcp_size: int,
+    interleave_size: int,
+    local_padded_num_tokens: int,
+    max_num_requests: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compress rank-major token mappings into contiguous exchange runs."""
+    rank_major = reorder_indices.reshape(pcp_size, local_padded_num_tokens)
+    valid = rank_major >= 0
+    previous = jnp.concatenate(
+        (jnp.zeros((pcp_size, 1), dtype=jnp.int32), rank_major[:, :-1]),
+        axis=1,
+    )
+    previous_valid = jnp.concatenate(
+        (jnp.zeros((pcp_size, 1), dtype=jnp.bool_), valid[:, :-1]),
+        axis=1,
+    )
+    run_starts = jnp.logical_and(
+        valid,
+        jnp.logical_or(jnp.logical_not(previous_valid), rank_major
+                       != previous + 1),
+    )
+    run_ids = (jnp.cumsum(run_starts.astype(jnp.int32), axis=1) - 1)
+
+    # A request contributes at most one more run than ceil(local_tokens / I).
+    # Summed over requests, this bound covers partial first and last chunks.
+    max_runs = (
+        (local_padded_num_tokens + interleave_size - 1) // interleave_size +
+        2 * max_num_requests)
+    local_positions = jnp.arange(local_padded_num_tokens, dtype=jnp.int32)
+    drop_index = jnp.asarray(max_runs, dtype=jnp.int32)
+
+    def _summarize_rank(reorder_row, valid_row, run_start_row, run_id_row):
+        start_slots = jnp.where(run_start_row, run_id_row, drop_index)
+        token_slots = jnp.where(valid_row, run_id_row, drop_index)
+        input_starts = jnp.zeros(
+            (max_runs, ), dtype=jnp.int32).at[start_slots].set(local_positions,
+                                                               mode="drop")
+        output_starts = jnp.zeros(
+            (max_runs, ), dtype=jnp.int32).at[start_slots].set(reorder_row,
+                                                               mode="drop")
+        sizes = jnp.zeros(
+            (max_runs, ),
+            dtype=jnp.int32).at[token_slots].add(valid_row.astype(jnp.int32),
+                                                 mode="drop")
+        return input_starts, sizes, output_starts
+
+    return jax.vmap(_summarize_rank)(rank_major, valid, run_starts, run_ids)
+
+
+def _ragged_exchange_pcp_token_shards_for_head_shards(
+    tensor: jnp.ndarray,
+    pcp_axis: str,
+    pcp_size: int,
+    local_descriptors: jnp.ndarray,
+    send_sizes_by_rank: jnp.ndarray,
+) -> jnp.ndarray:
+    """Exchange contiguous token runs directly into request-major order."""
+    if tensor.ndim != 2:
+        raise ValueError("PCP ragged exchange expects a rank-2 tensor.")
+    if tensor.shape[1] % pcp_size != 0:
+        raise ValueError("PCP ragged exchange requires a sharded last dim.")
+
+    local_padded_num_tokens = tensor.shape[0]
+    shard_width = tensor.shape[1] // pcp_size
+    if shard_width % 2 != 0:
+        raise ValueError("PCP ragged exchange requires an even shard width.")
+    max_runs = local_descriptors.shape[0]
+
+    # Match the TPU ragged A2A payload tile before transposing destinations;
+    # otherwise XLA materializes a costly [P, L, W] -> [P * L, 2, W / 2] repack.
+    tiled_shard_shape = (2, shard_width // 2)
+    tensor_by_destination = tensor.reshape(local_padded_num_tokens, pcp_size,
+                                           *tiled_shard_shape)
+    operand = jnp.transpose(tensor_by_destination, (1, 0, 2, 3)).reshape(
+        pcp_size * local_padded_num_tokens, *tiled_shard_shape)
+
+    local_input_starts = local_descriptors[:, 0]
+    local_send_sizes = local_descriptors[:, 1]
+    local_output_starts = local_descriptors[:, 2]
+    destination_bases = (jnp.arange(pcp_size, dtype=jnp.int32) *
+                         local_padded_num_tokens)
+    input_offsets = (destination_bases[:, None] +
+                     local_input_starts[None, :]).reshape(pcp_size * max_runs)
+    send_sizes = jnp.broadcast_to(local_send_sizes[None, :],
+                                  (pcp_size, max_runs)).reshape(-1)
+    output_offsets = jnp.broadcast_to(local_output_starts[None, :],
+                                      (pcp_size, max_runs)).reshape(-1)
+    recv_sizes = send_sizes_by_rank.reshape(-1)
+    output = jnp.zeros(
+        (pcp_size * local_padded_num_tokens, *tiled_shard_shape),
+        dtype=tensor.dtype)
+    exchanged = jax.lax.ragged_all_to_all(
+        operand,
+        output,
+        input_offsets,
+        send_sizes,
+        output_offsets,
+        recv_sizes,
+        axis_name=pcp_axis,
+    )
+    exchanged = exchanged.reshape(pcp_size * local_padded_num_tokens,
+                                  shard_width)
+    # Keep the BF16 result in the layout expected by the GDN FP32 conversion.
+    return with_layout_constraint(
+        exchanged,
+        Layout((0, 1), tiling=((8, 128), (2, 1))),
+    )
+
+
 def run_jax_gdn_attention_pcp_tp_prefill(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
@@ -568,8 +681,6 @@ def run_jax_gdn_attention_pcp_tp_prefill(
             pcp_size,
             -1,
         )
-        packed_qkv_shard = _exchange_pcp_token_shards_for_head_shards(
-            interleaved_qkv, pcp_axis, pcp_size)
         packed_b_shard = _exchange_pcp_token_shards_for_head_shards(
             local_b, pcp_axis, pcp_size)
         packed_a_shard = _exchange_pcp_token_shards_for_head_shards(
@@ -587,8 +698,28 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                                     full_reorder.size)
         gather_indices = jnp.where(valid_mask, full_reorder, 0)
 
-        qkv_shard = jnp.zeros_like(packed_qkv_shard).at[scatter_indices].set(
-            packed_qkv_shard, mode="drop")
+        (input_starts_by_rank, send_sizes_by_rank,
+         output_starts_by_rank) = _derive_pcp_ragged_exchange_descriptors(
+             full_reorder,
+             pcp_size=pcp_size,
+             interleave_size=interleave_size,
+             local_padded_num_tokens=local_qkv.shape[0],
+             max_num_requests=query_start_loc_.shape[0] - 1,
+         )
+        descriptors_by_rank = jnp.stack(
+            (input_starts_by_rank, send_sizes_by_rank, output_starts_by_rank),
+            axis=-1,
+        )
+        local_descriptors = _select_replicated_shard_for_pcp_rank(
+            descriptors_by_rank, pcp_axis, pcp_size, axis=0)[0]
+
+        qkv_shard = _ragged_exchange_pcp_token_shards_for_head_shards(
+            interleaved_qkv,
+            pcp_axis,
+            pcp_size,
+            local_descriptors,
+            send_sizes_by_rank,
+        )
         b_shard = jnp.zeros_like(packed_b_shard).at[scatter_indices].set(
             packed_b_shard, mode="drop")
         a_shard = jnp.zeros_like(packed_a_shard).at[scatter_indices].set(
