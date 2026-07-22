@@ -319,7 +319,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
         mesh=mesh,
         config=config)
 
-    pcp_output_np = np.array(pcp_output)
+    pcp_output_np = np.array(pcp_output).reshape(padded_num_tokens, -1)
     pcp_output_seq = np.zeros((padded_num_tokens, pcp_output_np.shape[1]),
                               dtype=pcp_output_np.dtype)
     pcp_output_seq[token_order[valid]] = pcp_output_np[valid]
