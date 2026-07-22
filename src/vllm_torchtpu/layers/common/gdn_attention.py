@@ -697,7 +697,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder,
                                     full_reorder.size)
-        gather_indices = jnp.where(valid_mask, full_reorder, 0)
+        gather_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
 
         (input_starts_by_rank, send_sizes_by_rank,
          output_starts_by_rank) = _derive_pcp_ragged_exchange_descriptors(
@@ -790,9 +790,12 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 
         seq_output_shard = seq_output_shard.reshape(seq_output_shard.shape[0],
                                                     local_n_v, d_v)
+        seq_output_shard = jnp.concatenate(
+            (seq_output_shard,
+             jnp.zeros((1, local_n_v, d_v), dtype=seq_output_shard.dtype)),
+            axis=0,
+        )
         packed_output_shard = seq_output_shard[gather_indices]
-        packed_output_shard = jnp.where(valid_mask[:, None, None],
-                                        packed_output_shard, 0.0)
         packed_output = jax.lax.all_to_all(packed_output_shard,
                                            axis_name=pcp_axis,
                                            split_axis=0,
