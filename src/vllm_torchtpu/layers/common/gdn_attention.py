@@ -682,10 +682,10 @@ def run_jax_gdn_attention_pcp_tp_prefill(
             pcp_size,
             -1,
         )
-        packed_b_shard = _exchange_pcp_token_shards_for_head_shards(
-            local_b, pcp_axis, pcp_size)
-        packed_a_shard = _exchange_pcp_token_shards_for_head_shards(
-            local_a, pcp_axis, pcp_size)
+        local_ba = jnp.stack((local_b, local_a),
+                             axis=-1).reshape(local_b.shape[0], -1)
+        packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
+            local_ba, pcp_axis, pcp_size)
 
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
@@ -721,10 +721,11 @@ def run_jax_gdn_attention_pcp_tp_prefill(
             local_descriptors,
             send_sizes_by_rank,
         )
-        b_shard = jnp.zeros_like(packed_b_shard).at[scatter_indices].set(
-            packed_b_shard, mode="drop")
-        a_shard = jnp.zeros_like(packed_a_shard).at[scatter_indices].set(
-            packed_a_shard, mode="drop")
+        ba_shard = jnp.zeros_like(packed_ba_shard).at[scatter_indices].set(
+            packed_ba_shard, mode="drop")
+        ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)
+        b_shard = ba_shard[:, :, 0]
+        a_shard = ba_shard[:, :, 1]
 
         conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
             conv_weight_,
