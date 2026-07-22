@@ -319,16 +319,13 @@ class TpuCompilerAdaptor(CompilerInterface):
 
             compiled_fn = unwrap_fn
 
-        # Save the per-shape PjRt executable to disk.
-        # We pickle the inner _TorchTpuCompiledExecutable (which has
-        # __reduce__), not the aot_autograd wrapper (which has
-        # unpicklable closures).
+        # Save the compiled executable (TorchTpuCompiledExecutable or
+        # _SplitCompiledExecutable) to disk.
         handle = None
         if (key is not None and self.cache_dir is not None
-                and not self._disable_cache
-                and _tpu_backend._compiled_executables):
+                and not self._disable_cache):
             try:
-                inner_exe = _tpu_backend._compiled_executables[-1]
+                inner_exe = inner_fn
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 with open(save_path, "wb") as f:

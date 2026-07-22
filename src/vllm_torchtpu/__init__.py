@@ -30,6 +30,28 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 
 
+def _patch_split_compiled_executable_serialization() -> None:
+    """Implement prepare_for_serialization for _SplitCompiledExecutable.
+
+    PyTorch AOTAutogradCache calls prepare_for_serialization() on OutputCode
+    artifacts during cache save. _SplitCompiledExecutable must implement this
+    to prevent NotImplementedError.
+    """
+    try:
+        from torch_tpu._internal.compile.split_compiler import \
+            _SplitCompiledExecutable
+        _SplitCompiledExecutable.prepare_for_serialization = (
+            lambda self: None)
+        logger.info(
+            "Applied TPU patch: _SplitCompiledExecutable.prepare_for_serialization"
+        )
+    except ImportError:
+        pass
+
+
+_patch_split_compiled_executable_serialization()
+
+
 def _patch_vllm_tpu_group_custom_ops() -> None:
     """Disable vLLM custom collective ops for TPU in this TorchTPU integration.
 
