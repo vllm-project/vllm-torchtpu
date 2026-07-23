@@ -21,7 +21,6 @@ def _patch_vllm_aot_compile_cache_key() -> None:
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash
         return [
-            *original(vllm_config),
             compute_tpu_compilation_hash(vllm_config),
         ]
 

@@ -305,7 +305,24 @@ class TpuCompilerAdaptor(CompilerInterface):
             fake_mode.shape_env = ShapeEnv()
         tracing_ctx = (torch._guards.TracingContext(fake_mode)
                        if fake_mode is not None else None)
-        with torch._guards.tracing(tracing_ctx):
+        import re
+        import unittest.mock
+
+        orig_print_readable = torch.fx.GraphModule.print_readable
+
+        def _sanitized_print_readable(self, *args, **kwargs):
+            text = orig_print_readable(self, *args, **kwargs)
+            # PyTorch's aot_forward_graph_str uses print_readable, which can embed
+            # module paths like "model.layers.0" and source location comments like "# File: ...".
+            # We sanitize these to ensure identical graphs produce the exact same hash.
+            text = re.sub(r'# File:.*?\n', '', text)
+            text = re.sub(r'(\.(?:layers|blocks|h|encoder|decoder)\.)\d+',
+                          r'\g<1>X', text)
+            return text
+
+        with torch._guards.tracing(tracing_ctx), unittest.mock.patch(
+                "torch.fx.GraphModule.print_readable",
+                _sanitized_print_readable):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
         if was_wrapped:
