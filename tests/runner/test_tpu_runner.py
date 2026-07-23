@@ -34,7 +34,9 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.runner import tpu_runner
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner import (
+    TPUModelRunner, _get_padded_num_reqs_with_upper_limit,
+    _get_padded_token_len, _get_req_paddings)
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
@@ -1413,3 +1415,43 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1])
         }
         assert slots == {1, 2, 3, 4}
+
+
+@pytest.mark.parametrize("max_req_size,expected", [
+    (10, [8, 10]),
+    (16, [8, 16]),
+    (32, [8, 16, 32]),
+])
+def test_get_req_paddings(max_req_size, expected):
+    """Test batch request padding buckets generation."""
+    assert _get_req_paddings(min_req_size=1,
+                             max_req_size=max_req_size) == expected
+
+
+@pytest.mark.parametrize(
+    "num_reqs,upper_limit,expected",
+    [
+        (3, 16, 8),  # Under MIN_NUM_SEQS (8): clamps to 8
+        (5, 16, 8),  # Under MIN_NUM_SEQS (8): clamps to 8
+        (11, 32, 16),  # Above 8, under limit: rounds to next power of 2
+        (18, 16, 16),  # Exceeds limit: clamps to upper_limit
+    ])
+def test_get_padded_num_reqs_with_upper_limit(num_reqs, upper_limit, expected):
+    """Test rounding up requests to nearest power of 2 with a cap."""
+    assert _get_padded_num_reqs_with_upper_limit(
+        num_reqs, upper_limit=upper_limit) == expected
+
+
+@pytest.mark.parametrize(
+    "token_len,expected",
+    [
+        (16, 16),  # Exact match
+        (32, 32),  # Exact match
+        (17, 32),  # Needs padding (rounds up)
+        (63, 64),  # Needs padding (rounds up)
+        (128, 128),  # Max bound
+    ])
+def test_get_padded_token_len(token_len, expected):
+    """Test finding the correct token bucket using binary search."""
+    paddings = [16, 32, 64, 128]
+    assert _get_padded_token_len(paddings, token_len) == expected

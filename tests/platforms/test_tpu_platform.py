@@ -21,7 +21,8 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.platforms.tpu_platform import (
+    TpuPlatform, _get_token_paddings, _patch_scheduler_mamba_external_kv)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
 
@@ -412,3 +413,66 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+
+
+def test_get_token_paddings_exponential():
+    """Test token padding buckets generation with exponential gap (powers of 2)."""
+    paddings = _get_token_paddings(min_token_size=16,
+                                   max_token_size=128,
+                                   padding_gap=0)
+    assert paddings == [16, 32, 64, 128]
+
+
+def test_get_token_paddings_linear():
+    """Test token padding buckets generation (starts exponential, switches to linear gap)."""
+    paddings = _get_token_paddings(min_token_size=16,
+                                   max_token_size=192,
+                                   padding_gap=64)
+    assert paddings == [16, 32, 64, 128, 192]
+
+
+@patch('vllm_torchtpu.envs.TPU_KERNEL_ITER_MODE', True)
+def test_patch_api_server_kernel_reload_endpoint():
+    import sys
+
+    from vllm_torchtpu.platforms.tpu_platform import \
+        _patch_api_server_kernel_reload_endpoint
+
+    mock_api_server = MagicMock()
+    mock_app = MagicMock()
+    mock_api_server.build_app.return_value = mock_app
+    mock_api_server._tpu_kernel_reload_patch = False
+
+    sys.modules["vllm.entrypoints.openai.api_server"] = mock_api_server
+    try:
+        _patch_api_server_kernel_reload_endpoint()
+
+        # Test calling the patched build_app attaches the route
+        patched_app = mock_api_server.build_app()
+        patched_app.post.assert_called_once_with("/reload_kernel")
+    finally:
+        del sys.modules["vllm.entrypoints.openai.api_server"]
+
+
+def test_patch_scheduler_mamba_external_kv():
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    _patch_scheduler_mamba_external_kv()
+    assert getattr(Scheduler, "_tpu_mamba_external_kv_patch", False) is True
+    assert hasattr(Scheduler, "_mamba_block_aligned_split")
+
+    mock_scheduler = MagicMock()
+    mock_scheduler.cache_config.block_size = 16
+    mock_scheduler.use_eagle = False
+
+    mock_req = MagicMock()
+    mock_req.num_computed_tokens = 0
+    mock_req.num_prompt_tokens = 128
+    mock_req.num_tokens = 128
+
+    res = Scheduler._mamba_block_aligned_split(
+        mock_scheduler,
+        mock_req,
+        num_new_tokens=10,
+        num_external_computed_tokens=100)
+    assert res == 0
