@@ -215,11 +215,17 @@ class Eagle3Proposer:
         # Run raw, compute_logits + argmax + the int32 cast are eager ops the
         # torch-tpu DEFER_AND_FUSE path fuses with per-step-varying neighbors in
         # the K-step propose loop -> a fresh fused program per context. Enclosing
-        # them makes a fixed, bucketed program per [n, hidden] shape. The draft
-        # always proposes greedily, so folding the argmax in is value-exact and
-        # avoids materializing the [n, vocab] logits outside the compiled region.
-        return self.draft_model.compute_logits(hidden).argmax(dim=-1).to(
-            torch.int32)
+        # them makes a fixed, bucketed program per [n, hidden] shape.
+        d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
+        if d2t is None:
+            # No draft->target mapping table. Upstream compute_logits then asserts
+            # the head is already target-vocab-width, so plain argmax yields
+            # target ids.
+            return self.draft_model.compute_logits(hidden).argmax(dim=-1).to(
+                torch.int32)
+        draft_id = self.draft_model.logits_processor(self.draft_model.lm_head,
+                                                     hidden).argmax(dim=-1)
+        return (draft_id + d2t[draft_id]).to(torch.int32)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
