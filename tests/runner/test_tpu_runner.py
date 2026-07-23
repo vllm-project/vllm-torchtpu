@@ -37,6 +37,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
@@ -455,6 +456,8 @@ class TestTPURunner:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        # Slots per request in the mamba pool (1 without spec decode).
+        self.runner._mamba_slot_stride = 1
 
         # Bind the actual methods to our mock
         self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
@@ -1559,10 +1562,12 @@ class TestCompactMambaSlotPool:
     (_init_mamba_slot_pool + _build_mamba_state_indices). The slot index is
     correctness-critical: a wrong slot = silent recurrent-state corruption."""
 
-    def _make_runner(self, max_num_reqs=4, mamba_num_blocks=5):
+    def _make_runner(self, max_num_reqs=4, mamba_num_blocks=5, slot_stride=1):
         runner = MagicMock(spec=TPUModelRunner)
         runner.device = torch.device("cpu")
         runner.max_num_reqs = max_num_reqs
+        # Slots per request: 1 without spec decode, num_spec + 1 with it.
+        runner._mamba_slot_stride = slot_stride
         runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs,
                                                      dtype=torch.int32)
         runner.input_batch = MagicMock()
@@ -1640,3 +1645,173 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1])
         }
         assert slots == {1, 2, 3, 4}
+
+    def test_spec_decode_stride_allocates_group_bases(self):
+        """With speculative decoding each request owns a group of `stride`
+        consecutive slots; the pool hands out only the group *bases*."""
+        # num_spec = 2 -> stride 3; max_num_reqs = 3 -> 3*3 + 1 = 10 blocks.
+        runner = self._make_runner(max_num_reqs=3,
+                                   mamba_num_blocks=10,
+                                   slot_stride=3)
+        runner._init_mamba_slot_pool(10)
+        # Group bases are 1, 4, 7 (slot 0 is the null block); the interior
+        # checkpoint slots (2,3,5,6,8,9) are never handed out directly.
+        assert sorted(runner._free_mamba_slots) == [1, 4, 7]
+
+        self._set_batch(runner, ["a", "b", "c"])
+        idx = runner._build_mamba_state_indices(0, 3, 3).cpu()
+        assert sorted(int(x) for x in idx) == [1, 4, 7]
+
+    def test_spec_decode_stride_one_matches_plain_layout(self):
+        """stride 1 (spec decode disabled) reproduces the dense layout."""
+        runner = self._make_runner(max_num_reqs=4,
+                                   mamba_num_blocks=5,
+                                   slot_stride=1)
+        runner._init_mamba_slot_pool(5)
+        assert sorted(runner._free_mamba_slots) == [1, 2, 3, 4]
+
+
+class TestReorderBatchForRpa:
+    """Unit tests for the RPA batch reordering. With spec decode the batch is
+    partitioned into three contiguous segments [decode][verify][prefill]; the
+    returned (num_decode, num_windowed) split is fed to both RPA (decode-only
+    front) and the GDN windowed kernel (decode + verify)."""
+
+    def _make_runner(self):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.input_batch = MagicMock()
+        runner._reorder_batch_for_rpa = (
+            TPUModelRunner._reorder_batch_for_rpa.__get__(runner))
+        return runner
+
+    def _batch(self, runner, req_ids):
+        ib = runner.input_batch
+        ib.req_ids = list(req_ids)
+        ib.num_reqs = len(req_ids)
+
+        def swap_states(i, j):
+            ib.req_ids[i], ib.req_ids[j] = ib.req_ids[j], ib.req_ids[i]
+
+        ib.swap_states.side_effect = swap_states
+
+    def _sched(self, num_scheduled, spec_reqs=()):
+        return SimpleNamespace(
+            num_scheduled_tokens=num_scheduled,
+            scheduled_spec_decode_tokens={r: object()
+                                          for r in spec_reqs})
+
+    def test_empty_batch(self):
+        runner = self._make_runner()
+        self._batch(runner, [])
+        assert runner._reorder_batch_for_rpa(self._sched({})) == (0, 0)
+
+    def test_no_spec_decode_first_and_windowed_equal(self):
+        """Without spec decode, num_decode == num_windowed and only the
+        1-token decodes move to the front."""
+        runner = self._make_runner()
+        self._batch(runner, ["p", "d1", "p2", "d2"])
+        sched = self._sched({"p": 8, "d1": 1, "p2": 5, "d2": 1})
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert num_decode == 2
+        assert num_windowed == 2
+        # Both decode requests are in the front two positions.
+        assert set(runner.input_batch.req_ids[:2]) == {"d1", "d2"}
+
+    def test_three_segments_decode_verify_prefill(self):
+        """Spec decode yields [decode][verify][prefill] with the split at
+        num_decode and num_windowed."""
+        runner = self._make_runner()
+        self._batch(runner, ["pf", "vr", "dc", "vr2", "dc2"])
+        # dc, dc2: 1-token decode; vr, vr2: multi-token spec verify; pf: prefill
+        sched = self._sched({
+            "pf": 16,
+            "vr": 3,
+            "dc": 1,
+            "vr2": 3,
+            "dc2": 1
+        },
+                            spec_reqs=("vr", "vr2"))
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert num_decode == 2
+        assert num_windowed == 4
+        ids = runner.input_batch.req_ids
+        assert set(ids[:2]) == {"dc", "dc2"}  # decode segment
+        assert set(ids[2:4]) == {"vr", "vr2"}  # verify segment
+        assert ids[4] == "pf"  # prefill/mixed tail
+
+    def test_all_verify_no_plain_decode(self):
+        """Verify windows with no 1-token decodes: decode segment empty,
+        windowed segment covers all verify requests."""
+        runner = self._make_runner()
+        self._batch(runner, ["pf", "vr", "vr2"])
+        sched = self._sched({
+            "pf": 10,
+            "vr": 3,
+            "vr2": 3
+        },
+                            spec_reqs=("vr", "vr2"))
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert num_decode == 0
+        assert num_windowed == 2
+        assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
+        assert runner.input_batch.req_ids[2] == "pf"
+
+
+class TestMambaSlotReadOffsets:
+    """Unit tests for the per-slot mamba read-offset scatter used to roll back
+    rejected speculative tokens by *selection* (base_slot + offset)."""
+
+    def _make_runner(self, num_blocks=8):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
+                                                     dtype=torch.int32)
+        runner._update_mamba_slot_read_offsets = (
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+        return runner
+
+    def test_noop_when_offsets_disabled(self):
+        """No slot buffer (spec decode disabled) -> nothing to scatter."""
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.mamba_slot_read_offsets = None
+        runner._update_mamba_slot_read_offsets = (
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+        # Must not raise even with real-looking args.
+        runner._update_mamba_slot_read_offsets(torch.tensor([1, 4]),
+                                               torch.tensor([[10, -1]]), 2)
+
+    def test_verify_offsets_are_num_accepted_minus_one(self):
+        """offset = (#valid tokens) - 1: full accept -> k, all-rejected -> 0."""
+        runner = self._make_runner(num_blocks=8)
+        state_indices = torch.tensor([1, 4], dtype=torch.int32)
+        # req at slot 1 accepted 3 tokens (2 drafts + bonus); req at slot 4
+        # accepted only the bonus (both drafts rejected).
+        next_tokens = torch.tensor([[10, 11, 12],
+                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        runner._update_mamba_slot_read_offsets(state_indices, next_tokens, 2)
+        assert int(runner.mamba_slot_read_offsets[1]) == 2  # 3 valid - 1
+        assert int(runner.mamba_slot_read_offsets[4]) == 0  # 1 valid - 1
+
+    def test_non_verify_chunk_resets_offsets(self):
+        """A None next_tokens (prefill / plain decode) resets to 0, so the
+        next step resumes from the group base checkpoint."""
+        runner = self._make_runner(num_blocks=8)
+        runner.mamba_slot_read_offsets[1] = 2
+        runner.mamba_slot_read_offsets[4] = 1
+        runner._update_mamba_slot_read_offsets(
+            torch.tensor([1, 4], dtype=torch.int32), None, 2)
+        assert int(runner.mamba_slot_read_offsets[1]) == 0
+        assert int(runner.mamba_slot_read_offsets[4]) == 0
+
+    def test_padded_tail_writes_to_null_slot(self):
+        """Padded positions carry slot 0 (the null block); their reset writes
+        land there harmlessly and never touch an active group base."""
+        runner = self._make_runner(num_blocks=8)
+        runner.mamba_slot_read_offsets[1] = 2
+        # num_reqs = 1 active (slot 1); position 1 is padding -> slot 0.
+        state_indices = torch.tensor([1, 0], dtype=torch.int32)
+        next_tokens = torch.tensor([[10, 11],
+                                    [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        runner._update_mamba_slot_read_offsets(state_indices, next_tokens, 1)
+        assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
+        # Null slot only ever gets 0; active groups untouched by the tail.
+        assert int(runner.mamba_slot_read_offsets[0]) == 0
