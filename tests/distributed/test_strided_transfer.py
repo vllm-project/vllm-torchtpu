@@ -398,31 +398,8 @@ def test_destination_session_accepts_torch_fp8_tensor_buffers() -> None:
     assert dst.view(torch.uint8).numpy().tobytes() == bytes(expected)
 
 
-def test_destination_session_rejects_unaligned_bfloat16_span() -> None:
-    torch = pytest.importorskip("torch")
-    dst = torch.zeros(8, dtype=torch.bfloat16)
-    engine = _engine()
-    _register_region(engine,
-                     dst,
-                     region_id="destination",
-                     page_bytes=dst.nbytes)
-    op = StridedTransferOp(src_region_id="source",
-                           dst_region_id="destination",
-                           src_offset_bytes=0,
-                           dst_offset_bytes=1,
-                           segment_bytes=2,
-                           src_stride_bytes=2,
-                           dst_stride_bytes=2,
-                           num_segments=1)
-    session = engine.new_destination_write_session()
-
-    with pytest.raises(ValueError, match="aligned to tensor element_size"):
-        session.scatter(b"ab", [op])
-    session.discard()
-
-
 @pytest.mark.parametrize("dtype_name", ["float8_e4m3fn", "bfloat16"])
-def test_destination_session_writes_only_touched_typed_spans(
+def test_destination_session_uses_one_whole_typed_tensor_host_cache(
         monkeypatch, dtype_name) -> None:
     _require_api()
     torch = pytest.importorskip("torch")
@@ -436,14 +413,25 @@ def test_destination_session_writes_only_touched_typed_spans(
                                      transport="zmq")
     _register_region(engine, dst, region_id="destination", page_bytes=16)
 
-    def fail_whole_tensor_read(*args, **kwargs):
-        pytest.fail(
-            "typed destination writeback must not read the full tensor")
+    original_tensor_to_bytes = strided_transfer._tensor_to_bytes
+    tensor_reads = []
+    tensor_writes = []
 
-    monkeypatch.setattr(strided_transfer, "_tensor_slice_to_bytes",
-                        fail_whole_tensor_read)
-    monkeypatch.setattr(strided_transfer, "_tensor_to_bytes",
-                        fail_whole_tensor_read)
+    def tensor_to_bytes(tensor):
+        payload = original_tensor_to_bytes(tensor)
+        tensor_reads.append(payload)
+        return payload
+
+    def copy_bytes_to_tensor(payload, tensor):
+        tensor_writes.append(bytes(payload))
+        cpu_bytes = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        tensor.copy_(cpu_bytes.view(tensor.dtype).reshape(tensor.shape))
+
+    monkeypatch.setattr(strided_transfer, "_tensor_to_bytes", tensor_to_bytes)
+    monkeypatch.setattr(strided_transfer,
+                        "_copy_bytes_to_tensor",
+                        copy_bytes_to_tensor,
+                        raising=False)
 
     session = engine.new_destination_write_session()
     first = [
@@ -475,6 +463,8 @@ def test_destination_session_writes_only_touched_typed_spans(
     expected[18:22] = b"abcd"
     expected[26:28] = b"de"
     assert dst.view(torch.uint8).numpy().tobytes() == bytes(expected)
+    assert tensor_reads == [initial]
+    assert tensor_writes == [bytes(expected)]
 
 
 def test_overlapping_destination_sessions_share_lock_per_raw_tensor(
@@ -497,19 +487,21 @@ def test_overlapping_destination_sessions_share_lock_per_raw_tensor(
     _register_region(engine, dst, region_id="destination.second", page_bytes=4)
     monkeypatch.setattr(strided_transfer, "_is_torch_tensor",
                         lambda buffer: isinstance(buffer, FakeTensor))
-    monkeypatch.setattr(strided_transfer, "_tensor_element_size",
-                        lambda tensor: 1)
 
-    def fail_tensor_read(*args, **kwargs):
-        pytest.fail("partial tensor writeback must not read the tensor")
+    tensor_reads = []
 
-    def copy_bytes_to_fake_tensor_range(payload, tensor, offset_bytes):
-        tensor.data[offset_bytes:offset_bytes + len(payload)] = payload
+    def tensor_to_bytes(tensor):
+        payload = bytes(tensor.data)
+        tensor_reads.append(payload)
+        return payload
 
-    monkeypatch.setattr(strided_transfer, "_tensor_to_bytes", fail_tensor_read)
+    def copy_bytes_to_fake_tensor(payload, tensor):
+        tensor.data[:] = payload
+
+    monkeypatch.setattr(strided_transfer, "_tensor_to_bytes", tensor_to_bytes)
     monkeypatch.setattr(strided_transfer,
-                        "_copy_bytes_to_tensor_range",
-                        copy_bytes_to_fake_tensor_range,
+                        "_copy_bytes_to_tensor",
+                        copy_bytes_to_fake_tensor,
                         raising=False)
 
     first = [
@@ -565,6 +557,10 @@ def test_overlapping_destination_sessions_share_lock_per_raw_tensor(
     expected[0:4] = b"1111"
     expected[8:12] = b"2222"
     assert dst.data == expected
+    assert tensor_reads == [
+        bytes(bytearray(16)),
+        bytes(expected[:4] + bytearray(12)),
+    ]
 
 
 def test_tpu_tensor_read_keeps_existing_torch_slice_path() -> None:
