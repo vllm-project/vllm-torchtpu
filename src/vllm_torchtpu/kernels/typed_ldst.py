@@ -17,9 +17,10 @@ A block ref holds bytes in the layout of its owning buffer (e.g. one
 kernel block of the unified KV pool). Consumers that pack a different
 element type into those bytes access them through a typed view: Mosaic
 ``ref.bitcast`` (which rescales the second-minor dim by the element-size
-ratio) plus an optional in-place 128-lane split — stacking 128-wide lane
-slices on a new sublane axis preserves row-major element order, so
-callers reshaping to a narrower-lane state shape pay no lane-crossing
+ratio) plus an optional 128-lane split. The split maps each 128-wide
+lane slice to a contiguous range of rows — lane slice ``i`` carries rows
+``[i * n, (i + 1) * n)`` — so a narrower-lane state view is a pair of
+128-aligned lane slices concatenated along rows, with no lane-crossing
 relayout. The pool gather/scatter kernels and the GDN V3 state seam
 share these helpers so the bytes they exchange are identical.
 """
@@ -35,11 +36,11 @@ def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
     arr = block_ref[...].reshape(-1, lanes)
     if lane_split > 1:
         out_lanes = lanes // lane_split
-        arr = jnp.stack([
+        arr = jnp.concatenate([
             arr[:, i * out_lanes:(i + 1) * out_lanes]
             for i in range(lane_split)
         ],
-                        axis=1).reshape(-1, out_lanes)
+                              axis=0)
     return arr
 
 
@@ -47,10 +48,10 @@ def store_typed(block_ref, values: jax.Array, *, lane_split: int = 1) -> None:
     """Inverse of ``load_typed``: lane-merges ``values`` and stores them
     through a bitcast view of the raw block ref, which is fully written."""
     if lane_split > 1:
-        v_lanes = values.shape[-1]
-        values = values.reshape(-1, lane_split, v_lanes)
-        values = jnp.concatenate([values[:, i, :] for i in range(lane_split)],
-                                 axis=-1)
+        rows = values.shape[0] // lane_split
+        values = jnp.concatenate(
+            [values[i * rows:(i + 1) * rows] for i in range(lane_split)],
+            axis=-1)
     if jnp.dtype(block_ref.dtype) != jnp.dtype(values.dtype):
         block_ref = block_ref.bitcast(jnp.dtype(values.dtype))
     block_ref[...] = values.reshape(block_ref.shape)

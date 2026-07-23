@@ -98,6 +98,7 @@ def _pallas_rpa_kernel_impl(
     soft_cap: float | None = None,
     shard: bool = True,
     kv_block_cap: int | None = None,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -125,6 +126,7 @@ def _pallas_rpa_kernel_impl(
         soft_cap=soft_cap,
         shard=shard,
         kv_block_cap=kv_block_cap,
+        use_causal_mask=use_causal_mask,
     )
     return new_kv_cache, outputs
 
@@ -148,6 +150,7 @@ def _pallas_rpa_kernel_default(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -173,6 +176,7 @@ def _pallas_rpa_kernel_default(
         rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
+        use_causal_mask=use_causal_mask,
     )
 
 
@@ -202,6 +206,7 @@ def _pallas_rpa_kernel_local(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -231,6 +236,7 @@ def _pallas_rpa_kernel_local(
         soft_cap=soft_cap,
         shard=False,
         kv_block_cap=_DRAFT_KV_BLOCK_CAP,
+        use_causal_mask=use_causal_mask,
     )
 
 
@@ -253,6 +259,7 @@ def _pallas_rpa_kernel_batched(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
+    use_causal_mask: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -274,6 +281,7 @@ def _pallas_rpa_kernel_batched(
         rpa_func=ragged_paged_attention_batched,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
+        use_causal_mask=use_causal_mask,
     )
 
 
@@ -469,6 +477,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self.sliding_window = sliding_window
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.use_causal_mask = kwargs.get("use_causal_mask", True)
 
         if alibi_slopes is not None:
             raise NotImplementedError("Alibi slopes is not supported.")
@@ -532,10 +541,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # layers of an otherwise-identical config.
         mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(
             ctx.mesh, use_pcp_streaming)
-        registry_key = (self._kernel_op_prefix, self.sliding_window,
-                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
-                        k_scale, v_scale, skip_kv_update, use_pcp_streaming,
-                        cp_kv_cache_interleave_size, max_model_len)
+        registry_key = (self._kernel_op_prefix,
+                        self.sliding_window, self.scale, self.logits_soft_cap,
+                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
+                        use_pcp_streaming, cp_kv_cache_interleave_size,
+                        max_model_len, self.use_causal_mask)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -570,6 +580,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
+                use_causal_mask=self.use_causal_mask,
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
