@@ -106,6 +106,11 @@ class ExecuteModelState:
     # hidden states) captured from the target verify pass. None if
     # spec decode proposer is disabled.
     draft_chunks: list[DraftChunkInputs] = field(default_factory=list)
+    # Per-chunk device mamba slot ids (base slot per batch position); only
+    # populated for hybrid models with spec decoding so sample_tokens can
+    # scatter this step's mamba read offsets per physical slot.
+    mamba_state_indices_list: list[torch.Tensor
+                                   | None] = field(default_factory=list)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -361,9 +366,22 @@ class TPUModelRunner(GPUModelRunner):
         # upstream vLLM's InputBatch, which we do not subclass.
         self._mamba_slot_by_req_id: dict[str, int] = {}
         self._free_mamba_slots: list[int] = []
+        # Slots per request in the mamba pool. With speculative decoding each
+        # request owns `num_speculative_tokens + 1` consecutive slots (one
+        # state checkpoint per speculative window position) and the tracked
+        # slot id is the group's base; see `_init_mamba_slot_pool`.
+        self._mamba_slot_stride: int = 1
+        if self.vllm_config.speculative_config is not None:
+            self._mamba_slot_stride = (
+                self.vllm_config.speculative_config.num_speculative_tokens + 1)
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
+        # Slot-indexed mamba read offsets for speculative decoding with
+        # hybrid (attention + mamba) models; allocated in
+        # `initialize_kv_cache` once the mamba pool size is known. See
+        # `AttentionMetadata.mamba_slot_read_offsets`.
+        self.mamba_slot_read_offsets: torch.Tensor | None = None
         self._mamba_align_mode: bool = (
             self.vllm_config.cache_config.mamba_cache_mode == "align")
         self._mamba_apc_copier: MambaApcStateCopier | None = None
@@ -539,6 +557,18 @@ class TPUModelRunner(GPUModelRunner):
         # tensors across consecutive decode steps.
         self._attn_layer_names: list[str] | None = None
         self._request_distribution_cpu = torch.zeros(3, dtype=torch.int32)
+        # GDN windowed distribution staging for spec decode with mamba
+        # layers; see AttentionMetadata.mamba_request_distribution. Staged
+        # together with the RPA distribution in one [6] tensor whose device
+        # copy is sliced into the two metadata fields ([0:3] RPA, [3:6]
+        # GDN). The fields must never be separate equal-valued device
+        # tensors: torch-tpu's lazy tracing CSEs those into one node on
+        # steps where the values coincide (pure decode), dynamo then folds
+        # the RPA and GDN op inputs into a single graph input, and later
+        # verify steps silently feed the GDN windowed distribution to
+        # ragged paged attention (in-window query rows never attend).
+        self._combined_request_distribution_cpu = torch.zeros(
+            6, dtype=torch.int32)
         self._decode_device_cache_key: tuple | None = None
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
@@ -762,42 +792,68 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.num_xla_graphs += new_compiled_graphs
 
-    def _reorder_batch_for_rpa(self,
-                               scheduler_output: "SchedulerOutput") -> int:
+    def _reorder_batch_for_rpa(
+            self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:
         """Reorder active requests into an RPA-friendly decode-first layout.
 
         decode-only requests come first and all remaining requests stay in the
         mixed bucket. We do not create a dedicated prefill-only bucket here.
 
+        With speculative decoding the order is three segments:
+        [1-token decodes][spec verify windows][prefill/mixed]. Ragged paged
+        attention keeps its 1-token decode front segment, while the GDN
+        kernel's windowed mode covers the first two segments contiguously
+        (see `AttentionMetadata.mamba_request_distribution`).
+
         Returns:
-            Number of decode-only requests after reordering.
+            (num_decode, num_windowed): the number of 1-token decode requests
+            and the number of windowed requests (decodes + speculative verify
+            windows) after reordering. Without spec decoding both are equal.
         """
         num_reqs = self.input_batch.num_reqs
         if num_reqs <= 0:
-            return 0
+            return 0, 0
 
-        # Two-pointer partition: move decode requests (1 scheduled token) to
-        # the front while preserving the existing mixed-mode fallback for the
-        # remaining requests.
-        i, j = 0, num_reqs - 1
-        while i < j:
-            i_req_id = self.input_batch.req_ids[i]
-            j_req_id = self.input_batch.req_ids[j]
-            assert i_req_id is not None
-            assert j_req_id is not None
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
 
-            if scheduler_output.num_scheduled_tokens[i_req_id] == 1:
+        def segment(req_id: str) -> int:
+            # 0: 1-token decode, 1: speculative verify window,
+            # 2: prefill/mixed.
+            if scheduler_output.num_scheduled_tokens[req_id] == 1:
+                return 0
+            if req_id in spec_decode_tokens:
+                return 1
+            return 2
+
+        def partition(start: int, end: int, bound: int) -> int:
+            """Two-pointer partition of [start, end]: requests with
+            segment <= bound before the rest. Returns the first index of the
+            second part."""
+            i, j = start, end
+            while i < j:
+                i_req_id = self.input_batch.req_ids[i]
+                j_req_id = self.input_batch.req_ids[j]
+                assert i_req_id is not None
+                assert j_req_id is not None
+                if segment(i_req_id) <= bound:
+                    i += 1
+                elif segment(j_req_id) > bound:
+                    j -= 1
+                else:
+                    self.input_batch.swap_states(i, j)
+                    i += 1
+                    j -= 1
+            if i == j and segment(self.input_batch.req_ids[i]) <= bound:
                 i += 1
-            elif scheduler_output.num_scheduled_tokens[j_req_id] > 1:
-                j -= 1
-            else:
-                self.input_batch.swap_states(i, j)
-                i += 1
-                j -= 1
+            return i
 
-        last_req_id = self.input_batch.req_ids[i]
-        assert last_req_id is not None
-        return i + int(scheduler_output.num_scheduled_tokens[last_req_id] == 1)
+        # Pass 1: 1-token decode requests to the front.
+        num_decode = partition(0, num_reqs - 1, 0)
+        # Pass 2: speculative verify windows before prefill/mixed requests.
+        num_windowed = num_decode
+        if spec_decode_tokens and num_decode < num_reqs:
+            num_windowed = partition(num_decode, num_reqs - 1, 1)
+        return num_decode, num_windowed
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -1364,7 +1420,11 @@ class TPUModelRunner(GPUModelRunner):
         # +1 reserves slot 0 as the null/sentinel block (never handed to a
         # request); padded tail positions in `mamba_state_indices` also point
         # here, so their writes can never corrupt an active request's state.
-        mamba_num_blocks = self.max_num_reqs + 1
+        # With speculative decoding each request owns a *group* of
+        # `num_spec + 1` consecutive slots so the GDN kernel can checkpoint
+        # the state after every speculative window position (see
+        # `_init_mamba_slot_pool` for the rollback scheme).
+        mamba_num_blocks = self.max_num_reqs * self._mamba_slot_stride + 1
 
         avail_per_tensor = avail // group_size
         mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
@@ -1418,9 +1478,22 @@ class TPUModelRunner(GPUModelRunner):
         Called once after KV cache allocation, when the true mamba block count
         is known. The mapping itself is keyed on req_id and rebuilt lazily in
         `_build_mamba_state_indices`, so re-init only resets the free pool.
+
+        With speculative decoding each request owns a *group* of
+        `num_speculative_tokens + 1` consecutive slots; the tracked slot id is
+        the group's base. During a verify step the GDN kernel writes one state
+        checkpoint per window position into `base + t`, and the next step
+        reads its initial state from `base + (num_accepted - 1)`. Rejected
+        drafts are thus rolled back by *selection*, never by copying. Without
+        spec decode the stride is 1 (one slot per request), matching the
+        original layout.
         """
+        stride = self._mamba_slot_stride
+        num_groups = (mamba_num_blocks - 1) // stride
         self._mamba_slot_by_req_id = {}
-        self._free_mamba_slots = list(range(mamba_num_blocks - 1, 0, -1))
+        self._free_mamba_slots = [
+            1 + g * stride for g in reversed(range(num_groups))
+        ]
         self._has_mamba_state = True
 
     def _build_mamba_state_indices(self, start_index: int, num_reqs: int,
@@ -1992,8 +2065,13 @@ class TPUModelRunner(GPUModelRunner):
         return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
                 num_draft_per_req)
 
-    def _prepare_inputs(self, scheduler_output: "SchedulerOutput",
-                        start_index: int, num_decode_reqs: int):
+    def _prepare_inputs(self,
+                        scheduler_output: "SchedulerOutput",
+                        start_index: int,
+                        num_decode_reqs: int,
+                        num_windowed_reqs: int | None = None):
+        if num_windowed_reqs is None:
+            num_windowed_reqs = num_decode_reqs
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -2294,6 +2372,31 @@ class TPUModelRunner(GPUModelRunner):
             start_index, num_reqs, target_num_reqs)
                                if self._has_mamba_state else None)
 
+        # Spec decode with mamba layers: the GDN kernel's windowed segment
+        # covers 1-token decodes AND speculative verify windows (the batch is
+        # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa),
+        # while RPA keeps its 1-token-decode-only front segment.
+        mamba_request_distribution = None
+        if self.mamba_slot_read_offsets is not None:
+            chunk_num_windowed = max(
+                0, min(num_windowed_reqs - start_index, num_reqs))
+            chunk_num_decode = max(
+                0, min(num_decode_reqs - start_index, num_reqs))
+            # One H2D copy, two views (see the staging tensor's comment for
+            # why these must not be independent device tensors). Overrides
+            # the RPA tensor built above so both fields always come from the
+            # same base tensor, matching the traced graph structure.
+            combined = self._combined_request_distribution_cpu
+            combined[0] = chunk_num_decode
+            combined[1] = chunk_num_decode
+            combined[2] = num_reqs
+            combined[3] = chunk_num_windowed
+            combined[4] = chunk_num_windowed
+            combined[5] = num_reqs
+            combined_device = combined.to(self.device, non_blocking=True)
+            request_distribution = combined_device[0:3]
+            mamba_request_distribution = combined_device[3:6]
+
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -2302,6 +2405,8 @@ class TPUModelRunner(GPUModelRunner):
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
+            mamba_slot_read_offsets=self.mamba_slot_read_offsets,
+            mamba_request_distribution=mamba_request_distribution,
             sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
@@ -2502,7 +2607,8 @@ class TPUModelRunner(GPUModelRunner):
         if self.supports_mm_inputs:
             self._execute_mm_encoder(scheduler_output)
 
-        num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
+        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
+            scheduler_output)
 
         # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
         if self.phase_based_profiler:
@@ -2563,6 +2669,7 @@ class TPUModelRunner(GPUModelRunner):
         pooler_output_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
+        mamba_state_indices_list: list[torch.Tensor | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = (self._is_async_drafter)
 
@@ -2592,7 +2699,8 @@ class TPUModelRunner(GPUModelRunner):
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
              end_index, cur_input_indices, pre_next_tokens_indices,
              spec_decode_metadata) = (self._prepare_inputs(
-                 scheduler_output, start_index, num_decode_reqs))
+                 scheduler_output, start_index, num_decode_reqs,
+                 num_windowed_reqs))
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -2697,6 +2805,9 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
+            mamba_state_indices_list.append(
+                self._attn_metadata_builder_ctx.mamba_state_indices if self.
+                mamba_slot_read_offsets is not None else None)
             if is_draft_model:
                 # Capture this chunk's draft inputs while they are valid.
                 draft_chunks.append(
@@ -2727,6 +2838,7 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs_list=num_reqs_list,
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
+            mamba_state_indices_list=mamba_state_indices_list,
         )
 
         if self.is_pooling_model:
@@ -2757,6 +2869,34 @@ class TPUModelRunner(GPUModelRunner):
         return self._sampling_generator
 
     @torch.no_grad()
+    def _update_mamba_slot_read_offsets(self,
+                                        state_indices: torch.Tensor | None,
+                                        next_tokens: torch.Tensor | None,
+                                        num_reqs: int) -> None:
+        """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
+
+        `state_indices` holds the base slot per batch position for the chunk
+        (padded tail = slot 0, the null block, so its writes are harmless).
+        The offset is `num_accepted - 1` derived from the rejection-sampler
+        output for verify chunks, and 0 for non-spec chunks (prefill / plain
+        decode) — which also resets a group's offset after prefill. The next
+        step's GDN kernel resumes each request from
+        `base_slot + offset` (the checkpoint of its last accepted token).
+        """
+        if self.mamba_slot_read_offsets is None or state_indices is None:
+            return
+        offsets = torch.zeros(state_indices.shape[0],
+                              dtype=torch.int32,
+                              device=state_indices.device)
+        if next_tokens is not None:
+            # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
+            # last accepted token is at base + num_valid - 1.
+            num_valid = (next_tokens[:num_reqs]
+                         != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+            offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
+        self.mamba_slot_read_offsets.index_put_((state_indices.long(), ),
+                                                offsets)
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -2801,6 +2941,10 @@ class TPUModelRunner(GPUModelRunner):
         # configured but no drafts exist yet, so is_spec_step is False there.
         is_spec_step = any(md is not None
                            for md in state.spec_decode_metadata_list)
+        # Per-chunk mamba slot ids (hybrid + spec decode only; None entries
+        # otherwise) for the read-offset scatter after sampling.
+        mamba_idx_list = (state.mamba_state_indices_list
+                          or [None] * len(state.logits_list))
         if self.is_pooling_model:
             req_ids = cast(
                 list[str],
@@ -2815,9 +2959,9 @@ class TPUModelRunner(GPUModelRunner):
             next_tokens_per_chunk: list[torch.Tensor] = []
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md in zip(state.logits_list,
-                                            state.num_reqs_list,
-                                            state.spec_decode_metadata_list):
+            for logits, num_reqs, md, mamba_indices in zip(
+                    state.logits_list, state.num_reqs_list,
+                    state.spec_decode_metadata_list, mamba_idx_list):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
                     if all_greedy:
@@ -2887,6 +3031,8 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
+                    self._update_mamba_slot_read_offsets(
+                        mamba_indices, next_tokens, num_reqs)
                 else:
                     dummy = torch.empty((1, 1),
                                         dtype=logits.dtype,
@@ -2928,6 +3074,10 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(padded)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(padded)
+                    # Non-verify chunk in a spec step: reset the read offsets
+                    # (the latest state checkpoint is at the group base).
+                    self._update_mamba_slot_read_offsets(
+                        mamba_indices, None, num_reqs)
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
         else:
@@ -2936,9 +3086,14 @@ class TPUModelRunner(GPUModelRunner):
                 list[str],
                 self.input_batch.req_ids[:self.input_batch.num_reqs])
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs in zip(state.logits_list,
-                                        state.num_reqs_list):
+            for logits, num_reqs, mamba_indices in zip(state.logits_list,
+                                                       state.num_reqs_list,
+                                                       mamba_idx_list):
                 cur_end_idx = cur_start_idx + num_reqs
+                # Non-spec step (prefill / plain decode): reset the mamba
+                # read offsets so the next step resumes from the group base.
+                self._update_mamba_slot_read_offsets(mamba_indices, None,
+                                                     num_reqs)
                 if grammar_output is not None:
                     require_struct_decoding, grammar_bitmask_padded, arange = (
                         self.prepare_structured_decoding_input(
@@ -3389,6 +3544,18 @@ class TPUModelRunner(GPUModelRunner):
             dummy_mamba_state_indices = (torch.zeros(
                 (num_reqs, ), dtype=torch.int32).to(self.device)
                                          if self._has_mamba_state else None)
+            # Match _prepare_inputs: the spec-decode mamba fields are set iff
+            # the model has mamba layers and spec decoding is enabled, so the
+            # dummy runs compile the same GDN program signature — including
+            # the two distributions being views of one [6] base tensor (see
+            # _combined_request_distribution_cpu for why).
+            dummy_mamba_request_distribution = None
+            if self.mamba_slot_read_offsets is not None:
+                combined_device = torch.tensor([actual_num_reqs] * 6,
+                                               dtype=torch.int32).to(
+                                                   self.device)
+                request_distribution = combined_device[0:3]
+                dummy_mamba_request_distribution = combined_device[3:6]
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
@@ -3398,6 +3565,8 @@ class TPUModelRunner(GPUModelRunner):
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
                 mamba_state_indices=dummy_mamba_state_indices,
+                mamba_slot_read_offsets=self.mamba_slot_read_offsets,
+                mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
             slot_mappings = self.empty_slot_mappings
@@ -4560,6 +4729,22 @@ class TPUModelRunner(GPUModelRunner):
         if (allocated_mamba_num_blocks is not None
                 and not self._uniform_mamba_layout):
             self._init_mamba_slot_pool(allocated_mamba_num_blocks)
+
+        # For hybrid models with spec decoding, keep a per-slot device buffer
+        # of mamba read offsets (num_accepted - 1 from each request's last
+        # verify step). The GDN kernel reads a request's initial state from
+        # `base_slot + offset`, which is how rejected draft tokens are rolled
+        # back (by selecting the checkpoint of the last accepted token, never
+        # by copying state).
+        if (allocated_mamba_num_blocks is not None
+                and self.speculative_config is not None):
+            if self._uniform_mamba_layout:
+                raise NotImplementedError(
+                    "Speculative decoding with mamba layers requires the "
+                    "compact mamba slot layout (unsupported with "
+                    "kv_transfer_config / uniform mamba layout).")
+            self.mamba_slot_read_offsets = torch.zeros(
+                allocated_mamba_num_blocks, dtype=torch.int32).to(self.device)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.
