@@ -33,7 +33,8 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
     broadcast_minor, convert_to_target_bitwidth, get_dtype_packing,
     strided_load)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
-    ScheduleField, build_pcp_streaming_schedule_inputs_from_metadata_jax)
+    ScheduleField, TilePlanField,
+    build_pcp_streaming_schedule_inputs_from_metadata_jax)
 
 AXIS = "pcp"
 PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE = 512
@@ -438,14 +439,137 @@ def _load_multi_head_online_state_tile(m_ref, l_ref, acc_ref, local_dma_sem,
         acc_load.wait()
 
 
-def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
+def _load_hbm_row(src_ref, dst_ref, sem, row):
     load_op = pltpu.make_async_copy(
-        src_ref=packed_schedule_ref.at[step],
-        dst_ref=sched_vmem_ref.at[:, :, :],
+        src_ref=src_ref.at[row],
+        dst_ref=dst_ref.at[:],
         sem=sem,
     )
     load_op.start()
     load_op.wait()
+
+
+def _vector_lookup(values, index):
+    values = jnp.reshape(values, (-1, ))
+    positions = jnp.arange(values.shape[0], dtype=jnp.int32)
+    return jnp.sum(jnp.where(positions == index, values, 0), dtype=jnp.int32)
+
+
+def _tile_plan_value(plan_values, consumer_rank, field):
+    return _vector_lookup(
+        plan_values,
+        consumer_rank * TilePlanField.NUM_FIELDS + field,
+    )
+
+
+def _tile_plan_value_static(plan_values, consumer_rank, field):
+    return plan_values[0, consumer_rank * TilePlanField.NUM_FIELDS + field]
+
+
+def _group_tile_position(group_starts, active_tiles, group_idx):
+    starts = jnp.reshape(group_starts, (-1, ))
+    positions = jnp.arange(starts.shape[0], dtype=jnp.int32)
+    before_or_at_group = jnp.logical_and(positions < active_tiles, starts
+                                         <= group_idx)
+    return jnp.maximum(
+        jnp.sum(before_or_at_group.astype(jnp.int32), dtype=jnp.int32) - 1,
+        0,
+    )
+
+
+def _local_page_valid_len_from_tile_plan(kv_len, local_page_idx, src_rank, *,
+                                         page_size, pcp_size, interleave_size):
+    cycle = pcp_size * interleave_size
+    base = (local_page_idx * page_size * pcp_size + src_rank * interleave_size)
+    delta = kv_len - base
+    chunks_per_page = page_size // interleave_size
+    full_chunks = jnp.minimum(chunks_per_page, jnp.maximum(delta, 0) // cycle)
+    partial = jnp.minimum(
+        interleave_size,
+        jnp.maximum(delta - full_chunks * cycle, 0),
+    )
+    valid_len = full_chunks * interleave_size + jnp.where(
+        full_chunks < chunks_per_page, partial, 0)
+    return jnp.where(kv_len > base, valid_len, 0)
+
+
+def _stage_schedule_step_from_tile_plan(
+    plan_values,
+    block_table_values,
+    sched_vmem_ref,
+    group_in_tile,
+    source_rank,
+    *,
+    state_mode,
+    pcp_size,
+    page_size,
+    interleave_size,
+    lane,
+):
+    req_id = _tile_plan_value_static(plan_values, 0, TilePlanField.REQ_ID)
+    kv_len = _tile_plan_value_static(plan_values, 0, TilePlanField.KV_LEN)
+    if state_mode == "current":
+        page_start = _tile_plan_value_static(plan_values, 0,
+                                             TilePlanField.HISTORY_CUT_PAGES)
+        effective_field = TilePlanField.EFFECTIVE_PAGES
+    elif state_mode == "history":
+        page_start = jnp.array(0, dtype=jnp.int32)
+        effective_field = TilePlanField.HISTORY_EFFECTIVE_PAGES
+    else:
+        raise ValueError(f"Unsupported PCP state mode: {state_mode}")
+
+    step_offset = group_in_tile * pcp_size + source_rank
+    global_page = page_start + step_offset
+    local_page_idx = page_start // pcp_size + group_in_tile
+    safe_local_page_idx = jnp.clip(local_page_idx, 0,
+                                   block_table_values.size - 1)
+    page_idx = _vector_lookup(block_table_values, safe_local_page_idx)
+    kv_global_start = (local_page_idx * page_size * pcp_size +
+                       source_rank * interleave_size)
+    page_valid_len = _local_page_valid_len_from_tile_plan(
+        kv_len,
+        local_page_idx,
+        source_rank,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+
+    for consumer_rank in range(pcp_size):
+        effective_pages = _tile_plan_value_static(plan_values, consumer_rank,
+                                                  effective_field)
+        valid_page = global_page < effective_pages
+        is_first = jnp.logical_and(valid_page, step_offset == 0)
+        is_last = jnp.logical_and(valid_page,
+                                  global_page == effective_pages - 1)
+        q_global_start = _tile_plan_value_static(plan_values, consumer_rank,
+                                                 TilePlanField.Q_GLOBAL_START)
+        q_hbm_offset = _tile_plan_value_static(plan_values, consumer_rank,
+                                               TilePlanField.Q_HBM_OFFSET)
+        q_tile_size = _tile_plan_value_static(plan_values, consumer_rank,
+                                              TilePlanField.Q_TILE_SIZE)
+
+        logical_fields = jnp.stack((
+            jnp.where(valid_page, req_id, -1),
+            source_rank,
+            jnp.where(valid_page, page_idx, 0),
+            is_first.astype(jnp.int32),
+            is_last.astype(jnp.int32),
+            is_first.astype(jnp.int32),
+            q_global_start,
+            kv_global_start,
+            jnp.where(valid_page, page_valid_len, 0),
+            q_hbm_offset,
+            q_tile_size,
+            q_hbm_offset,
+        ))
+        packed_row = jnp.concatenate((
+            logical_fields,
+            jnp.zeros(
+                (ScheduleField.PACKED_NUM_FIELDS - ScheduleField.NUM_FIELDS, ),
+                dtype=jnp.int32),
+        ))
+        sched_vmem_ref[consumer_rank, lane, :] = packed_row
 
 
 def _normalize_q_compute_size(q_block_size: int,
@@ -573,16 +697,24 @@ def _mesh_device_id(mesh_axis_names, pcp_axis_name, pcp_rank):
 
 
 def _run_pcp_page_groups_multi_head(
+    active_tiles,
     active_page_groups,
     q_ref,
     kv_cache_ref,
-    packed_schedule_ref,
+    tile_plan_ref,
+    block_tables_ref,
+    tile_ids_ref,
+    group_starts_ref,
     sched_dma_sem,
     local_dma_sem,
     remote_send_sems,
     remote_recv_sems,
     remote_sync_sems,
     group_slot_free_sems,
+    plan_vmem_ref,
+    block_table_vmem_ref,
+    tile_ids_vmem_ref,
+    group_starts_vmem_ref,
     sched_vmem_ref,
     q_vmem_ref,
     kv_vmem_ref,
@@ -616,11 +748,52 @@ def _run_pcp_page_groups_multi_head(
     next_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, next_rank)
     prev_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, prev_rank)
 
-    def _run_page_group(group_idx, kv_group_ref):
-        group_start = group_idx * pcp_size
+    ids_load = pltpu.make_async_copy(
+        src_ref=tile_ids_ref.at[:, :],
+        dst_ref=tile_ids_vmem_ref.at[:, :],
+        sem=sched_dma_sem,
+    )
+    ids_load.start()
+    ids_load.wait()
+    starts_load = pltpu.make_async_copy(
+        src_ref=group_starts_ref.at[:, :],
+        dst_ref=group_starts_vmem_ref.at[:, :],
+        sem=sched_dma_sem,
+    )
+    starts_load.start()
+    starts_load.wait()
+    tile_ids = tile_ids_vmem_ref[...]
+    group_starts = group_starts_vmem_ref[...]
 
-        _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sched_dma_sem,
-                            group_start)
+    def _run_page_group(group_idx, kv_group_ref):
+        tile_pos = _group_tile_position(group_starts, active_tiles, group_idx)
+        tile_id = _vector_lookup(tile_ids, tile_pos)
+        tile_group_start = _vector_lookup(group_starts, tile_pos)
+        group_in_tile = group_idx - tile_group_start
+
+        @pl.when(group_in_tile == 0)
+        def _load_tile_metadata():
+            _load_hbm_row(tile_plan_ref, plan_vmem_ref, sched_dma_sem, tile_id)
+            req_id = _tile_plan_value_static(plan_vmem_ref[...], 0,
+                                             TilePlanField.REQ_ID)
+            _load_hbm_row(block_tables_ref, block_table_vmem_ref,
+                          sched_dma_sem, req_id)
+
+        plan_values = plan_vmem_ref[...]
+        block_table_values = block_table_vmem_ref[...]
+
+        _stage_schedule_step_from_tile_plan(
+            plan_values,
+            block_table_values,
+            sched_vmem_ref,
+            group_in_tile,
+            jnp.array(0, dtype=jnp.int32),
+            state_mode=state_mode,
+            pcp_size=pcp_size,
+            page_size=kv_group_ref.shape[2],
+            interleave_size=interleave_size,
+            lane=lane,
+        )
         q_hbm_offset = sched_vmem_ref[my_id, lane, ScheduleField.Q_HBM_OFFSET]
         group_req_id = sched_vmem_ref[my_id, lane, ScheduleField.REQ_ID]
         group_o_hbm_offset = sched_vmem_ref[my_id, lane,
@@ -672,8 +845,18 @@ def _run_pcp_page_groups_multi_head(
                 q_tile_size,
             )
 
-        _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sched_dma_sem,
-                            group_start + my_id)
+        _stage_schedule_step_from_tile_plan(
+            plan_values,
+            block_table_values,
+            sched_vmem_ref,
+            group_in_tile,
+            my_id,
+            state_mode=state_mode,
+            pcp_size=pcp_size,
+            page_size=kv_group_ref.shape[2],
+            interleave_size=interleave_size,
+            lane=lane,
+        )
         _load_local_kv_page_block_all_heads_packed(
             kv_cache_ref,
             kv_group_ref,
@@ -697,8 +880,18 @@ def _run_pcp_page_groups_multi_head(
 
             @pl.when(round_idx > 0)
             def _load_round_schedule():
-                _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
-                                    sched_dma_sem, group_start + src_rank)
+                _stage_schedule_step_from_tile_plan(
+                    plan_values,
+                    block_table_values,
+                    sched_vmem_ref,
+                    group_in_tile,
+                    src_rank,
+                    state_mode=state_mode,
+                    pcp_size=pcp_size,
+                    page_size=kv_group_ref.shape[2],
+                    interleave_size=interleave_size,
+                    lane=lane,
+                )
 
             group_has_last = jnp.logical_or(
                 group_has_last,
@@ -839,10 +1032,13 @@ def _run_pcp_page_groups_multi_head(
 
 
 def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
-    active_page_groups_ref,
+    pass_meta_ref,
     q_ref,
     kv_cache_ref,
-    packed_schedule_ref,
+    tile_plan_ref,
+    block_tables_ref,
+    tile_ids_ref,
+    group_starts_ref,
     m_out_ref,
     l_out_ref,
     acc_out_ref,
@@ -852,6 +1048,10 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
     remote_recv_sems,
     remote_sync_sems,
     group_slot_free_sems,
+    plan_vmem_ref,
+    block_table_vmem_ref,
+    tile_ids_vmem_ref,
+    group_starts_vmem_ref,
     sched_vmem_ref,
     q_vmem_ref,
     kv_vmem_ref,
@@ -863,7 +1063,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
     interleave_size,
     num_lanes,
     q_compute_size,
-    num_page_groups,
+    num_tiles,
+    max_page_groups,
     sm_scale,
     kv_heads,
     packed_kv_groups,
@@ -876,19 +1077,27 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
 ):
     """Current-chunk causal PCP body that only materializes online state."""
     for lane in range(num_lanes):
-        active_page_groups = jnp.minimum(active_page_groups_ref[0],
-                                         num_page_groups)
+        active_tiles = jnp.minimum(pass_meta_ref[0], num_tiles)
+        active_page_groups = jnp.minimum(pass_meta_ref[1], max_page_groups)
         _run_pcp_page_groups_multi_head(
+            active_tiles,
             active_page_groups,
             q_ref,
             kv_cache_ref,
-            packed_schedule_ref,
+            tile_plan_ref,
+            block_tables_ref,
+            tile_ids_ref,
+            group_starts_ref,
             sched_dma_sem,
             local_dma_sem,
             remote_send_sems,
             remote_recv_sems,
             remote_sync_sems,
             group_slot_free_sems,
+            plan_vmem_ref,
+            block_table_vmem_ref,
+            tile_ids_vmem_ref,
+            group_starts_vmem_ref,
             sched_vmem_ref,
             q_vmem_ref,
             kv_vmem_ref,
@@ -918,10 +1127,13 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
 
 
 def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
-    active_page_groups_ref,
+    pass_meta_ref,
     q_ref,
     kv_cache_ref,
-    packed_schedule_ref,
+    tile_plan_ref,
+    block_tables_ref,
+    tile_ids_ref,
+    group_starts_ref,
     m_in_ref,
     l_in_ref,
     acc_in_ref,
@@ -932,6 +1144,10 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     remote_recv_sems,
     remote_sync_sems,
     group_slot_free_sems,
+    plan_vmem_ref,
+    block_table_vmem_ref,
+    tile_ids_vmem_ref,
+    group_starts_vmem_ref,
     sched_vmem_ref,
     q_vmem_ref,
     kv_vmem_ref,
@@ -943,7 +1159,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     interleave_size,
     num_lanes,
     q_compute_size,
-    num_page_groups,
+    num_tiles,
+    max_page_groups,
     sm_scale,
     kv_heads,
     packed_kv_groups,
@@ -962,19 +1179,27 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     still needed for QK.
     """
     for lane in range(num_lanes):
-        active_page_groups = jnp.minimum(active_page_groups_ref[0],
-                                         num_page_groups)
+        active_tiles = jnp.minimum(pass_meta_ref[0], num_tiles)
+        active_page_groups = jnp.minimum(pass_meta_ref[1], max_page_groups)
         _run_pcp_page_groups_multi_head(
+            active_tiles,
             active_page_groups,
             q_ref,
             kv_cache_ref,
-            packed_schedule_ref,
+            tile_plan_ref,
+            block_tables_ref,
+            tile_ids_ref,
+            group_starts_ref,
             sched_dma_sem,
             local_dma_sem,
             remote_send_sems,
             remote_recv_sems,
             remote_sync_sems,
             group_slot_free_sems,
+            plan_vmem_ref,
+            block_table_vmem_ref,
+            tile_ids_vmem_ref,
+            group_starts_vmem_ref,
             sched_vmem_ref,
             q_vmem_ref,
             kv_vmem_ref,
@@ -1004,16 +1229,20 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
 
 
 def _pcp_streaming_attention_zero_history_output_multi_head_kernel(
-    active_page_groups_ref,
+    pass_meta_ref,
     o_in_ref,
-    packed_schedule_ref,
+    tile_plan_ref,
+    tile_ids_ref,
+    group_starts_ref,
     m_in_ref,
     l_in_ref,
     acc_in_ref,
     o_ref,
     sched_dma_sem,
     local_dma_sem,
-    sched_vmem_ref,
+    plan_vmem_ref,
+    tile_ids_vmem_ref,
+    group_starts_vmem_ref,
     o_vmem_ref,
     m_scratch_ref,
     l_scratch_ref,
@@ -1021,7 +1250,7 @@ def _pcp_streaming_attention_zero_history_output_multi_head_kernel(
     *,
     pcp_size,
     num_lanes,
-    num_page_groups,
+    num_tiles,
     pcp_axis_name,
 ):
     """Write outputs for tiles whose current pass already covered all KV."""
@@ -1029,28 +1258,54 @@ def _pcp_streaming_attention_zero_history_output_multi_head_kernel(
     my_id = lax.axis_index(pcp_axis_name)
 
     for lane in range(num_lanes):
-        active_page_groups = jnp.minimum(active_page_groups_ref[0],
-                                         num_page_groups)
+        active_tiles = jnp.minimum(pass_meta_ref[0], num_tiles)
+        active_page_groups = pass_meta_ref[1]
+        ids_load = pltpu.make_async_copy(
+            src_ref=tile_ids_ref.at[:, :],
+            dst_ref=tile_ids_vmem_ref.at[:, :],
+            sem=sched_dma_sem,
+        )
+        ids_load.start()
+        ids_load.wait()
+        starts_load = pltpu.make_async_copy(
+            src_ref=group_starts_ref.at[:, :],
+            dst_ref=group_starts_vmem_ref.at[:, :],
+            sem=sched_dma_sem,
+        )
+        starts_load.start()
+        starts_load.wait()
+        tile_ids = tile_ids_vmem_ref[...]
+        group_starts = group_starts_vmem_ref[...]
 
         def _page_group_loop(group_idx, carry):
             del carry
-            group_start = group_idx * pcp_size
-            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
-                                sched_dma_sem, group_start)
-            group_req_id = sched_vmem_ref[my_id, lane, ScheduleField.REQ_ID]
-            group_load_q = sched_vmem_ref[my_id, lane,
-                                          ScheduleField.LOAD_Q] != 0
-            group_kv_global_start = sched_vmem_ref[
-                my_id, lane, ScheduleField.KV_GLOBAL_START]
-            group_q_hbm_offset = sched_vmem_ref[my_id, lane,
-                                                ScheduleField.Q_HBM_OFFSET]
-            group_o_hbm_offset = sched_vmem_ref[my_id, lane,
-                                                ScheduleField.O_HBM_OFFSET]
-            group_q_tile_size = sched_vmem_ref[my_id, lane,
-                                               ScheduleField.Q_TILE_SIZE]
+            tile_pos = _group_tile_position(group_starts, active_tiles,
+                                            group_idx)
+            tile_id = _vector_lookup(tile_ids, tile_pos)
+            tile_group_start = _vector_lookup(group_starts, tile_pos)
+            group_in_tile = group_idx - tile_group_start
+
+            @pl.when(group_in_tile == 0)
+            def _load_tile_metadata():
+                _load_hbm_row(tile_plan_ref, plan_vmem_ref, sched_dma_sem,
+                              tile_id)
+
+            plan_values = plan_vmem_ref[...]
+            history_effective = _tile_plan_value(
+                plan_values, my_id, TilePlanField.HISTORY_EFFECTIVE_PAGES)
+            effective_pages = _tile_plan_value(plan_values, my_id,
+                                               TilePlanField.EFFECTIVE_PAGES)
+            history_cut_pages = _tile_plan_value(
+                plan_values, my_id, TilePlanField.HISTORY_CUT_PAGES)
+            group_q_hbm_offset = _tile_plan_value(plan_values, my_id,
+                                                  TilePlanField.Q_HBM_OFFSET)
+            group_o_hbm_offset = group_q_hbm_offset
+            group_q_tile_size = _tile_plan_value(plan_values, my_id,
+                                                 TilePlanField.Q_TILE_SIZE)
+            has_current_page = effective_pages > history_cut_pages
             write_zero_history = jnp.logical_and(
-                jnp.logical_and(group_req_id != -1, group_load_q),
-                group_kv_global_start == 0,
+                group_in_tile == 0,
+                jnp.logical_and(has_current_page, history_effective == 0),
             )
             store_q_tile_size = jnp.where(write_zero_history,
                                           group_q_tile_size, 0)
@@ -1092,8 +1347,11 @@ def _pcp_streaming_attention_zero_history_output_multi_head_kernel(
 def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         q_multi_head,
         kv_cache_local,
-        packed_schedule,
-        active_page_groups,
+        tile_plan,
+        block_tables,
+        tile_ids,
+        group_starts,
+        pass_meta,
         *,
         pcp_size: int,
         q_block_size: int,
@@ -1115,12 +1373,11 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
     head_dim = q_multi_head.shape[-1]
     packed_kv_groups = kv_cache_local.shape[3]
     kv_packing = kv_cache_local.shape[4]
-    num_page_groups = packed_schedule.shape[0] // pcp_size
-    num_lanes = packed_schedule.shape[2]
+    num_tiles = tile_plan.shape[0]
+    max_page_groups = num_tiles * block_tables.shape[1]
+    num_lanes = 1
     q_compute_size = _normalize_q_compute_size(q_block_size, q_compute_size)
-    active_page_groups = jnp.asarray(active_page_groups, dtype=jnp.int32)
-    if active_page_groups.shape == ():
-        active_page_groups = active_page_groups[None]
+    pass_meta = jnp.asarray(pass_meta, dtype=jnp.int32)
 
     state_lm_hbm_shape = (
         kv_heads,
@@ -1143,7 +1400,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             interleave_size=interleave_size,
             num_lanes=num_lanes,
             q_compute_size=q_compute_size,
-            num_page_groups=num_page_groups,
+            num_tiles=num_tiles,
+            max_page_groups=max_page_groups,
             sm_scale=sm_scale,
             kv_heads=kv_heads,
             packed_kv_groups=packed_kv_groups,
@@ -1165,6 +1423,9 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             ],
             out_specs=(
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
@@ -1178,9 +1439,13 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
                 pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
                 pltpu.SemaphoreType.REGULAR((num_lanes, pcp_size - 1)),
                 pltpu.SemaphoreType.REGULAR((num_lanes, )),
+                pltpu.VMEM(tile_plan.shape[1:], tile_plan.dtype),
+                pltpu.VMEM(block_tables.shape[1:], block_tables.dtype),
+                pltpu.VMEM(tile_ids.shape, tile_ids.dtype),
+                pltpu.VMEM(group_starts.shape, group_starts.dtype),
                 pltpu.VMEM(
                     (pcp_size, num_lanes, ScheduleField.PACKED_NUM_FIELDS),
-                    packed_schedule.dtype),
+                    tile_plan.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
                 pltpu.VMEM((2, kv_pages_per_block, page_size, packed_kv_groups,
@@ -1194,17 +1459,21 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes),
         name="pcp_streaming_attention_current_state_page_groups_multi_head",
-    )(active_page_groups, q_multi_head, kv_cache_local, packed_schedule)
+    )(pass_meta, q_multi_head, kv_cache_local, tile_plan, block_tables,
+      tile_ids, group_starts)
 
 
 def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         q_multi_head,
         kv_cache_local,
-        packed_schedule,
+        tile_plan,
+        block_tables,
+        tile_ids,
+        group_starts,
         m_state,
         l_state,
         acc_state,
-        active_page_groups,
+        pass_meta,
         *,
         pcp_size: int,
         q_block_size: int,
@@ -1225,12 +1494,11 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
     head_dim = q_multi_head.shape[-1]
     packed_kv_groups = kv_cache_local.shape[3]
     kv_packing = kv_cache_local.shape[4]
-    num_page_groups = packed_schedule.shape[0] // pcp_size
-    num_lanes = packed_schedule.shape[2]
+    num_tiles = tile_plan.shape[0]
+    max_page_groups = num_tiles * block_tables.shape[1]
+    num_lanes = 1
     q_compute_size = _normalize_q_compute_size(q_block_size, q_compute_size)
-    active_page_groups = jnp.asarray(active_page_groups, dtype=jnp.int32)
-    if active_page_groups.shape == ():
-        active_page_groups = active_page_groups[None]
+    pass_meta = jnp.asarray(pass_meta, dtype=jnp.int32)
 
     state_lm_scratch_shape = (
         kv_heads,
@@ -1246,7 +1514,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             interleave_size=interleave_size,
             num_lanes=num_lanes,
             q_compute_size=q_compute_size,
-            num_page_groups=num_page_groups,
+            num_tiles=num_tiles,
+            max_page_groups=max_page_groups,
             sm_scale=sm_scale,
             kv_heads=kv_heads,
             packed_kv_groups=packed_kv_groups,
@@ -1267,6 +1536,9 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
@@ -1276,9 +1548,13 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
                 pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
                 pltpu.SemaphoreType.REGULAR((num_lanes, pcp_size - 1)),
                 pltpu.SemaphoreType.REGULAR((num_lanes, )),
+                pltpu.VMEM(tile_plan.shape[1:], tile_plan.dtype),
+                pltpu.VMEM(block_tables.shape[1:], block_tables.dtype),
+                pltpu.VMEM(tile_ids.shape, tile_ids.dtype),
+                pltpu.VMEM(group_starts.shape, group_starts.dtype),
                 pltpu.VMEM(
                     (pcp_size, num_lanes, ScheduleField.PACKED_NUM_FIELDS),
-                    packed_schedule.dtype),
+                    tile_plan.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
                 pltpu.VMEM((2, kv_pages_per_block, page_size, packed_kv_groups,
@@ -1293,17 +1569,19 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes),
         input_output_aliases={1: 0},
         name="pcp_streaming_attention_history_output_page_groups_multi_head",
-    )(active_page_groups, q_multi_head, kv_cache_local, packed_schedule,
-      m_state, l_state, acc_state)
+    )(pass_meta, q_multi_head, kv_cache_local, tile_plan, block_tables,
+      tile_ids, group_starts, m_state, l_state, acc_state)
 
 
 def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
     o_multi_head,
-    packed_schedule,
+    tile_plan,
+    tile_ids,
+    group_starts,
     m_state,
     l_state,
     acc_state,
-    active_page_groups,
+    pass_meta,
     *,
     pcp_size: int,
     q_block_size: int,
@@ -1312,11 +1590,9 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
     kv_heads = o_multi_head.shape[1]
     q_per_kv = o_multi_head.shape[2]
     head_dim = o_multi_head.shape[-1]
-    num_page_groups = packed_schedule.shape[0] // pcp_size
-    num_lanes = packed_schedule.shape[2]
-    active_page_groups = jnp.asarray(active_page_groups, dtype=jnp.int32)
-    if active_page_groups.shape == ():
-        active_page_groups = active_page_groups[None]
+    num_tiles = tile_plan.shape[0]
+    num_lanes = 1
+    pass_meta = jnp.asarray(pass_meta, dtype=jnp.int32)
 
     state_lm_scratch_shape = (
         kv_heads,
@@ -1330,7 +1606,7 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
             _pcp_streaming_attention_zero_history_output_multi_head_kernel,
             pcp_size=pcp_size,
             num_lanes=num_lanes,
-            num_page_groups=num_page_groups,
+            num_tiles=num_tiles,
             pcp_axis_name=pcp_axis_name,
         ),
         out_shape=jax.ShapeDtypeStruct(o_multi_head.shape, o_multi_head.dtype),
@@ -1342,14 +1618,16 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
-                pltpu.VMEM(
-                    (pcp_size, num_lanes, ScheduleField.PACKED_NUM_FIELDS),
-                    packed_schedule.dtype),
+                pltpu.VMEM(tile_plan.shape[1:], tile_plan.dtype),
+                pltpu.VMEM(tile_ids.shape, tile_ids.dtype),
+                pltpu.VMEM(group_starts.shape, group_starts.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            o_multi_head.dtype),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
@@ -1362,8 +1640,8 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes, ),
         input_output_aliases={1: 0},
         name="pcp_streaming_attention_zero_history_output_multi_head",
-    )(active_page_groups, o_multi_head, packed_schedule, m_state, l_state,
-      acc_state)
+    )(pass_meta, o_multi_head, tile_plan, tile_ids, group_starts, m_state,
+      l_state, acc_state)
 
 
 def pcp_streaming_attention_page_groups_packed_local_from_metadata(
@@ -1436,30 +1714,34 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
                                v_scale=v_scale)
 
     page_size = kv_cache_local.shape[1]
-    (current_schedule, current_active_page_groups, history_schedule,
-     history_active_page_groups) = (
-         build_pcp_streaming_schedule_inputs_from_metadata_jax(
-             kv_lens=kv_lens,
-             page_indices=page_indices,
-             cu_q_lens=cu_q_lens,
-             distribution=distribution,
-             global_bucket_tokens=q_local.shape[0] * pcp_size,
-             local_kv_cache_num_blocks=kv_cache_local.shape[0],
-             page_size=page_size,
-             pcp_size=pcp_size,
-             interleave_size=interleave_size,
-             q_block_size=q_block_size,
-             max_context_tokens=max_context_tokens,
-             num_lanes=num_lanes,
-             kv_pages_per_block=kv_pages_per_block,
-         ))
+    (tile_plan, block_tables, current_tile_ids, current_group_starts,
+     current_meta, history_tile_ids, history_group_starts,
+     history_meta) = (build_pcp_streaming_schedule_inputs_from_metadata_jax(
+         kv_lens=kv_lens,
+         page_indices=page_indices,
+         cu_q_lens=cu_q_lens,
+         distribution=distribution,
+         global_bucket_tokens=q_local.shape[0] * pcp_size,
+         local_kv_cache_num_blocks=kv_cache_local.shape[0],
+         page_size=page_size,
+         pcp_size=pcp_size,
+         interleave_size=interleave_size,
+         q_block_size=q_block_size,
+         max_context_tokens=max_context_tokens,
+         num_lanes=num_lanes,
+         kv_pages_per_block=kv_pages_per_block,
+         compact=True,
+     ))
 
     m_state, l_state, acc_state = (
         _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             q_local,
             kv_cache_local[None, ...],
-            current_schedule,
-            current_active_page_groups,
+            tile_plan,
+            block_tables,
+            current_tile_ids,
+            current_group_starts,
+            current_meta,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             q_block_size=q_block_size,
@@ -1475,11 +1757,14 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             q_local,
             kv_cache_local[None, ...],
-            history_schedule,
+            tile_plan,
+            block_tables,
+            history_tile_ids,
+            history_group_starts,
             m_state,
             l_state,
             acc_state,
-            history_active_page_groups,
+            history_meta,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             q_block_size=q_block_size,
@@ -1493,11 +1778,13 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         ))
     return _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
         history_output,
-        current_schedule,
+        tile_plan,
+        current_tile_ids,
+        current_group_starts,
         m_state,
         l_state,
         acc_state,
-        current_active_page_groups,
+        current_meta,
         pcp_size=pcp_size,
         q_block_size=q_block_size,
         pcp_axis_name=pcp_axis_name,

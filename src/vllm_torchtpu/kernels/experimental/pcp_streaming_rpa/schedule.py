@@ -40,6 +40,23 @@ class ScheduleField:
     MAX_KV_PAGES_PER_BLOCK = PACKED_NUM_FIELDS - KV_PAGE_INDICES_START
 
 
+class TilePlanField:
+    """Fields stored once per query tile and PCP consumer rank."""
+
+    REQ_ID = 0
+    KV_LEN = 1
+    Q_GLOBAL_START = 2
+    Q_HBM_OFFSET = 3
+    Q_TILE_SIZE = 4
+    EFFECTIVE_PAGES = 5
+    HISTORY_CUT_PAGES = 6
+    HISTORY_EFFECTIVE_PAGES = 7
+    CURRENT_NUM_GROUPS = 8
+    HISTORY_NUM_GROUPS = 9
+    NUM_FIELDS = 10
+    HBM_ROW_FIELDS = 128
+
+
 _PACKED_FIELD_NAMES = (
     "req_id",
     "kv_page_rank",
@@ -443,6 +460,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     max_context_tokens: int | None = None,
     num_lanes: int = 1,
     kv_pages_per_block: int = 1,
+    compact: bool = False,
 ):
     """Build current/history packed schedules with pure JAX ops.
 
@@ -883,6 +901,68 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     current_scheduled_steps = (
         (current_max_remaining_pages + pcp_size_i32 - 1) // pcp_size_i32 *
         pcp_size_i32)
+
+    if compact:
+        current_num_groups = current_scheduled_steps // pcp_size_i32
+        history_num_groups = history_scheduled_steps // pcp_size_i32
+        num_tiles = tile_req_ids.shape[0]
+
+        def _broadcast_tile(values):
+            return jnp.broadcast_to(values[:, None], (num_tiles, pcp_size))
+
+        logical_plan = jnp.stack(
+            (
+                _broadcast_tile(tile_req_ids),
+                _broadcast_tile(tile_kv_lens),
+                tile_q_global_starts,
+                tile_q_hbm_offsets,
+                tile_q_sizes,
+                tile_effective_pages_by_rank,
+                _broadcast_tile(history_cut_pages),
+                history_effective_pages_by_rank,
+                _broadcast_tile(current_num_groups),
+                _broadcast_tile(history_num_groups),
+            ),
+            axis=-1,
+        ).reshape(num_tiles, 1, pcp_size * TilePlanField.NUM_FIELDS)
+        packed_plan_fields = _cdiv(
+            pcp_size * TilePlanField.NUM_FIELDS,
+            TilePlanField.HBM_ROW_FIELDS,
+        ) * TilePlanField.HBM_ROW_FIELDS
+        tile_plan = jnp.zeros((num_tiles, 1, packed_plan_fields),
+                              dtype=jnp.int32)
+        tile_plan = tile_plan.at[..., :logical_plan.shape[-1]].set(
+            logical_plan)
+
+        index_capacity = _cdiv(
+            num_tiles,
+            TilePlanField.HBM_ROW_FIELDS,
+        ) * TilePlanField.HBM_ROW_FIELDS
+
+        def _compact_pass(num_groups):
+            active = num_groups > 0
+            active_count = jnp.sum(active, dtype=jnp.int32)
+            tile_ids = jnp.nonzero(active, size=num_tiles,
+                                   fill_value=0)[0].astype(jnp.int32)
+            positions = jnp.arange(num_tiles, dtype=jnp.int32)
+            compact_groups = jnp.where(positions < active_count,
+                                       num_groups[tile_ids], 0)
+            group_starts = jnp.cumsum(compact_groups) - compact_groups
+
+            padded_ids = jnp.zeros((1, index_capacity), dtype=jnp.int32)
+            padded_ids = padded_ids.at[0, :num_tiles].set(tile_ids)
+            padded_starts = jnp.zeros((1, index_capacity), dtype=jnp.int32)
+            padded_starts = padded_starts.at[0, :num_tiles].set(group_starts)
+            meta = jnp.stack((active_count, jnp.sum(num_groups,
+                                                    dtype=jnp.int32)))
+            return padded_ids, padded_starts, meta
+
+        current_ids, current_starts, current_meta = _compact_pass(
+            current_num_groups)
+        history_ids, history_starts, history_meta = _compact_pass(
+            history_num_groups)
+        return (tile_plan, block_tables, current_ids, current_starts,
+                current_meta, history_ids, history_starts, history_meta)
 
     current_schedule, current_active_page_groups = _pack_schedule(
         history_cut_pages,

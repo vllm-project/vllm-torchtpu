@@ -25,7 +25,7 @@ from schedule_reference import \
     generate_pcp_streaming_schedule_reference  # noqa: E402
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
-    PcpStreamingSchedule, ScheduleField,
+    PcpStreamingSchedule, ScheduleField, TilePlanField,
     build_pcp_streaming_active_page_groups,
     build_pcp_streaming_schedule_inputs_from_metadata_host,
     build_pcp_streaming_schedule_inputs_from_metadata_jax,
@@ -803,6 +803,156 @@ def test_metadata_schedule_inputs_return_kernel_arrays():
     assert int(active_page_groups[0]) > 0
     assert packed_schedule.shape[0] >= int(active_page_groups[0]) * 2
     assert packed_schedule.shape[0] % 2 == 0
+
+
+def test_metadata_jax_compact_plan_tracks_group_starts():
+    pcp_size = 2
+    (tile_plan, block_tables, current_ids, current_starts, current_meta,
+     history_ids, history_starts,
+     history_meta) = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+         kv_lens=np.array([23, 8], dtype=np.int32),
+         page_indices=np.arange(32, dtype=np.int32),
+         cu_q_lens=np.array([0, 8, 8], dtype=np.int32),
+         distribution=np.array([0, 0, 1], dtype=np.int32),
+         global_bucket_tokens=8,
+         local_kv_cache_num_blocks=16,
+         page_size=4,
+         pcp_size=pcp_size,
+         interleave_size=2,
+         q_block_size=4,
+         max_context_tokens=128,
+         compact=True,
+     )
+
+    tile_plan = np.asarray(tile_plan)
+    logical = tile_plan[:, 0, :pcp_size * TilePlanField.NUM_FIELDS].reshape(
+        tile_plan.shape[0], pcp_size, TilePlanField.NUM_FIELDS)
+    assert tile_plan.shape == (6, 1, TilePlanField.HBM_ROW_FIELDS)
+    assert np.asarray(block_tables).shape == (2, 16)
+
+    for ids, starts, meta, field in (
+        (current_ids, current_starts, current_meta,
+         TilePlanField.CURRENT_NUM_GROUPS),
+        (history_ids, history_starts, history_meta,
+         TilePlanField.HISTORY_NUM_GROUPS),
+    ):
+        groups = logical[:, 0, field]
+        expected_ids = np.flatnonzero(groups > 0)
+        expected_starts = np.cumsum(
+            groups[expected_ids]) - groups[expected_ids]
+        count = int(np.asarray(meta)[0])
+        np.testing.assert_array_equal(np.asarray(ids)[0, :count], expected_ids)
+        np.testing.assert_array_equal(
+            np.asarray(starts)[0, :count], expected_starts)
+        assert int(np.asarray(meta)[1]) == int(groups.sum())
+
+
+def test_metadata_jax_compact_plan_reconstructs_dense_schedule():
+    pcp_size = 2
+    page_size = 4
+    interleave_size = 2
+    kwargs = dict(
+        kv_lens=np.array([23, 8], dtype=np.int32),
+        page_indices=np.arange(32, dtype=np.int32),
+        cu_q_lens=np.array([0, 8, 8], dtype=np.int32),
+        distribution=np.array([0, 0, 1], dtype=np.int32),
+        global_bucket_tokens=8,
+        local_kv_cache_num_blocks=16,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        q_block_size=4,
+        max_context_tokens=128,
+    )
+    (current_dense, current_active, history_dense,
+     history_active) = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+         **kwargs)
+    (tile_plan, block_tables, current_ids, _current_starts, current_meta,
+     history_ids, _history_starts, history_meta
+     ) = build_pcp_streaming_schedule_inputs_from_metadata_jax(**kwargs,
+                                                               compact=True)
+
+    logical = np.asarray(tile_plan)[:, 0, :pcp_size *
+                                    TilePlanField.NUM_FIELDS].reshape(
+                                        tile_plan.shape[0], pcp_size,
+                                        TilePlanField.NUM_FIELDS)
+    block_tables = np.asarray(block_tables)
+
+    def _valid_len(kv_len, local_page_idx, source_rank):
+        cycle = pcp_size * interleave_size
+        base = (local_page_idx * page_size * pcp_size +
+                source_rank * interleave_size)
+        delta = kv_len - base
+        chunks_per_page = page_size // interleave_size
+        full_chunks = min(chunks_per_page, max(delta, 0) // cycle)
+        partial = min(interleave_size, max(delta - full_chunks * cycle, 0))
+        return (full_chunks * interleave_size +
+                (partial if full_chunks < chunks_per_page else 0)
+                if kv_len > base else 0)
+
+    def _materialize(tile_ids, meta, state_mode):
+        rows = []
+        active_tiles = int(np.asarray(meta)[0])
+        for tile_id in np.asarray(tile_ids)[0, :active_tiles]:
+            plan = logical[int(tile_id)]
+            req_id = int(plan[0, TilePlanField.REQ_ID])
+            kv_len = int(plan[0, TilePlanField.KV_LEN])
+            if state_mode == "current":
+                page_start = int(plan[0, TilePlanField.HISTORY_CUT_PAGES])
+                effective_field = TilePlanField.EFFECTIVE_PAGES
+                groups_field = TilePlanField.CURRENT_NUM_GROUPS
+            else:
+                page_start = 0
+                effective_field = TilePlanField.HISTORY_EFFECTIVE_PAGES
+                groups_field = TilePlanField.HISTORY_NUM_GROUPS
+            num_groups = int(plan[0, groups_field])
+
+            for group_in_tile in range(num_groups):
+                local_page_idx = page_start // pcp_size + group_in_tile
+                page_idx = block_tables[
+                    req_id,
+                    min(local_page_idx, block_tables.shape[1] - 1)]
+                for source_rank in range(pcp_size):
+                    step_offset = group_in_tile * pcp_size + source_rank
+                    global_page = page_start + step_offset
+                    kv_global_start = (local_page_idx * page_size * pcp_size +
+                                       source_rank * interleave_size)
+                    valid_len = _valid_len(kv_len, local_page_idx, source_rank)
+                    row = np.zeros((pcp_size, 1, ScheduleField.NUM_FIELDS),
+                                   dtype=np.int32)
+                    for consumer_rank in range(pcp_size):
+                        effective = int(plan[consumer_rank, effective_field])
+                        valid = global_page < effective
+                        is_first = valid and step_offset == 0
+                        is_last = valid and global_page == effective - 1
+                        row[consumer_rank, 0] = (
+                            req_id if valid else -1,
+                            source_rank,
+                            page_idx if valid else 0,
+                            is_first,
+                            is_last,
+                            is_first,
+                            plan[consumer_rank, TilePlanField.Q_GLOBAL_START],
+                            kv_global_start,
+                            valid_len if valid else 0,
+                            plan[consumer_rank, TilePlanField.Q_HBM_OFFSET],
+                            plan[consumer_rank, TilePlanField.Q_TILE_SIZE],
+                            plan[consumer_rank, TilePlanField.Q_HBM_OFFSET],
+                        )
+                    rows.append(row)
+        return np.stack(rows)
+
+    for dense, active, ids, meta, mode in (
+        (current_dense, current_active, current_ids, current_meta, "current"),
+        (history_dense, history_active, history_ids, history_meta, "history"),
+    ):
+        actual = _materialize(ids, meta, mode)
+        active_steps = int(np.asarray(active)[0]) * pcp_size
+        assert actual.shape[0] == active_steps
+        np.testing.assert_array_equal(
+            actual,
+            np.asarray(dense)[:active_steps, :, :, :ScheduleField.NUM_FIELDS],
+        )
 
 
 @pytest.mark.parametrize(
