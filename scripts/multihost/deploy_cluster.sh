@@ -100,7 +100,7 @@ fi
 # --- STEP 2: Distribute the script ---
 echo "📦 Distributing '${SCRIPT_PATH}' to all hosts..."
 REMOTE_HOME_DIR="~"
-REMOTE_SCRIPT_DIR="${REMOTE_HOME_DIR}/torchtpu-vllm/scripts/multihost"
+REMOTE_SCRIPT_DIR="${REMOTE_HOME_DIR}/vllm-torchtpu/scripts/multihost"
 REMOTE_SCRIPT_PATH="${REMOTE_SCRIPT_DIR}/run_cluster.sh"
 SSH_OPTIONS="-o StrictHostKeyChecking=no -o BatchMode=yes"
 
