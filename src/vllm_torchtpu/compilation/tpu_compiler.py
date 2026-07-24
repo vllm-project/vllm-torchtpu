@@ -8,6 +8,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 
 import copy
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -28,6 +29,50 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _get_cache_auth_key() -> bytes:
+    key_str = os.environ.get("VLLM_TORCHTPU_CACHE_KEY", "")
+    if key_str:
+        return key_str.encode("utf-8")
+    machine_id = ""
+    try:
+        if os.path.exists("/etc/machine-id"):
+            with open("/etc/machine-id", "r") as f:
+                machine_id = f.read().strip()
+    except Exception:
+        pass
+    user_id = str(os.getuid()) if hasattr(os, "getuid") else "0"
+    base_secret = f"vllm-torchtpu-cache-auth-{machine_id}-{user_id}".encode(
+        "utf-8")
+    return hashlib.sha256(base_secret).digest()
+
+
+_CACHE_AUTH_KEY: bytes = _get_cache_auth_key()
+
+
+def _save_signed_cache(obj: Any, path: str) -> None:
+    raw = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    sig = hmac.new(_CACHE_AUTH_KEY, raw, hashlib.sha256).digest()
+    with open(path, "wb") as f:
+        f.write(sig + raw)
+
+
+def _load_signed_cache(path: str) -> Any:
+    with open(path, "rb") as f:
+        data = f.read()
+    sig_len = 32
+    if len(data) < sig_len:
+        raise ValueError(
+            f"Cache file {path} too short for HMAC authentication")
+    sig, raw = data[:sig_len], data[sig_len:]
+    expected_sig = hmac.new(_CACHE_AUTH_KEY, raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(sig, expected_sig):
+        raise ValueError(
+            f"Cache file {path} HMAC authentication failed: potential tampering detected"
+        )
+    return pickle.loads(raw)
+
 
 # Type alias for the compile range tuple
 Range = tuple[int, int]
@@ -336,8 +381,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 inner_exe = _tpu_backend._compiled_executables[-1]
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                with open(save_path, "wb") as f:
-                    pickle.dump(inner_exe, f)
+                _save_signed_cache(inner_exe, save_path)
                 handle = (key, save_path, was_wrapped)
                 logger.info(
                     "[TpuCompilerAdaptor] Saved compiled executable to %s",
@@ -369,8 +413,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
                     path)
 
-        with open(path, "rb") as f:
-            inner_exe = pickle.load(f)
+        inner_exe = _load_signed_cache(path)
 
         # Re-create the aot_autograd wrapper around the cached executable.
         # The current torch_tpu executable already handles non-tensor argument
