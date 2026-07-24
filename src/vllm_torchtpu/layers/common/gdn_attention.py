@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 from jax.experimental.layout import Layout, with_layout_constraint
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper as ragged_gated_delta_rule_wrapper
@@ -496,8 +497,11 @@ def _derive_pcp_ragged_exchange_descriptors(
     )
     run_ids = (jnp.cumsum(run_starts.astype(jnp.int32), axis=1) - 1)
 
-    # A request contributes at most one more run than ceil(local_tokens / I).
-    # Summed over requests, this bound covers partial first and last chunks.
+    # For one request and rank, every run is an interleave chunk. All chunks
+    # except the first and last have I tokens, so their count is at most
+    # ceil(local_tokens / I) + 1. Summing that per-request bound and using
+    # sum(ceil(n_r / I)) <= ceil(sum(n_r) / I) + R - 1 gives the looser static
+    # bound ceil(local_padded_tokens / I) + 2R used below.
     max_runs = (
         (local_padded_num_tokens + interleave_size - 1) // interleave_size +
         2 * max_num_requests)
@@ -522,6 +526,16 @@ def _derive_pcp_ragged_exchange_descriptors(
     return jax.vmap(_summarize_rank)(rank_major, valid, run_starts, run_ids)
 
 
+def _validate_pcp_ragged_exchange_layout_support() -> None:
+    generation = pltpu.get_tpu_info().generation
+    # TODO: Validate this explicit tiled layout on TPU v4/v5e/v6 and relax
+    # this guard once compile and numerical coverage exists for those targets.
+    if generation != 7:
+        raise NotImplementedError(
+            "GDN PCP ragged exchange layout is only validated on TPU "
+            f"generation 7, got generation {generation}.")
+
+
 def _ragged_exchange_pcp_token_shards_for_head_shards(
     tensor: jnp.ndarray,
     pcp_axis: str,
@@ -530,6 +544,7 @@ def _ragged_exchange_pcp_token_shards_for_head_shards(
     send_sizes_by_rank: jnp.ndarray,
 ) -> jnp.ndarray:
     """Exchange contiguous token runs directly into request-major order."""
+    _validate_pcp_ragged_exchange_layout_support()
     if tensor.ndim != 2:
         raise ValueError("PCP ragged exchange expects a rank-2 tensor.")
     if tensor.shape[1] % pcp_size != 0:

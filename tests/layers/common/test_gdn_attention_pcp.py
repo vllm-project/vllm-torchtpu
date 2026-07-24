@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -24,14 +26,25 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     pcp_local_token_counts as _pcp_local_token_counts
 from vllm_torchtpu.layers.common.gdn_attention import (
-    GdnAttentionConfig, _derive_pcp_rank_major_reorder_indices,
+    GdnAttentionConfig, _derive_pcp_ragged_exchange_descriptors,
+    _derive_pcp_rank_major_reorder_indices,
     _exchange_pcp_token_shards_for_head_shards,
-    _select_replicated_shard_for_pcp_rank, run_jax_gdn_attention_local,
+    _select_replicated_shard_for_pcp_rank,
+    _validate_pcp_ragged_exchange_layout_support, run_jax_gdn_attention_local,
     run_jax_gdn_attention_pcp_tp_prefill)
 from vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
 from vllm_torchtpu.layers.common.utils import (
     inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
+
+_GDN_PCP_NUMERICAL_CASES = (
+    pytest.param(2, (10, 10), 4, None, id="pcp2-multi-request-padding"),
+    pytest.param(4, (17, 15), 4, None, id="pcp4-uneven-rank-split"),
+    pytest.param(4, (10, 10), 4, (7, 22), id="pcp4-chunk-continuation"),
+)
+
+_GDN_PCP_DESCRIPTOR_CASES = _GDN_PCP_NUMERICAL_CASES + (pytest.param(
+    8, (5, 7, 3, 9), 2, (1, 6, 13, 29), id="pcp8-fragmented-descriptors"), )
 
 
 def test_pcp_gdn_helpers_are_available():
@@ -177,6 +190,97 @@ def test_derive_pcp_rank_major_reorder_indices_uses_chunk_offsets():
     np.testing.assert_array_equal(np.array(actual), expected.astype(np.int32))
 
 
+@pytest.mark.parametrize(
+    ("pcp_size", "lengths", "interleave_size", "token_start_offsets"),
+    _GDN_PCP_DESCRIPTOR_CASES,
+)
+def test_derive_pcp_ragged_exchange_descriptors_reconstructs_reorder(
+        pcp_size, lengths, interleave_size, token_start_offsets):
+    lengths = np.asarray(lengths, dtype=np.int32)
+    offsets = (None if token_start_offsets is None else np.asarray(
+        token_start_offsets, dtype=np.int32))
+    local_counts = _pcp_local_token_counts(
+        lengths,
+        pcp_size,
+        interleave_size,
+        token_start_offsets_per_req=offsets,
+    )
+    local_padded_num_tokens = int(local_counts.max())
+    query_start_loc = jnp.asarray(
+        np.concatenate(([0], np.cumsum(lengths, dtype=np.int32))),
+        dtype=jnp.int32,
+    )
+    seq_lens = None
+    if offsets is not None:
+        seq_lens = jnp.asarray(offsets + lengths, dtype=jnp.int32)
+
+    reorder = _derive_pcp_rank_major_reorder_indices(
+        query_start_loc,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        local_padded_num_tokens=local_padded_num_tokens,
+        seq_lens=seq_lens,
+    )
+    input_starts, sizes, output_starts = (
+        _derive_pcp_ragged_exchange_descriptors(
+            reorder,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            local_padded_num_tokens=local_padded_num_tokens,
+            max_num_requests=len(lengths),
+        ))
+
+    reconstructed = np.full(
+        (pcp_size * local_padded_num_tokens, ),
+        -1,
+        dtype=np.int32,
+    )
+    input_starts = np.asarray(input_starts)
+    sizes = np.asarray(sizes)
+    output_starts = np.asarray(output_starts)
+    for rank in range(pcp_size):
+        rank_base = rank * local_padded_num_tokens
+        for input_start, size, output_start in zip(input_starts[rank],
+                                                   sizes[rank],
+                                                   output_starts[rank]):
+            size = int(size)
+            if size == 0:
+                continue
+            dst_start = rank_base + int(input_start)
+            reconstructed[dst_start:dst_start + size] = np.arange(
+                int(output_start),
+                int(output_start) + size,
+                dtype=np.int32,
+            )
+
+    np.testing.assert_array_equal(reconstructed, np.asarray(reorder))
+    assert int(sizes.sum()) == int(lengths.sum())
+
+
+def test_pcp_ragged_exchange_layout_accepts_tpu_generation_7(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.common.gdn_attention.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(generation=7),
+    )
+
+    _validate_pcp_ragged_exchange_layout_support()
+
+
+@pytest.mark.parametrize("generation", (4, 5, 6, 8))
+def test_pcp_ragged_exchange_layout_rejects_unvalidated_tpu_generation(
+        monkeypatch, generation):
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.common.gdn_attention.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(generation=generation),
+    )
+
+    with pytest.raises(
+            NotImplementedError,
+            match="only validated on TPU generation 7",
+    ):
+        _validate_pcp_ragged_exchange_layout_support()
+
+
 def _require_tpu_devices(min_count, reason):
     devices = jax.local_devices()
     if len(devices) < min_count or devices[0].platform != 'tpu':
@@ -184,17 +288,25 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
-    _require_tpu_devices(2, 'GDN PCP numerical test requires two TPU devices.')
-    pcp_size = 2
-    interleave_size = 16
-    lengths = [32]
+@pytest.mark.parametrize(
+    ("pcp_size", "lengths", "interleave_size", "token_start_offsets"),
+    _GDN_PCP_NUMERICAL_CASES,
+)
+def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
+        pcp_size, lengths, interleave_size, token_start_offsets):
+    _require_tpu_devices(
+        pcp_size,
+        f"GDN PCP numerical test requires {pcp_size} TPU devices.",
+    )
+    lengths = np.asarray(lengths, dtype=np.int32)
+    offsets = (None if token_start_offsets is None else np.asarray(
+        token_start_offsets, dtype=np.int32))
     n_kq = 4
     n_v = 4
     d_k = 64
     d_v = 64
     kernel_size = 4
-    num_tokens = sum(lengths)
+    num_tokens = int(lengths.sum())
     num_blocks = len(lengths) + 1
     dim = 2 * n_kq * d_k + n_v * d_v
     qkv_split_sizes = [n_kq * d_k, n_kq * d_k, n_v * d_v]
@@ -214,19 +326,30 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
     A_log0 = jax.random.normal(keys[5], (n_v, ), dtype=jnp.float32)
     dt_bias0 = jax.random.normal(keys[6], (n_v, ), dtype=jnp.float32)
 
-    query_start_loc = jnp.array([0, num_tokens], dtype=jnp.int32)
-    state_indices = jnp.array([1], dtype=jnp.int32)
-    distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
-    seq_lens = jnp.array(lengths, dtype=jnp.int32)
+    query_start_loc = jnp.asarray(
+        np.concatenate(([0], np.cumsum(lengths, dtype=np.int32))),
+        dtype=jnp.int32,
+    )
+    state_indices = jnp.arange(1, len(lengths) + 1, dtype=jnp.int32)
+    distribution = jnp.array([0, len(lengths), len(lengths)], dtype=jnp.int32)
+    seq_lens = jnp.asarray(
+        lengths if offsets is None else offsets + lengths,
+        dtype=jnp.int32,
+    )
 
     padded_num_tokens = int(
-        _pcp_local_token_counts(lengths, pcp_size,
-                                interleave_size).max()) * pcp_size
+        _pcp_local_token_counts(
+            lengths,
+            pcp_size,
+            interleave_size,
+            token_start_offsets_per_req=offsets,
+        ).max()) * pcp_size
     token_order, _ = _build_pcp_rank_major_token_order(
-        np.array(lengths, dtype=np.int32),
+        lengths,
         pcp_size,
         interleave_size,
         padded_num_tokens,
+        token_start_offsets_per_req=offsets,
     )
     valid = token_order >= 0
     pad_tokens = padded_num_tokens - num_tokens

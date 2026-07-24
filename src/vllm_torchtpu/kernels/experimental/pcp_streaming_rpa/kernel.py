@@ -535,6 +535,8 @@ def _stage_schedule_step_from_tile_plan(
         interleave_size=interleave_size,
     )
 
+    # TODO: Materialize only the current consumer rank, or split tile-invariant
+    # fields from per-source fields, to avoid repeated full schedule-row stores.
     for consumer_rank in range(pcp_size):
         effective_pages = _tile_plan_value_static(plan_values, consumer_rank,
                                                   effective_field)
@@ -753,6 +755,8 @@ def _run_pcp_page_groups_multi_head(
         dst_ref=tile_ids_vmem_ref.at[:, :],
         sem=sched_dma_sem,
     )
+    # TODO: Overlap these independent metadata DMAs by starting both copies
+    # before waiting when schedule staging becomes a material kernel cost.
     ids_load.start()
     ids_load.wait()
     starts_load = pltpu.make_async_copy(
@@ -1265,6 +1269,8 @@ def _pcp_streaming_attention_zero_history_output_multi_head_kernel(
             dst_ref=tile_ids_vmem_ref.at[:, :],
             sem=sched_dma_sem,
         )
+        # TODO: Overlap these independent metadata DMAs by starting both copies
+        # before waiting when schedule staging becomes a material kernel cost.
         ids_load.start()
         ids_load.wait()
         starts_load = pltpu.make_async_copy(
