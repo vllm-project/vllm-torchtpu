@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, InferencePhase,
     PhaseBasedProfiler)
@@ -256,14 +256,14 @@ def _stage_dp_rank_capture(rank_dir, ts_name, filename, content):
 
 
 def test_resolve_canonical_dst_ts_rank_zero_writes_marker(tmp_path):
-    """Rank 0 picks the canonical ts and writes a marker keyed by ppid."""
+    """Rank 0 picks the canonical ts and publishes it for the other ranks."""
     profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=0)
     phase_dir = tmp_path / "prefill_heavy"
     phase_dir.mkdir()
 
     ts = profiler._resolve_canonical_dst_ts(str(phase_dir))
 
-    marker = phase_dir / f".canonical_ts_{os.getppid()}"
+    marker = phase_dir / f".canonical_ts_{profiler_trace.profile_session_id()}"
     assert marker.exists()
     assert marker.read_text().strip() == ts
 
@@ -272,7 +272,7 @@ def test_resolve_canonical_dst_ts_non_zero_rank_reads_marker(tmp_path):
     """Non-zero rank reads whatever rank 0 already published."""
     phase_dir = tmp_path / "prefill_heavy"
     phase_dir.mkdir()
-    marker = phase_dir / f".canonical_ts_{os.getppid()}"
+    marker = phase_dir / f".canonical_ts_{profiler_trace.profile_session_id()}"
     marker.write_text("2026_05_06_04_47_36")
 
     profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=2)

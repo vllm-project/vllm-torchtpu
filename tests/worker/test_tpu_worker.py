@@ -14,6 +14,7 @@
 """Tests for TPUWorker"""
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -99,6 +100,12 @@ class TestProfilerDir:
         worker = _build_worker(cfg)
         assert worker.profile_dir == "/config/profiler/dir"
 
+    def test_every_rank_captures(self):
+        """A worker only sees its own chips, so all ranks must capture."""
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg, rank=3)
+        assert worker.profile_dir == "/config/profiler/dir"
+
     def test_no_profiler_when_not_set(self):
         """profile_dir is None when config is not set."""
         cfg = _make_vllm_config(profiler_torch_dir=None)
@@ -113,6 +120,125 @@ class TestProfilerDir:
                                 phased_profiling_dir="/phased/profiler/dir")
         worker = _build_worker(cfg)
         assert worker.profile_dir is None
+
+
+class TestProfileCaptureAndMerge:
+    """Standard torch_profiler_dir flow: per-rank capture, merged run dir."""
+
+    @staticmethod
+    def _make_worker(profile_dir, rank, world_size):
+        cfg = _make_vllm_config(profiler_torch_dir=str(profile_dir))
+        worker = _build_worker(cfg, rank=rank)
+        # init_device() normally derives these from the TPU rank binding.
+        worker.profile_rank = rank
+        worker.profile_world_size = world_size
+        return worker
+
+    @staticmethod
+    def _stage_capture(worker, filename, content):
+        """Stand in for the xprof trace handler writing on profiler exit."""
+        ts_dir = (Path(worker.profile_capture_dir) / "plugins" / "profile" /
+                  "pt_ts")
+        ts_dir.mkdir(parents=True)
+        (ts_dir / filename).write_text(content)
+
+    def _run_profile_cycle(self, workers, filename="t1v-n-host-w-0.xplane.pb"):
+        """Drive one start/stop cycle on every rank; return their run ts."""
+        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+            for worker in workers:
+                worker.profile(is_start=True)
+            canonical_ts = [w.profile_canonical_ts for w in workers]
+            for worker in workers:
+                self._stage_capture(worker, filename,
+                                    f"rank_{worker.profile_rank}")
+            for worker in workers:
+                worker.profile(is_start=False)
+        return canonical_ts
+
+    def test_single_rank_capture_is_merged_into_run_dir(self, tmp_path):
+        worker = self._make_worker(tmp_path, rank=0, world_size=1)
+
+        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+            worker.profile(is_start=True)
+            capture_dir = Path(worker.profile_capture_dir)
+            canonical_ts = worker.profile_canonical_ts
+            assert capture_dir == tmp_path / "dp_rank_0"
+            self._stage_capture(worker, "t1v-n-host-w-0.xplane.pb", "trace")
+            worker.profile(is_start=False)
+
+        dst = tmp_path / "plugins" / "profile" / canonical_ts
+        assert (dst / "t1v-n-host-w-0.xplane.pb").read_text() == "trace"
+        assert not (capture_dir / "plugins").exists()
+        # The marker is dropped once the run it describes is merged.
+        assert not list(tmp_path.glob(".canonical_ts_*"))
+
+    def test_all_ranks_merge_into_one_run_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
+        monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
+        workers = [
+            self._make_worker(tmp_path, rank=rank, world_size=4)
+            for rank in range(4)
+        ]
+
+        canonical_ts = set(self._run_profile_cycle(workers))
+
+        # Every rank agreed on rank 0's run directory...
+        assert len(canonical_ts) == 1
+        dst = tmp_path / "plugins" / "profile" / canonical_ts.pop()
+        # ...and same-named per-host xplane files did not collide.
+        for rank in range(4):
+            assert (dst /
+                    f"rank{rank}_t1v-n-host-w-0.xplane.pb").read_text() == (
+                        f"rank_{rank}")
+
+    def test_back_to_back_runs_get_separate_run_dirs(self, tmp_path,
+                                                     monkeypatch):
+        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
+        monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
+        workers = [
+            self._make_worker(tmp_path, rank=rank, world_size=2)
+            for rank in range(2)
+        ]
+
+        first_ts = self._run_profile_cycle(workers,
+                                           filename="first.xplane.pb")[0]
+        # The second cycle must not reuse the first cycle's marker; force a
+        # distinct timestamp so the two runs are distinguishable.
+        with patch("vllm_torchtpu.profiler_trace.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value.strftime.return_value = (
+                "2026_05_06_04_47_36")
+            second_ts = self._run_profile_cycle(workers,
+                                                filename="second.xplane.pb")
+
+        assert second_ts == ["2026_05_06_04_47_36"] * 2
+        assert second_ts[0] != first_ts
+        profiles = tmp_path / "plugins" / "profile"
+        assert (profiles / first_ts / "rank0_first.xplane.pb").exists()
+        assert (profiles / second_ts[0] / "rank1_second.xplane.pb").exists()
+
+    def test_profile_prefix_scopes_the_run_dir(self, tmp_path):
+        worker = self._make_worker(tmp_path, rank=0, world_size=1)
+
+        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+            worker.profile(is_start=True, profile_prefix="decode")
+            canonical_ts = worker.profile_canonical_ts
+            assert Path(worker.profile_capture_dir) == (tmp_path / "decode" /
+                                                        "dp_rank_0")
+            self._stage_capture(worker, "t1v-n-host-w-0.xplane.pb", "trace")
+            # The merge follows the run the capture was started under, so a
+            # stop that forgets the prefix still lands in the right place.
+            worker.profile(is_start=False)
+
+        dst = tmp_path / "decode" / "plugins" / "profile" / canonical_ts
+        assert (dst / "t1v-n-host-w-0.xplane.pb").read_text() == "trace"
+
+    def test_stop_without_start_is_a_noop(self, tmp_path):
+        worker = self._make_worker(tmp_path, rank=0, world_size=1)
+
+        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+            worker.profile(is_start=False)
+
+        assert not list(tmp_path.iterdir())
 
 
 def test_initialize_from_config_updates_num_gpu_blocks():

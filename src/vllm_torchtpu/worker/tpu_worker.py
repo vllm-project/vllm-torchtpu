@@ -25,7 +25,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -117,9 +117,22 @@ class TPUWorker(WorkerBase):
             self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
-        # TPU profiler: only on rank 0 single-host, or every PP worker.
+        # TPU profiler: every worker captures the chips it owns into its own
+        # sandbox, and the captures are merged into one run directory on stop
+        # (see profiler_trace). A worker can only trace its own chips, so
+        # capturing on rank 0 alone would miss the rest of the slice.
         self.profile_dir: str | None = None
         self.profile_context = None
+        self.profile_run_dir: str | None = None
+        self.profile_capture_dir: str | None = None
+        self.profile_canonical_ts: str | None = None
+        self.profile_session_key: str | None = None
+        self.profile_session_index = 0
+        # Rank/world used to label and merge traces. init_device() upgrades
+        # these to the slice-global TPU rank, which — unlike parallel_config's
+        # TPxPP-scoped rank — is unique across DP replicas too.
+        self.profile_rank = self.rank
+        self.profile_world_size = self.parallel_config.world_size
         torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
         phased_profiling_dir = self.vllm_config.additional_config.get(
             PHASED_PROFILING_DIR_KEY, "")
@@ -131,19 +144,10 @@ class TPUWorker(WorkerBase):
                 "profiler_config.torch_profiler_dir are set. Disabling manual "
                 "profiling (torch_profiler_dir) in favor of phased profiling.")
             torch_profiler_dir = None
-        pp_size = self.parallel_config.pipeline_parallel_size
-        if torch_profiler_dir and pp_size == 1 and self.rank < 1 and (
-                not self.devices or 0 in self.device_ranks):
-            # Only 1 active profiler session per server is allowed.
+        if torch_profiler_dir:
             self.profile_dir = torch_profiler_dir
             logger.info("Profiling enabled. Traces will be saved to: %s",
                         self.profile_dir)
-        elif pp_size > 1 and torch_profiler_dir:
-            # PP uses MPMD: profile every worker.
-            self.profile_dir = os.path.join(
-                torch_profiler_dir,
-                f"pprank_{self.rank}_ppworldsize_{pp_size}")
-            os.makedirs(self.profile_dir, exist_ok=True)
 
         # step_counter is used to calc uuid for intermediate tensor transfer.
         self.step_counter = 0
@@ -174,6 +178,12 @@ class TPUWorker(WorkerBase):
                                          self.local_rank,
                                          env=os.environ,
                                          use_spawned_pcp_local_rank=True)
+        # Slice-global rank: unique per worker process across DP replicas and
+        # TP/PP ranks, which is what trace filenames must be keyed on. Set
+        # before TPUModelRunner is built below, since the phased profiler
+        # takes these at construction time.
+        self.profile_rank = binding.rank
+        self.profile_world_size = binding.world_size
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -327,7 +337,11 @@ class TPUWorker(WorkerBase):
                 self.rank == self.parallel_config.pipeline_parallel_size - 1)
 
         # TODO: Fix device assignment
-        self.model_runner = TPUModelRunner(self.vllm_config, self.devices[0])
+        self.model_runner = TPUModelRunner(
+            self.vllm_config,
+            self.devices[0],
+            profiler_rank=self.profile_rank,
+            profiler_world_size=self.profile_world_size)
         logger.info(f"Init worker | "
                     f"rank={self.rank} | "
                     f"is_first_rank={is_first_rank} | "
@@ -418,29 +432,84 @@ class TPUWorker(WorkerBase):
             logger.warning("Profile directory is not set. Skipping profiling.")
             return
 
-        profile_dir = self.profile_dir
-        if profile_prefix:
-            profile_dir = os.path.join(profile_dir, profile_prefix)
-            os.makedirs(profile_dir, exist_ok=True)
-
         if is_start:
-            logger.info(
-                f"Starting TorchTPU profiler trace at {profile_dir}...")
-            handler = profiler_api.xprof_trace_handler(dir_name=profile_dir)
+            if self.profile_context is not None:
+                logger.warning(
+                    "Profiler is already running. Ignoring start request.")
+                return
+            profile_dir = self.profile_dir
+            if profile_prefix:
+                profile_dir = os.path.join(profile_dir, profile_prefix)
+            os.makedirs(profile_dir, exist_ok=True)
+            # All ranks capture concurrently, so each writes into its own
+            # sandbox under a run directory they agree on; stop merges them.
+            self.profile_run_dir = profile_dir
+            self.profile_session_key = self._next_profile_session_key()
+            self.profile_canonical_ts = profiler_trace.resolve_canonical_dst_ts(
+                profile_dir,
+                self.profile_rank,
+                session_key=self.profile_session_key)
+            self.profile_capture_dir = profiler_trace.rank_capture_dir(
+                profile_dir, self.profile_rank)
+            os.makedirs(self.profile_capture_dir, exist_ok=True)
+
+            logger.info("Starting TorchTPU profiler trace at %s...",
+                        self.profile_capture_dir)
+            handler = profiler_api.xprof_trace_handler(
+                dir_name=self.profile_capture_dir)
             self.profile_context = profiler_api.profile(activities=[
                 profiler_api.ProfilerActivity.CPU,
                 profiler_api.ProfilerActivity.TPU
             ],
                                                         on_trace_ready=handler)
-            self.profile_context.__enter__()
+            try:
+                self.profile_context.__enter__()
+            except Exception:
+                self.profile_context = None
+                raise
         else:
-            if self.profile_context is not None:
-                logger.info("Stopping TorchTPU profiler trace...")
-                self.profile_context.__exit__(None, None, None)
-                logger.info(f"Profiler trace saved to {profile_dir}")
-            else:
+            if self.profile_context is None:
                 logger.warning(
                     "Profiler context is not set. Cannot stop profiler.")
+                return
+            logger.info("Stopping TorchTPU profiler trace...")
+            try:
+                # The trace is written by the on_trace_ready handler during
+                # __exit__, so it is on disk once this returns.
+                self.profile_context.__exit__(None, None, None)
+            finally:
+                self.profile_context = None
+            # Merge into the run directory this capture was started under,
+            # which is what the sandbox path is relative to, rather than
+            # re-deriving it from the stop call's prefix.
+            profile_dir = self.profile_run_dir
+            if self.profile_capture_dir and self.profile_canonical_ts:
+                profiler_trace.merge_rank_capture(
+                    self.profile_capture_dir,
+                    profile_dir,
+                    self.profile_canonical_ts,
+                    self.profile_rank,
+                    world_size=self.profile_world_size,
+                )
+                if self.profile_rank == 0:
+                    profiler_trace.clear_canonical_ts_marker(
+                        profile_dir, self.profile_session_key)
+            logger.info("Profiler trace saved to %s", profile_dir)
+            self.profile_run_dir = None
+            self.profile_capture_dir = None
+            self.profile_canonical_ts = None
+
+    def _next_profile_session_key(self) -> str:
+        """Marker key for the start/stop cycle that is beginning.
+
+        Every worker sees the same sequence of profile RPCs, so the index
+        keeps back-to-back runs into the same directory from reusing an
+        earlier run's marker.
+        """
+        key = (f"{profiler_trace.profile_session_id()}"
+               f"_{self.profile_session_index}")
+        self.profile_session_index += 1
+        return key
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         from vllm_torchtpu.platforms.tpu_platform import \

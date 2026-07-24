@@ -4,14 +4,13 @@
 import datetime
 import json
 import os
-import shutil
-import time
 from enum import Enum
 from typing import Any, Optional
 
 from torch_tpu._internal.profiler import profiler_api
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
+from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -46,11 +45,6 @@ class InferencePhase(Enum):
     AMBIGUOUS = 3
     PREFILL_ONLY = 4
     DECODE_ONLY = 5
-
-
-def _inject_dp_rank_into_filename(fname: str, dp_rank: int) -> str:
-    """Prefix `rank<N>_` to an xplane or trace filename."""
-    return f"rank{dp_rank}_{fname}"
 
 
 def determine_phase_from_batch_composition_stats(
@@ -213,50 +207,21 @@ class PhaseBasedProfiler:
             logger.warning("Failed to write batch composition stats: %s", e)
 
     def _resolve_canonical_dst_ts(self, phase_dir: str) -> str:
-        """Resolve the canonical destination timestamp for this phase.
-
-        Rank 0 generates the timestamp and writes a marker file. Other ranks
-        wait and read this marker to ensure all workers merge their traces
-        into a unified directory.
-        """
-        marker = os.path.join(phase_dir, f".canonical_ts_{os.getppid()}")
-        if self.worker_rank == 0:
-            canonical_ts = datetime.datetime.now().strftime(
-                "%Y_%m_%d_%H_%M_%S")
-            marker_tmp = f"{marker}.tmp"
-            try:
-                with open(marker_tmp, "w") as f:
-                    f.write(canonical_ts)
-                os.replace(marker_tmp, marker)
-                return canonical_ts
-            except Exception as e:
-                logger.warning(
-                    "Rank 0 failed to write canonical ts marker: %s", e)
-                return canonical_ts
-
-        poll_timeout = getattr(self, "_CANONICAL_TS_POLL_TIMEOUT_S", 5.0)
-        poll_interval = getattr(self, "_CANONICAL_TS_POLL_INTERVAL_S", 0.05)
-        deadline = time.monotonic() + poll_timeout
-        while time.monotonic() < deadline:
-            try:
-                with open(marker) as f:
-                    ts = f.read().strip()
-                if ts:
-                    return ts
-            except OSError:
-                pass
-            time.sleep(poll_interval)
-
-        fallback_ts = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        logger.warning(
-            "dp_rank %d did not find rank 0's canonical-ts marker at %s "
-            "within %.1fs; falling back to own timestamp %s",
+        """Resolve the canonical destination timestamp for this phase."""
+        return profiler_trace.resolve_canonical_dst_ts(
+            phase_dir,
             self.worker_rank,
-            marker,
-            poll_timeout,
-            fallback_ts,
+            poll_timeout_s=getattr(
+                self,
+                "_CANONICAL_TS_POLL_TIMEOUT_S",
+                profiler_trace.CANONICAL_TS_POLL_TIMEOUT_S,
+            ),
+            poll_interval_s=getattr(
+                self,
+                "_CANONICAL_TS_POLL_INTERVAL_S",
+                profiler_trace.CANONICAL_TS_POLL_INTERVAL_S,
+            ),
         )
-        return fallback_ts
 
     def _start_profiling(self, batch_composition_stats: dict) -> None:
         """Starts profiling if the current phase is unseen."""
@@ -297,8 +262,8 @@ class PhaseBasedProfiler:
             os.makedirs(phase_dir, exist_ok=True)
 
             self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
-            self.profile_dir_with_phase_suffix = os.path.join(
-                phase_dir, f"dp_rank_{self.worker_rank}")
+            self.profile_dir_with_phase_suffix = profiler_trace.rank_capture_dir(
+                phase_dir, self.worker_rank)
             os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
 
             self._write_batch_composition_stats_to_file_helper(
@@ -347,50 +312,13 @@ class PhaseBasedProfiler:
         """Consolidates phase trace artifacts."""
         if not self.profile_dir_with_phase_suffix or not self._canonical_dst_ts:
             return
-        source_profile_path = os.path.join(self.profile_dir_with_phase_suffix,
-                                           "plugins", "profile")
-        if not os.path.exists(source_profile_path):
-            return
-        phase_dir = os.path.dirname(self.profile_dir_with_phase_suffix)
-        dst_ts_dir = os.path.join(phase_dir, "plugins", "profile",
-                                  self._canonical_dst_ts)
-
-        # Check if we are in a multi-worker environment (DP > 1, TP > 1, world_size > 1, or rank > 0).
-        dp_size = int(os.getenv("TORCH_TPU_DP_SIZE", "1"))
-        is_multi_worker = (dp_size > 1
-                           or os.getenv("TPU_MULTIPROCESS_DP") == "1"
-                           or getattr(self, "world_size", 1) > 1
-                           or self.worker_rank > 0)
-
-        try:
-            os.makedirs(dst_ts_dir, exist_ok=True)
-            for ts in os.listdir(source_profile_path):
-                src_ts_dir = os.path.join(source_profile_path, ts)
-                if not os.path.isdir(src_ts_dir):
-                    continue
-                for fname in os.listdir(src_ts_dir):
-                    new_fname = (_inject_dp_rank_into_filename(
-                        fname, self.worker_rank) if is_multi_worker else fname)
-                    shutil.move(
-                        os.path.join(src_ts_dir, fname),
-                        os.path.join(dst_ts_dir, new_fname),
-                    )
-                try:
-                    os.rmdir(src_ts_dir)
-                except OSError:
-                    pass
-            for cleanup in (
-                    source_profile_path,
-                    os.path.dirname(source_profile_path),
-            ):
-                try:
-                    os.rmdir(cleanup)
-                except OSError:
-                    pass
-            logger.info(
-                f"Successfully merged profile directories into: {dst_ts_dir}")
-        except Exception as e:
-            logger.warning("Failed to merge profile directories: %s", e)
+        profiler_trace.merge_rank_capture(
+            self.profile_dir_with_phase_suffix,
+            os.path.dirname(self.profile_dir_with_phase_suffix),
+            self._canonical_dst_ts,
+            self.worker_rank,
+            world_size=getattr(self, "world_size", 1),
+        )
 
     def step(self, batch_composition_stats: dict) -> None:
         """Steps the profiler and logs batch composition stats."""

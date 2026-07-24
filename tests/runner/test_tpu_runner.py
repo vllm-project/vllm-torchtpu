@@ -179,7 +179,9 @@ class TestInitPhasedProfiling:
     def _fake_runner(self,
                      additional_config,
                      max_iterations=0,
-                     delay_iterations=0):
+                     delay_iterations=0,
+                     profiler_rank=None,
+                     profiler_world_size=None):
         return SimpleNamespace(
             vllm_config=SimpleNamespace(
                 additional_config=additional_config,
@@ -187,6 +189,8 @@ class TestInitPhasedProfiling:
                     max_iterations=max_iterations,
                     delay_iterations=delay_iterations)),
             parallel_config=SimpleNamespace(rank=2, world_size=4),
+            _profiler_rank=profiler_rank,
+            _profiler_world_size=profiler_world_size,
         )
 
     def test_disabled_when_dir_not_set(self):
@@ -218,6 +222,23 @@ class TestInitPhasedProfiling:
             num_decode_steps_to_skip=3,
             decode_kv_len_threshold=128,
         )
+
+    def test_prefers_worker_supplied_slice_global_rank(self):
+        """parallel_config.rank is TPxPP-scoped: every DP replica calls itself
+        rank 0, so their traces would collide. The worker passes the
+        slice-global rank instead."""
+        runner = self._fake_runner(
+            additional_config={"phased_profiling_dir": "/tmp/phased"},
+            profiler_rank=9,
+            profiler_world_size=16,
+        )
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner._init_phased_profiling(runner)
+
+        assert mock_profiler_cls.call_args.kwargs["worker_rank"] == 9
+        assert mock_profiler_cls.call_args.kwargs["world_size"] == 16
 
     def test_falls_back_to_default_num_steps_when_max_iterations_unset(self):
         runner = self._fake_runner(
