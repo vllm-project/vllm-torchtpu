@@ -1589,24 +1589,24 @@ class TPURaidenConnectorWorker:
             or self.tp_size)
         dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
         if self.is_producer:
-            if pcp_size != 8 or tp_size != 1 or dp_size != 1:
+            if pcp_size not in (4, 8) or tp_size != 1 or dp_size != 1:
                 raise ValueError(
-                    "Raiden Qwen3.5 admission topology pcp8_prefill requires "
-                    "kv_producer with prefill_context_parallel_size=8, "
+                    "Raiden Qwen3.5 admission topology pcp8_prefill or pcp4_prefill requires "
+                    "kv_producer with prefill_context_parallel_size in (4, 8), "
                     "tensor_parallel_size=1, data_parallel_size=1; got "
                     f"prefill_context_parallel_size={pcp_size}, "
                     f"tensor_parallel_size={tp_size}, "
                     f"data_parallel_size={dp_size}")
-            return "pcp8_prefill"
-        if pcp_size != 1 or tp_size != 1 or dp_size != 8:
+            return f"pcp{pcp_size}_prefill"
+        if pcp_size != 1 or tp_size != 1 or dp_size not in (4, 8):
             raise ValueError(
-                "Raiden Qwen3.5 admission topology dp8_decode requires "
+                "Raiden Qwen3.5 admission topology dp8_decode or dp4_decode requires "
                 "kv_consumer with prefill_context_parallel_size=1, "
-                "tensor_parallel_size=1, data_parallel_size=8; got "
+                "tensor_parallel_size=1, data_parallel_size in (4, 8); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}")
-        return "dp8_decode"
+        return f"dp{dp_size}_decode"
 
     def _model_config_int(self, name: str, default: int) -> int:
         model_config = getattr(self.vllm_config, "model_config", None)
