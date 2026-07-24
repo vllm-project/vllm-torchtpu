@@ -273,7 +273,7 @@ def _flash_attention_kernel_single_batch(
                 if rem:
                     raise NotImplementedError(
                         f"kv block size must be a multiple of {NUM_LANES}")
-                q_segment_ids = pltpu.repeat(
+                q_segment_ids = jnp.repeat(
                     q_segment_ids_tile_ref[batch_idx[0]], repeats,
                     axis=1)  # [block_q, block_k].
                 kv_segment_ids = kv_segment_ids_tile_ref[
@@ -302,7 +302,7 @@ def _flash_attention_kernel_single_batch(
             if rem:
                 raise NotImplementedError(
                     f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}")
-            p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
+            p = jnp.exp(s - jnp.repeat(m_next, block_k_repeats, 1))
 
             alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
 
@@ -312,7 +312,7 @@ def _flash_attention_kernel_single_batch(
                                         None] + l_corr  # Shape [block_q, 128]
 
             head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
-            l_broadcast = lambda l: pltpu.repeat(l, head_dim_repeats, 1)
+            l_broadcast = lambda l: jnp.repeat(l, head_dim_repeats, 1)
             if rem:
                 if head_dim_repeats == 0:
                     l_broadcast = lambda l: l[:, :head_dim]
@@ -386,7 +386,7 @@ def _flash_attention_kernel_single_batch_single_step(
                 f"kv block size must be a multiple of {NUM_LANES}")
         q_segment_ids = q_segment_ids_tile_ref[
             batch_idx[0]]  # [block_q, NUM_LANES].
-        q_segment_ids = pltpu.repeat(q_segment_ids, repeats,
+        q_segment_ids = jnp.repeat(q_segment_ids, repeats,
                                      axis=1)  # [block_q, block_k].
         kv_segment_ids = kv_segment_ids_tile_ref[batch_idx[0], :
                                                  1]  # [1, block_k].
