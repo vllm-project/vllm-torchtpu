@@ -95,8 +95,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.runner = runner
         self.kv_cache_group_id = kv_cache_group_id
         self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
-        self.target_block_size = getattr(self.kv_cache_spec, "block_size",
-                                         runner.block_size)
+        self.target_block_size = self.kv_cache_spec.block_size
         if self.is_mamba_group:
             self.target_block_size *= get_total_cp_world_size()
         # Only mamba/GDN layers consume physical state slot ids; attention

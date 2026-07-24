@@ -197,9 +197,8 @@ def gdn_attention_core_tpu_pcp_prefill(
 
 
 def _get_pcp_size(vllm_config: VllmConfig) -> int:
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-    return pcp_size if isinstance(pcp_size, int) and pcp_size > 1 else 1
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    return pcp_size if pcp_size > 1 else 1
 
 
 def _localize_gdn_mamba_spec_for_pcp(
@@ -245,6 +244,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Bound by the runner during KV-cache initialization; None until then
+        # (warmup/profiling runs check this).
+        self.kv_cache = None
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op()
         self.gdn_pcp_op = (self._build_gdn_op(
@@ -508,7 +510,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        kv_cache = getattr(self, "kv_cache", None)
+        kv_cache = self.kv_cache
         local_num_v_heads = self.num_v_heads // self.tp_size
 
         # During warmup or memory profiling, the kv_cache might not be allocated yet
@@ -573,7 +575,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         attn_metadata.request_distribution,
                         attn_metadata.seq_lens)
                 else:
-                    gdn_pcp_op = getattr(self, "gdn_pcp_op", None)
+                    gdn_pcp_op = self.gdn_pcp_op
                     if gdn_pcp_op is None:
                         raise RuntimeError(
                             "GDN PCP prefill op was not initialized during model "

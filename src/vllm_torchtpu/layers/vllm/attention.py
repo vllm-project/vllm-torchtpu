@@ -522,10 +522,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         cp_kv_cache_interleave_size: int = 0,
     ):
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = getattr(ctx, "vllm_config", None)
-        max_model_len = (getattr(vllm_config.model_config, "max_model_len",
-                                 None) if use_pcp_streaming
-                         and vllm_config is not None else None)
+        vllm_config = ctx.vllm_config
+        max_model_len = (vllm_config.model_config.max_model_len
+                         if use_pcp_streaming and vllm_config is not None else
+                         None)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale, v_scale, use_pcp_streaming,
                       cp_kv_cache_interleave_size, max_model_len)
@@ -698,11 +698,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # cache aliasing for how the shared cache tensor is set up.
         skip_kv_update = self.kv_sharing_target_layer_name is not None
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = getattr(ctx, "vllm_config", None)
+        vllm_config = ctx.vllm_config
         parallel_config = (None if vllm_config is None else
                            vllm_config.parallel_config)
-        pcp_configured = (parallel_config is not None and getattr(
-            parallel_config, "prefill_context_parallel_size", 1) > 1)
+        pcp_configured = (parallel_config is not None and
+                          parallel_config.prefill_context_parallel_size > 1)
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
             self.rpa_kernel = self._build_rpa_kernel(
@@ -711,8 +711,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale,
                 skip_kv_update=skip_kv_update,
                 use_pcp_streaming=True,
-                cp_kv_cache_interleave_size=getattr(
-                    parallel_config, "cp_kv_cache_interleave_size", 0),
+                cp_kv_cache_interleave_size=parallel_config.
+                cp_kv_cache_interleave_size,
             )
             return
 
@@ -800,12 +800,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = getattr(ctx, "vllm_config", None)
+        vllm_config = ctx.vllm_config
         parallel_config = (None if vllm_config is None else
                            vllm_config.parallel_config)
         use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
-        pcp_configured = (parallel_config is not None and getattr(
-            parallel_config, "prefill_context_parallel_size", 1) > 1)
+        pcp_configured = (parallel_config is not None and
+                          parallel_config.prefill_context_parallel_size > 1)
         if pcp_configured and not use_pcp_streaming:
             raise RuntimeError(
                 "PCP is configured, but attention metadata does not use "
@@ -813,9 +813,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         skip_kv_update = self.kv_sharing_target_layer_name is not None
         if use_pcp_streaming:
             self._validate_pcp_streaming_support(skip_kv_update)
-        cp_kv_cache_interleave_size = (getattr(
-            parallel_config, "cp_kv_cache_interleave_size", 0)
-                                       if use_pcp_streaming else 0)
+        cp_kv_cache_interleave_size = (
+            parallel_config.cp_kv_cache_interleave_size
+            if use_pcp_streaming else 0)
         rpa_kernel = self._build_rpa_kernel(
             None,
             layer._k_scale_float if self.kv_cache_quantized_dtype else None,

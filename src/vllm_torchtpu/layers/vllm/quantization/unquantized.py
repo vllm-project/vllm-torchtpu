@@ -242,7 +242,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         """Forward pass using TPU-native GMM kernel."""
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        custom_routing_fn = layer.custom_routing_function
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
@@ -256,7 +256,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                scoring_fn=layer.scoring_func,
                 layer=layer,
             )
 

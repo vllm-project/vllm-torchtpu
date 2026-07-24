@@ -1232,6 +1232,7 @@ def test_zmq_prefill_decode_fa_4pcp_gdn_4tp_to_decode_tp(
                             is_kv_producer=False),
                         parallel_config=types.SimpleNamespace(
                             data_parallel_rank=0),
+                        cache_config=types.SimpleNamespace(block_size=1),
                     ))
                 scheduler.set_strided_decode_metadata(topology=topology,
                                                       destination=destination)
@@ -1265,7 +1266,14 @@ def test_zmq_prefill_decode_fa_4pcp_gdn_4tp_to_decode_tp(
                 }
 
                 consumer.start()
-                worker = mod.TPUConnectorV2Worker(object())
+                worker = mod.TPUConnectorV2Worker(
+                    types.SimpleNamespace(
+                        kv_transfer_config=types.SimpleNamespace(
+                            is_kv_producer=False),
+                        parallel_config=types.SimpleNamespace(
+                            data_parallel_rank=0,
+                            tensor_parallel_size=decode_tp_size),
+                        cache_config=types.SimpleNamespace(block_size=1)))
                 worker.tp_rank = decode_tp_rank
                 worker.set_strided_transfer_bridge(
                     mod.TPUConnectorV2StridedBridge(consumer))
@@ -1392,7 +1400,8 @@ def _decode_worker_process(decode_tp_rank: int, kv_transfer_params: dict,
         scheduler = mod.TPUConnectorV2Scheduler(
             types.SimpleNamespace(
                 kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-                parallel_config=types.SimpleNamespace(data_parallel_rank=0)))
+                parallel_config=types.SimpleNamespace(data_parallel_rank=0),
+                cache_config=types.SimpleNamespace(block_size=1)))
         scheduler.set_strided_decode_metadata(topology=topology,
                                               destination=destination)
         request = types.SimpleNamespace(
@@ -1413,7 +1422,11 @@ def _decode_worker_process(decode_tp_rank: int, kv_transfer_params: dict,
             for p_rank, ops in local_rank_ops.items()
         }
         engine.start()
-        worker = mod.TPUConnectorV2Worker(object())
+        worker = mod.TPUConnectorV2Worker(
+            types.SimpleNamespace(
+                kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
+                parallel_config=types.SimpleNamespace(data_parallel_rank=0),
+                cache_config=types.SimpleNamespace(block_size=1)))
         worker.tp_rank = decode_tp_rank
         worker.set_strided_transfer_bridge(
             mod.TPUConnectorV2StridedBridge(engine))

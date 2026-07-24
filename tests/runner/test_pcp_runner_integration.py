@@ -21,7 +21,8 @@ import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
+from vllm_torchtpu.layers.common.sequence_layout import (
+    SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 _PCP_LAYOUT_RANK = (
@@ -72,9 +73,15 @@ def _make_runner(*,
         prefill_context_parallel_size=2,
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
+        pipeline_parallel_size=1,
     )
     runner.vllm_config = SimpleNamespace(
-        parallel_config=runner.parallel_config)
+        parallel_config=runner.parallel_config,
+        scheduler_config=runner.scheduler_config,
+        speculative_config=None,
+        kv_transfer_config=None)
+    runner.sequence_layout_planner = create_sequence_layout_planner(
+        runner.vllm_config)
     runner.cache_config = SimpleNamespace(num_gpu_blocks=8,
                                           num_gpu_blocks_override=None)
     runner.mesh = SimpleNamespace(shape={

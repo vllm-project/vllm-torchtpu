@@ -248,9 +248,9 @@ def load_and_select_states(
         metadata_ref: Metadata reference containing grid and sequence mappings.
         p_id: Current Pallas program ID.
         conv_state_slot_ref: Convolution state read from HBM of shape
-            [seq_tile_size, prev_kernel_size, 1, dim_size].
+            [seq_tile_size, window_size, prev_kernel_size, 1, dim_size].
         recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-            num_v_heads, kq_head_dim, v_head_dim].
+            window_size, num_v_heads, kq_head_dim, v_head_dim].
         carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
             [seq_tile_size, prev_kernel_size, 1, dim_size].
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -275,9 +275,11 @@ def load_and_select_states(
         is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
+        # NOTE: The VMEM window holds one state per window position and the
+        # initial state was DMA'd into position 0.
         # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
         if cfg.state_plan is None:
-            hbm_conv_state = conv_state_slot_ref[idx].astype(jnp.float32)
+            hbm_conv_state = conv_state_slot_ref[idx, 0].astype(jnp.float32)
         else:
             hbm_conv_state = load_state_region(
                 conv_state_slot_ref.at[idx], cfg.state_plan.conv,
@@ -290,7 +292,7 @@ def load_and_select_states(
                                         prev_tile_conv)
 
         if cfg.state_plan is None:
-            hbm_recurrent_state = recurrent_slot_ref[idx]
+            hbm_recurrent_state = recurrent_slot_ref[idx, 0]
         else:
             hbm_recurrent_state = load_state_region(
                 recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,

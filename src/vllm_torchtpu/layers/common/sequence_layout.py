@@ -186,7 +186,7 @@ class AllSequenceLayoutPlanner:
              padded_num_reqs)
         padded_num_tokens = _first_ge(runner.num_tokens_paddings,
                                       int(total_num_scheduled_tokens))
-        dp_target_bucket = getattr(runner, "_dp_target_bucket", None)
+        dp_target_bucket = runner._dp_target_bucket
         if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
             padded_num_tokens = int(dp_target_bucket)
 

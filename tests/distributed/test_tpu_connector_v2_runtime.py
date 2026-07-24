@@ -24,6 +24,30 @@ def test_v2_connector_requires_unified_layout(monkeypatch):
         mod.TPUConnectorV2(config, mod.KVConnectorRole.SCHEDULER)
 
 
+def _stub_vllm_config(**overrides):
+    config = types.SimpleNamespace(
+        kv_transfer_config=types.SimpleNamespace(is_kv_producer=False,
+                                                 kv_ip="127.0.0.1"),
+        parallel_config=types.SimpleNamespace(
+            data_parallel_rank=0,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        cache_config=types.SimpleNamespace(block_size=1),
+    )
+    for name, value in overrides.items():
+        base = getattr(config, name, None)
+        if (isinstance(base, types.SimpleNamespace)
+                and isinstance(value, types.SimpleNamespace)):
+            for attr, attr_value in vars(value).items():
+                setattr(base, attr, attr_value)
+        else:
+            setattr(config, name, value)
+    return config
+
+
 def _strided_transfer_module():
     return sys.modules[
         "vllm_torchtpu.distributed.kv_transfer.v2.strided_transfer"]
@@ -64,7 +88,7 @@ def _finished_length_capped_status():
 
 
 def _v2_lifecycle_worker(mod):
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.node_id = 0
     worker._coord_lock = threading.Lock()
     worker._coord_send = {}
@@ -157,7 +181,7 @@ def test_v2_pull_start_end_logs_consumer_side_channel(monkeypatch):
     monkeypatch.setattr(mod.zmq_side_channel, "send_request",
                         fake_send_request)
 
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker._strided_timeout_s = lambda: 120.0
     req_meta = types.SimpleNamespace(uuid=123,
                                      v2_ack_host="10.0.0.9",
@@ -166,11 +190,7 @@ def test_v2_pull_start_end_logs_consumer_side_channel(monkeypatch):
     with _capture_logger_messages(mod.logger) as messages:
         worker._request_v2_pull_start(req_meta)
 
-        scheduler = mod.TPUConnectorV2Scheduler(
-            types.SimpleNamespace(
-                kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-                parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-            ))
+        scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
         scheduler._send_v2_end(req_meta)
 
     assert [item["tag"] for item in sent] == [
@@ -197,13 +217,9 @@ def test_v2_lifecycle_broadcasts_to_all_producer_ack_targets(monkeypatch):
     req_meta = types.SimpleNamespace(uuid=123,
                                      v2_ack_host=("10.0.0.10", "10.0.0.11"),
                                      v2_ack_port=(9600, 9601))
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker._strided_timeout_s = lambda: 120.0
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
 
     worker._request_v2_pull_start(req_meta)
     scheduler._send_v2_end(req_meta)
@@ -223,6 +239,7 @@ def test_v2_producer_host_coordinator_registers_send_lifecycle(monkeypatch):
     monkeypatch.setattr(mod, "_get_native_tp_size", lambda: 8)
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(data_parallel_rank=0,
                                               tensor_parallel_size=8),
     )
@@ -246,6 +263,7 @@ def test_v2_host_coordinator_reports_finished_sending(monkeypatch):
     monkeypatch.setattr(mod, "_get_native_tp_size", lambda: 8)
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(data_parallel_rank=0,
                                               tensor_parallel_size=8),
     )
@@ -269,6 +287,7 @@ def test_v2_multihost_ack_endpoints_match_producer_host_coordinators(
     for dp_rank in (0, 1):
         scheduler_config = types.SimpleNamespace(
             kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+            cache_config=types.SimpleNamespace(block_size=1),
             parallel_config=types.SimpleNamespace(data_parallel_rank=dp_rank),
         )
         scheduler = mod.TPUConnectorV2Scheduler(scheduler_config)
@@ -285,6 +304,7 @@ def test_v2_multihost_ack_endpoints_match_producer_host_coordinators(
                                 lambda host_tp_rank=host_tp_rank: host_tp_rank)
             worker_config = types.SimpleNamespace(
                 kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+                cache_config=types.SimpleNamespace(block_size=1),
                 parallel_config=types.SimpleNamespace(
                     data_parallel_rank=dp_rank, tensor_parallel_size=8),
             )
@@ -348,7 +368,7 @@ def test_v2_worker_logs_strided_lifecycle_metadata(monkeypatch):
     )
     metadata = types.SimpleNamespace(reqs_to_send={},
                                      reqs_to_load={"req-1": req_meta})
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.tp_rank = 0
     worker.set_strided_transfer_bridge(RecordingBridge())
     _disable_v2_pull_start(worker)
@@ -372,11 +392,7 @@ def test_v2_scheduler_logs_strided_lifecycle_metadata(monkeypatch):
                                          0: {},
                                          1: {},
                                      })
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._send_v2_end = lambda meta: None
 
     with _capture_logger_messages(mod.logger) as messages:
@@ -532,7 +548,7 @@ def test_v2_mamba_block_ids_select_group_tail_slots(monkeypatch):
 
 def test_v2_worker_group_indices_require_group_is_mamba(monkeypatch):
     mod = _load_v2_module(monkeypatch)
-    worker = object.__new__(mod.TPUConnectorV2Worker)
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker._kv_cache_region_templates = {}
 
     with pytest.raises(RuntimeError, match="requires group_is_mamba"):
@@ -550,7 +566,7 @@ def test_v2_worker_group_indices_use_group_is_mamba(monkeypatch):
 def test_v2_source_metadata_preserves_block_ids_by_group(monkeypatch):
     mod = _load_v2_module(monkeypatch)
     scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(parallel_config=types.SimpleNamespace(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
             tensor_parallel_rank=0)))
     source = _single_layer_source_metadata(mod)
     handshake = mod.TPUConnectorV2HandshakeMetadata(
@@ -588,7 +604,7 @@ def test_v2_source_metadata_preserves_block_ids_by_group(monkeypatch):
 def test_v2_producer_metadata_uses_mamba_group_tail_slots(monkeypatch):
     mod = _load_v2_module(monkeypatch)
     scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(parallel_config=types.SimpleNamespace(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
             tensor_parallel_rank=0)))
     source = _single_layer_source_metadata(mod)
     handshake = mod.TPUConnectorV2HandshakeMetadata(
@@ -679,7 +695,7 @@ def test_v2_strided_segment_op_requires_layer_identity(monkeypatch):
 def test_v2_decode_metadata_rejects_short_block_id_group_view(monkeypatch, ):
     mod = _load_v2_module(monkeypatch)
     scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(parallel_config=types.SimpleNamespace(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
             tensor_parallel_rank=0)))
     source = _single_layer_source_metadata(mod)
     handshake = mod.TPUConnectorV2HandshakeMetadata(
@@ -828,6 +844,7 @@ def test_worker_delegates_op_list_to_strided_bridge(monkeypatch):
     mod = _load_v2_module(monkeypatch)
 
     class RecordingBridge:
+        transfer_engine = None
 
         def __init__(self):
             self.calls = []
@@ -838,7 +855,7 @@ def test_worker_delegates_op_list_to_strided_bridge(monkeypatch):
                 (remote_tp_rank, tuple(ops), write_session, dp_rank))
             return 321
 
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     bridge = RecordingBridge()
     worker.set_strided_transfer_bridge(bridge)
     session = object()
@@ -892,7 +909,7 @@ def test_worker_registers_remote_metadata_from_connector_metadata(monkeypatch):
             self.registered.append(metadata)
 
     engine = RecordingEngine()
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.set_strided_transfer_bridge(mod.TPUConnectorV2StridedBridge(engine))
     connector_metadata = types.SimpleNamespace(
         reqs_to_load={
@@ -1078,7 +1095,7 @@ def test_process_send_load_uses_strided_engine_for_decode_rank_ops(
                                     layer_name="rank2.layer",
                                     layer_type=mod.LayerType.FULL_ATTN)
     bridge = RecordingBridge()
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.set_strided_transfer_bridge(bridge)
     _disable_v2_pull_start(worker)
     req_meta = types.SimpleNamespace(uuid=7,
@@ -1151,11 +1168,12 @@ def test_worker_rejects_ambiguous_remote_dp_rank_before_pull(monkeypatch):
     mod = _load_v2_module(monkeypatch)
 
     class RecordingBridge:
+        transfer_engine = None
 
         def __init__(self):
             self.calls = []
 
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     bridge = RecordingBridge()
     worker.set_strided_transfer_bridge(bridge)
     req_meta = types.SimpleNamespace(
@@ -1204,7 +1222,7 @@ def test_worker_rejects_ambiguous_remote_dp_rank_before_pull(monkeypatch):
 
 def test_process_send_load_raises_without_strided_ops(monkeypatch):
     mod = _load_v2_module(monkeypatch)
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     connector_metadata = types.SimpleNamespace(
         reqs_to_send={},
         reqs_to_load={
@@ -1219,7 +1237,7 @@ def test_process_send_load_raises_without_strided_ops(monkeypatch):
 
 def test_process_send_load_does_not_fallback_for_v2_producer_send(monkeypatch):
     mod = _load_v2_module(monkeypatch)
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.tp_rank = 0
     worker._coord_send = {}
     worker._coord_lock = None
@@ -1241,6 +1259,7 @@ def test_v2_scheduler_carries_decode_rank_ops_into_load_metadata(monkeypatch):
     mod = _load_v2_module(monkeypatch)
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(data_parallel_rank=0),
     )
     scheduler = mod.TPUConnectorV2Scheduler(config)
@@ -1334,8 +1353,11 @@ def test_v2_worker_auto_installs_strided_transfer_engine(monkeypatch):
 
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(data_parallel_rank=2,
-                                              tensor_parallel_size=4),
+                                              tensor_parallel_size=4,
+                                              prefill_context_parallel_size=1,
+                                              cp_kv_cache_interleave_size=1),
         model_config=types.SimpleNamespace(
             hf_config=types.SimpleNamespace(num_key_value_heads=8,
                                             linear_num_key_heads=8,
@@ -1366,6 +1388,7 @@ def test_v2_worker_auto_installs_strided_transfer_engine(monkeypatch):
     pool = torch.empty((8, 16, 2, 2, 8), dtype=torch.float8_e4m3fn)
     mamba_cache = [pool]
     runner = types.SimpleNamespace(
+        device=None,
         kv_caches=[pool, mamba_cache],
         kv_cache_raw_tensors=[pool],
         kv_cache_config=types.SimpleNamespace(kv_cache_groups=(
@@ -1467,8 +1490,12 @@ def test_v2_decode_worker_installs_client_engine_without_starting_server(
 
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(data_parallel_rank=2,
-                                              tensor_parallel_size=4))
+                                              tensor_parallel_size=4,
+                                              prefill_context_parallel_size=1,
+                                              cp_kv_cache_interleave_size=1),
+        model_config=types.SimpleNamespace(hf_config=None))
     worker = mod.TPUConnectorV2Worker(config)
     host = _local_test_host()
     kv_transfer_port = _pick_strided_base_port()
@@ -1484,7 +1511,9 @@ def test_v2_decode_worker_installs_client_engine_without_starting_server(
         page_size_padded=6,
     )
     runner = types.SimpleNamespace(
+        device=None,
         kv_caches=[torch.empty(6, dtype=torch.float8_e4m3fn)],
+        kv_cache_raw_tensors=[],
         kv_cache_config=types.SimpleNamespace(kv_cache_groups=(
             types.SimpleNamespace(layer_names=("model.layers.0.self_attn", ),
                                   kv_cache_spec=attention_spec), )),
@@ -1526,10 +1555,12 @@ def _strided_port_probe_worker(
 ):
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(
             data_parallel_rank=dp_rank,
             tensor_parallel_size=tp_size,
             prefill_context_parallel_size=pcp_size,
+            cp_kv_cache_interleave_size=1,
         ),
     )
     worker = mod.TPUConnectorV2Worker(config)
@@ -1906,6 +1937,7 @@ def test_v2_runtime_setters_reject_mapping_shims(monkeypatch):
 
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(tensor_parallel_size=1,
                                               data_parallel_rank=0),
     )
@@ -2198,7 +2230,9 @@ def test_v2_worker_uses_only_local_decode_rank_ops(monkeypatch):
                                     layer_name="layer.0",
                                     layer_type=mod.LayerType.FULL_ATTN)
     bridge = RecordingBridge()
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=2)))
     worker.tp_rank = 1
     worker.set_strided_transfer_bridge(bridge)
     _disable_v2_pull_start(worker)
@@ -2252,6 +2286,7 @@ def test_v2_scheduler_attaches_source_metadata_on_producer_finish(monkeypatch):
     mod = _load_v2_module(monkeypatch)
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(tensor_parallel_size=1,
                                               data_parallel_rank=0),
     )
@@ -2320,6 +2355,7 @@ def test_v2_scheduler_generates_remote_rank_ops_after_decode_alloc(
     mod = _load_v2_module(monkeypatch)
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(data_parallel_rank=0),
     )
     scheduler = mod.TPUConnectorV2Scheduler(config)
@@ -2431,6 +2467,7 @@ def test_v2_scheduler_keeps_single_nonzero_decode_rank_ops_by_decode_rank(
     mod = _load_v2_module(monkeypatch)
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
+        cache_config=types.SimpleNamespace(block_size=1),
         parallel_config=types.SimpleNamespace(data_parallel_rank=0),
     )
     scheduler = mod.TPUConnectorV2Scheduler(config)
@@ -2536,7 +2573,8 @@ def test_v2_scheduler_does_not_redispatch_finished_uuid(monkeypatch):
     assert set(first_meta.reqs_to_load) == {"req-1"}
 
     scheduler.update_connector_output(
-        types.SimpleNamespace(finished_recving={"req-1"}))
+        types.SimpleNamespace(finished_recving={"req-1"},
+                              kv_connector_worker_meta=None))
     scheduler.update_state_after_alloc(request, object(), 0)
     second_meta = scheduler.build_connector_meta()
 
@@ -2796,11 +2834,7 @@ def test_v2_scheduler_ends_after_worker_completion_meta(monkeypatch):
                                          0: {},
                                          1: {},
                                      })
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._mark_recv_lifecycle_planned(req_id="req-1",
                                            uuid=456,
                                            req_meta=req_meta,
@@ -2836,11 +2870,7 @@ def test_v2_scheduler_rejects_multihost_scalar_ack_port(monkeypatch):
     mod = _load_v2_module(monkeypatch)
     dist_utils = sys.modules["vllm_torchtpu.distributed.utils"]
     monkeypatch.setattr(dist_utils, "get_node_id", lambda: 1)
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     req_meta = types.SimpleNamespace(uuid=456,
                                      v2_ack_host=("10.0.0.10", "10.0.0.11"),
                                      v2_ack_port=9600)
@@ -2854,6 +2884,7 @@ def test_v2_scheduler_attaches_per_node_ack_ports_for_multihost(monkeypatch):
     scheduler = mod.TPUConnectorV2Scheduler(
         types.SimpleNamespace(
             kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+            cache_config=types.SimpleNamespace(block_size=1),
             parallel_config=types.SimpleNamespace(data_parallel_rank=2),
         ))
     kv_transfer_params = {
@@ -2874,11 +2905,7 @@ def test_v2_scheduler_raises_on_failed_worker_completion(monkeypatch):
                                      v2_ack_host="10.0.0.9",
                                      v2_ack_port=7600,
                                      remote_rank_ops_by_decode_rank={0: {}})
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._mark_recv_lifecycle_planned(req_id="req-1",
                                            uuid=456,
                                            req_meta=req_meta,
@@ -2921,11 +2948,7 @@ def test_v2_scheduler_processes_success_completion_in_failed_batch(
         v2_ack_port=7600,
         remote_rank_ops_by_decode_rank={0: {}},
     )
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._mark_recv_lifecycle_planned(req_id="req-failed",
                                            uuid=456,
                                            req_meta=req_meta_failed,
@@ -2968,11 +2991,7 @@ def test_v2_scheduler_raises_when_pull_end_rejected(monkeypatch):
                                      v2_ack_host="10.0.0.9",
                                      v2_ack_port=7600,
                                      remote_rank_ops_by_decode_rank={0: {}})
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._mark_recv_lifecycle_planned(req_id="req-1",
                                            uuid=456,
                                            req_meta=req_meta,
@@ -3047,7 +3066,9 @@ def test_v2_worker_single_decode_rank_reports_completion_meta(monkeypatch):
     metadata = types.SimpleNamespace(reqs_to_send={},
                                      reqs_to_load={"req-1": req_meta})
 
-    rank0 = mod.TPUConnectorV2Worker(object())
+    rank0 = mod.TPUConnectorV2Worker(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=2)))
     rank0.tp_rank = 0
     rank0.set_strided_transfer_bridge(RecordingBridge())
     _disable_v2_pull_start(rank0)
@@ -3126,7 +3147,9 @@ def test_v2_worker_reports_only_local_decode_rank_completion(monkeypatch):
                                      reqs_to_load={"req-1": req_meta})
 
     rank0_bridge = RecordingBridge()
-    rank0 = mod.TPUConnectorV2Worker(object())
+    rank0 = mod.TPUConnectorV2Worker(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=2)))
     rank0.tp_rank = 0
     rank0.tp_size = 2
     rank0.set_strided_transfer_bridge(rank0_bridge)
@@ -3209,7 +3232,9 @@ def test_v2_scheduler_ends_after_all_decode_tp_ranks_finish(monkeypatch):
                                      reqs_to_load={"req-1": req_meta})
 
     rank0_bridge = RecordingBridge()
-    rank0 = mod.TPUConnectorV2Worker(object())
+    rank0 = mod.TPUConnectorV2Worker(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=2)))
     rank0.tp_rank = 0
     rank0.tp_size = 2
     rank0.set_strided_transfer_bridge(rank0_bridge)
@@ -3221,7 +3246,9 @@ def test_v2_scheduler_ends_after_all_decode_tp_ranks_finish(monkeypatch):
                                    0)]
 
     rank1_bridge = RecordingBridge()
-    rank1 = mod.TPUConnectorV2Worker(object())
+    rank1 = mod.TPUConnectorV2Worker(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=2)))
     rank1.tp_rank = 1
     rank1.tp_size = 2
     rank1.set_strided_transfer_bridge(rank1_bridge)
@@ -3232,11 +3259,7 @@ def test_v2_scheduler_ends_after_all_decode_tp_ranks_finish(monkeypatch):
     assert rank1_bridge.calls == [(1, (op_rank1, ), rank1_bridge.sessions[0],
                                    0)]
 
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._mark_recv_lifecycle_planned(req_id="req-1",
                                            uuid=456,
                                            req_meta=req_meta,
@@ -3263,7 +3286,9 @@ def test_v2_scheduler_ends_after_all_decode_tp_ranks_finish(monkeypatch):
 def test_v2_worker_get_finished_does_not_report_strided_recv(monkeypatch):
     mod = _load_v2_module(monkeypatch)
 
-    rank0 = mod.TPUConnectorV2Worker(object())
+    rank0 = mod.TPUConnectorV2Worker(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=2)))
     rank0.tp_rank = 0
     rank0.tp_size = 2
     rank0._coord_lock = mod.threading.Lock()
@@ -3300,7 +3325,9 @@ def test_v2_worker_get_finished_does_not_report_strided_recv(monkeypatch):
 def test_v2_worker_failed_completion_requires_error_message(monkeypatch):
     mod = _load_v2_module(monkeypatch)
 
-    rank0 = mod.TPUConnectorV2Worker(object())
+    rank0 = mod.TPUConnectorV2Worker(
+        _stub_vllm_config(parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=2)))
     rank0.tp_rank = 0
     rank0.tp_size = 1
     rank0._coord_lock = mod.threading.Lock()
@@ -3336,11 +3363,7 @@ def test_v2_scheduler_waits_for_all_decode_tp_completions(monkeypatch):
             1: {},
         },
     )
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._mark_recv_lifecycle_planned(req_id="req-2",
                                            uuid=457,
                                            req_meta=req_meta,
@@ -3386,11 +3409,7 @@ def test_v2_scheduler_prunes_recv_lifecycle_after_end_ack(monkeypatch):
         v2_ack_port=7600,
         remote_rank_ops_by_decode_rank={0: {}},
     )
-    scheduler = mod.TPUConnectorV2Scheduler(
-        types.SimpleNamespace(
-            kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0),
-        ))
+    scheduler = mod.TPUConnectorV2Scheduler(_stub_vllm_config())
     scheduler._send_v2_end = lambda meta: None
     scheduler._mark_recv_lifecycle_planned(req_id="req-clean",
                                            uuid=458,
@@ -3421,6 +3440,7 @@ def test_v2_worker_prunes_strided_recv_lifecycle_after_request_leaves_metadata(
     worker = mod.TPUConnectorV2Worker(
         types.SimpleNamespace(
             kv_transfer_config=types.SimpleNamespace(is_kv_producer=False),
+            cache_config=types.SimpleNamespace(block_size=1),
             parallel_config=types.SimpleNamespace(data_parallel_rank=0,
                                                   tensor_parallel_size=1),
         ))
@@ -3444,7 +3464,7 @@ def test_v2_worker_prunes_strided_recv_lifecycle_after_request_leaves_metadata(
 def test_v2_worker_noop_load_does_not_report_done_recving(monkeypatch):
     mod = _load_v2_module(monkeypatch)
 
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.tp_rank = 0
     req_meta = types.SimpleNamespace(uuid=123,
                                      remote_block_ids=None,
@@ -3482,7 +3502,7 @@ def test_v2_worker_deduplicates_repeated_real_load_uuid(monkeypatch):
             return session
 
     bridge = RecordingBridge()
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.tp_rank = 0
     worker.set_strided_transfer_bridge(bridge)
     _disable_v2_pull_start(worker)
@@ -3553,7 +3573,7 @@ def test_v2_worker_strided_failure_raises_without_completion(monkeypatch):
             self.sessions.append(session)
             return session
 
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.tp_rank = 0
     bridge = FailingBridge()
     worker.set_strided_transfer_bridge(bridge)
@@ -3623,7 +3643,7 @@ def test_v2_worker_pull_start_rejection_fails_before_copy(monkeypatch):
             self.sessions.append(session)
             return session
 
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.tp_rank = 0
     bridge = RecordingBridge()
     worker.set_strided_transfer_bridge(bridge)
@@ -3699,7 +3719,7 @@ def test_v2_worker_schedules_strided_pulls_on_coord_executor(monkeypatch):
             self.transfer_engine = types.SimpleNamespace(
                 register_other_remote_metadata=lambda metadata: None)
 
-    worker = mod.TPUConnectorV2Worker(object())
+    worker = mod.TPUConnectorV2Worker(_stub_vllm_config())
     worker.set_strided_transfer_bridge(RecordingBridge())
     worker._coord_executor = RecordingExecutor()
     req_meta = types.SimpleNamespace(

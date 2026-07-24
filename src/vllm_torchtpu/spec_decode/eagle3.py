@@ -406,9 +406,9 @@ class Eagle3Proposer:
             ]
             loop_positions = [
                 _maybe_pad_dim1(pos, p) if
-                (getattr(runner, "uses_mrope", False) and pos.ndim == 2) else
-                _maybe_pad_dim0(pos, p) for pos, p in zip(
-                    positions_carry_per_chunk, padded_nr_per_chunk)
+                (runner.uses_mrope and pos.ndim == 2) else _maybe_pad_dim0(
+                    pos, p) for pos, p in zip(positions_carry_per_chunk,
+                                              padded_nr_per_chunk)
             ]
             # Per-chunk rejected count padded to kernel_num_reqs so the loop's
             # seq_lens subtraction is full-length (constant) — no per-num_reqs
@@ -788,8 +788,8 @@ class Eagle3Proposer:
                                 if num_tokens_padded else num_tokens)
 
         mamba_state_indices = (runner._build_mamba_state_indices(
-            chunk.start_index, num_reqs, kernel_num_reqs) if getattr(
-                runner, "_has_mamba_state", False) else None)
+            chunk.start_index, num_reqs, kernel_num_reqs)
+                               if runner._has_mamba_state else None)
         saved_ctx = runner._attn_metadata_builder_ctx
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,

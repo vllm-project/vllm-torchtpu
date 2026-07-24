@@ -89,17 +89,6 @@ class TpuWorkerBinding:
         }
 
 
-def _as_int(value: object, default: int) -> int:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return default
-    return default
-
-
 def _get_int_env(env: Mapping[str, str], name: str, default: int) -> int:
     try:
         return int(env.get(name, "") or default)
@@ -361,20 +350,19 @@ def get_tpu_worker_binding(
     env: Mapping[str, str],
     use_spawned_pcp_local_rank: bool = False,
 ) -> TpuWorkerBinding:
-    world_size = _as_int(getattr(parallel_config, "world_size", 1), 1)
-    pcp_size = _as_int(
-        getattr(parallel_config, "prefill_context_parallel_size", 1), 1)
-    dp_size = (_get_int_env(env, "TORCH_TPU_DP_SIZE", 0) or _as_int(
-        getattr(parallel_config, "data_parallel_size", 1), 1))
+    world_size = parallel_config.world_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    dp_size = (_get_int_env(env, "TORCH_TPU_DP_SIZE", 0)
+               or parallel_config.data_parallel_size)
     local_rank_offset = _get_int_env(env, "TPU_LOCAL_RANK_OFFSET", 0)
 
     rank = int(rank)
     local_rank = int(local_rank)
     if dp_size > 1:
-        dp_rank = getattr(parallel_config, "data_parallel_index", None)
-        if dp_rank is None:
-            dp_rank = getattr(parallel_config, "data_parallel_rank", 0)
-        dp_rank = _as_int(dp_rank, 0)
+        dp_rank = parallel_config.data_parallel_index
+        assert dp_rank is not None, (
+            "ParallelConfig.data_parallel_index must be resolved when "
+            "data_parallel_size > 1")
 
         native_local_rank = dp_rank * world_size + local_rank
         global_rank = dp_rank * world_size + rank

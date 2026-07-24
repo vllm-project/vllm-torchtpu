@@ -251,7 +251,7 @@ def _process_fp8_linear_weights(
         weight_scale_inv=weight_scale_inv,
         block_quant=block_quant,
         weight_block_size=weight_block_size,
-        logical_widths=getattr(layer, "logical_widths", None),
+        logical_widths=layer.logical_widths,
         out_dtype=torch.float32,
     )
     weight, weight_scale = quantize_tensor(
@@ -718,7 +718,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        custom_routing_fn = layer.custom_routing_function
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
@@ -732,7 +732,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                scoring_fn=layer.scoring_func,
                 layer=layer,
             )
 

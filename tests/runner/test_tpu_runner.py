@@ -48,6 +48,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
                                              if spec_k is None else object())),
         speculative_config=(None if spec_k is None else SimpleNamespace(
             num_speculative_tokens=spec_k)),
+        _last_sequence_layout_plan=None,
         input_batch=SimpleNamespace(req_ids=req_ids))
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         fake,
@@ -655,6 +656,7 @@ class TestTPURunner:
         owner.head_size = 128
         owner.kv_sharing_target_layer_name = None
         owner.sliding_window = None
+        owner.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         shared = MagicMock(spec=Attention)
         shared.attn_type = AttentionType.DECODER
@@ -662,6 +664,7 @@ class TestTPURunner:
         shared.head_size = 128
         shared.kv_sharing_target_layer_name = "layer.0"
         shared.sliding_window = None
+        shared.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         mock_get_layers.return_value = {
             "layer.0": owner,
@@ -679,14 +682,14 @@ class TestTPURunner:
         attn.num_kv_heads = 2
         attn.head_size = 128
         attn.sliding_window = attn_window
-        attn.impl = None
+        attn.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         target = MagicMock(spec=Attention)
         target.attn_type = AttentionType.DECODER
         target.num_kv_heads = 2
         target.head_size = 128
         target.sliding_window = target_window
-        target.impl = None
+        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
         return attn, target
 
     def test_validate_shared_layout_skips_sliding_window_when_hma_disabled(
@@ -1044,10 +1047,8 @@ class TestTPURunner:
         assert "attn.0" in created_caches
         assert created_caches["attn.0"].shape == (1, 16, 2, 1, 128)
 
-    def test_initialize_kv_cache_num_blocks_override_and_relaxed_divisibility(
-            self):
-        """Verify explicit num_blocks override on kv_cache_config and relaxed
-        divisibility when num_blocks is None and tensor_size is padded."""
+    def test_initialize_kv_cache_num_blocks_override(self):
+        """Verify explicit num_blocks override on kv_cache_config."""
         attn_spec = FullAttentionSpec(block_size=16,
                                       num_kv_heads=2,
                                       head_size=128,
@@ -1057,7 +1058,7 @@ class TestTPURunner:
             KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
         ]
 
-        # Case 1: num_blocks explicitly provided on kv_cache_config
+        # num_blocks explicitly provided on kv_cache_config
         kv_cache_config_explicit = KVCacheConfig(
             num_blocks=10,
             kv_cache_tensors=[
@@ -1091,28 +1092,27 @@ class TestTPURunner:
                                                    attn_spec.head_size,
                                                    attn_spec.dtype)
 
-        # Case 2: num_blocks is None, tensor_size has padding (not perfectly divisible)
-        kv_cache_config_implicit = KVCacheConfig(
+    def test_initialize_kv_cache_rejects_unresolved_num_blocks(self):
+        # num_blocks is resolved by the scheduler before reaching the runner;
+        # an unresolved config must fail loudly instead of being recomputed.
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        kv_cache_config = KVCacheConfig(
             num_blocks=None,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 5 + 400, shared_by=["attn.0"]),
+                KVCacheTensor(size=16384 * 5, shared_by=["attn.0"]),
             ],
-            kv_cache_groups=kv_cache_groups,
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["attn.0"],
+                                 kv_cache_spec=attn_spec),
+            ],
         )
-        kv_cache_config_implicit.num_blocks = None
 
-        with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(5, 16, 2, 1, 128)) as mock_get_shape, patch(
-                    'vllm_torchtpu.utils.tpu_bind_kv_cache'
-                ), patch(
-                    'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                    return_value=False):
-            self.runner.initialize_kv_cache(kv_cache_config_implicit)
-            mock_get_shape.assert_called_once_with(5, attn_spec.block_size,
-                                                   attn_spec.num_kv_heads,
-                                                   attn_spec.head_size,
-                                                   attn_spec.dtype)
+        with pytest.raises(AssertionError, match="num_blocks"):
+            self.runner.initialize_kv_cache(kv_cache_config)
 
 
 class TestAttentionMetadataBuilder:

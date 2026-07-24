@@ -6,6 +6,8 @@ from vllm.v1.kv_cache_interface import (EncoderOnlyAttentionSpec,
                                         MambaSpec)
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_torchtpu.distributed.kv_transfer.v2 import \
+    raiden_pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
     format_kv_cache_layout_summary, materialize_kv_cache_tensors)
 
@@ -268,6 +270,45 @@ def test_hybrid_materializes_one_attention_shaped_pool(attn_dtype):
     assert pool.shape == (4, 16, 2, 2, 8)
     assert materialized.kv_caches["model.layers.0.self_attn"] is pool
     assert materialized.kv_caches["model.layers.1.mamba"] == [pool]
+
+
+def test_hybrid_materialization_builds_raiden_logical_regions():
+    cfg = make_hybrid_config(num_blocks=4, attn_dtype=torch.bfloat16)
+    materialized = materialize_kv_cache_tensors(
+        kv_cache_config=cfg,
+        attn_groups=_hybrid_groups(cfg),
+        kernel_block_sizes=[16, 16],
+        device=torch.device("cpu"),
+        cache_dtype="bfloat16",
+    )
+
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=materialized.kv_caches,
+        kv_cache_groups=cfg.kv_cache_groups,
+        raw_tensors=materialized.raw_tensors,
+        gdn_geometry=rpm.GdnHeadGeometry(local_key_heads=1,
+                                         local_value_heads=1,
+                                         key_head_dim=2,
+                                         value_head_dim=4),
+        mamba_group_ordinal_by_layer={"model.layers.1.mamba": 0},
+    )
+
+    assert manifest.binding == rpm.BINDING_ALIASED_RAW
+    assert len(manifest.storages) == 1
+    assert manifest.storages[0] is materialized.raw_tensors[0]
+    assert len(manifest.pools) == 3
+    fa, conv, ssm = manifest.pools
+    assert [fa.tag, conv.tag, ssm.tag] == [
+        rpm.TAG_FA,
+        f"{rpm.TAG_GDN_CONV}.g0",
+        f"{rpm.TAG_GDN_SSM}.g0",
+    ]
+    assert all(pool.num_blocks == 4 for pool in manifest.pools)
+    assert all(pool.block_stride_bytes == 1024 for pool in manifest.pools)
+    assert ssm.base_offset_bytes == 0
+    assert conv.base_offset_bytes == 2 * 4 * 8 * torch.float32.itemsize
+    rpm.verify_storage_binding(manifest, materialized.kv_caches,
+                               materialized.raw_tensors)
 
 
 def test_hybrid_materialization_skips_encoder_only_kernel_entry():

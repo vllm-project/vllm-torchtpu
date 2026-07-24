@@ -39,6 +39,7 @@ def _vllm_config(*,
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
             cp_kv_cache_interleave_size=interleave_size,
+            data_parallel_size=1,
         ),
         cache_config=SimpleNamespace(
             mamba_block_size=4096,

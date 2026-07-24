@@ -31,6 +31,15 @@ def _gdn_group(layer_names):
                                  kv_cache_spec=types.SimpleNamespace())
 
 
+def _pooled_gdn_group(layer_names, *, shapes, dtypes, page_size_bytes):
+    return types.SimpleNamespace(
+        layer_names=tuple(layer_names),
+        kv_cache_spec=types.SimpleNamespace(shapes=tuple(shapes),
+                                            dtypes=tuple(dtypes),
+                                            page_size_bytes=page_size_bytes),
+    )
+
+
 QWEN35_FA_LAYERS = tuple(range(3, 60, 4))
 QWEN35_GDN_LAYERS = tuple(i for i in range(60) if i not in QWEN35_FA_LAYERS)
 
@@ -339,6 +348,127 @@ def test_aliased_binding_resolves_raw_storage_offsets():
     assert ssm_pool.block_stride_bytes == page
     assert ssm_pool.base_offset_bytes == 73_728
     rpm.verify_storage_binding(manifest, named, raw_tensors=(raw, ))
+
+
+def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
+    geometry = rpm.GdnHeadGeometry(local_key_heads=4,
+                                   local_value_heads=8,
+                                   key_head_dim=64,
+                                   value_head_dim=32)
+    conv_shape = (2, 768)
+    ssm_shape = (8, 64, 32)
+    manager_page_bytes = 131_072
+    # Four attention-shaped manager pages.  The same object is bound to FA,
+    # exposed as [pool] to GDN, and listed as the runner's raw tensor.
+    pool = FakeTensor((4, 128, 1, 4, 256), 1, dtype="torch.float8_e4m3fn")
+    named = {
+        "model.layers.0.linear_attn": [pool],
+        "model.layers.1.self_attn.attn": pool,
+    }
+    groups = (
+        _pooled_gdn_group(["model.layers.0.linear_attn"],
+                          shapes=(conv_shape, ssm_shape),
+                          dtypes=("torch.bfloat16", "torch.float32"),
+                          page_size_bytes=manager_page_bytes),
+        _fa_group(["model.layers.1.self_attn.attn"],
+                  block_size=128,
+                  num_kv_heads=2,
+                  head_size=256),
+    )
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(pool, ),
+        gdn_geometry=geometry,
+        mamba_group_ordinal_by_layer={"model.layers.0.linear_attn": 0},
+    )
+
+    assert manifest.binding == rpm.BINDING_ALIASED_RAW
+    assert manifest.storages == [pool]
+    assert len(manifest.pools) == 3
+    conv, ssm, fa = manifest.pools
+    assert [entry.tag for entry in manifest.pools] == [
+        f"{rpm.TAG_GDN_CONV}.g0",
+        f"{rpm.TAG_GDN_SSM}.g0",
+        rpm.TAG_FA,
+    ]
+    assert all(entry.storage_index == 0 for entry in manifest.pools)
+    assert all(entry.num_blocks == 4 for entry in manifest.pools)
+    assert all(entry.block_stride_bytes == manager_page_bytes
+               for entry in manifest.pools)
+    ssm_bytes = 8 * 64 * 32 * 4
+    assert (conv.base_offset_bytes, conv.dtype_tag,
+            conv.live_bytes_per_block) == (ssm_bytes, "bfloat16", 2 * 768 * 2)
+    assert (ssm.base_offset_bytes, ssm.dtype_tag,
+            ssm.live_bytes_per_block) == (0, "float32", ssm_bytes)
+    assert (fa.base_offset_bytes, fa.dtype_tag,
+            fa.live_bytes_per_block) == (0, "float8_e4m3fn",
+                                         manager_page_bytes)
+    assert max(region.extent_end_bytes
+               for region in conv.regions) + conv.base_offset_bytes < \
+        manager_page_bytes
+    rpm.verify_storage_binding(manifest, named, raw_tensors=(pool, ))
+
+
+@pytest.mark.parametrize(
+    ("shapes", "dtypes", "page_size", "raw_size", "match"),
+    [
+        (((2, 768), ), ("torch.bfloat16", ), 131_072, 524_288,
+         "requires conv and SSM specs"),
+        (((2, 768), (8, 64, 32)), ("torch.bfloat16", "torch.float32"), 65_536,
+         524_288, "exceed one manager page"),
+        (((2, 768), (8, 64, 32)), ("torch.bfloat16", "torch.float32"), 131_072,
+         524_289, "must be divisible"),
+    ],
+)
+def test_unified_pool_rejects_invalid_gdn_spec(shapes, dtypes, page_size,
+                                               raw_size, match):
+    pool = FakeTensor((raw_size, ), 1, dtype="torch.float8_e4m3fn")
+    layer = "model.layers.0.linear_attn"
+    named = {layer: [pool]}
+    groups = (_pooled_gdn_group([layer],
+                                shapes=shapes,
+                                dtypes=dtypes,
+                                page_size_bytes=page_size), )
+    geometry = rpm.GdnHeadGeometry(local_key_heads=4,
+                                   local_value_heads=8,
+                                   key_head_dim=64,
+                                   value_head_dim=32)
+    with pytest.raises(rpm.ManifestError, match=match):
+        rpm.build_qwen35_pool_manifest(named_kv_caches=named,
+                                       kv_cache_groups=groups,
+                                       raw_tensors=(pool, ),
+                                       gdn_geometry=geometry)
+
+
+def test_unified_pool_requires_a_complete_listed_raw_storage():
+    layer = "model.layers.0.linear_attn"
+    pool = FakeTensor((524_288, ), 1, dtype="torch.float8_e4m3fn")
+    groups = (_pooled_gdn_group(
+        [layer],
+        shapes=((2, 768), (8, 64, 32)),
+        dtypes=("torch.bfloat16", "torch.float32"),
+        page_size_bytes=131_072,
+    ), )
+    geometry = rpm.GdnHeadGeometry(local_key_heads=4,
+                                   local_value_heads=8,
+                                   key_head_dim=64,
+                                   value_head_dim=32)
+    with pytest.raises(rpm.ManifestError, match="must share raw pool storage"):
+        rpm.build_qwen35_pool_manifest(named_kv_caches={layer: [pool]},
+                                       kv_cache_groups=groups,
+                                       raw_tensors=(),
+                                       gdn_geometry=geometry)
+
+    partial = FakeTensor((262_144, ),
+                         1,
+                         dtype="torch.float8_e4m3fn",
+                         storage=pool.untyped_storage())
+    with pytest.raises(rpm.ManifestError, match="complete raw pool"):
+        rpm.build_qwen35_pool_manifest(named_kv_caches={layer: [partial]},
+                                       kv_cache_groups=groups,
+                                       raw_tensors=(pool, ),
+                                       gdn_geometry=geometry)
 
 
 def test_mixed_binding_is_rejected():

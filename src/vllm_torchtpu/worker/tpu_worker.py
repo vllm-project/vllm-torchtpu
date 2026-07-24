@@ -165,9 +165,7 @@ class TPUWorker(WorkerBase):
         # prepare_tpu_environment() in tpu_platform.py).
         pc = self.parallel_config
         dp_size = utils.get_dp_size(pc)
-        pcp_size = getattr(pc, "prefill_context_parallel_size", 1)
-        if not isinstance(pcp_size, int):
-            pcp_size = 1
+        pcp_size = pc.prefill_context_parallel_size
         binding = get_tpu_worker_binding(pc,
                                          self.rank,
                                          self.local_rank,

@@ -4,18 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 
-def _as_int(value: Any, default: int) -> int:
-    return value if isinstance(value, int) else default
-
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return bool(value)
-    return default
-
-
 @dataclass(frozen=True)
 class PcpStaticConfig:
     pcp_size: int
@@ -46,38 +34,21 @@ class PcpStaticSupportValidator:
                 is_kv_producer=None,
             )
 
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        scheduler_config = getattr(vllm_config, "scheduler_config", None)
-        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        parallel_config = vllm_config.parallel_config
+        scheduler_config = vllm_config.scheduler_config
+        kv_transfer_config = vllm_config.kv_transfer_config
 
         is_kv_producer = None
         if kv_transfer_config is not None:
-            raw_is_kv_producer = getattr(kv_transfer_config, "is_kv_producer",
-                                         None)
-            if isinstance(raw_is_kv_producer, bool):
-                is_kv_producer = raw_is_kv_producer
+            is_kv_producer = kv_transfer_config.is_kv_producer
 
         return PcpStaticConfig(
-            pcp_size=_as_int(
-                getattr(parallel_config, "prefill_context_parallel_size", 1),
-                1,
-            ),
-            interleave_size=_as_int(
-                getattr(parallel_config, "cp_kv_cache_interleave_size", 1),
-                1,
-            ),
-            dcp_size=_as_int(
-                getattr(parallel_config, "decode_context_parallel_size", 1),
-                1,
-            ),
-            pipeline_parallel_size=_as_int(
-                getattr(parallel_config, "pipeline_parallel_size", 1),
-                1,
-            ),
-            async_scheduling=_as_bool(
-                getattr(scheduler_config, "async_scheduling", False)),
-            speculative_enabled=getattr(vllm_config, "speculative_config",
-                                        None) is not None,
+            pcp_size=parallel_config.prefill_context_parallel_size,
+            interleave_size=parallel_config.cp_kv_cache_interleave_size,
+            dcp_size=parallel_config.decode_context_parallel_size,
+            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            async_scheduling=bool(scheduler_config.async_scheduling),
+            speculative_enabled=vllm_config.speculative_config is not None,
             is_kv_producer=is_kv_producer,
         )
 

@@ -307,7 +307,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     from vllm.v1.engine.core import EngineCoreProc
 
-    original_run = getattr(EngineCoreProc, "_tpu_original_run_engine_core")
+    original_run = EngineCoreProc._tpu_original_run_engine_core
     return original_run(*args, **kwargs)
 
 

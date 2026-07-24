@@ -37,7 +37,7 @@ def select_experts(
     layer=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local routed ids/weights for the non-EP path."""
-    if layer is not None and getattr(layer, "use_grouped_topk", False):
+    if layer is not None and layer.use_grouped_topk:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk
         topk_weights, topk_ids = grouped_topk(
@@ -45,12 +45,11 @@ def select_experts(
             gating_output=router_logits,
             topk=topk,
             renormalize=renormalize,
-            num_expert_group=getattr(layer, "num_expert_group", 0),
-            topk_group=getattr(layer, "topk_group", 0),
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
             scoring_func=scoring_fn,
-            routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
-            e_score_correction_bias=getattr(layer, "e_score_correction_bias",
-                                            None),
+            routed_scaling_factor=layer.routed_scaling_factor,
+            e_score_correction_bias=layer.e_score_correction_bias,
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
@@ -85,7 +84,7 @@ def validate_linear_ep_placement(layer) -> None:
     The kernel relies on a contiguous-block ``expert_map``, which vLLM only
     produces when ``expert_placement_strategy == "linear"``.
     """
-    strategy = getattr(layer, "expert_placement_strategy", "linear")
+    strategy = layer.expert_placement_strategy
     if strategy != "linear":
         raise NotImplementedError(
             "fused MoE kernel currently requires linear EP placement; got "

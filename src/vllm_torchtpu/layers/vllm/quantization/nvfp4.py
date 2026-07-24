@@ -339,7 +339,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         activation_str = layer._tpu_activation_str
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        custom_routing_fn = layer.custom_routing_function
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
@@ -353,7 +353,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                scoring_fn=layer.scoring_func,
             )
         return fused_moe_gmm(
             hidden_states=x,

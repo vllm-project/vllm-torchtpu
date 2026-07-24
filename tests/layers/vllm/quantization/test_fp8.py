@@ -170,6 +170,7 @@ class TestFp8LinearRuntimeQuant:
                                dtype=torch.float32)
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
         layer.weight_scale_inv = torch.nn.Parameter(scale_inv,
                                                     requires_grad=False)
@@ -200,6 +201,7 @@ class TestFp8LinearRuntimeQuant:
                                  dtype=torch.float32)
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
         layer.weight_scale_inv = torch.nn.Parameter(scale_inv,
                                                     requires_grad=False)
@@ -242,6 +244,7 @@ class TestFp8LinearRuntimeQuant:
         scale = torch.tensor([2.5], device=device, dtype=torch.float32)
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
 
@@ -334,6 +337,7 @@ class TestFp8LinearRuntimeQuant:
         block_h, block_w = 128, 128
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(torch.ones(out_dim,
                                                      in_dim,
                                                      device=device,

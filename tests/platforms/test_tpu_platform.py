@@ -94,6 +94,7 @@ class TestTpuPlatform:
         vllm_config.model_config = MagicMock(spec=ModelConfig)
         vllm_config.model_config.dtype = torch.bfloat16
         vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.hf_config = None
         vllm_config.cache_config = MagicMock(spec=CacheConfig)
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False
@@ -113,6 +114,9 @@ class TestTpuPlatform:
         vllm_config.parallel_config.enable_expert_parallel = False
         vllm_config.parallel_config.pipeline_parallel_size = 1
         vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
         vllm_config.kv_transfer_config = None
         vllm_config.additional_config = {}
         return vllm_config

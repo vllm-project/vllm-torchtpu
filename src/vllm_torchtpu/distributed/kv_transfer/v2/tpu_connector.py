@@ -171,7 +171,7 @@ def _get_native_pcp_rank() -> int:
 
 
 def _is_finished_length_capped(request: Any) -> bool:
-    status = getattr(request, "status", None)
+    status = request.status
     if getattr(status, "name", None) == "FINISHED_LENGTH_CAPPED":
         return True
     if status == "FINISHED_LENGTH_CAPPED":
@@ -307,16 +307,14 @@ class TPUConnectorV2Scheduler:
 
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
-        self.config = getattr(vllm_config, "kv_transfer_config", None)
-        self.is_producer = bool(getattr(self.config, "is_kv_producer", False))
-        self.block_size = int(
-            getattr(getattr(vllm_config, "cache_config", None), "block_size",
-                    1) or 1)
+        self.config = vllm_config.kv_transfer_config
+        self.is_producer = bool(self.config.is_kv_producer)
+        self.block_size = int(vllm_config.cache_config.block_size or 1)
         self.reqs_to_send: dict[ReqId, TPUConnectorV2SendMeta] = {}
         self.reqs_to_load: dict[ReqId, TPUConnectorV2LoadMeta] = {}
 
         self.kv_ip = _dist_utils_value("get_kv_ips", "127.0.0.1")
-        parallel_config = getattr(vllm_config, "parallel_config", None)
+        parallel_config = vllm_config.parallel_config
         dp_rank = _config_int(parallel_config, "data_parallel_rank", 0)
         tp_size = _config_int(parallel_config, "tensor_parallel_size", 1)
         port_base = _dist_utils_value("get_kv_ports", 9100)
@@ -421,7 +419,7 @@ class TPUConnectorV2Scheduler:
 
     def _attach_remote_metadata(self, kv_transfer_params: dict[str,
                                                                Any]) -> None:
-        remote_metadata = getattr(self, "remote_metadata", ())
+        remote_metadata = self.remote_metadata
         if remote_metadata:
             kv_transfer_params["remote_metadata"] = [
                 item.to_dict() for item in remote_metadata
@@ -470,7 +468,7 @@ class TPUConnectorV2Scheduler:
         if self.is_producer or not request.kv_transfer_params:
             return None
 
-        params = getattr(request, "kv_transfer_params", None) or {}
+        params = request.kv_transfer_params or {}
         if num_external_tokens > 0:
             fa_token_offset = self._fa_token_offset_from_request(
                 request, num_external_tokens)
@@ -503,7 +501,7 @@ class TPUConnectorV2Scheduler:
         if req_meta is None:
             return None
 
-        req_id = getattr(request, "request_id", None)
+        req_id = request.request_id
         uuid = self._metadata_value(req_meta, "uuid")
         remote_block_ids = self._metadata_value(req_meta, "remote_block_ids")
         if remote_block_ids is None:
@@ -570,7 +568,7 @@ class TPUConnectorV2Scheduler:
         else:
             meta.reqs_to_load = self.reqs_to_load
             self.reqs_to_load = {}
-        reqs_to_load = getattr(meta, "reqs_to_load", {}) or {}
+        reqs_to_load = meta.reqs_to_load or {}
         for req_id, req_meta in tuple(reqs_to_load.items()):
             if self._metadata_value(req_meta, "remote_block_ids") is None:
                 del reqs_to_load[req_id]
@@ -599,11 +597,10 @@ class TPUConnectorV2Scheduler:
         return len(self.kv_ip) if isinstance(self.kv_ip, list) else 1
 
     def update_connector_output(self, connector_output: Any) -> None:
-        worker_meta = getattr(connector_output, "kv_connector_worker_meta",
-                              None)
+        worker_meta = connector_output.kv_connector_worker_meta
         if worker_meta is not None:
             self._process_v2_worker_meta(worker_meta, connector_output)
-        for req_id in getattr(connector_output, "finished_recving", ()) or ():
+        for req_id in connector_output.finished_recving or ():
             uuid = self._recv_uuid_by_req_id.get(req_id)
             if uuid is None:
                 continue
@@ -612,7 +609,7 @@ class TPUConnectorV2Scheduler:
                 lifecycle.status = "done"
 
     def _drop_req_to_load(self, req_id: Any) -> None:
-        reqs_to_load = getattr(self, "reqs_to_load", None)
+        reqs_to_load = self.reqs_to_load
         if reqs_to_load is not None and req_id is not None:
             reqs_to_load.pop(req_id, None)
 
@@ -741,7 +738,7 @@ class TPUConnectorV2Scheduler:
             "TPUConnectorV2Scheduler --> recv END complete | req_id=%s | "
             "uuid=%s | completed_tp_ranks=%s", lifecycle.req_id,
             lifecycle.uuid, tuple(sorted(lifecycle.completed_tp_ranks)))
-        finished_recving = getattr(connector_output, "finished_recving", None)
+        finished_recving = connector_output.finished_recving
         if finished_recving is None:
             finished_recving = set()
             setattr(connector_output, "finished_recving", finished_recving)
@@ -832,9 +829,9 @@ class TPUConnectorV2Scheduler:
         return int(dist_utils.get_node_id())
 
     def _local_dp_rank(self) -> int:
-        config = getattr(self, "vllm_config", None)
-        parallel_config = getattr(config, "parallel_config", None)
-        return int(getattr(parallel_config, "data_parallel_rank", 0) or 0)
+        config = self.vllm_config
+        parallel_config = config.parallel_config
+        return int(parallel_config.data_parallel_rank or 0)
 
     def _maybe_generate_strided_rank_ops(
         self,
@@ -1083,8 +1080,7 @@ class TPUConnectorV2Scheduler:
                         raise ValueError("full attention region must have "
                                          "block_size")
                     return int(region.block_size)
-        block_size = getattr(getattr(self.vllm_config, "cache_config", None),
-                             "block_size", None)
+        block_size = self.vllm_config.cache_config.block_size
         if block_size is None:
             raise ValueError("source block_size cannot be inferred")
         return int(block_size)
@@ -1159,10 +1155,10 @@ class TPUConnectorV2Scheduler:
         return tuple(result)
 
     def _req_meta_for_request(self, request: Any) -> Any | None:
-        reqs_to_load = getattr(self, "reqs_to_load", None)
+        reqs_to_load = self.reqs_to_load
         if not reqs_to_load:
             return None
-        request_id = getattr(request, "request_id", None)
+        request_id = request.request_id
         if request_id is None:
             return None
         if isinstance(reqs_to_load, Mapping):
@@ -1170,9 +1166,9 @@ class TPUConnectorV2Scheduler:
         return getattr(reqs_to_load, request_id, None)
 
     def _is_kv_producer(self) -> bool:
-        config = getattr(self, "vllm_config", None)
-        kv_transfer_config = getattr(config, "kv_transfer_config", None)
-        return bool(getattr(kv_transfer_config, "is_kv_producer", False))
+        config = self.vllm_config
+        kv_transfer_config = config.kv_transfer_config
+        return bool(kv_transfer_config.is_kv_producer)
 
     @staticmethod
     def _require_remote_metadata_sequence(
@@ -1229,14 +1225,21 @@ class TPUConnectorV2Worker:
     named_kv_caches: dict[str, Any] | None = None
 
     def __init__(self, vllm_config: VllmConfig):
+        self._stop_event = threading.Event()
+        self._coord_threads: list[threading.Thread] = []
+        self._coord_executor: ThreadPoolExecutor | None = None
+        self.strided_transfer_engine: Any | None = None
+        self.zmq_cxt: Any | None = None
+        self.named_kv_caches: dict[str, Any] | None = None
+        self.group_is_mamba: list[bool] | None = None
         self.vllm_config = vllm_config
-        self.config = getattr(vllm_config, "kv_transfer_config", None)
-        self.is_producer = bool(getattr(self.config, "is_kv_producer", False))
+        self.config = vllm_config.kv_transfer_config
+        self.is_producer = bool(self.config.is_kv_producer)
         self.runner: Any | None = None
         self.device: Any | None = None
         self.node_id = int(_dist_utils_value("get_node_id", 0))
 
-        parallel_config = getattr(vllm_config, "parallel_config", None)
+        parallel_config = vllm_config.parallel_config
         self.dp_rank = _config_int(parallel_config, "data_parallel_rank", 0)
         self.model_tp_rank = _get_native_tp_rank()
         self.model_tp_size = _get_native_tp_size()
@@ -1265,19 +1268,15 @@ class TPUConnectorV2Worker:
             _dist_utils_value("get_side_channel_port",
                               9600)) + self.node_id + self.dp_rank
         self.zmq_cxt = _new_zmq_context(max(1, int(self.tp_size)))
-        self._stop_event = threading.Event()
         self._coord_lock = threading.Lock()
-        self._coord_threads: list[threading.Thread] = []
         self._coord_send: dict[int, _V2SendLifecycleEntry] = {}
         self._coord_done_sending: set[ReqId] = set()
         self._coord_recv: dict[int, Any] = {}
         self._coord_done_recving: set[ReqId] = set()
         self._coord_pool: Any | None = None
-        self._coord_executor: ThreadPoolExecutor | None = None
         self._v2_lifecycle_threads_started = False
         self.transfer_stats = _build_transfer_stats()
         self.strided_bridge: TPUConnectorV2StridedBridge | None = None
-        self.strided_transfer_engine: Any | None = None
         self._strided_recv_started_uuids: set[int] = set()
         self._strided_recv_done_uuids: set[int] = set()
         self._pending_v2_worker_completions: list[
@@ -1308,7 +1307,7 @@ class TPUConnectorV2Worker:
 
     def register_runner(self, runner: Any) -> Any:
         self.runner = runner
-        self.device = getattr(runner, "device", None)
+        self.device = runner.device
         self._extract_kv_layout()
         self._ensure_coord_executor()
         self._maybe_install_strided_transfer_engine(runner)
@@ -1347,11 +1346,9 @@ class TPUConnectorV2Worker:
         runner = self.runner
         if runner is None:
             return
-        groups = getattr(getattr(runner, "kv_cache_config", None),
-                         "kv_cache_groups", ())
+        groups = runner.kv_cache_config.kv_cache_groups
         self.group_is_mamba = [
-            isinstance(getattr(group, "kv_cache_spec", None), MambaSpec)
-            for group in groups
+            isinstance(group.kv_cache_spec, MambaSpec) for group in groups
         ]
 
     def _map_layers_to_groups(self, kv_caches: list[Any],
@@ -1385,25 +1382,25 @@ class TPUConnectorV2Worker:
         return None
 
     def __del__(self) -> None:
-        stop_event = getattr(self, "_stop_event", None)
+        stop_event = self._stop_event
         if stop_event is not None:
             stop_event.set()
-        executor = getattr(self, "_coord_executor", None)
+        executor = self._coord_executor
         if executor is not None and hasattr(executor, "shutdown"):
             executor.shutdown(wait=False)
-        engine = getattr(self, "strided_transfer_engine", None)
+        engine = self.strided_transfer_engine
         if engine is not None and hasattr(engine, "stop"):
             engine.stop()
-        for thread in getattr(self, "_coord_threads", ()):
+        for thread in self._coord_threads:
             thread.join(timeout=2)
-        zmq_context = getattr(self, "zmq_cxt", None)
+        zmq_context = self.zmq_cxt
         if zmq_context is not None:
             zmq_context.destroy(linger=0)
 
     def set_strided_transfer_bridge(
             self, bridge: TPUConnectorV2StridedBridge | Any) -> None:
         self.strided_bridge = bridge
-        self.strided_transfer_engine = getattr(bridge, "transfer_engine", None)
+        self.strided_transfer_engine = bridge.transfer_engine
 
     def _maybe_install_strided_transfer_engine(self, runner: Any) -> None:
         if self.strided_bridge is not None:
@@ -1426,13 +1423,11 @@ class TPUConnectorV2Worker:
 
     def _register_named_kv_cache_regions(self, engine: Any,
                                          runner: Any) -> None:
-        named_kv_caches = getattr(self, "named_kv_caches", None)
+        named_kv_caches = self.named_kv_caches
         if not named_kv_caches:
             return
-        raw_tensors = tuple(getattr(runner, "kv_cache_raw_tensors", ()) or ())
-        groups = tuple(
-            getattr(getattr(runner, "kv_cache_config", None),
-                    "kv_cache_groups", ()) or ())
+        raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
+        groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
         layer_specs = {
             layer_name: group.kv_cache_spec
             for group in groups
@@ -1727,44 +1722,40 @@ class TPUConnectorV2Worker:
         return nbytes // num_blocks
 
     def _is_kv_producer(self) -> bool:
-        config = getattr(self, "vllm_config", None)
-        kv_transfer_config = getattr(config, "kv_transfer_config", None)
-        return bool(getattr(kv_transfer_config, "is_kv_producer", False))
+        config = self.vllm_config
+        kv_transfer_config = config.kv_transfer_config
+        return bool(kv_transfer_config.is_kv_producer)
 
     def _local_dp_rank(self) -> int:
-        config = getattr(self, "vllm_config", None)
-        parallel_config = getattr(config, "parallel_config", None)
-        return int(getattr(parallel_config, "data_parallel_rank", 0) or 0)
+        config = self.vllm_config
+        parallel_config = config.parallel_config
+        return int(parallel_config.data_parallel_rank or 0)
 
     def _local_tp_rank(self) -> int:
-        tp_rank = int(getattr(self, "tp_rank", 0) or 0)
-        parallel_config = getattr(getattr(self, "vllm_config", None),
-                                  "parallel_config", None)
-        configured_tp_size = getattr(parallel_config, "tensor_parallel_size",
-                                     None)
+        tp_rank = int(self.tp_rank or 0)
+        parallel_config = self.vllm_config.parallel_config
+        configured_tp_size = parallel_config.tensor_parallel_size
         if configured_tp_size:
             return tp_rank % int(configured_tp_size)
         return tp_rank
 
     def _local_tp_size(self) -> int:
-        config = getattr(self, "vllm_config", None)
-        parallel_config = getattr(config, "parallel_config", None)
-        configured_tp_size = getattr(parallel_config, "tensor_parallel_size",
-                                     None)
+        config = self.vllm_config
+        parallel_config = config.parallel_config
+        configured_tp_size = parallel_config.tensor_parallel_size
         if configured_tp_size:
             return int(configured_tp_size)
-        tp_size = int(getattr(self, "tp_size", 1) or 1)
-        tp_rank = int(getattr(self, "tp_rank", 0) or 0)
+        tp_size = int(self.tp_size or 1)
+        tp_rank = int(self.tp_rank or 0)
         return max(tp_size, tp_rank + 1)
 
     def _local_pcp_size(self) -> int:
-        config = getattr(self, "vllm_config", None)
-        parallel_config = getattr(config, "parallel_config", None)
-        return int(
-            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        config = self.vllm_config
+        parallel_config = config.parallel_config
+        return int(parallel_config.prefill_context_parallel_size or 1)
 
     def _local_pcp_rank(self) -> int:
-        pcp_rank = getattr(self, "pcp_rank", None)
+        pcp_rank = self.pcp_rank
         if pcp_rank is not None:
             return int(pcp_rank)
         if self._local_pcp_size() <= 1:
@@ -1790,12 +1781,12 @@ class TPUConnectorV2Worker:
         return f"dp{self._local_dp_rank()}-tp{self._local_tp_rank()}"
 
     def _local_host_for_metadata(self) -> str:
-        host = getattr(self, "host_ip", None)
+        host = self.host_ip
         if host:
             return str(host)
-        config = getattr(self, "vllm_config", None)
-        kv_transfer_config = getattr(config, "kv_transfer_config", None)
-        kv_ip = getattr(kv_transfer_config, "kv_ip", None)
+        config = self.vllm_config
+        kv_transfer_config = config.kv_transfer_config
+        kv_ip = kv_transfer_config.kv_ip
         if isinstance(kv_ip, (list, tuple)):
             return str(kv_ip[0]) if kv_ip else "127.0.0.1"
         if kv_ip:
@@ -1803,7 +1794,7 @@ class TPUConnectorV2Worker:
         return "127.0.0.1"
 
     def _strided_listen_port(self) -> int:
-        base_port = int(getattr(self, "kv_transfer_port", 9100)) + 10000
+        base_port = int(self.kv_transfer_port) + 10000
         return (base_port +
                 self._local_dp_rank() * self._local_transfer_world_size() +
                 self._local_transfer_rank())
@@ -1860,11 +1851,11 @@ class TPUConnectorV2Worker:
         )
 
     def _local_kv_source_layout(self) -> KVParallelLayout:
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        full_attn_pcp_size = int(
-            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        parallel_config = self.vllm_config.parallel_config
+        full_attn_pcp_size = int(parallel_config.prefill_context_parallel_size
+                                 or 1)
         cp_kv_cache_interleave_size = int(
-            getattr(parallel_config, "cp_kv_cache_interleave_size", 1) or 1)
+            parallel_config.cp_kv_cache_interleave_size or 1)
         tp_size = self._local_tp_size()
         if full_attn_pcp_size > 1 and tp_size != 1:
             raise ValueError(
@@ -1897,8 +1888,7 @@ class TPUConnectorV2Worker:
                     raise ValueError("full attention region must have "
                                      "block_size")
                 return int(region.block_size)
-        block_size = getattr(getattr(self.vllm_config, "cache_config", None),
-                             "block_size", None)
+        block_size = self.vllm_config.cache_config.block_size
         if block_size is not None:
             return int(block_size)
         return 1
@@ -1915,7 +1905,7 @@ class TPUConnectorV2Worker:
         return fa_groups, mamba_groups
 
     def _require_group_is_mamba(self) -> Sequence[bool]:
-        group_is_mamba = getattr(self, "group_is_mamba", None)
+        group_is_mamba = self.group_is_mamba
         if group_is_mamba is None:
             raise RuntimeError("TPUConnectorV2 requires group_is_mamba; "
                                "register_runner must run before building KV "
@@ -2162,14 +2152,14 @@ class TPUConnectorV2Worker:
         )
 
     def _group_index_for_region(self, region_id: str) -> int | None:
-        runner = getattr(self, "runner", None)
-        kv_cache_config = getattr(runner, "kv_cache_config", None)
-        groups = getattr(kv_cache_config, "kv_cache_groups", None)
+        runner = self.runner
+        kv_cache_config = runner.kv_cache_config
+        groups = kv_cache_config.kv_cache_groups
         if not groups:
             return None
         layer_name = self._base_layer_name(region_id)
         for group_index, group in enumerate(groups):
-            if layer_name in getattr(group, "layer_names", ()):
+            if layer_name in group.layer_names:
                 return group_index
         return None
 
@@ -2198,8 +2188,8 @@ class TPUConnectorV2Worker:
         return 1
 
     def _model_text_config(self) -> Any:
-        model_config = getattr(self.vllm_config, "model_config", None)
-        hf_config = getattr(model_config, "hf_config", None)
+        model_config = self.vllm_config.model_config
+        hf_config = model_config.hf_config
         if hf_config is None:
             hf_config = model_config
         return getattr(hf_config, "text_config", hf_config)
@@ -2286,7 +2276,7 @@ class TPUConnectorV2Worker:
         if self.strided_bridge is None:
             return
         transfer_engine = self.strided_bridge.transfer_engine
-        reqs_to_load = getattr(metadata, "reqs_to_load", {})
+        reqs_to_load = metadata.reqs_to_load
         for req_meta in reqs_to_load.values():
             remote_metadata = self._metadata_value(req_meta, "remote_metadata")
             if remote_metadata:
@@ -2308,20 +2298,19 @@ class TPUConnectorV2Worker:
         self.register_remote_metadata_from_connector_metadata(metadata)
         self._process_v2_sends(metadata)
         copied, handled_load_ids = self._process_strided_loads(metadata)
-        if len(handled_load_ids) != len(
-                getattr(metadata, "reqs_to_load", {}) or {}):
+        if len(handled_load_ids) != len(metadata.reqs_to_load or {}):
             raise RuntimeError(
                 "TPUConnectorV2 requires every load to use "
                 "remote_rank_ops_by_decode_rank; HMA fallback is disabled")
         return copied
 
     def _process_v2_sends(self, metadata: Any) -> None:
-        reqs_to_send = getattr(metadata, "reqs_to_send", {}) or {}
+        reqs_to_send = metadata.reqs_to_send or {}
         if not reqs_to_send:
             return
         if not self._is_host_coordinator:
             return
-        coord_send = getattr(self, "_coord_send", None)
+        coord_send = self._coord_send
         if coord_send is None:
             self._coord_send = {}
             coord_send = self._coord_send
@@ -2340,7 +2329,7 @@ class TPUConnectorV2Worker:
             req_id=req_id,
             expiration_time=float(expiration_time),
         )
-        lock = getattr(self, "_coord_lock", None)
+        lock = self._coord_lock
         if lock is None:
             self._coord_send[int(uuid)] = entry
         else:
@@ -2352,7 +2341,7 @@ class TPUConnectorV2Worker:
             uuid, float(expiration_time))
 
     def _process_strided_loads(self, metadata: Any) -> tuple[int, set[Any]]:
-        reqs_to_load = getattr(metadata, "reqs_to_load", {}) or {}
+        reqs_to_load = metadata.reqs_to_load or {}
         self._prune_strided_recv_lifecycle(reqs_to_load)
         total_copied = 0
         handled: set[Any] = set()
@@ -2360,7 +2349,7 @@ class TPUConnectorV2Worker:
             if not hasattr(req_meta, "remote_block_ids"):
                 raise RuntimeError(
                     "TPUConnectorV2 load metadata requires remote_block_ids")
-            if getattr(req_meta, "remote_block_ids") is None:
+            if req_meta.remote_block_ids is None:
                 handled.add(req_id)
                 continue
             has_decode_rank_ops, rank_ops = (
@@ -2387,7 +2376,7 @@ class TPUConnectorV2Worker:
                                           error="")
                 handled.add(req_id)
                 continue
-            executor = getattr(self, "_coord_executor", None)
+            executor = self._coord_executor
             if executor is not None:
                 executor.submit(self._process_one_strided_load_fail_forward,
                                 req_id, req_meta, rank_ops)
@@ -2406,7 +2395,7 @@ class TPUConnectorV2Worker:
         try:
             return self._process_one_strided_load(req_id, req_meta, rank_ops)
         except Exception as exc:
-            transfer_stats = getattr(self, "transfer_stats", None)
+            transfer_stats = self.transfer_stats
             if transfer_stats is not None and hasattr(
                     transfer_stats, "record_failed_transfer"):
                 transfer_stats.record_failed_transfer()
@@ -2425,7 +2414,7 @@ class TPUConnectorV2Worker:
         req_meta: Any,
         rank_ops: dict[int, tuple[StridedSegmentOp, ...]],
     ) -> int:
-        if getattr(req_meta, "remote_block_ids", None) is None:
+        if req_meta.remote_block_ids is None:
             return 0
 
         if self.strided_bridge is None:
@@ -2635,7 +2624,7 @@ class TPUConnectorV2Worker:
                                       reqs_to_load: Mapping[Any, Any]) -> None:
         active_uuids: set[int] = set()
         for req_meta in reqs_to_load.values():
-            if getattr(req_meta, "remote_block_ids", None) is None:
+            if req_meta.remote_block_ids is None:
                 continue
             uuid = self._metadata_value(req_meta, "uuid")
             if uuid is not None:
@@ -2709,7 +2698,7 @@ class TPUConnectorV2Worker:
                              f"{op.destination_region_id!r}")
 
     def _local_destination_region_ids(self) -> set[str]:
-        engine = getattr(self, "strided_transfer_engine", None)
+        engine = self.strided_transfer_engine
         if engine is None:
             return set()
         if hasattr(engine, "local_regions_metadata"):

@@ -246,3 +246,12 @@ def test_dp_binding_uses_registered_probe_result_and_applies_offset():
     assert b.init_rank == 2
     assert b.init_world_size == 4
     assert b.init_local_rank == 6
+
+
+def test_dp_binding_rejects_unresolved_data_parallel_index():
+    # data_parallel_index is resolved by ParallelConfig.__post_init__; an
+    # unresolved index under DP must fail loudly instead of being defaulted.
+    pc = _parallel_config(data_parallel_size=2, data_parallel_index=None)
+
+    with pytest.raises(AssertionError, match="data_parallel_index"):
+        binding.get_tpu_worker_binding(pc, rank=0, local_rank=0, env={})

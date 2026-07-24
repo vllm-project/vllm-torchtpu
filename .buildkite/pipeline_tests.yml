@@ -19,6 +19,7 @@ x-unit-test-defaults: &unit_test_defaults
     - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
 
 x-tests-plugin-defaults: &tests_plugin_defaults
+  suite-slug: tests
   test-runner: pytest
   install-client: false
   oidc-lifetime: 7200

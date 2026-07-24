@@ -10,11 +10,16 @@ context plus their kv-cache-group specs) — never from pinned constants.
 Binding resolution follows the storage-pointer rule used by the working ZMQ
 transfer path (``_register_named_region``):
 
-- every typed cache shares storage with a raw unified tensor →
+- every logical cache shares storage with a raw unified tensor →
   ``aliased_raw``: pools reference the raw storages with interior offsets;
-- no typed cache shares storage with a raw tensor (the alias-fallback
-  default today) → ``private_typed``: one pool per typed tensor;
+- no typed cache shares storage with a raw tensor → ``private_typed``: one
+  pool per typed tensor (legacy materializations only);
 - a mix is a materialization bug and is rejected.
+
+Current unified-pool materializations expose a GDN layer as ``[pool]`` rather
+than persistent ``(conv, ssm)`` tensors.  For manifest construction we derive
+two metadata-only logical views from the Mamba spec.  This does not execute a
+torch operation or add tensors to the model graph.
 
 Registering storages the kernels never touch (e.g. the raw unified pages while
 the typed caches are private) hard-fails before any raiden manager is
@@ -24,6 +29,7 @@ constructed.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any, Mapping, Sequence
 
 from .common import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
@@ -55,6 +61,14 @@ class RegionSpec:
     @property
     def live_bytes(self) -> int:
         return self.unit_bytes * self.num_units * self.units_per_stride
+
+    @property
+    def extent_end_bytes(self) -> int:
+        """Exclusive end of the last live byte relative to the pool base."""
+        if self.num_units <= 0:
+            return self.offset_bytes
+        return (self.offset_bytes + (self.num_units - 1) * self.stride_bytes +
+                self.unit_bytes * self.units_per_stride)
 
     def to_dict(self) -> dict[str, int | str]:
         return dataclasses.asdict(self)
@@ -165,6 +179,56 @@ def _dtype_tag(tensor: Any) -> str:
     return text.removeprefix("torch.")
 
 
+def _dtype_itemsize(dtype: Any) -> int:
+    itemsize = getattr(dtype, "itemsize", None)
+    if itemsize is not None:
+        return int(itemsize)
+    # Test fakes and serialized specs may carry a dtype name rather than a
+    # torch.dtype.  Keep this module importable without importing torch/TPU.
+    name = str(dtype).removeprefix("torch.")
+    known = {
+        "bfloat16": 2,
+        "float16": 2,
+        "float32": 4,
+        "float64": 8,
+        "float8_e4m3fn": 1,
+        "float8_e5m2": 1,
+        "int8": 1,
+        "uint8": 1,
+    }
+    try:
+        return known[name]
+    except KeyError as exc:
+        raise ManifestError(f"cannot determine item size of dtype {dtype!r}") \
+            from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class _PooledStateView:
+    """Tensor-like metadata for one logical state inside a unified pool.
+
+    The descriptor deliberately implements only the accessors used below.  In
+    particular, constructing it never calls ``view``/``as_strided`` on an XLA
+    tensor, so Raiden manifest admission cannot grow the device graph.
+    """
+
+    pool: Any
+    shape: tuple[int, ...]
+    dtype: Any
+    itemsize: int
+    storage_offset_elems: int
+    nbytes: int
+
+    def element_size(self) -> int:
+        return self.itemsize
+
+    def untyped_storage(self) -> Any:
+        return self.pool.untyped_storage()
+
+    def storage_offset(self) -> int:
+        return self.storage_offset_elems
+
+
 def _raw_index_for(tensor: Any, raw_tensors: Sequence[Any]) -> int | None:
     tensor_ptr = _storage_ptr(tensor)
     for idx, raw in enumerate(raw_tensors):
@@ -196,7 +260,7 @@ def layer_index_from_name(layer_name: str) -> int | None:
 
 @dataclasses.dataclass(frozen=True)
 class GdnHeadGeometry:
-    """Per-rank linear-attention head geometry (already TP-divided)."""
+    """Per-rank linear-attention geometry (already TP/PCP-divided)."""
 
     local_key_heads: int
     local_value_heads: int
@@ -289,9 +353,90 @@ def _gdn_ssm_regions(*, ssm_shape: Sequence[int],
 def _group_spec_for_layer(kv_cache_groups: Sequence[Any],
                           layer_name: str) -> Any:
     for group in kv_cache_groups:
-        if layer_name in getattr(group, "layer_names", ()):
-            return getattr(group, "kv_cache_spec", None)
+        if layer_name in group.layer_names:
+            return group.kv_cache_spec
     raise ManifestError(f"layer {layer_name} is in no kv cache group")
+
+
+def _pooled_gdn_state_views(*, pool: Any, spec: Any,
+                            raw_tensors: Sequence[Any],
+                            layer_name: str) -> tuple[Any, Any]:
+    """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool."""
+    raw_index = _raw_index_for(pool, raw_tensors)
+    if raw_index is None:
+        raise ManifestError(
+            f"pooled GDN cache {layer_name} must share raw pool storage")
+    raw = raw_tensors[raw_index]
+    pool_nbytes = _nbytes(pool)
+    raw_nbytes = _nbytes(raw)
+    pool_offset_bytes = _storage_offset_bytes(pool)
+    if (pool_nbytes != raw_nbytes
+            or pool_offset_bytes != _storage_offset_bytes(raw)):
+        raise ManifestError(
+            f"pooled GDN cache {layer_name} must cover the complete raw pool")
+
+    shapes = tuple(getattr(spec, "shapes", ()))
+    dtypes = tuple(getattr(spec, "dtypes", ()))
+    if len(shapes) != 2 or len(dtypes) != 2:
+        raise ManifestError(
+            f"pooled GDN cache {layer_name} requires conv and SSM specs")
+    conv_shape, ssm_shape = (tuple(int(dim) for dim in shape)
+                             for shape in shapes)
+    if (not conv_shape or not ssm_shape or any(dim <= 0 for dim in conv_shape)
+            or any(dim <= 0 for dim in ssm_shape)):
+        raise ManifestError(
+            f"pooled GDN cache {layer_name} has invalid state shapes: "
+            f"conv={conv_shape} ssm={ssm_shape}")
+    conv_dtype, ssm_dtype = dtypes
+    conv_itemsize = _dtype_itemsize(conv_dtype)
+    ssm_itemsize = _dtype_itemsize(ssm_dtype)
+    conv_bytes = math.prod(conv_shape) * conv_itemsize
+    ssm_bytes = math.prod(ssm_shape) * ssm_itemsize
+
+    try:
+        manager_page_bytes = int(spec.page_size_bytes)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ManifestError(
+            f"pooled GDN cache {layer_name} has no manager page size") from exc
+    if manager_page_bytes <= 0 or raw_nbytes % manager_page_bytes != 0:
+        raise ManifestError(
+            f"raw pool bytes {raw_nbytes} for {layer_name} must be divisible "
+            f"by manager page bytes {manager_page_bytes}")
+    if conv_bytes + ssm_bytes > manager_page_bytes:
+        raise ManifestError(
+            f"GDN states for {layer_name} exceed one manager page: "
+            f"states={conv_bytes + ssm_bytes} page={manager_page_bytes}")
+    num_blocks = raw_nbytes // manager_page_bytes
+
+    states: list[_PooledStateView] = []
+    # The PR #106 pooled ABI places SSM first and conv immediately after it,
+    # while the public/canonical manifest order remains conv then SSM.
+    for shape, dtype, itemsize, state_bytes, offset_bytes in ((conv_shape,
+                                                               conv_dtype,
+                                                               conv_itemsize,
+                                                               conv_bytes,
+                                                               ssm_bytes),
+                                                              (ssm_shape,
+                                                               ssm_dtype,
+                                                               ssm_itemsize,
+                                                               ssm_bytes, 0)):
+        absolute_offset_bytes = pool_offset_bytes + offset_bytes
+        if (manager_page_bytes % itemsize != 0
+                or absolute_offset_bytes % itemsize != 0):
+            raise ManifestError(
+                f"pooled GDN state for {layer_name} is not aligned to "
+                f"dtype {dtype}: page={manager_page_bytes} "
+                f"offset={absolute_offset_bytes}")
+        states.append(
+            _PooledStateView(
+                pool=pool,
+                shape=(num_blocks, *shape),
+                dtype=dtype,
+                itemsize=itemsize,
+                storage_offset_elems=absolute_offset_bytes // itemsize,
+                nbytes=num_blocks * state_bytes,
+            ))
+    return states[0], states[1]
 
 
 class _StorageTable:
@@ -342,12 +487,20 @@ def build_qwen35_pool_manifest(
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
     gdn_geometry: GdnHeadGeometry,
+    mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
     Canonical pool order (must match on both transfer peers because pool
     indices travel on the wire): model layer order; within a GDN layer, conv
     before ssm.
+
+    ``mamba_group_ordinal_by_layer`` (opt-in, state-reshard deployments):
+    suffixes GDN pool tags with the layer's mamba kv-cache-group ordinal
+    (``gdn.conv.g0`` ...). Each group has its own block table, so state
+    transfers must address slots per group; the suffix is pure vLLM policy —
+    raiden keeps treating tags as opaque. Both peers must configure it
+    identically (enforced by the manifest identity check at plan time).
     """
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
@@ -357,17 +510,33 @@ def build_qwen35_pool_manifest(
                             (layer_index_from_name(name) is None,
                              layer_index_from_name(name) or 0, str(name)))
 
-    # Flatten to (pool key, typed tensor) in canonical order.
+    # Flatten to (pool key, typed/logical tensor) in canonical order.
     flat: list[tuple[str, str, Any]] = []  # (tag, layer_name, tensor)
     for layer_name in ordered_layers:
         cache = named_kv_caches[layer_name]
         if isinstance(cache, (list, tuple)):
-            if len(cache) != 2:
+            if len(cache) == 1:
+                spec = _group_spec_for_layer(kv_cache_groups, layer_name)
+                states = _pooled_gdn_state_views(pool=cache[0],
+                                                 spec=spec,
+                                                 raw_tensors=raw_tensors,
+                                                 layer_name=layer_name)
+            elif len(cache) == 2:
+                states = cache
+            else:
                 raise ManifestError(
-                    f"GDN layer {layer_name} must have (conv, ssm) states: "
+                    f"GDN layer {layer_name} must have a unified pool or "
+                    f"(conv, ssm) states: "
                     f"got {len(cache)}")
-            flat.append((TAG_GDN_CONV, layer_name, cache[0]))
-            flat.append((TAG_GDN_SSM, layer_name, cache[1]))
+            suffix = ""
+            if mamba_group_ordinal_by_layer is not None:
+                ordinal = mamba_group_ordinal_by_layer.get(layer_name)
+                if ordinal is None:
+                    raise ManifestError(
+                        f"GDN layer {layer_name} has no mamba group ordinal")
+                suffix = f".g{int(ordinal)}"
+            flat.append((TAG_GDN_CONV + suffix, layer_name, states[0]))
+            flat.append((TAG_GDN_SSM + suffix, layer_name, states[1]))
         else:
             flat.append((TAG_FA, layer_name, cache))
 
@@ -384,9 +553,9 @@ def build_qwen35_pool_manifest(
 
         if tag == TAG_FA:
             spec = _group_spec_for_layer(kv_cache_groups, layer_name)
-            block_size = int(getattr(spec, "block_size"))
-            num_kv_heads = int(getattr(spec, "num_kv_heads"))
-            head_size = int(getattr(spec, "head_size"))
+            block_size = int(spec.block_size)
+            num_kv_heads = int(spec.num_kv_heads)
+            head_size = int(spec.head_size)
             if len(shape) < 2:
                 raise ManifestError(
                     f"full-attention cache {layer_name} needs a paged shape: "
@@ -418,7 +587,7 @@ def build_qwen35_pool_manifest(
                     f"GDN state {layer_name} nbytes {nbytes} is not "
                     f"divisible by num_blocks {num_blocks}")
             live_stride = nbytes // num_blocks
-            if tag == TAG_GDN_CONV:
+            if tag.startswith(TAG_GDN_CONV):
                 regions = _gdn_conv_regions(conv_shape=shape,
                                             itemsize=itemsize,
                                             geometry=gdn_geometry)
@@ -444,6 +613,14 @@ def build_qwen35_pool_manifest(
                 raise ManifestError(
                     f"typed cache {layer_name} offset {base_offset} is "
                     f"outside one raw page of {stride} bytes")
+
+        last_live_byte = base_offset + max(region.extent_end_bytes
+                                           for region in regions)
+        if last_live_byte > stride:
+            raise ManifestError(
+                f"logical cache {layer_name} extends through byte "
+                f"{last_live_byte}, beyond its physical page of {stride} "
+                "bytes")
 
         pools.append(
             PoolEntry(
@@ -473,8 +650,8 @@ def build_qwen35_pool_manifest(
 def materialize_storages(manifest: PoolManifest) -> None:
     """Forces device-buffer materialization of every manifest storage.
 
-    torch_tpu tensors created with ``torch.empty`` (the alias-fallback path
-    for fp8 caches) carry no materialized device buffer until first use;
+    torch_tpu tensors created with ``torch.empty`` can carry no materialized
+    device buffer until first use;
     wrapping such a tensor in a raiden manager hangs its constructor
     (AwaitBuffer never resolves). A one-block read materializes the buffer
     without touching cache contents.

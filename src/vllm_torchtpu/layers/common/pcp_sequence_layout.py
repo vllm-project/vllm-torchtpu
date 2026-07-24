@@ -44,18 +44,6 @@ def _get_pcp_streaming_q_block_size() -> int:
     return PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
 
 
-def _as_int(value: Any, default: int) -> int:
-    return value if isinstance(value, int) else default
-
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return bool(value)
-    return default
-
-
 class PcpSequenceLayoutMode(Enum):
     DISABLED = "DISABLED"
     STREAMING = "STREAMING"
@@ -111,14 +99,13 @@ class PcpSequenceLayoutEligibility:
         speculative_enabled: bool = False,
         is_kv_producer: bool | None = None,
     ):
-        self.pcp_size = _as_int(pcp_size, 1)
-        self.interleave_size = _as_int(interleave_size, 1)
-        self.dcp_size = _as_int(dcp_size, 1)
-        self.pipeline_parallel_size = _as_int(pipeline_parallel_size, 1)
-        self.async_scheduling = _as_bool(async_scheduling)
+        self.pcp_size = pcp_size
+        self.interleave_size = interleave_size
+        self.dcp_size = dcp_size
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.async_scheduling = bool(async_scheduling)
         self.speculative_enabled = bool(speculative_enabled)
-        self.is_kv_producer = (is_kv_producer if isinstance(
-            is_kv_producer, bool) else None)
+        self.is_kv_producer = is_kv_producer
 
     @classmethod
     def from_vllm_config(cls,
@@ -126,38 +113,21 @@ class PcpSequenceLayoutEligibility:
         if vllm_config is None:
             return cls()
 
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        scheduler_config = getattr(vllm_config, "scheduler_config", None)
-        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        parallel_config = vllm_config.parallel_config
+        scheduler_config = vllm_config.scheduler_config
+        kv_transfer_config = vllm_config.kv_transfer_config
 
         is_kv_producer = None
         if kv_transfer_config is not None:
-            raw_is_kv_producer = getattr(kv_transfer_config, "is_kv_producer",
-                                         None)
-            if isinstance(raw_is_kv_producer, bool):
-                is_kv_producer = raw_is_kv_producer
+            is_kv_producer = kv_transfer_config.is_kv_producer
 
         return cls(
-            pcp_size=_as_int(
-                getattr(parallel_config, "prefill_context_parallel_size", 1),
-                1,
-            ),
-            interleave_size=_as_int(
-                getattr(parallel_config, "cp_kv_cache_interleave_size", 1),
-                1,
-            ),
-            dcp_size=_as_int(
-                getattr(parallel_config, "decode_context_parallel_size", 1),
-                1,
-            ),
-            pipeline_parallel_size=_as_int(
-                getattr(parallel_config, "pipeline_parallel_size", 1),
-                1,
-            ),
-            async_scheduling=_as_bool(
-                getattr(scheduler_config, "async_scheduling", False)),
-            speculative_enabled=getattr(vllm_config, "speculative_config",
-                                        None) is not None,
+            pcp_size=parallel_config.prefill_context_parallel_size,
+            interleave_size=parallel_config.cp_kv_cache_interleave_size,
+            dcp_size=parallel_config.decode_context_parallel_size,
+            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            async_scheduling=bool(scheduler_config.async_scheduling),
+            speculative_enabled=vllm_config.speculative_config is not None,
             is_kv_producer=is_kv_producer,
         )
 
@@ -251,8 +221,8 @@ class PcpSequenceLayoutEligibility:
                 continue
             req_index = input_batch.req_id_to_index[req_id]
             scheduled_tokens = int(scheduled[chunk_offset])
-            scheduler_tokens = getattr(scheduler_output,
-                                       "num_scheduled_tokens", {}).get(req_id)
+            scheduler_tokens = scheduler_output.num_scheduled_tokens.get(
+                req_id)
             if scheduler_tokens is not None:
                 scheduled_tokens = int(scheduler_tokens)
             computed_tokens = int(
@@ -415,7 +385,7 @@ class PcpSequenceLayoutPlanner:
             num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
             num_tokens_paddings=runner.num_tokens_paddings,
             max_num_tokens=runner.max_num_tokens,
-            dp_target_bucket=getattr(runner, "_dp_target_bucket", None),
+            dp_target_bucket=runner._dp_target_bucket,
         )
         if decision.mode is PcpSequenceLayoutMode.DISABLED:
             return self._all_planner.prepare_real(
@@ -541,15 +511,14 @@ def _ensure_host_token_buffer_capacity(runner: Any,
     runner.positions_cpu[:current_num_tokens] = old_positions_cpu
     runner.positions_np = runner.positions_cpu.numpy()
 
-    if getattr(runner, "supports_mm_inputs", False) and hasattr(
-            runner, "is_mm_embed_cpu"):
+    if runner.supports_mm_inputs and hasattr(runner, "is_mm_embed_cpu"):
         old_is_mm_embed_cpu = runner.is_mm_embed_cpu
         runner.is_mm_embed_cpu = torch.zeros(required_num_tokens,
                                              dtype=old_is_mm_embed_cpu.dtype,
                                              device=old_is_mm_embed_cpu.device)
         runner.is_mm_embed_cpu[:current_num_tokens] = old_is_mm_embed_cpu
 
-    if getattr(runner, "uses_mrope", False):
+    if runner.uses_mrope:
         old_mrope_positions = runner.mrope_positions
         new_mrope_positions = runner._make_buffer(3,
                                                   required_num_tokens + 1,
@@ -626,7 +595,7 @@ def prepare_pcp_sequence_layout(
                 num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
                 num_tokens_paddings=runner.num_tokens_paddings,
                 max_num_tokens=runner.max_num_tokens,
-                dp_target_bucket=getattr(runner, "_dp_target_bucket", None),
+                dp_target_bucket=runner._dp_target_bucket,
             )
     PcpSequenceLayoutEligibility.require_mode(decision,
                                               PcpSequenceLayoutMode.STREAMING)

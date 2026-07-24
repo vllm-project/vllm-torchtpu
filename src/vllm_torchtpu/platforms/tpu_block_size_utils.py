@@ -116,8 +116,7 @@ def _hybrid_mamba_page_size_bytes(vllm_config: VllmConfig) -> int | None:
     dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
     full_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
     parallel_config = vllm_config.parallel_config
-    pcp_size = int(
-        getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    pcp_size = parallel_config.prefill_context_parallel_size
     if pcp_size > 1:
         # PCP-local GDN state is equivalent to adding PCP to the model's
         # head-sharding factor. Shape calculators used here must therefore
@@ -180,8 +179,7 @@ def _derive_tpu_block_slot_config(
             _ceil_div(mamba_raw_state_bytes, fa_physical_bytes_per_token),
             16,
         )
-        user_specified = getattr(vllm_config.cache_config,
-                                 "user_specified_block_size", False)
+        user_specified = vllm_config.cache_config.user_specified_block_size
         if user_specified and input_block_size < mamba_fit_block_size:
             raise ValueError(
                 "Explicit TPU block size is below Mamba fit floor for the "

@@ -89,6 +89,10 @@ class SendMeta:
     # Exact transfer extent for controller-planned PCP striping. Legacy send
     # paths leave this unset.
     num_tokens: int | None = None
+    # Uniform-mamba-layout source state slots, one per mamba kv-cache group
+    # ordinal (the block holding the final recurrent state); None for FA-only
+    # Stage-3 models and all legacy paths.
+    mamba_state_block_ids: list[int] | None = None
 
 
 @dataclass
@@ -249,6 +253,8 @@ class ZmqShmKvConnectorBase:
     """
 
     def __init__(self, vllm_config: VllmConfig):
+        self._coord_threads: list[threading.Thread] = []
+        self._coord_pool: Optional[HostKVShmPool] = None
         self.vllm_config = vllm_config
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
@@ -317,9 +323,7 @@ class ZmqShmKvConnectorBase:
         # smoke-test or compile failure.
         self._kv_scatter_enabled: bool = False
 
-        self._coord_pool: Optional[HostKVShmPool] = None
         self._coord_ipc_sock: Optional[zmq.Socket] = None
-        self._coord_threads: list[threading.Thread] = []
         # Outbound IPC queue: the IPC loop owns the socket and drains this
         # queue each iteration, so send_multipart() is only ever called from
         # one thread (ZMQ sockets are not thread-safe).
@@ -483,10 +487,8 @@ class ZmqShmKvConnectorBase:
             if cache is old_cache:
                 kv_caches[idx] = new_cache
 
-        compilation_config = getattr(self.vllm_config, "compilation_config",
-                                     None)
-        static_forward_context = getattr(compilation_config,
-                                         "static_forward_context", None)
+        compilation_config = self.vllm_config.compilation_config
+        static_forward_context = compilation_config.static_forward_context
         if not isinstance(static_forward_context, dict):
             return
         for layer in static_forward_context.values():
@@ -842,9 +844,9 @@ class ZmqShmKvConnectorBase:
             self._coord_channel_executor.shutdown(wait=False)
         if hasattr(self, "_coord_stage_waiter_pool"):
             self._coord_stage_waiter_pool.shutdown(wait=False)
-        for t in getattr(self, "_coord_threads", []):
+        for t in self._coord_threads:
             t.join(timeout=2)
-        if getattr(self, "_coord_pool", None) is not None:
+        if self._coord_pool is not None:
             self._coord_pool.close()
 
     # =========================================================

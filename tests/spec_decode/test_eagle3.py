@@ -315,6 +315,7 @@ def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
         num_reqs_most_model_len=16,
         num_tokens_paddings=[16, 32, 64, 128],
         device=device,
+        uses_mrope=False,
         _dp_lockstep_enabled=lambda: False,
     )
 
