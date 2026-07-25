@@ -183,7 +183,8 @@ class RpaConfigs:
         fixed_bytes = 0
         fixed_bytes += self.serve.num_seqs  # kv_lens
         fixed_bytes += self.serve.num_seqs + 1  # cu_q_lens
-        fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq  # page_indices
+        fixed_bytes += (self.serve.num_seqs * self.serve.pages_per_seq
+                        )  # page_indices
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
         fixed_bytes += 1  # actual_steps

@@ -35,6 +35,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import (configs, kernel,
                                                             schedule, utils)
 
@@ -146,10 +147,11 @@ def get_kv_cache_shape(
     kv_dtype,
     kv_layout: configs.KVLayout | None = None,
 ):
-    # No caller selects SEQ_ALONG_LANE yet; it is reachable only by passing
-    # `kv_layout` explicitly, which the tests do.
     if kv_layout is None:
-        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            kv_layout = configs.KVLayout.SEQ_ALONG_LANE
+        else:
+            kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     kv_packing = utils.get_dtype_packing(kv_dtype)
@@ -459,7 +461,10 @@ def ragged_paged_attention(
     """
 
     if kv_layout is None:
-        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            kv_layout = configs.KVLayout.SEQ_ALONG_LANE
+        else:
+            kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
 
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
