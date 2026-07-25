@@ -86,6 +86,9 @@ benchmarking = [
 # https://docs.vllm.ai/en/latest/design/plugin_system/
 torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
+[project.entry-points."vllm.general_plugins"]
+torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+
 [tool.pytest.ini_options]
 markers = [
     "nightly: tests that only run in the nightly CI workflow",

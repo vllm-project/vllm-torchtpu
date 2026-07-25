@@ -29,4 +29,4 @@ def _log_tpu_info() -> None:
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
     _log_tpu_info()
-    return "vllm_torchtpu.platforms.tpu_platform.TpuPlatform"
+    return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"

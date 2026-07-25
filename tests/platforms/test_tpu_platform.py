@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
@@ -86,6 +88,21 @@ def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(
     assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
 
 
+def set_mock_attn_to_vllm_config(vllm_config, page_size, min_page_size):
+    new_vllm_config = copy.copy(vllm_config)
+
+    mock_impl = MagicMock()
+    mock_impl.get_page_size.return_value = page_size
+    mock_impl.get_min_page_size.return_value = min_page_size
+    mock_impl.is_ssm.return_value = False
+    mock_attn = MagicMock(spec=Attention)
+    mock_attn.get_attn_backend.return_value = mock_impl
+    new_vllm_config.compilation_config.static_forward_context = {
+        "layer": mock_attn
+    }
+    return new_vllm_config, mock_impl
+
+
 class TestTpuPlatform:
 
     @pytest.fixture
@@ -138,18 +155,12 @@ class TestTpuPlatform:
         vllm_config.kv_transfer_config.kv_connector = "TPUConnector"
         vllm_config.cache_config.block_size = 123  # already set
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 999
-        mock_pallas.get_min_page_size.return_value = 16
+        vllm_config, mock_pallas = set_mock_attn_to_vllm_config(
+            vllm_config, 999, 16)
 
-        with patch.dict(
-                'sys.modules',
-            {
-                'vllm_torchtpu.layers.vllm.attention':
-                MagicMock(PallasAttentionBackend=mock_pallas)
-            }), patch("vllm_torchtpu.platforms.tpu_platform."
-                      "update_tpu_block_size_and_slot_config") as mock_update:
-            TpuPlatform.check_and_update_config(vllm_config)
+        with patch("vllm_torchtpu.platforms.tpu_platform."
+                   "update_tpu_block_size_and_slot_config") as mock_update:
+            TpuPlatform.update_block_size_for_backend(vllm_config)
 
         # Without the unified-layout env the split-layout path must not run
         # the block-size derivation helper.
@@ -172,18 +183,12 @@ class TestTpuPlatform:
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 123  # already set
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 999
-        mock_pallas.get_min_page_size.return_value = 16
+        vllm_config, mock_pallas = set_mock_attn_to_vllm_config(
+            vllm_config, 999, 16)
 
-        with patch.dict(
-                'sys.modules',
-            {
-                'vllm_torchtpu.layers.vllm.attention':
-                MagicMock(PallasAttentionBackend=mock_pallas)
-            }), patch("vllm_torchtpu.platforms.tpu_platform."
-                      "update_tpu_block_size_and_slot_config") as mock_update:
-            TpuPlatform.check_and_update_config(vllm_config)
+        with patch("vllm_torchtpu.platforms.tpu_platform."
+                   "update_tpu_block_size_and_slot_config") as mock_update:
+            TpuPlatform.update_block_size_for_backend(vllm_config)
 
         # The env opts into the unified layout family: block size and slot
         # sizing are owned by the derivation helper (its math is covered by
@@ -240,20 +245,11 @@ class TestTpuPlatform:
         # master ip takes the code's "localhost" fallback.
         vllm_config.parallel_config.data_parallel_master_ip = ""
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 256
-        mock_pallas.get_min_page_size.return_value = 16
-
-        with patch.dict(
-                'sys.modules', {
-                    'vllm_torchtpu.layers.vllm.attention':
-                    MagicMock(PallasAttentionBackend=mock_pallas)
-                }):
-            if message is None:
+        if message is None:
+            TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
-            else:
-                with pytest.raises(NotImplementedError, match=message):
-                    TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         "connector_name",
@@ -272,16 +268,7 @@ class TestTpuPlatform:
         vllm_config.kv_transfer_config.kv_connector = connector_name
         vllm_config.cache_config.block_size = 16
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 16
-        mock_pallas.get_min_page_size.return_value = 16
-
-        with patch.dict(
-                'sys.modules', {
-                    'vllm_torchtpu.layers.vllm.attention':
-                    MagicMock(PallasAttentionBackend=mock_pallas)
-                }):
-            TpuPlatform.check_and_update_config(vllm_config)
+        TpuPlatform.check_and_update_config(vllm_config)
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
@@ -298,16 +285,7 @@ class TestTpuPlatform:
         vllm_config.cache_config.block_size = 16
         vllm_config.cache_config.cache_dtype = "auto"
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 16
-        mock_pallas.get_min_page_size.return_value = 16
-
-        with patch.dict(
-                'sys.modules', {
-                    'vllm_torchtpu.layers.vllm.attention':
-                    MagicMock(PallasAttentionBackend=mock_pallas)
-                }):
-            TpuPlatform.check_and_update_config(vllm_config)
+        TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
@@ -345,16 +323,8 @@ class TestTpuPlatform:
             monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL",
                                raising=False)
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 256
-        mock_pallas.get_min_page_size.return_value = 16
-
-        with patch.dict(
-                'sys.modules', {
-                    'vllm_torchtpu.layers.vllm.attention':
-                    MagicMock(PallasAttentionBackend=mock_pallas)
-                }), patch("vllm_torchtpu.platforms.tpu_platform."
-                          "update_tpu_block_size_and_slot_config"):
+        with patch("vllm_torchtpu.platforms.tpu_platform."
+                   "update_tpu_block_size_and_slot_config"):
             if expect_error:
                 with pytest.raises(ValueError, match="unified block\\s+pool"):
                     TpuPlatform.check_and_update_config(vllm_config)
@@ -376,16 +346,7 @@ class TestTpuPlatform:
         vllm_config.scheduler_config.is_multimodal_model = True
         vllm_config.scheduler_config.disable_chunked_mm_input = False
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 16
-        mock_pallas.get_min_page_size.return_value = 16
-
-        with patch.dict(
-                'sys.modules', {
-                    'vllm_torchtpu.layers.vllm.attention':
-                    MagicMock(PallasAttentionBackend=mock_pallas)
-                }):
-            TpuPlatform.check_and_update_config(vllm_config)
+        TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
@@ -404,15 +365,6 @@ class TestTpuPlatform:
         vllm_config.scheduler_config.is_multimodal_model = True
         vllm_config.scheduler_config.disable_chunked_mm_input = False
 
-        mock_pallas = MagicMock()
-        mock_pallas.get_page_size.return_value = 16
-        mock_pallas.get_min_page_size.return_value = 16
-
-        with patch.dict(
-                'sys.modules', {
-                    'vllm_torchtpu.layers.vllm.attention':
-                    MagicMock(PallasAttentionBackend=mock_pallas)
-                }):
-            TpuPlatform.check_and_update_config(vllm_config)
+        TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is True

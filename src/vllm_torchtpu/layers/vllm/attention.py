@@ -11,6 +11,8 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType)
+from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
+                                                 register_backend)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -290,6 +292,7 @@ def _pallas_rpa_kernel_batched(
 # =========================================================================================
 
 
+@register_backend(AttentionBackendEnum.FLASH_ATTN)
 class PallasAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes = [
         "auto",
@@ -417,6 +420,7 @@ class PallasAttentionBackend(AttentionBackend):
         return page_size
 
 
+@register_backend(AttentionBackendEnum.CUSTOM)
 class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     """Pallas attention backend wired to the batched-RPA kernel.
 

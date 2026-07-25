@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
     from vllm.multimodal.processing import ProcessorInputs
     from vllm.pooling_params import PoolingParams
-    from vllm.sampling_params import SamplingParams, SamplingType
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
@@ -455,23 +455,6 @@ class TpuPlatform(Platform):
     ]
 
     @classmethod
-    def pre_register_and_update(cls, parser=None) -> None:
-        del parser
-        from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
-                                                         register_backend)
-
-        register_backend(
-            AttentionBackendEnum.FLASH_ATTN,
-            "vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend",
-        )
-        # Experimental batched RPA — opt in via `--attention-backend CUSTOM`.
-        register_backend(
-            AttentionBackendEnum.CUSTOM,
-            "vllm_torchtpu.layers.vllm.attention."
-            "PallasBatchedRPAAttentionBackend",
-        )
-
-    @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
 
@@ -522,18 +505,17 @@ class TpuPlatform(Platform):
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
                              attn_selector_config: "AttentionSelectorConfig",
                              **kwargs) -> str:
-        backend_name = getattr(selected_backend, "name", None)
-        if backend_name == "CUSTOM":
-            logger.info("Using TPU Pallas attention backend (batched-RPA "
-                        "variant via CUSTOM; requires block_size=256).")
-            return ("vllm_torchtpu.layers.vllm.attention."
-                    "PallasBatchedRPAAttentionBackend")
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        if backend_name not in (None, "FLASH_ATTN"):
-            logger.info("Cannot use %s backend on TPU.", selected_backend)
-
-        logger.info("Using TPU Pallas attention backend via FLASH_ATTN.")
-        return "vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend"
+        supported_backends = [
+            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM
+        ]
+        if selected_backend not in supported_backends:
+            logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
+                        selected_backend)
+            selected_backend = AttentionBackendEnum.FLASH_ATTN
+        logger.info("Using %s backend.", selected_backend.name)
+        return selected_backend.get_path()
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -682,24 +664,11 @@ class TpuPlatform(Platform):
             )
             model_config.dtype = torch.bfloat16
 
+        scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
-        # vLLM's CacheConfig._apply_block_size_default has already populated
-        # block_size with DEFAULT_BLOCK_SIZE if the user didn't pass one, so
-        # `block_size is None` is never true by this point. The authoritative
-        # signal is the `user_specified_block_size` flag pydantic sets.
-        block_size_was_unspecified = not cache_config.user_specified_block_size
 
-        from vllm_torchtpu.layers.vllm.attention import (
-            PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
-        attn_backend = vllm_config.attention_config.backend
-        selected_name = attn_backend.name if attn_backend is not None else None
-        backend_cls = (PallasBatchedRPAAttentionBackend if selected_name
-                       == "CUSTOM" else PallasAttentionBackend)
-        is_hybrid = vllm_config.model_config.is_hybrid
-        cls._is_hybrid = is_hybrid
-        cls._speculative_enabled = vllm_config.speculative_config is not None
-        if cls._speculative_enabled and \
-                vllm_config.scheduler_config.async_scheduling:
+        is_hybrid = model_config.is_hybrid
+        if vllm_config.speculative_config is not None and scheduler_config.async_scheduling:
             method = vllm_config.speculative_config.method
             if not vllm_config.speculative_config.use_eagle():
                 # Ngram needs the sampled tokens on the host, which async defers.
@@ -721,26 +690,8 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
-        if not is_hybrid and block_size_was_unspecified:
-            default = backend_cls.get_page_size(vllm_config)
-            cache_config.block_size = (  # type: ignore[assignment]
-                backend_cls.get_preferred_block_size(default))
-        if unified_kv_layout_enabled(vllm_config):
-            update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
-
-        min_page_size = backend_cls.get_min_page_size(vllm_config)
-        if min_page_size > cache_config.block_size:
-            logger.warning(
-                "Increase the page size from %s to %s to make sure there's"
-                "no SMEM OOM",
-                cache_config.block_size,
-                min_page_size,
-            )
-            cache_config.block_size = min_page_size  # type: ignore[assignment]
-        logger.info("Using KV cache block size: %s", cache_config.block_size)
 
         parallel_config = vllm_config.parallel_config
-        scheduler_config = vllm_config.scheduler_config
         parallel_config.worker_cls = \
                         "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
@@ -792,8 +743,8 @@ class TpuPlatform(Platform):
             if (pcp_size <= 1 and parallel_config.data_parallel_size == 1
                     and parallel_config.pipeline_parallel_size == 1
                     and parallel_config.tensor_parallel_size == 1):
-                logger.info("Force using UniProcExecutor for TPU on \
-                        single host without tensor/pipeline parallelism.")
+                logger.info("Force using UniProcExecutor for TPU on "
+                            "single host without tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "uni"
             else:
                 logger.info(
@@ -874,9 +825,27 @@ class TpuPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
-        # TODO: TPU still sets block_size in check_and_update_config.
-        # Move that logic here so block_size is chosen by the backend.
-        pass
+        cache_config = vllm_config.cache_config
+        backend_cls = cls._find_non_ssm_backend(vllm_config)
+
+        is_hybrid = vllm_config.model_config.is_hybrid
+        if not is_hybrid and not cache_config.user_specified_block_size:
+            default = backend_cls.get_page_size(vllm_config)
+            cache_config.block_size = (  # type: ignore[assignment]
+                backend_cls.get_preferred_block_size(default))
+        if unified_kv_layout_enabled(vllm_config):
+            update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
+
+        min_page_size = backend_cls.get_min_page_size(vllm_config)
+        if min_page_size > cache_config.block_size:
+            logger.warning(
+                "Increase the page size from %s to %s to make sure there's"
+                "no SMEM OOM",
+                cache_config.block_size,
+                min_page_size,
+            )
+            cache_config.block_size = min_page_size  # type: ignore[assignment]
+        logger.info("Using KV cache block size: %s", cache_config.block_size)
 
     @classmethod
     def is_pin_memory_available(cls):
@@ -885,7 +854,9 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "vllm_torchtpu.distributed.tpu_communicator.TpuDeviceCommunicator"  # noqa
+        from vllm_torchtpu.distributed.tpu_communicator import \
+            TpuDeviceCommunicator
+        return f"{TpuDeviceCommunicator.__module__}.{TpuDeviceCommunicator.__qualname__}"
 
     @classmethod
     def use_all_gather(cls) -> bool:
@@ -931,7 +902,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        return cls._is_hybrid
+        return True
 
 
 def _get_token_paddings(min_token_size: int, max_token_size: int,
