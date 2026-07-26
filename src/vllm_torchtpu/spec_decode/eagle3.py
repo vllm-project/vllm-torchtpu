@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -118,6 +119,12 @@ class Eagle3Proposer:
         # (token ids, positions, attn ctx, aux hidden states) captured
         # during the target verify forward.
         self.draft_chunks: list[DraftChunkInputs] | None = None
+        # Per-propose-call cache of loop-step draft attention metadata, keyed
+        # by id(chunk). Between loop iterations of one step everything in the
+        # metadata is constant except seq_lens advancing by +1, so iterations
+        # >= 2 swap the seq_lens field on the cached objects instead of paying
+        # the full upstream builder walk per iteration.
+        self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
 
     def load_model(self, target_model) -> None:
         """Load the draft model and share embeddings/lm_head with target.
@@ -315,6 +322,7 @@ class Eagle3Proposer:
         draft tokens; or (return_device) the ``[num_reqs, K]`` device tensor.
         """
         runner = self.runner
+        self._draft_md_cache.clear()
         num_reqs = runner.input_batch.num_reqs
         if num_reqs == 0:
             return []
@@ -723,6 +731,30 @@ class Eagle3Proposer:
         num_reqs = chunk.num_reqs
         chunk_ctx = chunk.attn_ctx
 
+        # Loop-step metadata reuse: between loop iterations of one step the
+        # metadata is identical except seq_lens (+1 per iteration) — qsl and
+        # request_distribution are hoisted, block tables can't change
+        # mid-propose, shapes are fixed.
+        cacheable = (step_idx >= 1 and not runner._has_mamba_state
+                     and not runner._unified_kv_layout
+                     and chunk_ctx.position_ids_override is None)
+        if cacheable and step_idx >= 2:
+            cached = self._draft_md_cache.get(id(chunk))
+            if cached is not None:
+                md_dict, prev_seq_lens = cached
+                # base + (s-1) - rejected, advanced by 1 == base + s - rejected:
+                # value-identical to the full rebuild below.
+                new_seq_lens = prev_seq_lens + 1
+                replaced: dict[int, object] = {}
+                new_md = {}
+                for lname, md in md_dict.items():
+                    if id(md) not in replaced:
+                        replaced[id(md)] = dataclasses.replace(
+                            md, seq_lens=new_seq_lens)
+                    new_md[lname] = replaced[id(md)]
+                self._draft_md_cache[id(chunk)] = (new_md, new_seq_lens)
+                return new_md
+
         use_max_model_len = chunk_ctx.use_max_model_len
         kernel_num_reqs = (runner.num_reqs_max_model_len if use_max_model_len
                            else runner.num_reqs_most_model_len)
@@ -819,11 +851,14 @@ class Eagle3Proposer:
 
         assert self._draft_attn_layer_names is not None, (
             "draft attn layer names were not captured during load_model")
-        return {
+        result = {
             name: md
             for name, md in per_layer_attn_metadata.items()
             if name in self._draft_attn_layer_names
         }
+        if cacheable:
+            self._draft_md_cache[id(chunk)] = (result, seq_lens)
+        return result
 
     @staticmethod
     def _unwrap_model_out(out) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1050,6 +1085,7 @@ class Eagle3Proposer:
         """
         if not self._dp_lockstep_sharded():
             return
+        self._draft_md_cache.clear()
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
         if num_chunks * K == 0:

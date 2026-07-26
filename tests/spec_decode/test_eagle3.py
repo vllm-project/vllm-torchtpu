@@ -672,3 +672,103 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
         if f["step_idx"] > 0)
     # K lm-head gathers per chunk, all at the constant loop bucket.
     assert tok_shapes == [(16, 8)] * 6
+
+
+def test_build_draft_attn_metadata_loop_cache(device):
+    """Loop iterations >= 2 must reuse the step-1 metadata objects with only
+    seq_lens swapped (advanced by +1), value-identical to a full rebuild."""
+    import dataclasses as dc
+
+    from vllm_torchtpu.layers.common.attention_metadata import \
+        AttentionMetadata
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+    runner = SimpleNamespace(
+        _has_mamba_state=False,
+        _unified_kv_layout=False,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=8,
+        device=device,
+        _attn_metadata_builder_ctx=None,
+        empty_slot_mappings={},
+    )
+    proposer.runner = runner
+
+    # chunk_ctx.seq_lens is the full [kernel_num_reqs]-padded tensor in
+    # production; tail entries are ignored by the kernel.
+    base_seq_lens = torch.tensor([5, 9, 0, 0, 0, 0, 0, 0],
+                                 dtype=torch.int32,
+                                 device=device)
+    chunk = SimpleNamespace(
+        num_reqs=2,
+        start_index=0,
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True,
+            seq_lens=base_seq_lens,
+            query_start_loc="QSL",
+            request_distribution="RD",
+            position_ids_override=None,
+        ),
+    )
+
+    build_calls = []
+
+    def fake_build_attention_metadata(**kw):
+        build_calls.append(kw)
+        ctx = runner._attn_metadata_builder_ctx
+        md = AttentionMetadata(
+            input_positions=torch.zeros(1, device=device),
+            block_tables=torch.zeros(1, dtype=torch.int32, device=device),
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
+            request_distribution=ctx.request_distribution,
+        )
+        return {"draft.attn.0": md, "target.attn.0": md}, None
+
+    runner._build_attention_metadata = fake_build_attention_metadata
+    loop_qsl = torch.arange(9, dtype=torch.int32, device=device)
+    loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+
+    def build(step):
+        return proposer._build_draft_attn_metadata(
+            chunk,
+            step_idx=step,
+            seq_lens_delta=step,
+            num_rejected_np=np.array([1, 0], dtype=np.int32),
+            num_tokens_padded=8,
+            loop_query_start_loc=loop_qsl,
+            loop_request_distribution=loop_rd,
+        )
+
+    md1 = build(1)
+    assert len(build_calls) == 1
+    md2 = build(2)
+    md3 = build(3)
+    # No further upstream builder calls after step 1.
+    assert len(build_calls) == 1
+    # Draft-layer filter held; non-seq_lens fields are the SAME objects.
+    assert set(md2) == {"draft.attn.0"}
+    assert md2["draft.attn.0"].block_tables is md1["draft.attn.0"].block_tables
+    assert md2["draft.attn.0"].query_start_loc is loop_qsl
+    # seq_lens advance: step s = base + s - rejected.
+    rej = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0],
+                       dtype=torch.int32,
+                       device=device)
+    for s, md in ((1, md1), (2, md2), (3, md3)):
+        expect = base_seq_lens + s - rej
+        assert torch.equal(md["draft.attn.0"].seq_lens.cpu(), expect.cpu()), s
+    # Cached objects are fresh dataclass copies, not mutated step-1 objects.
+    assert md2["draft.attn.0"] is not md1["draft.attn.0"]
+    assert dc.is_dataclass(md2["draft.attn.0"])
+
+
+def test_build_draft_attn_metadata_cache_cleared_per_propose(device):
+    """A new propose() run must not reuse a previous step's cached metadata
+    for a recycled chunk id — the cache is cleared at propose entry."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer._draft_md_cache[12345] = ("stale", None)
+    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
+    assert proposer.propose([], [], None, None) == []
+    assert proposer._draft_md_cache == {}
