@@ -547,14 +547,23 @@ class TPUModelRunner(GPUModelRunner):
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
             profiler_config = self.vllm_config.profiler_config
-            global_rank = getattr(self.parallel_config, "rank", 0) or 0
+            # parallel_config.rank is TP*PP-local (each MPMD DP replica gets
+            # its own ParallelConfig) -- pass it as worker_rank so the
+            # canonical-timestamp marker election (scoped per DP replica via
+            # getppid()) keeps working. data_parallel_index is the value
+            # that's actually unique per DP replica; PhaseBasedProfiler uses
+            # both together for naming so neither DP replicas nor TP ranks
+            # within one replica collide with each other.
+            local_rank = getattr(self.parallel_config, "rank", 0) or 0
+            dp_rank = self.parallel_config.data_parallel_index
             world_size = getattr(self.parallel_config, "world_size", 1) or 1
             decode_kv_len_threshold = additional_config.get(
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
             self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
                 self.phased_profiling_dir,
-                worker_rank=global_rank,
+                worker_rank=local_rank,
+                dp_rank=dp_rank,
                 world_size=world_size,
                 # max_iterations defaults to 0 ("no limit") for standard torch
                 # profiling; that's meaningless for the phased profiler, so

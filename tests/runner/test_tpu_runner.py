@@ -186,7 +186,13 @@ class TestInitPhasedProfiling:
                 profiler_config=SimpleNamespace(
                     max_iterations=max_iterations,
                     delay_iterations=delay_iterations)),
-            parallel_config=SimpleNamespace(rank=2, world_size=4),
+            # rank (TP*PP-local) and data_parallel_index (unique per MPMD DP
+            # replica) deliberately differ here, to prove worker_rank comes
+            # from the former and dp_rank from the latter -- not swapped or
+            # collapsed into one value.
+            parallel_config=SimpleNamespace(rank=2,
+                                            world_size=4,
+                                            data_parallel_index=3),
         )
 
     def test_disabled_when_dir_not_set(self):
@@ -213,6 +219,7 @@ class TestInitPhasedProfiling:
         mock_profiler_cls.assert_called_once_with(
             "/tmp/phased",
             worker_rank=2,
+            dp_rank=3,
             world_size=4,
             num_steps_to_profile_for=20,
             num_decode_steps_to_skip=3,

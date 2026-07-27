@@ -325,40 +325,42 @@ def test_merge_profile_directories_single_rank(tmp_path, monkeypatch):
 
 
 def test_merge_profile_directories_mpmd(tmp_path, monkeypatch):
-    """MPMD: 4 ranks captured to their own sandboxes with identical filenames; each moves to the SAME canonical ts dir with rank{N}_ prefix."""
+    """MPMD (DP=4, TP=1): 4 DP replicas captured to their own sandboxes with identical filenames; each moves to the SAME canonical ts dir with dp{D}_rank{R}_ prefix."""
     monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
     phase_dir = tmp_path / "prefill_heavy"
 
     canonical_ts = "2026_05_06_04_47_36"
     profilers = []
-    for rank in range(4):
+    for dp_rank in range(4):
+        # TP=1, so every DP replica's own local (TP*PP) rank is 0.
         profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
-                                      worker_rank=rank)
-        rank_dir = phase_dir / f"dp_rank_{rank}"
+                                      worker_rank=0,
+                                      dp_rank=dp_rank)
+        rank_dir = phase_dir / f"dp{dp_rank}_rank0"
         rank_dir.mkdir(parents=True)
         profiler.profile_dir_with_phase_suffix = str(rank_dir)
         profiler._canonical_dst_ts = canonical_ts
         _stage_dp_rank_capture(
             rank_dir,
-            f"pt_ts_{rank}",
+            f"pt_ts_{dp_rank}",
             "t1v-n-host-w-0.xplane.pb",
-            f"rank_{rank}_xplane",
+            f"rank_{dp_rank}_xplane",
         )
         profilers.append(profiler)
 
-    for rank, profiler in enumerate(profilers):
+    for profiler in profilers:
         profiler._merge_profile_directories()
 
     dst = phase_dir / "plugins" / "profile" / canonical_ts
-    for rank in range(4):
-        assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
-                ).read_text() == f"rank_{rank}_xplane"
-        rank_dir = phase_dir / f"dp_rank_{rank}"
+    for dp_rank in range(4):
+        assert (dst / f"dp{dp_rank}_rank0_t1v-n-host-w-0.xplane.pb"
+                ).read_text() == f"rank_{dp_rank}_xplane"
+        rank_dir = phase_dir / f"dp{dp_rank}_rank0"
         assert not (rank_dir / "plugins").exists()
 
 
 def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
-    """TP multi-worker (TP=4, DP=1): world_size=4 with no DP env vars; each rank moves to canonical ts dir with rank{N}_ prefix."""
+    """TP multi-worker (TP=4, DP=1): world_size=4 with no DP env vars; each local rank moves to canonical ts dir with dp0_rank{R}_ prefix."""
     monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
     monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
     phase_dir = tmp_path / "prefill_heavy"
@@ -366,10 +368,12 @@ def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
     canonical_ts = "2026_05_06_04_47_36"
     profilers = []
     for rank in range(4):
+        # DP=1, so every worker's dp_rank is 0; TP*PP-local rank varies.
         profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
                                       worker_rank=rank,
+                                      dp_rank=0,
                                       world_size=4)
-        rank_dir = phase_dir / f"dp_rank_{rank}"
+        rank_dir = phase_dir / f"dp0_rank{rank}"
         rank_dir.mkdir(parents=True)
         profiler.profile_dir_with_phase_suffix = str(rank_dir)
         profiler._canonical_dst_ts = canonical_ts
@@ -381,12 +385,57 @@ def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
         )
         profilers.append(profiler)
 
-    for rank, profiler in enumerate(profilers):
+    for profiler in profilers:
         profiler._merge_profile_directories()
 
     dst = phase_dir / "plugins" / "profile" / canonical_ts
     for rank in range(4):
-        assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
+        assert (dst / f"dp0_rank{rank}_t1v-n-host-w-0.xplane.pb"
                 ).read_text() == f"rank_{rank}_xplane"
-        rank_dir = phase_dir / f"dp_rank_{rank}"
+        rank_dir = phase_dir / f"dp0_rank{rank}"
         assert not (rank_dir / "plugins").exists()
+
+
+def test_merge_profile_directories_dp_and_tp_do_not_collide(
+        tmp_path, monkeypatch):
+    """DP=2, TP=2: this is the exact bug scenario -- workers at the same
+    dp_rank with different local ranks (or vice versa) must not collide."""
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
+    phase_dir = tmp_path / "prefill_heavy"
+    canonical_ts = "2026_05_06_04_47_36"
+
+    profilers = []
+    for dp_rank in range(2):
+        for local_rank in range(2):
+            profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
+                                          worker_rank=local_rank,
+                                          dp_rank=dp_rank,
+                                          world_size=2)
+            rank_dir = phase_dir / f"dp{dp_rank}_rank{local_rank}"
+            rank_dir.mkdir(parents=True)
+            profiler.profile_dir_with_phase_suffix = str(rank_dir)
+            profiler._canonical_dst_ts = canonical_ts
+            _stage_dp_rank_capture(
+                rank_dir,
+                f"pt_ts_{dp_rank}_{local_rank}",
+                "t1v-n-host-w-0.xplane.pb",
+                f"data_dp{dp_rank}_local{local_rank}",
+            )
+            profilers.append(profiler)
+
+    for profiler in profilers:
+        profiler._merge_profile_directories()
+
+    dst = phase_dir / "plugins" / "profile" / canonical_ts
+    seen_files = sorted(p.name for p in dst.iterdir())
+    assert seen_files == [
+        "dp0_rank0_t1v-n-host-w-0.xplane.pb",
+        "dp0_rank1_t1v-n-host-w-0.xplane.pb",
+        "dp1_rank0_t1v-n-host-w-0.xplane.pb",
+        "dp1_rank1_t1v-n-host-w-0.xplane.pb",
+    ]
+    for dp_rank in range(2):
+        for local_rank in range(2):
+            assert (dst /
+                    f"dp{dp_rank}_rank{local_rank}_t1v-n-host-w-0.xplane.pb"
+                    ).read_text() == f"data_dp{dp_rank}_local{local_rank}"

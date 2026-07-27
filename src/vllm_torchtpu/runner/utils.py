@@ -48,9 +48,15 @@ class InferencePhase(Enum):
     DECODE_ONLY = 5
 
 
-def _inject_dp_rank_into_filename(fname: str, dp_rank: int) -> str:
-    """Prefix `rank<N>_` to an xplane or trace filename."""
-    return f"rank{dp_rank}_{fname}"
+def _inject_rank_into_filename(fname: str, dp_rank: int,
+                               local_rank: int) -> str:
+    """Prefix `dp<D>_rank<R>_` to an xplane or trace filename.
+
+    Both components are needed to stay unique: dp_rank alone collides across
+    TP ranks of the same MPMD DP replica, and local_rank alone collides
+    across different DP replicas (each has its own TP-local rank 0..N-1).
+    """
+    return f"dp{dp_rank}_rank{local_rank}_{fname}"
 
 
 def determine_phase_from_batch_composition_stats(
@@ -147,7 +153,15 @@ class PhaseBasedProfiler:
     def __init__(
         self,
         profile_dir: str,
+        # TP*PP-local rank within this worker's own MPMD DP replica. Used to
+        # elect who generates the canonical-timestamp marker (see
+        # _resolve_canonical_dst_ts) -- that marker is itself scoped per DP
+        # replica via getppid(), so "local rank 0" is the right check.
         worker_rank: int = 0,
+        # Index of this worker's DP replica. Used (together with
+        # worker_rank) only for naming -- it's what actually distinguishes
+        # different DP replicas from each other.
+        dp_rank: int = 0,
         world_size: int = 1,
         num_steps_to_profile_for:
         int = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
@@ -175,6 +189,7 @@ class PhaseBasedProfiler:
         }
         self.current_phase: str = ""
         self.worker_rank = worker_rank
+        self.dp_rank = dp_rank
         self.world_size = world_size
         self.profile_context: Optional[Any] = None
         self._canonical_dst_ts: Optional[str] = None
@@ -249,8 +264,10 @@ class PhaseBasedProfiler:
 
         fallback_ts = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         logger.warning(
-            "dp_rank %d did not find rank 0's canonical-ts marker at %s "
-            "within %.1fs; falling back to own timestamp %s",
+            "dp_rank %d local_rank %d did not find local rank 0's "
+            "canonical-ts marker at %s within %.1fs; falling back to own "
+            "timestamp %s",
+            self.dp_rank,
             self.worker_rank,
             marker,
             poll_timeout,
@@ -297,8 +314,12 @@ class PhaseBasedProfiler:
             os.makedirs(phase_dir, exist_ok=True)
 
             self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
+            # Must be unique per physical worker (dp_rank, worker_rank), not
+            # just per dp_rank -- this sandbox is where each worker's own
+            # torch/XLA profiler writes before _merge_profile_directories
+            # consolidates everything into the shared canonical ts dir.
             self.profile_dir_with_phase_suffix = os.path.join(
-                phase_dir, f"dp_rank_{self.worker_rank}")
+                phase_dir, f"dp{self.dp_rank}_rank{self.worker_rank}")
             os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
 
             self._write_batch_composition_stats_to_file_helper(
@@ -360,7 +381,7 @@ class PhaseBasedProfiler:
         is_multi_worker = (dp_size > 1
                            or os.getenv("TPU_MULTIPROCESS_DP") == "1"
                            or getattr(self, "world_size", 1) > 1
-                           or self.worker_rank > 0)
+                           or self.worker_rank > 0 or self.dp_rank > 0)
 
         try:
             os.makedirs(dst_ts_dir, exist_ok=True)
@@ -369,8 +390,9 @@ class PhaseBasedProfiler:
                 if not os.path.isdir(src_ts_dir):
                     continue
                 for fname in os.listdir(src_ts_dir):
-                    new_fname = (_inject_dp_rank_into_filename(
-                        fname, self.worker_rank) if is_multi_worker else fname)
+                    new_fname = (_inject_rank_into_filename(
+                        fname, self.dp_rank, self.worker_rank)
+                                 if is_multi_worker else fname)
                     shutil.move(
                         os.path.join(src_ts_dir, fname),
                         os.path.join(dst_ts_dir, new_fname),
