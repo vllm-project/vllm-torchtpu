@@ -148,6 +148,7 @@ class VllmTPUMLAAttention(MLAAttention):
                                               q_scale=q_scale,
                                               k_scale=k_scale,
                                               v_scale=v_scale)
+        self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
 
     def forward(self,
                 q: tuple[torch.Tensor, torch.Tensor],
@@ -169,6 +170,7 @@ class VllmTPUMLAAttention(MLAAttention):
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
             output=output,
+            topk_indices=kwargs.get("topk_indices"),
         )
 
 
@@ -297,9 +299,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if self.indexer and self.is_sparse:
-            _topk_indices = self.indexer(hidden_states, q_c, positions,
-                                         self.indexer_rope_emb)
+        topk_indices = None
+        if self.indexer and self.is_sparse and not self.skip_topk:
+            raise NotImplementedError(
+                "Sparse DSA attention requires the TPU indexer, which is "
+                "not yet implemented for this backend.")
 
         if llama_4_scaling is not None:
             q_nope *= llama_4_scaling
@@ -311,6 +315,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             k_pe,
             output_shape=(hidden_states.shape[0],
                           self.num_heads * self.v_head_dim),
+            topk_indices=topk_indices,
         )
 
         return self.o_proj(attn_out)[0]

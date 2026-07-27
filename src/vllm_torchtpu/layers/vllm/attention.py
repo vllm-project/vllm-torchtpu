@@ -1095,6 +1095,78 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return mla_impl
 
+    def _build_sparse_mla_op(self, layer: Any):
+        from vllm_torchtpu.layers.common.attention_interface import \
+            sparse_mla_attention
+
+        vllm_context = get_vllm_model_wrapper_context()
+
+        # Per-tensor fp8 dequant scale for the packed nope cache -- the
+        # same checkpoint k_scale the dense path uses.
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def sparse_mla_attention_core_tpu(
+            kv_cache: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return sparse_mla_attention(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                vllm_context.mesh,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+            )
+
+        op_name = ("pallas::sparse_mla_attention_"
+                   f"{layer.layer_name.replace('.', '_')}")
+        sparse_mla_jax_op = pallas.jax_op(op_name,
+                                          sparse_mla_attention_core_tpu,
+                                          donate_argnums=(0, ))
+
+        def _fake_sparse_mla(kv_cache, ql_nope, q_pe, kv_c_normed, k_pe,
+                             topk_indices, *args, **kwargs):
+            num_tokens = ql_nope.size(0)
+            out_shape = (num_tokens, layer.num_heads, layer.kv_lora_rank)
+            return torch.empty_like(kv_cache), torch.empty(
+                out_shape, dtype=ql_nope.dtype, device=ql_nope.device)
+
+        sparse_mla_jax_op.register_fake(_fake_sparse_mla)
+
+        def sparse_mla_impl(
+                kv_cache: torch.Tensor, ql_nope: torch.Tensor,
+                q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
+                k_pe: torch.Tensor, topk_indices: torch.Tensor,
+                seq_lens: torch.Tensor, block_tables: torch.Tensor,
+                query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor) -> torch.Tensor:
+            new_kv, outputs = sparse_mla_jax_op(kv_cache, ql_nope, q_pe,
+                                                kv_c_normed, k_pe,
+                                                topk_indices, seq_lens,
+                                                block_tables, query_start_loc,
+                                                request_distribution)
+            kv_cache.copy_(new_kv)
+            return outputs
+
+        return sparse_mla_impl
+
     def forward(
         self,
         layer: Any,
@@ -1147,28 +1219,47 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                   value=None,
                                   k_scale=k_scale)
 
-        if not hasattr(layer, "mla_op") or layer.mla_op is None:
-            layer.mla_op = self._build_mla_op(layer,
-                                              q_scale=q_scale,
-                                              k_scale=k_scale,
-                                              v_scale=v_scale)
-
         ql_nope_flat = ql_nope.view(-1, layer.num_heads, layer.kv_lora_rank)
         q_pe_flat = q_pe.view(-1, layer.num_heads, layer.qk_rope_head_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
 
-        outputs = layer.mla_op(
-            kv_cache,
-            ql_nope_flat,
-            q_pe_flat,
-            kv_c_normed_flat,
-            k_pe_flat,
-            attn_metadata.seq_lens,
-            attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
-            attn_metadata.request_distribution,
-        )
+        topk_indices = kwargs.get("topk_indices")
+        if topk_indices is not None:
+            if (not hasattr(layer, "sparse_mla_op")
+                    or layer.sparse_mla_op is None):
+                layer.sparse_mla_op = self._build_sparse_mla_op(layer)
+
+            outputs = layer.sparse_mla_op(
+                kv_cache,
+                ql_nope_flat,
+                q_pe_flat,
+                kv_c_normed_flat,
+                k_pe_flat,
+                topk_indices,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+            )
+        else:
+            if not hasattr(layer, "mla_op") or layer.mla_op is None:
+                layer.mla_op = self._build_mla_op(layer,
+                                                  q_scale=q_scale,
+                                                  k_scale=k_scale,
+                                                  v_scale=v_scale)
+
+            outputs = layer.mla_op(
+                kv_cache,
+                ql_nope_flat,
+                q_pe_flat,
+                kv_c_normed_flat,
+                k_pe_flat,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+            )
 
         outputs_t = outputs.reshape(-1, layer.num_heads,
                                     layer.kv_lora_rank).transpose(0, 1)
