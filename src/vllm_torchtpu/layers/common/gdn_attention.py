@@ -115,8 +115,8 @@ def run_jax_gdn_attention(
         P(None),  # seq_lens
     )
     if slot_read_offsets is not None:
-        # Per-slot buffer, replicated like the other per-sequence inputs
-        # (query_start_loc / state_indices / seq_lens).
+        # Per-sequence read offsets (see below), replicated like the other
+        # per-sequence inputs (query_start_loc / state_indices / seq_lens).
         in_specs = in_specs + (P(None), )
 
     out_specs = (
@@ -147,7 +147,20 @@ def run_jax_gdn_attention(
         check_vma=False,
     )
 
-    extra_args = (() if slot_read_offsets is None else (slot_read_offsets, ))
+    # `slot_read_offsets` is the per-slot offset buffer (shape (num_blocks,)):
+    # `slot_read_offsets[base_slot]` holds `num_accepted - 1` for the request
+    # whose checkpoint group starts at `base_slot`. Index it by `state_indices`
+    # (each sequence's base slot) to get the per-sequence read offsets the
+    # kernel expects (shape (num_seqs,)); it then reads each request's initial
+    # state from `state_indices[s] + read_offsets[s]`. Both operands are
+    # replicated, so gather here, outside the shard_map. (This indexing was
+    # dropped when #115 inlined run_jax_gdn_attention_local into the shard_map
+    # body, leaving the full buffer to reach the kernel and trip its
+    # `read_offsets.shape == (num_seqs,)` assertion.)
+    if slot_read_offsets is not None:
+        extra_args = (slot_read_offsets[state_indices], )
+    else:
+        extra_args = ()
     (new_conv_state, new_recurrent_state), output = mapped_fn(
         j_mixed_qkv,
         j_b,
