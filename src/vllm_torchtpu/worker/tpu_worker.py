@@ -498,6 +498,7 @@ class TPUWorker(WorkerBase):
             self.profile_run_dir = None
             self.profile_capture_dir = None
             self.profile_canonical_ts = None
+            self.profile_session_key = None
 
     def _next_profile_session_key(self) -> str:
         """Marker key for the start/stop cycle that is beginning.

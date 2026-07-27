@@ -247,8 +247,8 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     assert profiler.current_phase == ""
 
 
-def _stage_dp_rank_capture(rank_dir, ts_name, filename, content):
-    """Helper: simulate writing one xplane file under dp_rank_N/plugins/profile/<ts>/."""
+def _stage_rank_capture(rank_dir, ts_name, filename, content):
+    """Helper: simulate writing one xplane file under rank_N/plugins/profile/<ts>/."""
     ts_dir = rank_dir / "plugins" / "profile" / ts_name
     ts_dir.mkdir(parents=True)
     (ts_dir / filename).write_text(content)
@@ -282,15 +282,15 @@ def test_resolve_canonical_dst_ts_non_zero_rank_reads_marker(tmp_path):
 
 
 def test_resolve_canonical_dst_ts_non_zero_rank_falls_back_on_timeout(
-        tmp_path):
+        tmp_path, monkeypatch):
     """When rank 0 never publishes, a non-zero rank falls back to own ts."""
     phase_dir = tmp_path / "prefill_heavy"
     phase_dir.mkdir()
 
     profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=1)
     # Speed the test up by shrinking the timeout.
-    profiler._CANONICAL_TS_POLL_TIMEOUT_S = 0.1
-    profiler._CANONICAL_TS_POLL_INTERVAL_S = 0.02
+    monkeypatch.setattr(profiler_trace, "CANONICAL_TS_POLL_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(profiler_trace, "CANONICAL_TS_POLL_INTERVAL_S", 0.02)
 
     ts = profiler._resolve_canonical_dst_ts(str(phase_dir))
 
@@ -300,67 +300,69 @@ def test_resolve_canonical_dst_ts_non_zero_rank_falls_back_on_timeout(
     _dt.datetime.strptime(ts, "%Y_%m_%d_%H_%M_%S")
 
 
-def test_merge_profile_directories_single_rank(tmp_path, monkeypatch):
+def test_merge_profile_directories_single_rank(tmp_path):
     """Single rank, non-MPMD: capture moves from sandbox to <phase>/plugins/profile/<canonical_ts>/."""
     profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=0)
     phase_dir = tmp_path / "prefill_heavy"
-    rank_dir = phase_dir / "dp_rank_0"
+    rank_dir = phase_dir / "rank_0"
     rank_dir.mkdir(parents=True)
     profiler.profile_dir_with_phase_suffix = str(rank_dir)
     profiler._canonical_dst_ts = "2026_05_06_04_47_36"
 
     # We need to create the actual directory structure for listdir to work in test
-    _stage_dp_rank_capture(rank_dir, "2026_05_06_04_47_36_pt",
-                           "t1v-n-host-w-0.xplane.pb", "data_0")
+    _stage_rank_capture(rank_dir, "2026_05_06_04_47_36_pt",
+                        "t1v-n-host-w-0.xplane.pb", "data_0")
+    # A phase always writes stats into the sandbox before it captures.
+    (rank_dir / "batch_composition_stats_1.json").write_text("{}")
 
-    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
-    monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
     profiler._merge_profile_directories()
 
     dst = phase_dir / "plugins" / "profile" / "2026_05_06_04_47_36"
     assert (dst / "t1v-n-host-w-0.xplane.pb").read_text() == "data_0"
-    # Sandbox plugins/ subtree cleaned up; dp_rank_0/ itself remains for stats.
+    # Sandbox plugins/ subtree cleaned up; rank_0/ itself remains for stats.
     assert not (rank_dir / "plugins").exists()
     assert rank_dir.exists()
 
 
-def test_merge_profile_directories_mpmd(tmp_path, monkeypatch):
-    """MPMD: 4 ranks captured to their own sandboxes with identical filenames; each moves to the SAME canonical ts dir with rank{N}_ prefix."""
-    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
+def test_merge_profile_directories_clears_marker_on_rank_zero(tmp_path):
+    """Rank 0 drops the marker on merge, so a later run cannot inherit it."""
     phase_dir = tmp_path / "prefill_heavy"
+    phase_dir.mkdir()
 
-    canonical_ts = "2026_05_06_04_47_36"
-    profilers = []
-    for rank in range(4):
+    profilers = {}
+    # Rank 0 resolves first so it publishes the marker the other rank reads.
+    for rank in (0, 1):
         profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
-                                      worker_rank=rank)
-        rank_dir = phase_dir / f"dp_rank_{rank}"
-        rank_dir.mkdir(parents=True)
+                                      worker_rank=rank,
+                                      world_size=2)
+        rank_dir = phase_dir / f"rank_{rank}"
+        rank_dir.mkdir()
         profiler.profile_dir_with_phase_suffix = str(rank_dir)
-        profiler._canonical_dst_ts = canonical_ts
-        _stage_dp_rank_capture(
-            rank_dir,
-            f"pt_ts_{rank}",
-            "t1v-n-host-w-0.xplane.pb",
-            f"rank_{rank}_xplane",
-        )
-        profilers.append(profiler)
+        profiler._canonical_dst_ts = profiler._resolve_canonical_dst_ts(
+            str(phase_dir))
+        _stage_rank_capture(rank_dir, f"pt_ts_{rank}",
+                            "t1v-n-host-w-0.xplane.pb", f"rank_{rank}")
+        profilers[rank] = profiler
 
-    for rank, profiler in enumerate(profilers):
-        profiler._merge_profile_directories()
+    assert profilers[1]._canonical_dst_ts == profilers[0]._canonical_dst_ts
 
-    dst = phase_dir / "plugins" / "profile" / canonical_ts
-    for rank in range(4):
-        assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
-                ).read_text() == f"rank_{rank}_xplane"
-        rank_dir = phase_dir / f"dp_rank_{rank}"
-        assert not (rank_dir / "plugins").exists()
+    # A non-zero rank merging first must not pull the marker out from under
+    # ranks that have not read it yet.
+    profilers[1]._merge_profile_directories()
+    assert list(phase_dir.glob(".canonical_ts_*"))
+
+    profilers[0]._merge_profile_directories()
+    assert not list(phase_dir.glob(".canonical_ts_*"))
 
 
-def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
-    """TP multi-worker (TP=4, DP=1): world_size=4 with no DP env vars; each rank moves to canonical ts dir with rank{N}_ prefix."""
-    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
-    monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
+def test_merge_profile_directories_multiworker(tmp_path):
+    """4 ranks captured to their own sandboxes with identical filenames; each
+    moves to the SAME canonical ts dir with a rank{N}_ prefix.
+
+    DP=4/TP=1 and TP=4/DP=1 are the same case here: the worker hands the
+    profiler the slice-global world size either way, so there is one path to
+    cover rather than one per parallelism mode.
+    """
     phase_dir = tmp_path / "prefill_heavy"
 
     canonical_ts = "2026_05_06_04_47_36"
@@ -369,11 +371,11 @@ def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
         profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
                                       worker_rank=rank,
                                       world_size=4)
-        rank_dir = phase_dir / f"dp_rank_{rank}"
+        rank_dir = phase_dir / f"rank_{rank}"
         rank_dir.mkdir(parents=True)
         profiler.profile_dir_with_phase_suffix = str(rank_dir)
         profiler._canonical_dst_ts = canonical_ts
-        _stage_dp_rank_capture(
+        _stage_rank_capture(
             rank_dir,
             f"pt_ts_{rank}",
             "t1v-n-host-w-0.xplane.pb",
@@ -388,5 +390,5 @@ def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
     for rank in range(4):
         assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
                 ).read_text() == f"rank_{rank}_xplane"
-        rank_dir = phase_dir / f"dp_rank_{rank}"
+        rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()

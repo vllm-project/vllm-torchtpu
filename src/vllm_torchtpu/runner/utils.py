@@ -208,20 +208,8 @@ class PhaseBasedProfiler:
 
     def _resolve_canonical_dst_ts(self, phase_dir: str) -> str:
         """Resolve the canonical destination timestamp for this phase."""
-        return profiler_trace.resolve_canonical_dst_ts(
-            phase_dir,
-            self.worker_rank,
-            poll_timeout_s=getattr(
-                self,
-                "_CANONICAL_TS_POLL_TIMEOUT_S",
-                profiler_trace.CANONICAL_TS_POLL_TIMEOUT_S,
-            ),
-            poll_interval_s=getattr(
-                self,
-                "_CANONICAL_TS_POLL_INTERVAL_S",
-                profiler_trace.CANONICAL_TS_POLL_INTERVAL_S,
-            ),
-        )
+        return profiler_trace.resolve_canonical_dst_ts(phase_dir,
+                                                       self.worker_rank)
 
     def _start_profiling(self, batch_composition_stats: dict) -> None:
         """Starts profiling if the current phase is unseen."""
@@ -312,13 +300,21 @@ class PhaseBasedProfiler:
         """Consolidates phase trace artifacts."""
         if not self.profile_dir_with_phase_suffix or not self._canonical_dst_ts:
             return
+        phase_dir = os.path.dirname(self.profile_dir_with_phase_suffix)
         profiler_trace.merge_rank_capture(
             self.profile_dir_with_phase_suffix,
-            os.path.dirname(self.profile_dir_with_phase_suffix),
+            phase_dir,
             self._canonical_dst_ts,
             self.worker_rank,
-            world_size=getattr(self, "world_size", 1),
+            world_size=self.world_size,
         )
+        if self.worker_rank == 0:
+            # The phase is merged, so nothing will read this marker again.
+            # Dropping it keeps a later run against the same profile_dir from
+            # finding it; slower ranks have long since timed out, since a
+            # phase spans num_steps_to_profile_for steps and the poll window
+            # is CANONICAL_TS_POLL_TIMEOUT_S.
+            profiler_trace.clear_canonical_ts_marker(phase_dir)
 
     def step(self, batch_composition_stats: dict) -> None:
         """Steps the profiler and logs batch composition stats."""

@@ -9,7 +9,7 @@ other.
 
 These helpers give all ranks a common protocol:
 
-  1. Each rank captures into its own sandbox, ``<root>/dp_rank_<N>/``.
+  1. Each rank captures into its own sandbox, ``<root>/rank_<N>/``.
   2. Rank 0 publishes a canonical run timestamp via a marker file; the other
      ranks read it, so everyone agrees on one destination run directory.
   3. On stop, each rank moves its capture into
@@ -34,11 +34,6 @@ CANONICAL_TS_FORMAT = "%Y_%m_%d_%H_%M_%S"
 CANONICAL_TS_POLL_TIMEOUT_S = 5.0
 CANONICAL_TS_POLL_INTERVAL_S = 0.05
 
-# Overrides the id that scopes canonical-ts markers. Only needed when the
-# workers of one server are not siblings and TORCH_TPU_DP_MASTER_PORT is
-# unset; see `profile_session_id`.
-PROFILE_SESSION_ID_ENV = "VLLM_TORCHTPU_PROFILE_SESSION_ID"
-
 
 def profile_session_id() -> str:
     """Return an id shared by every worker process of this server run.
@@ -47,12 +42,9 @@ def profile_session_id() -> str:
     earlier run is never mistaken for the current one. ``TORCH_TPU_DP_MASTER_PORT``
     is picked once per server and inherited by every engine and worker, which
     also covers DP>1 with TP>1, where workers of different DP replicas have
-    different parents. The parent pid is the fallback for the single-engine
-    case, where all workers are children of the same engine core.
+    different parents. The parent pid is the fallback for DP=1, where the port
+    is unset and all workers are children of the same engine core.
     """
-    override = os.environ.get(PROFILE_SESSION_ID_ENV)
-    if override:
-        return override
     dp_master_port = os.environ.get("TORCH_TPU_DP_MASTER_PORT")
     if dp_master_port:
         return f"dp{dp_master_port}"
@@ -60,20 +52,12 @@ def profile_session_id() -> str:
 
 
 def rank_capture_dir(dst_root: str, worker_rank: int) -> str:
-    """Return the per-rank capture sandbox under `dst_root`."""
-    return os.path.join(dst_root, f"dp_rank_{worker_rank}")
+    """Return the per-rank capture sandbox under `dst_root`.
 
-
-def inject_rank_into_filename(fname: str, worker_rank: int) -> str:
-    """Prefix `rank<N>_` to an xplane or trace filename."""
-    return f"rank{worker_rank}_{fname}"
-
-
-def is_multi_worker_capture(worker_rank: int, world_size: int) -> bool:
-    """Whether more than one rank is expected to capture into `dst_root`."""
-    dp_size = int(os.getenv("TORCH_TPU_DP_SIZE", "1"))
-    return (dp_size > 1 or os.getenv("TPU_MULTIPROCESS_DP") == "1"
-            or world_size > 1 or worker_rank > 0)
+    `worker_rank` is the slice-global rank, so this names TP and PP ranks as
+    well as DP replicas.
+    """
+    return os.path.join(dst_root, f"rank_{worker_rank}")
 
 
 def canonical_ts_marker_path(dst_root: str, session_key: str) -> str:
@@ -85,8 +69,6 @@ def resolve_canonical_dst_ts(
     worker_rank: int,
     *,
     session_key: str | None = None,
-    poll_timeout_s: float = CANONICAL_TS_POLL_TIMEOUT_S,
-    poll_interval_s: float = CANONICAL_TS_POLL_INTERVAL_S,
 ) -> str:
     """Resolve the destination run timestamp shared by all ranks.
 
@@ -94,6 +76,10 @@ def resolve_canonical_dst_ts(
     poll for it so every worker merges into the same run directory. A rank
     that never sees the marker falls back to its own timestamp, which costs a
     split run directory but never loses a trace.
+
+    The marker is only visible to ranks that share a filesystem with rank 0,
+    so on a multi-host slice `dst_root` has to be a shared mount for the
+    merge to produce one run directory.
     """
     if session_key is None:
         session_key = profile_session_id()
@@ -110,7 +96,7 @@ def resolve_canonical_dst_ts(
             logger.warning("Rank 0 failed to write canonical ts marker: %s", e)
         return canonical_ts
 
-    deadline = time.monotonic() + poll_timeout_s
+    deadline = time.monotonic() + CANONICAL_TS_POLL_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
             with open(marker) as f:
@@ -119,16 +105,19 @@ def resolve_canonical_dst_ts(
                 return ts
         except OSError:
             pass
-        time.sleep(poll_interval_s)
+        time.sleep(CANONICAL_TS_POLL_INTERVAL_S)
 
     fallback_ts = datetime.datetime.now().strftime(CANONICAL_TS_FORMAT)
     logger.warning(
         "rank %d did not find rank 0's canonical-ts marker at %s "
-        "within %.1fs; falling back to own timestamp %s",
+        "within %.1fs; falling back to own timestamp %s. Traces are kept, "
+        "but this rank lands in its own run directory; check that %s is on "
+        "a filesystem rank 0 can also write to.",
         worker_rank,
         marker,
-        poll_timeout_s,
+        CANONICAL_TS_POLL_TIMEOUT_S,
         fallback_ts,
+        dst_root,
     )
     return fallback_ts
 
@@ -158,13 +147,18 @@ def merge_rank_capture(
     Everything found there lands in `<dst_root>/plugins/profile/<canonical_ts>/`,
     rank-prefixed when several workers share the destination. Non-trace files
     the caller put in the sandbox (e.g. batch composition stats) are left
-    alone.
+    alone, and the sandbox itself is removed only if moving the trace left it
+    empty.
     """
     source_profile_path = os.path.join(capture_dir, "plugins", "profile")
     if not os.path.exists(source_profile_path):
         return
     dst_ts_dir = os.path.join(dst_root, "plugins", "profile", canonical_ts)
-    multi_worker = is_multi_worker_capture(worker_rank, world_size)
+    # `world_size` is the slice-global world (TP*PP*DP), so this one
+    # comparison covers every parallelism mode. Deciding purely from it also
+    # keeps the verdict identical on every rank, which is what makes the rank
+    # prefix present on all of a run's files or absent from all of them.
+    multi_worker = world_size > 1
 
     try:
         os.makedirs(dst_ts_dir, exist_ok=True)
@@ -173,7 +167,10 @@ def merge_rank_capture(
             if not os.path.isdir(src_ts_dir):
                 continue
             for fname in os.listdir(src_ts_dir):
-                new_fname = (inject_rank_into_filename(fname, worker_rank)
+                # Mind the two spellings of the same idea: the capture
+                # sandbox is `rank_<N>` (see `rank_capture_dir`), the merged
+                # filename is `rank<N>_`.
+                new_fname = (f"rank{worker_rank}_{fname}"
                              if multi_worker else fname)
                 shutil.move(
                     os.path.join(src_ts_dir, fname),
@@ -183,9 +180,13 @@ def merge_rank_capture(
                 os.rmdir(src_ts_dir)
             except OSError:
                 pass
+        # rmdir only succeeds on an empty directory, so the sandbox survives
+        # when the caller left other artifacts (batch composition stats) in
+        # it and is cleaned up when the trace was all it held.
         for cleanup in (
                 source_profile_path,
                 os.path.dirname(source_profile_path),
+                capture_dir,
         ):
             try:
                 os.rmdir(cleanup)

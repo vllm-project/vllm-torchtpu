@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -180,15 +181,15 @@ class TestInitPhasedProfiling:
                      additional_config,
                      max_iterations=0,
                      delay_iterations=0,
-                     profiler_rank=None,
-                     profiler_world_size=None):
+                     profiler_rank=2,
+                     profiler_world_size=4):
+        # No parallel_config: the phased profiler must not reach for it.
         return SimpleNamespace(
             vllm_config=SimpleNamespace(
                 additional_config=additional_config,
                 profiler_config=SimpleNamespace(
                     max_iterations=max_iterations,
                     delay_iterations=delay_iterations)),
-            parallel_config=SimpleNamespace(rank=2, world_size=4),
             _profiler_rank=profiler_rank,
             _profiler_world_size=profiler_world_size,
         )
@@ -223,10 +224,23 @@ class TestInitPhasedProfiling:
             decode_kv_len_threshold=128,
         )
 
-    def test_prefers_worker_supplied_slice_global_rank(self):
+    def test_profiler_rank_kwargs_have_no_default(self):
+        """Guards the reason they are required.
+
+        A default here can only come from parallel_config, which is the wrong
+        scope for DP and fails silently: every replica reports rank 0 and the
+        merge keeps one trace out of N. Better to fail loudly at a new call
+        site than to lose traces at one.
+        """
+        params = inspect.signature(TPUModelRunner.__init__).parameters
+        for name in ("profiler_rank", "profiler_world_size"):
+            assert params[name].default is inspect.Parameter.empty
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_uses_worker_supplied_slice_global_rank(self):
         """parallel_config.rank is TPxPP-scoped: every DP replica calls itself
         rank 0, so their traces would collide. The worker passes the
-        slice-global rank instead."""
+        slice-global rank instead, and it is the only source."""
         runner = self._fake_runner(
             additional_config={"phased_profiling_dir": "/tmp/phased"},
             profiler_rank=9,
@@ -1008,8 +1022,11 @@ class TestTPURunner:
              patch.object(TPUModelRunner,
                           '_create_mesh_for_parallelism',
                           return_value=MagicMock()):
-            TPUModelRunner.__init__(self.runner, self.runner.vllm_config,
-                                    self.mock_device)
+            TPUModelRunner.__init__(self.runner,
+                                    self.runner.vllm_config,
+                                    self.mock_device,
+                                    profiler_rank=0,
+                                    profiler_world_size=1)
 
         assert self.runner.mrope_positions.cpu.dtype == torch.int32
         assert self.runner.mrope_positions.cpu.shape == (

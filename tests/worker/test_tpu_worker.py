@@ -162,7 +162,7 @@ class TestProfileCaptureAndMerge:
             worker.profile(is_start=True)
             capture_dir = Path(worker.profile_capture_dir)
             canonical_ts = worker.profile_canonical_ts
-            assert capture_dir == tmp_path / "dp_rank_0"
+            assert capture_dir == tmp_path / "rank_0"
             self._stage_capture(worker, "t1v-n-host-w-0.xplane.pb", "trace")
             worker.profile(is_start=False)
 
@@ -172,9 +172,7 @@ class TestProfileCaptureAndMerge:
         # The marker is dropped once the run it describes is merged.
         assert not list(tmp_path.glob(".canonical_ts_*"))
 
-    def test_all_ranks_merge_into_one_run_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
-        monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
+    def test_all_ranks_merge_into_one_run_dir(self, tmp_path):
         workers = [
             self._make_worker(tmp_path, rank=rank, world_size=4)
             for rank in range(4)
@@ -191,10 +189,7 @@ class TestProfileCaptureAndMerge:
                     f"rank{rank}_t1v-n-host-w-0.xplane.pb").read_text() == (
                         f"rank_{rank}")
 
-    def test_back_to_back_runs_get_separate_run_dirs(self, tmp_path,
-                                                     monkeypatch):
-        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
-        monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
+    def test_back_to_back_runs_get_separate_run_dirs(self, tmp_path):
         workers = [
             self._make_worker(tmp_path, rank=rank, world_size=2)
             for rank in range(2)
@@ -223,7 +218,7 @@ class TestProfileCaptureAndMerge:
             worker.profile(is_start=True, profile_prefix="decode")
             canonical_ts = worker.profile_canonical_ts
             assert Path(worker.profile_capture_dir) == (tmp_path / "decode" /
-                                                        "dp_rank_0")
+                                                        "rank_0")
             self._stage_capture(worker, "t1v-n-host-w-0.xplane.pb", "trace")
             # The merge follows the run the capture was started under, so a
             # stop that forgets the prefix still lands in the right place.
