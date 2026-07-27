@@ -857,6 +857,82 @@ class TestTPURaidenConnectorScheduler:
         assert first_meta.reqs_to_send[req.request_id].num_tokens == (65_023)
         assert duplicate_meta.reqs_to_send == {}
 
+    @pytest.mark.parametrize("num_computed_tokens", [32_775, 32_768])
+    def test_v3_stage3_finish_trims_blocks_past_the_transfer_prefix(
+            self, num_computed_tokens):
+        """Blocks opened by tokens kept on the producer are trimmed."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8)
+        req = MagicMock()
+        req.request_id = f"trim-{num_computed_tokens}"
+        req.prompt_token_ids = [0] * 32_768
+        req.num_prompt_tokens = 32_768
+        req.num_computed_tokens = num_computed_tokens
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        # Generation crossed the 32768-token scheduler block, so the producer
+        # table carries a second ID that is outside the transfer prefix.
+        block_ids = [100, 101]
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True), patch(f"{_MOD}.get_uuid",
+                                           return_value=778), patch(
+                                               f"{_MOD}.dist_utils."
+                                               "get_p2p_wait_pull_timeout",
+                                               return_value=30.0):
+            delay, params = producer.request_finished(req, block_ids)
+            meta = producer.build_connector_meta()
+
+        assert delay
+        assert params["num_tokens"] == 32_767
+        # Only the block covering the transferred prefix is published.
+        assert list(meta.reqs_to_send[req.request_id].local_block_ids) == [100]
+
+    def test_v3_stage3_finish_still_rejects_too_few_blocks(self):
+        """Trimming the tail must not mask a genuinely short block table."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8)
+        req = MagicMock()
+        req.request_id = "short"
+        req.prompt_token_ids = [0] * 65_536
+        req.num_prompt_tokens = 65_536
+        req.num_computed_tokens = 65_536
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        # 65535 transferred tokens need 2 scheduler blocks; only one given.
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True):
+            with pytest.raises(ValueError, match="must cover every PCP"):
+                producer.request_finished(req, [100])
+
+    def test_mamba_live_state_column_matches_cp_local_block_size(self):
+        scheduler = _make_raiden_scheduler(pcp_size=8)
+        scheduler.vllm_config.cache_config.mamba_cache_mode = "align"
+        scheduler.vllm_config.cache_config.mamba_block_size = 16
+        scheduler.vllm_config.parallel_config.decode_context_parallel_size = 1
+
+        assert scheduler._mamba_live_state_column(128) == 0
+        assert scheduler._mamba_live_state_column(129) == 1
+        assert scheduler._select_mamba_state_blocks([("group 0", [10, 11])],
+                                                    129,
+                                                    side="producer") == [11]
+
+    def test_non_align_mamba_state_stays_in_first_block(self):
+        scheduler = _make_raiden_scheduler(pcp_size=8)
+        scheduler.vllm_config.cache_config.mamba_cache_mode = "none"
+
+        assert scheduler._select_mamba_state_blocks([("group 0", [10, 11])],
+                                                    129,
+                                                    side="producer") == [10]
+
     def test_v3_stage3_finish_dedup_refuses_unsafe_inflight_eviction(self):
         producer = _make_raiden_scheduler(is_producer=True,
                                           block_size=4096,

@@ -81,6 +81,7 @@ Environment knobs (all optional)
 """
 from __future__ import annotations
 
+import math
 import os
 import queue as _queue
 import threading
@@ -331,6 +332,14 @@ def expand_hybrid_pool_block_ids(
     return np.asarray(gpu_block_ids, dtype=np.int64), cpu_rows
 
 
+def _expand_rows(rows: np.ndarray, rows_per_unit: int) -> np.ndarray:
+    """Expand each mapped unit into its `rows_per_unit` contiguous rows."""
+    if rows_per_unit == 1:
+        return rows
+    offsets = np.arange(rows_per_unit, dtype=np.int64)
+    return (rows[:, None] * rows_per_unit + offsets[None, :]).reshape(-1)
+
+
 def _expand_transfer_ids(
     transfer_spec: TransferSpec,
     tpu_to_cpu: bool,
@@ -346,6 +355,13 @@ def _expand_transfer_ids(
     unified block pool: the GPU-side spec carries per-KV-group segments
     (GPULoadStoreSpec.group_sizes / block_indices); route them through
     expand_hybrid_pool_block_ids.
+
+    Both factors count rows of the same physical granularity, so a factor
+    they share only scales every mapped pair. The mapping is done in units
+    of that common factor and re-expanded at the end, which keeps the result
+    identical whether the caller addresses manager blocks (torch, device
+    factor 1) or physical kernel blocks (raiden, whose manager indexes the
+    base buffer's major dimension directly).
     """
     src_spec, dst_spec = transfer_spec
     assert isinstance(src_spec, BlockIDsLoadStoreSpec)
@@ -354,18 +370,25 @@ def _expand_transfer_ids(
     dst_blocks = dst_spec.block_ids
     assert src_blocks.ndim == 1 and dst_blocks.ndim == 1
 
+    rows_per_unit = math.gcd(src_block_size_factor, dst_block_size_factor)
+    src_factor = src_block_size_factor // rows_per_unit
+    dst_factor = dst_block_size_factor // rows_per_unit
+
     if hybrid_num_groups is not None:
-        gpu_spec, cpu_blocks, cpu_factor = ((src_spec, dst_blocks,
-                                             dst_block_size_factor)
-                                            if tpu_to_cpu else
-                                            (dst_spec, src_blocks,
-                                             src_block_size_factor))
+        gpu_spec, cpu_blocks, gpu_factor, cpu_factor = (
+            (src_spec, dst_blocks, src_factor, dst_factor) if tpu_to_cpu else
+            (dst_spec, src_blocks, dst_factor, src_factor))
         assert isinstance(gpu_spec, GPULoadStoreSpec), (
             "hybrid pool offloading requires grouped GPU load/store specs "
             f"(group_sizes/block_indices), got {type(gpu_spec).__name__}")
         assert len(
             gpu_spec.group_sizes) == hybrid_num_groups, (gpu_spec.group_sizes,
                                                          hybrid_num_groups)
+        # The pool mapper maps one unit per GPU scheduler block.
+        assert gpu_factor == 1, (
+            "CPU offload blocks must contain a whole number of GPU scheduler "
+            f"blocks: src_block_size_factor={src_block_size_factor}, "
+            f"dst_block_size_factor={dst_block_size_factor}")
         gpu_rows, cpu_rows = expand_hybrid_pool_block_ids(
             gpu_spec.block_ids,
             gpu_spec.group_sizes,
@@ -373,23 +396,23 @@ def _expand_transfer_ids(
             cpu_blocks,
             cpu_factor,
         )
+        gpu_rows = _expand_rows(gpu_rows, rows_per_unit)
+        cpu_rows = _expand_rows(cpu_rows, rows_per_unit)
         return (gpu_rows, cpu_rows) if tpu_to_cpu else (cpu_rows, gpu_rows)
 
-    src_sub_count = src_blocks.size * src_block_size_factor
-    dst_sub_count = dst_blocks.size * dst_block_size_factor
-    src_skip = -dst_blocks.size % src_block_size_factor
+    src_sub_count = src_blocks.size * src_factor
+    dst_sub_count = dst_blocks.size * dst_factor
+    src_skip = -dst_blocks.size % src_factor
     assert dst_sub_count == src_sub_count - src_skip
 
     # expand_block_ids writes compactly with the skip already applied, so
     # both sides expand to exactly dst_sub_count entries.
     src_expanded = np.empty(dst_sub_count, dtype=np.int64)
     dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
-    expand_block_ids(src_blocks,
-                     src_block_size_factor,
-                     src_expanded,
-                     skip_count=src_skip)
-    expand_block_ids(dst_blocks, dst_block_size_factor, dst_expanded)
-    return src_expanded, dst_expanded
+    expand_block_ids(src_blocks, src_factor, src_expanded, skip_count=src_skip)
+    expand_block_ids(dst_blocks, dst_factor, dst_expanded)
+    return (_expand_rows(src_expanded, rows_per_unit),
+            _expand_rows(dst_expanded, rows_per_unit))
 
 
 # ---------------------------------------------------------------------------
@@ -1254,13 +1277,34 @@ class CpuTpuOffloadingHandlers:
         cpu_block_size_factor = cpu_block_size // kernel_block_size
         gpu_block_size_factor = gpu_block_size // kernel_block_size
         num_cpu_kernel_blocks = num_cpu_blocks * cpu_block_size_factor
+        bytes_per_kernel_block = (
+            int(np.prod(per_block_shape)) *
+            torch.empty(0, dtype=kv_dtype).element_size())
+
+        # Row granularity of the tensors handed to the handlers, and the
+        # matching block-size factors:
+        #   * Raiden DMAs against the live base buffer, so its device view
+        #     must keep the physical kernel-block leading dimension and its
+        #     block IDs are expanded to kernel rows.
+        #   * The torch path gathers/scatters whole scheduler blocks as
+        #     opaque rows, so it keeps the canonical manager-block leading
+        #     dimension and folds the kernel blocks into the trailing dims.
+        if _USE_RAIDEN_OFFLOAD:
+            rows_per_gpu_block = 1
+            src_block_size_factor, dst_block_size_factor = (
+                gpu_block_size_factor, cpu_block_size_factor)
+        else:
+            rows_per_gpu_block = gpu_block_size_factor
+            src_block_size_factor, dst_block_size_factor = 1, cpu_block_size // gpu_block_size
+        row_shape = ((rows_per_gpu_block, ) if rows_per_gpu_block > 1 else
+                     ()) + tuple(per_block_shape)
 
         tpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
 
         logger.debug(
             "[kv-offload] Allocating %d unpinned CPU pool tensors "
-            "(num_cpu_blocks=%d, gpu_factor=%d, cpu_factor=%d)",
+            "(num_cpu_blocks=%d, gpu_block_size_factor=%d, cpu_factor=%d)",
             len(kv_caches.tensors),
             num_cpu_blocks,
             gpu_block_size_factor,
@@ -1269,17 +1313,36 @@ class CpuTpuOffloadingHandlers:
         total_bytes = 0
         for kv_cache_tensor in kv_caches.tensors:
             int8_view = kv_cache_tensor.tensor
-            num_blocks = int8_view.shape[0]
-            # Rebuild the original 5D Pallas view from the same storage.
-            # vllm canonicalized to (num_blocks, page_size_bytes) int8 via
-            # .set_(storage).view(num_blocks, page_size_bytes); we round-trip
-            # to the kv_dtype-typed 5D shape so Pallas gather/scatter can
-            # operate on it directly.
+            canonical_num_blocks = int8_view.shape[0]
+            # Rebuild the kv_dtype-typed Pallas view from the same storage so
+            # Pallas gather/scatter (and raiden's raw DMA) can operate on it
+            # directly. vllm canonicalized to (num_blocks, page_size_bytes)
+            # int8 via .set_(storage).view(num_blocks, page_size_bytes);
+            # recover the physical kernel-block count from the full storage
+            # size so a manager block that spans several kernel blocks (e.g.
+            # a 4096-token pool page over 256-token CUSTOM kernel blocks) is
+            # described by its real geometry rather than by an equal-sized
+            # reinterpret.
+            storage_bytes = int8_view.numel() * int8_view.element_size()
+            assert storage_bytes % bytes_per_kernel_block == 0, (
+                "KV cache storage must contain whole physical kernel blocks: "
+                f"storage_bytes={storage_bytes}, "
+                f"bytes_per_kernel_block={bytes_per_kernel_block}")
+            num_kernel_blocks = storage_bytes // bytes_per_kernel_block
+            assert num_kernel_blocks == (
+                canonical_num_blocks * gpu_block_size_factor), (
+                    "canonical KV cache geometry does not match physical "
+                    "kernel-block geometry: "
+                    f"canonical_num_blocks={canonical_num_blocks}, "
+                    f"gpu_block_size_factor={gpu_block_size_factor}, "
+                    f"num_kernel_blocks={num_kernel_blocks}")
             tpu_tensor = (torch.empty(
                 0, dtype=kv_dtype, device=int8_view.device).set_(
-                    int8_view.untyped_storage()).view((num_blocks, ) +
-                                                      tuple(per_block_shape)))
-            cpu_shape = (num_cpu_kernel_blocks, ) + tuple(per_block_shape)
+                    int8_view.untyped_storage()).view((num_kernel_blocks //
+                                                       rows_per_gpu_block, ) +
+                                                      row_shape))
+            cpu_shape = ((num_cpu_kernel_blocks // rows_per_gpu_block, ) +
+                         row_shape)
             # cpu_pool is intentionally NOT pinned. The DMA-capable host
             # staging buffer is allocated per-transfer (pinned) in
             # register_store/register_load, and the host
@@ -1315,22 +1378,19 @@ class CpuTpuOffloadingHandlers:
                 local_control_port=0,
                 host_blocks_to_allocate=num_cpu_kernel_blocks,
             )
-            bytes_per_kernel_block = (
-                int(np.prod(per_block_shape)) *
-                torch.empty(0, dtype=kv_dtype).element_size())
             self.gpu_to_cpu_handler = _RaidenOffloadingHandler(
                 self._raiden_mgr,
                 tpu_to_cpu=True,
-                src_block_size_factor=gpu_block_size_factor,
-                dst_block_size_factor=cpu_block_size_factor,
+                src_block_size_factor=src_block_size_factor,
+                dst_block_size_factor=dst_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
                 hybrid_num_groups=hybrid_num_groups,
             )
             self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
                 self._raiden_mgr,
                 tpu_to_cpu=False,
-                src_block_size_factor=cpu_block_size_factor,
-                dst_block_size_factor=gpu_block_size_factor,
+                src_block_size_factor=dst_block_size_factor,
+                dst_block_size_factor=src_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
                 hybrid_num_groups=hybrid_num_groups,
             )
@@ -1348,15 +1408,15 @@ class CpuTpuOffloadingHandlers:
         self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=tpu_tensors,
             dst_tensors=cpu_tensors,
-            src_block_size_factor=gpu_block_size_factor,
-            dst_block_size_factor=cpu_block_size_factor,
+            src_block_size_factor=src_block_size_factor,
+            dst_block_size_factor=dst_block_size_factor,
             hybrid_num_groups=hybrid_num_groups,
         )
         self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=cpu_tensors,
             dst_tensors=tpu_tensors,
-            src_block_size_factor=cpu_block_size_factor,
-            dst_block_size_factor=gpu_block_size_factor,
+            src_block_size_factor=dst_block_size_factor,
+            dst_block_size_factor=src_block_size_factor,
             hybrid_num_groups=hybrid_num_groups,
         )
 
@@ -1531,9 +1591,9 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     ) -> OffloadingWorker:
         if self._tpu_worker is None:
             from vllm.v1.kv_cache_interface import AttentionSpec
+            from vllm.v1.worker.utils import select_common_block_size
 
-            from vllm_torchtpu.layers.vllm.attention import \
-                PallasAttentionBackend
+            from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
             gpu_block_sizes = set(self.gpu_block_size)
             assert len(gpu_block_sizes) == 1, (
@@ -1542,6 +1602,20 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                 "--enable-prefix-caching and mamba_cache_mode='align'); "
                 f"got {self.gpu_block_size}")
             gpu_block_size = gpu_block_sizes.pop()
+
+            # Under context parallelism the scheduler block spans cp_world
+            # ranks (OffloadingSpec.gpu_block_size multiplies by pcp*dcp),
+            # but each rank physically owns only 1/cp_world of its tokens
+            # as local pool rows, and the handlers move per-rank bytes.
+            # Work in per-rank token units so scheduler block b maps to
+            # this rank's pool rows [b*f, (b+1)*f).
+            parallel_config = self.vllm_config.parallel_config
+            cp_world = (parallel_config.prefill_context_parallel_size *
+                        parallel_config.decode_context_parallel_size)
+            assert gpu_block_size % cp_world == 0, (
+                "scheduler block tokens must divide evenly across CP ranks: "
+                f"gpu_block_size={gpu_block_size}, cp_world={cp_world}")
+            gpu_block_size //= cp_world
             offloaded_block_size = gpu_block_size * self.block_size_factor
 
             # All kv_cache_groups must share the same attention spec so the
@@ -1580,9 +1654,16 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                                 f"{kv_cache_tensor.page_size_bytes}")
                 hybrid_num_groups = len(self.kv_cache_config.kv_cache_groups)
 
-            full_5d_shape = PallasAttentionBackend.get_kv_cache_shape(
+            # The pool page is a manager block; the kernel block the backend
+            # actually addresses can be smaller (batched RPA: 256 tokens).
+            backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+            assert backend_cls is not None, (
+                "CPU offloading requires a non-SSM attention backend.")
+            kernel_block_size = select_common_block_size(
+                spec0.block_size, [backend_cls])
+            full_5d_shape = backend_cls.get_kv_cache_shape(
                 num_blocks=1,
-                block_size=spec0.block_size,
+                block_size=kernel_block_size,
                 num_kv_heads=spec0.num_kv_heads,
                 head_size=spec0.head_size,
                 cache_dtype_str=spec0.dtype,
@@ -1594,7 +1675,7 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                 cpu_block_size=offloaded_block_size,
                 num_cpu_blocks=self.num_blocks,
                 kv_caches=kv_caches,
-                kernel_block_size=spec0.block_size,
+                kernel_block_size=kernel_block_size,
                 kv_dtype=spec0.dtype,
                 per_block_shape=per_block_shape,
                 hybrid_num_groups=hybrid_num_groups,

@@ -780,6 +780,104 @@ class TestExpandTransferIdsFlat(unittest.TestCase):
         self.assertEqual(src_ids, [1, 2, 3, 4])
         self.assertEqual(dst_ids, [6, 7, 14, 15])
 
+    def test_kernel_granular_factors_scale_manager_mapping(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        # Raiden addresses physical kernel rows, so both factors carry the
+        # same kernel-block multiplier (4 here). The mapping must be the
+        # manager-block mapping of test_h2d_partial_first_cpu_block with
+        # every row expanded into its 4 kernel rows — not a different
+        # skip/row count.
+        src_ids, dst_ids = self._expand(
+            CPULoadStoreSpec([5, 6]),
+            GPULoadStoreSpec([7, 8, 9], group_sizes=[3], block_indices=[1]),
+            tpu_to_cpu=False,
+            src_factor=8,
+            dst_factor=4,
+        )
+        self.assertEqual(src_ids,
+                         [r * 4 + i for r in (11, 12, 13) for i in range(4)])
+        self.assertEqual(dst_ids,
+                         [r * 4 + i for r in (7, 8, 9) for i in range(4)])
+
+
+class TestExpandTransferIdsHybridPhysical(unittest.TestCase):
+    """Raiden indexes physical kernel blocks while vLLM's grouped hybrid
+    specs contain scheduler-block IDs. Each mapped scheduler pair must expand
+    to matching contiguous physical rows on both sides."""
+
+    def test_d2h_expands_scheduler_pairs_to_kernel_rows(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        from vllm_torchtpu.offload.cpu_tpu import _expand_transfer_ids
+
+        src_ids, dst_ids = _expand_transfer_ids(
+            (
+                GPULoadStoreSpec([5, 9], group_sizes=[2], block_indices=[0]),
+                CPULoadStoreSpec([10, 11]),
+            ),
+            tpu_to_cpu=True,
+            src_block_size_factor=4,
+            dst_block_size_factor=4,
+            hybrid_num_groups=1,
+        )
+        self.assertEqual(list(src_ids), [20, 21, 22, 23, 36, 37, 38, 39])
+        self.assertEqual(list(dst_ids), [40, 41, 42, 43, 44, 45, 46, 47])
+
+
+class TestTorchPathManagerBlockView(unittest.TestCase):
+    """A manager block may span several physical kernel blocks (e.g. a
+    4096-token pool page over 256-token CUSTOM kernel blocks). The torch
+    handlers index rows with scheduler-block IDs, so their views must keep
+    the manager-block leading dimension and fold the kernel blocks into the
+    trailing dims — and both sides must be passed matching block factors."""
+
+    def test_keeps_manager_rows_over_physical_storage(self):
+        from vllm.v1.kv_offload.base import (CanonicalKVCaches,
+                                             CanonicalKVCacheTensor)
+
+        from vllm_torchtpu.offload.cpu_tpu import CpuTpuOffloadingHandlers
+
+        # 8 kernel blocks of 2 int8 elements = 2 manager blocks of 4 kernel
+        # blocks; vllm canonicalizes that storage to (2, 8) int8.
+        base = torch.empty((8, 2), dtype=torch.int8)
+        canonical = torch.empty(0, dtype=torch.int8).set_(
+            base.untyped_storage()).view(2, 8)
+        caches = CanonicalKVCaches(
+            tensors=[
+                CanonicalKVCacheTensor(tensor=canonical, page_size_bytes=8)
+            ],
+            group_data_refs=[[]],
+        )
+
+        with patch("vllm_torchtpu.offload.cpu_tpu._USE_RAIDEN_OFFLOAD",
+                   False), patch(
+                       "vllm_torchtpu.offload.cpu_tpu."
+                       "SingleDirectionOffloadingHandler") as handler_cls:
+            CpuTpuOffloadingHandlers(
+                gpu_block_size=4,
+                cpu_block_size=8,
+                num_cpu_blocks=2,
+                kv_caches=caches,
+                kernel_block_size=1,
+                kv_dtype=torch.int8,
+                per_block_shape=(2, ),
+            )
+
+        d2h_kwargs = handler_cls.call_args_list[0].kwargs
+        rebuilt = d2h_kwargs["src_tensors"][0]
+        self.assertEqual(tuple(rebuilt.shape), (2, 4, 2))
+        self.assertEqual(rebuilt.untyped_storage().data_ptr(),
+                         base.untyped_storage().data_ptr())
+        # CPU pool: 2 offloaded blocks of 2 manager blocks each.
+        self.assertEqual(tuple(d2h_kwargs["dst_tensors"][0].shape), (4, 4, 2))
+        # Both rows are manager blocks, so the device factor is 1 and the CPU
+        # factor is the offloaded/scheduler block ratio.
+        self.assertEqual(d2h_kwargs["src_block_size_factor"], 1)
+        self.assertEqual(d2h_kwargs["dst_block_size_factor"], 2)
+
 
 class TestHybridTransferAsyncMapping(unittest.TestCase):
     """`transfer_async` in hybrid pool mode must route grouped GPU specs

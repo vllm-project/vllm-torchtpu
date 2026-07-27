@@ -18,7 +18,8 @@ logger = init_logger(__name__)
 
 _PCP_LOCAL_RANK_REMAPS: dict[int, tuple[tuple[int, ...], str]] = {}
 _PCP_REMAP_PROBE_PREFIX = "VLLM_TPU_PCP_REMAP_PROBE "
-_PCP_REMAP_PROBE_TIMEOUT_S = 120.0
+_PCP_REMAP_PROBE_TIMEOUT_S = float(
+    os.getenv("TPU_PCP_REMAP_PROBE_TIMEOUT_S", "120.0"))
 _PCP_REMAP_PROBE_SCRIPT = r"""
 import json
 import os

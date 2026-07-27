@@ -48,6 +48,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.worker.cp_utils import get_total_cp_world_size
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import (AttentionGroup,
@@ -1414,7 +1415,13 @@ class TPUModelRunner(GPUModelRunner):
             if req_id not in live_req_ids:
                 del self._mamba_state_pos[req_id]
 
-        block_size = self.block_size
+        # Each CP rank owns only its interleaved share of a logical sequence.
+        # Accordingly, vLLM sizes Mamba block-table rows in units of
+        # block_size * total_cp_world_size (see AttentionMetadataBuilder).
+        # Using the unsharded block size here can index beyond the per-rank
+        # table and also move the recurrent state before its local block
+        # actually advances.
+        block_size = self.block_size * get_total_cp_world_size()
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
         crossings: list[tuple[int, int, int]] = []

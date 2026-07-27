@@ -937,23 +937,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"num_tokens={num_tokens}, page_tokens={self.block_size}")
         mamba_state_block_ids: Optional[list[int]] = None
         if self._stage3_mamba_group_indices:
-            # Uniform mamba layout: the GDN op reads/writes the live
-            # recurrent state at the mamba table's FIRST block
-            # (block_tables[:, 0] fallback); later blocks hold APC boundary
-            # checkpoints, not the live state.
-            mamba_state_block_ids = []
+            tables = []
             for mamba_gid in self._stage3_mamba_group_indices:
                 if mamba_gid >= len(grouped_block_ids):
                     raise ValueError(
                         "GDN state reshard: mamba KV cache group is absent "
                         f"from decode allocation: index={mamba_gid}, "
                         f"groups={len(grouped_block_ids)}")
-                mamba_ids = list(grouped_block_ids[mamba_gid])
-                if not mamba_ids:
-                    raise ValueError(
-                        "GDN state reshard: destination mamba table is empty "
-                        f"(group {mamba_gid})")
-                mamba_state_block_ids.append(int(mamba_ids[0]))
+                tables.append(
+                    (f"group {mamba_gid}", grouped_block_ids[mamba_gid]))
+            mamba_state_block_ids = self._select_mamba_state_blocks(
+                tables, num_tokens, side="destination")
         self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
             uuid=uuid,
             source_req_id=source_req_id,
@@ -977,6 +971,53 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             len(local_block_ids),
             src_controller_address,
         )
+
+    def _select_mamba_state_blocks(
+        self,
+        tables: list[tuple[str, list[int]]],
+        num_computed_tokens: int,
+        *,
+        side: str,
+    ) -> list[int]:
+        """Pick the block holding each mamba group's live GDN state.
+
+        `tables` pairs a label (used only in errors) with that group's block
+        table; `side` names the endpoint the tables belong to.
+        """
+        state_col = self._mamba_live_state_column(num_computed_tokens)
+        state_block_ids = []
+        for label, group_ids in tables:
+            group_ids = list(group_ids)
+            if not group_ids:
+                raise ValueError(f"GDN state reshard: {side} mamba table is "
+                                 f"empty ({label})")
+            if state_col >= len(group_ids):
+                raise ValueError(
+                    "GDN state reshard: align-mode state column is outside "
+                    f"the {side} mamba table: column={state_col}, "
+                    f"table_len={len(group_ids)}, "
+                    f"num_computed_tokens={num_computed_tokens} ({label})")
+            state_block_ids.append(int(group_ids[state_col]))
+        return state_block_ids
+
+    def _mamba_live_state_column(self, num_computed_tokens: int) -> int:
+        """Block-table column holding the live GDN recurrent state.
+
+        Align mode advances at rank-local CP block boundaries, matching
+        ``MambaApcStateCopier``. Other modes keep state in column zero.
+        """
+        cache_config = self.vllm_config.cache_config
+        if cache_config.mamba_cache_mode != "align":
+            return 0
+        # mamba_block_size is Optional in CacheConfig; None means align-mode
+        # checkpointing never advanced past column zero.
+        mamba_block_size = cache_config.mamba_block_size or 0
+        if mamba_block_size <= 0 or num_computed_tokens <= 0:
+            return 0
+        parallel_config = self.vllm_config.parallel_config
+        cp_world = (parallel_config.prefill_context_parallel_size *
+                    parallel_config.decode_context_parallel_size)
+        return (num_computed_tokens - 1) // (mamba_block_size * cp_world)
 
     def request_finished(
         self,
@@ -1008,13 +1049,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             (num_tokens + scheduler_block_tokens - 1) //
             scheduler_block_tokens)
         normalized_block_ids = tuple(int(block_id) for block_id in block_ids)
-        # If the excluded last prompt token opened a new scheduler block, the
-        # full producer block table has one trailing ID that is outside the
-        # transfer prefix. This is the only safe count mismatch to trim.
-        if (len(normalized_block_ids) == expected_scheduler_blocks + 1
-                and prompt_tokens == num_tokens + 1
-                and num_tokens % scheduler_block_tokens == 0):
-            normalized_block_ids = normalized_block_ids[:-1]
+        # The producer may allocate trailing blocks for its excluded final
+        # prompt token or locally generated tokens. They are outside the
+        # transfer prefix; too few blocks remains an error.
+        if len(normalized_block_ids) > expected_scheduler_blocks:
+            normalized_block_ids = (
+                normalized_block_ids[:expected_scheduler_blocks])
         if len(normalized_block_ids) != expected_scheduler_blocks:
             raise ValueError(
                 "Stage-3 producer block IDs must cover every PCP scheduler "
@@ -1072,15 +1112,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if not mamba_block_ids:
                 raise ValueError("GDN state is present but the producer's "
                                  "mamba block tables were not provided")
-            # Live state is at the mamba table's first block (see the
-            # consumer-side note); the producer ships that slot.
-            mamba_state_block_ids = []
-            for ordinal, group_ids in enumerate(mamba_block_ids):
-                if not group_ids:
-                    raise ValueError(
-                        "GDN state reshard: producer mamba table is empty "
-                        f"(ordinal {ordinal})")
-                mamba_state_block_ids.append(int(group_ids[0]))
+            mamba_state_block_ids = self._select_mamba_state_blocks(
+                [(f"ordinal {ordinal}", group_ids)
+                 for ordinal, group_ids in enumerate(mamba_block_ids)],
+                computed_tokens,
+                side="producer")
         uuid = get_uuid()
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())

@@ -404,14 +404,16 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     Upstream vLLM rejects all multi-group KV cache configs when
     ``pcp_world_size > 1`` because it cannot infer the scheduler block size for
     mixed cache types. TorchTPU's Qwen3.5 path has a narrower, well-defined
-    layout: attention cache is token-parallel across PCP ranks, while GDN/Mamba
-    state is rank-local state. Use the effective token granularity seen by the
-    scheduler instead of rejecting the config.
+    layout: each physical cache page is rank-local, while the scheduler and
+    cache coordinator operate on logical pages spanning all PCP ranks. Present
+    those logical page sizes to the generic hybrid coordinator instead of
+    rejecting the config.
     """
     import math
     import sys
+    from dataclasses import replace
 
-    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
     from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec,
                                             MambaSpec, UniformTypeKVCacheSpecs)
 
@@ -433,15 +435,31 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         return any(
             isinstance(leaf, spec_type) for leaf in _iter_leaf_specs(spec))
 
-    def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
+    def _is_attention_mamba_hybrid(groups) -> bool:
+        return any(
+            _has_spec_type(group.kv_cache_spec, MambaSpec)
+            for group in groups) and any(
+                _has_spec_type(group.kv_cache_spec, AttentionSpec)
+                for group in groups)
+
+    def _with_effective_block_size(spec: KVCacheSpec, pcp: int) -> KVCacheSpec:
+        """Restate a rank-local spec in the logical (all-ranks) page size."""
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            return math.lcm(*(_effective_block_size(leaf, pcp)
-                              for leaf in spec.kv_cache_specs.values()))
-        if isinstance(spec, MambaSpec):
-            return spec.block_size
-        if isinstance(spec, AttentionSpec):
-            return spec.block_size * pcp
-        return spec.block_size
+            effective_specs = {
+                name: _with_effective_block_size(leaf, pcp)
+                for name, leaf in spec.kv_cache_specs.items()
+            }
+            effective_block_size = math.lcm(
+                *(leaf.block_size for leaf in effective_specs.values()))
+            return replace(spec,
+                           block_size=effective_block_size,
+                           kv_cache_specs=effective_specs)
+        if isinstance(spec, (AttentionSpec, MambaSpec)):
+            return replace(spec, block_size=spec.block_size * pcp)
+        return spec
+
+    def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
+        return _with_effective_block_size(spec, pcp).block_size
 
     def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
         cache_config = vllm_config.cache_config
@@ -453,12 +471,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         if len(groups) <= 1 or dcp != 1 or pcp == 1:
             return original_resolve(kv_cache_config, vllm_config)
 
-        has_mamba = any(
-            _has_spec_type(group.kv_cache_spec, MambaSpec) for group in groups)
-        has_attention = any(
-            _has_spec_type(group.kv_cache_spec, AttentionSpec)
-            for group in groups)
-        if not (has_mamba and has_attention):
+        if not _is_attention_mamba_hybrid(groups):
             return original_resolve(kv_cache_config, vllm_config)
 
         group_block_sizes = [
@@ -469,10 +482,17 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         connector_enabled = vllm_config.kv_transfer_config is not None
         if not (cache_config.enable_prefix_caching or connector_enabled):
             hash_block_size = scheduler_block_size
+        elif (not hasattr(cache_config, "prefix_match_unit")
+              or cache_config.prefix_match_unit is None):
+            hash_block_size = math.gcd(*group_block_sizes)
         else:
-            # Mamba/GDN groups do not hash token KV blocks like attention
-            # groups. Keep hash granularity at the scheduler block size.
-            hash_block_size = scheduler_block_size
+            hash_block_size = cache_config.prefix_match_unit
+            if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+                raise ValueError(
+                    f"Invalid prefix_match_unit={hash_block_size}; all logical "
+                    "PCP KV cache group block sizes must be divisible by "
+                    "prefix_match_unit. Got "
+                    f"block sizes={group_block_sizes}.")
 
         logger.info(
             "Applied TPU PCP hybrid KV cache block-size resolution: "
@@ -488,6 +508,61 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             original_resolve)
         kv_cache_utils.resolve_kv_cache_block_sizes = patched_resolve
         kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
+
+    hybrid_coordinator = kv_cache_coordinator.HybridKVCacheCoordinator
+    if not getattr(hybrid_coordinator, "_tpu_hybrid_pcp_coordinator_patch",
+                   False):
+        original_hybrid_init = hybrid_coordinator.__init__
+
+        def _hybrid_init_with_logical_pcp_blocks(self,
+                                                 kv_cache_config,
+                                                 max_model_len,
+                                                 max_num_batched_tokens,
+                                                 use_eagle,
+                                                 enable_caching,
+                                                 enable_kv_cache_events,
+                                                 dcp_world_size,
+                                                 pcp_world_size,
+                                                 scheduler_block_size,
+                                                 hash_block_size,
+                                                 metrics_collector=None):
+            groups = kv_cache_config.kv_cache_groups
+            if (pcp_world_size > 1 and _is_attention_mamba_hybrid(groups)):
+                if dcp_world_size != 1:
+                    raise ValueError("TPU hybrid PCP cache coordination does "
+                                     "not support DCP.")
+                # The generic coordinator only needs logical token
+                # granularity. Encoding PCP into each group spec and then
+                # passing pcp_world_size=1 avoids multiplying block sizes
+                # twice and keeps its prefix-cache lookup, hashing, and
+                # allocation invariants internally consistent.
+                kv_cache_config = replace(
+                    kv_cache_config,
+                    kv_cache_groups=[
+                        replace(group,
+                                kv_cache_spec=_with_effective_block_size(
+                                    group.kv_cache_spec, pcp_world_size))
+                        for group in kv_cache_config.kv_cache_groups
+                    ])
+                pcp_world_size = 1
+
+            original_hybrid_init(
+                self,
+                kv_cache_config,
+                max_model_len,
+                max_num_batched_tokens,
+                use_eagle,
+                enable_caching,
+                enable_kv_cache_events,
+                dcp_world_size,
+                pcp_world_size,
+                scheduler_block_size,
+                hash_block_size,
+                metrics_collector,
+            )
+
+        hybrid_coordinator.__init__ = _hybrid_init_with_logical_pcp_blocks
+        hybrid_coordinator._tpu_hybrid_pcp_coordinator_patch = True
 
     from vllm.v1.engine.core import EngineCoreProc
 

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, MambaSpec,
@@ -8,18 +9,21 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 
 
-def _config(*, pcp: int):
+def _config(*,
+            pcp: int,
+            enable_prefix_caching: bool = False,
+            connector_enabled: bool = False):
     return SimpleNamespace(
         cache_config=SimpleNamespace(
             block_size=512,
-            enable_prefix_caching=False,
-            hash_block_size=None,
+            enable_prefix_caching=enable_prefix_caching,
+            prefix_match_unit=None,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             prefill_context_parallel_size=pcp,
         ),
-        kv_transfer_config=None,
+        kv_transfer_config=object() if connector_enabled else None,
     )
 
 
@@ -37,6 +41,7 @@ def _mamba_spec(block_size: int = 4096):
         block_size=block_size,
         shapes=((3, 8192), ),
         dtypes=(torch.bfloat16, ),
+        mamba_cache_mode="align",
     )
 
 
@@ -64,7 +69,62 @@ def test_hybrid_full_attention_mamba_pcp_resolves_effective_block_size():
     )
 
     assert resolve_kv_cache_block_sizes(kv_cache_config,
-                                        _config(pcp=8)) == (4096, 4096)
+                                        _config(pcp=8)) == (32768, 32768)
+    assert resolve_kv_cache_block_sizes(
+        kv_cache_config, _config(pcp=8,
+                                 enable_prefix_caching=True)) == (32768, 4096)
+
+
+def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core.kv_cache_coordinator import (HybridKVCacheCoordinator,
+                                                   get_kv_cache_coordinator)
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], _full_spec(block_size=4096)),
+            KVCacheGroupSpec(["gdn"], _mamba_spec()),
+        ],
+    )
+    vllm_config = _config(pcp=8,
+                          enable_prefix_caching=True,
+                          connector_enabled=True)
+    scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config)
+
+    assert (scheduler_block_size, hash_block_size) == (32768, 32768)
+    coordinator = get_kv_cache_coordinator(
+        kv_cache_config=kv_cache_config,
+        max_model_len=65536,
+        max_num_batched_tokens=4096,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=8,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+    )
+
+    assert isinstance(coordinator, HybridKVCacheCoordinator)
+    assert [
+        group.kv_cache_spec.block_size
+        for group in coordinator.kv_cache_config.kv_cache_groups
+    ] == [32768, 32768]
+    assert [
+        manager.block_size for manager in coordinator.single_type_managers
+    ] == [32768, 32768]
+    # PCP is folded into the group specs, so the coordinator runs unaware of
+    # it (it asserts pcp_world_size == 1) and never multiplies the block
+    # sizes a second time. The caller's config is left untouched, i.e. still
+    # holds the physical, rank-local page sizes.
+    assert [
+        group.kv_cache_spec.block_size
+        for group in kv_cache_config.kv_cache_groups
+    ] == [4096, 4096]
 
 
 def test_hybrid_pcp_patch_keeps_non_mamba_scope():
@@ -103,3 +163,40 @@ def test_hybrid_pcp_patch_keeps_non_mamba_scope():
         kv_cache_config,
         vllm_config,
     )
+
+
+def test_hybrid_pcp_coordinator_patch_keeps_non_mamba_scope():
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], _full_spec()),
+            KVCacheGroupSpec(
+                ["sliding"],
+                SlidingWindowSpec(
+                    block_size=512,
+                    num_kv_heads=4,
+                    head_size=128,
+                    sliding_window=1024,
+                    dtype=torch.bfloat16,
+                ),
+            ),
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="PCP not support hybrid"):
+        get_kv_cache_coordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=4096,
+            max_num_batched_tokens=4096,
+            use_eagle=False,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=8,
+            scheduler_block_size=512,
+            hash_block_size=512,
+        )

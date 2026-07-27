@@ -116,6 +116,25 @@ def test_chunk_advance_copies_state():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7)]
 
 
+def test_pcp_uses_rank_local_state_block_size(monkeypatch):
+    monkeypatch.setattr(runner_mod, "get_total_cp_world_size", lambda: 8)
+    # A PCP rank's two table columns cover 16 logical manager blocks. The
+    # third global chunk is still in local column 0 and must not index column 2.
+    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6]]])
+    _collect(fake, _sched({"a": BLOCK_SIZE}))
+    assert fake._mamba_state_pos["a"] == 0
+    assert fake._pending_mamba_state_copies == []
+
+
+def test_pcp_local_state_block_crossing_copies(monkeypatch):
+    monkeypatch.setattr(runner_mod, "get_total_cp_world_size", lambda: 8)
+    fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]],
+                         state_pos={"a": 0})
+    _collect(fake, _sched({"a": BLOCK_SIZE}))
+    assert fake._mamba_state_pos["a"] == 1
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(5, 6)]
+
+
 def test_cache_hit_resume_copies_from_checkpoint():
     # No prior state_pos: a resumed request's prev block is derived from its
     # computed-token count (the cached prefix boundary), then seeded forward.

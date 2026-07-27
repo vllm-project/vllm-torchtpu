@@ -23,3 +23,13 @@ class TPUMultiConnector(MultiConnector):
             fn = getattr(c, "register_runner", None)
             if fn is not None:
                 fn(runner)
+
+    def get_block_ids_with_load_errors_group_index(self) -> int | None:
+        """Return the first child connector's failed-load cache group."""
+        for c in self._connectors:
+            fn = getattr(c, "get_block_ids_with_load_errors_group_index", None)
+            if fn is not None:
+                index = fn()
+                if index is not None:
+                    return index
+        return None
