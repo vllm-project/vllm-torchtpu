@@ -79,8 +79,13 @@ def _make_self(req_ids,
         _mamba_state_pos=dict(state_pos or {}),
         _mamba_state_block_size=state_block_size,
         _pool_block_split=split,
+        # The collector reads the manager block size from cache_config, not
+        # the runner's init-time snapshot (the executor finalizes it after
+        # the runner is constructed).
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
         block_size=BLOCK_SIZE,
         device="cpu",
+        mamba_slot_read_offsets=None,
         _pending_mamba_state_copies=[],
         input_batch=input_batch,
     ), raws
