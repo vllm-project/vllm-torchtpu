@@ -14,8 +14,8 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 # Dynamo Unsupported crash during vLLM startup (fullgraph=True). Setting
 # this to false allows functional collectives to compile under SPMD, which
 # is safe and required for Tensor Parallelism.
-os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                      "false")
+# os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+#                       "false")
 
 # Per-tensor-core VMEM capacity by TPU family (used to set the SC-offload
 # threshold below). Values mirror JAX's pallas chip table at
@@ -194,3 +194,22 @@ if vllm_xla_cache_path:
     # Enable Tier-2 cache in memory (required by Tier-3)
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
+
+
+def _patch_split_compiled_executable_serialization() -> None:
+    """Monkey-patch prepare_for_serialization onto _SplitCompiledExecutable.
+
+    This prevents PyTorch AOTAutogradCache from throwing NotImplementedError
+    during model warmup graph serialization when running with older torch_tpu
+    wheels.
+    """
+    try:
+        from torch_tpu._internal.compile.split_compiler import \
+            _SplitCompiledExecutable
+
+        _SplitCompiledExecutable.prepare_for_serialization = lambda self: None
+    except Exception:
+        pass
+
+
+_patch_split_compiled_executable_serialization()

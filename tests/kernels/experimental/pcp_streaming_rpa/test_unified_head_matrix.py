@@ -119,8 +119,8 @@ def _prepare_worker_env() -> dict[str, str]:
             else:
                 os.environ[key] = value
 
-    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                   "false")
+    # env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+    #                "false")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
     return env

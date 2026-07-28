@@ -34,6 +34,28 @@ Range = tuple[int, int]
 
 _tpu_backend = TpuBackend()
 
+
+def _patch_split_compiled_executable_serialization() -> None:
+    """Monkey-patch prepare_for_serialization onto _SplitCompiledExecutable.
+
+    This prevents PyTorch AOTAutogradCache from throwing NotImplementedError
+    during model warmup graph serialization when running with older torch_tpu
+    wheels.
+    """
+    try:
+        from torch_tpu._internal.compile.split_compiler import \
+            _SplitCompiledExecutable
+
+        _SplitCompiledExecutable.prepare_for_serialization = lambda self: None
+        logger.info("[TpuCompiler] Patched"
+                    " _SplitCompiledExecutable.prepare_for_serialization")
+    except Exception as e:
+        logger.warning(
+            "[TpuCompiler] Could not patch _SplitCompiledExecutable: %s", e)
+
+
+_patch_split_compiled_executable_serialization()
+
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
@@ -55,7 +77,7 @@ _TPU_COMPILE_ENV_IGNORED = {
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
     "LIBTPU_INIT_ARGS",
-    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+    # "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
     "TORCH_TPU_INTERNAL_XLA_OPTIONS",
     "XLA_FLAGS",
 )
