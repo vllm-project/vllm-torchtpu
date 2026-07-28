@@ -22,33 +22,25 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    QwenGatedDeltaNetAttention,
-)
-from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
+    QwenGatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.mamba_utils import \
+    is_conv_state_dim_first
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
-from vllm_torchtpu.distributed.pcp import (
-    get_or_create_pcp_mesh,
-    get_pcp_rank,
-    get_pcp_world_size,
-)
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
-    pcp_streaming_jax_op,
-)
+from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
+                                           get_pcp_rank, get_pcp_world_size)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
+    pcp_streaming_jax_op
 from vllm_torchtpu.layers.common.gdn_attention import (
-    run_jax_gdn_attention,
-    run_jax_gdn_attention_pcp_tp_prefill,
-    run_jax_gdn_attention_pooled,
-    run_jax_gdn_attention_pooled_pcp_tp_prefill,
-)
-from vllm_torchtpu.layers.common.sequence_layout import (
-    is_pcp_streaming_attention_metadata,
-)
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
-)
-from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+    run_jax_gdn_attention, run_jax_gdn_attention_pcp_tp_prefill,
+    run_jax_gdn_attention_pooled, run_jax_gdn_attention_pooled_pcp_tp_prefill)
+from vllm_torchtpu.layers.common.sequence_layout import \
+    is_pcp_streaming_attention_metadata
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
+    get_vllm_model_wrapper_context
+from vllm_torchtpu.platforms.tpu_block_size_utils import \
+    unified_kv_layout_enabled
 
 
 def gdn_attention_core_tpu(
@@ -493,8 +485,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.num_k_heads // self.tp_size
-        pool_block_tokens = (
-            vllm_context.vllm_config.cache_config.block_size)
+        pool_block_tokens = (vllm_context.vllm_config.cache_config.block_size)
         common_kwargs = {
             "n_kq": local_num_kq_heads,
             "n_v": local_num_v_heads,
@@ -687,11 +678,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 assert attn_metadata.mamba_state_indices is not None
                 state_indices = attn_metadata.mamba_state_indices.to(
                     torch.int32)
-                core_attn_out = gdn_op(
-                    mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
-                    self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
-                    attn_metadata.query_start_loc,
-                    attn_metadata.request_distribution, attn_metadata.seq_lens)
+                core_attn_out = gdn_op(mixed_qkv, b, a, recurrent_state,
+                                       self.conv1d.weight, self.conv1d.bias,
+                                       self.A_log, self.dt_bias, state_indices,
+                                       attn_metadata.query_start_loc,
+                                       attn_metadata.request_distribution,
+                                       attn_metadata.seq_lens)
             else:
                 conv_state, recurrent_state = kv_cache
                 # Recurrent-state slot id per persistent-batch position.
@@ -740,13 +732,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         attn_metadata.query_start_loc, request_distribution,
                         attn_metadata.seq_lens, slot_read_offsets)
                 else:
-                    core_attn_out = gdn_op(
-                        mixed_qkv, b, a, conv_state, recurrent_state,
-                        self.conv1d.weight, self.conv1d.bias, self.A_log,
-                        self.dt_bias, state_indices,
-                        attn_metadata.query_start_loc,
-                        attn_metadata.request_distribution,
-                        attn_metadata.seq_lens)
+                    core_attn_out = gdn_op(mixed_qkv, b, a, conv_state,
+                                           recurrent_state, self.conv1d.weight,
+                                           self.conv1d.bias, self.A_log,
+                                           self.dt_bias, state_indices,
+                                           attn_metadata.query_start_loc,
+                                           attn_metadata.request_distribution,
+                                           attn_metadata.seq_lens)
             if core_attn_out.shape[0] != num_tokens:
                 if not use_pcp_streaming:
                     raise RuntimeError(

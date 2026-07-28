@@ -21,12 +21,10 @@ from jax.sharding import PartitionSpec
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
-    VllmGatedDeltaNetAttention,
-)
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    set_vllm_model_wrapper_context,
-)
+from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
+    VllmGatedDeltaNetAttention
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
+    set_vllm_model_wrapper_context
 
 
 def _mesh():
@@ -281,8 +279,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_get_pcp_mesh.return_value = pcp_mesh
 
         with set_vllm_model_wrapper_context(
-                mesh=_mesh(),
-                vllm_config=_vllm_config(pcp_size=8)), patch(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), patch(
                     "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
                     "pcp_streaming_jax_op",
                     return_value=fake_jax_op,

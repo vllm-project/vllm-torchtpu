@@ -22,12 +22,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels import pool_adapters
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
-    build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order,
-)
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
-    pcp_local_token_counts as _pcp_local_token_counts,
-)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
+    build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
+    pcp_local_token_counts as _pcp_local_token_counts
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.gdn_attention import (
     _derive_pcp_ragged_exchange_descriptors,
@@ -36,12 +34,9 @@ from vllm_torchtpu.layers.common.gdn_attention import (
     _select_replicated_shard_for_pcp_rank,
     _validate_pcp_ragged_exchange_layout_support,
     run_jax_gdn_attention_pcp_tp_prefill,
-    run_jax_gdn_attention_pooled_pcp_tp_prefill,
-)
+    run_jax_gdn_attention_pooled_pcp_tp_prefill)
 from vllm_torchtpu.layers.common.utils import (
-    inverse_reorder_for_sharding,
-    reorder_concatenated_tensor_for_sharding,
-)
+    inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
 
 _GDN_PCP_NUMERICAL_CASES = (
     pytest.param(2, (20, 20, 24), 4, None, id="pcp2-multi-request-padding"),
@@ -323,18 +318,16 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
                                    dtype=jnp.bfloat16)
     b0 = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
     a0 = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
-    conv_state0 = (
-        jax.random.normal(
-            keys[7],
-            (num_blocks, kernel_size - 1, dim),
-            dtype=jnp.bfloat16,
-        ) * jnp.asarray(0.01, dtype=jnp.bfloat16))
-    rec_state0 = (
-        jax.random.normal(
-            keys[8],
-            (num_blocks, n_v, d_k, d_v),
-            dtype=jnp.float32,
-        ) * jnp.asarray(0.01, dtype=jnp.float32))
+    conv_state0 = (jax.random.normal(
+        keys[7],
+        (num_blocks, kernel_size - 1, dim),
+        dtype=jnp.bfloat16,
+    ) * jnp.asarray(0.01, dtype=jnp.bfloat16))
+    rec_state0 = (jax.random.normal(
+        keys[8],
+        (num_blocks, n_v, d_k, d_v),
+        dtype=jnp.float32,
+    ) * jnp.asarray(0.01, dtype=jnp.float32))
     conv_weight0 = jax.random.normal(keys[3], (dim, 1, kernel_size),
                                      dtype=jnp.bfloat16)
     conv_bias0 = jax.random.normal(keys[4], (dim, ), dtype=jnp.bfloat16)
@@ -488,24 +481,22 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     ssm_ntok = local_n_v * d_k * d_v * 4 // tok_bytes
     conv_ntok = 1
     conv_bytes = (kernel_size - 1) * local_dim * 2
-    while (conv_ntok * tok_bytes < conv_bytes
-           or ssm_ntok % conv_ntok != 0):
+    while (conv_ntok * tok_bytes < conv_bytes or ssm_ntok % conv_ntok != 0):
         conv_ntok *= 2
 
     state_pool = jnp.zeros(
         (pcp_size * num_blocks, pool_block_tokens, 1, 4, pool_lanes),
         dtype=jnp.int8,
     )
-    state_pool = jax.device_put(state_pool,
-                                NamedSharding(mesh, P("pcp")))
+    state_pool = jax.device_put(state_pool, NamedSharding(mesh, P("pcp")))
 
     def _write_local_pool(local_pool, local_conv, local_rec,
                           local_state_indices):
         num_states = local_state_indices.shape[0]
         local_pool = pool_adapters.scatter_region(
             local_pool,
-            local_rec[local_state_indices].reshape(num_states,
-                                                   local_n_v * d_k, d_v),
+            local_rec[local_state_indices].reshape(num_states, local_n_v * d_k,
+                                                   d_v),
             local_state_indices,
             tok0=0,
             ntok=ssm_ntok,
@@ -536,33 +527,31 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         ),
         out_specs=P("pcp"),
         check_vma=False,
-    )(state_pool, pcp_initial_conv, pcp_initial_rec,
-      replicate(state_indices))
+    )(state_pool, pcp_initial_conv, pcp_initial_rec, replicate(state_indices))
 
-    pooled_state, pooled_output = (
-        run_jax_gdn_attention_pooled_pcp_tp_prefill(
-            shard_tokens(packed_qkv),
-            shard_tokens(packed_b),
-            shard_tokens(packed_a),
-            state_pool,
-            replicate(conv_weight0),
-            replicate(conv_bias0),
-            replicate(A_log0),
-            replicate(dt_bias0),
-            replicate(state_indices),
-            replicate(query_start_loc),
-            replicate(distribution),
-            replicate(seq_lens),
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            pool_block_tokens=pool_block_tokens,
-            mesh=mesh,
-        ))
+    pooled_state, pooled_output = (run_jax_gdn_attention_pooled_pcp_tp_prefill(
+        shard_tokens(packed_qkv),
+        shard_tokens(packed_b),
+        shard_tokens(packed_a),
+        state_pool,
+        replicate(conv_weight0),
+        replicate(conv_bias0),
+        replicate(A_log0),
+        replicate(dt_bias0),
+        replicate(state_indices),
+        replicate(query_start_loc),
+        replicate(distribution),
+        replicate(seq_lens),
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        pool_block_tokens=pool_block_tokens,
+        mesh=mesh,
+    ))
 
     def _gather_local_pool(local_pool, local_state_indices):
         local_rec = pool_adapters.gather_region(

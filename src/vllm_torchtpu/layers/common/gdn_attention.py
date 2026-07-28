@@ -28,7 +28,8 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
-from vllm_torchtpu.layers.common.utils import reorder_concatenated_tensor_for_sharding
+from vllm_torchtpu.layers.common.utils import \
+    reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 
@@ -699,8 +700,8 @@ def _unified_pool_state_geometry(
     pool_block_tokens: int,
 ) -> tuple[int, int, int]:
     """Return `(split, ssm_ntok, conv_ntok)` for one local GDN state."""
-    assert pool_block_tokens % state_pool.shape[1] == 0, (
-        pool_block_tokens, state_pool.shape)
+    assert pool_block_tokens % state_pool.shape[1] == 0, (pool_block_tokens,
+                                                          state_pool.shape)
     split = pool_block_tokens // state_pool.shape[1]
 
     per_tok_elems = math.prod(state_pool.shape[2:])
@@ -716,8 +717,7 @@ def _unified_pool_state_geometry(
     # The conv slot occupies whole tokens right after the ssm region,
     # padded up so the slot's token range satisfies tok0 % ntok == 0.
     conv_ntok = 1
-    while (conv_ntok * tok_bytes < conv_bytes
-           or ssm_ntok % conv_ntok != 0):
+    while (conv_ntok * tok_bytes < conv_bytes or ssm_ntok % conv_ntok != 0):
         conv_ntok *= 2
     assert ssm_ntok + conv_ntok <= pool_block_tokens, (
         "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
@@ -854,14 +854,13 @@ def _run_gdn_with_unified_pool(
 
     canonical_state_indices = jnp.arange(state_indices.shape[0],
                                          dtype=jnp.int32)
-    (new_conv_state,
-     new_recurrent_state), output = run_canonical_gdn(
-         # The canonical GDN donates its states. Keep the full gathered conv
-         # slot alive so its dead padding bytes can be copied through below.
-         jnp.copy(conv_state),
-         recurrent_state,
-         canonical_state_indices,
-     )
+    (new_conv_state, new_recurrent_state), output = run_canonical_gdn(
+        # The canonical GDN donates its states. Keep the full gathered conv
+        # slot alive so its dead padding bytes can be copied through below.
+        jnp.copy(conv_state),
+        recurrent_state,
+        canonical_state_indices,
+    )
 
     state_pool = _scatter_gdn_states_to_unified_pool(
         state_pool,
