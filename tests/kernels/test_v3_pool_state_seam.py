@@ -4,7 +4,9 @@
 The remaining classes execute Pallas kernels and run on TPU (same gating
 as test_pool_adapters.py).
 """
+import functools
 import pathlib
+import time
 
 import jax
 import jax.numpy as jnp
@@ -398,3 +400,326 @@ class TestPooledCallerV3:
                                    atol=1e-5)
         assert jnp.array_equal(new_pool.view(jnp.int16),
                                pool_rt.view(jnp.int16))
+
+
+# --------------------------------------------------------------------
+# Production-shape TPU comparison. This intentionally keeps timing as
+# diagnostic output rather than a pass/fail threshold: shared TPU load can
+# move wall time, while correctness must remain deterministic.
+# --------------------------------------------------------------------
+
+BENCH_N_KQ, BENCH_N_V = 16, 64
+BENCH_D_K, BENCH_D_V = 128, 128
+BENCH_KERNEL_SIZE = 4
+BENCH_DIM = (BENCH_N_KQ * BENCH_D_K * 2 +
+             BENCH_N_V * BENCH_D_V)
+BENCH_NUM_TOKENS = 4096
+BENCH_ITERATIONS = 5
+BENCH_DECODE_TILE_SIZE = 4
+BENCH_KBS, BENCH_LANES = 256, 256
+BENCH_PAYLOAD = (1, 4)
+BENCH_TOK_BYTES = int(
+    np.prod(BENCH_PAYLOAD) * BENCH_LANES *
+    jnp.dtype(jnp.int8).itemsize)
+BENCH_SSM_NTOK = (
+    BENCH_N_V * BENCH_D_K * BENCH_D_V * 4 // BENCH_TOK_BYTES)
+BENCH_CONV_TOK0 = BENCH_SSM_NTOK
+BENCH_CONV_NTOK = 128
+BENCH_MANAGER_TOKENS = 4352
+BENCH_SPLIT = BENCH_MANAGER_TOKENS // BENCH_KBS
+BENCH_NUM_MGR = 2  # null slot and one active request
+BENCH_POOL_SHAPE = (
+    BENCH_NUM_MGR * BENCH_SPLIT,
+    BENCH_KBS,
+) + BENCH_PAYLOAD + (BENCH_LANES, )
+BENCH_STATE_IDX = jnp.array([1], dtype=jnp.int32)
+BENCH_QUERY_START_LOC = jnp.array(
+    [0, BENCH_NUM_TOKENS], dtype=jnp.int32)
+BENCH_DISTRIBUTION = jnp.array([0, 1, 1], dtype=jnp.int32)
+# Greater than the query length so every iteration consumes its input state.
+BENCH_SEQ_LENS = jnp.array([BENCH_NUM_TOKENS + 1], dtype=jnp.int32)
+
+
+def _benchmark_plan(pool=None):
+    if pool is None:
+        pool = jax.ShapeDtypeStruct(BENCH_POOL_SHAPE, jnp.int8)
+    return pool_adapters.v3_state_source(
+        pool,
+        split=BENCH_SPLIT,
+        ssm_ntok=BENCH_SSM_NTOK,
+        conv_tok0=BENCH_CONV_TOK0,
+        conv_ntok=BENCH_CONV_NTOK,
+        conv_dim=BENCH_DIM,
+        n_v=BENCH_N_V,
+        d_k=BENCH_D_K,
+        d_v=BENCH_D_V,
+        kernel_size=BENCH_KERNEL_SIZE,
+    )
+
+
+def _benchmark_write_states(pool, recurrent, conv):
+    recurrent_rows = recurrent.reshape(
+        1, BENCH_N_V * BENCH_D_K, BENCH_D_V)
+    pool = pool_adapters.scatter_region(
+        pool,
+        recurrent_rows,
+        BENCH_STATE_IDX,
+        tok0=0,
+        ntok=BENCH_SSM_NTOK,
+        split=BENCH_SPLIT,
+    )
+    conv_rows = conv.astype(jnp.bfloat16).reshape(
+        1, -1, BENCH_LANES)
+    conv_capacity_rows = (
+        BENCH_CONV_NTOK * BENCH_TOK_BYTES //
+        (jnp.dtype(jnp.bfloat16).itemsize * BENCH_LANES))
+    conv_rows = jnp.pad(
+        conv_rows,
+        ((0, 0), (0, conv_capacity_rows - conv_rows.shape[1]), (0, 0)),
+    )
+    return pool_adapters.scatter_region(
+        pool,
+        conv_rows,
+        BENCH_STATE_IDX,
+        tok0=BENCH_CONV_TOK0,
+        ntok=BENCH_CONV_NTOK,
+        split=BENCH_SPLIT,
+    )
+
+
+def _benchmark_read_states(pool):
+    recurrent = pool_adapters.gather_region(
+        pool,
+        BENCH_STATE_IDX,
+        tok0=0,
+        ntok=BENCH_SSM_NTOK,
+        split=BENCH_SPLIT,
+        out_dtype=jnp.float32,
+        out_lanes=BENCH_D_V,
+    ).reshape(1, BENCH_N_V, BENCH_D_K, BENCH_D_V)
+    conv = pool_adapters.gather_region(
+        pool,
+        BENCH_STATE_IDX,
+        tok0=BENCH_CONV_TOK0,
+        ntok=BENCH_CONV_NTOK,
+        split=BENCH_SPLIT,
+        out_dtype=jnp.bfloat16,
+    )
+    conv_rows = (
+        (BENCH_KERNEL_SIZE - 1) * BENCH_DIM // BENCH_LANES)
+    conv = conv[:, :conv_rows].reshape(
+        1, BENCH_KERNEL_SIZE - 1, BENCH_DIM)
+    return conv, recurrent
+
+
+def _benchmark_common_args(qkv, b, a, conv_weight, conv_bias, a_log,
+                           dt_bias):
+    return dict(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=BENCH_QUERY_START_LOC,
+        state_indices=BENCH_STATE_IDX,
+        distribution=BENCH_DISTRIBUTION,
+        seq_lens=BENCH_SEQ_LENS,
+        n_kq=BENCH_N_KQ,
+        n_v=BENCH_N_V,
+        d_k=BENCH_D_K,
+        d_v=BENCH_D_V,
+        kernel_size=BENCH_KERNEL_SIZE,
+        decode_tile_size=BENCH_DECODE_TILE_SIZE,
+    )
+
+
+@functools.partial(jax.jit, donate_argnums=(0, 1))
+def _benchmark_dense_five(conv_state, recurrent_state, qkv, b, a,
+                          conv_weight, conv_bias, a_log, dt_bias):
+
+    def step(states, _):
+        new_states, output = wrapper.fused_conv1d_gdn(
+            conv_state=states[0],
+            recurrent_state=states[1],
+            state_source=None,
+            state_plan=None,
+            **_benchmark_common_args(
+                qkv, b, a, conv_weight, conv_bias, a_log, dt_bias))
+        return new_states, output
+
+    return jax.lax.scan(
+        step,
+        (conv_state, recurrent_state),
+        xs=None,
+        length=BENCH_ITERATIONS,
+    )
+
+
+@functools.partial(jax.jit, donate_argnums=(0, ))
+def _benchmark_pooled_five(pool, qkv, b, a, conv_weight, conv_bias, a_log,
+                           dt_bias):
+
+    def step(state_source, _):
+        new_source, output = wrapper.fused_conv1d_gdn(
+            conv_state=None,
+            recurrent_state=None,
+            state_source=state_source,
+            state_plan=_benchmark_plan(),
+            **_benchmark_common_args(
+                qkv, b, a, conv_weight, conv_bias, a_log, dt_bias))
+        return new_source, output
+
+    return jax.lax.scan(
+        step,
+        pool,
+        xs=None,
+        length=BENCH_ITERATIONS,
+    )
+
+
+def _block_until_ready(tree):
+    return jax.tree.map(lambda x: x.block_until_ready(), tree)
+
+
+def _time_five_steps(run, *args):
+    start = time.perf_counter()
+    result = _block_until_ready(run(*args))
+    elapsed = time.perf_counter() - start
+    return result, elapsed
+
+
+class TestProductionShapeDenseVsUnifiedPool:
+    """Production-shape correctness and performance comparison.
+
+    This reproduces the Qwen3.5-397B GDN geometry used by the end-to-end DP
+    prefill benchmark: 16 KQ heads, 64 V heads, 128-d head dimensions, 4096
+    tokens, a 4352-token unified-pool manager block, and decode_tile_size=4.
+    Dense and pooled modes receive identical activations, weights, and logical
+    initial states. Each mode runs one five-iteration single-JIT warmup,
+    followed by a fresh five-iteration single-JIT timed run.
+
+    Reference TPU observation on 2026-07-28:
+      dense:  1.500 ms/iteration
+      pooled: 3.318 ms/iteration
+      change: +1.818 ms/iteration (2.212x)
+
+    Timing remains diagnostic rather than an assertion because shared TPU load
+    can vary. Outputs from all five iterations and both final states are strict
+    correctness checks; the reference run had zero maximum absolute error.
+    """
+
+    def test_prefill_five_step_correctness_and_timing(self):
+        keys = iter(jax.random.split(jax.random.key(20260728), 10))
+
+        def normal(shape, scale):
+            value = jax.random.normal(
+                next(keys), shape, dtype=jnp.bfloat16)
+            return value * jnp.asarray(scale, dtype=jnp.bfloat16)
+
+        qkv = normal((BENCH_NUM_TOKENS, BENCH_DIM), 0.05)
+        b = normal((BENCH_NUM_TOKENS, BENCH_N_V), 0.05)
+        a = normal((BENCH_NUM_TOKENS, BENCH_N_V), 0.05)
+        conv_weight = normal(
+            (BENCH_DIM, 1, BENCH_KERNEL_SIZE), 0.02)
+        conv_bias = normal((BENCH_DIM, ), 0.01)
+        a_log = normal((BENCH_N_V, ), 0.02).astype(jnp.float32)
+        dt_bias = (
+            normal((BENCH_N_V, ), 0.02).astype(jnp.float32) - 2.0)
+        initial_conv = normal(
+            (1, BENCH_KERNEL_SIZE - 1, BENCH_DIM), 0.01)
+        initial_recurrent = normal(
+            (1, BENCH_N_V, BENCH_D_K, BENCH_D_V),
+            0.01,
+        ).astype(jnp.float32)
+
+        dense_conv = jnp.zeros(
+            (BENCH_NUM_MGR, BENCH_KERNEL_SIZE - 1, BENCH_DIM),
+            dtype=jnp.bfloat16,
+        ).at[1].set(initial_conv[0])
+        dense_recurrent = jnp.zeros(
+            (BENCH_NUM_MGR, BENCH_N_V, BENCH_D_K, BENCH_D_V),
+            dtype=jnp.float32,
+        ).at[1].set(initial_recurrent[0])
+        pool = _benchmark_write_states(
+            jnp.zeros(BENCH_POOL_SHAPE, dtype=jnp.int8),
+            initial_recurrent,
+            initial_conv,
+        )
+
+        shared_args = (
+            qkv, b, a, conv_weight, conv_bias, a_log, dt_bias)
+        _block_until_ready(_benchmark_dense_five(
+            jnp.copy(dense_conv), jnp.copy(dense_recurrent), *shared_args))
+        _block_until_ready(
+            _benchmark_pooled_five(jnp.copy(pool), *shared_args))
+
+        # Fresh, synchronized state keeps copies and initialization out of the
+        # timed region. Each timed call executes five dependent iterations in
+        # one compiled JIT.
+        timed_dense_conv = jnp.copy(dense_conv).block_until_ready()
+        timed_dense_recurrent = (
+            jnp.copy(dense_recurrent).block_until_ready())
+        timed_pool = jnp.copy(pool).block_until_ready()
+        dense_result, dense_elapsed = _time_five_steps(
+            _benchmark_dense_five,
+            timed_dense_conv,
+            timed_dense_recurrent,
+            *shared_args,
+        )
+        pooled_result, pooled_elapsed = _time_five_steps(
+            _benchmark_pooled_five,
+            timed_pool,
+            *shared_args,
+        )
+
+        (dense_final_conv, dense_final_recurrent), dense_outputs = dense_result
+        pooled_final, pooled_outputs = pooled_result
+        pooled_final_conv, pooled_final_recurrent = (
+            _benchmark_read_states(pooled_final))
+        _block_until_ready((pooled_final_conv, pooled_final_recurrent))
+
+        output_tol = dict(rtol=2e-2, atol=2e-2)
+        state_tol = dict(rtol=2e-2, atol=2e-2)
+        assert bool(jnp.allclose(
+            pooled_outputs, dense_outputs, **output_tol))
+        assert bool(jnp.allclose(
+            pooled_final_conv.astype(jnp.float32),
+            dense_final_conv[1:2].astype(jnp.float32),
+            **state_tol,
+        ))
+        assert bool(jnp.allclose(
+            pooled_final_recurrent,
+            dense_final_recurrent[1:2],
+            **state_tol,
+        ))
+
+        output_max_abs = np.asarray(jnp.max(
+            jnp.abs(
+                pooled_outputs.astype(jnp.float32) -
+                dense_outputs.astype(jnp.float32)),
+            axis=(1, 2),
+        ))
+        conv_max_abs = float(jnp.max(jnp.abs(
+            pooled_final_conv.astype(jnp.float32) -
+            dense_final_conv[1:2].astype(jnp.float32))))
+        recurrent_max_abs = float(jnp.max(jnp.abs(
+            pooled_final_recurrent -
+            dense_final_recurrent[1:2])))
+        dense_ms = dense_elapsed * 1e3
+        pooled_ms = pooled_elapsed * 1e3
+        print(
+            "\nGDN dense vs unified-pool "
+            f"({BENCH_NUM_TOKENS} tokens, {BENCH_ITERATIONS} iterations/JIT):"
+        )
+        print(
+            f"  dense:   {dense_ms:.3f} ms total, "
+            f"{dense_ms / BENCH_ITERATIONS:.3f} ms/iteration")
+        print(
+            f"  pooled:  {pooled_ms:.3f} ms total, "
+            f"{pooled_ms / BENCH_ITERATIONS:.3f} ms/iteration")
+        print(f"  pooled/dense: {pooled_elapsed / dense_elapsed:.3f}x")
+        print(f"  output max abs error by iteration: {output_max_abs}")
+        print(f"  final conv max abs error: {conv_max_abs:.6g}")
+        print(f"  final recurrent max abs error: {recurrent_max_abs:.6g}")
