@@ -445,7 +445,7 @@ BENCH_DECODE_TILE_SIZE = 4
 BENCH_KBS, BENCH_LANES = 256, 256
 BENCH_PAYLOAD = (1, 4)
 BENCH_TOK_BYTES = int(
-    np.prod(BENCH_PAYLOAD) * BENCH_LANES * jnp.dtype(jnp.int8).itemsize)
+    np.prod(BENCH_PAYLOAD) * BENCH_LANES * np.dtype(np.int8).itemsize)
 BENCH_SSM_NTOK = (BENCH_N_V * BENCH_D_K * BENCH_D_V * 4 // BENCH_TOK_BYTES)
 BENCH_CONV_TOK0 = BENCH_SSM_NTOK
 BENCH_CONV_NTOK = 128
@@ -456,11 +456,22 @@ BENCH_POOL_SHAPE = (
     BENCH_NUM_MGR * BENCH_SPLIT,
     BENCH_KBS,
 ) + BENCH_PAYLOAD + (BENCH_LANES, )
-BENCH_STATE_IDX = jnp.array([1], dtype=jnp.int32)
-BENCH_QUERY_START_LOC = jnp.array([0, BENCH_NUM_TOKENS], dtype=jnp.int32)
-BENCH_DISTRIBUTION = jnp.array([0, 1, 1], dtype=jnp.int32)
+BENCH_STATE_IDX = np.array([1], dtype=np.int32)
+BENCH_QUERY_START_LOC = np.array([0, BENCH_NUM_TOKENS], dtype=np.int32)
+BENCH_DISTRIBUTION = np.array([0, 1, 1], dtype=np.int32)
 # Greater than the query length so every iteration consumes its input state.
-BENCH_SEQ_LENS = jnp.array([BENCH_NUM_TOKENS + 1], dtype=jnp.int32)
+BENCH_SEQ_LENS = np.array([BENCH_NUM_TOKENS + 1], dtype=np.int32)
+
+
+def test_production_benchmark_metadata_stays_host_resident():
+    """Keep pytest collection from initializing the JAX TPU backend."""
+    metadata = (
+        BENCH_STATE_IDX,
+        BENCH_QUERY_START_LOC,
+        BENCH_DISTRIBUTION,
+        BENCH_SEQ_LENS,
+    )
+    assert all(isinstance(value, np.ndarray) for value in metadata)
 
 
 def _benchmark_write_states(pool, recurrent, conv):
