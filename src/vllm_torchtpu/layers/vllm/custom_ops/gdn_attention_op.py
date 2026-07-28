@@ -126,6 +126,7 @@ def gdn_attention_pooled_core_tpu(
     query_start_loc: jax.Array,
     distribution: jax.Array,
     seq_lens: jax.Array,
+    slot_read_offsets: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -134,6 +135,7 @@ def gdn_attention_pooled_core_tpu(
     d_v: int,
     kernel_size: int,
     pool_block_tokens: int,
+    num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -148,6 +150,7 @@ def gdn_attention_pooled_core_tpu(
         query_start_loc,
         distribution,
         seq_lens,
+        slot_read_offsets,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -155,6 +158,7 @@ def gdn_attention_pooled_core_tpu(
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
         mesh=mesh,
+        num_spec_tokens=num_spec_tokens,
     )
 
 
@@ -487,6 +491,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
+        # Speculative decoding: verify windows run in the GDN kernel's SPEC
+        # mode with one state checkpoint per window position kept inside
+        # the request's state block; rejected drafts are rolled back by
+        # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
+        num_spec_tokens = self.num_spec
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -504,6 +513,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             query_start_loc: jax.Array,
             distribution: jax.Array,
             seq_lens: jax.Array,
+            slot_read_offsets: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             return gdn_attention_pooled_core_tpu(
                 mixed_qkv,
@@ -518,6 +528,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 query_start_loc,
                 distribution,
                 seq_lens,
+                slot_read_offsets,
                 mesh=mesh,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
@@ -531,6 +542,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # models construct GDN layers before the first
                 # full-attention layer would ever see the adjusted value.
                 pool_block_tokens=vllm_config.cache_config.block_size,
+                num_spec_tokens=num_spec_tokens,
             )
 
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
@@ -551,18 +563,26 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         gdn_jax_op.register_fake(_fake_gdn)
 
-        def gdn_impl(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
-                     recurrent_state: torch.Tensor, conv_weight: torch.Tensor,
-                     conv_bias: torch.Tensor | None, A_log: torch.Tensor,
-                     dt_bias: torch.Tensor, state_indices: torch.Tensor,
-                     query_start_loc: torch.Tensor,
-                     request_distribution: torch.Tensor,
-                     seq_lens: torch.Tensor) -> torch.Tensor:
+        def gdn_impl(
+                mixed_qkv: torch.Tensor,
+                b: torch.Tensor,
+                a: torch.Tensor,
+                recurrent_state: torch.Tensor,
+                conv_weight: torch.Tensor,
+                conv_bias: torch.Tensor | None,
+                A_log: torch.Tensor,
+                dt_bias: torch.Tensor,
+                state_indices: torch.Tensor,
+                query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor,
+                seq_lens: torch.Tensor,
+                slot_read_offsets: torch.Tensor | None = None) -> torch.Tensor:
             new_rec, outputs = gdn_jax_op(mixed_qkv, b, a, recurrent_state,
                                           conv_weight, conv_bias, A_log,
                                           dt_bias, state_indices,
                                           query_start_loc,
-                                          request_distribution, seq_lens)
+                                          request_distribution, seq_lens,
+                                          slot_read_offsets)
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)
@@ -778,12 +798,27 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         attn_metadata.request_distribution,
                         attn_metadata.seq_lens)
                 else:
+                    # Speculative decoding: the GDN kernel's windowed segment
+                    # covers both 1-token decodes and speculative verify
+                    # windows (the batch is ordered [decode][verify][prefill]);
+                    # ragged paged attention keeps `request_distribution` with
+                    # its 1-token decode front segment.
+                    request_distribution = attn_metadata.request_distribution
+                    slot_read_offsets = getattr(attn_metadata,
+                                                "mamba_slot_read_offsets", None)
+                    mamba_request_distribution = getattr(
+                        attn_metadata, "mamba_request_distribution", None)
+                    if mamba_request_distribution is not None:
+                        request_distribution = mamba_request_distribution
+                    if self.num_spec > 0:
+                        assert slot_read_offsets is not None, (
+                            "Speculative decoding with GDN layers requires "
+                            "mamba_slot_read_offsets in the attention metadata.")
                     core_attn_out = self.gdn_pooled_op(
                         mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
-                        self.conv1d.bias, self.A_log, self.dt_bias,
-                        state_indices, attn_metadata.query_start_loc,
-                        attn_metadata.request_distribution,
-                        attn_metadata.seq_lens)
+                        self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
+                        attn_metadata.query_start_loc, request_distribution,
+                        attn_metadata.seq_lens, slot_read_offsets)
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError(
                         "GDN op returned an incompatible output shape.")

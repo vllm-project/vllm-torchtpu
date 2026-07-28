@@ -165,6 +165,54 @@ class TestAttentionMetadataBuilderPlumbing:
                                 dtype=torch.int32)
         assert torch.equal(meta.mamba_state_indices, expected)
 
+    def test_unified_spec_stashes_state_indices_for_offset_scatter(self):
+        # With spec decoding the runner seeds unified_mamba_state_indices
+        # with an empty list; each mamba group's builder appends the state
+        # blocks it derived so the post-sampling read-offset scatter can
+        # address them.
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        runner._mamba_align_mode = True
+        builder = self._make_mamba_builder(runner)
+
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 16, 17, 64], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            unified_mamba_state_indices=[],
+        )
+        runner._attn_metadata_builder_ctx = ctx
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert len(ctx.unified_mamba_state_indices) == 1
+        assert ctx.unified_mamba_state_indices[0] is meta.mamba_state_indices
+
+    def test_unified_without_spec_does_not_stash_state_indices(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        runner._mamba_align_mode = True
+        builder = self._make_mamba_builder(runner)
+
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 16, 17, 64], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+
+        builder.build(common_prefix_len=0,
+                      common_attn_metadata=self._make_cm(4))
+
+        assert ctx.unified_mamba_state_indices is None
+
     def test_unified_none_mode_derives_state_indices_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_kv_layout = True

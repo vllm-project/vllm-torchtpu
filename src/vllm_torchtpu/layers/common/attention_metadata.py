@@ -107,6 +107,12 @@ class AttentionMetadataBuilderContext:
     # the same names. Only the mamba group's builder reads them.
     mamba_slot_read_offsets: torch.Tensor | None = None
     mamba_request_distribution: torch.Tensor | None = None
+    # Unified pool + spec decode only: the runner seeds this with an empty
+    # list and each mamba group's builder appends the per-request state
+    # block ids it derived from its block table, so the post-sampling
+    # read-offset scatter can address every group's state block (groups
+    # allocate distinct blocks, unlike the compact pool's shared slots).
+    unified_mamba_state_indices: list[torch.Tensor] | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
 
@@ -200,6 +206,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 dim=1,
                 index=state_block_offsets.unsqueeze(1),
             ).squeeze(1)
+            if ctx.unified_mamba_state_indices is not None:
+                # Spec decode: expose this group's state blocks for the
+                # post-sampling read-offset scatter.
+                ctx.unified_mamba_state_indices.append(mamba_state_indices)
         else:
             mamba_state_indices = None
 

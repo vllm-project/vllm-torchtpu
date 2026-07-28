@@ -1815,3 +1815,97 @@ class TestMambaSlotReadOffsets:
         assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
         # Null slot only ever gets 0; active groups untouched by the tail.
         assert int(runner.mamba_slot_read_offsets[0]) == 0
+
+    def test_unified_per_group_indices_all_scattered(self):
+        """Unified pool: each mamba group has its own state block per
+        request; the same offsets land at every group's blocks."""
+        runner = self._make_runner(num_blocks=16)
+        group0 = torch.tensor([3, 7], dtype=torch.int32)
+        group1 = torch.tensor([11, 5], dtype=torch.int32)
+        next_tokens = torch.tensor([[10, 11, 12],
+                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens,
+                                               2)
+        for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
+            assert int(runner.mamba_slot_read_offsets[block]) == expected
+
+    def test_unified_empty_group_list_is_noop(self):
+        runner = self._make_runner(num_blocks=8)
+        runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
+        assert int(runner.mamba_slot_read_offsets.sum()) == 0
+
+
+class TestUnifiedReadOffsetMigration:
+    """The align-mode seed-copy collector must migrate the per-block read
+    offsets together with the state when a request's state block moves."""
+
+    def _make_runner(self, *, block_table, computed, scheduled, block_size=4):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.cache_config = MagicMock()
+        runner.cache_config.block_size = block_size
+        runner.device = torch.device("cpu")
+        runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
+        runner._mamba_state_pos = {}
+        runner._pool_block_split = 1
+        runner._pending_mamba_state_copies = []
+        raw = torch.zeros(16, 2)
+        runner._mamba_copy_plan = [(0, [raw])]
+        runner.input_batch = MagicMock()
+        req_ids = [f"r{i}" for i in range(len(computed))]
+        runner.input_batch.req_ids = req_ids
+        runner.input_batch.req_id_to_index = {
+            rid: i
+            for i, rid in enumerate(req_ids)
+        }
+        runner.input_batch.num_computed_tokens_cpu = np.array(computed)
+        bt_obj = MagicMock()
+        bt_obj.get_cpu_tensor.return_value = torch.tensor(block_table,
+                                                          dtype=torch.int32)
+        runner.input_batch.block_table = {0: bt_obj}
+        runner._collect_mamba_state_seed_copies = (
+            TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner))
+        scheduler_output = MagicMock()
+        scheduler_output.num_scheduled_tokens = {
+            rid: s
+            for rid, s in zip(req_ids, scheduled)
+        }
+        return runner, scheduler_output
+
+    def test_offsets_follow_state_block_on_crossing(self):
+        # block_size=4: req r0 computed=7 scheduled=2 -> state block moves
+        # from position 1 (block id 5) to position 2 (block id 9).
+        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
+                                                                   0]],
+                                                     computed=[7],
+                                                     scheduled=[2])
+        runner.mamba_slot_read_offsets[5] = 3
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        assert int(runner.mamba_slot_read_offsets[9]) == 3
+        # The state seed copy itself was staged for the same pair.
+        assert len(runner._pending_mamba_state_copies) == 1
+        _, src_t, dst_t = runner._pending_mamba_state_copies[0]
+        assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
+
+    def test_no_crossing_leaves_offsets_alone(self):
+        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
+                                                                   0]],
+                                                     computed=[5],
+                                                     scheduled=[2])
+        runner.mamba_slot_read_offsets[5] = 3
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        assert int(runner.mamba_slot_read_offsets[5]) == 3
+        assert int(runner.mamba_slot_read_offsets[9]) == 0
+        assert not runner._pending_mamba_state_copies
+
+    def test_rollback_crossing_migrates_offsets_backward(self):
+        # A rejected verify window can pull the state position back into the
+        # previous block: prev tracked position 2 (block 9), current step
+        # lands in position 1 (block 5) -> offsets follow backward.
+        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
+                                                                   0]],
+                                                     computed=[6],
+                                                     scheduled=[1])
+        runner._mamba_state_pos["r0"] = 2
+        runner.mamba_slot_read_offsets[9] = 1
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        assert int(runner.mamba_slot_read_offsets[5]) == 1
