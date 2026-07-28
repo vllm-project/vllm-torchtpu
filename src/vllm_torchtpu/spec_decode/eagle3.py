@@ -1182,6 +1182,13 @@ class Eagle3Proposer:
                                     dtype=torch.int32,
                                     device=runner.device)
         uses_aux = self._draft_uses_aux_hidden_state()
+        # Mirror propose()'s branch exactly: only eagle3 runs the plain
+        # hidden state through combine_hidden_states. An MTP draft feeds the
+        # target hidden state straight to the forward and has no
+        # combine_hidden_states at all, so replaying one here would both
+        # crash and add a step the real trace does not have.
+        combines_plain = not uses_aux and (self.speculative_config.method
+                                           == "eagle3")
         if uses_aux:
             aux_width = self._draft_combine_input_size() // 3
             combine_aux = [
@@ -1189,18 +1196,19 @@ class Eagle3Proposer:
                             dtype=dtype,
                             device=runner.device) for _ in range(3)
             ]
-        else:
+        elif combines_plain:
             combine_plain = torch.zeros(
                 (bucket, self._draft_combine_input_size()),
                 dtype=dtype,
                 device=runner.device)
         for _ in range(num_chunks):
             # Mirror the real first pass: combine -> forward @bucket -> lm head.
-            with set_model_tag("eagle_head"):
-                if uses_aux:
-                    self._draft_combine_hidden_states(*combine_aux)
-                else:
-                    self.draft_model.combine_hidden_states(combine_plain)
+            if uses_aux or combines_plain:
+                with set_model_tag("eagle_head"):
+                    if uses_aux:
+                        self._draft_combine_hidden_states(*combine_aux)
+                    else:
+                        self.draft_model.combine_hidden_states(combine_plain)
             last_hidden, _ = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,
