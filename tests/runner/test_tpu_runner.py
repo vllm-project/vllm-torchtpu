@@ -177,11 +177,13 @@ def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
 
 
 class TestInitPhasedProfiling:
-    """Verify _init_phased_profiling reads from additional_config/profiler_config
-    instead of PHASED_PROFILER_* env vars."""
+    """Verify _init_phased_profiling reads the phased profiler's directory
+    from profiler_config, not additional_config."""
 
     def _fake_runner(self,
-                     additional_config,
+                     profiler=None,
+                     torch_profiler_dir="",
+                     additional_config=None,
                      max_iterations=0,
                      delay_iterations=0,
                      profiler_rank=2,
@@ -189,24 +191,37 @@ class TestInitPhasedProfiling:
         # No parallel_config: the phased profiler must not reach for it.
         return SimpleNamespace(
             vllm_config=SimpleNamespace(
-                additional_config=additional_config,
+                additional_config=additional_config
+                if additional_config is not None else {},
                 profiler_config=SimpleNamespace(
+                    profiler=profiler,
+                    torch_profiler_dir=torch_profiler_dir,
                     max_iterations=max_iterations,
                     delay_iterations=delay_iterations)),
             _profiler_rank=profiler_rank,
             _profiler_world_size=profiler_world_size,
         )
 
-    def test_disabled_when_dir_not_set(self):
-        runner = self._fake_runner(additional_config={})
+    def test_disabled_when_profiler_not_set(self):
+        runner = self._fake_runner()
+        TPUModelRunner._init_phased_profiling(runner)
+        assert runner.phased_profiling_dir == ""
+        assert runner.phase_based_profiler is None
+
+    def test_disabled_for_plain_torch_profiler(self):
+        """Both kinds share torch_profiler_dir, so a 'torch' run must not be
+        mistaken for a phased one."""
+        runner = self._fake_runner(profiler="torch",
+                                   torch_profiler_dir="/tmp/torch")
         TPUModelRunner._init_phased_profiling(runner)
         assert runner.phased_profiling_dir == ""
         assert runner.phase_based_profiler is None
 
     def test_enabled_uses_config_values(self):
         runner = self._fake_runner(
+            profiler="torch_phased",
+            torch_profiler_dir="/tmp/phased",
             additional_config={
-                "phased_profiling_dir": "/tmp/phased",
                 "phased_profiler_decode_only_kv_len_threshold": 128,
             },
             max_iterations=20,
@@ -245,7 +260,8 @@ class TestInitPhasedProfiling:
         rank 0, so their traces would collide. The worker passes the
         slice-global rank instead, and it is the only source."""
         runner = self._fake_runner(
-            additional_config={"phased_profiling_dir": "/tmp/phased"},
+            profiler="torch_phased",
+            torch_profiler_dir="/tmp/phased",
             profiler_rank=9,
             profiler_world_size=16,
         )
@@ -259,7 +275,8 @@ class TestInitPhasedProfiling:
 
     def test_falls_back_to_default_num_steps_when_max_iterations_unset(self):
         runner = self._fake_runner(
-            additional_config={"phased_profiling_dir": "/tmp/phased"},
+            profiler="torch_phased",
+            torch_profiler_dir="/tmp/phased",
             max_iterations=0,
             delay_iterations=0,
         )

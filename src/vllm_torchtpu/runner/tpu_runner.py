@@ -559,13 +559,15 @@ class TPUModelRunner(GPUModelRunner):
 
     def _init_phased_profiling(self) -> None:
         """Initializes the phase-based profiler if configured via
-        additional_config['phased_profiling_dir']."""
-        additional_config = self.vllm_config.additional_config
-        self.phased_profiling_dir = additional_config.get(
-            runner_utils.PHASED_PROFILING_DIR_KEY, "")
+        profiler_config.profiler='torch_phased'."""
+        profiler_config = self.vllm_config.profiler_config
+        # torch_profiler_dir is shared with the 'torch' profiler, so the kind
+        # is what distinguishes a phased run from a standard one.
+        self.phased_profiling_dir = (
+            profiler_config.torch_profiler_dir if profiler_config.profiler
+            == runner_utils.TORCH_PHASED_PROFILER_KIND else "")
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
-            profiler_config = self.vllm_config.profiler_config
             # Deliberately not read from parallel_config: its rank is
             # TPxPP-scoped, so every DP replica would call itself rank 0 and
             # their traces would overwrite each other on merge. The worker
@@ -573,7 +575,8 @@ class TPUModelRunner(GPUModelRunner):
             # passes it in.
             global_rank = self._profiler_rank
             world_size = self._profiler_world_size
-            decode_kv_len_threshold = additional_config.get(
+            # No profiler_config equivalent, so this one stays plugin-owned.
+            decode_kv_len_threshold = self.vllm_config.additional_config.get(
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
             self.phase_based_profiler = runner_utils.PhaseBasedProfiler(

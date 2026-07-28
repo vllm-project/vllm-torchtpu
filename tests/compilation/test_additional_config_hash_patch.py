@@ -15,8 +15,8 @@
 
 ``VllmConfig.compute_hash()`` folds the whole ``additional_config`` dict in,
 and that hash feeds both the AOT compile cache key and the piecewise cache dir.
-The phased profiler is configured through ``additional_config`` with a per-run
-trace directory, which would otherwise force a full recompile on every start.
+The phased profiler's remaining ``additional_config`` knob only steers
+profiling, so letting it into the hash would force needless recompiles.
 """
 
 from types import SimpleNamespace
@@ -27,7 +27,7 @@ from vllm.config import VllmConfig
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
 from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
-    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY, PHASED_PROFILING_DIR_KEY)
+    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY)
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
@@ -92,23 +92,20 @@ def patched_compute_hash(apply_patch_over):
     return apply_patch_over(_upstream_compute_hash())
 
 
-def test_unpatched_hash_changes_with_the_profile_dir():
+def test_unpatched_hash_changes_with_the_threshold():
     """Guards the premise: without the carve-out this busts the cache."""
     assert (_upstream_compute_hash()(_StubVllmConfig(
-        {PHASED_PROFILING_DIR_KEY: "/tmp/profile_0723"}))
+        {PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY: 128}))
             != _upstream_compute_hash()(_StubVllmConfig(
-                {PHASED_PROFILING_DIR_KEY: "/tmp/profile_0724"})))
+                {PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY: 256})))
 
 
-def test_profile_dir_no_longer_changes_the_hash(patched_compute_hash):
-    """The PR's own usage example: a dated dir must not force a recompile."""
-    assert (patched_compute_hash(
-        _StubVllmConfig({PHASED_PROFILING_DIR_KEY:
-                         "/tmp/profile_0723"})) == patched_compute_hash(
-                             _StubVllmConfig({
-                                 PHASED_PROFILING_DIR_KEY:
-                                 "/tmp/profile_0724"
-                             })))
+def test_threshold_no_longer_changes_the_hash(patched_compute_hash):
+    """Retuning a profiling threshold must not force a recompile."""
+    key = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
+
+    assert (patched_compute_hash(_StubVllmConfig(
+        {key: 128})) == patched_compute_hash(_StubVllmConfig({key: 256})))
 
 
 def test_enabling_phased_profiling_reuses_the_unprofiled_cache(
@@ -117,7 +114,6 @@ def test_enabling_phased_profiling_reuses_the_unprofiled_cache(
 
     assert patched_compute_hash(
         _StubVllmConfig({
-            PHASED_PROFILING_DIR_KEY: "/tmp/phased",
             PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY: 128,
         })) == baseline
 
@@ -127,11 +123,13 @@ def test_non_diagnostic_keys_still_change_the_hash(patched_compute_hash):
     assert (patched_compute_hash(
         _StubVllmConfig({
             "some_plugin_knob": 1,
-            PHASED_PROFILING_DIR_KEY: "/tmp/phased",
+            PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY: 128,
         })) != patched_compute_hash(
             _StubVllmConfig({
-                "some_plugin_knob": 2,
-                PHASED_PROFILING_DIR_KEY: "/tmp/phased",
+                "some_plugin_knob":
+                2,
+                PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY:
+                128,
             })))
 
 
@@ -142,7 +140,7 @@ def test_untouched_configs_keep_their_upstream_hash(patched_compute_hash):
 
 
 def test_additional_config_is_restored_after_hashing(patched_compute_hash):
-    additional_config = {PHASED_PROFILING_DIR_KEY: "/tmp/phased"}
+    additional_config = {PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY: 128}
     config = _StubVllmConfig(additional_config)
 
     patched_compute_hash(config)
@@ -156,7 +154,7 @@ def test_additional_config_is_restored_when_hashing_raises(apply_patch_over):
         raise RuntimeError("boom")
 
     compute_hash = apply_patch_over(exploding_compute_hash)
-    additional_config = {PHASED_PROFILING_DIR_KEY: "/tmp/phased"}
+    additional_config = {PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY: 128}
     config = _StubVllmConfig(additional_config)
 
     with pytest.raises(RuntimeError):
@@ -182,6 +180,5 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
     assert HASH_IGNORED_ADDITIONAL_CONFIG_KEYS == {
-        PHASED_PROFILING_DIR_KEY,
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     }

@@ -24,8 +24,20 @@ PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
 
-# `additional_config` keys that configure phased profiling.
-PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
+# `profiler_config.profiler` value that selects phased profiling, registered
+# on vLLM's ProfilerConfig by `_patch_vllm_profiler_kind_torch_phased`. The
+# trace directory comes from `profiler_config.torch_profiler_dir`.
+TORCH_PHASED_PROFILER_KIND = "torch_phased"
+
+# Kinds that record through the torch profiler and therefore share
+# `torch_profiler_dir`.
+TORCH_PROFILER_KINDS = ("torch", TORCH_PHASED_PROFILER_KIND)
+
+# Superseded by `profiler_config`; rejected at startup in tpu_platform.
+LEGACY_PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
+
+# Tuning knob with no `profiler_config` equivalent, so it stays in
+# `additional_config`.
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_decode_only_kv_len_threshold")
 
@@ -33,7 +45,6 @@ PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
 # graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
 # TPU compile cache key. Keep this in sync with the keys read above.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
-    PHASED_PROFILING_DIR_KEY,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
 })
 

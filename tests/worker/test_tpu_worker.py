@@ -48,15 +48,16 @@ def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(
     assert os.environ["WORLD_SIZE"] == "8"
 
 
-def _make_vllm_config(profiler_torch_dir=None, phased_profiling_dir=""):
+def _make_vllm_config(profiler_torch_dir=None, profiler="torch"):
     """Build a minimal mock VllmConfig for TPUWorker.__init__."""
     cfg = MagicMock()
     cfg.model_config.dtype = torch.bfloat16
     cfg.cache_config.cache_dtype = "auto"
     cfg.parallel_config.pipeline_parallel_size = 1
     cfg.compilation_config.compile_ranges_endpoints = []
+    cfg.profiler_config.profiler = profiler
     cfg.profiler_config.torch_profiler_dir = profiler_torch_dir
-    cfg.additional_config = {"phased_profiling_dir": phased_profiling_dir}
+    cfg.additional_config = {}
     return cfg
 
 
@@ -113,11 +114,10 @@ class TestProfilerDir:
         assert worker.profile_dir is None
 
     def test_phased_profiling_disables_manual_profiler(self):
-        """additional_config['phased_profiling_dir'] takes precedence over
-        profiler_config.torch_profiler_dir to avoid conflicting profiler
-        contexts."""
-        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir",
-                                phased_profiling_dir="/phased/profiler/dir")
+        """A phased run shares torch_profiler_dir but is driven by the model
+        runner, so the worker must not open a second profiler context."""
+        cfg = _make_vllm_config(profiler_torch_dir="/phased/profiler/dir",
+                                profiler="torch_phased")
         worker = _build_worker(cfg)
         assert worker.profile_dir is None
 

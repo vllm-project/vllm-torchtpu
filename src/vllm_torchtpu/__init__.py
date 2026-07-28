@@ -82,6 +82,94 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS))
 
 
+def _patch_vllm_profiler_kind_torch_phased() -> None:
+    """Teach vLLM's ``ProfilerConfig`` a 'torch_phased' profiler kind.
+
+    Captures one trace per inference phase rather than one continuous trace.
+    This is a vllm-torchtpu-only profiler, so vLLM's ``profiler`` field is a
+    closed ``Literal["torch", "cuda"]`` that rejects it.
+
+    pydantic v2 compiles ``Literal`` fields and ``@model_validator``s into a
+    cached core schema at class-definition time, so widening the type hint
+    alone does nothing -- the field's annotation and the validator both need
+    patching in the caches pydantic actually reads from, followed by a
+    forced schema rebuild. The patch is purely additive: existing
+    ``torch``/``cuda`` validation is preserved by delegating to the original
+    validator.
+    """
+    from typing import Literal, Optional
+
+    import vllm.config.profiler as profiler_module
+    from pydantic.dataclasses import rebuild_dataclass
+    from vllm.config.profiler import ProfilerConfig
+
+    from vllm_torchtpu.runner.utils import (TORCH_PHASED_PROFILER_KIND,
+                                            TORCH_PROFILER_KINDS)
+
+    if getattr(ProfilerConfig, "_tpu_torch_phased_profiler_kind_patch", False):
+        return
+
+    original_validate = ProfilerConfig._validate_profiler_config
+    widened_kind = Literal["torch", "cuda", TORCH_PHASED_PROFILER_KIND]
+    widened_annotation = Optional[widened_kind]
+
+    def validate(self):
+        profiler_dir = self.torch_profiler_dir
+        if profiler_dir and self.profiler not in TORCH_PROFILER_KINDS:
+            raise ValueError(
+                "torch_profiler_dir is only applicable when profiler is set "
+                f"to one of {TORCH_PROFILER_KINDS}")
+        if self.profiler in TORCH_PROFILER_KINDS and not profiler_dir:
+            raise ValueError("torch_profiler_dir must be set when profiler "
+                             f"is {self.profiler!r}")
+
+        # Delegate everything else (dir abspath/URI handling, ...) to the
+        # original validator by presenting a kind it already accepts.
+        # ignore_frontend rides along because AsyncLLM starts its frontend CPU
+        # profiler only for `profiler == "torch"` (v1/engine/async_llm.py), so
+        # a phased run genuinely has no frontend to profile -- without this the
+        # original validator warns about frontend overhead that cannot occur.
+        real_kind = self.profiler
+        real_ignore_frontend = self.ignore_frontend
+        try:
+            if real_kind == TORCH_PHASED_PROFILER_KIND:
+                self.profiler = "torch"
+                self.ignore_frontend = True
+            return original_validate(self)
+        finally:
+            if real_kind == TORCH_PHASED_PROFILER_KIND:
+                self.profiler = real_kind
+                self.ignore_frontend = real_ignore_frontend
+
+    try:
+        profiler_module.ProfilerKind = widened_kind
+        ProfilerConfig.__pydantic_fields__["profiler"].annotation = (
+            widened_annotation)
+        ProfilerConfig.__annotations__["profiler"] = widened_annotation
+        ProfilerConfig.__dataclass_fields__["profiler"].type = (
+            widened_annotation)
+
+        ProfilerConfig._validate_profiler_config = validate
+        # rebuild_dataclass() rebuilds field schemas but does not re-collect
+        # @model_validator decorators, so the cached Decorator.func the
+        # validator actually runs from must be reassigned directly.
+        ProfilerConfig.__pydantic_decorators__.model_validators[
+            "_validate_profiler_config"].func = validate
+        rebuild_dataclass(ProfilerConfig, force=True)
+    except (AttributeError, KeyError) as e:
+        raise RuntimeError(
+            "Failed to patch vllm.config.profiler.ProfilerConfig to accept "
+            f"{TORCH_PHASED_PROFILER_KIND!r}. This patch pokes at pydantic "
+            "internals (__pydantic_fields__, __dataclass_fields__, "
+            "__pydantic_decorators__) that a vLLM/pydantic version bump may "
+            "have reshaped; see "
+            "_patch_vllm_profiler_kind_torch_phased's docstring.") from e
+
+    ProfilerConfig._tpu_torch_phased_profiler_kind_patch = True
+    logger.info("Applied TPU patch: ProfilerConfig accepts profiler=%r.",
+                TORCH_PHASED_PROFILER_KIND)
+
+
 def _patch_vllm_tpu_group_custom_ops() -> None:
     """Disable vLLM custom collective ops for TPU in this TorchTPU integration.
 
