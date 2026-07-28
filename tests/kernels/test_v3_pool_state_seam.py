@@ -624,8 +624,8 @@ class TestProductionShapeDenseVsUnifiedPool:
     followed by a fresh five-iteration single-JIT timed run.
 
     Reference TPU observation on 2026-07-28:
-      dense:  1.503 ms/iteration
-      pooled: 1.495 ms/iteration
+      dense:  1.500 ms/iteration
+      pooled: 1.492 ms/iteration
       change: -0.008 ms/iteration (0.995x)
 
     Timing remains diagnostic rather than an assertion because shared TPU load

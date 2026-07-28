@@ -114,12 +114,19 @@ class TestVllmGatedDeltaNetAttention:
                          match="VLLM_SSM_CONV_STATE_LAYOUT=SD"):
             attn.get_kv_cache_spec(_vllm_config(pcp_size=8))
 
-    def test_init_builds_only_regular_gdn_op_without_pcp(self):
+    @pytest.mark.parametrize("use_unified_pool", (False, True))
+    def test_init_builds_one_storage_specific_gdn_op_without_pcp(
+            self, use_unified_pool):
         regular_op = MagicMock()
         pooled_op = MagicMock()
 
         with set_vllm_model_wrapper_context(mesh=_mesh(),
                                             vllm_config=_vllm_config()), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "unified_kv_layout_enabled",
+                 return_value=use_unified_pool,
+             ), \
              patch(
                  "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
                  "QwenGatedDeltaNetAttention.__init__",
@@ -133,14 +140,19 @@ class TestVllmGatedDeltaNetAttention:
                           return_value=pooled_op) as mock_build_pooled:
             attn = VllmGatedDeltaNetAttention()
 
-        mock_build.assert_called_once_with()
-        mock_build_pooled.assert_called_once_with()
-        assert attn.gdn_op is regular_op
-        assert attn.gdn_pooled_op is pooled_op
+        if use_unified_pool:
+            mock_build.assert_not_called()
+            mock_build_pooled.assert_called_once_with()
+            assert attn.gdn_op is pooled_op
+        else:
+            mock_build.assert_called_once_with()
+            mock_build_pooled.assert_not_called()
+            assert attn.gdn_op is regular_op
         assert attn.gdn_pcp_op is None
-        assert attn.gdn_pooled_pcp_op is None
 
-    def test_init_builds_pcp_gdn_op_when_pcp_enabled(self):
+    @pytest.mark.parametrize("use_unified_pool", (False, True))
+    def test_init_builds_two_storage_specific_ops_when_pcp_enabled(
+            self, use_unified_pool):
         regular_op = MagicMock()
         pooled_op = MagicMock()
         pcp_op = MagicMock()
@@ -149,6 +161,11 @@ class TestVllmGatedDeltaNetAttention:
         with set_vllm_model_wrapper_context(mesh=_mesh(),
                                             vllm_config=_vllm_config(
                                                 pcp_size=8)), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "unified_kv_layout_enabled",
+                 return_value=use_unified_pool,
+             ), \
              patch(
                  "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
                  "QwenGatedDeltaNetAttention.__init__",
@@ -163,15 +180,17 @@ class TestVllmGatedDeltaNetAttention:
                           ) as mock_build_pooled:
             attn = VllmGatedDeltaNetAttention()
 
-        assert mock_build.call_args_list == [call(), call(pcp_streaming=True)]
-        assert mock_build_pooled.call_args_list == [
-            call(),
-            call(pcp_streaming=True)
-        ]
-        assert attn.gdn_op is regular_op
-        assert attn.gdn_pooled_op is pooled_op
-        assert attn.gdn_pcp_op is pcp_op
-        assert attn.gdn_pooled_pcp_op is pooled_pcp_op
+        expected_calls = [call(), call(pcp_streaming=True)]
+        if use_unified_pool:
+            mock_build.assert_not_called()
+            assert mock_build_pooled.call_args_list == expected_calls
+            assert attn.gdn_op is pooled_op
+            assert attn.gdn_pcp_op is pooled_pcp_op
+        else:
+            assert mock_build.call_args_list == expected_calls
+            mock_build_pooled.assert_not_called()
+            assert attn.gdn_op is regular_op
+            assert attn.gdn_pcp_op is pcp_op
 
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
         attn0 = _qwen35_397b_gdn_attn(
@@ -660,8 +679,8 @@ class TestVllmGatedDeltaNetAttention:
         attn.dt_bias = torch.randn(1)
         state_pool = torch.ones(1)
         attn.kv_cache = (state_pool, )
-        attn.gdn_pooled_op = MagicMock()
-        attn.gdn_pooled_pcp_op = MagicMock()
+        attn.gdn_op = MagicMock()
+        attn.gdn_pcp_op = MagicMock()
 
         attn.in_proj_qkv = MagicMock()
         attn.in_proj_z = MagicMock()
@@ -687,7 +706,7 @@ class TestVllmGatedDeltaNetAttention:
             torch.full((64, ), 12.0),
             torch.full((64, ), 13.0),
         ])
-        attn.gdn_pooled_pcp_op.return_value = native_output
+        attn.gdn_pcp_op.return_value = native_output
 
         mock_fc = MagicMock()
         mock_attn_metadata = MagicMock()
@@ -709,9 +728,9 @@ class TestVllmGatedDeltaNetAttention:
                 vllm_config=_vllm_config(pcp_size=2, interleave_size=1)):
             attn.forward(hidden_states, output)
 
-        attn.gdn_pooled_op.assert_not_called()
-        attn.gdn_pooled_pcp_op.assert_called_once()
-        core_args = attn.gdn_pooled_pcp_op.call_args[0]
+        attn.gdn_op.assert_not_called()
+        attn.gdn_pcp_op.assert_called_once()
+        core_args = attn.gdn_pcp_op.call_args[0]
         assert core_args[0] is mixed_local
         assert torch.equal(core_args[1], b_local)
         assert torch.equal(core_args[2], a_local)

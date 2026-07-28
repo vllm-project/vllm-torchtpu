@@ -48,6 +48,7 @@ from vllm_torchtpu.layers.common.sequence_layout import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 
 
 def gdn_attention_core_tpu(
@@ -318,11 +319,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         self.kv_cache = None
-        self.gdn_op = self._build_gdn_op()
-        self.gdn_pooled_op = self._build_pooled_gdn_op()
-        self.gdn_pcp_op = (self._build_gdn_op(
-            pcp_streaming=True) if self._pcp_streaming_enabled() else None)
-        self.gdn_pooled_pcp_op = (self._build_pooled_gdn_op(
+        vllm_config = get_vllm_model_wrapper_context().vllm_config
+        build_gdn_op = (self._build_pooled_gdn_op
+                        if unified_kv_layout_enabled(vllm_config) else
+                        self._build_gdn_op)
+        self.gdn_op = build_gdn_op()
+        self.gdn_pcp_op = (build_gdn_op(
             pcp_streaming=True) if self._pcp_streaming_enabled() else None)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
@@ -671,6 +673,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             attn_metadata = fc.attn_metadata[self.prefix]
             use_pcp_streaming = is_pcp_streaming_attention_metadata(
                 attn_metadata)
+            gdn_op = self.gdn_pcp_op if use_pcp_streaming else self.gdn_op
+            if gdn_op is None:
+                raise RuntimeError(
+                    "GDN PCP prefill op was not initialized during model "
+                    "loading.")
 
             if len(kv_cache) == 1:
                 # Unified block pool: the attention-shaped pool carries the
@@ -680,14 +687,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 assert attn_metadata.mamba_state_indices is not None
                 state_indices = attn_metadata.mamba_state_indices.to(
                     torch.int32)
-                pooled_op = self.gdn_pooled_op
-                if use_pcp_streaming:
-                    pooled_op = self.gdn_pooled_pcp_op
-                    if pooled_op is None:
-                        raise RuntimeError(
-                            "GDN pooled PCP prefill op was not initialized "
-                            "during model loading.")
-                core_attn_out = pooled_op(
+                core_attn_out = gdn_op(
                     mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
                     self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
                     attn_metadata.query_start_loc,
@@ -733,19 +733,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
                 # Execute the TorchTPU custom op
                 if not use_pcp_streaming:
-                    core_attn_out = self.gdn_op(
+                    core_attn_out = gdn_op(
                         mixed_qkv, b, a, conv_state, recurrent_state,
                         self.conv1d.weight, self.conv1d.bias, self.A_log,
                         self.dt_bias, state_indices,
                         attn_metadata.query_start_loc, request_distribution,
                         attn_metadata.seq_lens, slot_read_offsets)
                 else:
-                    gdn_pcp_op = self.gdn_pcp_op
-                    if gdn_pcp_op is None:
-                        raise RuntimeError(
-                            "GDN PCP prefill op was not initialized during model "
-                            "loading.")
-                    core_attn_out = gdn_pcp_op(
+                    core_attn_out = gdn_op(
                         mixed_qkv, b, a, conv_state, recurrent_state,
                         self.conv1d.weight, self.conv1d.bias, self.A_log,
                         self.dt_bias, state_indices,
