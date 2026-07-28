@@ -412,7 +412,6 @@ configure_role_environment() {
   export PJRT_DEVICE=TPU
   export TPU_BACKEND_TYPE=jax
   export VLLM_TARGET_DEVICE=tpu
-  export MODEL_IMPL_TYPE=vllm
   export NEW_MODEL_DESIGN=0
   export SKIP_JAX_PRECOMPILE=1
   export VLLM_XLA_CHECK_RECOMPILATION=0

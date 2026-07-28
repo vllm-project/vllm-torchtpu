@@ -173,7 +173,6 @@ def test_eagle3_correctness_greedy(
     async_scheduling: bool,
 ):
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
-    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
 
     _test_correctness_helper(
         monkeypatch,
@@ -286,8 +285,6 @@ def test_eagle3_performance(
     temperature: float,
     min_acceptance_rate: float,
 ):
-    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
-
     _test_performance_helper(
         monkeypatch,
         _make_sampling_config(temperature),
@@ -430,7 +427,6 @@ def test_eagle3_correctness_greedy_multi_chunk(
         "draft_tensor_parallel_size": 1,
     }
     with monkeypatch.context() as mp:
-        mp.setenv("MODEL_IMPL_TYPE", "vllm")
         # collective_rpc ships a Python function to the TPU workers, which
         # needs pickle fallback in vLLM's IPC encoder.
         mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -504,8 +500,7 @@ def test_eagle3_sharded_draft(
     """
     tp = _get_tensor_parallel_size()
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
-    with monkeypatch.context() as mp:
-        mp.setenv("MODEL_IMPL_TYPE", "vllm")
+    with monkeypatch.context():
 
         test_prompts = get_eagle3_test_prompts()
         kwargs = dict(

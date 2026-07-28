@@ -79,7 +79,6 @@ MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
 # Increase API-server frontend wait time since cold init may take long.
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
-export MODEL_IMPL_TYPE=vllm
 export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768

@@ -14,7 +14,6 @@ git config --global --add safe.directory "$REPO_DIR"
 
 # Dependencies are installed in the workflow file (.github/workflows/tests.yml)
 
-export MODEL_IMPL_TYPE="vllm"
 TEST_DIR="$REPO_DIR/tests"
 
 # Run tests from a temp dir to force Python to test the installed package

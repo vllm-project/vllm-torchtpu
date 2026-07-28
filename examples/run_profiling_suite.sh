@@ -119,7 +119,7 @@ for experiment in "${EXPERIMENTS[@]}"; do
     # shellcheck disable=SC2206
     [[ -n "$extra_args" ]] && cmd+=($extra_args)
 
-    if env MODEL_IMPL_TYPE="vllm" "${cmd[@]}"; then
+    if "${cmd[@]}"; then
         echo -e "${GREEN}[SUCCESS] Experiment completed.${NC}"
     else
         echo -e "${RED}[FAILURE] Experiment failed!${NC}"

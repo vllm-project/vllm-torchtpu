@@ -22,7 +22,6 @@ steps:
         agents:
           queue: "tpu_v7x_8_queue"
         env:
-          MODEL_IMPL_TYPE: "vllm"
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
           RUN_ROOT: "/perf_eval_results/qwen35_p4d2_disagg_ci"
         commands:

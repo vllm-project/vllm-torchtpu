@@ -186,7 +186,6 @@ start_vllm_server() {
     fi
 
     export PYTHONUNBUFFERED=1
-    export MODEL_IMPL_TYPE=vllm
 
     if [ -n "$PROFILE_DIR" ]; then
         # The --profiler-config flags gate vllm's /start_profile endpoint

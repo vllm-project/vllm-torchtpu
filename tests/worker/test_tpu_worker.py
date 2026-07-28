@@ -61,13 +61,13 @@ def _make_vllm_config(profiler_torch_dir=None, phased_profiling_dir=""):
 
 def _build_worker(vllm_config, rank=0):
     """Construct a TPUWorker with heavy side-effects mocked out."""
-    with patch(
-            "vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches"), patch(
-                "vllm_torchtpu.worker.tpu_worker.envs") as mock_envs, patch(
-                    "vllm_torchtpu.worker.tpu_worker.WorkerBase.__init__",
-                    return_value=None,
-                ):
-        mock_envs.MODEL_IMPL_TYPE = "vllm"
+    with (
+            patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches"),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.WorkerBase.__init__",
+                return_value=None,
+            ),
+    ):
 
         worker = TPUWorker.__new__(TPUWorker)
         # Set attributes that WorkerBase.__init__ would normally set.

@@ -279,8 +279,6 @@ def main():
 
         # ExtraArgs construction
         extra_args_parts = []
-        model_impl = os.getenv("MODEL_IMPL_TYPE", "vllm")
-        extra_args_parts.append(f"MODEL_IMPL_TYPE={model_impl}")
         if config.get("enable_ep"):
             extra_args_parts.append("enable_ep")
         if config.get("quantization"):

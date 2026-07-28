@@ -128,10 +128,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Check for XLA recompilation during execution
     "VLLM_XLA_CHECK_RECOMPILATION":
     lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION") or "0")),
-    # Model implementation type (e.g., "flax_nnx")
-    "MODEL_IMPL_TYPE":
-    env_with_choices("MODEL_IMPL_TYPE", "vllm",
-                     ["vllm", "flax_nnx", "jetpack"]),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL":
     lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),

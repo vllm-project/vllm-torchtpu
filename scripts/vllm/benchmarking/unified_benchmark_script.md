@@ -6,7 +6,6 @@ Use one terminal for the server and another for the benchmark client.
 ## Server
 
 ```bash
-export MODEL_IMPL_TYPE=vllm
 export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
 
 vllm serve --model=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \

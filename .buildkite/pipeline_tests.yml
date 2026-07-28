@@ -13,8 +13,6 @@
 # limitations under the License.
 
 x-unit-test-defaults: &unit_test_defaults
-  env:
-    MODEL_IMPL_TYPE: "vllm"
   commands:
     - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
 
