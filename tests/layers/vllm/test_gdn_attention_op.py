@@ -21,10 +21,12 @@ from jax.sharding import PartitionSpec
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
-    VllmGatedDeltaNetAttention
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    set_vllm_model_wrapper_context
+from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
+    VllmGatedDeltaNetAttention,
+)
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
 
 
 def _mesh():
@@ -42,6 +44,7 @@ def _vllm_config(*,
             data_parallel_size=1,
         ),
         cache_config=SimpleNamespace(
+            block_size=4096,
             mamba_block_size=4096,
             mamba_page_size_padded=mamba_page_size_padded,
             mamba_cache_mode=None,
@@ -135,11 +138,13 @@ class TestVllmGatedDeltaNetAttention:
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
         assert attn.gdn_pcp_op is None
+        assert attn.gdn_pooled_pcp_op is None
 
     def test_init_builds_pcp_gdn_op_when_pcp_enabled(self):
         regular_op = MagicMock()
         pooled_op = MagicMock()
         pcp_op = MagicMock()
+        pooled_pcp_op = MagicMock()
 
         with set_vllm_model_wrapper_context(mesh=_mesh(),
                                             vllm_config=_vllm_config(
@@ -154,14 +159,19 @@ class TestVllmGatedDeltaNetAttention:
                           side_effect=[regular_op, pcp_op]) as mock_build, \
              patch.object(VllmGatedDeltaNetAttention,
                           "_build_pooled_gdn_op",
-                          return_value=pooled_op) as mock_build_pooled:
+                          side_effect=[pooled_op, pooled_pcp_op]
+                          ) as mock_build_pooled:
             attn = VllmGatedDeltaNetAttention()
 
         assert mock_build.call_args_list == [call(), call(pcp_streaming=True)]
-        mock_build_pooled.assert_called_once_with()
+        assert mock_build_pooled.call_args_list == [
+            call(),
+            call(pcp_streaming=True)
+        ]
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
         assert attn.gdn_pcp_op is pcp_op
+        assert attn.gdn_pooled_pcp_op is pooled_pcp_op
 
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
         attn0 = _qwen35_397b_gdn_attn(
@@ -236,6 +246,44 @@ class TestVllmGatedDeltaNetAttention:
                 PartitionSpec(None, "pcp", None, None),
             )
         assert fake_jax_op.register_fake.call_count == 2
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=8)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_build_pooled_gdn_op_supports_pcp(self, mock_get_pcp_mesh,
+                                              _mock_get_pcp_world_size):
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        fake_jax_op = MagicMock()
+        pcp_mesh = SimpleNamespace(shape={"pcp": 8})
+        mock_get_pcp_mesh.return_value = pcp_mesh
+
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(),
+                vllm_config=_vllm_config(pcp_size=8)), patch(
+                    "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                    "pcp_streaming_jax_op",
+                    return_value=fake_jax_op,
+                ) as mock_pcp_jax_op:
+            attn._build_pooled_gdn_op(pcp_streaming=True)
+
+        mock_pcp_jax_op.assert_called_once()
+        call_args = mock_pcp_jax_op.call_args
+        assert call_args.args[0] == (
+            "pallas::gdn_attention_pooled_pcp_"
+            "language_model_model_layers_0_linear_attn")
+        assert call_args.kwargs["mesh"] is pcp_mesh
+        assert call_args.kwargs["donate_argnums"] == (3, )
+        assert call_args.kwargs["input_partition_specs"][3] == PartitionSpec(
+            "pcp")
+        assert call_args.kwargs["output_partition_specs"] == (
+            PartitionSpec("pcp"),
+            PartitionSpec("pcp"),
+        )
+        fake_jax_op.register_fake.assert_called_once()
 
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
@@ -582,6 +630,97 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[11] is mock_attn_metadata.request_distribution
         assert core_args[12] is mock_attn_metadata.seq_lens
         assert len(core_args) == 13
+        expected_local = torch.stack(
+            [torch.full((4, 16), 12.0),
+             torch.full((4, 16), 13.0)])
+        assert torch.equal(attn.norm.call_args[0][0], expected_local)
+        assert torch.all(output[:num_tokens] == 5)
+        assert torch.all(output[num_tokens:] == 0)
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+    )
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_rank",
+        return_value=1)
+    def test_forward_uses_pooled_gdn_pcp_op_for_unified_pool(
+            self, _mock_rank, mock_get_forward_context):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
+        attn.head_v_dim = 16
+        attn.num_v_heads = 4
+        attn.tp_size = 1
+        attn.prefix = "test_layer"
+        attn.gqa_interleaved_layout = True
+
+        attn.conv1d = MagicMock()
+        attn.conv1d.weight = torch.randn(1)
+        attn.conv1d.bias = torch.randn(1)
+        attn.A_log = torch.randn(1)
+        attn.dt_bias = torch.randn(1)
+        state_pool = torch.ones(1)
+        attn.kv_cache = (state_pool, )
+        attn.gdn_pooled_op = MagicMock()
+        attn.gdn_pooled_pcp_op = MagicMock()
+
+        attn.in_proj_qkv = MagicMock()
+        attn.in_proj_z = MagicMock()
+        attn.in_proj_ba = MagicMock()
+        attn.norm = MagicMock()
+        attn.out_proj = MagicMock()
+
+        num_tokens = 2
+        hidden_states = torch.randn(num_tokens, 64)
+        output = torch.zeros(5, 64)
+        mixed_local = torch.full((num_tokens, 96), -1.0)
+        b_local = torch.full((num_tokens, 16), -2.0)
+        a_local = torch.full((num_tokens, 16), -3.0)
+        attn.in_proj_qkv.return_value = (mixed_local, None)
+        attn.in_proj_z.return_value = (torch.randn(num_tokens, 64), None)
+        attn.in_proj_ba.return_value = (torch.cat((b_local, a_local),
+                                                  dim=-1), None)
+        attn.norm.side_effect = lambda core, _z: core
+        attn.out_proj.return_value = (torch.ones(num_tokens, 64) * 5, None)
+        native_output = torch.stack([
+            torch.full((64, ), 10.0),
+            torch.full((64, ), 11.0),
+            torch.full((64, ), 12.0),
+            torch.full((64, ), 13.0),
+        ])
+        attn.gdn_pooled_pcp_op.return_value = native_output
+
+        mock_fc = MagicMock()
+        mock_attn_metadata = MagicMock()
+        mock_attn_metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
+        mock_attn_metadata.mamba_state_indices = torch.tensor(
+            [3], dtype=torch.int32)
+        mock_attn_metadata.sequence_layout_kind = (
+            SequenceLayoutKind.PARTIAL.value)
+        mock_attn_metadata.sequence_layout_protocol = "pcp_streaming"
+        mock_attn_metadata.query_start_loc = torch.tensor([0, 4],
+                                                          dtype=torch.int32)
+        mock_attn_metadata.request_distribution = torch.tensor(
+            [0, 1, 1], dtype=torch.int32)
+        mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
+        mock_get_forward_context.return_value = mock_fc
+
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(),
+                vllm_config=_vllm_config(pcp_size=2, interleave_size=1)):
+            attn.forward(hidden_states, output)
+
+        attn.gdn_pooled_op.assert_not_called()
+        attn.gdn_pooled_pcp_op.assert_called_once()
+        core_args = attn.gdn_pooled_pcp_op.call_args[0]
+        assert core_args[0] is mixed_local
+        assert torch.equal(core_args[1], b_local)
+        assert torch.equal(core_args[2], a_local)
+        assert core_args[3] is state_pool
+        assert core_args[8] is mock_attn_metadata.mamba_state_indices
+        assert core_args[9] is mock_attn_metadata.query_start_loc
+        assert core_args[10] is mock_attn_metadata.request_distribution
+        assert core_args[11] is mock_attn_metadata.seq_lens
+        assert len(core_args) == 12
         expected_local = torch.stack(
             [torch.full((4, 16), 12.0),
              torch.full((4, 16), 13.0)])

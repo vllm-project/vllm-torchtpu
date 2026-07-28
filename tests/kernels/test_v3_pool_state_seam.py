@@ -15,6 +15,7 @@ import pytest
 
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
+from vllm_torchtpu.layers.common import gdn_attention
 
 # 35B-like slice: manager block = 3 kernel blocks; ssm = 2 whole kernel
 # blocks (one contiguous 512 KB DMA per slot); conv = 16 token rows at
@@ -223,6 +224,29 @@ def _run_seam(pool, idx, kwargs):
                                     **kwargs)
 
 
+def _run_pooled_caller(pool, idx, kwargs):
+    return gdn_attention.run_jax_gdn_attention_pooled_local(
+        mixed_qkv=kwargs["qkv"],
+        b=kwargs["b"],
+        a=kwargs["a"],
+        recurrent_state=pool,
+        conv_weight=kwargs["conv_weight"],
+        conv_bias=kwargs["conv_bias"],
+        A_log=kwargs["a_log"],
+        dt_bias=kwargs["dt_bias"],
+        query_start_loc=kwargs["query_start_loc"],
+        state_indices=idx,
+        distribution=kwargs["distribution"],
+        seq_lens=kwargs["seq_lens"],
+        n_kq=N_KQ,
+        n_v=N_V,
+        d_k=D_K,
+        d_v=D_V,
+        kernel_size=KERNEL_SIZE,
+        pool_block_tokens=SPLIT * KBS,
+    )
+
+
 class TestSeamMatchesRoundTrip:
 
     def _compare(self, pool, idx, kwargs):
@@ -355,8 +379,6 @@ class TestSeamSkipsInvalidSlots:
 class TestPooledCallerV3:
 
     def test_caller_matches_roundtrip(self):
-        gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
         n = 4
         idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         keys = iter(jax.random.split(jax.random.key(14), 2))
@@ -373,26 +395,7 @@ class TestPooledCallerV3:
         )
         pool_rt, out_rt = _run_roundtrip(jnp.copy(pool), idx, kwargs)
 
-        new_pool, out = gdn_attention.run_jax_gdn_attention_pooled_local(
-            mixed_qkv=kwargs["qkv"],
-            b=kwargs["b"],
-            a=kwargs["a"],
-            recurrent_state=jnp.copy(pool),
-            conv_weight=kwargs["conv_weight"],
-            conv_bias=kwargs["conv_bias"],
-            A_log=kwargs["a_log"],
-            dt_bias=kwargs["dt_bias"],
-            query_start_loc=kwargs["query_start_loc"],
-            state_indices=idx,
-            distribution=kwargs["distribution"],
-            seq_lens=kwargs["seq_lens"],
-            n_kq=N_KQ,
-            n_v=N_V,
-            d_k=D_K,
-            d_v=D_V,
-            kernel_size=KERNEL_SIZE,
-            pool_block_tokens=SPLIT * KBS,
-        )
+        new_pool, out = _run_pooled_caller(jnp.copy(pool), idx, kwargs)
 
         np.testing.assert_allclose(np.asarray(out),
                                    np.asarray(out_rt),
@@ -400,6 +403,30 @@ class TestPooledCallerV3:
                                    atol=1e-5)
         assert jnp.array_equal(new_pool.view(jnp.int16),
                                pool_rt.view(jnp.int16))
+
+    def test_caller_preserves_null_block_for_padded_rows(self):
+        idx = jnp.array([2, 4, 0, 0], dtype=jnp.int32)
+        keys = iter(jax.random.split(jax.random.key(17), 2))
+        pool = _write_states(
+            _garbage_pool(18),
+            jax.random.normal(next(keys), (2, N_V, D_K, D_V)),
+            jax.random.normal(
+                next(keys),
+                (2, KERNEL_SIZE - 1, DIM),
+            ).astype(jnp.bfloat16),
+            idx[:2],
+        )
+        before = jnp.copy(pool)
+        kwargs = _rand_inputs(19, 2) | {
+            "query_start_loc": jnp.array([0, 1, 2, 2, 2]),
+            "distribution": jnp.array([2, 2, 2], dtype=jnp.int32),
+            "seq_lens": jnp.array([5, 5, 0, 0], dtype=jnp.int32),
+        }
+
+        after, _ = _run_pooled_caller(pool, idx, kwargs)
+
+        assert jnp.array_equal(after[:SPLIT].view(jnp.int16),
+                               before[:SPLIT].view(jnp.int16))
 
 
 # --------------------------------------------------------------------
@@ -438,23 +465,6 @@ BENCH_QUERY_START_LOC = jnp.array(
 BENCH_DISTRIBUTION = jnp.array([0, 1, 1], dtype=jnp.int32)
 # Greater than the query length so every iteration consumes its input state.
 BENCH_SEQ_LENS = jnp.array([BENCH_NUM_TOKENS + 1], dtype=jnp.int32)
-
-
-def _benchmark_plan(pool=None):
-    if pool is None:
-        pool = jax.ShapeDtypeStruct(BENCH_POOL_SHAPE, jnp.int8)
-    return pool_adapters.v3_state_source(
-        pool,
-        split=BENCH_SPLIT,
-        ssm_ntok=BENCH_SSM_NTOK,
-        conv_tok0=BENCH_CONV_TOK0,
-        conv_ntok=BENCH_CONV_NTOK,
-        conv_dim=BENCH_DIM,
-        n_v=BENCH_N_V,
-        d_k=BENCH_D_K,
-        d_v=BENCH_D_V,
-        kernel_size=BENCH_KERNEL_SIZE,
-    )
 
 
 def _benchmark_write_states(pool, recurrent, conv):
@@ -561,15 +571,28 @@ def _benchmark_dense_five(conv_state, recurrent_state, qkv, b, a,
 def _benchmark_pooled_five(pool, qkv, b, a, conv_weight, conv_bias, a_log,
                            dt_bias):
 
-    def step(state_source, _):
-        new_source, output = wrapper.fused_conv1d_gdn(
-            conv_state=None,
-            recurrent_state=None,
-            state_source=state_source,
-            state_plan=_benchmark_plan(),
-            **_benchmark_common_args(
-                qkv, b, a, conv_weight, conv_bias, a_log, dt_bias))
-        return new_source, output
+    def step(state_pool, _):
+        state_pool, output = gdn_attention.run_jax_gdn_attention_pooled_local(
+            mixed_qkv=qkv,
+            b=b,
+            a=a,
+            recurrent_state=state_pool,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=BENCH_QUERY_START_LOC,
+            state_indices=BENCH_STATE_IDX,
+            distribution=BENCH_DISTRIBUTION,
+            seq_lens=BENCH_SEQ_LENS,
+            n_kq=BENCH_N_KQ,
+            n_v=BENCH_N_V,
+            d_k=BENCH_D_K,
+            d_v=BENCH_D_V,
+            kernel_size=BENCH_KERNEL_SIZE,
+            pool_block_tokens=BENCH_MANAGER_TOKENS,
+        )
+        return state_pool, output
 
     return jax.lax.scan(
         step,
@@ -601,9 +624,9 @@ class TestProductionShapeDenseVsUnifiedPool:
     followed by a fresh five-iteration single-JIT timed run.
 
     Reference TPU observation on 2026-07-28:
-      dense:  1.500 ms/iteration
-      pooled: 3.318 ms/iteration
-      change: +1.818 ms/iteration (2.212x)
+      dense:  1.503 ms/iteration
+      pooled: 1.495 ms/iteration
+      change: -0.008 ms/iteration (0.995x)
 
     Timing remains diagnostic rather than an assertion because shared TPU load
     can vary. Outputs from all five iterations and both final states are strict

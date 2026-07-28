@@ -17,6 +17,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 import functools
 import math
+from collections.abc import Callable
 from typing import Optional, Tuple
 
 import jax
@@ -27,8 +28,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
-from vllm_torchtpu.layers.common.utils import \
-    reorder_concatenated_tensor_for_sharding
+from vllm_torchtpu.layers.common.utils import reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 
@@ -681,10 +681,202 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 # ---------------------------------------------------------------
 # Unified block pool variants: the mamba state crosses the op boundary
 # once as the attention-shaped pool (ssm | conv slot | pad token-ranges
-# inside each block); the state is gathered/scattered through the pool
-# adapters around stock kernels. The split-state functions above serve
-# the non-pooled (disagg / kv-transfer) layout.
+# inside each block). This wrapper gathers canonical dense states once,
+# invokes either the regular or PCP core without any pool-layout branches,
+# then scatters the final states once. The split-state functions above
+# serve the non-pooled (disagg / kv-transfer) layout.
 # ---------------------------------------------------------------
+
+
+def _unified_pool_state_geometry(
+    state_pool: jnp.ndarray,
+    *,
+    conv_dim: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pool_block_tokens: int,
+) -> tuple[int, int, int]:
+    """Return `(split, ssm_ntok, conv_ntok)` for one local GDN state."""
+    assert pool_block_tokens % state_pool.shape[1] == 0, (
+        pool_block_tokens, state_pool.shape)
+    split = pool_block_tokens // state_pool.shape[1]
+
+    per_tok_elems = math.prod(state_pool.shape[2:])
+    tok_bytes = per_tok_elems * jnp.dtype(state_pool.dtype).itemsize
+    ssm_bytes = n_v * d_k * d_v * 4
+    conv_bytes = (kernel_size - 1) * conv_dim * 2
+    assert ssm_bytes % tok_bytes == 0, (ssm_bytes, tok_bytes)
+    ssm_ntok = ssm_bytes // tok_bytes
+    assert ssm_ntok <= pool_block_tokens, (
+        "ssm state does not fit the attention page", ssm_ntok,
+        pool_block_tokens)
+
+    # The conv slot occupies whole tokens right after the ssm region,
+    # padded up so the slot's token range satisfies tok0 % ntok == 0.
+    conv_ntok = 1
+    while (conv_ntok * tok_bytes < conv_bytes
+           or ssm_ntok % conv_ntok != 0):
+        conv_ntok *= 2
+    assert ssm_ntok + conv_ntok <= pool_block_tokens, (
+        "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
+        pool_block_tokens)
+    return split, ssm_ntok, conv_ntok
+
+
+def _gather_gdn_states_from_unified_pool(
+    state_pool: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    *,
+    split: int,
+    ssm_ntok: int,
+    conv_ntok: int,
+    conv_dim: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    num_state_slots = state_indices.shape[0]
+    pool_lanes = state_pool.shape[-1]
+    recurrent_state = pool_adapters.gather_region(
+        state_pool,
+        state_indices,
+        tok0=0,
+        ntok=ssm_ntok,
+        split=split,
+        out_dtype=jnp.float32,
+        out_lanes=d_v,
+    ).reshape(num_state_slots, n_v, d_k, d_v)
+
+    conv_slot = pool_adapters.gather_region(
+        state_pool,
+        state_indices,
+        tok0=ssm_ntok,
+        ntok=conv_ntok,
+        split=split,
+        out_dtype=jnp.bfloat16,
+    )
+    conv_elems = (kernel_size - 1) * conv_dim
+    assert conv_elems % pool_lanes == 0, (conv_elems, pool_lanes)
+    conv_rows = conv_elems // pool_lanes
+    conv_state = conv_slot[:, :conv_rows].reshape(num_state_slots,
+                                                  kernel_size - 1, conv_dim)
+    return conv_state, recurrent_state, conv_slot
+
+
+def _scatter_gdn_states_to_unified_pool(
+    state_pool: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    conv_slot: jnp.ndarray,
+    new_conv_state: jnp.ndarray,
+    new_recurrent_state: jnp.ndarray,
+    *,
+    split: int,
+    ssm_ntok: int,
+    conv_ntok: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+) -> jnp.ndarray:
+    num_state_slots = state_indices.shape[0]
+    pool_lanes = state_pool.shape[-1]
+
+    # Padded request rows point at the shared null block. The dense GDN leaves
+    # their canonical state rows unchanged, so duplicate writes remain
+    # byte-identical. The conv slot starts from the full gathered region, which
+    # also preserves its dead padding bytes.
+    state_pool = pool_adapters.scatter_region(
+        state_pool,
+        new_recurrent_state.reshape(num_state_slots, n_v * d_k, d_v),
+        state_indices,
+        tok0=0,
+        ntok=ssm_ntok,
+        split=split,
+    )
+
+    conv_rows = new_conv_state.size // (num_state_slots * pool_lanes)
+    new_conv_rows = new_conv_state.astype(jnp.bfloat16).reshape(
+        num_state_slots, conv_rows, pool_lanes)
+    conv_values = conv_slot.at[:, :conv_rows].set(new_conv_rows)
+    return pool_adapters.scatter_region(
+        state_pool,
+        conv_values,
+        state_indices,
+        tok0=ssm_ntok,
+        ntok=conv_ntok,
+        split=split,
+    )
+
+
+def _run_gdn_with_unified_pool(
+    state_pool: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    run_canonical_gdn: Callable,
+    *,
+    conv_dim: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pool_block_tokens: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Adapt the unified pool once around a canonical-layout GDN core.
+
+    The core receives request-major dense state arrays and identity state
+    indices. Pool block IDs remain private to this wrapper, so PCP and regular
+    cores share exactly the same state interface and never see the raw pool
+    layout.
+    """
+    split, ssm_ntok, conv_ntok = _unified_pool_state_geometry(
+        state_pool,
+        conv_dim=conv_dim,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
+    )
+    conv_state, recurrent_state, conv_slot = (
+        _gather_gdn_states_from_unified_pool(
+            state_pool,
+            state_indices,
+            split=split,
+            ssm_ntok=ssm_ntok,
+            conv_ntok=conv_ntok,
+            conv_dim=conv_dim,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        ))
+
+    canonical_state_indices = jnp.arange(state_indices.shape[0],
+                                         dtype=jnp.int32)
+    (new_conv_state,
+     new_recurrent_state), output = run_canonical_gdn(
+         # The canonical GDN donates its states. Keep the full gathered conv
+         # slot alive so its dead padding bytes can be copied through below.
+         jnp.copy(conv_state),
+         recurrent_state,
+         canonical_state_indices,
+     )
+
+    state_pool = _scatter_gdn_states_to_unified_pool(
+        state_pool,
+        state_indices,
+        conv_slot,
+        new_conv_state,
+        new_recurrent_state,
+        split=split,
+        ssm_ntok=ssm_ntok,
+        conv_ntok=conv_ntok,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+    )
+    return state_pool, output
 
 
 def run_jax_gdn_attention_pooled_local(
@@ -711,86 +903,176 @@ def run_jax_gdn_attention_pooled_local(
 
     ``recurrent_state`` is the attention-shaped pool holding the f32 ssm
     region at token offset 0 and the conv region in the tokens right after
-    it. All pool knowledge lives here: for the chunked impls, conv state
-    is gathered/scattered through `pool_adapters` around the stock conv
-    kernel and the ssm region is threaded into the stock delta-rule via
-    pluggable `StateOps`; the fused V3 kernel instead streams both regions
-    in place through a `v3_state_source` copy-plan — the model kernels'
-    math is unmodified either way.
+    it. All pool knowledge lives in `_run_gdn_with_unified_pool`; the fused
+    V3 kernel receives its normal dense state layout, so its per-tile pipeline
+    is identical to the non-pooled path.
     """
-
-    # Backends with a fixed kernel block (batched RPA) get the pool born
-    # at kernel granularity; a manager block is `split` consecutive kernel
-    # blocks (upstream map_to_kernel_blocks). State regions address
-    # manager-block token ranges; the adapters route them (split kwarg) —
-    # the pool itself is never reshaped (an XLA reshape of the pool
-    # materializes as a pool-sized relayout copy per step).
-    assert pool_block_tokens % recurrent_state.shape[1] == 0, (
-        pool_block_tokens, recurrent_state.shape)
-    split = pool_block_tokens // recurrent_state.shape[1]
-
     conv_dim = conv_weight.shape[0]
-    per_tok_elems = math.prod(recurrent_state.shape[2:])
-    tok_bytes = per_tok_elems * jnp.dtype(recurrent_state.dtype).itemsize
-    ssm_bytes = n_v * d_k * d_v * 4
-    conv_bytes = (kernel_size - 1) * conv_dim * 2
-    assert ssm_bytes % tok_bytes == 0, (ssm_bytes, tok_bytes)
-    ssm_ntok = ssm_bytes // tok_bytes
-    assert ssm_ntok <= pool_block_tokens, (
-        "ssm state does not fit the attention page", ssm_ntok,
-        pool_block_tokens)
 
-    # The conv slot occupies whole tokens right after the ssm region,
-    # padded up so the slot's token range satisfies the tok0 % ntok == 0
-    # layout rule; the pad tokens are dead bytes inside the slot.
-    conv_ntok = 1
-    while (conv_ntok * tok_bytes < conv_bytes or ssm_ntok % conv_ntok != 0):
-        conv_ntok *= 2
-    assert ssm_ntok + conv_ntok <= pool_block_tokens, (
-        "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
-        pool_block_tokens)
+    def _run_canonical(conv_state, recurrent_state_, dense_state_indices):
+        return gdn_v3_wrapper.fused_conv1d_gdn(
+            mixed_qkv,
+            b,
+            a,
+            conv_state,
+            recurrent_state_,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            dense_state_indices,
+            distribution,
+            seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
 
-    # Fused conv+GDN kernel: both state regions stream directly
-    # between the pool and the kernel's double-buffered pipeline (one
-    # contiguous DMA per slot per region) — no external gather/scatter
-    # round trip. The kernel masks fresh slots via has_initial_state,
-    # so a newly-allocated block's bytes are never read, and padded
-    # slots move no bytes in either direction.
-    plan = pool_adapters.v3_state_source(
+    return _run_gdn_with_unified_pool(
         recurrent_state,
-        split=split,
-        ssm_ntok=ssm_ntok,
-        conv_tok0=ssm_ntok,
-        conv_ntok=conv_ntok,
+        state_indices,
+        _run_canonical,
         conv_dim=conv_dim,
         n_v=n_v,
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
     )
-    recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
-        mixed_qkv,
-        b,
-        a,
-        None,
-        None,
-        conv_weight,
-        conv_bias,
-        A_log,
-        dt_bias,
-        query_start_loc,
-        state_indices,
-        distribution,
-        seq_lens,
-        n_kq=n_kq,
-        n_v=n_v,
+
+
+def run_jax_gdn_attention_pooled_pcp_tp_prefill(
+    j_mixed_qkv: jnp.ndarray,
+    j_b: jnp.ndarray,
+    j_a: jnp.ndarray,
+    state_pool: jnp.ndarray,
+    j_conv_weight: jnp.ndarray,
+    j_conv_bias: jnp.ndarray | None,
+    j_A_log: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    pool_block_tokens: int,
+    mesh: jax.sharding.Mesh,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Adapt rank-local unified pools around the unchanged PCP GDN core."""
+    local_n_kq = n_kq // pcp_size
+    local_n_v = n_v // pcp_size
+    local_conv_dim = 2 * local_n_kq * d_k + local_n_v * d_v
+    split, ssm_ntok, conv_ntok = _unified_pool_state_geometry(
+        state_pool,
+        conv_dim=local_conv_dim,
+        n_v=local_n_v,
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
-        state_source=recurrent_state,
-        state_plan=plan,
+        pool_block_tokens=pool_block_tokens,
     )
-    return recurrent_state, output
+
+    pcp_axis = "pcp"
+    pool_spec = P(pcp_axis)
+    replicated_spec = P()
+    conv_state_spec = P(None, None, pcp_axis)
+    recurrent_state_spec = P(None, pcp_axis, None, None)
+    # The full conv slot includes padding bytes that must survive the core.
+    # Its middle dimension is only a carrier for independent rank-local data.
+    conv_slot_spec = P(None, pcp_axis, None)
+
+    def _gather_local(local_pool, local_state_indices):
+        return _gather_gdn_states_from_unified_pool(
+            local_pool,
+            local_state_indices,
+            split=split,
+            ssm_ntok=ssm_ntok,
+            conv_ntok=conv_ntok,
+            conv_dim=local_conv_dim,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+
+    conv_state, recurrent_state, conv_slot = jax.shard_map(
+        _gather_local,
+        mesh=mesh,
+        in_specs=(pool_spec, replicated_spec),
+        out_specs=(conv_state_spec, recurrent_state_spec, conv_slot_spec),
+        check_vma=False,
+    )(state_pool, state_indices)
+
+    # The wrapper has compacted physical pool block IDs into one canonical row
+    # per request. The original PCP implementation therefore sees only dense
+    # identity state indices and remains entirely pool-agnostic.
+    canonical_state_indices = jnp.arange(state_indices.shape[0],
+                                         dtype=jnp.int32)
+    (new_conv_state,
+     new_recurrent_state), output = run_jax_gdn_attention_pcp_tp_prefill(
+         j_mixed_qkv,
+         j_b,
+         j_a,
+         conv_state,
+         recurrent_state,
+         j_conv_weight,
+         j_conv_bias,
+         j_A_log,
+         j_dt_bias,
+         canonical_state_indices,
+         query_start_loc,
+         distribution,
+         seq_lens,
+         n_kq=n_kq,
+         n_v=n_v,
+         d_k=d_k,
+         d_v=d_v,
+         kernel_size=kernel_size,
+         pcp_size=pcp_size,
+         interleave_size=interleave_size,
+         mesh=mesh,
+     )
+
+    def _scatter_local(local_pool, local_conv_slot, local_conv_state,
+                       local_recurrent_state, local_state_indices):
+        return _scatter_gdn_states_to_unified_pool(
+            local_pool,
+            local_state_indices,
+            local_conv_slot,
+            local_conv_state,
+            local_recurrent_state,
+            split=split,
+            ssm_ntok=ssm_ntok,
+            conv_ntok=conv_ntok,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+        )
+
+    state_pool = jax.shard_map(
+        _scatter_local,
+        mesh=mesh,
+        in_specs=(
+            pool_spec,
+            conv_slot_spec,
+            conv_state_spec,
+            recurrent_state_spec,
+            replicated_spec,
+        ),
+        out_specs=pool_spec,
+        check_vma=False,
+    )(state_pool, conv_slot, new_conv_state, new_recurrent_state,
+      state_indices)
+    return state_pool, output
 
 
 def run_jax_gdn_attention_pooled(
