@@ -3,7 +3,7 @@ import itertools
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+#
 
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import (
     ensure_op_built, mamba_state_copy)
@@ -47,7 +47,7 @@ class MambaApcStateCopier:
         ensure_op_built()
 
     def _state_block_size(self) -> int:
-        return self.base_block_size * get_total_cp_world_size()
+        return self.base_block_size
 
     def preprocess(self, scheduler_output) -> None:
         runner = self.runner
