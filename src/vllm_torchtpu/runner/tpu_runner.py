@@ -393,7 +393,7 @@ class TPUModelRunner(GPUModelRunner):
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
-        self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
+        self.most_model_len = int(os.environ.get('VLLM_TPU_MOST_MODEL_LEN', '4096'))
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req

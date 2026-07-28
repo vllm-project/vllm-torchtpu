@@ -643,7 +643,7 @@ class TpuPlatform(Platform):
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
                 max_token_size=scheduler_config.max_num_batched_tokens,
-                padding_gap=vllm_envs.VLLM_TPU_BUCKET_PADDING_GAP,
+                padding_gap=int(os.environ.get('VLLM_TPU_BUCKET_PADDING_GAP', '256')),
             )
         else:
             compilation_config.compile_sizes = sorted(
