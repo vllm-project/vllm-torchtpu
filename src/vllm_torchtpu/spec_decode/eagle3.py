@@ -1121,9 +1121,19 @@ class Eagle3Proposer:
         input_ids = torch.zeros(bucket,
                                 dtype=torch.int32,
                                 device=runner.device)
-        positions = torch.zeros(bucket,
-                                dtype=torch.int32,
-                                device=runner.device)
+        # Two consumers, two ranks. The draft forward takes mrope-shaped
+        # positions [3, N] on models that use them, and its compiled graph
+        # is specialized on that rank (dynamic_arg_dims marks positions
+        # dim -1), so a 1-D dummy trips the guard with
+        # `IndexError: Dimension out of range`. The attn-metadata build
+        # always wants the 1-D token positions, matching
+        # runner.position_ids.
+        token_positions = torch.zeros(bucket,
+                                      dtype=torch.int32,
+                                      device=runner.device)
+        positions = (torch.zeros(
+            (3, bucket), dtype=torch.int32, device=runner.device)
+                     if runner.uses_mrope else token_positions)
         target_hidden_states = torch.zeros((bucket, self._draft_hidden_size()),
                                            dtype=runner._hidden_states_dtype,
                                            device=runner.device)
@@ -1146,7 +1156,7 @@ class Eagle3Proposer:
             # zeroed-block-table branch (attention_metadata.py) instead of
             # slicing the real block table, which on an idle rank is shorter
             # than num_reqs and would fail to broadcast.
-            position_ids_override=positions,
+            position_ids_override=token_positions,
         )
         chunk = DraftChunkInputs(
             input_ids=input_ids,
@@ -1168,9 +1178,12 @@ class Eagle3Proposer:
         loop_input_ids = torch.zeros(p,
                                      dtype=torch.int32,
                                      device=runner.device)
-        loop_positions = torch.zeros(p,
-                                     dtype=torch.int32,
-                                     device=runner.device)
+        # Mirrors the real loop carry, which stays mrope-shaped across steps
+        # (propose() pads it with _maybe_pad_dim1 when pos.ndim == 2).
+        loop_positions = (torch.zeros(
+            (3, p), dtype=torch.int32, device=runner.device)
+                          if runner.uses_mrope else torch.zeros(
+                              p, dtype=torch.int32, device=runner.device))
         loop_hidden = torch.zeros((p, draft_hidden),
                                   dtype=dtype,
                                   device=runner.device)
