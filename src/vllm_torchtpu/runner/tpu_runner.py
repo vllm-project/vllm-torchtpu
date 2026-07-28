@@ -109,8 +109,10 @@ class ExecuteModelState:
     draft_chunks: list[DraftChunkInputs] = field(default_factory=list)
     # Per-chunk device mamba slot ids (base slot per batch position); only
     # populated for hybrid models with spec decoding so sample_tokens can
-    # scatter this step's mamba read offsets per physical slot.
-    mamba_state_indices_list: list[torch.Tensor
+    # scatter this step's mamba read offsets per physical slot. Compact
+    # pool: one shared slot tensor per chunk; unified pool: one state-block
+    # tensor per mamba group per chunk.
+    mamba_state_indices_list: list[torch.Tensor | list[torch.Tensor]
                                    | None] = field(default_factory=list)
 
 
@@ -1658,6 +1660,10 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         per_raw: dict[int, tuple[torch.Tensor, list[int], list[int]]] = {}
+        # Manager-level (src, dst) block pairs across mamba groups: with
+        # spec decoding the per-block read offsets must follow the state
+        # (and its checkpoints) to the request's new state block.
+        offset_pairs: list[tuple[int, int]] = []
         for gid, raws in self._mamba_copy_plan:
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
             pairs: list[tuple[int, int]] = []
@@ -1668,6 +1674,7 @@ class TPUModelRunner(GPUModelRunner):
                     pairs.append((src, dst))
             if not pairs:
                 continue
+            offset_pairs.extend(pairs)
             if self._pool_block_split > 1:
                 # The pool is born at kernel granularity: a manager state
                 # block is `split` consecutive pool blocks.
@@ -1678,6 +1685,25 @@ class TPUModelRunner(GPUModelRunner):
                 entry = per_raw.setdefault(id(raw), (raw, [], []))
                 entry[1].extend(p[0] for p in pairs)
                 entry[2].extend(p[1] for p in pairs)
+
+        if self.mamba_slot_read_offsets is not None and offset_pairs:
+            # Migrate the read offsets with the state: gather at the old
+            # blocks, scatter at the new ones (both device-side, before the
+            # forward that reads the buffer). Padding with (0, 0) null-block
+            # self-copies keeps the shapes on the seed-copy bucket ladder.
+            padded = 8
+            while padded < len(offset_pairs):
+                padded *= 4
+            offset_pairs = offset_pairs + [(0, 0)
+                                           ] * (padded - len(offset_pairs))
+            src_t = torch.tensor([s for s, _ in offset_pairs],
+                                 dtype=torch.long).to(self.device,
+                                                      non_blocking=True)
+            dst_t = torch.tensor([d for _, d in offset_pairs],
+                                 dtype=torch.long).to(self.device,
+                                                      non_blocking=True)
+            self.mamba_slot_read_offsets.index_put_(
+                (dst_t, ), self.mamba_slot_read_offsets[src_t])
 
         for raw, srcs, dsts in per_raw.values():
             # Pad the pair count to a small bucket ladder so the copy op
@@ -2412,6 +2438,12 @@ class TPUModelRunner(GPUModelRunner):
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_request_distribution=mamba_request_distribution,
+            # Unified pool + spec decode: the mamba group builders append
+            # their per-request state block ids here for the post-sampling
+            # read-offset scatter.
+            unified_mamba_state_indices=(
+                [] if self._unified_kv_layout
+                and self.mamba_slot_read_offsets is not None else None),
             sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
@@ -2674,7 +2706,8 @@ class TPUModelRunner(GPUModelRunner):
         pooler_output_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
-        mamba_state_indices_list: list[torch.Tensor | None] = []
+        mamba_state_indices_list: list[torch.Tensor | list[torch.Tensor]
+                                       | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = (self._is_async_drafter)
 
@@ -2812,9 +2845,19 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
-            mamba_state_indices_list.append(
-                self._attn_metadata_builder_ctx.mamba_state_indices if self.
-                mamba_slot_read_offsets is not None else None)
+            if self.mamba_slot_read_offsets is None:
+                mamba_state_indices_list.append(None)
+            elif (self._attn_metadata_builder_ctx.mamba_state_indices
+                  is not None):
+                # Compact pool: one shared slot id per request across groups.
+                mamba_state_indices_list.append(
+                    self._attn_metadata_builder_ctx.mamba_state_indices)
+            else:
+                # Unified pool: one state block per request per mamba group,
+                # captured by the group builders during metadata build.
+                mamba_state_indices_list.append(
+                    self._attn_metadata_builder_ctx.unified_mamba_state_indices
+                )
             if is_draft_model:
                 # Capture this chunk's draft inputs while they are valid.
                 draft_chunks.append(
@@ -2876,8 +2919,8 @@ class TPUModelRunner(GPUModelRunner):
         return self._sampling_generator
 
     @torch.no_grad()
-    def _update_mamba_slot_read_offsets(self,
-                                        state_indices: torch.Tensor | None,
+    def _update_mamba_slot_read_offsets(self, state_indices: torch.Tensor
+                                        | list[torch.Tensor] | None,
                                         next_tokens: torch.Tensor | None,
                                         num_reqs: int) -> None:
         """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
@@ -2889,20 +2932,30 @@ class TPUModelRunner(GPUModelRunner):
         decode) — which also resets a group's offset after prefill. The next
         step's GDN kernel resumes each request from
         `base_slot + offset` (the checkpoint of its last accepted token).
+
+        Compact pool: one shared slot tensor addresses every mamba group.
+        Unified pool: a list with each mamba group's per-request state
+        block, all scattered with the same offsets (the buffer is indexed
+        by pool block id and each group allocates distinct blocks).
         """
         if self.mamba_slot_read_offsets is None or state_indices is None:
             return
-        offsets = torch.zeros(state_indices.shape[0],
+        indices_per_group = (state_indices if isinstance(state_indices, list)
+                             else [state_indices])
+        if not indices_per_group:
+            return
+        offsets = torch.zeros(indices_per_group[0].shape[0],
                               dtype=torch.int32,
-                              device=state_indices.device)
+                              device=indices_per_group[0].device)
         if next_tokens is not None:
             # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
             # last accepted token is at base + num_valid - 1.
             num_valid = (next_tokens[:num_reqs]
                          != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
             offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
-        self.mamba_slot_read_offsets.index_put_((state_indices.long(), ),
-                                                offsets)
+        for group_indices in indices_per_group:
+            self.mamba_slot_read_offsets.index_put_((group_indices.long(), ),
+                                                    offsets)
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -4019,12 +4072,18 @@ class TPUModelRunner(GPUModelRunner):
                                                NewRequestData, SchedulerOutput)
 
         K = self.speculative_config.num_speculative_tokens
-        bs = self.block_size
-        ng = len(self.kv_cache_config.kv_cache_groups)
         room = self.max_model_len - P
         n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
-        nblk = min((max_pos + bs - 1) // bs, self.max_num_blocks_per_req)
+        # Per-group block counts at each group's own block size (see
+        # _warmup_one_spec_request); the per-request stride uses the widest
+        # group so every group's ranges stay disjoint across requests.
+        group_nblks = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            gbs = int(group.kv_cache_spec.block_size)
+            group_nblks.append(
+                min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs)))
+        nblk = max(group_nblks)
         top = int(self.kv_cache_config.num_blocks)
         if top <= R * nblk + 1:
             logger.warning(
@@ -4037,7 +4096,6 @@ class TPUModelRunner(GPUModelRunner):
             new_reqs = []
             for j, rid in enumerate(rids):
                 lo = top - (j + 1) * nblk
-                blk = list(range(lo, lo + nblk))
                 new_reqs.append(
                     NewRequestData(req_id=rid,
                                    prompt_token_ids=[0] * P,
@@ -4045,7 +4103,8 @@ class TPUModelRunner(GPUModelRunner):
                                    sampling_params=sp,
                                    pooling_params=None,
                                    block_ids=tuple(
-                                       list(blk) for _ in range(ng)),
+                                       list(range(lo, lo + g_nblk))
+                                       for g_nblk in group_nblks),
                                    num_computed_tokens=0,
                                    lora_request=None))
             # Prefill in chunks that respect the pre-allocated host token buffers.
@@ -4108,8 +4167,6 @@ class TPUModelRunner(GPUModelRunner):
 
         rid = f"__spec_warmup_{idx}__"
         K = self.speculative_config.num_speculative_tokens
-        bs = self.block_size
-        ng = len(self.kv_cache_config.kv_cache_groups)
         # The contexts (num_computed_tokens) to run decode steps at: a short walk
         # near the prefill.
         room = self.max_model_len - P
@@ -4119,15 +4176,24 @@ class TPUModelRunner(GPUModelRunner):
         # don't collide. Page CONTENTS are value-insensitive and KV writes use
         # empty_slot_mappings, so stale pages are safe; each request is fully torn
         # down before the next. Cover the highest context this request reaches.
+        # Count blocks per kv-cache group at that group's own block size:
+        # groups differ on hybrid models (mamba vs attention), and the
+        # runner-level self.block_size predates the executor's post-load
+        # block-size finalization.
         max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
-        nblk = min((max_pos + bs - 1) // bs, self.max_num_blocks_per_req)
         top = int(self.kv_cache_config.num_blocks)
-        if top <= nblk + 1:
+        block_ids_per_group = []
+        max_nblk = 0
+        for group in self.kv_cache_config.kv_cache_groups:
+            gbs = int(group.kv_cache_spec.block_size)
+            g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
+            block_ids_per_group.append(list(range(top - g_nblk, top)))
+            max_nblk = max(max_nblk, g_nblk)
+        if top <= max_nblk + 1:
             logger.warning(
                 "skip spec-decode warmup P=%d: not enough kv blocks", P)
             return
-        blk = list(range(top - nblk, top))
-        block_ids = tuple(list(blk) for _ in range(ng))
+        block_ids = tuple(block_ids_per_group)
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         try:
             # ---- prefill ----
@@ -4498,6 +4564,20 @@ class TPUModelRunner(GPUModelRunner):
         if (not self._unified_kv_layout and self._mamba_align_mode
                 and kv_cache_config.has_mamba_layers):
             self._mamba_apc_copier = MambaApcStateCopier(self)
+
+        # For hybrid models with spec decoding on the unified pool, keep a
+        # per-block device buffer of mamba read offsets (num_accepted - 1
+        # from each request's last verify step), indexed by manager block
+        # id. The GDN kernel reads a request's initial state from checkpoint
+        # `offset` of its state block, which is how rejected draft tokens
+        # are rolled back (by selecting the checkpoint of the last accepted
+        # token, never by copying state). The offsets follow the state
+        # block through the align-mode seed copies (see
+        # `_collect_mamba_state_seed_copies`).
+        if (self._unified_kv_layout and kv_cache_config.has_mamba_layers
+                and self.speculative_config is not None):
+            self.mamba_slot_read_offsets = torch.zeros(
+                kv_cache_config.num_blocks, dtype=torch.int32).to(self.device)
 
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()

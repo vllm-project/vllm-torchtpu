@@ -109,18 +109,21 @@ def inner_kernel(
     if cfg.state_plan is None:
         conv_state_slot_ref[...] = new_conv_state
     else:
-        # External source tiles: encode the state through the region's
-        # typed view; copy_out pushes the raw bytes back to the source.
+        # External source tiles: encode each window position's checkpoint
+        # through the region's typed view; copy_out pushes the raw bytes
+        # of the valid checkpoints back to the source.
         for idx in range(cfg.seq_tile_size):
 
-            args = (conv_state_slot_ref.at[idx], cfg.state_plan.conv,
-                    new_conv_state[idx])
-            if carry_conv_scratch_ref is None:
-                vmem_ldst.store_state_region(*args)
-            else:
-                # copy_out only DMAs the tile that ends a sequence.
-                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                    functools.partial(vmem_ldst.store_state_region, *args))
+            for t in range(cfg.window_size):
+                args = (conv_state_slot_ref.at[idx, t], cfg.state_plan.conv,
+                        new_conv_state[idx, t])
+                if carry_conv_scratch_ref is None:
+                    vmem_ldst.store_state_region(*args)
+                else:
+                    # copy_out only DMAs the tile that ends a sequence.
+                    pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                        functools.partial(vmem_ldst.store_state_region,
+                                          *args))
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -193,13 +196,15 @@ def inner_kernel(
     else:
         for idx in range(cfg.seq_tile_size):
 
-            args = (recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
-                    new_recurrent_state[idx])
-            if carry_recurrent_scratch_ref is None:
-                vmem_ldst.store_state_region(*args)
-            else:
-                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                    functools.partial(vmem_ldst.store_state_region, *args))
+            for t in range(cfg.window_size):
+                args = (recurrent_slot_ref.at[idx, t],
+                        cfg.state_plan.recurrent, new_recurrent_state[idx, t])
+                if carry_recurrent_scratch_ref is None:
+                    vmem_ldst.store_state_region(*args)
+                else:
+                    pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                        functools.partial(vmem_ldst.store_state_region,
+                                          *args))
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -406,11 +411,12 @@ def fused_conv1d_gdn(
     if pooled:
         assert conv_state is None and recurrent_state is None
         assert state_source is not None
-        # An external source stores one state per slot, not a checkpoint
-        # window, so the rollback reads/writes have nowhere to land.
-        assert num_spec_tokens == 0, (
-            "speculative decoding is not supported with an external state "
-            f"source (num_spec_tokens={num_spec_tokens})")
+        if num_spec_tokens > 0:
+            # The slot must hold one checkpoint per window position; a plan
+            # without a checkpoint pitch would alias them all onto slot 0.
+            assert state_plan.ckpt_kb > 0 or state_plan.ckpt_rows > 0, (
+                "num_spec_tokens > 0 requires a state_plan with a "
+                "checkpoint pitch")
     else:
         assert state_source is None
         conv_out_dtype = conv_state.dtype
@@ -557,6 +563,7 @@ def fused_conv1d_gdn(
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 state_indices=state_indices,
+                read_offsets=read_offsets,
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
             )

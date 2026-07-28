@@ -71,10 +71,20 @@ class StateRegion:
 class StateSourcePlan:
     """States live in an indexed external source instead of dense per-slot
     tensors: each state index owns a window of ``stride`` consecutive
-    source blocks holding both state regions."""
+    source blocks holding both state regions.
+
+    With speculative decoding the slot holds one checkpoint per verify
+    window position at a fixed pitch: checkpoint ``t``'s regions sit
+    ``t * ckpt_kb`` source blocks plus ``t * ckpt_rows`` rows past
+    checkpoint 0's (exactly one of the two is nonzero for a multi
+    checkpoint plan, keeping the ``t -> address`` map affine so the
+    dynamic read offset stays a plain DMA index). Both are 0 without
+    speculative decoding, where the slot holds a single checkpoint."""
     stride: int
     conv: StateRegion
     recurrent: StateRegion
+    ckpt_kb: int = 0
+    ckpt_rows: int = 0
 
 
 @jax.tree_util.register_dataclass

@@ -66,10 +66,19 @@ def compute_per_seq_metadata(
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
     state_indices: jax.Array,
+    read_offsets: jax.Array,
     start_seq: jax.Array,
     end_seq: jax.Array,
 ) -> memory_ref.MetadataRef:
-    """Metadata for computing single sequence per tile."""
+    """Metadata for computing single sequence per tile.
+
+    `read_offsets` selects the checkpoint a resuming sequence's initial
+    state is read from. It is 0 in the common cases (a fresh or chunked
+    prefill resumes from the single state its previous chunk wrote), but a
+    prefix-cache resume on the unified pool may land on a boundary state
+    block whose committed state is a non-zero checkpoint from a verify
+    step. The final state is always written to checkpoint 0.
+    """
 
     max_seqs = seq_lens.size
     max_tokens = cfg.batch_size
@@ -80,6 +89,7 @@ def compute_per_seq_metadata(
     query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
     seq_lens = jnp.roll(seq_lens, shift=-start_seq)
     state_indices = jnp.roll(state_indices, shift=-start_seq)
+    read_offsets = jnp.roll(read_offsets, shift=-start_seq)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -142,6 +152,5 @@ def compute_per_seq_metadata(
         p_id_is_last_tile=p_id_is_last_tile,
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
-        # Prefill/mixed sequences always resume from the group's base slot.
-        s_idx_to_read_offset=jnp.zeros_like(state_indices),
+        s_idx_to_read_offset=read_offsets,
     )
