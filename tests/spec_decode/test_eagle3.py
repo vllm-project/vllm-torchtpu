@@ -748,6 +748,59 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     assert tok_shapes == [(16, 8)] * 6
 
 
+def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
+    """An MTP draft has no combine_hidden_states, so the replay must not
+    emit one.
+
+    propose() runs combine only for eagle3; MTP feeds the target hidden
+    state straight to the forward. Replaying a combine here would both
+    raise AttributeError on the draft and add a step the real trace does
+    not have.
+    """
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    monkeypatch.setattr(e3.sync, "synchronize", lambda *a, **k: None)
+
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        _dp_target_bucket=64,
+        num_reqs_max_model_len=16,
+        max_num_reqs=16,
+        num_tokens_paddings=[16, 32, 64],
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        _dp_lockstep_enabled=lambda: True,
+    )
+    # A real Qwen3_5MoeMTP has no combine_hidden_states attribute at all;
+    # SimpleNamespace reproduces that, so a stray call raises here too.
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(use_aux_hidden_state=False),
+    )
+    proposer._draft_has_moe_cache = True
+
+    fwd, tok_shapes = [], []
+
+    def fake_forward(**kw):
+        fwd.append(kw)
+        return (torch.zeros((kw["num_tokens_padded"], 8)), None)
+
+    proposer._forward_draft = fake_forward
+
+    def fake_propose_token(h):
+        tok_shapes.append(tuple(h.shape))
+        return torch.zeros(h.shape[0], dtype=torch.int32)
+
+    proposer._draft_propose_token = fake_propose_token
+
+    proposer.run_dp_dummy_draft(2)
+
+    # Same forward/lm-head trace as eagle3, only without the combine step.
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 16, 16] * 2
+    assert [f["step_idx"] for f in fwd] == [0, 1, 2] * 2
+    assert tok_shapes == [(16, 8)] * 6
+
+
 def test_build_draft_attn_metadata_loop_cache(device):
     """Loop iterations >= 2 must reuse the step-1 metadata objects with only
     seq_lens swapped (advanced by +1), value-identical to a full rebuild."""
