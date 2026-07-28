@@ -1,0 +1,16 @@
+#!/bin/bash
+# shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
+# Benchmark config: RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (MoE, TP=2 on v7x-8).
+MODEL="RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
+TENSOR_PARALLELISM=2
+DATA_PARALLELISM=1
+ENABLE_EP=false
+QUANTIZATION=""
+ISL_OSL_CONFIGS="1024:1024"
+CONCURRENCY_OPTIONS="32"
+RANDOM_RANGE_RATIO="0.8"
+export VLLM_WORKER_MULTIPROC_METHOD=fork
+GPU_MEMORY_UTILIZATION=0.90
+EVAL_TOLERANCE="0.02"
+MAX_MODEL_LEN=4096
+EXTRA_SERVE_ARGS="--language-model-only --limit-mm-per-prompt '{\"image\": 0, \"video\": 0, \"audio\": 0}'"
