@@ -28,6 +28,11 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import (
 from vllm_torchtpu.kernels.deepseek_v4.compressor import compressor_forward
 # isort: on
 
+requires_tpu = pytest.mark.skipif(
+    jax.devices()[0].platform != "tpu",
+    reason="requires a TPU backend",
+)
+
 # KV row-slots per shared-cache page (the MLA storage block size).
 PAGE_SIZE = 64
 
@@ -72,13 +77,13 @@ def _boundary_store_ref(
     overlap,
     rms_eps,
     quant_block,
+    num_kv_pages,
 ):
     """Naive NumPy boundary store; returns nope/rope/scale per flat KV slot."""
     coff = 1 + int(overlap)
     state_width = coff * head_dim
     window = coff * compress_ratio
-    num_pages = state_cache.shape[0]
-    num_slots = num_pages * PAGE_SIZE
+    num_slots = num_kv_pages * PAGE_SIZE
     nope_dim = head_dim - rope_head_dim
     n_qb = nope_dim // quant_block
     nope_out = np.zeros((num_slots, nope_dim), dtype=ml_dtypes.float8_e4m3fn)
@@ -125,7 +130,7 @@ def _boundary_store_ref(
 
         q, scale = quantize_fp8_ue8m0(jnp.asarray(nope[None]), quant_block)
         q = np.asarray(q[0]).astype(ml_dtypes.float8_e4m3fn)
-        scale = np.asarray(scale[0]).astype(np.float32)
+        scale = np.exp2(np.asarray(scale[0]).astype(np.float32) - 127.0)
         rope_q = rope.astype(ml_dtypes.bfloat16)
 
         slot = int(kv_slot_mapping[t])
@@ -160,9 +165,11 @@ def _make_inputs(
     max_blocks = (seq_len + state_block_size - 1) // state_block_size
     num_state_pages = num_reqs * max_blocks + 1  # +1 spare (page 0)
 
-    # Compressed-KV output pages follow the state pages in the same buffer.
+    # Compressed-KV output pages live in their own, separate buffer (not
+    # shared with the state buffer) -- matches the dedicated-state-buffer
+    # design: state and compressed/real KV are physically disjoint tensors,
+    # not just disjoint page ranges within one tensor.
     num_kv_pages = (num_tokens // PAGE_SIZE) + 4
-    num_pages = num_state_pages + num_kv_pages
 
     # Per-request contiguous physical state pages (page 0 left as spare).
     block_table = np.zeros((num_reqs, max_blocks), np.int32)
@@ -186,13 +193,11 @@ def _make_inputs(
         slot_mapping[t] = block_table[r, p // state_block_size] \
             * state_block_size + p % state_block_size
 
-    # KV slots live in the KV page range so boundary writes never clobber the
-    # state bytes the gather still needs.
-    kv_base = num_state_pages * PAGE_SIZE
+    # KV slots live in their own dedicated buffer (see cache/state_cache_buf
+    # below), so there's no need to offset them past a shared state range.
     kv_capacity = num_kv_pages * PAGE_SIZE
-    kv_slot_mapping = (kv_base +
-                       rng.permutation(kv_capacity)[:num_tokens]).astype(
-                           np.int32)
+    kv_slot_mapping = rng.permutation(kv_capacity)[:num_tokens].astype(
+        np.int32)
 
     if num_pad > 0:
         pad_idx = rng.permutation(num_tokens)[:num_pad]
@@ -213,30 +218,39 @@ def _make_inputs(
     cos_sin_cache = rng.standard_normal((max_pos, rope_head_dim),
                                         dtype=np.float32)
 
-    cache_shape = shared_sparse_cache_shape(num_pages, PAGE_SIZE,
+    # Two physically separate buffers: state_cache_buf is the compressor's
+    # own dedicated scratch (never touched by real/compressed KV), cache is
+    # the shared main/compressed-KV buffer.
+    state_cache_buf_shape = shared_sparse_cache_shape(num_state_pages,
+                                                      PAGE_SIZE,
+                                                      head_dim - rope_head_dim,
+                                                      rope_head_dim,
+                                                      quant_block)
+    state_cache_buf = np.zeros(state_cache_buf_shape, dtype=np.uint8)
+
+    cache_shape = shared_sparse_cache_shape(num_kv_pages, PAGE_SIZE,
                                             head_dim - rope_head_dim,
                                             rope_head_dim, quant_block)
     cache = np.zeros(cache_shape, dtype=np.uint8)
 
-    return {
-        "kv_score": kv_score,
-        "ape": ape,
-        "norm_weight": norm_weight,
-        "cos_sin_cache": cos_sin_cache,
-        "positions": positions,
-        "slot_mapping": slot_mapping,
-        "block_table": block_table,
-        "token_to_req_indices": token_to_req_indices,
-        "kv_slot_mapping": kv_slot_mapping,
-        "cache": cache,
-        "state_block_size": state_block_size,
-        "head_dim": head_dim,
-        "rope_head_dim": rope_head_dim,
-        "compress_ratio": compress_ratio,
-        "overlap": overlap,
-        "rms_eps": 1e-6,
-        "quant_block": quant_block,
-    }
+    return dict(kv_score=kv_score,
+                ape=ape,
+                norm_weight=norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                token_to_req_indices=token_to_req_indices,
+                kv_slot_mapping=kv_slot_mapping,
+                state_cache_buf=state_cache_buf,
+                cache=cache,
+                state_block_size=state_block_size,
+                head_dim=head_dim,
+                rope_head_dim=rope_head_dim,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rms_eps=1e-6,
+                quant_block=quant_block)
 
 
 def _to_jax(kw):
@@ -251,7 +265,7 @@ def _save_state_ref(kv, score, kw):
     coff = 1 + int(kw["overlap"])
     state_dim = 2 * coff * kw["head_dim"]
     sb = kw["state_block_size"]
-    num_pages = kw["cache"].shape[0]
+    num_pages = kw["state_cache_buf"].shape[0]
     ape = kw["ape"].astype(np.float32)
     positions = kw["positions"]
     slot_mapping = kw["slot_mapping"]
@@ -304,7 +318,8 @@ def _naive_reference(kw):
         compress_ratio=kw["compress_ratio"],
         overlap=kw["overlap"],
         rms_eps=kw["rms_eps"],
-        quant_block=kw["quant_block"])
+        quant_block=kw["quant_block"],
+        num_kv_pages=kw["cache"].shape[0])
     return _dequant(nope, rope, scale, kw)
 
 
@@ -348,8 +363,8 @@ def test_compressor_forward_matches_reference(compress_ratio, overlap, seq_len,
                       seed=seed)
     ref_deq = _naive_reference(kw)
 
-    act_cache = np.asarray(compressor_forward(**_to_jax(kw)))
-    act_deq = _dequant_written(act_cache, kw)
+    act_cache, _act_state_cache_buf = compressor_forward(**_to_jax(kw))
+    act_deq = _dequant_written(np.asarray(act_cache), kw)
 
     # Compare the dequantized compressed-KV at the boundary slots actually
     # written.
@@ -367,7 +382,8 @@ def test_compressor_forward_eval_shape():
     jkw = _to_jax(kw)
 
     def fn(kv_score, ape, norm_weight, cos_sin_cache, positions, slot_mapping,
-           block_table, token_to_req_indices, kv_slot_mapping, cache):
+           block_table, token_to_req_indices, kv_slot_mapping, state_cache_buf,
+           cache):
         return compressor_forward(kv_score=kv_score,
                                   ape=ape,
                                   norm_weight=norm_weight,
@@ -377,6 +393,7 @@ def test_compressor_forward_eval_shape():
                                   block_table=block_table,
                                   token_to_req_indices=token_to_req_indices,
                                   kv_slot_mapping=kv_slot_mapping,
+                                  state_cache_buf=state_cache_buf,
                                   cache=cache,
                                   state_block_size=kw["state_block_size"],
                                   head_dim=kw["head_dim"],
@@ -386,28 +403,24 @@ def test_compressor_forward_eval_shape():
                                   rms_eps=kw["rms_eps"],
                                   quant_block=kw["quant_block"])
 
-    out_cache = jax.eval_shape(fn, jkw["kv_score"], jkw["ape"],
-                               jkw["norm_weight"], jkw["cos_sin_cache"],
-                               jkw["positions"], jkw["slot_mapping"],
-                               jkw["block_table"], jkw["token_to_req_indices"],
-                               jkw["kv_slot_mapping"], jkw["cache"])
+    out_cache, out_state_cache_buf = jax.eval_shape(
+        fn, jkw["kv_score"], jkw["ape"], jkw["norm_weight"],
+        jkw["cos_sin_cache"], jkw["positions"], jkw["slot_mapping"],
+        jkw["block_table"], jkw["token_to_req_indices"],
+        jkw["kv_slot_mapping"], jkw["state_cache_buf"], jkw["cache"])
     assert out_cache.shape == kw["cache"].shape
     assert out_cache.dtype == jnp.uint8
+    assert out_state_cache_buf.shape == kw["state_cache_buf"].shape
+    assert out_state_cache_buf.dtype == jnp.uint8
 
 
+@requires_tpu
 def test_compressor_forward_runs_on_tpu():
     """Executes on TPU and confirms the backend really is TPU."""
-    try:
-        backend = jax.default_backend()
-    except Exception as exc:
-        pytest.skip(f"JAX TPU backend failed to initialize: {exc}")
-    if backend != "tpu":
-        pytest.skip(f"Expected JAX TPU backend, got {backend}.")
-
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
     ref_deq = _naive_reference(kw)
 
-    act = compressor_forward(**_to_jax(kw))
+    act, act_state_cache_buf = compressor_forward(**_to_jax(kw))
     act.block_until_ready()
     assert act.devices().pop().platform == "tpu"
 

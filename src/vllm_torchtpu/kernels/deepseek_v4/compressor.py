@@ -77,7 +77,10 @@ def compressor_forward(
         block_table: jax.Array,  # [num_reqs, max_blocks] int state pages
         token_to_req_indices: jax.Array,  # [num_tokens] int req id per token
         kv_slot_mapping: jax.Array,  # [num_tokens] int flat compressed-KV slot
-        cache: jax.Array,  # [num_pages, page_size//4, 4, width] uint8
+        state_cache_buf: jax.
+    Array,  # [num_state_pages, page_size//4, 4, width] uint8; dedicated, not shared with any real KV
+        cache: jax.
+    Array,  # [num_pages, page_size//4, 4, width] uint8; shared main/compressed-KV buffer
         state_block_size: int,  # state tokens per page (4=C4, 8=C128)
         head_dim: int,  # 512 for sparse CSA/HCA main path
         rope_head_dim: int,  # 64; trailing dims get interleaved RoPE
@@ -86,19 +89,25 @@ def compressor_forward(
         rms_eps: float,
         quant_block: int,  # fp8 absmax block along nope (64)
 ):
-    """head_dim=512 path: project, save state, compress, store into one buffer.
+    """head_dim=512 path: project, save state, compress, store.
 
-    State cache and compressed KV cache share the same underlying ``cache``
-    buffer (see ``compress_norm_rope`` for layout).
+    ``state_cache_buf`` is the compressor's own dedicated scratch buffer (its
+    own vLLM-managed KV-cache-spec allocation, physically disjoint from any
+    real attention KV data). ``cache`` is the shared main/compressed-KV buffer
+    that the attention kernels also read/write. Keeping these separate is
+    what prevents the compressor's per-token state write (which otherwise
+    would touch every row-slot of whatever page it lands on) from ever
+    clobbering real or compressed KV bytes.
     """
     coff = 1 + int(overlap)
     state_dim = 2 * coff * head_dim
 
-    state_view = unpack_state_cache(cache, state_block_size, state_dim)
+    state_view = unpack_state_cache(state_cache_buf, state_block_size,
+                                    state_dim)
     state_view = save_partial_states(kv_score, ape, positions, state_view,
                                      slot_mapping, head_dim, overlap,
                                      compress_ratio)
-    cache = pack_state_cache(cache, state_view)
+    state_cache_buf = pack_state_cache(state_cache_buf, state_view)
 
     cache = compress_norm_rope_store(
         cache=cache,
@@ -119,7 +128,7 @@ def compressor_forward(
         quant_block=quant_block,
     )
 
-    return cache
+    return cache, state_cache_buf
 
 
 def compressor_forward_indexer(
@@ -132,7 +141,10 @@ def compressor_forward_indexer(
         block_table: jax.Array,  # [num_reqs, max_blocks] int state pages
         token_to_req_indices: jax.Array,  # [num_tokens] int req id per token
         kv_slot_mapping: jax.Array,  # [num_tokens] int flat indexer-KV slot
-        cache: jax.Array,  # [num_pages, page_size//4, 4, width] uint8
+        state_cache_buf: jax.
+    Array,  # [num_state_pages, page_size//4, 4, width] uint8; dedicated, not shared with any real KV
+        cache: jax.
+    Array,  # [num_pages, page_size//4, 4, width] uint8; shared main/indexer-KV buffer
         state_block_size: int,  # indexer state tokens per page
         head_dim: int,  # 128 for the indexer path
         rope_head_dim: int,  # 64; trailing dims get interleaved RoPE
@@ -145,11 +157,12 @@ def compressor_forward_indexer(
     coff = 1 + int(overlap)
     state_dim = 2 * coff * head_dim
 
-    state_view = unpack_state_cache(cache, state_block_size, state_dim)
+    state_view = unpack_state_cache(state_cache_buf, state_block_size,
+                                    state_dim)
     state_view = save_partial_states(kv_score, ape, positions, state_view,
                                      slot_mapping, head_dim, overlap,
                                      compress_ratio)
-    cache = pack_state_cache(cache, state_view)
+    state_cache_buf = pack_state_cache(state_cache_buf, state_view)
 
     cache = compress_norm_rope_store_indexer(
         cache=cache,
@@ -170,4 +183,4 @@ def compressor_forward_indexer(
         quant_block=quant_block,
     )
 
-    return cache
+    return cache, state_cache_buf

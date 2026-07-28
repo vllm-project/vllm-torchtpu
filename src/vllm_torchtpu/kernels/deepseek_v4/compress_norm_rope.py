@@ -71,10 +71,17 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     blocked = x.reshape(*lead, dim // block_size, block_size)
     amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4,
                     None)
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
-    q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
-    scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
-    return q, scale
+    exponent = jnp.ceil(jnp.log2(amax / fp8_max))
+    scale = jnp.exp2(exponent)
+    # Explicit clip before the fp8 cast: rounding error in the ceil/log2/exp2
+    # scale chain can push a borderline value just past fp8_max, and
+    # round-to-nearest during the cast then lands on float8_e4m3fn's
+    # reserved NaN bit pattern instead of saturating at the max finite value.
+    q = jnp.clip(blocked * (1.0 / scale), -fp8_max,
+                 fp8_max).astype(jnp.float8_e4m3fn).reshape(x.shape)
+    scale_u8 = jnp.squeeze(exponent + 127.0,
+                           -1).astype(jnp.int32).astype(jnp.uint8)
+    return q, scale_u8
 
 
 def sparse_packed_width(nope_dim: int, rope_head_dim: int,
@@ -102,8 +109,8 @@ def unpack_sparse_kv_cache(kv_cache: jax.Array, nope_dim: int,
     b = a + rope_head_dim * 2
     nope = _from_byte_lane(kv_cache[..., :a], jnp.float8_e4m3fn)
     rope = _from_byte_lane(kv_cache[..., a:b], jnp.bfloat16)
-    scale = _from_byte_lane(kv_cache[..., b:b + n_qb],
-                            jnp.float8_e8m0fnu).astype(jnp.float32)
+    scale_bytes = _from_byte_lane(kv_cache[..., b:b + n_qb], jnp.uint8)
+    scale = jnp.exp2(scale_bytes.astype(jnp.float32) - 127.0)
     return nope, rope, scale
 
 
@@ -112,8 +119,9 @@ def unpack_indexer_kv_cache(kv_cache: jax.Array, head_dim: int,
     """Split the packed indexer KV cache into ``(fp8, scale)`` views."""
     n_qb = head_dim // quant_block
     fp8 = _from_byte_lane(kv_cache[..., :head_dim], jnp.float8_e4m3fn)
-    scale = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb],
-                            jnp.float8_e8m0fnu).astype(jnp.float32)
+    scale_bytes = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb],
+                                  jnp.uint8)
+    scale = jnp.exp2(scale_bytes.astype(jnp.float32) - 127.0)
     return fp8, scale
 
 
@@ -305,7 +313,12 @@ def gather_state_windows(
     req = token_to_req_indices[:, None]
     # Gather page numbers (optimized to 1D indexing to avoid 2D index bitpacking)
     max_blocks = block_table.shape[-1]
-    flat_index = req * max_blocks + (safe_pos // block_size)
+    # Wrap within this request's own block allocation (circular/sliding-window
+    # buffer) -- without the modulo, positions beyond max_blocks*block_size
+    # alias into the *next* request's block-table slice. Must stay consistent
+    # with the matching wraparound in custom_ops/deepseek_v4.py's
+    # state_cache_block_num computation (the write side).
+    flat_index = req * max_blocks + (safe_pos // block_size) % max_blocks
     block_numbers = block_table.reshape(-1)[flat_index]
     block_offsets = safe_pos % block_size
 
