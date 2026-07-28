@@ -3880,25 +3880,29 @@ class TPUModelRunner(GPUModelRunner):
                            self.input_batch.num_reqs)
 
     @contextmanager
-    def _profile_no_cache_writes(self) -> Iterator[None]:
-        # Keep the kv=0-specialized profile compile out of the persistent
-        # serving cache. Flips only the disable flag; does not touch
-        # compile_sizes / compile_ranges_split_points / cache_dir, so
-        # capture_model sees its normal compile config.
-        saved_env = os.environ.get("VLLM_DISABLE_COMPILE_CACHE")
-        clear_envs = getattr(envs.__getattr__, "cache_clear", None)
-        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-        if clear_envs:
-            clear_envs()
+    def _profile_isolated_cache(self) -> Iterator[None]:
+        # Isolate the kv=0-specialized profile compile into a dedicated
+        # subdirectory ("profile_cache") so it can be cached across warm
+        # restarts without colliding with the real serving cache (kv > 0)
+        # or across different models / TP sizes / dtypes.
+        import hashlib
+
+        from vllm.compilation.caching import aot_compile_hash_factors
+
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+        cc = self.vllm_config.compilation_config
+        base_cache_dir = cc.cache_dir or envs.VLLM_CACHE_ROOT
+        factors = aot_compile_hash_factors(self.vllm_config)
+        factors.append(compute_tpu_compilation_hash(self.vllm_config))
+        hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
+        saved_cache_dir = cc.cache_dir
+        cc.cache_dir = os.path.join(base_cache_dir, "profile_cache", hash_key)
+        os.makedirs(cc.cache_dir, exist_ok=True)
         try:
             yield
         finally:
-            if saved_env is None:
-                os.environ.pop("VLLM_DISABLE_COMPILE_CACHE", None)
-            else:
-                os.environ["VLLM_DISABLE_COMPILE_CACHE"] = saved_env
-            if clear_envs:
-                clear_envs()
+            cc.cache_dir = saved_cache_dir
 
     def profile_run(
         self,
@@ -3931,7 +3935,7 @@ class TPUModelRunner(GPUModelRunner):
             # program-region reservation, and the kv=0-specialized graphs are
             # dead after the dynamo reset below — one throwaway program keeps
             # the region within budget for capture_model's full bucket ladder.
-            with self._profile_no_cache_writes():
+            with self._profile_isolated_cache():
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)
