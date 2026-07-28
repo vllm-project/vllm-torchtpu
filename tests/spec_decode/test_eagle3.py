@@ -97,6 +97,76 @@ def test_draft_tp_invalid_raises(draft_tp):
         _make_proposer(draft_tp=draft_tp, target_tp=8)
 
 
+class TestDpLockstepSharded:
+    """Which drafts must have their collective trace replayed by idle DP ranks.
+
+    A draft emits cross-DP collectives either because it is TP-sharded, or
+    because it carries MoE whose experts are expert-parallel across the DP
+    group — the latter holds even at draft_tp=1, since forcing the draft to
+    tp=1 does not make its MoE rank-local.
+    """
+
+    def _proposer(self, *, target_tp, lockstep, has_moe, loaded=True):
+        proposer = _make_proposer(draft_tp=None, target_tp=target_tp)
+        proposer.runner._dp_lockstep_enabled = lambda: lockstep
+        proposer.draft_model = object() if loaded else None
+        return proposer, mock.patch(
+            "vllm.model_executor.models.interfaces.is_mixture_of_experts",
+            return_value=has_moe)
+
+    def test_replicated_moe_draft_under_ep_dp_pairs(self):
+        # TP=1 + DP>1 + EP: the MoE draft still needs idle-rank pairing.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=True)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is True
+
+    def test_replicated_dense_draft_does_not_pair(self):
+        # A tp=1 dense draft is entirely rank-local: nothing to pair with.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=False)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is False
+
+    def test_sharded_draft_pairs_regardless_of_moe(self):
+        proposer, moe_patch = self._proposer(target_tp=8,
+                                             lockstep=True,
+                                             has_moe=False)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is True
+
+    def test_no_lockstep_never_pairs(self):
+        # DP=1 or EP off: no cross-DP collective program to match.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=False,
+                                             has_moe=True)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is False
+
+    def test_moe_detection_is_cached(self):
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=True)
+        with moe_patch as m:
+            assert proposer._dp_lockstep_sharded() is True
+            assert proposer._dp_lockstep_sharded() is True
+            assert m.call_count == 1
+
+    def test_unloaded_draft_reports_no_moe(self):
+        # Queried before load_model: must not raise, and must not cache a
+        # False that would outlive the load.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=True,
+                                             loaded=False)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is False
+            proposer.draft_model = object()
+            assert proposer._dp_lockstep_sharded() is True
+
+
 def _make_chunk(*,
                 input_ids,
                 position_ids,
@@ -140,6 +210,7 @@ def test_prepare_draft_inputs(device):
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -188,6 +259,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -235,6 +307,7 @@ def test_prepare_draft_inputs_async_device(device):
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -612,7 +685,8 @@ def test_loop_bucket_constant_under_sharded_lockstep():
     assert proposer._loop_bucket(33) == 64
 
     rep = _make_proposer(draft_tp=1, target_tp=2)
-    rep.runner = SimpleNamespace(num_tokens_paddings=[16, 32, 64, 128])
+    rep.runner = SimpleNamespace(num_tokens_paddings=[16, 32, 64, 128],
+                                 _dp_lockstep_enabled=lambda: False)
     assert rep._loop_bucket(1) == 16
     assert rep._loop_bucket(33) == 64
 

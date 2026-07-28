@@ -105,6 +105,8 @@ class Eagle3Proposer:
                 f"on TPU: it must be 1 (replicated draft) or {target_tp} "
                 f"(== target tensor_parallel_size, sharded draft).")
         self._draft_replicated = (draft_tp == 1)
+        # Lazily resolved by _draft_has_moe once the draft model exists.
+        self._draft_has_moe_cache: bool | None = None
         logger.info(
             "%s draft parallelism: %s (draft_tp=%s).",
             self.speculative_config.method,
@@ -968,15 +970,39 @@ class Eagle3Proposer:
             return self.draft_model.model.fc_input_size
         return self._draft_hidden_size()
 
-    def _dp_lockstep_sharded(self) -> bool:
-        """True when the draft is TP-SHARDED under EP-DP lockstep.
+    def _draft_has_moe(self) -> bool:
+        """Whether the draft model carries MoE layers.
 
-        In that one topology the draft's internal collectives are part of the
-        cross-rank collective program, so every rank must execute the same collective trace.
-        The replicated (draft_tp=1) draft has no collectives and needs none of this.
+        A TP-replicated draft is not rank-local when it carries MoE: under
+        `--enable-expert-parallel` the experts are distributed across the DP
+        group, so the draft forward emits cross-DP collectives just like a
+        TP-sharded draft does. `_force_draft_tp1` only collapses the TP group;
+        it does not make the MoE local. (The MTP draft of an MoE target is
+        itself a full decoder layer, MoE block included.) Cached after the
+        first query; False until the draft model is loaded.
         """
-        return (not self._draft_replicated
-                and self.runner._dp_lockstep_enabled())
+        if self._draft_has_moe_cache is None:
+            if self.draft_model is None:
+                return False
+            from vllm.model_executor.models.interfaces import \
+                is_mixture_of_experts
+            self._draft_has_moe_cache = bool(
+                is_mixture_of_experts(self.draft_model))
+        return self._draft_has_moe_cache
+
+    def _dp_lockstep_sharded(self) -> bool:
+        """True when the draft emits cross-DP collectives under EP-DP lockstep.
+
+        Those collectives are part of the cross-rank collective program, so
+        every rank must execute the same collective trace. Two ways the draft
+        can emit them: it is TP-SHARDED (its TP collectives ride the same
+        program), or it carries expert-parallel MoE layers, whose experts span
+        the DP group even when the draft is TP-replicated (draft_tp=1). A
+        replicated, MoE-free draft is entirely local and needs none of this.
+        """
+        if not self.runner._dp_lockstep_enabled():
+            return False
+        return not self._draft_replicated or self._draft_has_moe()
 
     def _loop_bucket(self, num_reqs: int) -> int:
         """Loop-phase token bucket p (carries, lm-head gathers, loop forwards).
