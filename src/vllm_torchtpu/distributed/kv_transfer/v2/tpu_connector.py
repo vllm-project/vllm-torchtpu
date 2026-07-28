@@ -17,7 +17,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer.v2.strided_bridge import \
     TPUConnectorV2StridedBridge
 from vllm_torchtpu.distributed.kv_transfer.v2.strided_transfer import (
@@ -3028,9 +3027,6 @@ class TPUConnectorV2(KVConnectorBase_V1, SupportsHMA):
         del kwargs
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
-        if not tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:
-            raise ValueError("TPUConnectorV2 requires "
-                             "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
         self._connector_metadata = None
 
         if role == KVConnectorRole.SCHEDULER:

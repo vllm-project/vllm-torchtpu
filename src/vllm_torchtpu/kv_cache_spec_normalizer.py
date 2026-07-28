@@ -9,14 +9,11 @@ from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
 def normalize_kv_cache_specs_for_tpu(
     kv_cache_specs: dict[str, KVCacheSpec],
     kv_cache_dtype: str | torch.dtype,
-    *,
-    enable_unified_kv_layout: bool = False,
 ) -> dict[str, KVCacheSpec]:
     normalized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_specs.items():
         normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
-    if (enable_unified_kv_layout
-            and _has_hybrid_attention_and_mamba(normalized)):
+    if _has_hybrid_attention_and_mamba(normalized):
         page_size = max(spec.page_size_bytes for spec in normalized.values())
         normalized = {
             layer_name: _pad_page_size(spec, page_size)

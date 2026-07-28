@@ -1424,7 +1424,7 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     overridden to create the TPU-specific transfer worker.
 
     Hybrid attention+Mamba models (e.g. Qwen 3.5) run on the unified block
-    pool (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1, enforced by tpu_platform):
+    pool:
     attention KV and mamba state live in the same attention-shaped pool
     buffers, every group's block IDs address rows of those same buffers,
     and a transferred block is one dtype-agnostic pool row. The same

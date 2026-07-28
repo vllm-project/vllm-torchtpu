@@ -20,8 +20,8 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
+from vllm_torchtpu.platforms.tpu_block_size_utils import \
+    update_tpu_block_size_and_slot_config
 from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
@@ -707,8 +707,7 @@ class TpuPlatform(Platform):
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # align-mode mamba state seeding (MambaApcStateCopier on the
-        # typed-view layout, or the pool's seed copies); other cache modes
+        # align-mode mamba state seeding (the pool's seed copies); other modes
         # and speculative decoding must be rejected up front instead of
         # failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
@@ -725,8 +724,7 @@ class TpuPlatform(Platform):
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
-        if unified_kv_layout_enabled(vllm_config):
-            update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
+        update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
         min_page_size = backend_cls.get_min_page_size(vllm_config)
         if min_page_size > cache_config.block_size:
@@ -857,20 +855,6 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
-            if (kv_transfer_config.kv_connector == "TPUConnectorV2"
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
-                raise ValueError("TPUConnectorV2 requires "
-                                 "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
-            is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    == "OffloadingConnector" and is_hybrid)
-            if (is_hybrid_offloading
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
-                # Hybrid CPU offloading transfers whole pool rows; the
-                # typed-view layout has no uniform per-block row to copy.
-                raise ValueError(
-                    "CPU offloading (OffloadingConnector) on hybrid "
-                    "attention+Mamba models requires the unified block "
-                    "pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

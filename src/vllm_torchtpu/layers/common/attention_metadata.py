@@ -145,15 +145,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
 
         if not self.is_mamba_group:
             mamba_state_indices = None
-        elif ctx.mamba_state_indices is not None:
-            # Default compact-mamba path: the runner provides a per-request
-            # physical slot id from the compact slot pool.
-            mamba_state_indices = ctx.mamba_state_indices
-        elif runner._unified_kv_layout:
+        else:
             # The pool keys mamba state by vLLM block ids in every cache
-            # mode (it has no compact slot pool). Derive the current physical
-            # state
-            # slot on device from the zero-padded `block_tables_dev` (padded
+            # mode. Derive the current physical state slot on device from
+            # the zero-padded `block_tables_dev` (padded
             # tail rows resolve to the null block, never a stale id — the
             # GDN op scans the full length every step), avoiding a
             # D2H -> CPU gather -> H2D dependency.
@@ -169,8 +164,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 dim=1,
                 index=state_block_offsets.unsqueeze(1),
             ).squeeze(1)
-        else:
-            mamba_state_indices = None
 
         return AttentionMetadata(
             input_positions=input_positions,

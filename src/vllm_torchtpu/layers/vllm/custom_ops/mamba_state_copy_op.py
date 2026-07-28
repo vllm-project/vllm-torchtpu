@@ -56,7 +56,7 @@ def copy_mamba_state_blocks(pool: torch.Tensor, src: torch.Tensor,
     return marker
 
 
-# --- Typed-view state copy (MambaApcStateCopier, split per-state arrays) ---
+# --- Typed-view state copy (split per-state arrays) ---
 
 _mamba_state_copy_op = None
 

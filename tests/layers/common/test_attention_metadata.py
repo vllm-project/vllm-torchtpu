@@ -137,7 +137,6 @@ class TestAttentionMetadataBuilderPlumbing:
 
     def test_build_mamba_state_indices_from_current_block_table_entry(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
-        runner._unified_kv_layout = True
         runner._mamba_align_mode = True
         builder = self._make_mamba_builder(runner)
 
@@ -167,7 +166,6 @@ class TestAttentionMetadataBuilderPlumbing:
 
     def test_unified_none_mode_derives_state_indices_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
-        runner._unified_kv_layout = True
         runner._mamba_align_mode = False
         builder = self._make_mamba_builder(runner)
 

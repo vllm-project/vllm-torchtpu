@@ -98,7 +98,6 @@ def test_hybrid_specs_use_uniform_page_size_when_unified_enabled():
             "mamba": mamba_spec,
         },
         torch.float8_e4m3fn,
-        enable_unified_kv_layout=True,
     )
 
     assert normalized["attn"].page_size_bytes == normalized[

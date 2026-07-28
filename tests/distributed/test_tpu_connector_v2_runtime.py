@@ -14,16 +14,6 @@ from .tpu_connector_v2_test_utils import (_assert_log_messages,
                                           _load_v2_module)
 
 
-def test_v2_connector_requires_unified_layout(monkeypatch):
-    mod = _load_v2_module(monkeypatch)
-    sys.modules[
-        "vllm_torchtpu.envs"].TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL = False
-
-    config = types.SimpleNamespace(kv_transfer_config=object())
-    with pytest.raises(ValueError, match="UNIFIED_BLOCK_POOL"):
-        mod.TPUConnectorV2(config, mod.KVConnectorRole.SCHEDULER)
-
-
 def _stub_vllm_config(**overrides):
     config = types.SimpleNamespace(
         kv_transfer_config=types.SimpleNamespace(is_kv_producer=False,

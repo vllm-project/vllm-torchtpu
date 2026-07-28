@@ -421,7 +421,6 @@ configure_role_environment() {
 
   # This is the single current layout gate. The removed alias-fallback flag
   # must not influence the test, even if it is set in the invoking shell.
-  export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
   unset TPU_VLLM_KV_CACHE_ALIAS_FALLBACK
   export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
   export TPU_RAIDEN_QWEN35_ADMISSION=1

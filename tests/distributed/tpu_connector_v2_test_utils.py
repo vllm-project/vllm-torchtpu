@@ -151,7 +151,6 @@ def _load_v2_module(monkeypatch: Any, *, stub_zmq: bool = True):
         monkeypatch.setitem(sys.modules, name, package)
 
     tpu_envs = types.ModuleType("vllm_torchtpu.envs")
-    tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL = True
     monkeypatch.setitem(sys.modules, "vllm_torchtpu.envs", tpu_envs)
 
     def get_loopback_host() -> str:

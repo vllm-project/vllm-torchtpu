@@ -14,14 +14,6 @@ else:
 
 logger = init_logger(__name__)
 
-
-def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
-    """Whether the deployment uses the attention-shaped unified KV pool."""
-    del vllm_config
-    from vllm_torchtpu import envs as tpu_envs
-    return tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-
-
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,

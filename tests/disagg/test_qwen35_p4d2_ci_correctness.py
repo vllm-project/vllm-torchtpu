@@ -378,8 +378,6 @@ def test_ci_wrapper_uses_hugging_face_model_and_existing_p4d2_launcher():
     assert "smoke_qwen35_p4d2_v2_prefix_cache_correctness.py" in text
     assert "smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py" in text
     assert "prefix_cache_e2e_divergence.log" in text
-    assert "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL" in text
-    assert "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL" in launcher_text
     assert "--kv-cache-dtype fp8" in launcher_text
     assert removed_alias_env not in text
     assert removed_alias_env not in launcher_text
