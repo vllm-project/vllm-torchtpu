@@ -190,17 +190,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
-    # Gated Delta Rule implementation. Default is the fused Conv1D+GDN v3
-    # kernel; the older `chunked_kernel_pd` (v1) path is intentionally not a
-    # valid choice — v1's ConcatBitcast conv-state assembly corrupts persistent
-    # I/O-aliased state under libtpu 0.0.42.1 (mmlu_pro collapse on Qwen3.5),
-    # and v3 supersedes it in every config we run.
-    "RAGGED_GATED_DELTA_RULE_IMPL":
-    env_with_choices("RAGGED_GATED_DELTA_RULE_IMPL", "chunked_kernel_v3_pd", [
-        "ref", "chunked_jax_pd", "chunked_kernel_p_jax_d",
-        "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd",
-        "chunked_kernel_v3_pd"
-    ]),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors

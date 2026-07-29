@@ -23,8 +23,7 @@ This check is deliberately built to flag real corruption without false alarms:
     is what catches a real state-bleed even if it were somehow reproducible.
 
 Config is env-driven so the same file runs both the plain (default) and the
-batched-RPA (``E2E_ATTN_BACKEND=CUSTOM``) pooled paths; the GDN kernel is
-selected by ``RAGGED_GATED_DELTA_RULE_IMPL`` as usual.
+batched-RPA (``E2E_ATTN_BACKEND=CUSTOM``) pooled paths.
 
 Success = PREFIX_CACHE_OK. Any mismatch prints the offending tokens for triage.
 """
