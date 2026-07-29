@@ -190,11 +190,11 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
-    tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
-    # Normally already applied by register_tpu_platform(); repeated here (it is
-    # idempotent) so processes that reach the platform without going through
-    # plugin registration still get it.
-    tpu_plugin._patch_vllm_profiler_kind_torch_phased()
+    # Needed for spawned workers, which never run pre_register_and_update():
+    # reconstructing a VllmConfig there would otherwise re-validate
+    # profiler_config against vLLM's class and reject the phased kind. No
+    # parser to pass -- workers do not parse arguments.
+    tpu_plugin._patch_vllm_profiler_config_class()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_vllm_disable_compile_ranges()
@@ -593,6 +593,17 @@ class TpuPlatform(Platform):
                     object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu",
                                        tpu_t)
         return {}
+
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        """Register TPU-specific config classes before CLI args are parsed.
+
+        vLLM calls this before building a VllmConfig, which is the window the
+        profiler config class has to be swapped in: check_and_update_config()
+        is too late, as the config object already exists by then.
+        """
+        from vllm_torchtpu import _patch_vllm_profiler_config_class
+        _patch_vllm_profiler_config_class(parser)
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

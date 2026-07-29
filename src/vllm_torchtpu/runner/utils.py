@@ -12,6 +12,8 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.profiler_config import \
+    PHASED_DECODE_ONLY_KV_LEN_THRESHOLD_DISABLED
 
 logger = init_logger(__name__)
 
@@ -22,31 +24,8 @@ DECODE_HEAVY_RATIO_THRESHOLD = 0.2
 BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
 PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
-PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
-
-# `profiler_config.profiler` value that selects phased profiling, registered
-# on vLLM's ProfilerConfig by `_patch_vllm_profiler_kind_torch_phased`. The
-# trace directory comes from `profiler_config.torch_profiler_dir`.
-TORCH_PHASED_PROFILER_KIND = "torch_phased"
-
-# Kinds that record through the torch profiler and therefore share
-# `torch_profiler_dir`.
-TORCH_PROFILER_KINDS = ("torch", TORCH_PHASED_PROFILER_KIND)
-
 # Superseded by `profiler_config`; rejected at startup in tpu_platform.
 LEGACY_PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
-
-# Tuning knob with no `profiler_config` equivalent, so it stays in
-# `additional_config`.
-PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
-    "phased_profiler_decode_only_kv_len_threshold")
-
-# Diagnostics-only knobs: they steer profiling and never change the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
-# TPU compile cache key. Keep this in sync with the keys read above.
-HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
-    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
-})
 
 
 class InferencePhase(Enum):
@@ -159,7 +138,7 @@ class PhaseBasedProfiler:
         num_decode_steps_to_skip:
         int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
         decode_kv_len_threshold:
-        int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+        int = PHASED_DECODE_ONLY_KV_LEN_THRESHOLD_DISABLED,
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: Optional[str] = None

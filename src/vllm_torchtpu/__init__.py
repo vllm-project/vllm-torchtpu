@@ -29,145 +29,79 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 
 
-def _patch_vllm_config_hash_ignore_diagnostics() -> None:
-    """Keep diagnostics-only ``additional_config`` keys out of cache keys.
+def _patch_vllm_profiler_config_class(parser=None) -> None:
+    """Point ``VllmConfig.profiler_config`` at vllm-torchtpu's subclass.
 
-    ``VllmConfig.compute_hash()`` unconditionally folds
-    ``json.dumps(additional_config)`` into its result, and that hash feeds both
-    the AOT compile cache key (``caching.aot_compile_hash_factors``) and the
-    piecewise cache dir (``backends.py``). The phased profiler is configured
-    through ``additional_config``, so a per-run trace directory would force a
-    full recompile on every server start. Upstream takes the same care in
-    ``ProfilerConfig.compute_hash()`` ("this config will not affect the
-    computation graph"); this is the equivalent carve-out for the plugin-owned
-    keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars.
+    ``VllmConfig`` compiles the class it was annotated with into its pydantic
+    schema at class-definition time, so rebinding
+    ``vllm.config.profiler.ProfilerConfig`` has no effect. The field on
+    ``VllmConfig`` has to be repointed and its schema rebuilt.
+
+    ``parser``, when given, is the CLI parser vLLM passes to
+    ``pre_register_and_update``. By then ``--profiler-config`` has already been
+    registered with a converter bound to the old class, so that converter is
+    retargeted too.
     """
-    import copy
-
+    from pydantic.dataclasses import rebuild_dataclass
     from vllm.config import VllmConfig
 
-    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    from vllm_torchtpu.profiler_config import TpuProfilerConfig
 
-    if getattr(VllmConfig, "_tpu_additional_config_hash_patch", False):
+    field = VllmConfig.__pydantic_fields__.get("profiler_config")
+    if field is not None and field.annotation is TpuProfilerConfig:
         return
-
-    original = VllmConfig.compute_hash
-
-    def compute_hash(self) -> str:
-        additional_config = self.additional_config
-        if not isinstance(additional_config, dict):
-            return original(self)
-        filtered = {
-            key: value
-            for key, value in additional_config.items()
-            if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
-        }
-        if filtered == additional_config:
-            return original(self)
-        # Hash a shallow copy with the filtered dict rather than mutating the
-        # live config: compute_hash() may run while other code holds the same
-        # VllmConfig, and a shallow copy shares every sub-config by reference
-        # (cheap, no re-validation -- __post_init__ is not re-run) while giving
-        # compute_hash its own additional_config to read.
-        proxy = copy.copy(self)
-        proxy.additional_config = filtered
-        return original(proxy)
-
-    VllmConfig._tpu_upstream_compute_hash = original
-    VllmConfig.compute_hash = compute_hash
-    VllmConfig._tpu_additional_config_hash_patch = True
-    logger.info(
-        "Applied TPU patch: exclude diagnostics-only additional_config keys "
-        "%s from the compile cache key.",
-        sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS))
-
-
-def _patch_vllm_profiler_kind_torch_phased() -> None:
-    """Teach vLLM's ``ProfilerConfig`` a 'torch_phased' profiler kind.
-
-    Captures one trace per inference phase rather than one continuous trace.
-    This is a vllm-torchtpu-only profiler, so vLLM's ``profiler`` field is a
-    closed ``Literal["torch", "cuda"]`` that rejects it.
-
-    pydantic v2 compiles ``Literal`` fields and ``@model_validator``s into a
-    cached core schema at class-definition time, so widening the type hint
-    alone does nothing -- the field's annotation and the validator both need
-    patching in the caches pydantic actually reads from, followed by a
-    forced schema rebuild. The patch is purely additive: existing
-    ``torch``/``cuda`` validation is preserved by delegating to the original
-    validator.
-    """
-    from typing import Literal, Optional
-
-    import vllm.config.profiler as profiler_module
-    from pydantic.dataclasses import rebuild_dataclass
-    from vllm.config.profiler import ProfilerConfig
-
-    from vllm_torchtpu.runner.utils import (TORCH_PHASED_PROFILER_KIND,
-                                            TORCH_PROFILER_KINDS)
-
-    if getattr(ProfilerConfig, "_tpu_torch_phased_profiler_kind_patch", False):
-        return
-
-    original_validate = ProfilerConfig._validate_profiler_config
-    widened_kind = Literal["torch", "cuda", TORCH_PHASED_PROFILER_KIND]
-    widened_annotation = Optional[widened_kind]
-
-    def validate(self):
-        profiler_dir = self.torch_profiler_dir
-        if profiler_dir and self.profiler not in TORCH_PROFILER_KINDS:
-            raise ValueError(
-                "torch_profiler_dir is only applicable when profiler is set "
-                f"to one of {TORCH_PROFILER_KINDS}")
-        if self.profiler in TORCH_PROFILER_KINDS and not profiler_dir:
-            raise ValueError("torch_profiler_dir must be set when profiler "
-                             f"is {self.profiler!r}")
-
-        # Delegate everything else (dir abspath/URI handling, ...) to the
-        # original validator by presenting a kind it already accepts.
-        # ignore_frontend rides along because AsyncLLM starts its frontend CPU
-        # profiler only for `profiler == "torch"` (v1/engine/async_llm.py), so
-        # a phased run genuinely has no frontend to profile -- without this the
-        # original validator warns about frontend overhead that cannot occur.
-        real_kind = self.profiler
-        real_ignore_frontend = self.ignore_frontend
-        try:
-            if real_kind == TORCH_PHASED_PROFILER_KIND:
-                self.profiler = "torch"
-                self.ignore_frontend = True
-            return original_validate(self)
-        finally:
-            if real_kind == TORCH_PHASED_PROFILER_KIND:
-                self.profiler = real_kind
-                self.ignore_frontend = real_ignore_frontend
 
     try:
-        profiler_module.ProfilerKind = widened_kind
-        ProfilerConfig.__pydantic_fields__["profiler"].annotation = (
-            widened_annotation)
-        ProfilerConfig.__annotations__["profiler"] = widened_annotation
-        ProfilerConfig.__dataclass_fields__["profiler"].type = (
-            widened_annotation)
-
-        ProfilerConfig._validate_profiler_config = validate
-        # rebuild_dataclass() rebuilds field schemas but does not re-collect
-        # @model_validator decorators, so the cached Decorator.func the
-        # validator actually runs from must be reassigned directly.
-        ProfilerConfig.__pydantic_decorators__.model_validators[
-            "_validate_profiler_config"].func = validate
-        rebuild_dataclass(ProfilerConfig, force=True)
+        field.annotation = TpuProfilerConfig
+        VllmConfig.__annotations__["profiler_config"] = TpuProfilerConfig
+        VllmConfig.__dataclass_fields__["profiler_config"].type = (
+            TpuProfilerConfig)
+        rebuild_dataclass(VllmConfig, force=True)
     except (AttributeError, KeyError) as e:
         raise RuntimeError(
-            "Failed to patch vllm.config.profiler.ProfilerConfig to accept "
-            f"{TORCH_PHASED_PROFILER_KIND!r}. This patch pokes at pydantic "
-            "internals (__pydantic_fields__, __dataclass_fields__, "
-            "__pydantic_decorators__) that a vLLM/pydantic version bump may "
-            "have reshaped; see "
-            "_patch_vllm_profiler_kind_torch_phased's docstring.") from e
+            "Failed to point VllmConfig.profiler_config at TpuProfilerConfig. "
+            "This reads pydantic/dataclass field internals "
+            "(__pydantic_fields__, __dataclass_fields__) that a vLLM or "
+            "pydantic version bump may have reshaped.") from e
 
-    ProfilerConfig._tpu_torch_phased_profiler_kind_patch = True
-    logger.info("Applied TPU patch: ProfilerConfig accepts profiler=%r.",
-                TORCH_PHASED_PROFILER_KIND)
+    if parser is not None:
+        _retarget_profiler_config_cli_arg(parser, TpuProfilerConfig)
+
+    logger.info("Applied TPU patch: VllmConfig.profiler_config uses %s.",
+                TpuProfilerConfig.__name__)
+
+
+def _retarget_profiler_config_cli_arg(parser, config_cls) -> None:
+    """Rebind the ``--profiler-config`` converter to ``config_cls``.
+
+    ``add_cli_args`` builds the converter from whatever class ``VllmConfig``
+    was annotated with at that moment, and only calls
+    ``pre_register_and_update`` afterwards -- so repointing the field alone
+    leaves the CLI still validating against vLLM's class. Mirrors upstream's
+    ``parse_dataclass`` in ``vllm/engine/arg_utils.py``.
+    """
+    import argparse
+
+    from pydantic import TypeAdapter, ValidationError
+    from vllm.engine.arg_utils import _expand_json_human_readable_numbers
+
+    action = next((a for a in parser._actions if a.dest == "profiler_config"),
+                  None)
+    if action is None:
+        # No --profiler-config on this parser (not every entry point builds
+        # the full engine arg set); the VllmConfig repoint above is enough.
+        return
+
+    adapter = TypeAdapter(config_cls)
+
+    def parse_profiler_config(val: str):
+        try:
+            return adapter.validate_json(
+                _expand_json_human_readable_numbers(val))
+        except ValidationError as e:
+            raise argparse.ArgumentTypeError(repr(e)) from e
+
+    action.type = parse_profiler_config
 
 
 def _patch_vllm_tpu_group_custom_ops() -> None:

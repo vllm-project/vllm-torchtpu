@@ -29,11 +29,4 @@ def _log_tpu_info() -> None:
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
     _log_tpu_info()
-    # Config-schema patches must land here rather than in apply_tpu_patches():
-    # this entry point runs while plugins are loaded, whereas
-    # apply_tpu_patches() runs from check_and_update_config(), by which point
-    # ProfilerConfig has already been constructed and would have rejected
-    # profiler='torch_phased'.
-    from vllm_torchtpu import _patch_vllm_profiler_kind_torch_phased
-    _patch_vllm_profiler_kind_torch_phased()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"

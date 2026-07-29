@@ -29,8 +29,8 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.profiler_config import TORCH_PHASED_PROFILER_KIND
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.utils import TORCH_PHASED_PROFILER_KIND
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
