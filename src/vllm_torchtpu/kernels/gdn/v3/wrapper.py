@@ -327,6 +327,7 @@ def fused_conv1d_gdn(
     distribution: jax.Array,  # [3]
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
+    ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
     *,
     n_kq: int,
     n_v: int,
@@ -412,11 +413,18 @@ def fused_conv1d_gdn(
         assert conv_state is None and recurrent_state is None
         assert state_source is not None
         if num_spec_tokens > 0:
-            # The slot must hold one checkpoint per window position; a plan
-            # without a checkpoint pitch would alias them all onto slot 0.
-            assert state_plan.ckpt_kb > 0 or state_plan.ckpt_rows > 0, (
-                "num_spec_tokens > 0 requires a state_plan with a "
-                "checkpoint pitch")
+            # Checkpoints must be individually addressable, or they would
+            # all alias onto slot 0: either the caller names a block per
+            # checkpoint, or the plan carries an affine pitch within the
+            # slot.
+            assert (ckpt_indices is not None or state_plan.ckpt_kb > 0
+                    or state_plan.ckpt_rows
+                    > 0), ("num_spec_tokens > 0 requires either ckpt_indices "
+                           "or a state_plan with a checkpoint pitch")
+            assert not (ckpt_indices is not None and
+                        (state_plan.ckpt_kb > 0 or state_plan.ckpt_rows
+                         > 0)), ("ckpt_indices and a checkpoint pitch are "
+                                 "alternative addressing schemes; pass one")
     else:
         assert state_source is None
         conv_out_dtype = conv_state.dtype
@@ -443,6 +451,15 @@ def fused_conv1d_gdn(
         read_offsets = jnp.zeros((num_seqs, ), dtype=jnp.int32)
     assert read_offsets.shape == (num_seqs, )
     read_offsets = read_offsets.astype(jnp.int32)
+    if ckpt_indices is not None:
+        # One source block per checkpoint (vLLM's ssm_state_indices scheme):
+        # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
+        # the group needs no affine pitch and the pool block only has to
+        # hold a single state.
+        assert ckpt_indices.shape == (num_seqs, num_spec_tokens +
+                                      1), (ckpt_indices.shape, num_seqs,
+                                           num_spec_tokens)
+        ckpt_indices = ckpt_indices.astype(jnp.int32)
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
@@ -556,6 +573,7 @@ def fused_conv1d_gdn(
                 state_indices=state_indices,
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
+                ckpt_indices=ckpt_indices,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
@@ -566,6 +584,7 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
+                ckpt_indices=ckpt_indices,
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)

@@ -465,7 +465,8 @@ def v3_state_source(
         d_v: int,
         kernel_size: int,
         qk_pair_layout: bool = False,
-        window: int = 1) -> gdn_v3_config.StateSourcePlan:
+        window: int = 1,
+        per_ckpt_indices: bool = False) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
@@ -486,6 +487,13 @@ def v3_state_source(
     group fits inside one kernel block (row pitch) or the pitch is whole
     kernel blocks (block pitch); anything else would need per-checkpoint
     region geometry, which the DMA path does not support.
+
+    With ``per_ckpt_indices`` the caller instead names one source block per
+    checkpoint (``MetadataRef.s_idx_to_ckpt_indices``), matching how vLLM's
+    reference GDN kernel indexes ``ssm_state_indices[seq, ckpt]``. The
+    affine pitch is then unnecessary and the group may be scattered across
+    ordinary pool blocks, so the pool block size no longer has to grow with
+    ``window``.
     """
     block_size, payload, lanes = _pool_geometry(pool)
     tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
@@ -543,7 +551,15 @@ def v3_state_source(
     )
 
     ckpt_kb = ckpt_rows = 0
-    if window > 1:
+    if window > 1 and per_ckpt_indices:
+        # Each checkpoint is an independent source block named by the
+        # caller's per-checkpoint index array, so there is no pitch to
+        # apply, and the group no longer has to fit inside one manager
+        # block — which is what forced the pool block size to scale with
+        # `window`. Every checkpoint keeps checkpoint 0's intra-block
+        # region geometry, so `conv`/`ssm` above already describe it.
+        pass
+    elif window > 1:
         pitch_tok = v3_ckpt_pitch_tok(ssm_ntok=ssm_ntok,
                                       conv_ntok=conv_ntok,
                                       window=window,

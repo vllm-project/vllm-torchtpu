@@ -82,6 +82,15 @@ class MetadataRef:
     # (the checkpoint of the last accepted token). Zero everywhere without
     # speculative decoding.
     s_idx_to_read_offset: Any
+    # Speculative decoding, pooled source only: `[max_seqs, window_size]`
+    # source-block index per checkpoint, so checkpoint `t` of sequence `s`
+    # lives at block `s_idx_to_ckpt_indices[s, t]` instead of at an affine
+    # offset from a single base block. Independent blocks mean the group no
+    # longer has to fit inside one manager block, which is what let the
+    # pool's block size grow with `window_size`. None keeps the affine
+    # base + pitch addressing (`s_idx_to_state_indices` + the plan's
+    # checkpoint pitch).
+    s_idx_to_ckpt_indices: Any = None
 
     @classmethod
     def create(
@@ -96,6 +105,7 @@ class MetadataRef:
         s_idx_has_initial_state: jax.Array,
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
+        s_idx_to_ckpt_indices: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -109,6 +119,7 @@ class MetadataRef:
             s_idx_has_initial_state=s_idx_has_initial_state,
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
+            s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
         )
 
     def __len__(self) -> int:
@@ -440,6 +451,19 @@ class ExternalStateBufferedRef(StateBufferedRef):
     compact_output_ref: Any | None = dataclasses.field(
         default=None, metadata=dict(static=True))
 
+    def _ckpt_state_idx(self, s_idx, ckpt):
+        """Source block holding checkpoint `ckpt` of sequence `s_idx`.
+
+        With per-checkpoint indices every checkpoint is an independent
+        block, so the index is looked up rather than derived; the plan's
+        pitch is 0 in that mode and `_region_slice` adds nothing for
+        `ckpt`. Otherwise the group is affine from one base block.
+        """
+        ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
+        if ckpt_indices is None:
+            return self.metadata_ref.s_idx_to_state_indices[s_idx]
+        return ckpt_indices[s_idx, ckpt]
+
     def _region_slice(self, src_ref: jax.Ref, state_idx, ckpt, nblocks):
         base = state_idx * self.stride + ckpt * self.ckpt_kb + self.region.kb0
         row0 = self.region.row0 + ckpt * self.ckpt_rows
@@ -459,7 +483,6 @@ class ExternalStateBufferedRef(StateBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[
                 s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
@@ -467,6 +490,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
             # Resume from the checkpoint of the last accepted token.
             read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
+            state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
 
             pltpu.make_async_copy(
                 self._region_slice(src_ref, state_idx, read_ckpt, nblocks),
@@ -485,7 +509,6 @@ class ExternalStateBufferedRef(StateBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
             # One checkpoint per valid window position, starting at the
             # slot's checkpoint 0. `r_size` never exceeds `window_size` for
             # windowed sequences; the clamp is for PER_SEQ tiles, which
@@ -496,6 +519,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
             for t in range(self.cfg.window_size):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                 nblocks = jnp.where(should_write, self.region.nblocks, 0)
+                state_idx = self._ckpt_state_idx(s_idx, t)
                 pltpu.make_async_copy(
                     vmem_ref.at[idx, t, pl.ds(0, nblocks)],
                     self._region_slice(dst_ref, state_idx, t, nblocks),
