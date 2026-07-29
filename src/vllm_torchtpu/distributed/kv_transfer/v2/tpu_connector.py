@@ -18,6 +18,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.kv_transfer import \
+    tpu_connector as _base_connector
 from vllm_torchtpu.distributed.kv_transfer.v2.strided_bridge import \
     TPUConnectorV2StridedBridge
 from vllm_torchtpu.distributed.kv_transfer.v2.strided_transfer import (
@@ -338,20 +340,8 @@ class TPUConnectorV2Scheduler:
         self._recv_lifecycle_by_uuid: dict[int, _V2RecvLifecycleEntry] = {}
         self._recv_uuid_by_req_id: dict[Any, int] = {}
 
-    def _maybe_truncate_for_mamba(self, request: Any) -> None:
-        if request.num_prompt_tokens <= 1:
-            return
-        params = request.kv_transfer_params
-        if params is not None and params.get("_p_side_truncated"):
-            return
-        if request.prompt_token_ids is None:
-            return
-        request.prompt_token_ids.pop()
-        request._all_token_ids.pop()
-        request.num_prompt_tokens -= 1
-        if request.kv_transfer_params is None:
-            request.kv_transfer_params = {}
-        request.kv_transfer_params["_p_side_truncated"] = True
+    _maybe_truncate_for_mamba = (
+        _base_connector.TPUConnectorScheduler._maybe_truncate_for_mamba)
 
     def get_num_new_matched_tokens(
         self,

@@ -58,12 +58,22 @@ def get_eagle3_test_prompts():
     ]
 
 
+def get_dflash_test_prompts():
+    num_prompts = 10
+    return [
+        "Predict the continuation of this sequence: 1 2 3 4 5 6 7 8"
+        for _ in range(num_prompts)
+    ]
+
+
 def get_test_prompts(speculative_config: dict):
     method = speculative_config["method"]
     if method == "ngram":
         return get_ngram_test_prompts()
     if method == "eagle3":
         return get_eagle3_test_prompts()
+    if method == "dflash":
+        return get_dflash_test_prompts()
     raise NotImplementedError(f"{method} is not supported yet.")
 
 
@@ -189,6 +199,39 @@ def test_eagle3_correctness_greedy(
     )
 
 
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(10, id="bs10")])
+def test_dflash_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    model_name = "Qwen/Qwen3-4B"
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        model_name,
+        {
+            "method": "dflash",
+            "model": "z-lab/Qwen3-4B-DFlash-b16",
+            "num_speculative_tokens": 15,
+            "draft_tensor_parallel_size": 1,
+        },
+        max_num_seqs=max_num_seqs,
+        async_scheduling=async_scheduling,
+        extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
 def _test_performance_helper(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -298,6 +341,39 @@ def test_eagle3_performance(
         max_num_seqs=max_num_seqs,
         model_name="NousResearch/Meta-Llama-3.1-8B-Instruct",
         async_scheduling=async_scheduling,
+    )
+
+
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(4, id="bs4")])
+def test_dflash_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        {
+            "method": "dflash",
+            "model": "z-lab/Qwen3-4B-DFlash-b16",
+            "num_speculative_tokens": 15,
+            "draft_tensor_parallel_size": 1,
+        },
+        min_acceptance_rate=0.08,
+        max_num_seqs=max_num_seqs,
+        model_name="Qwen/Qwen3-4B",
+        async_scheduling=async_scheduling,
+        extra_kwargs={"gpu_memory_utilization": 0.6},
     )
 
 

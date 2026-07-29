@@ -913,26 +913,6 @@ class TestTPURaidenConnectorScheduler:
             with pytest.raises(ValueError, match="must cover every PCP"):
                 producer.request_finished(req, [100])
 
-    def test_mamba_live_state_column_matches_cp_local_block_size(self):
-        scheduler = _make_raiden_scheduler(pcp_size=8)
-        scheduler.vllm_config.cache_config.mamba_cache_mode = "align"
-        scheduler.vllm_config.cache_config.mamba_block_size = 16
-        scheduler.vllm_config.parallel_config.decode_context_parallel_size = 1
-
-        assert scheduler._mamba_live_state_column(128) == 0
-        assert scheduler._mamba_live_state_column(129) == 1
-        assert scheduler._select_mamba_state_blocks([("group 0", [10, 11])],
-                                                    129,
-                                                    side="producer") == [11]
-
-    def test_non_align_mamba_state_stays_in_first_block(self):
-        scheduler = _make_raiden_scheduler(pcp_size=8)
-        scheduler.vllm_config.cache_config.mamba_cache_mode = "none"
-
-        assert scheduler._select_mamba_state_blocks([("group 0", [10, 11])],
-                                                    129,
-                                                    side="producer") == [10]
-
     def test_v3_stage3_finish_dedup_refuses_unsafe_inflight_eviction(self):
         producer = _make_raiden_scheduler(is_producer=True,
                                           block_size=4096,

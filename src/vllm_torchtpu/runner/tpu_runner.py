@@ -87,7 +87,9 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
-from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs, Eagle3Proposer
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -133,7 +135,7 @@ def _substitute_placeholder_token(
     """
     assert input_ids.shape[0] == token_in_tpu_cur_input_indices.shape[
         0] == token_in_tpu_pre_next_tokens_indices.shape[0]
-    mask = token_in_tpu_pre_next_tokens_indices >= 0
+    mask = token_in_tpu_pre_next_tokens_indices > -1
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
@@ -258,6 +260,13 @@ def _torch_tpu_wrapper():
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
+
+    @property
+    def _is_async_drafter(self) -> bool:
+        if not self.speculative_config:
+            return False
+        return (self.speculative_config.use_eagle()
+                or self.speculative_config.method == "dflash")
 
     def __init__(
         self,
@@ -681,6 +690,8 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler = RejectionSampler()
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "dflash":
+                self.drafter = DFlashProposer(self, self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = Eagle3Proposer(self, self.vllm_config)
             else:
@@ -2425,8 +2436,7 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         draft_chunks: list[DraftChunkInputs] = []
-        is_draft_model = (self.speculative_config is not None
-                          and self.speculative_config.use_eagle())
+        is_draft_model = (self._is_async_drafter)
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -2576,6 +2586,7 @@ class TPUModelRunner(GPUModelRunner):
                         draft_lengths=(spec_decode_metadata.draft_lengths
                                        if spec_decode_metadata is not None else
                                        None),
+                        attn_metadata=attn_metadata,
                     ))
 
             start_index = end_index
@@ -2592,7 +2603,6 @@ class TPUModelRunner(GPUModelRunner):
 
         if self.is_pooling_model:
             return self.sample_tokens(None)
-
         return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2633,8 +2643,8 @@ class TPUModelRunner(GPUModelRunner):
         # Used to keep rand draws consistent across TP ranks.
         sampling_generator = self._get_sampling_generator()
 
-        # Hand the per-chunk draft inputs to the proposer.
-        if self.speculative_config and self.speculative_config.use_eagle():
+        # Hand the per-chunk draft inputs to the drafter.
+        if self._is_async_drafter:
             self.drafter.draft_chunks = state.draft_chunks
 
         # Prepare inputs, the requests might be split into multiple
@@ -2950,8 +2960,7 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = self.scheduler_config.async_scheduling
         eagle3_drafts = None
-        if (self.speculative_config and self.speculative_config.use_eagle()
-                and combined_selected_tokens):
+        if (self._is_async_drafter and combined_selected_tokens):
             if is_spec_step:
                 eagle3_drafts = (
                     self.spec_decode_manager.propose_draft_token_ids(
@@ -2991,9 +3000,7 @@ class TPUModelRunner(GPUModelRunner):
                 (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
                  num_draft_per_req) = (self._assemble_async_spec_substitution(
                      eagle3_drafts, next_tokens_per_chunk, state))
-            elif (self.speculative_config
-                  and self.speculative_config.use_eagle()
-                  and next_tokens_tpu_chunks):
+            elif (self._is_async_drafter and next_tokens_tpu_chunks):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
@@ -3094,14 +3101,14 @@ class TPUModelRunner(GPUModelRunner):
             if (self.speculative_config
                     and self.speculative_config.method == "ngram"):
                 # ngram drafts on the host from the committed token ids, so it
-                # must run after materialization; eagle3 was already proposed
+                # must run after materialization; eagle3/dflash were already proposed
                 # from device state by the unified call above.
                 self.spec_decode_manager.propose_draft_token_ids(
-                    final_output.sampled_token_ids,
+                    sampled_token_ids=final_output.sampled_token_ids,
                     discard_sampled_tokens_req_indices=
                     discard_sampled_tokens_req_indices,
-                    scheduler_output=scheduler_output,
-                )
+                    num_rejected_tokens_np=None,
+                    scheduler_output=scheduler_output)
 
             return final_output
 
@@ -3132,9 +3139,9 @@ class TPUModelRunner(GPUModelRunner):
                                             model_config=self.model_config)
         self.model = model
 
-        # If using eagle3/mtp speculative decoding, load the draft model and
+        # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
-        if self.speculative_config and self.speculative_config.use_eagle():
+        if self._is_async_drafter:
             self.drafter.load_model(self.model)
 
         # Ensure attention custom ops exist before any compile/inference path,
@@ -3423,8 +3430,7 @@ class TPUModelRunner(GPUModelRunner):
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
         next_lens = list(self.num_reqs_paddings)
-        if (self.speculative_config is not None
-                and self.speculative_config.use_eagle()):
+        if (self._is_async_drafter):
             next_lens.append(
                 self.max_num_reqs *
                 (1 + self.speculative_config.num_speculative_tokens))
@@ -3476,8 +3482,7 @@ class TPUModelRunner(GPUModelRunner):
         step by ``input_batch.all_greedy``, so both are reachable and must be
         pre-compiled here.
         """
-        if not (self.speculative_config is not None
-                and self.speculative_config.use_eagle()):
+        if not (self._is_async_drafter):
             return
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
@@ -3602,8 +3607,7 @@ class TPUModelRunner(GPUModelRunner):
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
-            if (self.speculative_config
-                    and self.speculative_config.use_eagle()):
+            if (self._is_async_drafter):
                 self.drafter.precompile()
                 self._precompile_rejection_sampler()
                 # The isolated precompile above emits standalone fused programs;
@@ -3643,8 +3647,7 @@ class TPUModelRunner(GPUModelRunner):
             return  # escape hatch / A-B toggle
         if self.enforce_eager:
             return
-        if not (self.speculative_config
-                and self.speculative_config.use_eagle()):
+        if not (self._is_async_drafter):
             return
         if self.input_batch.num_reqs != 0:
             logger.warning("skip spec-decode warmup: input_batch not empty")
