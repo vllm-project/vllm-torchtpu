@@ -434,21 +434,6 @@ def _ragged_exchange_pcp_token_shards_for_head_shards(
     )
 
 
-def _validate_pcp_prefill_mesh(mesh: jax.sharding.Mesh, pcp_axis: str,
-                               pcp_size: int, n_kq: int, n_v: int) -> None:
-    if pcp_axis not in mesh.axis_names:
-        raise NotImplementedError("GDN PCP prefill requires a pcp mesh axis.")
-    if mesh.shape[pcp_axis] != pcp_size:
-        raise ValueError(f"pcp_size={pcp_size} does not match mesh axis size "
-                         f"{mesh.shape[pcp_axis]}.")
-    if n_kq % pcp_size != 0:
-        raise ValueError(
-            f"n_kq={n_kq} must be divisible by pcp_size={pcp_size}.")
-    if n_v % pcp_size != 0:
-        raise ValueError(
-            f"n_v={n_v} must be divisible by pcp_size={pcp_size}.")
-
-
 def run_jax_gdn_attention_pcp_tp_prefill(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
@@ -485,7 +470,17 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     op-local mesh, so the shard_map body receives only the rank-local state.
     """
     pcp_axis = "pcp"
-    _validate_pcp_prefill_mesh(mesh, pcp_axis, pcp_size, n_kq, n_v)
+    if pcp_axis not in mesh.axis_names:
+        raise NotImplementedError("GDN PCP prefill requires a pcp mesh axis.")
+    if mesh.shape[pcp_axis] != pcp_size:
+        raise ValueError(f"pcp_size={pcp_size} does not match mesh axis size "
+                         f"{mesh.shape[pcp_axis]}.")
+    if n_kq % pcp_size != 0:
+        raise ValueError(
+            f"n_kq={n_kq} must be divisible by pcp_size={pcp_size}.")
+    if n_v % pcp_size != 0:
+        raise ValueError(
+            f"n_v={n_v} must be divisible by pcp_size={pcp_size}.")
 
     local_n_kq = n_kq // pcp_size
     local_n_v = n_v // pcp_size
@@ -912,216 +907,3 @@ def run_jax_gdn_attention_pooled(
     )
 
     return outputs
-
-
-def run_jax_gdn_attention_pooled_pcp_tp_prefill(
-    j_mixed_qkv: jnp.ndarray,
-    j_b: jnp.ndarray,
-    j_a: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
-    j_conv_weight: jnp.ndarray,
-    j_conv_bias: Optional[jnp.ndarray],
-    j_A_log: jnp.ndarray,
-    j_dt_bias: jnp.ndarray,
-    state_indices: jnp.ndarray,
-    query_start_loc: jnp.ndarray,
-    distribution: jnp.ndarray,
-    seq_lens: jnp.ndarray,
-    n_kq: int,
-    n_v: int,
-    d_k: int,
-    d_v: int,
-    kernel_size: int,
-    pool_block_tokens: int,
-    pcp_size: int,
-    interleave_size: int,
-    mesh: jax.sharding.Mesh,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Prefill with GDN state stored in the unified block pool, under PCP.
-
-    Pooled counterpart of ``run_jax_gdn_attention_pcp_tp_prefill``: GDN
-    compute stays TP over the ``pcp`` mesh axis. Incoming PCP token shards
-    are all-to-all'ed into head shards, each rank runs the full-sequence
-    scan on its ``1/pcp_size`` of the heads, and the output is exchanged
-    back to the PCP token layout. Only the input/output layout is PCP —
-    no sequence parallelism happens inside GDN.
-    """
-    pcp_axis = "pcp"
-    _validate_pcp_prefill_mesh(mesh, pcp_axis, pcp_size, n_kq, n_v)
-
-    local_n_kq = n_kq // pcp_size
-    local_n_v = n_v // pcp_size
-    key_dim = n_kq * d_k
-    value_dim = n_v * d_v
-    qkv_split_sizes = [key_dim, key_dim, value_dim]
-
-    token_spec = P(pcp_axis, None)
-    replicated_spec = P()
-    pool_spec = P(pcp_axis, None, None, None)
-    in_specs = (
-        token_spec,  # j_mixed_qkv
-        token_spec,  # j_b
-        token_spec,  # j_a
-        pool_spec,  # recurrent_state
-        replicated_spec,  # j_conv_weight
-        replicated_spec if j_conv_bias is not None else None,  # j_conv_bias
-        replicated_spec,  # j_A_log
-        replicated_spec,  # j_dt_bias
-        replicated_spec,  # query_start_loc
-        replicated_spec,  # state_indices
-        replicated_spec,  # distribution
-        replicated_spec,  # seq_lens
-    )
-    output_spec = P(pcp_axis, None, None)
-    out_specs = (pool_spec, output_spec)
-
-    def _pooled_pcp_prefill_fn(
-        local_qkv,
-        local_b,
-        local_a,
-        pool_,
-        conv_weight_,
-        conv_bias_,
-        A_log_,
-        dt_bias_,
-        query_start_loc_,
-        state_indices_,
-        distribution_,
-        seq_lens_,
-    ):
-        interleaved_qkv = reorder_concatenated_tensor_for_sharding(
-            local_qkv,
-            qkv_split_sizes,
-            pcp_size,
-            -1,
-        )
-        local_ba = jnp.stack((local_b, local_a),
-                             axis=-1).reshape(local_b.shape[0], -1)
-        packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
-            local_ba, pcp_axis, pcp_size)
-
-        full_reorder = _derive_pcp_rank_major_reorder_indices(
-            query_start_loc_,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            local_padded_num_tokens=local_qkv.shape[0],
-            seq_lens=seq_lens_,
-        )
-        valid_mask = full_reorder >= 0
-        scatter_indices = jnp.where(valid_mask, full_reorder,
-                                    full_reorder.size)
-        gather_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
-
-        (input_starts_by_rank, send_sizes_by_rank,
-         output_starts_by_rank) = _derive_pcp_ragged_exchange_descriptors(
-             full_reorder,
-             pcp_size=pcp_size,
-             interleave_size=interleave_size,
-             local_padded_num_tokens=local_qkv.shape[0],
-             max_num_requests=query_start_loc_.shape[0] - 1,
-         )
-        descriptors_by_rank = jnp.stack(
-            (input_starts_by_rank, send_sizes_by_rank, output_starts_by_rank),
-            axis=-1,
-        )
-        local_descriptors = _select_replicated_shard_for_pcp_rank(
-            descriptors_by_rank, pcp_axis, pcp_size, axis=0)[0]
-
-        qkv_shard = _ragged_exchange_pcp_token_shards_for_head_shards(
-            interleaved_qkv,
-            pcp_axis,
-            pcp_size,
-            local_descriptors,
-            send_sizes_by_rank,
-        )
-        ba_shard = jnp.zeros_like(packed_ba_shard).at[scatter_indices].set(
-            packed_ba_shard, mode="drop")
-        ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)
-        b_shard = ba_shard[:, :, 0]
-        a_shard = ba_shard[:, :, 1]
-
-        conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
-            conv_weight_,
-            qkv_split_sizes,
-            pcp_size,
-            0,
-        )
-        weight_shard = _select_replicated_shard_for_pcp_rank(
-            conv_weight_interleaved, pcp_axis, pcp_size, axis=0)
-        if conv_bias_ is None:
-            bias_shard = None
-        else:
-            conv_bias_interleaved = reorder_concatenated_tensor_for_sharding(
-                conv_bias_,
-                qkv_split_sizes,
-                pcp_size,
-                0,
-            )
-            bias_shard = _select_replicated_shard_for_pcp_rank(
-                conv_bias_interleaved, pcp_axis, pcp_size, axis=0)
-        A_shard = _select_replicated_shard_for_pcp_rank(A_log_,
-                                                        pcp_axis,
-                                                        pcp_size,
-                                                        axis=0)
-        dt_shard = _select_replicated_shard_for_pcp_rank(dt_bias_,
-                                                         pcp_axis,
-                                                         pcp_size,
-                                                         axis=0)
-
-        new_pool, seq_output_shard = run_jax_gdn_attention_pooled_local(
-            qkv_shard,
-            b_shard,
-            a_shard,
-            pool_,
-            weight_shard,
-            bias_shard,
-            A_shard,
-            dt_shard,
-            query_start_loc_,
-            state_indices_,
-            distribution_,
-            seq_lens_,
-            n_kq=local_n_kq,
-            n_v=local_n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            pool_block_tokens=pool_block_tokens,
-        )
-
-        seq_output_shard = seq_output_shard.reshape(seq_output_shard.shape[0],
-                                                    local_n_v, d_v)
-        seq_output_shard = jnp.concatenate(
-            (seq_output_shard,
-             jnp.zeros((1, local_n_v, d_v), dtype=seq_output_shard.dtype)),
-            axis=0,
-        )
-        packed_output_shard = seq_output_shard[gather_indices]
-        packed_output = jax.lax.all_to_all(packed_output_shard,
-                                           axis_name=pcp_axis,
-                                           split_axis=0,
-                                           concat_axis=1,
-                                           tiled=True)
-        return new_pool, packed_output
-
-    mapped_fn = jax.shard_map(
-        _pooled_pcp_prefill_fn,
-        mesh=mesh,
-        in_specs=in_specs,
-        out_specs=out_specs,
-        check_vma=False,
-    )
-    return mapped_fn(
-        j_mixed_qkv,
-        j_b,
-        j_a,
-        recurrent_state,
-        j_conv_weight,
-        j_conv_bias,
-        j_A_log,
-        j_dt_bias,
-        query_start_loc,
-        state_indices,
-        distribution,
-        seq_lens,
-    )
