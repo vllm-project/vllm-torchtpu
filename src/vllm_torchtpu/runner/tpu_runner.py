@@ -64,8 +64,11 @@ from vllm_torchtpu.kv_cache_spec_normalizer import \
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
+from vllm_torchtpu.layers.common.pcp_allgather_layout import \
+    build_headtail_pcp_meta
 from vllm_torchtpu.layers.common.sequence_layout import (
-    SequenceLayoutKind, create_sequence_layout_planner)
+    SequenceLayoutKind, create_sequence_layout_planner,
+    is_pcp_allgather_sequence_layout)
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend,
                                                  PallasMLAttentionBackend)
@@ -2000,6 +2003,35 @@ class TPUModelRunner(GPUModelRunner):
             padded_num_reqs=padded_num_reqs,
         )
         self._last_sequence_layout_plan = layout_plan
+        # The all-gather PCP current phase presents the request's head and tail
+        # chunks as TWO fused prefill seqs (see pcp_allgather_layout), so every
+        # per-seq tensor needs both entries. The generic fill above only wrote
+        # num_reqs (= 1 for PCP) of them, which left seq 1 with length 0: the
+        # kernel then skipped the whole tail chunk, so any prompt long enough to
+        # put tokens past chunk `pcp` lost roughly half its tokens.
+        pcp_allgather_layout = is_pcp_allgather_sequence_layout(
+            kind=layout_plan.descriptor.kind,
+            protocol=layout_plan.descriptor.protocol)
+        # ...but only when the tail chunk actually holds real tokens. Rank r's
+        # tail starts at global offset (2*pcp-1-r)*C, so the earliest tail
+        # begins at pcp*C: with S <= pcp*C every real token is in a head chunk
+        # and the request is ONE seq. That is always true of a decode step
+        # (S=1), and it matters because write_last_seq_only writes seq
+        # end_seq_idx-1 -- claiming two seqs on a decode step points the KV
+        # write at the padded tail, so the sampled token never reaches the
+        # cache and generation collapses into repetition.
+        pcp_allgather_two_seqs = False
+        if pcp_allgather_layout:
+            pcp_chunk = max(layout_plan.local_padded_num_tokens // 2, 1)
+            pcp_ranks = max(
+                layout_plan.global_padded_num_tokens // (2 * pcp_chunk), 1)
+            pcp_allgather_two_seqs = (int(total_num_scheduled_tokens) >
+                                      pcp_ranks * pcp_chunk)
+            if pcp_allgather_two_seqs:
+                self.seq_lens_np[1] = self.seq_lens_np[0]
+                self.seq_lens_np[2:] = 0
+            else:
+                self.seq_lens_np[1:] = 0
         padded_total_num_scheduled_tokens = (
             layout_plan.global_padded_num_tokens)
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
@@ -2141,6 +2173,15 @@ class TPUModelRunner(GPUModelRunner):
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
+            if pcp_allgather_layout:
+                # Head and tail are two prefill seqs of the one request, so the
+                # mixed bucket must cover both -- num_reqs (= 1) would stop the
+                # kernel's seq loop before it ever reached the tail. When the
+                # tail is all padding (decode, or any S <= pcp*C) it is one seq.
+                self._request_distribution_cpu[0] = 0
+                self._request_distribution_cpu[1] = 0
+                self._request_distribution_cpu[2] = (
+                    2 if pcp_allgather_two_seqs else 1)
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
 
@@ -2159,6 +2200,29 @@ class TPUModelRunner(GPUModelRunner):
             start_index, num_reqs, target_num_reqs)
                                if self._has_mamba_state else None)
 
+        # The all-gather PCP planner cannot return its two extra tensors on the
+        # frozen SequenceLayoutPlan, so it stashes them on itself. They are
+        # overwritten every prepare_real and cleared on any fallback step, so
+        # consume them here, right after prepare_real.
+        pcp_kv_cache_lens = pcp_q_pos_offsets = pcp_cu_q_lens = None
+        pcp_tensors = getattr(sequence_layout_planner, "last_pcp_tensors", None)
+        if pcp_tensors is not None:
+            pcp_cu_q_lens = pcp_tensors.pcp_cu_q_lens_cpu.to(self.device,
+                                                             non_blocking=True)
+            # Cache portion only: seq_lens is cache + current, and the
+            # all-gather cache-phase launch must not see the current tokens.
+            cache_lens_np = np.zeros(target_num_reqs, dtype=np.int32)
+            # Both fused seqs are the same request, so both see the same cache
+            # portion. seq_lens_np[1] was mirrored from [0] above, and the
+            # request's scheduled-token count sits at index 0.
+            n_seqs = 2 if pcp_allgather_two_seqs else 1
+            cache_lens_np[:n_seqs] = (self.seq_lens_np[0] -
+                                      num_scheduled_tokens_per_req[0])
+            pcp_kv_cache_lens = torch.from_numpy(cache_lens_np).to(
+                self.device, non_blocking=True)
+            pcp_q_pos_offsets = pcp_tensors.pcp_q_pos_offsets_cpu.to(
+                self.device, non_blocking=True)
+
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -2167,6 +2231,9 @@ class TPUModelRunner(GPUModelRunner):
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
+            pcp_kv_cache_lens=pcp_kv_cache_lens,
+            pcp_q_pos_offsets=pcp_q_pos_offsets,
+            pcp_cu_q_lens=pcp_cu_q_lens,
             sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
@@ -3254,6 +3321,31 @@ class TPUModelRunner(GPUModelRunner):
             dummy_mamba_state_indices = (torch.zeros(
                 (num_reqs, ), dtype=torch.int32).to(self.device)
                                          if self._has_mamba_state else None)
+            # The all-gather PCP kernel takes two extra tensors, so the dummy
+            # run has to supply correctly-shaped stand-ins or the op's arity
+            # check fires during profiling -- before any real request exists.
+            # Values are irrelevant (shapes/HBM only), but the head-tail
+            # geometry must be self-consistent: pcp_size ranks, chunk = half
+            # the per-rank token budget.
+            dummy_pcp_kv_cache_lens = dummy_pcp_q_pos_offsets = None
+            dummy_pcp_cu_q_lens = None
+            if is_pcp_allgather_sequence_layout(
+                    kind=dummy_layout_plan.descriptor.kind,
+                    protocol=dummy_layout_plan.descriptor.protocol):
+                pcp_size = _get_sequence_layout_planner_for_runner(
+                    self).backend_preinit_world_size
+                dummy_cu, dummy_qpos = build_headtail_pcp_meta(
+                    pcp_size,
+                    max(dummy_layout_plan.local_padded_num_tokens // 2, 1),
+                    num_tokens,
+                    num_reqs,
+                )
+                dummy_pcp_kv_cache_lens = torch.zeros(
+                    (num_reqs, ), dtype=torch.int32).to(self.device)
+                dummy_pcp_q_pos_offsets = torch.from_numpy(dummy_qpos).to(
+                    self.device)
+                dummy_pcp_cu_q_lens = torch.from_numpy(dummy_cu).to(self.device)
+
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
@@ -3263,6 +3355,9 @@ class TPUModelRunner(GPUModelRunner):
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
                 mamba_state_indices=dummy_mamba_state_indices,
+                pcp_kv_cache_lens=dummy_pcp_kv_cache_lens,
+                pcp_q_pos_offsets=dummy_pcp_q_pos_offsets,
+                pcp_cu_q_lens=dummy_pcp_cu_q_lens,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
             slot_mappings = self.empty_slot_mappings

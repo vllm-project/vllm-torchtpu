@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
 import jax
 import torch
@@ -15,25 +15,36 @@ from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
+from jax.sharding import PartitionSpec
+
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh, get_pcp_rank
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
-    attention, mla_attention, ragged_paged_attention,
-    ragged_paged_attention_batched)
+    PCP_AXIS_NAME, attention, mla_attention, ragged_paged_attention,
+    ragged_paged_attention_batched,
+    sharded_pcp_allgather_ragged_paged_attention)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import (is_floating_dtype,
                                                       quantize_kv)
-from vllm_torchtpu.layers.common.sequence_layout import \
-    is_pcp_streaming_attention_metadata
+from vllm_torchtpu.layers.common.sequence_layout import (
+    is_pcp_allgather_attention_metadata, is_pcp_streaming_attention_metadata)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 
 logger = init_logger(__name__)
+
+# Which PCP kernel a layer is compiled against. None means no PCP. These are
+# NOT interchangeable at runtime: the two kernels stripe the KV cache
+# differently (streaming interleave=page_size vs all-gather interleave=1) and
+# pack query tokens differently, so the mode is fixed per server.
+PCP_MODE_STREAMING = "streaming"
+PCP_MODE_ALLGATHER = "all_gather"
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -529,16 +540,23 @@ class PallasAttentionBackendImpl(AttentionImpl):
         k_scale: float | None,
         v_scale: float | None,
         skip_kv_update: bool = False,
-        use_pcp_streaming: bool = False,
+        pcp_mode: str | None = None,
         cp_kv_cache_interleave_size: int = 0,
     ):
+        """Build (or fetch) the RPA kernel op.
+
+        `pcp_mode` is None for the non-PCP path, or one of the PCP_MODE_*
+        constants. It participates in every cache key, so the three paths never
+        share a compiled op -- they take different tensor args and, for the two
+        PCP modes, incompatible KV-cache stripings.
+        """
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
-        max_model_len = (vllm_config.model_config.max_model_len
-                         if use_pcp_streaming and vllm_config is not None else
-                         None)
+        vllm_config = getattr(ctx, "vllm_config", None)
+        max_model_len = (getattr(vllm_config.model_config, "max_model_len",
+                                 None) if pcp_mode is not None
+                         and vllm_config is not None else None)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
-                      k_scale, v_scale, use_pcp_streaming,
+                      k_scale, v_scale, pcp_mode,
                       cp_kv_cache_interleave_size, max_model_len)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -551,12 +569,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # get their own kernel variant and never share an op with KV-owning
         # layers of an otherwise-identical config.
         mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(
-            ctx.mesh, use_pcp_streaming)
-        registry_key = (self._kernel_op_prefix,
-                        self.sliding_window, self.scale, self.logits_soft_cap,
-                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
-                        use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask)
+            ctx.mesh, pcp_mode)
+        registry_key = (self._kernel_op_prefix, self.sliding_window,
+                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
+                        k_scale, v_scale, skip_kv_update, pcp_mode,
+                        cp_kv_cache_interleave_size, max_model_len,
+                        self.use_causal_mask)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -565,7 +583,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kernel_instance_id = self._allocate_kernel_instance_id()
         op_name = f"{self._kernel_op_prefix}_{kernel_instance_id}"
 
-        if use_pcp_streaming:
+        if pcp_mode == PCP_MODE_STREAMING:
             pcp_make_kwargs = dict(
                 mesh=mesh,
                 sliding_window=self.sliding_window,
@@ -579,6 +597,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 max_model_len=max_model_len,
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
+        elif pcp_mode == PCP_MODE_ALLGATHER:
+            # No cp_kv_cache_interleave_size: the all-gather path is fixed at
+            # interleave 1 (token g -> rank g % pcp) by the kernel's strided
+            # cache indexing, and no sliding window / soft cap support.
+            pcp_make_kwargs = dict(
+                mesh=mesh,
+                sliding_window=self.sliding_window,
+                sm_scale=self.scale,
+                soft_cap=self.logits_soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                skip_kv_update=skip_kv_update,
+                max_model_len=max_model_len,
+            )
+            wrapped_fn = make_pcp_allgather_rpa_kernel(**pcp_make_kwargs)
         else:
             # Prepare wrapper function with static arguments.
             wrapped_fn = functools.partial(
@@ -603,14 +637,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # graph XLA rewires the alias, so donation is only safe when the op
         # is compiled.
         rpa_donate_argnums = (None if envs.TPU_KERNEL_ITER_MODE else (0, ))
-        if use_pcp_streaming:
+        if pcp_mode is not None:
+            # Both PCP modes need the shard_map-aware op registrar (explicit
+            # out_shardings); only the kernel entry and specs differ.
             rpa_kernel_op = pcp_streaming_jax_op(
                 op_name,
                 wrapped_fn,
                 donate_argnums=rpa_donate_argnums,
                 mesh=op_mesh,
                 input_partition_specs=input_partition_specs)
-            if envs.TPU_KERNEL_ITER_MODE:
+            if envs.TPU_KERNEL_ITER_MODE and pcp_mode == PCP_MODE_STREAMING:
                 from vllm_torchtpu.compilation import kernel_reload
 
                 def _rebuild_pcp_callable(name=op_name,
@@ -648,9 +684,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
         rpa_kernel_op.register_fake(_fake_rpa_op)
 
         def rpa_kernel_impl(kv_cache, *args, **kwargs):
-            if use_pcp_streaming:
+            if pcp_mode == PCP_MODE_STREAMING:
                 new_kv_cache, output = invoke_pcp_streaming_op(
                     rpa_kernel_op, kv_cache, args, kwargs)
+            elif pcp_mode == PCP_MODE_ALLGATHER:
+                # These two ride in as kwargs from forward() because they come
+                # from the attention metadata, not the generic RPA arg tuple.
+                kv_cache_lens = kwargs.pop("pcp_kv_cache_lens", None)
+                q_pos_offsets = kwargs.pop("pcp_q_pos_offsets", None)
+                new_kv_cache, output = invoke_pcp_allgather_op(
+                    rpa_kernel_op, kv_cache, args, kwargs, kv_cache_lens,
+                    q_pos_offsets)
             else:
                 new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
             if new_kv_cache.shape != kv_cache.shape:
@@ -668,7 +712,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
 
-    def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
+    def _validate_pcp_support(self, skip_kv_update: bool,
+                              pcp_mode: str) -> None:
         unsupported_features = []
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
@@ -676,18 +721,26 @@ class PallasAttentionBackendImpl(AttentionImpl):
             unsupported_features.append("logits soft cap")
         if skip_kv_update:
             unsupported_features.append("skip_kv_update")
+        if (pcp_mode == PCP_MODE_ALLGATHER and self.sliding_window is not None):
+            unsupported_features.append("sliding window")
         if unsupported_features:
+            label = ("PCP streaming" if pcp_mode == PCP_MODE_STREAMING else
+                     "All-gather PCP")
             raise NotImplementedError(
-                "PCP streaming attention does not support: "
+                f"{label} attention does not support: "
                 f"{', '.join(unsupported_features)}.")
 
     @staticmethod
-    def _select_kernel_mesh(default_mesh, use_pcp_streaming: bool):
-        if not use_pcp_streaming:
+    def _select_kernel_mesh(default_mesh, pcp_mode: str | None):
+        if pcp_mode is None:
             return default_mesh, None, None
-
-        pcp_mesh = get_pcp_streaming_mesh()
-        return pcp_mesh, pcp_mesh, PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+        if pcp_mode == PCP_MODE_STREAMING:
+            pcp_mesh = get_pcp_streaming_mesh()
+            return pcp_mesh, pcp_mesh, PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+        if pcp_mode == PCP_MODE_ALLGATHER:
+            pcp_mesh = get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME)
+            return pcp_mesh, pcp_mesh, PCP_ALLGATHER_RPA_INPUT_PARTITION_SPECS
+        raise ValueError(f"Unknown PCP mode: {pcp_mode!r}.")
 
     def initialize_kernel(self, layer: AttentionLayer) -> None:
         """Pre-build the RPA kernel before torch.compile traces the model.
@@ -715,15 +768,28 @@ class PallasAttentionBackendImpl(AttentionImpl):
         pcp_configured = (parallel_config is not None and
                           parallel_config.prefill_context_parallel_size > 1)
         if pcp_configured:
-            self._validate_pcp_streaming_support(skip_kv_update)
+            # Pre-build happens before any metadata exists, so the mode comes
+            # from the env flag rather than from the layout protocol tag. The
+            # two must agree; forward() re-derives the mode from metadata and
+            # would build a second kernel if they ever disagreed.
+            pcp_mode = (PCP_MODE_ALLGATHER if envs.PCP_IMPL == "all_gather"
+                        else PCP_MODE_STREAMING)
+            self._validate_pcp_support(skip_kv_update, pcp_mode)
+            # MUST match how forward() derives this, or the config_key differs,
+            # the prebuilt kernel is not found, and _build_rpa_kernel runs
+            # inside the traced region -- where _select_kernel_mesh hits a
+            # pybind (global_device_id) that Dynamo cannot trace.
+            # All-gather is fixed at interleave 1, so it does not key on it.
             self.rpa_kernel = self._build_rpa_kernel(
                 q_scale,
                 k_scale,
                 v_scale,
                 skip_kv_update=skip_kv_update,
-                use_pcp_streaming=True,
-                cp_kv_cache_interleave_size=parallel_config.
-                cp_kv_cache_interleave_size,
+                pcp_mode=pcp_mode,
+                cp_kv_cache_interleave_size=(getattr(
+                    parallel_config, "cp_kv_cache_interleave_size", 0)
+                                             if pcp_mode == PCP_MODE_STREAMING
+                                             else 0),
             )
             return
 
@@ -814,25 +880,36 @@ class PallasAttentionBackendImpl(AttentionImpl):
         vllm_config = ctx.vllm_config
         parallel_config = (None if vllm_config is None else
                            vllm_config.parallel_config)
-        use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
-        pcp_configured = (parallel_config is not None and
-                          parallel_config.prefill_context_parallel_size > 1)
-        if pcp_configured and not use_pcp_streaming:
+        # The layout protocol tag on the metadata is the source of truth for
+        # which kernel to use -- it is what the planner actually packed the
+        # tokens for.
+        if is_pcp_streaming_attention_metadata(attn_metadata):
+            pcp_mode = PCP_MODE_STREAMING
+        elif is_pcp_allgather_attention_metadata(attn_metadata):
+            pcp_mode = PCP_MODE_ALLGATHER
+        else:
+            pcp_mode = None
+        pcp_configured = (parallel_config is not None and getattr(
+            parallel_config, "prefill_context_parallel_size", 1) > 1)
+        if pcp_configured and pcp_mode is None:
             raise RuntimeError(
-                "PCP is configured, but attention metadata does not use "
-                "the PCP streaming sequence layout.")
+                "PCP is configured, but attention metadata does not use a PCP "
+                "sequence layout (protocol="
+                f"{getattr(attn_metadata, 'sequence_layout_protocol', None)!r}).")
         skip_kv_update = self.kv_sharing_target_layer_name is not None
-        if use_pcp_streaming:
-            self._validate_pcp_streaming_support(skip_kv_update)
-        cp_kv_cache_interleave_size = (
-            parallel_config.cp_kv_cache_interleave_size
-            if use_pcp_streaming else 0)
+        if pcp_mode is not None:
+            self._validate_pcp_support(skip_kv_update, pcp_mode)
+        # Only streaming keys its kernel on the interleave size; all-gather is
+        # fixed at interleave 1.
+        cp_kv_cache_interleave_size = (getattr(
+            parallel_config, "cp_kv_cache_interleave_size", 0)
+                                       if pcp_mode == PCP_MODE_STREAMING else 0)
         rpa_kernel = self._build_rpa_kernel(
             None,
             layer._k_scale_float if self.kv_cache_quantized_dtype else None,
             layer._v_scale_float if self.kv_cache_quantized_dtype else None,
             skip_kv_update=skip_kv_update,
-            use_pcp_streaming=use_pcp_streaming,
+            pcp_mode=pcp_mode,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
@@ -842,6 +919,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # pallas.set_buffer_donor_(kv_cache, True)
 
         # Call the operator
+        pcp_kwargs = {}
+        if pcp_mode == PCP_MODE_ALLGATHER:
+            # Carried on the metadata rather than in the positional RPA tuple,
+            # which every other path shares.
+            pcp_kwargs = dict(
+                pcp_kv_cache_lens=attn_metadata.pcp_kv_cache_lens,
+                pcp_q_pos_offsets=attn_metadata.pcp_q_pos_offsets,
+            )
+        # All-gather takes the per-rank 2-D cu_q_lens here instead of the global
+        # 1-D query_start_loc: its spec is P(pcp, None), and each rank needs its
+        # own head/tail chunk lengths rather than the request-major cumsum.
+        query_start_loc = (attn_metadata.pcp_cu_q_lens
+                           if pcp_mode == PCP_MODE_ALLGATHER else
+                           attn_metadata.query_start_loc)
         outputs = rpa_kernel(
             kv_cache,
             query,
@@ -849,9 +940,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
             value,
             attn_metadata.seq_lens,
             attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
+            query_start_loc,
             attn_metadata.request_distribution,
             sink,
+            **pcp_kwargs,
         )
 
         # TODO (geyuhao) ideally we don't want this
@@ -1220,3 +1312,130 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     ) -> None:
         """Structural no-op. KV cache updates occur in-place during ragged paged attention kernel run."""
         pass
+# ---------------------------------------------------------------------------
+# All-gather PCP custom-op glue (was kernels/experimental/rpa_v3_cp/vllm_adapter.py).
+#
+# kv_cache_lens and pcp_q_pos_offsets are pcp-SHARDED rather than replicated:
+# rank r owns chunks r and 2*pcp-1-r, whose real lengths and global offsets
+# differ per rank.
+# ---------------------------------------------------------------------------
+
+PCP_ALLGATHER_RPA_INPUT_PARTITION_SPECS = (
+    PartitionSpec(PCP_AXIS_NAME),  # kv_cache: local cache blocks
+    PartitionSpec(PCP_AXIS_NAME),  # query: local head|tail chunks
+    PartitionSpec(PCP_AXIS_NAME),  # key: local head|tail chunks
+    PartitionSpec(PCP_AXIS_NAME),  # value: local head|tail chunks
+    PartitionSpec(),  # seq_lens
+    PartitionSpec(),  # block_tables
+    PartitionSpec(PCP_AXIS_NAME, None),  # query_start_loc: per-rank
+    PartitionSpec(),  # request_distribution
+    PartitionSpec(),  # kv_cache_lens
+    PartitionSpec(PCP_AXIS_NAME, None),  # pcp_q_pos_offsets: per-rank
+)
+
+
+def make_pcp_allgather_rpa_kernel(
+    *,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
+    skip_kv_update: bool,
+    max_model_len: int | None = None,
+) -> Callable[..., tuple[jax.Array, jax.Array]]:
+    """Build an all-gather PCP RPA entry with only tensor args in its signature."""
+    if soft_cap is not None:
+        raise NotImplementedError(
+            "All-gather PCP RPA does not support logits soft cap.")
+    if skip_kv_update:
+        raise NotImplementedError(
+            "All-gather PCP RPA does not support skip_kv_update.")
+    if sliding_window is not None:
+        raise NotImplementedError(
+            "All-gather PCP RPA does not support sliding window / chunked "
+            "attention.")
+    if sm_scale is None:
+        raise ValueError("All-gather PCP RPA requires an explicit sm_scale.")
+
+    # Resolved once at build time, not per call: under MPMD this process is a
+    # fixed PCP rank, and the kernel bakes it in as a constant rather than
+    # deriving it on device with lax.axis_index (unsupported here).
+    cp_rank = get_pcp_rank()
+
+    def _pcp_allgather_rpa_kernel(
+        kv_cache: jax.Array,
+        query: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        kv_cache_lens: jax.Array,
+        pcp_q_pos_offsets: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        output, new_kv_cache = sharded_pcp_allgather_ragged_paged_attention(
+            mesh=mesh,
+            q=query,
+            k=key,
+            v=value,
+            kv_cache=kv_cache,
+            kv_lens=seq_lens,
+            page_indices=block_tables,
+            cu_q_lens=query_start_loc,
+            distribution=request_distribution,
+            kv_cache_lens=kv_cache_lens,
+            pcp_q_pos_offsets=pcp_q_pos_offsets,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=True,
+            use_causal_mask=True,
+            cp_rank=cp_rank,
+        )
+        return new_kv_cache, output
+
+    return _pcp_allgather_rpa_kernel
+
+
+def invoke_pcp_allgather_op(rpa_kernel_op, kv_cache, args, kwargs,
+                            kv_cache_lens, pcp_q_pos_offsets):
+    """Call the 10-tensor all-gather PCP custom op from generic RPA args.
+
+    ``args`` is the shared RPA tensor tuple (query, key, value, seq_lens,
+    block_tables, query_start_loc, request_distribution, attention_sink); the
+    two PCP-specific tensors are passed separately because they come from the
+    attention metadata rather than the generic RPA call.
+    """
+    if kwargs:
+        raise ValueError(
+            "All-gather PCP RPA kernel does not accept keyword tensor args: "
+            f"{tuple(kwargs)}.")
+    if len(args) != 8:
+        raise ValueError(
+            f"All-gather PCP RPA kernel expects 8 tensor args after kv_cache, "
+            f"got {len(args)}.")
+    if args[7] is not None:
+        raise NotImplementedError(
+            "All-gather PCP RPA does not support attention sinks.")
+    if kv_cache_lens is None or pcp_q_pos_offsets is None:
+        raise ValueError(
+            "All-gather PCP RPA requires kv_cache_lens and pcp_q_pos_offsets "
+            "from the attention metadata; got None. The runner must be using "
+            "the all-gather sequence layout protocol.")
+    return rpa_kernel_op(
+        kv_cache,
+        args[0],  # query
+        args[1],  # key
+        args[2],  # value
+        args[3],  # seq_lens
+        args[4],  # block_tables
+        args[5],  # query_start_loc
+        args[6],  # request_distribution
+        kv_cache_lens,
+        pcp_q_pos_offsets,
+    )

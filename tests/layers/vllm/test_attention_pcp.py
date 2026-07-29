@@ -81,14 +81,14 @@ def _capture_kernel(monkeypatch):
                    v_scale,
                    *,
                    skip_kv_update=False,
-                   use_pcp_streaming,
+                   pcp_mode,
                    cp_kv_cache_interleave_size):
         captured["build"] = {
             "q_scale": q_scale,
             "k_scale": k_scale,
             "v_scale": v_scale,
             "skip_kv_update": skip_kv_update,
-            "use_pcp_streaming": use_pcp_streaming,
+            "pcp_mode": pcp_mode,
             "cp_kv_cache_interleave_size": cp_kv_cache_interleave_size,
         }
 
@@ -116,7 +116,7 @@ def test_forward_routes_partial_layout_to_streaming_kernel(monkeypatch):
                                   metadata)
 
     assert outputs.shape == query.shape
-    assert captured["build"]["use_pcp_streaming"] is True
+    assert captured["build"]["pcp_mode"] == "streaming"
     assert captured["build"]["cp_kv_cache_interleave_size"] == 4
     assert len(captured["args"]) == 9
     assert captured["args"][1].shape[0] == query.shape[0]
@@ -136,7 +136,7 @@ def test_forward_routes_fp8_partial_layout_with_kv_scales(monkeypatch):
             layer, query, key, value, kv_cache, metadata)
 
     assert outputs.shape == query.shape
-    assert captured["build"]["use_pcp_streaming"] is True
+    assert captured["build"]["pcp_mode"] == "streaming"
     assert captured["build"]["q_scale"] is None
     assert captured["build"]["k_scale"] == 0.125
     assert captured["build"]["v_scale"] == 0.25
@@ -156,7 +156,7 @@ def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(monkeypatch):
                                   metadata)
 
     assert outputs.shape == query.shape
-    assert captured["build"]["use_pcp_streaming"] is True
+    assert captured["build"]["pcp_mode"] == "streaming"
     assert captured["build"]["cp_kv_cache_interleave_size"] == 4
     assert len(captured["args"]) == 9
     assert captured["args"][8] is None
@@ -204,7 +204,7 @@ def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch):
                                         vllm_config=_vllm_config(pcp_size=1)):
         _impl().forward(_layer(), query, key, value, kv_cache, metadata)
 
-    assert captured["build"]["use_pcp_streaming"] is False
+    assert captured["build"]["pcp_mode"] is None
     assert captured["build"]["cp_kv_cache_interleave_size"] == 0
 
 
@@ -217,9 +217,9 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
                    k_scale,
                    v_scale,
                    skip_kv_update=False,
-                   use_pcp_streaming=False,
+                   pcp_mode=None,
                    cp_kv_cache_interleave_size=0):
-        calls.append((use_pcp_streaming, cp_kv_cache_interleave_size))
+        calls.append((pcp_mode, cp_kv_cache_interleave_size))
         return MagicMock()
 
     monkeypatch.setattr(PallasAttentionBackendImpl, "_build_rpa_kernel",
@@ -229,7 +229,46 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
                                         vllm_config=_vllm_config()):
         _impl().initialize_kernel(_layer())
 
-    assert calls == [(True, 4)]
+    assert calls == [("streaming", 4)]
+
+
+def test_initialize_kernel_prebuild_key_matches_forward_key_for_allgather(
+        monkeypatch):
+    """The prebuild and the forward() lookup must derive an identical
+    cp_kv_cache_interleave_size.
+
+    initialize_kernel exists to build the kernel BEFORE torch.compile traces
+    the model. If its config_key disagrees with the one forward() looks up,
+    the prebuilt kernel is missed and _build_rpa_kernel runs inside the traced
+    region, where _select_kernel_mesh calls a pybind (global_device_id) that
+    Dynamo cannot trace -- an engine-init crash, not a graceful fallback.
+
+    All-gather is fixed at interleave 1 and so does not key on it; regression
+    test for the two sides having disagreed (prebuild 1 vs forward 0).
+    """
+    calls = []
+
+    def fake_build(self,
+                   q_scale,
+                   k_scale,
+                   v_scale,
+                   skip_kv_update=False,
+                   pcp_mode=None,
+                   cp_kv_cache_interleave_size=0):
+        calls.append((pcp_mode, cp_kv_cache_interleave_size))
+        return MagicMock()
+
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_build_rpa_kernel",
+                        fake_build)
+    monkeypatch.setattr("vllm_torchtpu.layers.vllm.attention.envs.PCP_IMPL",
+                        "all_gather")
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        _impl().initialize_kernel(_layer())
+
+    # interleave 0, matching forward()'s derivation for the all-gather mode.
+    assert calls == [("all_gather", 0)]
 
 
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
@@ -239,7 +278,7 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
 
     monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
 
-    def fake_select_kernel_mesh(_default_mesh, _use_pcp_streaming):
+    def fake_select_kernel_mesh(_default_mesh, _pcp_mode):
         return fake_mesh, fake_mesh, None
 
     class FakeOp:
@@ -262,11 +301,11 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
             None,
             None,
             None,
-            use_pcp_streaming=True,
+            pcp_mode="streaming",
             cp_kv_cache_interleave_size=4,
         )
 
-    def fail_select_kernel_mesh(_default_mesh, _use_pcp_streaming):
+    def fail_select_kernel_mesh(_default_mesh, _pcp_mode):
         raise AssertionError(
             "mesh lookup should not run on prebuilt cache hit")
 
@@ -279,7 +318,7 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
             None,
             None,
             None,
-            use_pcp_streaming=True,
+            pcp_mode="streaming",
             cp_kv_cache_interleave_size=4,
         )
 
@@ -293,8 +332,8 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(monkeypatch):
 
     monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
 
-    def fake_select_kernel_mesh(_default_mesh, use_pcp_streaming):
-        assert use_pcp_streaming is True
+    def fake_select_kernel_mesh(_default_mesh, pcp_mode):
+        assert pcp_mode == "streaming"
         return (fake_mesh, fake_mesh,
                 pcp_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS)
 
@@ -324,7 +363,7 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(monkeypatch):
             None,
             None,
             None,
-            use_pcp_streaming=True,
+            pcp_mode="streaming",
             cp_kv_cache_interleave_size=4,
         )
 

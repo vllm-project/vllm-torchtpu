@@ -12,7 +12,8 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 from vllm_torchtpu.layers.common.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR, DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
-    SequenceLayoutDescriptor, SequenceLayoutKind)
+    SequenceLayoutDescriptor, SequenceLayoutKind,
+    is_pcp_allgather_sequence_layout)
 
 
 @functools.partial(
@@ -26,6 +27,9 @@ from vllm_torchtpu.layers.common.sequence_layout import (
         "mamba_state_indices",
         "mamba_slot_read_offsets",
         "mamba_request_distribution",
+        "pcp_kv_cache_lens",
+        "pcp_q_pos_offsets",
+        "pcp_cu_q_lens",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -73,6 +77,25 @@ class AttentionMetadata(object):
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | None = None
+    # All-gather PCP only; None for every other layout.
+    #
+    # pcp_kv_cache_lens: (max_num_seqs,) int32 - length of the *cache* portion
+    #   of each request, i.e. tokens already resident in the paged KV cache.
+    #   The all-gather path attends cache and current KV in two separate kernel
+    #   launches, so the cache launch needs this to avoid reading the current
+    #   tokens. (seq_lens, by contrast, is cache + current.)
+    # pcp_q_pos_offsets: (pcp_size, max_num_seqs) int32 - global query position
+    #   of each of the two fused head/tail chunks owned by each rank, so the
+    #   causal mask in the current phase knows where each chunk really sits.
+    #   pcp-sharded, not replicated: rank r owns chunks r and 2*pcp-1-r.
+    # pcp_cu_q_lens: (pcp_size, max_num_seqs + 1) int32 - per-rank cumulative
+    #   query lengths for the two fused head/tail seqs. Replaces the ordinary
+    #   1-D global query_start_loc for the all-gather kernel, which needs each
+    #   rank's own chunk lengths: the head chunk is always full but the tail
+    #   is clamped by however much of it is padding, which differs per rank.
+    pcp_kv_cache_lens: jax.Array | None = None
+    pcp_q_pos_offsets: jax.Array | None = None
+    pcp_cu_q_lens: jax.Array | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -107,6 +130,11 @@ class AttentionMetadataBuilderContext:
     # the same names. Only the mamba group's builder reads them.
     mamba_slot_read_offsets: torch.Tensor | None = None
     mamba_request_distribution: torch.Tensor | None = None
+    # All-gather PCP only; see AttentionMetadata for the shapes and why these
+    # cannot be derived from seq_lens / query_start_loc.
+    pcp_kv_cache_lens: torch.Tensor | None = None
+    pcp_q_pos_offsets: torch.Tensor | None = None
+    pcp_cu_q_lens: torch.Tensor | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
 
@@ -163,6 +191,17 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             block_tables[:ctx.num_reqs, :target_num_blocks] = (
                 source_block_tables[ctx.start_index:ctx.start_index +
                                     ctx.num_reqs, :target_num_blocks])
+            # All-gather PCP fuses the request's head and tail chunks into one
+            # launch as two "seqs" that are really the SAME request, so seq 1
+            # must carry a COPY of the request's pages. num_reqs is 1 here, so
+            # the zero_() above leaves row 1 pointing at block 0 -- and since
+            # write_last_seq_only makes the tail the KV writer, the whole
+            # current KV lands in block 0 and the cache is destroyed.
+            if (target_num_reqs > 1 and is_pcp_allgather_sequence_layout(
+                    kind=ctx.sequence_layout_descriptor.kind,
+                    protocol=ctx.sequence_layout_descriptor.protocol)):
+                block_tables[1, :target_num_blocks] = (
+                    block_tables[0, :target_num_blocks])
             # Flatten on CPU before H2D to avoid device-side as_strided/reshape
             # materialization on every decode step.
             block_tables_dev = block_tables.reshape(-1).to(runner.device,
@@ -214,6 +253,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_request_distribution=mamba_request_distribution,
+            pcp_kv_cache_lens=ctx.pcp_kv_cache_lens,
+            pcp_q_pos_offsets=ctx.pcp_q_pos_offsets,
+            pcp_cu_q_lens=ctx.pcp_cu_q_lens,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,

@@ -4,6 +4,7 @@ from typing import Any, Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 from jax.experimental.pallas.ops.tpu.splash_attention import \
@@ -17,6 +18,10 @@ import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import \
+    PCP_AXIS_NAME
+from vllm_torchtpu.kernels.experimental.rpa_v3_cp.kernel import \
+    ragged_paged_attention as pcp_cp_kernel
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
@@ -584,3 +589,230 @@ def mla_attention(
                                               md.query_start_loc,
                                               md.request_distribution)
     return kv_cache, output_TNA
+# ---------------------------------------------------------------------------
+# All-gather prefill context parallel (PCP) attention.
+#
+# """All-gather prefill context parallel (PCP) attention.
+#
+# An alternative to the streaming-ring PCP implementation in
+# `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa`. Ported from
+# tpu-inference's `attention_interface.pcp_ragged_paged_attention`, with the
+# shard_map specs adapted to this repo's pcp-only mesh (heads are already
+# per-device under vLLM TP, so only the token axis is sharded here).
+#
+# KV-cache layout (INCOMPATIBLE with streaming -- see below): the cache is
+# round-robin striped with interleave 1, i.e. global token `g` lives on rank
+# `g % pcp` at local slot `g // pcp` (local page `g // (pcp * page_size)` via the
+# block table, offset `(g // pcp) % page_size`).
+#
+# The streaming path instead stripes with interleave `page_size`: token `g` lives
+# on rank `(g // page_size) % pcp`. The two layouts therefore do NOT interoperate
+# -- a cache written by one path is garbage to the other. Concretely this path
+# requires `--cp-kv-cache-interleave-size 1` while streaming requires it to equal
+# `page_size`, so `PCP_IMPL` is fixed for the lifetime of a server and cannot be
+# switched against a warm cache.
+#
+# tpu-inference expresses the same striping by sharding the `page_size` dim of a
+# `page_size*pcp` global page; here the cache is sharded on the block dim with
+# `page_size`-sized pages. The per-rank tensor the kernel sees is identical.
+#
+# Token layout (differs from streaming!): the request's `S = 2*pcp*C` current
+# tokens are split head-tail into `2*pcp` chunks of size `C`; rank `r` holds
+# chunk `r` (head) and chunk `2*pcp-1-r` (tail), so its local buffer is
+# `[head_chunk | tail_chunk]`. This balances the causal triangle across ranks.
+# ---------------------------------------------------------------------------
+
+
+def merge_attn_states(context_out: jax.Array, context_lse: jax.Array,
+                      query_out: jax.Array,
+                      query_lse: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """LSE-combine the cache term and the current term (disjoint KV)."""
+    max_lse = jnp.maximum(context_lse, query_lse)
+    max_lse_safe = jnp.where(jnp.isinf(max_lse), 0.0, max_lse)
+    exp_context = jnp.exp(context_lse - max_lse_safe)
+    exp_query = jnp.exp(query_lse - max_lse_safe)
+
+    sum_exp = exp_context + exp_query
+    denom = jnp.where(sum_exp == 0.0, 1.0, sum_exp)
+    merged_out = (context_out * exp_context[..., None] +
+                  query_out * exp_query[..., None]) / denom[..., None]
+    merged_lse = jnp.where(sum_exp == 0.0, -jnp.inf,
+                           max_lse_safe + jnp.log(denom))
+    return merged_out, merged_lse
+
+
+def _lse_all_to_all(o: jax.Array, lse: jax.Array, axis: str, axis_size: int):
+    """LSE-merge partial attention across `axis`, keeping only THIS rank's block.
+
+    `o`/`lse` hold the partial softmax for ALL `axis_size` query blocks computed
+    against this rank's KV shard. An all-to-all gives each rank every rank's
+    partial for its OWN block (moves 1x instead of axis_size x the data), then
+    the merge is local.
+
+    o:   [axis_size*blk, nq, hd] -> [blk, nq, hd]
+    lse: [axis_size*blk, nq]     -> [blk, nq]
+    """
+    n = o.shape[0] // axis_size
+    nq = o.shape[1]
+    o = o.reshape(axis_size, n, *o.shape[1:])
+    lse = lse.reshape(axis_size, n, nq)
+    # send block j to rank j; axis 0 becomes the SOURCE rank
+    o = lax.all_to_all(o, axis, 0, 0, tiled=True)
+    lse = lax.all_to_all(lse, axis, 0, 0, tiled=True)
+    m = jnp.max(lse, axis=0, keepdims=True)
+    m_safe = jnp.where(jnp.isinf(m), 0.0, m)
+    w = jnp.exp(lse - m_safe)
+    denom = jnp.sum(w, axis=0)
+    w_o = w[..., None].astype(o.dtype)
+    o_sum = jnp.sum(o * w_o, axis=0)
+    denom_safe = jnp.where(denom == 0.0, 1.0, denom)[..., None]
+    o_merged = o_sum.astype(denom.dtype) / denom_safe
+    lse_merged = jnp.where(denom == 0.0, -jnp.inf, m_safe[0] + jnp.log(denom))
+    return o_merged, lse_merged
+
+
+def sharded_pcp_allgather_ragged_paged_attention(
+    mesh: Mesh,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    kv_cache_lens: jax.Array,
+    pcp_q_pos_offsets: jax.Array,
+    sm_scale: float,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    update_kv_cache: bool = True,
+    use_causal_mask: bool = True,
+    cp_rank: int | None = None,
+):
+    """Single-request prefill context-parallel attention (all-gather variant).
+
+    Two kernel launches per rank, LSE-combined:
+      * cache phase:   all-gather Q across pcp, attend the pcp-strided cache
+                       (non-causal, no write), then all-to-all LSE merge.
+      * current phase: local Q attends the current KV (causal, per-chunk
+                       `q_pos_offset`); the tail seq writes the strided cache.
+    """
+    if PCP_AXIS_NAME not in mesh.axis_names:
+        raise ValueError(
+            f"all-gather PCP requires a mesh with a '{PCP_AXIS_NAME}' axis; "
+            f"got {mesh.axis_names}.")
+    pcp_size = mesh.shape[PCP_AXIS_NAME]
+    if cp_rank is not None and not 0 <= cp_rank < pcp_size:
+        raise ValueError(
+            f"all-gather PCP cp_rank must lie in [0, {pcp_size}); got "
+            f"{cp_rank!r}.")
+    two_p = 2 * pcp_size
+    padded_q_len = q.shape[0]          # current tokens across all pcp ranks
+    if padded_q_len % two_p:
+        raise ValueError(
+            f"PCP head-tail split needs q tokens divisible by 2*pcp: "
+            f"{padded_q_len=} {two_p=}.")
+    C = padded_q_len // two_p          # head-tail chunk size
+
+    _row = [c for r in range(pcp_size) for c in (r, two_p - 1 - r)]
+    _inv = [0] * two_p
+    for _i, _c in enumerate(_row):
+        _inv[_c] = _i
+    inv_row = jnp.array(_inv, jnp.int32)
+
+    # pcp-only mesh: shard the token axis; heads are already per-device (TP).
+    tok_spec = P(PCP_AXIS_NAME)
+    pcp_spec = P(PCP_AXIS_NAME, None)
+    repl = P()
+
+    def _fn(q_l, k_l, v_l, kvc, kvl, kvcl, pi, cu_ql, dist2, pcp_qpos):
+        # Under MPMD (the vLLM server) pass an explicit cp_rank: lax.axis_index
+        # lowers to a PartitionId instruction, which torchtpu's MPMD compiler
+        # rejects ("not supported for SPMD partitioning ... the meaning is
+        # ambiguous"), and every rank is its own process that knows its index at
+        # trace time. The streaming wrapper avoids axis_index for the same
+        # reason -- see _select_replicated_shard_for_pcp_rank there.
+        #
+        # cp_rank=None keeps the SPMD path tpu-inference uses, where one process
+        # drives every rank and a baked-in constant would be the same value on
+        # all of them. That is what the multi-device tests exercise.
+        if cp_rank is None:
+            r = jnp.reshape(lax.axis_index(PCP_AXIS_NAME), (1, )).astype(
+                jnp.int32)
+        else:
+            r = jnp.full((1, ), cp_rank, jnp.int32)
+
+        def ag(x):
+            return lax.all_gather(x, PCP_AXIS_NAME, axis=0, tiled=True)
+
+        def to_token_order(x):  # rank-order chunks -> global token order
+            g = ag(x).reshape(two_p, C, *x.shape[1:])
+            return g[inv_row].reshape(padded_q_len, *x.shape[1:])
+
+        common = dict(cp_rank=r,
+                      cp_group_size=pcp_size,
+                      return_lse=True,
+                      sm_scale=sm_scale,
+                      q_scale=q_scale,
+                      k_scale=k_scale,
+                      v_scale=v_scale)
+
+        # ---- cache phase: all-gather Q, attend this rank's strided cache ----
+        ag_q = ag(q_l)
+        cu_cache = jnp.zeros_like(cu_ql[0]).at[1:].set(padded_q_len)
+        dist_cache = jnp.array([0, 0, 1], jnp.int32)
+        o1, kvc1, l1 = pcp_cp_kernel(ag_q,
+                                     k_l,
+                                     v_l,
+                                     kvc,
+                                     kvl,
+                                     pi,
+                                     cu_cache,
+                                     dist_cache,
+                                     kv_cache_lens=kvcl,
+                                     skip_current_attn=True,
+                                     use_causal_mask=False,
+                                     update_kv_cache=False,
+                                     **common)
+        o1, l1 = _lse_all_to_all(o1, l1, PCP_AXIS_NAME, pcp_size)
+
+        # ---- current phase: local Q vs current KV (causal), tail writes ----
+        # Rank-order KV remap avoids the head-tail permute copies, but is only
+        # valid when a prefetch block fits one chunk (kernel caps bkv_sz <= C).
+        page_size_local = kvc.shape[1]
+        remap_kv = (C >= page_size_local) and (C % page_size_local == 0)
+        if remap_kv:
+            k_cur, v_cur = ag(k_l), ag(v_l)
+        else:
+            k_cur, v_cur = to_token_order(k_l), to_token_order(v_l)
+        o2, kvc2, l2 = pcp_cp_kernel(q_l,
+                                     k_cur,
+                                     v_cur,
+                                     kvc1,
+                                     kvl,
+                                     pi,
+                                     cu_ql[0],
+                                     dist2,
+                                     kv_cache_lens=kvcl,
+                                     q_pos_offsets=pcp_qpos[0],
+                                     pcp_chunk_size=(C if remap_kv else None),
+                                     skip_cache_attn=True,
+                                     use_causal_mask=use_causal_mask,
+                                     update_kv_cache=update_kv_cache,
+                                     write_last_seq_only=True,
+                                     **common)
+
+        out, _ = merge_attn_states(o1, l1, o2, l2)  # [2C] = [head | tail]
+        return out.astype(q.dtype), kvc2
+
+    return jax.shard_map(
+        _fn,
+        mesh=mesh,
+        in_specs=(tok_spec, tok_spec, tok_spec, tok_spec, repl, repl, repl,
+                  pcp_spec, repl, pcp_spec),
+        out_specs=(tok_spec, tok_spec),
+        check_vma=False,
+    )(q, k, v, kv_cache, kv_lens, kv_cache_lens, page_indices, cu_q_lens,
+      distribution, pcp_q_pos_offsets)

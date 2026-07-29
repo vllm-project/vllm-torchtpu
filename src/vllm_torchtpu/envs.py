@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    DP_SCHED_BUFFER_PREFILL: bool = False
+    DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS: int = 10000
+    PCP_IMPL: str = "streaming"
 
 
 def env_with_choices(
@@ -235,6 +238,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    # TpuDpScheduler: buffer new prefills and flush them in batches.
+    "DP_SCHED_BUFFER_PREFILL":
+    lambda: bool(int(os.getenv("DP_SCHED_BUFFER_PREFILL") or "0")),
+    # TpuDpScheduler: flush buffered prefills once the oldest pending request
+    # has waited this long (bounds TTFT).
+    "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS") or "10000"),
+    # Prefill context parallel (PCP) implementation.
+    # "streaming"  = ring-streaming RPA: each rank keeps a local KV shard and
+    #                streams KV pages around the PCP ring (KV never gathered).
+    # "all_gather" = all-gather RPA (rpa_v3_cp): all-gather Q, attend the
+    #                round-robin strided cache, LSE-merge via all-to-all.
+    # The two use DIFFERENT KV-cache striping and Q token packing, so the
+    # choice is fixed for the lifetime of a server.
+    "PCP_IMPL":
+    env_with_choices("PCP_IMPL", "streaming", ["streaming", "all_gather"]),
 }
 
 

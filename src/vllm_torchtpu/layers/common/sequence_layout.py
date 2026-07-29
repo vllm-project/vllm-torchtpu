@@ -15,6 +15,10 @@ class SequenceLayoutKind(str, Enum):
 
 DEFAULT_SEQUENCE_LAYOUT_PROTOCOL = "default"
 PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL = "pcp_streaming"
+# All-gather PCP packs tokens head-tail rather than on a fixed interleave
+# cycle, and stripes the KV cache with interleave 1 instead of page_size, so it
+# is a genuinely distinct protocol -- not a variant of the streaming one.
+PCP_ALLGATHER_SEQUENCE_LAYOUT_PROTOCOL = "pcp_allgather"
 
 
 @dataclass(frozen=True)
@@ -236,6 +240,17 @@ class AllSequenceLayoutPlanner:
 
 
 def create_sequence_layout_planner(vllm_config: Any) -> SequenceLayoutPlanner:
+    from vllm_torchtpu import envs
+
+    if envs.PCP_IMPL == "all_gather":
+        from vllm_torchtpu.layers.common.pcp_allgather_sequence_layout import \
+            PcpAllgatherSequenceLayoutPlanner
+        allgather_planner = (
+            PcpAllgatherSequenceLayoutPlanner.from_vllm_config(vllm_config))
+        if allgather_planner.enabled:
+            return allgather_planner
+        return AllSequenceLayoutPlanner()
+
     from vllm_torchtpu.layers.common.pcp_sequence_layout import \
         PcpSequenceLayoutPlanner
 
@@ -265,3 +280,32 @@ def is_pcp_streaming_attention_metadata(attn_metadata: Any) -> bool:
         protocol=getattr(attn_metadata, "sequence_layout_protocol",
                          DEFAULT_SEQUENCE_LAYOUT_PROTOCOL),
     )
+
+
+def is_pcp_allgather_sequence_layout(
+    *,
+    kind: str | SequenceLayoutKind,
+    protocol: str,
+) -> bool:
+    if isinstance(kind, SequenceLayoutKind):
+        kind_value = kind.value
+    else:
+        kind_value = str(kind)
+    return (kind_value == SequenceLayoutKind.PARTIAL.value
+            and protocol == PCP_ALLGATHER_SEQUENCE_LAYOUT_PROTOCOL)
+
+
+def is_pcp_allgather_attention_metadata(attn_metadata: Any) -> bool:
+    return is_pcp_allgather_sequence_layout(
+        kind=getattr(attn_metadata, "sequence_layout_kind",
+                     SequenceLayoutKind.ALL.value),
+        protocol=getattr(attn_metadata, "sequence_layout_protocol",
+                         DEFAULT_SEQUENCE_LAYOUT_PROTOCOL),
+    )
+
+
+def is_pcp_attention_metadata(attn_metadata: Any) -> bool:
+    """True for either PCP protocol. Use when the caller only needs to know
+    that tokens are pcp-partitioned, not which kernel consumes them."""
+    return (is_pcp_streaming_attention_metadata(attn_metadata)
+            or is_pcp_allgather_attention_metadata(attn_metadata))
