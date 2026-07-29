@@ -42,10 +42,6 @@ else:
 
 logger = init_logger(__name__)
 
-# Phased profiling moved to `profiler_config`; this additional_config key is
-# rejected at startup rather than ignored.
-LEGACY_PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
-
 # TODO(ranlihao): add more flexible topology map
 TPU_MULTIHOST_TOPOLOGY_MAP = {
     16: "2,2,2,2",
@@ -194,6 +190,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
+    tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_vllm_disable_compile_ranges()
@@ -598,14 +595,6 @@ class TpuPlatform(Platform):
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
-        # Reject rather than ignore: silently dropping this key would start a
-        # run that looks fine and writes no traces.
-        assert (LEGACY_PHASED_PROFILING_DIR_KEY
-                not in vllm_config.additional_config), (
-                    "Legacy additional_config"
-                    f"['{LEGACY_PHASED_PROFILING_DIR_KEY}'] is no longer "
-                    "supported. Use --profiler-config.profiler=torch_phased "
-                    "with --profiler-config.torch_profiler_dir=<dir> instead.")
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
 

@@ -88,7 +88,6 @@ torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
-torchtpu_config = "vllm_torchtpu.platforms:register_tpu_config"
 
 [tool.pytest.ini_options]
 markers = [

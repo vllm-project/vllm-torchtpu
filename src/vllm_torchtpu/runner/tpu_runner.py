@@ -80,7 +80,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
-from vllm_torchtpu.profiler_config import TORCH_PHASED_PROFILER_KIND
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
@@ -560,15 +559,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def _init_phased_profiling(self) -> None:
         """Initializes the phase-based profiler if configured via
-        profiler_config.profiler='torch_phased'."""
-        profiler_config = self.vllm_config.profiler_config
-        # torch_profiler_dir is shared with the 'torch' profiler, so the kind
-        # is what distinguishes a phased run from a standard one.
-        self.phased_profiling_dir = (profiler_config.torch_profiler_dir
-                                     if profiler_config.profiler
-                                     == TORCH_PHASED_PROFILER_KIND else "")
+        additional_config['phased_profiling_dir']."""
+        additional_config = self.vllm_config.additional_config
+        self.phased_profiling_dir = additional_config.get(
+            runner_utils.PHASED_PROFILING_DIR_KEY, "")
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
+            profiler_config = self.vllm_config.profiler_config
             # Deliberately not read from parallel_config: its rank is
             # TPxPP-scoped, so every DP replica would call itself rank 0 and
             # their traces would overwrite each other on merge. The worker
@@ -576,6 +573,9 @@ class TPUModelRunner(GPUModelRunner):
             # passes it in.
             global_rank = self._profiler_rank
             world_size = self._profiler_world_size
+            decode_kv_len_threshold = additional_config.get(
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
             self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
                 self.phased_profiling_dir,
                 worker_rank=global_rank,
@@ -587,8 +587,7 @@ class TPUModelRunner(GPUModelRunner):
                     profiler_config.max_iterations
                     or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
                 num_decode_steps_to_skip=profiler_config.delay_iterations,
-                decode_kv_len_threshold=(
-                    profiler_config.phased_decode_only_kv_len_threshold),
+                decode_kv_len_threshold=decode_kv_len_threshold,
             )
 
     # ----- Backend hooks overridden from GPUModelRunner -----

@@ -31,7 +31,6 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_torchtpu import profiler_config as profiler_config_module
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
@@ -178,52 +177,40 @@ def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
 
 
 class TestInitPhasedProfiling:
-    """Verify _init_phased_profiling reads the phased profiler's directory
-    from profiler_config, not additional_config."""
+    """Verify _init_phased_profiling reads from additional_config/profiler_config
+    instead of PHASED_PROFILER_* env vars."""
 
     def _fake_runner(self,
-                     profiler=None,
-                     torch_profiler_dir="",
+                     additional_config,
                      max_iterations=0,
                      delay_iterations=0,
-                     kv_len_threshold=-1,
                      profiler_rank=2,
                      profiler_world_size=4):
         # No parallel_config: the phased profiler must not reach for it.
-        # No additional_config either: every phased knob is in profiler_config.
         return SimpleNamespace(
-            vllm_config=SimpleNamespace(profiler_config=SimpleNamespace(
-                profiler=profiler,
-                torch_profiler_dir=torch_profiler_dir,
-                max_iterations=max_iterations,
-                delay_iterations=delay_iterations,
-                phased_decode_only_kv_len_threshold=kv_len_threshold)),
+            vllm_config=SimpleNamespace(
+                additional_config=additional_config,
+                profiler_config=SimpleNamespace(
+                    max_iterations=max_iterations,
+                    delay_iterations=delay_iterations)),
             _profiler_rank=profiler_rank,
             _profiler_world_size=profiler_world_size,
         )
 
-    def test_disabled_when_profiler_not_set(self):
-        runner = self._fake_runner()
-        TPUModelRunner._init_phased_profiling(runner)
-        assert runner.phased_profiling_dir == ""
-        assert runner.phase_based_profiler is None
-
-    def test_disabled_for_plain_torch_profiler(self):
-        """Both kinds share torch_profiler_dir, so a 'torch' run must not be
-        mistaken for a phased one."""
-        runner = self._fake_runner(profiler="torch",
-                                   torch_profiler_dir="/tmp/torch")
+    def test_disabled_when_dir_not_set(self):
+        runner = self._fake_runner(additional_config={})
         TPUModelRunner._init_phased_profiling(runner)
         assert runner.phased_profiling_dir == ""
         assert runner.phase_based_profiler is None
 
     def test_enabled_uses_config_values(self):
         runner = self._fake_runner(
-            profiler="torch_phased",
-            torch_profiler_dir="/tmp/phased",
+            additional_config={
+                "phased_profiling_dir": "/tmp/phased",
+                "phased_profiler_decode_only_kv_len_threshold": 128,
+            },
             max_iterations=20,
             delay_iterations=3,
-            kv_len_threshold=128,
         )
         with patch(
                 "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
@@ -258,8 +245,7 @@ class TestInitPhasedProfiling:
         rank 0, so their traces would collide. The worker passes the
         slice-global rank instead, and it is the only source."""
         runner = self._fake_runner(
-            profiler="torch_phased",
-            torch_profiler_dir="/tmp/phased",
+            additional_config={"phased_profiling_dir": "/tmp/phased"},
             profiler_rank=9,
             profiler_world_size=16,
         )
@@ -273,8 +259,7 @@ class TestInitPhasedProfiling:
 
     def test_falls_back_to_default_num_steps_when_max_iterations_unset(self):
         runner = self._fake_runner(
-            profiler="torch_phased",
-            torch_profiler_dir="/tmp/phased",
+            additional_config={"phased_profiling_dir": "/tmp/phased"},
             max_iterations=0,
             delay_iterations=0,
         )
@@ -286,9 +271,9 @@ class TestInitPhasedProfiling:
         assert (
             mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] ==
             runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
-        assert (mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"]
-                == profiler_config_module.
-                PHASED_DECODE_ONLY_KV_LEN_THRESHOLD_DISABLED)
+        assert (
+            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"] ==
+            runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
 
 
 class DummyMamba(MambaBase):

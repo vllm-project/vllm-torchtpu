@@ -351,29 +351,3 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is True
-
-
-class TestLegacyPhasedProfilingKeyRejected:
-    """The phased profiler moved to profiler_config; the old
-    additional_config key must fail loudly rather than be ignored."""
-
-    def _config_with(self, additional_config):
-        vllm_config = MagicMock()
-        vllm_config.additional_config = additional_config
-        return vllm_config
-
-    def test_legacy_key_raises(self):
-        with pytest.raises(AssertionError, match="torch_phased"):
-            TpuPlatform.check_and_update_config(
-                self._config_with({"phased_profiling_dir": "/tmp/phased"}))
-
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
-    def test_other_keys_pass_the_check(self, _mock_apply_patches):
-        """The guard must be specific: an unrelated key reaches the rest of
-        check_and_update_config (which then fails on the MagicMock, proving
-        the assertion was not what stopped it)."""
-        with pytest.raises(Exception) as excinfo:
-            TpuPlatform.check_and_update_config(
-                self._config_with({"some_plugin_knob": 1}))
-
-        assert "phased_profiling_dir" not in str(excinfo.value)

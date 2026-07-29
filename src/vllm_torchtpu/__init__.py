@@ -29,42 +29,57 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 
 
-def _patch_vllm_profiler_config_class() -> None:
-    """Point ``VllmConfig.profiler_config`` at vllm-torchtpu's subclass.
+def _patch_vllm_config_hash_ignore_diagnostics() -> None:
+    """Keep diagnostics-only ``additional_config`` keys out of cache keys.
 
-    ``VllmConfig`` compiles the class it was annotated with into its pydantic
-    schema at class-definition time, so rebinding
-    ``vllm.config.profiler.ProfilerConfig`` has no effect. The field on
-    ``VllmConfig`` has to be repointed and its schema rebuilt.
-
-    Runs from the ``vllm.general_plugins`` entry point, which vLLM loads at
-    the top of ``add_cli_args`` -- before ``--profiler-config`` is built from
-    this field, so the CLI converter picks up the subclass on its own.
+    ``VllmConfig.compute_hash()`` unconditionally folds
+    ``json.dumps(additional_config)`` into its result, and that hash feeds both
+    the AOT compile cache key (``caching.aot_compile_hash_factors``) and the
+    piecewise cache dir (``backends.py``). The phased profiler is configured
+    through ``additional_config``, so a per-run trace directory would force a
+    full recompile on every server start. Upstream takes the same care in
+    ``ProfilerConfig.compute_hash()`` ("this config will not affect the
+    computation graph"); this is the equivalent carve-out for the plugin-owned
+    keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars.
     """
-    from pydantic.dataclasses import rebuild_dataclass
+    import copy
+
     from vllm.config import VllmConfig
 
-    from vllm_torchtpu.profiler_config import TpuProfilerConfig
+    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
-    field = VllmConfig.__pydantic_fields__.get("profiler_config")
-    if field is not None and field.annotation is TpuProfilerConfig:
+    if getattr(VllmConfig, "_tpu_additional_config_hash_patch", False):
         return
 
-    try:
-        field.annotation = TpuProfilerConfig
-        VllmConfig.__annotations__["profiler_config"] = TpuProfilerConfig
-        VllmConfig.__dataclass_fields__["profiler_config"].type = (
-            TpuProfilerConfig)
-        rebuild_dataclass(VllmConfig, force=True)
-    except (AttributeError, KeyError) as e:
-        raise RuntimeError(
-            "Failed to point VllmConfig.profiler_config at TpuProfilerConfig. "
-            "This reads pydantic/dataclass field internals "
-            "(__pydantic_fields__, __dataclass_fields__) that a vLLM or "
-            "pydantic version bump may have reshaped.") from e
+    original = VllmConfig.compute_hash
 
-    logger.info("Applied TPU patch: VllmConfig.profiler_config uses %s.",
-                TpuProfilerConfig.__name__)
+    def compute_hash(self) -> str:
+        additional_config = self.additional_config
+        if not isinstance(additional_config, dict):
+            return original(self)
+        filtered = {
+            key: value
+            for key, value in additional_config.items()
+            if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+        }
+        if filtered == additional_config:
+            return original(self)
+        # Hash a shallow copy with the filtered dict rather than mutating the
+        # live config: compute_hash() may run while other code holds the same
+        # VllmConfig, and a shallow copy shares every sub-config by reference
+        # (cheap, no re-validation -- __post_init__ is not re-run) while giving
+        # compute_hash its own additional_config to read.
+        proxy = copy.copy(self)
+        proxy.additional_config = filtered
+        return original(proxy)
+
+    VllmConfig._tpu_upstream_compute_hash = original
+    VllmConfig.compute_hash = compute_hash
+    VllmConfig._tpu_additional_config_hash_patch = True
+    logger.info(
+        "Applied TPU patch: exclude diagnostics-only additional_config keys "
+        "%s from the compile cache key.",
+        sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS))
 
 
 def _patch_vllm_tpu_group_custom_ops() -> None:

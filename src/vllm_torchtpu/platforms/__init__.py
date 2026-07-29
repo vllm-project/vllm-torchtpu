@@ -26,17 +26,6 @@ def _log_tpu_info() -> None:
             "Are you running on CPU?", error)
 
 
-def register_tpu_config() -> None:
-    """vLLM general-plugin entry point for TPU config classes.
-
-    vLLM loads general plugins at the top of ``add_cli_args``, before the
-    ``--profiler-config`` argument is built from ``VllmConfig``'s field, so
-    repointing that field here is enough for the CLI to pick it up.
-    """
-    from vllm_torchtpu import _patch_vllm_profiler_config_class
-    _patch_vllm_profiler_config_class()
-
-
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
     _log_tpu_info()

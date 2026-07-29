@@ -12,8 +12,6 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.profiler_config import \
-    PHASED_DECODE_ONLY_KV_LEN_THRESHOLD_DISABLED
 
 logger = init_logger(__name__)
 
@@ -24,6 +22,20 @@ DECODE_HEAVY_RATIO_THRESHOLD = 0.2
 BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
 PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
+PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
+
+# `additional_config` keys that configure phased profiling.
+PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
+PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
+    "phased_profiler_decode_only_kv_len_threshold")
+
+# Diagnostics-only knobs: they steer profiling and never change the compiled
+# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
+# TPU compile cache key. Keep this in sync with the keys read above.
+HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
+    PHASED_PROFILING_DIR_KEY,
+    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+})
 
 
 class InferencePhase(Enum):
@@ -136,7 +148,7 @@ class PhaseBasedProfiler:
         num_decode_steps_to_skip:
         int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
         decode_kv_len_threshold:
-        int = PHASED_DECODE_ONLY_KV_LEN_THRESHOLD_DISABLED,
+        int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: Optional[str] = None
