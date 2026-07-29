@@ -4215,17 +4215,13 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         attn_block_size = None
-        has_attention = False
-        has_mamba = False
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
             if isinstance(spec, MambaSpec):
-                has_mamba = True
                 # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
                 continue
-            if isinstance(spec, AttentionSpec):
-                has_attention = True
-            elif len(kv_cache_config.kv_cache_groups) > 1:
+            if not isinstance(spec, AttentionSpec) and len(
+                    kv_cache_config.kv_cache_groups) > 1:
                 raise NotImplementedError(
                     "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
                 )
@@ -4303,7 +4299,6 @@ class TPUModelRunner(GPUModelRunner):
             tensor_size = kv_cache_tensor.size
             shared_by = kv_cache_tensor.shared_by
             if len(shared_by) > 1:
-                assert has_attention and has_mamba, "KV cache duplication is only supported for hybrid models with Mamba and Full Attention layers."
                 total_group_page_size = 0
                 for name in shared_by:
                     spec = layer_name_to_spec[name]
