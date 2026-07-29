@@ -24,8 +24,6 @@ DECODE_HEAVY_RATIO_THRESHOLD = 0.2
 BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
 PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
-# Superseded by `profiler_config`; rejected at startup in tpu_platform.
-LEGACY_PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
 
 
 class InferencePhase(Enum):

@@ -158,19 +158,19 @@ class TestSubstitution:
         assert PHASED not in str(annotation)
 
     def test_vllm_config_field_points_at_the_subclass(self):
-        """vLLM calls pre_register_and_update before it builds a VllmConfig,
-        which is the only window where the class can still be swapped."""
-        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+        """Applied by the vllm.general_plugins entry point, which vLLM loads
+        before it builds the --profiler-config argument."""
+        from vllm_torchtpu.platforms import register_tpu_config
 
-        TpuPlatform.pre_register_and_update()
+        register_tpu_config()
 
         assert VllmConfig.__pydantic_fields__[
             "profiler_config"].annotation is TpuProfilerConfig
 
     def test_accepts_a_plain_profiler_config(self):
         """Regression: repointing VllmConfig's field made it reject vLLM's own
-        class, and several defaults are built from that class before the
-        platform hook runs (EngineArgs' field factory, the argparse default).
+        class, while two defaults are still built from it -- EngineArgs' field
+        factory and the argparse default.
         Without this coercion every run that does not profile fails with
         "Input should be ... an instance of TpuProfilerConfig"."""
         adapter = TypeAdapter(TpuProfilerConfig)
@@ -196,6 +196,19 @@ class TestSubstitution:
         with pytest.raises(ValidationError, match="only applicable"):
             adapter.validate_python(
                 ProfilerConfig(profiler="cuda", torch_profiler_dir="/tmp/x"))
+
+    def test_registered_as_a_general_plugin(self):
+        """The entry point is what applies the patch. It lives in
+        pyproject.toml, so a rename here fails silently -- nothing would call
+        it and torch_phased would be rejected at the CLI."""
+        from importlib.metadata import entry_points
+
+        registered = {
+            ep.value
+            for ep in entry_points(group="vllm.general_plugins")
+        }
+
+        assert ("vllm_torchtpu.platforms:register_tpu_config" in registered)
 
     def test_is_a_profiler_config(self):
         """Anything type-checking against vLLM's class keeps working."""

@@ -57,12 +57,12 @@ class TpuProfilerConfig(ProfilerConfig):
     def _accept_base_profiler_config(cls, value):
         """Coerce a plain ``ProfilerConfig`` into this subclass.
 
-        Several defaults are built from vLLM's class before the platform hook
-        can repoint anything -- ``EngineArgs``' own field factory, and the
-        ``--profiler-config`` argparse default. Those instances are then
-        passed to ``VllmConfig`` explicitly, where the repointed field would
-        otherwise reject them outright and break every run that does not
-        profile. Widening here covers all such sources at once.
+        Two defaults are still built from vLLM's class: ``EngineArgs``' own
+        field factory (bound when that module is imported) and the
+        ``--profiler-config`` argparse default (built from the field's
+        unrepointed factory). Both reach ``VllmConfig`` explicitly, where the
+        repointed field would otherwise reject them and break every run that
+        does not profile.
         """
         if isinstance(value, ProfilerConfig) and not isinstance(value, cls):
             return {

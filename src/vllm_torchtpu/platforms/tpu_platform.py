@@ -42,6 +42,10 @@ else:
 
 logger = init_logger(__name__)
 
+# Phased profiling moved to `profiler_config`; this additional_config key is
+# rejected at startup rather than ignored.
+LEGACY_PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
+
 # TODO(ranlihao): add more flexible topology map
 TPU_MULTIHOST_TOPOLOGY_MAP = {
     16: "2,2,2,2",
@@ -190,11 +194,6 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
-    # Needed for spawned workers, which never run pre_register_and_update():
-    # reconstructing a VllmConfig there would otherwise re-validate
-    # profiler_config against vLLM's class and reject the phased kind. No
-    # parser to pass -- workers do not parse arguments.
-    tpu_plugin._patch_vllm_profiler_config_class()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_vllm_disable_compile_ranges()
@@ -595,19 +594,7 @@ class TpuPlatform(Platform):
         return {}
 
     @classmethod
-    def pre_register_and_update(cls, parser=None) -> None:
-        """Register TPU-specific config classes before CLI args are parsed.
-
-        vLLM calls this before building a VllmConfig, which is the window the
-        profiler config class has to be swapped in: check_and_update_config()
-        is too late, as the config object already exists by then.
-        """
-        from vllm_torchtpu import _patch_vllm_profiler_config_class
-        _patch_vllm_profiler_config_class(parser)
-
-    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from vllm_torchtpu.runner.utils import LEGACY_PHASED_PROFILING_DIR_KEY
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")

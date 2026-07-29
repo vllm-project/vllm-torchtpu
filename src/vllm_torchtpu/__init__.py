@@ -29,7 +29,7 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 
 
-def _patch_vllm_profiler_config_class(parser=None) -> None:
+def _patch_vllm_profiler_config_class() -> None:
     """Point ``VllmConfig.profiler_config`` at vllm-torchtpu's subclass.
 
     ``VllmConfig`` compiles the class it was annotated with into its pydantic
@@ -37,10 +37,9 @@ def _patch_vllm_profiler_config_class(parser=None) -> None:
     ``vllm.config.profiler.ProfilerConfig`` has no effect. The field on
     ``VllmConfig`` has to be repointed and its schema rebuilt.
 
-    ``parser``, when given, is the CLI parser vLLM passes to
-    ``pre_register_and_update``. By then ``--profiler-config`` has already been
-    registered with a converter bound to the old class, so that converter is
-    retargeted too.
+    Runs from the ``vllm.general_plugins`` entry point, which vLLM loads at
+    the top of ``add_cli_args`` -- before ``--profiler-config`` is built from
+    this field, so the CLI converter picks up the subclass on its own.
     """
     from pydantic.dataclasses import rebuild_dataclass
     from vllm.config import VllmConfig
@@ -64,44 +63,8 @@ def _patch_vllm_profiler_config_class(parser=None) -> None:
             "(__pydantic_fields__, __dataclass_fields__) that a vLLM or "
             "pydantic version bump may have reshaped.") from e
 
-    if parser is not None:
-        _retarget_profiler_config_cli_arg(parser, TpuProfilerConfig)
-
     logger.info("Applied TPU patch: VllmConfig.profiler_config uses %s.",
                 TpuProfilerConfig.__name__)
-
-
-def _retarget_profiler_config_cli_arg(parser, config_cls) -> None:
-    """Rebind the ``--profiler-config`` converter to ``config_cls``.
-
-    ``add_cli_args`` builds the converter from whatever class ``VllmConfig``
-    was annotated with at that moment, and only calls
-    ``pre_register_and_update`` afterwards -- so repointing the field alone
-    leaves the CLI still validating against vLLM's class. Mirrors upstream's
-    ``parse_dataclass`` in ``vllm/engine/arg_utils.py``.
-    """
-    import argparse
-
-    from pydantic import TypeAdapter, ValidationError
-    from vllm.engine.arg_utils import _expand_json_human_readable_numbers
-
-    action = next((a for a in parser._actions if a.dest == "profiler_config"),
-                  None)
-    if action is None:
-        # No --profiler-config on this parser (not every entry point builds
-        # the full engine arg set); the VllmConfig repoint above is enough.
-        return
-
-    adapter = TypeAdapter(config_cls)
-
-    def parse_profiler_config(val: str):
-        try:
-            return adapter.validate_json(
-                _expand_json_human_readable_numbers(val))
-        except ValidationError as e:
-            raise argparse.ArgumentTypeError(repr(e)) from e
-
-    action.type = parse_profiler_config
 
 
 def _patch_vllm_tpu_group_custom_ops() -> None:
