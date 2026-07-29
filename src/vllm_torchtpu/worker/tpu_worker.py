@@ -130,11 +130,6 @@ class TPUWorker(WorkerBase):
         self.profile_rank = self.rank
         self.profile_world_size = self.parallel_config.world_size
         torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
-        # Both profilers read torch_profiler_dir. A phased run is driven from
-        # TPUModelRunner and opens its own PyTorch profiler contexts, so the
-        # worker must not also open one.
-        if envs.USE_PHASED_PROFILER:
-            torch_profiler_dir = None
         if torch_profiler_dir:
             self.profile_dir = torch_profiler_dir
             logger.info("Profiling enabled. Traces will be saved to: %s",
@@ -429,6 +424,17 @@ class TPUWorker(WorkerBase):
     def profile(self,
                 is_start: bool = True,
                 profile_prefix: str | None = None):
+        if envs.USE_PHASED_PROFILER:
+            # A phased run captures one trace per inference phase rather than
+            # a single continuous one, driven from TPUModelRunner since phase
+            # detection needs per-step batch composition. profile() still owns
+            # arming/disarming it, so both profilers share one trigger.
+            if is_start:
+                self.model_runner.start_phased_profiling(profile_prefix)
+            else:
+                self.model_runner.stop_phased_profiling()
+            return
+
         if self.profile_dir is None:
             logger.warning("Profile directory is not set. Skipping profiling.")
             return

@@ -106,8 +106,9 @@ def test_threshold_no_longer_changes_the_hash(patched_compute_hash):
         {KEY: 128})) == patched_compute_hash(_StubVllmConfig({KEY: 256})))
 
 
-def test_enabling_phased_profiling_reuses_the_unprofiled_cache(
+def test_setting_the_threshold_reuses_the_unprofiled_cache(
         patched_compute_hash):
+    """Adding the knob at all must not invalidate a cache built without it."""
     baseline = patched_compute_hash(_StubVllmConfig())
 
     assert patched_compute_hash(_StubVllmConfig({KEY: 128})) == baseline

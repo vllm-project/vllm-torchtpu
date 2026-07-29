@@ -122,7 +122,9 @@ def get_batch_composition_stats(
                 num_decode_tokens += 1
 
     stats = {
-        "batch_id": batch_id,
+        # Counted from when profiling was armed, not from server start: the
+        # profiler is created on worker.profile(is_start=True).
+        "batch_id_since_profile_start": batch_id,
         "total_num_scheduled_tokens": total_num_scheduled_tokens,
         "num_prefill_tokens": num_prefill_tokens,
         "num_decode_tokens": num_decode_tokens,
@@ -282,18 +284,30 @@ class PhaseBasedProfiler:
                 batch_composition_stats)
             self.profiling_n_steps_left -= 1
             if self.profiling_n_steps_left <= 0:
-                if self.profile_context:
-                    try:
-                        self.profile_context.__exit__(None, None, None)
-                        logger.info("Stopped PyTorch profiler trace.")
-                    except Exception as e:
-                        logger.error("Failed to stop PyTorch profiler: %s", e)
-                    self.profile_context = None
+                self._finish_current_phase()
 
-                self._merge_profile_directories()
-                logger.info(
-                    f"Profiling for {self.current_phase} phase finished")
-                self.current_phase = ""
+    def _finish_current_phase(self) -> None:
+        """Closes out the phase capture in progress, if any."""
+        if self.profile_context:
+            try:
+                self.profile_context.__exit__(None, None, None)
+                logger.info("Stopped PyTorch profiler trace.")
+            except Exception as e:
+                logger.error("Failed to stop PyTorch profiler: %s", e)
+            self.profile_context = None
+
+        self._merge_profile_directories()
+        logger.info(f"Profiling for {self.current_phase} phase finished")
+        self.current_phase = ""
+
+    def finish(self) -> None:
+        """Force-stops a phase capture in progress.
+
+        Called when profiling is disarmed (worker.profile(is_start=False))
+        before the current phase's step budget ran out.
+        """
+        if self.current_phase:
+            self._finish_current_phase()
 
     def _merge_profile_directories(self) -> None:
         """Consolidates phase trace artifacts."""

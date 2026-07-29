@@ -60,19 +60,17 @@ def _make_vllm_config(profiler_torch_dir=None):
     return cfg
 
 
-def _build_worker(vllm_config, rank=0, use_phased_profiler=False):
+def _build_worker(vllm_config, rank=0):
     """Construct a TPUWorker with heavy side-effects mocked out."""
+    # envs is deliberately not patched: __init__ reads nothing from it, and
+    # profile() must see the real USE_PHASED_PROFILER that tests monkeypatch.
     with (
             patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches"),
-            patch("vllm_torchtpu.worker.tpu_worker.envs") as mock_envs,
             patch(
                 "vllm_torchtpu.worker.tpu_worker.WorkerBase.__init__",
                 return_value=None,
             ),
     ):
-        # Explicit: attribute access on a MagicMock is truthy, which would
-        # silently put every worker on the phased path.
-        mock_envs.USE_PHASED_PROFILER = use_phased_profiler
 
         worker = TPUWorker.__new__(TPUWorker)
         # Set attributes that WorkerBase.__init__ would normally set.
@@ -116,12 +114,46 @@ class TestProfilerDir:
         worker = _build_worker(cfg)
         assert worker.profile_dir is None
 
-    def test_phased_profiling_disables_manual_profiler(self):
-        """A phased run shares torch_profiler_dir but is driven by the model
-        runner, so the worker must not open a second profiler context."""
+
+class TestProfileDispatchesToPhasedProfiler:
+    """USE_PHASED_PROFILER makes profile() arm/disarm TPUModelRunner's phase
+    profiler instead of opening a worker-owned profiler context."""
+
+    def test_start_arms_the_model_runners_phased_profiler(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
         cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
-        worker = _build_worker(cfg, use_phased_profiler=True)
-        assert worker.profile_dir is None
+        worker = _build_worker(cfg)
+        worker.model_runner = MagicMock()
+
+        worker.profile(is_start=True)
+
+        worker.model_runner.start_phased_profiling.assert_called_once_with(
+            None)
+        worker.model_runner.stop_phased_profiling.assert_not_called()
+        assert worker.profile_context is None
+
+    def test_start_forwards_the_profile_prefix(self, monkeypatch):
+        """The prefix must not be dropped just because this is a phased run."""
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg)
+        worker.model_runner = MagicMock()
+
+        worker.profile(is_start=True, profile_prefix="decode")
+
+        worker.model_runner.start_phased_profiling.assert_called_once_with(
+            "decode")
+
+    def test_stop_disarms_the_model_runners_phased_profiler(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg)
+        worker.model_runner = MagicMock()
+
+        worker.profile(is_start=False)
+
+        worker.model_runner.stop_phased_profiling.assert_called_once_with()
+        worker.model_runner.start_phased_profiling.assert_not_called()
 
 
 class TestProfileCaptureAndMerge:
