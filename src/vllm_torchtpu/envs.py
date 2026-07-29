@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     FORCE_MOE_RANDOM_ROUTING: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
@@ -221,6 +222,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ragged_gather_reduce.
     "RAGGED_GATHER_REDUCE_VERSION":
     env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
+    # Capture one trace per inference phase instead of one continuous trace.
+    # The trace directory and iteration limits come from `profiler_config`;
+    # this only selects which profiler consumes them.
+    "USE_PHASED_PROFILER":
+    env_bool("USE_PHASED_PROFILER"),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server

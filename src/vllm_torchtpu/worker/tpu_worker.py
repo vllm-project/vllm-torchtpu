@@ -30,7 +30,6 @@ from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.utils import PHASED_PROFILING_DIR_KEY
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
@@ -131,15 +130,10 @@ class TPUWorker(WorkerBase):
         self.profile_rank = self.rank
         self.profile_world_size = self.parallel_config.world_size
         torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
-        phased_profiling_dir = self.vllm_config.additional_config.get(
-            PHASED_PROFILING_DIR_KEY, "")
-        # Phased profiling takes precedence over standard Torch profiling
-        # to prevent conflicting PyTorch profiler contexts.
-        if phased_profiling_dir and torch_profiler_dir:
-            logger.warning(
-                "Both additional_config['phased_profiling_dir'] and "
-                "profiler_config.torch_profiler_dir are set. Disabling manual "
-                "profiling (torch_profiler_dir) in favor of phased profiling.")
+        # Both profilers read torch_profiler_dir. A phased run is driven from
+        # TPUModelRunner and opens its own PyTorch profiler contexts, so the
+        # worker must not also open one.
+        if envs.USE_PHASED_PROFILER:
             torch_profiler_dir = None
         if torch_profiler_dir:
             self.profile_dir = torch_profiler_dir

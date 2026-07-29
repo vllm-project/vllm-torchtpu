@@ -48,7 +48,7 @@ def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(
     assert os.environ["WORLD_SIZE"] == "8"
 
 
-def _make_vllm_config(profiler_torch_dir=None, phased_profiling_dir=""):
+def _make_vllm_config(profiler_torch_dir=None):
     """Build a minimal mock VllmConfig for TPUWorker.__init__."""
     cfg = MagicMock()
     cfg.model_config.dtype = torch.bfloat16
@@ -56,19 +56,23 @@ def _make_vllm_config(profiler_torch_dir=None, phased_profiling_dir=""):
     cfg.parallel_config.pipeline_parallel_size = 1
     cfg.compilation_config.compile_ranges_endpoints = []
     cfg.profiler_config.torch_profiler_dir = profiler_torch_dir
-    cfg.additional_config = {"phased_profiling_dir": phased_profiling_dir}
+    cfg.additional_config = {}
     return cfg
 
 
-def _build_worker(vllm_config, rank=0):
+def _build_worker(vllm_config, rank=0, use_phased_profiler=False):
     """Construct a TPUWorker with heavy side-effects mocked out."""
     with (
             patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches"),
+            patch("vllm_torchtpu.worker.tpu_worker.envs") as mock_envs,
             patch(
                 "vllm_torchtpu.worker.tpu_worker.WorkerBase.__init__",
                 return_value=None,
             ),
     ):
+        # Explicit: attribute access on a MagicMock is truthy, which would
+        # silently put every worker on the phased path.
+        mock_envs.USE_PHASED_PROFILER = use_phased_profiler
 
         worker = TPUWorker.__new__(TPUWorker)
         # Set attributes that WorkerBase.__init__ would normally set.
@@ -113,12 +117,10 @@ class TestProfilerDir:
         assert worker.profile_dir is None
 
     def test_phased_profiling_disables_manual_profiler(self):
-        """additional_config['phased_profiling_dir'] takes precedence over
-        profiler_config.torch_profiler_dir to avoid conflicting profiler
-        contexts."""
-        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir",
-                                phased_profiling_dir="/phased/profiler/dir")
-        worker = _build_worker(cfg)
+        """A phased run shares torch_profiler_dir but is driven by the model
+        runner, so the worker must not open a second profiler context."""
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg, use_phased_profiler=True)
         assert worker.profile_dir is None
 
 

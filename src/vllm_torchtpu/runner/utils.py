@@ -24,16 +24,15 @@ PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
 
-# `additional_config` keys that configure phased profiling.
-PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
+# Tuning knob with no `profiler_config` equivalent, so it stays in
+# `additional_config`.
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_decode_only_kv_len_threshold")
 
-# Diagnostics-only knobs: they steer profiling and never change the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
-# TPU compile cache key. Keep this in sync with the keys read above.
+# Diagnostics-only knob: it steers profiling and never changes the compiled
+# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
+# TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
-    PHASED_PROFILING_DIR_KEY,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
 })
 

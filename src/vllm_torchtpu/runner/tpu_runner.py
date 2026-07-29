@@ -558,14 +558,18 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
 
     def _init_phased_profiling(self) -> None:
-        """Initializes the phase-based profiler if configured via
-        additional_config['phased_profiling_dir']."""
-        additional_config = self.vllm_config.additional_config
-        self.phased_profiling_dir = additional_config.get(
-            runner_utils.PHASED_PROFILING_DIR_KEY, "")
+        """Initializes the phase-based profiler when USE_PHASED_PROFILER is set.
+
+        The trace directory and iteration limits are read from
+        `profiler_config`, the same fields the standard torch profiler uses;
+        the env var only selects which profiler consumes them.
+        """
+        profiler_config = self.vllm_config.profiler_config
+        self.phased_profiling_dir = (profiler_config.torch_profiler_dir
+                                     if envs.USE_PHASED_PROFILER else "")
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
-            profiler_config = self.vllm_config.profiler_config
+            additional_config = self.vllm_config.additional_config
             # Deliberately not read from parallel_config: its rank is
             # TPxPP-scoped, so every DP replica would call itself rank 0 and
             # their traces would overwrite each other on merge. The worker
