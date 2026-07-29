@@ -137,11 +137,13 @@ class TestVllmGatedDeltaNetAttention:
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
         assert attn.gdn_pcp_op is None
+        assert attn.gdn_pooled_pcp_op is None
 
     def test_init_builds_pcp_gdn_op_when_pcp_enabled(self):
         regular_op = MagicMock()
         pooled_op = MagicMock()
         pcp_op = MagicMock()
+        pooled_pcp_op = MagicMock()
 
         with set_vllm_model_wrapper_context(mesh=_mesh(),
                                             vllm_config=_vllm_config(
@@ -156,14 +158,20 @@ class TestVllmGatedDeltaNetAttention:
                           side_effect=[regular_op, pcp_op]) as mock_build, \
              patch.object(VllmGatedDeltaNetAttention,
                           "_build_pooled_gdn_op",
-                          return_value=pooled_op) as mock_build_pooled:
+                          return_value=pooled_op) as mock_build_pooled, \
+             patch.object(
+                 VllmGatedDeltaNetAttention,
+                 "_build_pooled_pcp_gdn_op",
+                 return_value=pooled_pcp_op) as mock_build_pooled_pcp:
             attn = VllmGatedDeltaNetAttention()
 
         assert mock_build.call_args_list == [call(), call(pcp_streaming=True)]
         mock_build_pooled.assert_called_once_with()
+        mock_build_pooled_pcp.assert_called_once_with()
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
         assert attn.gdn_pcp_op is pcp_op
+        assert attn.gdn_pooled_pcp_op is pooled_pcp_op
 
     def test_pooled_op_reads_block_size_at_call_time(self):
         """The pooled op must not freeze cache_config.block_size at build.

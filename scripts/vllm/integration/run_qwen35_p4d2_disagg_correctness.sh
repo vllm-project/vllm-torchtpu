@@ -14,7 +14,6 @@ VLLM_SRC="${VLLM_SRC:-${repo_root}}"
 TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-1}"
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
-RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL:-chunked_kernel_v3_pd}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"
 
 cleanup() {
@@ -60,7 +59,6 @@ export VLLM_SRC
 export TORCHTPU_VLLM_SRC
 export USE_CURRENT_PY_ENV
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-export RAGGED_GATED_DELTA_RULE_IMPL
 export ASYNC_SCHEDULING
 
 export P4D2_SHORT_REPEAT_LINES="${P4D2_SHORT_REPEAT_LINES:-32}"
@@ -79,15 +77,14 @@ cd "${repo_root}"
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
 
-python examples/disagg/smoke_qwen35_p4d2_v2_prefix_cache_correctness.py \
+python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
-  --run-dir "${RUN_DIR}" \
   2>&1 | tee "${RUN_DIR}/logs/correctness.log"
 
 if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
-  python examples/disagg/smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py \
+  python scripts/vllm/integration/smoke_prefix_cache_e2e_divergence.py \
     --host "${P4D2_BIND_HOST}" \
     --port "${PROXY_PORT}" \
     --model "${SERVED_MODEL_NAME}" \

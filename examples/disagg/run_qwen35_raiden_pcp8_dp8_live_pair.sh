@@ -412,7 +412,6 @@ configure_role_environment() {
   export PJRT_DEVICE=TPU
   export TPU_BACKEND_TYPE=jax
   export VLLM_TARGET_DEVICE=tpu
-  export NEW_MODEL_DESIGN=0
   export SKIP_JAX_PRECOMPILE=1
   export VLLM_XLA_CHECK_RECOMPILATION=0
   export USE_MOE_SPARSE_CORE=0
@@ -426,8 +425,6 @@ configure_role_environment() {
 
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-  export USE_BATCHED_RPA_KERNEL=1
-  export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
   export LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
 
   export TPU_P2P_WAIT_PULL_TIMEOUT=600

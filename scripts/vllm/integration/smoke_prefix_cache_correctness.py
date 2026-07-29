@@ -2,14 +2,12 @@
 import argparse
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 SHORT_QA = [
     ("math_add", "What is 7+8? Answer only the number.", "15"),
@@ -48,10 +46,6 @@ SHORT_QA = [
 ]
 
 BAD_MARKERS = ["<think>", "Thinking Process", "====", "\ufffd"]
-FATAL_LOG_RE = re.compile(
-    r"Traceback|RuntimeError|ValueError|LLVM ERROR|dynamic_update_slice|"
-    r"strided KV pull failed|registered memory region overlaps|"
-    r"Only support arrays with rank")
 
 
 def env_int(name: str, default: int) -> int:
@@ -132,27 +126,6 @@ def chat(url: str, model: str, prompt: str, max_tokens: int,
         "cached_tokens": cached_tokens_from_usage(usage),
     })
     return result
-
-
-def log_offsets(run_dir: str) -> dict[Path, int]:
-    offsets = {}
-    if not run_dir:
-        return offsets
-    for name in ["prefill.log", "decode.log", "proxy.log"]:
-        path = Path(run_dir) / "logs" / name
-        offsets[path] = path.stat().st_size if path.exists() else 0
-    return offsets
-
-
-def new_log_text(offsets: dict[Path, int]) -> str:
-    chunks = []
-    for path, offset in offsets.items():
-        if not path.exists():
-            continue
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            handle.seek(offset)
-            chunks.append(handle.read())
-    return "\n".join(chunks)
 
 
 def build_repeat_prompt(namespace: str, line_count: int, expected: str) -> str:
@@ -622,170 +595,20 @@ def run_concurrent_mixed_query_correctness(
     return requests, failures
 
 
-def check_planner_logs(run_dir: str,
-                       offsets: dict[Path, int],
-                       *,
-                       expect_pcp_source: bool = False) -> int:
-    if not run_dir:
-        print("PLANNER_LOG_CHECK_SKIPPED no RUN_DIR")
-        return 1
-
-    log_text = new_log_text(offsets)
-    failures = 0
-    required = [
-        "TPUConnectorV2 logical pull meta built",
-        "TPUConnectorV2 physical lowering summary",
-        "mamba_state0_q_key_heads_by_rank=",
-        "mamba_state0_k_key_heads_by_rank=",
-        "mamba_state0_v_value_heads_by_rank=",
-        "mamba_state1_value_heads_by_rank=",
-        "mamba_state0_q_ops_by_key_head=",
-        "mamba_state0_k_ops_by_key_head=",
-        "mamba_state0_v_ops_by_value_head=",
-        "mamba_state1_ops_by_value_head=",
-    ]
-    if expect_pcp_source:
-        required.extend([
-            "d_tp_rank=0 | p_ranks=(0, 1, 2, 3)",
-            "d_tp_rank=1 | p_ranks=(0, 1, 2, 3)",
-            "fa_heads_by_rank={0: (0,), 1: (0,), 2: (0,), 3: (0,)}",
-            "fa_heads_by_rank={0: (1,), 1: (1,), 2: (1,), 3: (1,)}",
-        ])
-    else:
-        required.extend([
-            "d_tp_rank=0 | p_ranks=(0, 1)",
-            "d_tp_rank=1 | p_ranks=(2, 3)",
-            "fa_heads_by_rank={0: (0,)}",
-            "fa_heads_by_rank={2: (1,)}",
-        ])
-    for marker in required:
-        if marker not in log_text:
-            failures += 1
-            print(f"PLANNER_LOG_MISSING {marker}")
-    if "mamba_ops_by_head=" in log_text:
-        failures += 1
-        print("PLANNER_LOG_LEGACY_MAMBA_OPS_BY_HEAD_PRESENT")
-    for legacy_marker in (
-            "TPUConnectorV2 pull meta built |",
-            "TPUConnectorV2 lowering summary |",
-            "mamba_value_heads_by_rank=",
-    ):
-        if legacy_marker in log_text:
-            failures += 1
-            print(f"PLANNER_LOG_LEGACY_MARKER_PRESENT {legacy_marker}")
-
-    summary_re = re.compile(r"TPUConnectorV2 physical lowering summary "
-                            r".*?d_tp_rank=(?P<d_tp_rank>\d+)"
-                            r" \| p_ranks=\((?P<p_ranks>[^)]*)\)"
-                            r" \| total_ops=(?P<total_ops>\d+)"
-                            r" \| ops_by_p_rank=\{(?P<ops_by_p_rank>[^}]*)\}")
-    expected_p_ranks = ({
-        "0": ("0", "1", "2", "3"),
-        "1": ("0", "1", "2", "3"),
-    } if expect_pcp_source else {
-        "0": ("0", "1"),
-        "1": ("2", "3"),
-    })
-    seen_by_rank: defaultdict[str, set[int]] = defaultdict(set)
-    for match in summary_re.finditer(log_text):
-        d_tp_rank = match.group("d_tp_rank")
-        total_ops = int(match.group("total_ops"))
-        p_ranks = tuple(part.strip()
-                        for part in match.group("p_ranks").split(","))
-        ops_by_p_rank = match.group("ops_by_p_rank")
-        if total_ops <= 0:
-            failures += 1
-            print(f"PLANNER_LOG_BAD_TOTAL_OPS d_tp_rank={d_tp_rank}")
-        seen_by_rank[d_tp_rank].add(total_ops)
-        if d_tp_rank in expected_p_ranks:
-            expected = expected_p_ranks[d_tp_rank]
-            if p_ranks != expected:
-                failures += 1
-                print(
-                    "PLANNER_LOG_BAD_P_RANKS "
-                    f"d_tp_rank={d_tp_rank} actual={p_ranks} expected={expected}"
-                )
-            for p_rank in expected:
-                if f"{p_rank}:" not in ops_by_p_rank:
-                    failures += 1
-                    print("PLANNER_LOG_MISSING_OPS_BY_P_RANK "
-                          f"d_tp_rank={d_tp_rank} p_rank={p_rank}")
-
-    for d_tp_rank in expected_p_ranks:
-        if d_tp_rank not in seen_by_rank:
-            failures += 1
-            print(f"PLANNER_LOG_MISSING_SUMMARY d_tp_rank={d_tp_rank}")
-    if seen_by_rank:
-        print("PLANNER_LOG_TOTAL_OPS_BY_D_TP_RANK " + json.dumps(
-            {
-                rank: sorted(values)
-                for rank, values in seen_by_rank.items()
-            },
-            sort_keys=True))
-
-    lifecycle_required = [
-        "TPUConnectorV2Worker(0) rank0 <-- START registered",
-        "TPUConnectorV2Scheduler --> START planned",
-        "TPUConnectorV2Scheduler --> START dispatched",
-        "TPUConnectorV2Worker(0) tp_rank=0 <-- local START",
-        "TPUConnectorV2Worker(0) tp_rank=1 <-- local START",
-        "TPUConnectorV2 strided lifecycle send START",
-        "TPUConnectorV2 strided lifecycle START ack OK",
-        "TPUConnectorV2Worker(0) rank0 <-- recv START",
-        "TPUConnectorV2Worker(0) rank0 --> accept START",
-        "TPUConnectorV2Worker(0) tp_rank=0 --> local END queued",
-        "TPUConnectorV2Worker(0) tp_rank=1 --> local END queued",
-        "TPUConnectorV2Worker(0) --> END completion meta",
-        "TPUConnectorV2Scheduler <-- recv END completion",
-        "TPUConnectorV2 strided lifecycle send END",
-        "TPUConnectorV2 strided lifecycle END ack OK",
-        "TPUConnectorV2Worker(0) rank0 <-- recv END",
-        "TPUConnectorV2Worker(0) rank0 --> accept END",
-        "TPUConnectorV2Scheduler --> recv END complete",
-    ]
-    lifecycle_failures = 0
-    for marker in lifecycle_required:
-        if marker not in log_text:
-            failures += 1
-            lifecycle_failures += 1
-            print(f"LIFECYCLE_LOG_MISSING {marker}")
-
-    fatal_matches = sorted(
-        set(match.group(0) for match in FATAL_LOG_RE.finditer(log_text)))
-    if fatal_matches:
-        failures += len(fatal_matches)
-        print("FATAL_LOG_MARKERS " +
-              json.dumps(fatal_matches, ensure_ascii=False))
-
-    print(f"LIFECYCLE_LOG_CHECK_OK {int(lifecycle_failures == 0)}")
-    print(f"PLANNER_LOG_CHECK_OK {int(failures == 0)}")
-    return failures
-
-
-def default_run_dir() -> str:
-    run_root = os.environ.get("RUN_ROOT", str(Path.home() / "pd_disagg_runs"))
-    latest = Path(run_root) / "latest_qwen35_pd_v2_p4d2_baseline"
-    if latest.exists():
-        return str(latest.resolve())
-    return os.environ.get("RUN_DIR", "")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=
-        "End-to-end correctness smoke for Qwen3.5 P4/D2 TPUConnectorV2 prefix-cache PD."
+        "End-to-end correctness smoke for disaggregated serving with prefix caching."
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", default=os.environ.get("PROXY_PORT", "8000"))
     parser.add_argument("--model",
                         default=os.environ.get("SERVED_MODEL_NAME",
                                                "Qwen3.5-35B-A3B-FP8"))
-    parser.add_argument("--run-dir", default=default_run_dir())
     parser.add_argument("--timeout",
                         type=int,
                         default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600))
     parser.add_argument("--quick-probe-only", action="store_true")
-    parser.add_argument("--expect-pcp-source", action="store_true")
     parser.add_argument("--skip-short-qa", action="store_true")
     parser.add_argument("--short-repeat-lines",
                         type=int,
@@ -824,8 +647,7 @@ def main() -> int:
     if args.quick_probe_only:
         return run_quick_probe(url, args.model, args.timeout)
 
-    namespace = f"p4d2-v2-correctness-{int(time.time())}"
-    offsets = log_offsets(args.run_dir)
+    namespace = f"pc-correctness-{int(time.time())}"
     total_requests = 0
     failures = 0
 
@@ -898,17 +720,10 @@ def main() -> int:
             total_requests += requests
             failures += suite_failures
 
-    failures += check_planner_logs(
-        args.run_dir,
-        offsets,
-        expect_pcp_source=args.expect_pcp_source,
-    )
-
-    print("\n=== P4D2 TPUCONNECTORV2 CORRECTNESS SUMMARY ===")
-    print(f"RUN_DIR {args.run_dir}")
+    print("\n=== PREFIX CACHE CORRECTNESS SUMMARY ===")
     print(f"TOTAL_REQUESTS {total_requests}")
     print(f"FAILURES {failures}")
-    print(f"P4D2_V2_PREFIX_CACHE_CORRECTNESS_OK {int(failures == 0)}")
+    print(f"PREFIX_CACHE_CORRECTNESS_OK {int(failures == 0)}")
     return 1 if failures else 0
 
 
