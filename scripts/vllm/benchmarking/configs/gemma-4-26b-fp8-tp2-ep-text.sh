@@ -11,5 +11,4 @@ CONCURRENCY_OPTIONS="32"
 RANDOM_RANGE_RATIO="0.8"
 GPU_MEMORY_UTILIZATION=0.90
 EVAL_TOLERANCE="0.02"
-MAX_MODEL_LEN=4096
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size=256 --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0,\"audio\":0} --hf-overrides {\"architectures\":[\"Gemma4ForCausalLM\"]}"
