@@ -26,6 +26,7 @@ def compute_batched_seq_metadata(
     state_indices: jax.Array,
     read_offsets: jax.Array,
     end_seq: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -58,6 +59,7 @@ def compute_batched_seq_metadata(
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
+        s_idx_to_ckpt_indices=ckpt_indices,
     )
 
 
@@ -69,6 +71,7 @@ def compute_per_seq_metadata(
     read_offsets: jax.Array,
     start_seq: jax.Array,
     end_seq: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -90,6 +93,10 @@ def compute_per_seq_metadata(
     seq_lens = jnp.roll(seq_lens, shift=-start_seq)
     state_indices = jnp.roll(state_indices, shift=-start_seq)
     read_offsets = jnp.roll(read_offsets, shift=-start_seq)
+    if ckpt_indices is not None:
+        # Same shift, sequence-major axis only: the checkpoint axis must
+        # stay put or the read offset would select another slot's block.
+        ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -153,4 +160,5 @@ def compute_per_seq_metadata(
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
+        s_idx_to_ckpt_indices=ckpt_indices,
     )

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
+    TPU_VLLM_GDN_SPEC_CKPT_BLOCKS: bool = False
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
@@ -182,6 +183,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # preserve the compact-mamba allocation/indexing path.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL":
     env_bool("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"),
+    # Store speculative GDN state checkpoints as `num_spec` extra ordinary
+    # pool blocks per request (vLLM's MambaSpec.num_speculative_blocks
+    # scheme) instead of growing every pool block to hold the whole
+    # checkpoint group. Keeps block_size independent of
+    # num_speculative_tokens. Disabled by default until verified on device.
+    "TPU_VLLM_GDN_SPEC_CKPT_BLOCKS":
+    env_bool("TPU_VLLM_GDN_SPEC_CKPT_BLOCKS"),
     # Destination (decode-side) page geometry in tokens, required on the
     # producer: the byte-span lowering splits declarations at destination
     # page boundaries at registration time. 0 means unset.
