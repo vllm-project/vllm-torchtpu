@@ -19,7 +19,11 @@
 #   CAPTURE_PROFILE=1     turn on TPU/XProf trace capture for the bench window.
 #                         Server gets --profiler-config.profiler torch +
 #                         torch_profiler_dir + ignore_frontend (the last skips
-#                         AsyncLLM's CPU profiler we don't read). Bench gets
+#                         AsyncLLM's CPU profiler we don't read). Traces go to
+#                         <results>/profile. Implied when EXTRA_SERVE_ARGS sets
+#                         --profiler-config.torch_profiler_dir, which then also
+#                         chooses the trace directory; CAPTURE_PROFILE=0 opts
+#                         back out. Bench gets
 #                         --profile so /start_profile and /stop_profile fire
 #                         around the main run; warmup runs aren't profiled.
 #                         --profile costs roughly +11% TTFT and −4% throughput,
@@ -156,9 +160,25 @@ mkdir -p "$RESULTS_DIR"
 log_file="$RESULTS_DIR/benchmark.log"
 
 # Resolve profile state once so config.json and start_vllm_server agree.
+# Configuring profiler_config by hand is itself a request to profile, so treat
+# a caller-supplied torch_profiler_dir as CAPTURE_PROFILE=1 when the latter was
+# not set either way. Otherwise the server is armed but the bench client never
+# sends --profile, so /start_profile never fires and the run writes no traces.
+# An explicit CAPTURE_PROFILE (0 or 1) always wins.
+requested_profile_dir=$(printf '%s' "${EXTRA_SERVE_ARGS:-}" |
+    sed -n 's/.*--profiler-config\.torch_profiler_dir[= ]\+\([^ ]\+\).*/\1/p')
+if [ -z "${CAPTURE_PROFILE:-}" ] && [ -n "$requested_profile_dir" ]; then
+    CAPTURE_PROFILE=1
+    echo "Profiling inferred from --profiler-config.torch_profiler_dir in" \
+        "EXTRA_SERVE_ARGS. Set CAPTURE_PROFILE=0 to override."
+fi
+
 PROFILE_DIR=""
 if [ "${CAPTURE_PROFILE:-0}" = "1" ]; then
-    PROFILE_DIR="$RESULTS_DIR/profile"
+    # A caller-supplied directory wins over the default: the block appended in
+    # start_vllm_server lands after EXTRA_SERVE_ARGS and argparse takes the
+    # last occurrence, so otherwise the chosen directory is silently ignored.
+    PROFILE_DIR="${requested_profile_dir:-$RESULTS_DIR/profile}"
     mkdir -p "$PROFILE_DIR"
 fi
 
