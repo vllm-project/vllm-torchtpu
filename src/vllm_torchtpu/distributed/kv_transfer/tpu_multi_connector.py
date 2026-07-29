@@ -25,11 +25,26 @@ class TPUMultiConnector(MultiConnector):
                 fn(runner)
 
     def get_block_ids_with_load_errors_group_index(self) -> int | None:
-        """Return the first child connector's failed-load cache group."""
+        """Return the KV cache group shared by all children's load errors.
+
+        Failed block ids are unioned by upstream
+        ``get_block_ids_with_load_errors``; this index only tells the
+        scheduler which group's block table those ids resolve against.
+        One scalar cannot scope two groups, so conflicting child indices
+        raise instead of mis-scoping.
+        """
+        index: int | None = None
         for c in self._connectors:
             fn = getattr(c, "get_block_ids_with_load_errors_group_index", None)
-            if fn is not None:
-                index = fn()
-                if index is not None:
-                    return index
-        return None
+            if fn is None:
+                continue
+            child_index = fn()
+            if child_index is None:
+                continue
+            if index is not None and child_index != index:
+                raise RuntimeError(
+                    "Conflicting KV-load-error group indices across child "
+                    f"connectors: {index} vs {child_index}; cannot scope "
+                    "invalid blocks to a single cache group")
+            index = child_index
+        return index
