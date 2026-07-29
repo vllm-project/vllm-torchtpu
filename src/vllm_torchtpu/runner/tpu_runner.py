@@ -3577,6 +3577,7 @@ class TPUModelRunner(GPUModelRunner):
         """Precompile every torch.compile subgraph across all input buckets."""
         if self.enforce_eager:
             return
+        self._setup_xla_persistent_cache()
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
                 for num_tokens in self.num_tokens_paddings:
@@ -3943,6 +3944,36 @@ class TPUModelRunner(GPUModelRunner):
         finally:
             cc.cache_dir = saved_cache_dir
 
+    def _setup_xla_persistent_cache(self) -> None:
+        import hashlib
+
+        from vllm.compilation.caching import aot_compile_hash_factors
+
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+        cc = self.vllm_config.compilation_config
+        base_cache_dir = cc.cache_dir or envs.VLLM_CACHE_ROOT
+        factors = aot_compile_hash_factors(self.vllm_config)
+        factors.append(compute_tpu_compilation_hash(self.vllm_config))
+        hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
+
+        rank = self.vllm_config.parallel_config.rank
+        dp_rank = self.vllm_config.parallel_config.data_parallel_index
+        xla_cache_dir = os.path.join(
+            base_cache_dir,
+            "xla_cache",
+            hash_key,
+            f"rank_{rank}_{dp_rank}",
+        )
+        os.makedirs(xla_cache_dir, exist_ok=True)
+        os.environ["XLA_PERSISTENT_CACHE_PATH"] = xla_cache_dir
+        os.environ["VLLM_XLA_CACHE_PATH"] = xla_cache_dir
+        logger.info(
+            "Initialized PJRT XLA_PERSISTENT_CACHE_PATH and "
+            "VLLM_XLA_CACHE_PATH at %s",
+            xla_cache_dir,
+        )
+
     def profile_run(
         self,
         num_tokens: int,
@@ -3957,6 +3988,7 @@ class TPUModelRunner(GPUModelRunner):
         # forward code, so the next trace re-instantiates CustomOps that
         # call get_current_vllm_config().
         cc = self.vllm_config.compilation_config
+        self._setup_xla_persistent_cache()
         saved_cache = (cc.cache_dir, cc.local_cache_dir)
         saved_sizes = cc.compile_sizes
         with set_current_vllm_config(self.vllm_config):
