@@ -79,15 +79,14 @@ cd "${repo_root}"
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
 
-python examples/disagg/smoke_qwen35_p4d2_v2_prefix_cache_correctness.py \
+python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
-  --run-dir "${RUN_DIR}" \
   2>&1 | tee "${RUN_DIR}/logs/correctness.log"
 
 if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
-  python examples/disagg/smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py \
+  python scripts/vllm/integration/smoke_prefix_cache_e2e_divergence.py \
     --host "${P4D2_BIND_HOST}" \
     --port "${PROXY_PORT}" \
     --model "${SERVED_MODEL_NAME}" \

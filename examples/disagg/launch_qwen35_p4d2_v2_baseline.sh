@@ -365,11 +365,10 @@ setsid bash -lc "${proxy_cmd}" >"${RUN_DIR}/logs/proxy.log" 2>&1 &
 echo $! >"${RUN_DIR}/proxy.pid"
 
 sleep 2
-"${python_bin}" "${script_dir}/smoke_qwen35_p4d2_v2_prefix_cache_correctness.py" \
+"${python_bin}" "${TORCHTPU_VLLM_SRC}/scripts/vllm/integration/smoke_prefix_cache_correctness.py" \
   --host "${SERVE_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
-  --run-dir "${RUN_DIR}" \
   --quick-probe-only \
   | tee "${RUN_DIR}/logs/proxy_probe.log"
 
