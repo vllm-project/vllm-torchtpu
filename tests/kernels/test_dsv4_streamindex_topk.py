@@ -123,9 +123,9 @@ def streamindex_topk_ref(
     " bq_sz, bkv_p, seq_lens_list, cu_q_lens_list",
     [
         # Small standard case
-        (2, 6, 16, 8, 4, 1, 64, 512, 2, 32, 2, [4, 6], [0, 3, 6]),
+        (2, 6, 16, 8, 4, 1, 64, 512, 2, 32, 8, [4, 6], [0, 3, 6]),
         # # Single token batch (Decode Phase)
-        (1, 1, 16, 4, 2, 1, 32, 512, 1, 16, 1, [10], [0, 1]),
+        (1, 1, 16, 4, 2, 1, 32, 512, 1, 16, 8, [10], [0, 1]),
         # Large batch, multiple tokens per sequence (Prefill Phase)
         (
             4,
@@ -143,14 +143,14 @@ def streamindex_topk_ref(
             [0, 5, 10, 15, 20],
         ),
         # Odd chunk sizes
-        (2, 5, 8, 6, 4, 1, 16, 512, 1, 16, 3, [8, 12], [0, 2, 5]),
+        (2, 5, 8, 6, 4, 1, 16, 512, 1, 16, 16, [8, 12], [0, 2, 5]),
         # Single head for KV but multiple heads for Queries (MQA/GQA pattern)
-        (2, 10, 16, 8, 8, 1, 64, 512, 2, 32, 4, [16, 24], [0, 4, 10]),
+        (2, 10, 16, 8, 8, 1, 64, 512, 2, 32, 8, [16, 24], [0, 4, 10]),
         # # High D, High K
-        (1, 8, 16, 4, 2, 1, 256, 512, 1, 32, 4, [60], [0, 8]),
+        (1, 8, 16, 4, 2, 1, 256, 512, 1, 32, 8, [60], [0, 8]),
         # Mixed batch: sequence 0 has 1 token (decode), sequence 1 has 5 tokens
         # (prefill)
-        (2, 6, 16, 8, 4, 1, 64, 512, 2, 32, 2, [4, 6], [0, 1, 6]),
+        (2, 6, 16, 8, 4, 1, 64, 512, 2, 32, 8, [4, 6], [0, 1, 6]),
     ],
 )
 def test_streamindex_topk_shape(
@@ -235,15 +235,15 @@ def test_streamindex_topk_shape(
     " block_table_list",
     [
         # 0. Single sequence, single page (page_indices shape (1,))
-        (1, [1], [8], 8, 4, 1, 16, 1024, 1, 1, 1, [[0]]),
+        (1, [1], [8], 8, 4, 1, 16, 1024, 1, 1, 16, [[0]]),
         # 1. Single sequence, highly fragmented block table
-        (1, [4], [16], 8, 4, 1, 16, 1024, 2, 8, 2, [[2, 0]]),
+        (1, [4], [16], 8, 4, 1, 16, 1024, 2, 8, 16, [[2, 0]]),
         # 2. Batched Decode (T=1, B=2)
-        (2, [1, 1], [12, 16], 8, 4, 1, 16, 1024, 1, 8, 1, [[1, 3], [0, 2]]),
+        (2, [1, 1], [12, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[1, 3], [0, 2]]),
         # 3. High GQA (8 Query Heads, 2 KV Heads)
-        (1, [6], [20], 4, 8, 1, 16, 1024, 1, 8, 2, [[4, 1, 3, 0, 2]]),
+        (1, [6], [20], 4, 8, 1, 16, 1024, 1, 8, 32, [[4, 1, 3, 0, 2]]),
         # 4. Multi-Batch Prefill with variable query/sequence lengths
-        (2, [5, 3], [16, 16], 8, 4, 1, 16, 1024, 1, 8, 4, [[3, 1], [2, 4]]),
+        (2, [5, 3], [16, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[3, 1], [2, 4]]),
         # 5. Dummy sequences / Padding (B=3, but sequence 1 has 0 tokens)
         (
             3,
@@ -256,11 +256,28 @@ def test_streamindex_topk_shape(
             1024,
             1,
             8,
-            2,
+            16,
             [[1, 2], [0, 0], [4, 3]],
         ),
         # 6. Mixed batch: sequence 0 has 1 token, sequence 1 has 5 tokens
-        (2, [1, 5], [12, 16], 8, 4, 1, 16, 1024, 2, 8, 2, [[1, 3], [2, 0]]),
+        (2, [1, 5], [12, 16], 8, 4, 1, 16, 1024, 2, 8, 16, [[1, 3], [2, 0]]),
+        (
+            1,
+            [4],
+            [384],
+            16,
+            4,
+            1,
+            16,
+            1024,
+            1,
+            8,
+            8,
+            [[
+                13, 2, 21, 7, 0, 18, 5, 11, 23, 1, 9, 16, 3, 20, 6, 14, 22, 4,
+                10, 17, 8, 15, 19, 12
+            ]],
+        ),
     ],
 )
 def test_streamindex_topk_numerical_correctness(
@@ -406,14 +423,14 @@ def test_streamindex_topk_quantized():
     np.random.seed(42)
 
     T_seq = 4
-    S_seq = 512
+    S_seq = 2048
     page_size = 16
     H_I = 2
     H_KV = 1
     D = 128
     k = 512
     comp_ratio = 4
-    bkv_p = 1
+    bkv_p = 8  # page_size * bkv_p = 128 (TPU DMA contract of the scores kernel)
     bq_sz = 1
 
     q = np.random.randn(T_seq, H_I, D).astype(np.float32)
