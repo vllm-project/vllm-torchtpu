@@ -119,8 +119,9 @@ def get_packing_factor(storage_dtype: jnp.dtype,
                        quant_dtype: jnp.dtype | None) -> int:
     if quant_dtype is None or quant_dtype == storage_dtype:
         return 1
-    packing_factor, remainder = divmod(jax.dtypes.itemsize_bits(storage_dtype),
-                                       jax.dtypes.itemsize_bits(quant_dtype))
+    storage_bits = jax.dtypes.itemsize_bits(storage_dtype)
+    quant_bits = jax.dtypes.itemsize_bits(quant_dtype)
+    packing_factor, remainder = divmod(storage_bits, quant_bits)
     if remainder != 0:
         raise ValueError(f"Storage dtype {storage_dtype} is not divisible by "
                          f"quant dtype {quant_dtype}")
