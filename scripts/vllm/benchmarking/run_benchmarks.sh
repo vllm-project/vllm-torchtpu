@@ -23,8 +23,8 @@
 #                         <results>/profile. Implied when EXTRA_SERVE_ARGS sets
 #                         --profiler-config.torch_profiler_dir, which then also
 #                         chooses the trace directory; CAPTURE_PROFILE=0 opts
-#                         back out. Bench gets
-#                         --profile so /start_profile and /stop_profile fire
+#                         back out. Bench gets --profile so /start_profile
+#                         and /stop_profile fire
 #                         around the main run; warmup runs aren't profiled.
 #                         --profile costs roughly +11% TTFT and −4% throughput,
 #                         so don't compare profile-on numbers to a non-profile

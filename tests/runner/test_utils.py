@@ -98,6 +98,9 @@ def test_phased_profiler_finish_stops_a_phase_mid_capture(profiler_fixture):
 
     mock_context.__exit__.assert_called_once_with(None, None, None)
     assert profiler.current_phase == ""
+    # Otherwise a reused profiler never starts a new phase: step() only calls
+    # _start_profiling when profiling_n_steps_left <= 0.
+    assert profiler.profiling_n_steps_left == 0
 
 
 def test_phased_profiler_finish_when_idle_is_a_noop(profiler_fixture):

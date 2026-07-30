@@ -122,9 +122,7 @@ def get_batch_composition_stats(
                 num_decode_tokens += 1
 
     stats = {
-        # Counted from when profiling was armed, not from server start: the
-        # profiler is created on worker.profile(is_start=True).
-        "batch_id_since_profile_start": batch_id,
+        "batch_id": batch_id,
         "total_num_scheduled_tokens": total_num_scheduled_tokens,
         "num_prefill_tokens": num_prefill_tokens,
         "num_decode_tokens": num_decode_tokens,
@@ -299,6 +297,7 @@ class PhaseBasedProfiler:
         self._merge_profile_directories()
         logger.info(f"Profiling for {self.current_phase} phase finished")
         self.current_phase = ""
+        self.profiling_n_steps_left = 0
 
     def finish(self) -> None:
         """Force-stops a phase capture in progress.
