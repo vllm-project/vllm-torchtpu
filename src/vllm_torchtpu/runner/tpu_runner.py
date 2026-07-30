@@ -78,8 +78,8 @@ from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    unified_kv_layout_enabled
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    gdn_spec_ckpt_blocks_enabled, unified_kv_layout_enabled)
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
@@ -376,6 +376,13 @@ class TPUModelRunner(GPUModelRunner):
         if self.vllm_config.speculative_config is not None:
             self._mamba_slot_stride = (
                 self.vllm_config.speculative_config.num_speculative_tokens + 1)
+        # Unified pool + spec decode: with one block per checkpoint the group
+        # is `num_spec + 1` ordinary blocks named individually, so the pool
+        # block stays sized for a single state. 1 keeps the affine base +
+        # pitch addressing, whose group must fit inside one block.
+        self._mamba_ckpt_window: int = 1
+        if gdn_spec_ckpt_blocks_enabled(self.vllm_config):
+            self._mamba_ckpt_window = self._mamba_slot_stride
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
@@ -2432,6 +2439,7 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
+            mamba_ckpt_window=self._mamba_ckpt_window,
             mamba_request_distribution=mamba_request_distribution,
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
@@ -3619,6 +3627,7 @@ class TPUModelRunner(GPUModelRunner):
                 position_ids_override=position_ids,
                 mamba_state_indices=dummy_mamba_state_indices,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
+                mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )

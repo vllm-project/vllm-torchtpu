@@ -237,6 +237,42 @@ def test_unified_slot_rejects_non_compact_fa_pages(vllm_config):
         _update(vllm_config, backend_cls=FakeNonLinearPageBackend)
 
 
+def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
+        vllm_config, monkeypatch):
+    """One block per checkpoint means the fit floor stops scaling with K.
+
+    Same config as the affine test above, which lands on 2560 tokens for
+    K=1 (and would keep growing with K). With the checkpoints held in
+    `num_spec` extra ordinary blocks, the block only has to fit a single
+    state, so the floor is the no-spec one for every K.
+    """
+    monkeypatch.setenv("TPU_VLLM_GDN_SPEC_CKPT_BLOCKS", "1")
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    sizes = {}
+    for num_spec in (1, 3, 7):
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.model_config.architecture = (
+            "Qwen3_5MoeForConditionalGeneration")
+        vllm_config.cache_config.block_size = 2112
+        vllm_config.cache_config.mamba_block_size = 2112
+        vllm_config.cache_config.mamba_cache_mode = "align"
+        vllm_config.cache_config.mamba_page_size_padded = None
+        vllm_config.speculative_config = MagicMock()
+        vllm_config.speculative_config.num_speculative_tokens = num_spec
+
+        with patch(
+                "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+                return_value=(FakeQwenMambaModel, None)):
+            update_tpu_block_size_and_slot_config(
+                vllm_config, FakeBatchedRPAAttentionBackend)
+        sizes[num_spec] = vllm_config.cache_config.block_size
+
+    assert len(set(sizes.values())) == 1, sizes
+    # One checkpoint's 1056 tokens padded to this backend's 256-token
+    # kernel block = 1280, versus 2560 for K=1 on the affine path.
+    assert sizes[1] == 1280, sizes
+
+
 def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):
     _configure_hybrid(vllm_config)
     vllm_config.cache_config.mamba_cache_mode = "none"

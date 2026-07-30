@@ -25,6 +25,7 @@ from vllm_torchtpu.layers.common.sequence_layout import (
         "request_distribution",
         "mamba_state_indices",
         "mamba_slot_read_offsets",
+        "mamba_ckpt_indices",
         "mamba_request_distribution",
     ],
     meta_fields=[
@@ -63,6 +64,9 @@ class AttentionMetadata(object):
     # condensed. Updated on device after each sampling step; None unless the
     # model has mamba layers *and* speculative decoding is enabled.
     mamba_slot_read_offsets: jax.Array | None = None
+    # `(num_reqs, num_spec + 1)` source block per checkpoint; None keeps the
+    # affine base + pitch addressing.
+    mamba_ckpt_indices: jax.Array | None = None
     # (3,) int32 — GDN-specific request distribution, same format as
     # `request_distribution` but with the first segment covering all
     # *windowed* sequences (plain decodes and speculative verify windows of
@@ -106,6 +110,10 @@ class AttentionMetadataBuilderContext:
     # Spec decode with mamba layers only; see the AttentionMetadata fields of
     # the same names. Only the mamba group's builder reads them.
     mamba_slot_read_offsets: torch.Tensor | None = None
+    # Checkpoints per request when speculative GDN state is stored as one
+    # block per checkpoint (num_spec + 1). 1 keeps the affine base + pitch
+    # addressing, where the group lives inside a single block.
+    mamba_ckpt_window: int = 1
     mamba_request_distribution: torch.Tensor | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty
     # list and each mamba group's builder appends the per-request state
@@ -180,6 +188,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                                                            non_blocking=True)
             input_positions = runner.position_ids
 
+        mamba_ckpt_indices = None
         if not self.is_mamba_group:
             mamba_state_indices = None
         elif ctx.mamba_state_indices is not None:
@@ -206,6 +215,30 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 dim=1,
                 index=state_block_offsets.unsqueeze(1),
             ).squeeze(1)
+            if ctx.mamba_ckpt_window > 1:
+                # Speculative decoding, one block per checkpoint (vLLM's
+                # MambaSpec.num_speculative_blocks scheme): the manager
+                # allocates `window - 1` extra blocks per request by
+                # inflating the token count, so they land immediately after
+                # the positional state block. Checkpoint t is therefore the
+                # row entry `state_block_offsets + t`.
+                ckpt_offsets = (
+                    state_block_offsets.unsqueeze(1) +
+                    torch.arange(ctx.mamba_ckpt_window,
+                                 device=state_block_offsets.device,
+                                 dtype=state_block_offsets.dtype).unsqueeze(0))
+                # Defensive: a row too short to hold the group would alias
+                # two checkpoints onto one block and silently corrupt state,
+                # so clamp to the null block instead of a live one.
+                in_row = ckpt_offsets < target_num_blocks
+                mamba_ckpt_indices = torch.gather(
+                    block_tables_2d,
+                    dim=1,
+                    index=torch.where(in_row, ckpt_offsets,
+                                      torch.zeros_like(ckpt_offsets)),
+                ) * in_row
+            else:
+                mamba_ckpt_indices = None
             if ctx.unified_mamba_state_indices is not None:
                 # Spec decode: expose this group's state blocks for the
                 # post-sampling read-offset scatter.
@@ -228,6 +261,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             request_distribution=ctx.request_distribution,
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=mamba_slot_read_offsets,
+            mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
