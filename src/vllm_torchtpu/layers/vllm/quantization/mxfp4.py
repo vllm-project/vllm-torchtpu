@@ -236,10 +236,11 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
+        moe_routing.register_experts_start_buffer(layer)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
-            experts_start=moe_routing.get_experts_start(layer),
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
 
     def get_fused_moe_quant_config(
@@ -296,7 +297,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=layer.w2_bias,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            experts_start=moe_routing.get_experts_start(layer),
+            experts_start=layer._experts_start,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
