@@ -186,6 +186,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
+    from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
@@ -198,6 +199,7 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_kimi_kda_layer_counts()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()

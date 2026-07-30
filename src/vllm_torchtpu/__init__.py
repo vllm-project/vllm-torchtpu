@@ -391,7 +391,6 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_vllm_kimi_kda_layer_counts()
 
     from vllm.v1.engine.core import EngineCoreProc
 
