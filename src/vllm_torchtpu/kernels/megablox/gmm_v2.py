@@ -115,12 +115,12 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
-def get_packing_factor(storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None) -> int:
+def get_packing_factor(storage_dtype: jnp.dtype,
+                       quant_dtype: jnp.dtype | None) -> int:
     if quant_dtype is None or quant_dtype == storage_dtype:
         return 1
-    if quant_dtype != jnp.int4 or storage_dtype not in (jnp.int32, jnp.uint32):
-        raise ValueError("Packing supports only INT4 packed in INT32/UINT32")
-    return jax.dtypes.itemsize_bits(storage_dtype) // jax.dtypes.itemsize_bits(quant_dtype)
+    return jax.dtypes.itemsize_bits(storage_dtype) // jax.dtypes.itemsize_bits(
+        quant_dtype)
 
 
 # Define data classes.
