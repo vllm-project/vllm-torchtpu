@@ -280,3 +280,120 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
                                np.asarray(expected),
                                atol=1e-1,
                                rtol=1e-1)
+
+
+def test_fused_moe_func_int4_packed_matches_reference():
+    _require_tpu()
+
+    num_tokens = 4
+    hidden_size = 512
+    logical_k = 512
+    storage_k = logical_k // 8
+    intermediate_size = 256
+    intermediate_size_storage = intermediate_size // 8
+    num_experts = 4
+    topk = 2
+    key = jax.random.key(0)
+
+    hidden_states = jax.random.uniform(key, (num_tokens, hidden_size),
+                                       dtype=jnp.bfloat16,
+                                       minval=-1,
+                                       maxval=1)
+    topk_weights = jax.random.uniform(key, (num_tokens, topk),
+                                      dtype=jnp.float32,
+                                      minval=0.1,
+                                      maxval=0.9)
+    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    topk_ids = jax.random.randint(key, (num_tokens, topk),
+                                  minval=0,
+                                  maxval=num_experts)
+
+    w1_key, w2_key = jax.random.split(key)
+    w1_raw = jax.random.uniform(
+        w1_key,
+        (num_experts, logical_k, intermediate_size * 2),
+        dtype=jnp.bfloat16,
+        minval=-1,
+        maxval=1,
+    )
+    w2_raw = jax.random.uniform(
+        w2_key,
+        (num_experts, intermediate_size, hidden_size),
+        dtype=jnp.bfloat16,
+        minval=-1,
+        maxval=1,
+    )
+
+    def quantize_to_int4(x, axis, block_size):
+        max_val = 7
+        min_val = -8
+        orig_shape = x.shape
+        blocked_shape = (orig_shape[:axis] + (-1, block_size) +
+                         orig_shape[axis + 1:])
+        x_blocked = x.reshape(blocked_shape)
+        x_blocked_abs_max = jnp.max(jnp.abs(x_blocked),
+                                    axis=axis + 1,
+                                    keepdims=True)
+        scale = x_blocked_abs_max / max_val
+        x_blocked_q = jnp.clip(x_blocked / scale, min_val,
+                               max_val).astype(jnp.int32)
+        x_q = x_blocked_q.reshape(orig_shape)
+        scale = scale.squeeze(axis=axis + 1).astype(jnp.bfloat16)
+        return x_q, scale
+
+    w1_int4, w1_scale = quantize_to_int4(w1_raw, axis=1, block_size=64)
+    w2_int4, w2_scale = quantize_to_int4(w2_raw, axis=1, block_size=64)
+
+    w1_scale = jnp.expand_dims(w1_scale, axis=2)
+    w2_scale = jnp.expand_dims(w2_scale, axis=2)
+
+    w1_scale_tiled = jnp.repeat(w1_scale, 64, axis=1).squeeze(axis=2)
+    w1_dequantized = w1_int4.astype(jnp.bfloat16) * w1_scale_tiled
+
+    w2_scale_tiled = jnp.repeat(w2_scale, 64, axis=1).squeeze(axis=2)
+    w2_dequantized = w2_int4.astype(jnp.bfloat16) * w2_scale_tiled
+
+    expected = _reference_fused_moe(
+        hidden_states,
+        w1_dequantized,
+        w2_dequantized,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation="silu",
+    )
+
+    def pack_int4(x_int4, num_exp, storage_dim, out_dim):
+        x_uint4 = (x_int4 + 8) & 0x0F
+        x_reshaped = x_uint4.reshape(num_exp, storage_dim, 8, out_dim)
+        shifts = jnp.arange(8, dtype=jnp.int32) * 4
+        shifted = x_reshaped << shifts[None, None, :, None]
+        x_packed = jnp.sum(shifted, axis=2).astype(jnp.int32)
+        INT4_SIGN_XOR = -2004318072
+        return x_packed ^ INT4_SIGN_XOR
+
+    w1_packed = pack_int4(w1_int4, num_experts, storage_k,
+                          intermediate_size * 2)
+    w2_packed = pack_int4(w2_int4, num_experts, intermediate_size_storage,
+                          hidden_size)
+
+    actual = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1_packed,
+        w2=w2_packed,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        topk=topk,
+        activation="silu",
+        rhs_quant_dtype=jnp.int4,
+    )
+
+    np.testing.assert_allclose(np.asarray(actual),
+                               np.asarray(expected),
+                               atol=8.0,
+                               rtol=3e-1)

@@ -33,7 +33,7 @@ from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 
 from vllm_torchtpu.layers.common import quant_methods
-from vllm_torchtpu.layers.vllm.quantization.compressed_tensors import \
+from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors import \
     VllmCompressedTensorsConfig
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8Config

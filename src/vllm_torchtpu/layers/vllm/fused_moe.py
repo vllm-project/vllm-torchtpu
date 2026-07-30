@@ -14,7 +14,7 @@
 """Torch bridge for fused MoE based on fused_moe_func in fused_moe_gmm."""
 
 import functools
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch_tpu._internal import pallas
@@ -25,7 +25,8 @@ from vllm_torchtpu.layers.common.fused_moe_gmm import (fused_moe_func,
                                                        unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, Optional[int]], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, Optional[int], Any],
+                              Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 
@@ -78,6 +79,7 @@ def _build_fused_moe_custom_op(
     topk: int,
     activation: str,
     experts_start: Optional[int],
+    rhs_quant_dtype=None,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -97,7 +99,8 @@ def _build_fused_moe_custom_op(
         activation=activation,
         use_ep=experts_start is not None,
         use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD)
+        onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
+        rhs_quant_dtype=rhs_quant_dtype)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -108,7 +111,7 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, experts_start)
+    cache_key = (topk, activation, experts_start, rhs_quant_dtype)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -118,8 +121,9 @@ def _get_fused_moe_custom_op(
     topk: int,
     activation: str,
     experts_start: Optional[int],
+    rhs_quant_dtype=None,
 ):
-    cache_key = (topk, activation, experts_start)
+    cache_key = (topk, activation, experts_start, rhs_quant_dtype)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -127,6 +131,7 @@ def _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         experts_start=experts_start,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
 
 
@@ -135,12 +140,14 @@ def prebuild_fused_moe_kernel(
     topk: int,
     activation: str,
     experts_start: Optional[int],
+    rhs_quant_dtype=None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         experts_start=experts_start,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
 
 
@@ -157,6 +164,7 @@ def fused_moe_gmm(
     experts_start: Optional[int],
     topk: int,
     activation: str,
+    rhs_quant_dtype=None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -171,6 +179,7 @@ def fused_moe_gmm(
         topk=topk,
         activation=activation,
         experts_start=experts_start,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
     return fused_moe(
         hidden_states,

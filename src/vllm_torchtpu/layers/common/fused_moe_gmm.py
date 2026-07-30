@@ -17,7 +17,7 @@ import functools
 import jax
 from jax import numpy as jnp
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
@@ -71,7 +71,8 @@ def gmm_wrapper(lhs,
                 group_offset,
                 zero_initialize=False,
                 fuse_act=None,
-                preferred_element_type=None):
+                preferred_element_type=None,
+                rhs_quant_dtype=None):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
@@ -88,6 +89,7 @@ def gmm_wrapper(lhs,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
 
 
@@ -173,6 +175,7 @@ def moe_gmm(
     use_ep: bool,
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -191,8 +194,10 @@ def moe_gmm(
         group_offset,
         zero_initialize=False,
         fuse_act=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
-    gmm1_res = gmm1_res[:, :w2.shape[1]]
+    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+    gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -204,7 +209,8 @@ def moe_gmm(
                            group_sizes,
                            group_offset,
                            zero_initialize=False,
-                           preferred_element_type=x.dtype)
+                           preferred_element_type=x.dtype,
+                           rhs_quant_dtype=rhs_quant_dtype)
 
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
@@ -243,6 +249,7 @@ def moe_gmm(
         "use_ep",
         "use_sparse_core",
         "onehot_moe_permute_threshold",
+        "rhs_quant_dtype",
     ),
 )
 def fused_moe_func(
@@ -261,6 +268,7 @@ def fused_moe_func(
     use_ep: bool = False,
     use_sparse_core: bool = True,
     onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -270,13 +278,26 @@ def fused_moe_func(
     subtract and masks non-local experts. ``use_ep`` is a static flag enabling
     EP routing; ``use_sparse_core`` is a static flag selecting the #193
     SparseCore ragged gather/gather-reduce (vs the pre-#193 plain-JAX path).
+
+    For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the weights.
+    Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier containers are
+    supported. Weights must be packed along the contracting dimension (K-axis) in LSB-first order.
     """
+
+    # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N] expected by gmm_v2.
+    if w1_scale is not None and w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale is not None and w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+
     num_tokens, hidden_size = hidden_states.shape
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
     # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
     _, padded_hidden_size, _ = w1.shape
+    packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
+    padded_hidden_size *= packing_factor
 
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
@@ -323,5 +344,6 @@ def fused_moe_func(
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
     return x[:num_tokens, :hidden_size]
