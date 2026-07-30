@@ -567,26 +567,26 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         gdn_jax_op.register_fake(_fake_gdn)
 
-        def gdn_impl(
-                mixed_qkv: torch.Tensor,
-                b: torch.Tensor,
-                a: torch.Tensor,
-                recurrent_state: torch.Tensor,
-                conv_weight: torch.Tensor,
-                conv_bias: torch.Tensor | None,
-                A_log: torch.Tensor,
-                dt_bias: torch.Tensor,
-                state_indices: torch.Tensor,
-                query_start_loc: torch.Tensor,
-                request_distribution: torch.Tensor,
-                seq_lens: torch.Tensor,
-                slot_read_offsets: torch.Tensor | None = None) -> torch.Tensor:
+        def gdn_impl(mixed_qkv: torch.Tensor,
+                     b: torch.Tensor,
+                     a: torch.Tensor,
+                     recurrent_state: torch.Tensor,
+                     conv_weight: torch.Tensor,
+                     conv_bias: torch.Tensor | None,
+                     A_log: torch.Tensor,
+                     dt_bias: torch.Tensor,
+                     state_indices: torch.Tensor,
+                     query_start_loc: torch.Tensor,
+                     request_distribution: torch.Tensor,
+                     seq_lens: torch.Tensor,
+                     slot_read_offsets: torch.Tensor | None = None,
+                     ckpt_indices: torch.Tensor | None = None) -> torch.Tensor:
             new_rec, outputs = gdn_jax_op(mixed_qkv, b, a, recurrent_state,
                                           conv_weight, conv_bias, A_log,
                                           dt_bias, state_indices,
                                           query_start_loc,
                                           request_distribution, seq_lens,
-                                          slot_read_offsets)
+                                          slot_read_offsets, ckpt_indices)
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)

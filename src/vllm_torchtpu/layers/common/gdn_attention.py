@@ -770,19 +770,27 @@ def run_jax_gdn_attention_pooled_local(
         pool_block_tokens)
 
     # Speculative decoding keeps one state checkpoint per verify window
-    # position inside the slot, at a fixed token pitch; the block must
-    # hold the whole checkpoint group (rollback selects a checkpoint by
-    # read offset, never copies state).
+    # position (rollback selects a checkpoint, never copies state).
     window = num_spec_tokens + 1
-    pitch_ntok = pool_adapters.v3_ckpt_pitch_tok(
-        ssm_ntok=ssm_ntok,
-        conv_ntok=conv_ntok,
-        window=window,
-        kernel_block=recurrent_state.shape[1],
-    )
-    assert window * pitch_ntok <= pool_block_tokens, (
-        "mamba slot checkpoints exceed the attention page", window, pitch_ntok,
-        ssm_ntok, conv_ntok, pool_block_tokens)
+    if ckpt_indices is not None:
+        # One block per checkpoint: only a single checkpoint has to fit the
+        # page, which is what keeps the block size independent of
+        # `num_spec_tokens`.
+        assert ssm_ntok + conv_ntok <= pool_block_tokens, (
+            "mamba state does not fit the attention page", ssm_ntok, conv_ntok,
+            pool_block_tokens)
+    else:
+        # Affine addressing: the checkpoints live inside one slot at a fixed
+        # token pitch, so the block must hold the whole group.
+        pitch_ntok = pool_adapters.v3_ckpt_pitch_tok(
+            ssm_ntok=ssm_ntok,
+            conv_ntok=conv_ntok,
+            window=window,
+            kernel_block=recurrent_state.shape[1],
+        )
+        assert window * pitch_ntok <= pool_block_tokens, (
+            "mamba slot checkpoints exceed the attention page", window,
+            pitch_ntok, ssm_ntok, conv_ntok, pool_block_tokens)
 
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
