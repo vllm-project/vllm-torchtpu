@@ -111,6 +111,8 @@ def _make_runner(*,
     # decoding is enabled, so _prepare_inputs / dummy_run skip the windowed
     # GDN distribution path and just pass None through to the metadata.
     runner.mamba_slot_read_offsets = None
+    # Affine checkpoint addressing (no per-checkpoint blocks) in these tests.
+    runner._mamba_ckpt_window = 1
     runner._unified_kv_layout = False
     # Bind the real seed-copy collector; an empty copy plan makes it a no-op
     # (no mamba align mode in these layout tests).

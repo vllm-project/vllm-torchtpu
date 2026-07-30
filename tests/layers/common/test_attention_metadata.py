@@ -165,6 +165,67 @@ class TestAttentionMetadataBuilderPlumbing:
                                 dtype=torch.int32)
         assert torch.equal(meta.mamba_state_indices, expected)
 
+    def test_ckpt_window_names_the_blocks_after_the_state_block(self):
+        """Checkpoint t is the row entry `state_block_offset + t`.
+
+        The manager allocates the `window - 1` speculative blocks by
+        inflating the request's token count, so they sit immediately after
+        the positional state block; checkpoint 0 must stay the state block
+        itself, keeping `mamba_state_indices` its column 0.
+        """
+        window = 3
+        runner = self._make_runner_mock(max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        runner._mamba_align_mode = True
+        builder = self._make_mamba_builder(runner)
+
+        seq_lens = torch.tensor([1, 17, 33, 33], dtype=torch.int32)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            mamba_ckpt_window=window,
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        block_tables = (
+            runner.input_batch.block_table[0].get_cpu_tensor.return_value)
+        # (seq_len - 1) // 16 for a 16-token block: 0, 1, 2, 2.
+        base_cols = [0, 1, 2, 2]
+        assert meta.mamba_ckpt_indices is not None
+        assert meta.mamba_ckpt_indices.shape == (4, window)
+        for row, col0 in enumerate(base_cols):
+            for t in range(window):
+                assert (meta.mamba_ckpt_indices[row,
+                                                t] == block_tables[row, col0 +
+                                                                   t]), (row,
+                                                                         t)
+        # Checkpoint 0 is the state block the affine path also uses.
+        assert torch.equal(meta.mamba_ckpt_indices[:, 0],
+                           meta.mamba_state_indices)
+
+    def test_no_ckpt_indices_without_a_window(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        runner._mamba_align_mode = True
+        builder = self._make_mamba_builder(runner)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 16], dtype=torch.int32),
+            query_start_loc=torch.arange(3, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(2))
+        assert meta.mamba_ckpt_indices is None
+
     def test_unified_spec_stashes_state_indices_for_offset_scatter(self):
         # With spec decoding the runner seeds unified_mamba_state_indices
         # with an empty list; each mamba group's builder appends the state

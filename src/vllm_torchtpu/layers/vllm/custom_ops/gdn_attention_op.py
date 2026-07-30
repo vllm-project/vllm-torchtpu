@@ -128,6 +128,7 @@ def gdn_attention_pooled_core_tpu(
     distribution: jax.Array,
     seq_lens: jax.Array,
     slot_read_offsets: jax.Array | None = None,
+    ckpt_indices: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -152,6 +153,7 @@ def gdn_attention_pooled_core_tpu(
         distribution,
         seq_lens,
         slot_read_offsets,
+        ckpt_indices,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -468,6 +470,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             distribution: jax.Array,
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
+            ckpt_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             return gdn_attention_pooled_core_tpu(
                 mixed_qkv,
@@ -483,6 +486,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 distribution,
                 seq_lens,
                 slot_read_offsets,
+                ckpt_indices,
                 mesh=mesh,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
@@ -885,11 +889,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
                         "mamba_slot_read_offsets in the attention metadata.")
+                ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices",
+                                       None)
                 core_attn_out = self.gdn_pooled_op(
                     mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
                     self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
                     attn_metadata.query_start_loc, request_distribution,
-                    attn_metadata.seq_lens, slot_read_offsets)
+                    attn_metadata.seq_lens, slot_read_offsets, ckpt_indices)
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError(
                         "GDN op returned an incompatible output shape.")
