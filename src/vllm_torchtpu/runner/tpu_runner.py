@@ -818,7 +818,7 @@ class TPUModelRunner(GPUModelRunner):
             isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
         if has_attention and not self._unified_kv_layout:
-            self._update_sliding_window_page_size_padded(layers)
+            self._update_attention_page_size_padded(layers)
             if has_mamba:
                 self._update_mamba_page_size_padded(layers)
 
@@ -1056,7 +1056,7 @@ class TPUModelRunner(GPUModelRunner):
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-    def _update_sliding_window_page_size_padded(
+    def _update_attention_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
         """Pad attention page sizes so vLLM's num_blocks matches what
         the TPU allocates per layer.
@@ -1074,6 +1074,22 @@ class TPUModelRunner(GPUModelRunner):
         up front (mirroring the Mamba-hybrid case below), so all
         layers already report equal `page_size_bytes` and
         `unify_kv_cache_spec_page_size` is a no-op.
+
+        NOTE: Cannot leave `page_size_padded=None` on every layer, because
+        vLLM core uses `page_size_padded` to size `num_blocks` against the HBM
+        budget. With `page_size_padded=None`, that sizing falls back to
+        generic page-size formula (https://github.com/vllm-project/vllm/blob/48aa8d8d7529d2314858d8487cc0a21789fc7ec1/vllm/v1/kv_cache_interface.py#L204-L218)
+        which has no notion of TPU's packing/alignment rules (e.g.
+        fp8 packs 4 elements per 32-bit lane, so `num_kv_heads * 2` gets
+        rounded up to a multiple of 4 in the actual TPU tensor -- see
+        `get_kv_cache_shape`). Where that rounding changes the byte count --
+        e.g. a GQA layer TP-sharded down to a single KV head -- the real TPU
+        allocation ends up larger than vLLM's generic formula accounted for,
+        so `num_blocks` is silently oversized and HBM usage silently exceeds
+        `gpu_memory_utilization`'s target, instead of failing loudly the way
+        this assertion does. `page_size_padded` has to stay pinned to the
+        true, packing-aware size on every layer; this function's job is only
+        to make sure every layer is pinned to the *same* one.
         """
         attn_page_sizes = {
             PallasAttentionBackend.get_kv_cache_page_size_bytes(
@@ -1156,6 +1172,13 @@ class TPUModelRunner(GPUModelRunner):
         mamba_modules = [
             m for m in layers.values() if isinstance(m, MambaBase)
         ]
+        if not mamba_modules:
+            # Not hybrid; set `mamba_page_size_padded` to the attention
+            # page size as a no-op default (vLLM's platform interface sets
+            # this too when it detects hybrid). No layer duplication will
+            # happen without mamba layers, so no block-ID mismatch to fix.
+            self.cache_config.mamba_page_size_padded = attn_page_size_bytes
+            return
 
         # Compute the unpadded mamba page size from an actual mamba module's
         # spec (shapes × dtype-size), ignoring any existing padding.
