@@ -391,11 +391,49 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_kimi_kda_layer_counts()
 
     from vllm.v1.engine.core import EngineCoreProc
 
     original_run = EngineCoreProc._tpu_original_run_engine_core
     return original_run(*args, **kwargs)
+
+
+def _patch_vllm_kimi_kda_layer_counts() -> None:
+    """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
+    for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).
+    """
+    from vllm.config.model import ModelConfig
+
+    if getattr(ModelConfig, "_tpu_kimi_kda_layer_counts_patched", False):
+        return
+
+    original_get_num_layers = ModelConfig.get_num_layers_by_block_type
+
+    def patched_get_num_layers_by_block_type(self,
+                                             parallel_config,
+                                             block_type="attention") -> int:
+        try:
+            return original_get_num_layers(self, parallel_config, block_type)
+        except ValueError:
+            pass
+
+        start, end = self.get_layers_start_end_indices(parallel_config)
+        linear_attn_config = getattr(self.hf_text_config, "linear_attn_config",
+                                     None)
+        if linear_attn_config is not None and block_type == "attention":
+            kda_layers = set(linear_attn_config.get("kda_layers", []))
+            return sum(
+                (idx + 1) not in kda_layers for idx in range(start, end))
+
+        return original_get_num_layers(self, parallel_config, block_type)
+
+    ModelConfig.get_num_layers_by_block_type = (
+        patched_get_num_layers_by_block_type)
+    ModelConfig._tpu_kimi_kda_layer_counts_patched = True
+    logger.info(
+        "Applied TPU patch: accurate layer counts for Kimi-K3 / KDA hybrid"
+        " models.")
 
 
 def _patch_vllm_hybrid_pcp_block_sizes() -> None:
