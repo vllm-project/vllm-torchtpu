@@ -1510,6 +1510,13 @@ class TPUModelRunner(GPUModelRunner):
         mamba_modules = [
             m for m in layers.values() if isinstance(m, MambaBase)
         ]
+        if not mamba_modules:
+            # Not hybrid; set `mamba_page_size_padded` to the attention
+            # page size as a no-op default (vLLM's platform interface sets
+            # this too when it detects hybrid). No layer duplication will
+            # happen without mamba layers, so no block-ID mismatch to fix.
+            self.cache_config.mamba_page_size_padded = attn_page_size_bytes
+            return
 
         # Compute the unpadded mamba page size from an actual mamba module's
         # spec (shapes × dtype-size), ignoring any existing padding.
