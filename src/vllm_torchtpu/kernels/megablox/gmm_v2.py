@@ -115,6 +115,14 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
+def get_packing_factor(storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None) -> int:
+    if quant_dtype is None or quant_dtype == storage_dtype:
+        return 1
+    if quant_dtype != jnp.int4 or storage_dtype not in (jnp.int32, jnp.uint32):
+        raise ValueError("Packing supports only INT4 packed in INT32/UINT32")
+    return jax.dtypes.itemsize_bits(storage_dtype) // jax.dtypes.itemsize_bits(quant_dtype)
+
+
 # Define data classes.
 
 
@@ -1138,29 +1146,6 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
     )
-
-
-def get_packing_factor(
-    storage_dtype: jnp.dtype | None,
-    quant_dtype: jnp.dtype | None,
-) -> int:
-    """Returns the packing factor for INT4 packed in a 32-bit carrier.
-        Sub-byte weights are packed along the contracting (K) dimension (axis 1).
-    """
-    if quant_dtype is None or quant_dtype == storage_dtype:
-        return 1
-
-    if (quant_dtype != jnp.int4
-            or storage_dtype not in (jnp.int32, jnp.uint32)):
-        raise ValueError(
-            "Pre-packed GMM only supports logical INT4 weights packed in "
-            f"INT32/UINT32 carrier; received logical {quant_dtype} "
-            f"and carrier {storage_dtype}.")
-
-    storage_bits = jax.dtypes.itemsize_bits(storage_dtype)
-    quant_bits = jax.dtypes.itemsize_bits(quant_dtype)
-
-    return storage_bits // quant_bits
 
 
 def make_gmm_configs(
