@@ -119,7 +119,7 @@ def get_experts_start(layer) -> int | None:
             min(layer.moe_config.ep_rank, remainder))
 
 
-def register_experts_start_buffer(layer) -> None:
+def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     """Register ``layer._experts_start`` as a persistent 0-d int32 buffer
     (``None`` for non-EP layers).
 
@@ -139,8 +139,7 @@ def register_experts_start_buffer(layer) -> None:
     the compiled graph as runtime data, not compile-time constants.
     """
     experts_start = get_experts_start(layer)
-    buffer = (torch.tensor(
-        experts_start, dtype=torch.int32, device=layer.w13_weight.device)
+    buffer = (torch.tensor(experts_start, dtype=torch.int32, device=device)
               if experts_start is not None else None)
     layer.register_buffer("_experts_start", buffer, persistent=False)
 

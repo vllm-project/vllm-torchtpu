@@ -312,7 +312,7 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
-    if use_ep:
+    if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights,
