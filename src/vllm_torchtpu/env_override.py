@@ -17,6 +17,20 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
                       "false")
 
+# Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
+# transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
+# skips per-allocation DMA mapping on multi-process v7x workers
+# (host_memory_allocator.cc), and torch_tpu pins TPU_PREMAPPED_BUFFER_SIZE
+# to "0" when unset (discovery.cc, memoized at torch_tpu import). The
+# combination routes every KV-cache D2H/H2D through libtpu's synchronous
+# staged-copy slow path (~0.4 GB/s with per-transfer IOMMU map/unmap).
+# A sized pool restores the pinned fast path; 16 GiB per worker covers the
+# connector's host mirrors with headroom. Must run before torch_tpu is
+# imported; overridable by presetting the variable.
+if os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden" or os.getenv(
+        "TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1":
+    os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
+
 # Per-tensor-core VMEM capacity by TPU family (used to set the SC-offload
 # threshold below). Values mirror JAX's pallas chip table at
 # jax/_src/pallas/mosaic/tpu_info.py. We resolve from the chip family string
