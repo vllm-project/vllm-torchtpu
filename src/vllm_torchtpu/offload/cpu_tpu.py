@@ -21,6 +21,10 @@ in-place indexing.
 
 Architecture
 ------------
+- A ctor patch on `OffloadingConnector`
+  (`_patch_vllm_offloading_connector_spec` in `vllm_torchtpu/__init__.py`)
+  hands `TPUCPUOffloadingSpec` the raw `VllmConfig`/`KVCacheConfig` alongside
+  vLLM's normalized offloading config.
 - `TPUCPUOffloadingSpec` subclasses `vllm.v1.kv_offload.cpu.spec.
   CPUOffloadingSpec`; it overrides `get_worker()` and exposes
   `estimate_hbm_reserve_bytes(vllm_config) -> int` so the worker can
@@ -98,6 +102,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec, CanonicalKVCaches,
                                      GPULoadStoreSpec, LoadStoreSpec,
                                      OffloadingWorker, TransferResult)
+from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 from vllm_torchtpu.logger import init_logger
@@ -1492,9 +1497,29 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     the grouped row mapping (expand_hybrid_pool_block_ids).
     """
 
-    def __init__(self, vllm_config: VllmConfig,
-                 kv_cache_config: KVCacheConfig):
-        super().__init__(vllm_config, kv_cache_config)
+    def __init__(
+        self,
+        offloading_config: OffloadingConfig,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ):
+        # vLLM 0.26 intentionally narrows the generic spec constructor to a
+        # normalized OffloadingConfig. The TPU transfer worker additionally
+        # needs the concrete cache specs and backend selection, so the
+        # OffloadingConnector ctor patch supplies those alongside the
+        # normalized config instead of routing this spec through
+        # OffloadingSpecFactory.
+        super().__init__(offloading_config)
+        self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
+        parallel_config = vllm_config.parallel_config
+        context_parallel_factor = (
+            parallel_config.prefill_context_parallel_size *
+            parallel_config.decode_context_parallel_size)
+        self.gpu_block_size = tuple(
+            group.kv_cache_spec.block_size * context_parallel_factor
+            for group in kv_cache_config.kv_cache_groups)
+        self.block_size_factor = offloading_config.cache.blocks_per_chunk
         self._tpu_worker: TPUCPUOffloadingWorker | None = None
         # Hybrid without the unified block pool is rejected at config time
         # by TpuPlatform.check_and_update_config.

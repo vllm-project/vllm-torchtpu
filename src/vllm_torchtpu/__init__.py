@@ -391,11 +391,153 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_offloading_config_build()
+    _patch_vllm_offloading_connector_spec()
 
     from vllm.v1.engine.core import EngineCoreProc
 
     original_run = EngineCoreProc._tpu_original_run_engine_core
     return original_run(*args, **kwargs)
+
+
+def _patch_vllm_offloading_config_build() -> None:
+    """Adapt vLLM's OffloadingConfig construction to TPU PCP.
+
+    ``build_offloading_config`` scales each group's ``tokens_per_block`` by
+    DCP only -- upstream has no PCP notion. TorchTPU PCP scheduler blocks
+    span all PCP ranks (see ``_patch_vllm_hybrid_pcp_block_sizes``), so
+    ``tokens_per_block`` must scale by PCP as well and ``tokens_per_hash``
+    must come from the runtime (PCP-patched) resolve; otherwise the
+    offloading manager would track sub-scheduler-block chunks, and on PCP
+    hybrid configs ``build_offloading_config`` trips its own
+    ``tokens_per_block % tokens_per_hash`` assert (the PCP-patched resolve
+    returns logical hash sizes while the group sizes stay rank-local).
+    """
+    import sys
+    from dataclasses import replace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
+        config as offloading_config_module
+
+    if getattr(offloading_config_module, "_tpu_offloading_config_patch",
+               False):
+        return
+
+    original_build = offloading_config_module.build_offloading_config
+
+    def build_offloading_config_tpu(vllm_config, kv_cache_config):
+        pcp = vllm_config.parallel_config.prefill_context_parallel_size
+        if pcp <= 1:
+            return original_build(vllm_config, kv_cache_config)
+
+        # Run the original against rank-local block sizes (the
+        # unpatched resolve, so its tokens_per_block % tokens_per_hash
+        # assert compares rank-local to rank-local), then scale each
+        # group's tokens_per_block to the logical all-PCP-rank span.
+        from vllm.v1.core import kv_cache_utils
+        unpatched_resolve = getattr(
+            kv_cache_utils, "_tpu_original_resolve_kv_cache_block_sizes",
+            kv_cache_utils.resolve_kv_cache_block_sizes)
+        saved_resolve = (offloading_config_module.resolve_kv_cache_block_sizes)
+        offloading_config_module.resolve_kv_cache_block_sizes = (
+            unpatched_resolve)
+        try:
+            config = original_build(vllm_config, kv_cache_config)
+        finally:
+            offloading_config_module.resolve_kv_cache_block_sizes = (
+                saved_resolve)
+        # tokens_per_hash must match the granularity the scheduler
+        # actually hashes Request.block_hashes at -- the runtime
+        # (PCP-patched) resolve: logical under hybrid PCP, rank-local
+        # otherwise.
+        _, tokens_per_hash = kv_cache_utils.resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config)
+        config = replace(
+            config,
+            groups=tuple(
+                replace(group, tokens_per_block=group.tokens_per_block * pcp)
+                for group in config.groups),
+            cache=replace(config.cache, tokens_per_hash=tokens_per_hash))
+        for group in config.groups:
+            assert group.tokens_per_block % tokens_per_hash == 0, (
+                f"tokens_per_block={group.tokens_per_block} not "
+                f"divisible by tokens_per_hash={tokens_per_hash} after "
+                f"PCP scaling (pcp={pcp})")
+        return config
+
+    offloading_config_module.build_offloading_config = (
+        build_offloading_config_tpu)
+    offloading_config_module._tpu_offloading_config_patch = True
+
+    # OffloadingConnector imports the function directly; rebind if the
+    # module is already loaded.
+    connector_module = sys.modules.get(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector")
+    if connector_module is not None:
+        connector_module.build_offloading_config = build_offloading_config_tpu
+
+    logger.info("Applied TPU patch: PCP-aware OffloadingConfig build.")
+
+
+def _patch_vllm_offloading_connector_spec() -> None:
+    """Construct TPUCPUOffloadingSpec with the raw cache metadata.
+
+    vLLM 0.26 narrows OffloadingConnector's spec construction to
+    ``OffloadingSpecFactory.create_spec(OffloadingConfig)`` -- one
+    normalized, frozen argument. TPUCPUOffloadingSpec must rebuild the
+    physical TPU cache view (per-group kv_cache_specs for the hybrid pool
+    row layout, PCP/DCP page scaling, HBM reserve sizing), which that
+    config no longer carries, so intercept the connector constructor --
+    the one surface that still holds VllmConfig and KVCacheConfig -- and
+    hand the spec all three. Non-TPU specs keep the stock construction
+    path untouched.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
+        OffloadingConnector
+
+    if getattr(OffloadingConnector, "_tpu_offloading_spec_patch", False):
+        return
+    original_init = OffloadingConnector.__init__
+
+    def _init_with_tpu_spec(self, vllm_config, role, kv_cache_config):
+        extra_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config)
+        if extra_config.get("spec_name") != "TPUCPUOffloadingSpec":
+            original_init(self, vllm_config, role, kv_cache_config)
+            return
+
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            KVConnectorBase_V1, KVConnectorRole)
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import \
+            build_offloading_config
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
+            OffloadingConnectorScheduler
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
+            OffloadingConnectorWorker
+
+        # Deferred: pulls in torch_tpu, which must not load in processes
+        # that never construct the TPU spec.
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
+
+        KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
+        offloading_config = build_offloading_config(vllm_config,
+                                                    kv_cache_config)
+        spec = TPUCPUOffloadingSpec(offloading_config, vllm_config,
+                                    kv_cache_config)
+
+        self.connector_scheduler = None
+        self.connector_worker = None
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = OffloadingConnectorScheduler(
+                spec, vllm_config, kv_cache_config)
+        elif role == KVConnectorRole.WORKER:
+            self.connector_worker = OffloadingConnectorWorker(
+                spec, kv_cache_config)
+
+    OffloadingConnector.__init__ = _init_with_tpu_spec
+    OffloadingConnector._tpu_offloading_spec_patch = True
+    logger.info("Applied TPU patch: OffloadingConnector TPU spec "
+                "construction.")
 
 
 def _patch_vllm_kimi_kda_layer_counts() -> None:
@@ -554,7 +696,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         def _hybrid_init_with_logical_pcp_blocks(self,
                                                  kv_cache_config,
                                                  max_model_len,
-                                                 max_num_batched_tokens,
+                                                 max_in_flight_tokens,
                                                  use_eagle,
                                                  enable_caching,
                                                  enable_kv_cache_events,
@@ -564,7 +706,20 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                                  hash_block_size,
                                                  metrics_collector=None):
             groups = kv_cache_config.kv_cache_groups
-            if (pcp_world_size > 1 and _is_attention_mamba_hybrid(groups)):
+            if _is_attention_mamba_hybrid(groups):
+                # The Scheduler constructs the KVCacheManager with
+                # pcp_world_size=1 unconditionally, so the PCP factor must
+                # be recovered from the block-size resolution instead: the
+                # patched resolve_kv_cache_block_sizes above returned the
+                # logical scheduler_block_size (per-rank LCM x pcp) while
+                # the group specs still carry per-rank block sizes.
+                per_rank_lcm = math.lcm(
+                    *(_effective_block_size(group.kv_cache_spec, 1)
+                      for group in groups))
+                pcp = max(pcp_world_size, scheduler_block_size // per_rank_lcm)
+            else:
+                pcp = 1
+            if pcp > 1:
                 if dcp_world_size != 1:
                     raise ValueError("TPU hybrid PCP cache coordination does "
                                      "not support DCP.")
@@ -578,7 +733,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     kv_cache_groups=[
                         replace(group,
                                 kv_cache_spec=_with_effective_block_size(
-                                    group.kv_cache_spec, pcp_world_size))
+                                    group.kv_cache_spec, pcp))
                         for group in kv_cache_config.kv_cache_groups
                     ])
                 pcp_world_size = 1
@@ -587,7 +742,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 self,
                 kv_cache_config,
                 max_model_len,
-                max_num_batched_tokens,
+                max_in_flight_tokens,
                 use_eagle,
                 enable_caching,
                 enable_kv_cache_events,
