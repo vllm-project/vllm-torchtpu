@@ -804,8 +804,6 @@ def run_jax_gdn_attention_pooled_local(
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
         qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
-        window=window,
-        per_ckpt_indices=ckpt_indices is not None,
     )
     recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,

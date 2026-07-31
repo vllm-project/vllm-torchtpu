@@ -122,8 +122,7 @@ def inner_kernel(
                 else:
                     # copy_out only DMAs the tile that ends a sequence.
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                        functools.partial(vmem_ldst.store_state_region,
-                                          *args))
+                        functools.partial(vmem_ldst.store_state_region, *args))
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -203,8 +202,7 @@ def inner_kernel(
                     vmem_ldst.store_state_region(*args)
                 else:
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                        functools.partial(vmem_ldst.store_state_region,
-                                          *args))
+                        functools.partial(vmem_ldst.store_state_region, *args))
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -412,19 +410,10 @@ def fused_conv1d_gdn(
     if pooled:
         assert conv_state is None and recurrent_state is None
         assert state_source is not None
-        if num_spec_tokens > 0:
-            # Checkpoints must be individually addressable, or they would
-            # all alias onto slot 0: either the caller names a block per
-            # checkpoint, or the plan carries an affine pitch within the
-            # slot.
-            assert (ckpt_indices is not None or state_plan.ckpt_kb > 0
-                    or state_plan.ckpt_rows
-                    > 0), ("num_spec_tokens > 0 requires either ckpt_indices "
-                           "or a state_plan with a checkpoint pitch")
-            assert not (ckpt_indices is not None and
-                        (state_plan.ckpt_kb > 0 or state_plan.ckpt_rows
-                         > 0)), ("ckpt_indices and a checkpoint pitch are "
-                                 "alternative addressing schemes; pass one")
+        # Checkpoints are individually addressable source blocks; without
+        # the index array they would all alias onto the slot's own block.
+        assert num_spec_tokens == 0 or ckpt_indices is not None, (
+            "num_spec_tokens > 0 requires ckpt_indices")
     else:
         assert state_source is None
         conv_out_dtype = conv_state.dtype
@@ -454,8 +443,7 @@ def fused_conv1d_gdn(
     if ckpt_indices is not None:
         # One source block per checkpoint (vLLM's ssm_state_indices scheme):
         # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
-        # the group needs no affine pitch and the pool block only has to
-        # hold a single state.
+        # the pool block only ever has to hold a single state.
         assert ckpt_indices.shape == (num_seqs, num_spec_tokens +
                                       1), (ckpt_indices.shape, num_seqs,
                                            num_spec_tokens)

@@ -64,8 +64,9 @@ class AttentionMetadata(object):
     # condensed. Updated on device after each sampling step; None unless the
     # model has mamba layers *and* speculative decoding is enabled.
     mamba_slot_read_offsets: jax.Array | None = None
-    # `(num_reqs, num_spec + 1)` source block per checkpoint; None keeps the
-    # affine base + pitch addressing.
+    # `(num_reqs, num_spec + 1)` source block per checkpoint. Unified pool
+    # with speculative decoding only; None elsewhere, where the sole
+    # checkpoint is the request's own state block.
     mamba_ckpt_indices: jax.Array | None = None
     # (3,) int32 — GDN-specific request distribution, same format as
     # `request_distribution` but with the first segment covering all
@@ -110,9 +111,9 @@ class AttentionMetadataBuilderContext:
     # Spec decode with mamba layers only; see the AttentionMetadata fields of
     # the same names. Only the mamba group's builder reads them.
     mamba_slot_read_offsets: torch.Tensor | None = None
-    # Checkpoints per request when speculative GDN state is stored as one
-    # block per checkpoint (num_spec + 1). 1 keeps the affine base + pitch
-    # addressing, where the group lives inside a single block.
+    # State checkpoints per request on the unified pool (num_spec + 1, each
+    # its own block). 1 means a single state per request, so the builder
+    # emits no `mamba_ckpt_indices`.
     mamba_ckpt_window: int = 1
     mamba_request_distribution: torch.Tensor | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty

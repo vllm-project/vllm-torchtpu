@@ -1776,7 +1776,7 @@ class TestMambaSlotReadOffsets:
         runner._update_mamba_slot_read_offsets = (
             TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
         # Must not raise even with real-looking args.
-        runner._update_mamba_slot_read_offsets(torch.tensor([1, 4]),
+        runner._update_mamba_slot_read_offsets([torch.tensor([1, 4])],
                                                torch.tensor([[10, -1]]), 2)
 
     def test_verify_offsets_are_num_accepted_minus_one(self):
@@ -1787,7 +1787,7 @@ class TestMambaSlotReadOffsets:
         # accepted only the bonus (both drafts rejected).
         next_tokens = torch.tensor([[10, 11, 12],
                                     [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
-        runner._update_mamba_slot_read_offsets(state_indices, next_tokens, 2)
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
         assert int(runner.mamba_slot_read_offsets[1]) == 2  # 3 valid - 1
         assert int(runner.mamba_slot_read_offsets[4]) == 0  # 1 valid - 1
 
@@ -1798,7 +1798,7 @@ class TestMambaSlotReadOffsets:
         runner.mamba_slot_read_offsets[1] = 2
         runner.mamba_slot_read_offsets[4] = 1
         runner._update_mamba_slot_read_offsets(
-            torch.tensor([1, 4], dtype=torch.int32), None, 2)
+            [torch.tensor([1, 4], dtype=torch.int32)], None, 2)
         assert int(runner.mamba_slot_read_offsets[1]) == 0
         assert int(runner.mamba_slot_read_offsets[4]) == 0
 
@@ -1811,7 +1811,7 @@ class TestMambaSlotReadOffsets:
         state_indices = torch.tensor([1, 0], dtype=torch.int32)
         next_tokens = torch.tensor([[10, 11],
                                     [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
-        runner._update_mamba_slot_read_offsets(state_indices, next_tokens, 1)
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 1)
         assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
         # Null slot only ever gets 0; active groups untouched by the tail.
         assert int(runner.mamba_slot_read_offsets[0]) == 0
