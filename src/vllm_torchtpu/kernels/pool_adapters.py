@@ -434,24 +434,6 @@ def _conv_qk_pair_rows_perm(taps: int, conv_dim: int, n_v: int, d_v: int,
     return tuple(perm)
 
 
-def v3_ckpt_pitch_tok(*, ssm_ntok: int, conv_ntok: int, window: int,
-                      kernel_block: int) -> int:
-    """Token pitch between speculative state checkpoints in a slot.
-
-    The natural pitch is one checkpoint's tokens (``ssm_ntok +
-    conv_ntok``). When the whole ``window``-checkpoint group does not fit
-    inside one kernel block, the pitch is padded up to whole kernel
-    blocks so every checkpoint keeps identical intra-block region
-    geometry (the affine-addressing requirement of the kernel's dynamic
-    read offset); the pad tokens are dead bytes between checkpoints.
-    """
-    pitch_tok = ssm_ntok + conv_ntok
-    if window > 1 and window * pitch_tok > kernel_block:
-        pitch_tok = ((pitch_tok + kernel_block - 1) // kernel_block *
-                     kernel_block)
-    return pitch_tok
-
-
 def v3_state_source(
         pool,
         *,
@@ -464,9 +446,7 @@ def v3_state_source(
         d_k: int,
         d_v: int,
         kernel_size: int,
-        qk_pair_layout: bool = False,
-        window: int = 1,
-        per_ckpt_indices: bool = False) -> gdn_v3_config.StateSourcePlan:
+        qk_pair_layout: bool = False) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
@@ -479,21 +459,12 @@ def v3_state_source(
     Arguments mirror the region geometry computed by the pooled GDN
     caller; ``pool`` contributes only its shape and dtype.
 
-    With speculative decoding (``window`` = num_spec_tokens + 1 > 1) the
-    slot holds one checkpoint per verify window position, laid out at a
-    fixed token pitch of ``ssm_ntok + conv_ntok`` (checkpoint 0's layout
-    repeated). The pitch must keep the checkpoint -> address map affine
-    for the kernel's dynamic read offset: either the whole checkpoint
-    group fits inside one kernel block (row pitch) or the pitch is whole
-    kernel blocks (block pitch); anything else would need per-checkpoint
-    region geometry, which the DMA path does not support.
-
-    With ``per_ckpt_indices`` the caller instead names one source block per
-    checkpoint (``MetadataRef.s_idx_to_ckpt_indices``), matching how vLLM's
-    reference GDN kernel indexes ``ssm_state_indices[seq, ckpt]``. The
-    affine pitch is then unnecessary and the group may be scattered across
-    ordinary pool blocks, so the pool block size no longer has to grow with
-    ``window``.
+    The plan describes one checkpoint. With speculative decoding the
+    caller names one source block per checkpoint
+    (``MetadataRef.s_idx_to_ckpt_indices``), matching how vLLM's reference
+    GDN kernel indexes ``ssm_state_indices[seq, ckpt]``; every checkpoint
+    reuses this same intra-block geometry, so the block size stays
+    independent of ``num_speculative_tokens``.
     """
     block_size, payload, lanes = _pool_geometry(pool)
     tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
@@ -550,40 +521,6 @@ def v3_state_source(
         rows_perm=conv_rows_perm,
     )
 
-    ckpt_kb = ckpt_rows = 0
-    if window > 1 and per_ckpt_indices:
-        # Each checkpoint is an independent source block named by the
-        # caller's per-checkpoint index array, so there is no pitch to
-        # apply, and the group no longer has to fit inside one manager
-        # block — which is what forced the pool block size to scale with
-        # `window`. Every checkpoint keeps checkpoint 0's intra-block
-        # region geometry, so `conv`/`ssm` above already describe it.
-        pass
-    elif window > 1:
-        pitch_tok = v3_ckpt_pitch_tok(ssm_ntok=ssm_ntok,
-                                      conv_ntok=conv_ntok,
-                                      window=window,
-                                      kernel_block=block_size)
-        if window * pitch_tok <= block_size:
-            # The whole checkpoint group lives inside one kernel block:
-            # checkpoints shift by whole token rows.
-            ckpt_rows = pitch_tok
-        else:
-            # Checkpoints shift by whole kernel blocks (the pitch helper
-            # padded the pitch up to that), keeping every checkpoint's
-            # intra-block region geometry identical.
-            assert pitch_tok % block_size == 0, (pitch_tok, block_size)
-            ckpt_kb = pitch_tok // block_size
-        if window * pitch_tok > split * block_size:
-            raise ValueError(
-                "speculative checkpoint group exceeds the manager block: "
-                f"window={window} x pitch_tok={pitch_tok} > "
-                f"split={split} x kernel_block={block_size}; the unified "
-                "pool block size must cover num_spec_tokens + 1 mamba "
-                "state checkpoints")
-
     return gdn_v3_config.StateSourcePlan(stride=split,
                                          conv=conv,
-                                         recurrent=ssm,
-                                         ckpt_kb=ckpt_kb,
-                                         ckpt_rows=ckpt_rows)
+                                         recurrent=ssm)

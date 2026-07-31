@@ -94,60 +94,6 @@ class TestV3StateSourcePlan:
         with pytest.raises(NotImplementedError):
             _plan(conv_tok0=KBS - 8)
 
-    def test_no_ckpt_pitch_without_spec_window(self):
-        plan = _plan()
-        assert (plan.ckpt_kb, plan.ckpt_rows) == (0, 0)
-
-    def test_row_pitch_when_ckpt_group_fits_one_kernel_block(self):
-        # Manager-grained pool (split == 1): 2 checkpoints of
-        # 512 + 16 = 528 tokens fit one 1280-token kernel block, so the
-        # checkpoints shift by whole token rows.
-        pool = jax.ShapeDtypeStruct((NUM_MGR, 1280) + PAYLOAD + (LANES, ),
-                                    jnp.bfloat16)
-        plan = _plan(pool, split=1, window=2)
-        assert (plan.ckpt_kb, plan.ckpt_rows) == (0, SSM_NTOK + CONV_NTOK)
-
-    def test_block_pitch_padded_to_whole_kernel_blocks(self):
-        # 528-token checkpoints on a 256-token kernel-block pool: the pitch
-        # pads to 3 whole kernel blocks so every checkpoint keeps identical
-        # intra-block geometry.
-        pool = jax.ShapeDtypeStruct((NUM_MGR * 6, KBS) + PAYLOAD + (LANES, ),
-                                    jnp.bfloat16)
-        plan = _plan(pool, split=6, window=2)
-        assert (plan.ckpt_kb, plan.ckpt_rows) == (3, 0)
-
-    def test_ckpt_group_exceeding_manager_block_rejected(self):
-        with pytest.raises(ValueError):
-            _plan(window=2)  # 2 x 768-padded > SPLIT(3) x 256
-
-    def test_per_ckpt_indices_drop_the_pitch(self):
-        # Naming one block per checkpoint replaces the affine base + pitch
-        # map, so no pitch is emitted and each checkpoint keeps checkpoint
-        # 0's intra-block geometry.
-        plan = _plan(window=4, per_ckpt_indices=True)
-        assert (plan.ckpt_kb, plan.ckpt_rows) == (0, 0)
-        base = _plan()
-        assert plan.recurrent == base.recurrent
-        assert plan.conv == base.conv
-
-    def test_per_ckpt_indices_lift_the_manager_block_limit(self):
-        # The same window that the affine plan rejects is fine here: the
-        # group is scattered across ordinary pool blocks, so the pool block
-        # size no longer has to cover it. This is what decouples block_size
-        # from num_speculative_tokens.
-        for window in (2, 4, 8):
-            plan = _plan(window=window, per_ckpt_indices=True)
-            assert (plan.ckpt_kb, plan.ckpt_rows) == (0, 0)
-
-    def test_ckpt_pitch_helper(self):
-        pitch = pool_adapters.v3_ckpt_pitch_tok
-        assert pitch(ssm_ntok=512, conv_ntok=16, window=1,
-                     kernel_block=256) == 528
-        assert pitch(ssm_ntok=512, conv_ntok=16, window=2,
-                     kernel_block=256) == 768
-        assert pitch(ssm_ntok=512, conv_ntok=16, window=2,
-                     kernel_block=1280) == 528
-
 
 def test_v3_kernel_package_stays_pool_agnostic():
     """The dense path must be byte-for-byte untouched by the seam: the V3
@@ -336,16 +282,19 @@ class TestSeamMatchesRoundTrip:
         )
 
         def _run(src, read_ckpt):
-            return wrapper.fused_conv1d_gdn(
-                conv_state=None,
-                recurrent_state=None,
-                state_indices=jnp.zeros((n, ), dtype=jnp.int32),
-                state_source=jnp.copy(src),
-                state_plan=_plan(src, window=window, per_ckpt_indices=True),
-                read_offsets=jnp.full((n, ), read_ckpt, dtype=jnp.int32),
-                ckpt_indices=ckpt_blocks,
-                num_spec_tokens=num_spec,
-                **kwargs)[1]
+            return wrapper.fused_conv1d_gdn(conv_state=None,
+                                            recurrent_state=None,
+                                            state_indices=jnp.zeros(
+                                                (n, ), dtype=jnp.int32),
+                                            state_source=jnp.copy(src),
+                                            state_plan=_plan(src),
+                                            read_offsets=jnp.full(
+                                                (n, ),
+                                                read_ckpt,
+                                                dtype=jnp.int32),
+                                            ckpt_indices=ckpt_blocks,
+                                            num_spec_tokens=num_spec,
+                                            **kwargs)[1]
 
         for r in range(window):
             ssm_r, conv_r = states[r]
@@ -377,7 +326,7 @@ class TestSeamMatchesRoundTrip:
             recurrent_state=None,
             state_indices=jnp.zeros((n, ), dtype=jnp.int32),
             state_source=jnp.copy(pool),
-            state_plan=_plan(pool, window=window, per_ckpt_indices=True),
+            state_plan=_plan(pool),
             read_offsets=jnp.zeros((n, ), dtype=jnp.int32),
             ckpt_indices=jnp.asarray(ckpt_blocks),
             num_spec_tokens=num_spec,
@@ -501,32 +450,24 @@ def _write_states_split(pool, ssm, conv, idx, split):
 class TestPooledSpecWindows:
     """Speculative verify windows on the pooled path.
 
-    Checkpoints live at a fixed pitch inside the slot and the read offset
-    selects the resume checkpoint. Reference is the dense SPEC kernel
-    (validated token-by-token in test_gdn_attention_v3) on compact slot
-    groups, fed byte-equal initial states: matching outputs across
-    multi-step schedules prove the pooled DMA wrote each window position's
-    checkpoint where the next step's read offset finds it.
+    Each checkpoint is its own pool block, named by `ckpt_indices`, and the
+    read offset picks which one a sequence resumes from. Reference is the
+    dense SPEC kernel (validated token-by-token in test_gdn_attention_v3)
+    on compact slot groups, fed byte-equal initial states: matching outputs
+    across multi-step schedules prove the pooled DMA wrote each window
+    position's checkpoint to the block the next step's read offset names.
     """
 
     NUM_SPEC = 1
     WINDOW = NUM_SPEC + 1
     N = 3
 
-    def _pool_case(self, kind):
-        if kind == "block_pitch":
-            # 256-token kernel blocks, 6 per manager block: the 528-token
-            # checkpoint pitch pads to 3 whole kernel blocks.
-            split = 6
-            shape = (NUM_MGR * split, KBS) + PAYLOAD + (LANES, )
-        else:
-            # Manager-grained pool: both 528-token checkpoints fit one
-            # 1280-token kernel block, shifting by whole token rows.
-            split = 1
-            shape = (NUM_MGR, 1280) + PAYLOAD + (LANES, )
+    def _pool(self, split):
+        shape = ((NUM_MGR * self.WINDOW * split, KBS) + PAYLOAD +
+                 (LANES, ) if split > 1 else
+                 (NUM_MGR * self.WINDOW, 1280) + PAYLOAD + (LANES, ))
         rng = np.random.default_rng(20)
-        pool = jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
-        return pool, split
+        return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
 
     def _steps(self):
         """Three-step schedule; every step's per-seq read offsets pick a
@@ -557,18 +498,23 @@ class TestPooledSpecWindows:
                  read_offsets=jnp.array([0, 1, 0], dtype=jnp.int32)),
         ]
 
-    @pytest.mark.parametrize("kind", ["block_pitch", "row_pitch"])
-    def test_pooled_spec_matches_dense(self, kind):
+    @pytest.mark.parametrize("split", [6, 1],
+                             ids=["kernel_grained", "manager"])
+    def test_pooled_spec_matches_dense(self, split):
         n, window = self.N, self.WINDOW
-        pool, split = self._pool_case(kind)
+        pool = self._pool(split)
+        # Checkpoint 0 is the request's state block; the rest are ordinary
+        # pool blocks elsewhere, deliberately *not* adjacent, so a stray
+        # affine base + offset would land on the wrong state.
         pool_idx = jnp.array([4, 1, 3], dtype=jnp.int32)
+        ckpt_indices = jnp.array([[4, 7], [1, 9], [3, 5]], dtype=jnp.int32)
 
         keys = iter(jax.random.split(jax.random.key(21), 2))
         ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
         conv0 = jax.random.normal(
             next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
         pool = _write_states_split(pool, ssm0, conv0, pool_idx, split)
-        plan = _plan(pool, split=split, window=window)
+        plan = _plan(pool, split=split)
 
         # Dense reference: compact slot groups of `window` consecutive
         # slots, byte-equal initial states at each group's base. Garbage in
@@ -599,12 +545,14 @@ class TestPooledSpecWindows:
                 recurrent_state=dense_rec,
                 state_indices=dense_base,
                 **kwargs)
-            pool, out_pooled = wrapper.fused_conv1d_gdn(conv_state=None,
-                                                        recurrent_state=None,
-                                                        state_indices=pool_idx,
-                                                        state_source=pool,
-                                                        state_plan=plan,
-                                                        **kwargs)
+            pool, out_pooled = wrapper.fused_conv1d_gdn(
+                conv_state=None,
+                recurrent_state=None,
+                state_indices=pool_idx,
+                ckpt_indices=ckpt_indices,
+                state_source=pool,
+                state_plan=plan,
+                **kwargs)
             np.testing.assert_allclose(np.asarray(out_pooled),
                                        np.asarray(out_dense),
                                        rtol=2e-2,

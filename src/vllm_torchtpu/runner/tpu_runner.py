@@ -78,8 +78,8 @@ from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
-from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    gdn_spec_ckpt_blocks_enabled, unified_kv_layout_enabled)
+from vllm_torchtpu.platforms.tpu_block_size_utils import \
+    unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
@@ -106,12 +106,12 @@ class ExecuteModelState:
     # hidden states) captured from the target verify pass. None if
     # spec decode proposer is disabled.
     draft_chunks: list[DraftChunkInputs] = field(default_factory=list)
-    # Per-chunk device mamba slot ids (base slot per batch position); only
-    # populated for hybrid models with spec decoding so sample_tokens can
-    # scatter this step's mamba read offsets per physical slot. Compact
-    # pool: one shared slot tensor per chunk; unified pool: one state-block
-    # tensor per mamba group per chunk.
-    mamba_state_indices_list: list[torch.Tensor | list[torch.Tensor]
+    # Per chunk, the device mamba state slot ids per mamba group (base slot
+    # per batch position); only populated for hybrid models with spec
+    # decoding, so sample_tokens can scatter this step's read offsets per
+    # physical slot. The compact pool shares one slot tensor across groups
+    # and so contributes a single-element list.
+    mamba_state_indices_list: list[list[torch.Tensor]
                                    | None] = field(default_factory=list)
 
 
@@ -368,21 +368,25 @@ class TPUModelRunner(GPUModelRunner):
         # upstream vLLM's InputBatch, which we do not subclass.
         self._mamba_slot_by_req_id: dict[str, int] = {}
         self._free_mamba_slots: list[int] = []
-        # Slots per request in the mamba pool. With speculative decoding each
-        # request owns `num_speculative_tokens + 1` consecutive slots (one
-        # state checkpoint per speculative window position) and the tracked
-        # slot id is the group's base; see `_init_mamba_slot_pool`.
-        self._mamba_slot_stride: int = 1
+        # State checkpoints per request under speculative decoding: one per
+        # verify window position, so rejected drafts roll back by *selecting*
+        # a checkpoint rather than by copying state. 1 without spec decoding.
+        # The two layouts hold the group differently, hence two names:
+        #   * compact pool -- `num_spec + 1` consecutive slots in the mamba
+        #     tensor, addressed as base + offset (`_init_mamba_slot_pool`);
+        #   * unified pool -- `num_spec + 1` ordinary pool blocks named
+        #     individually by `mamba_ckpt_indices`, following vLLM's
+        #     `MambaSpec.num_speculative_blocks`. Naming them keeps a block
+        #     sized for a single state; holding the whole group in one block
+        #     instead would scale `block_size` with `num_spec` (Qwen3.5-397B
+        #     at TP=1, K=4: 21760 tokens rather than 4352).
+        num_ckpts = 1
         if self.vllm_config.speculative_config is not None:
-            self._mamba_slot_stride = (
+            num_ckpts = (
                 self.vllm_config.speculative_config.num_speculative_tokens + 1)
-        # Unified pool + spec decode: with one block per checkpoint the group
-        # is `num_spec + 1` ordinary blocks named individually, so the pool
-        # block stays sized for a single state. 1 keeps the affine base +
-        # pitch addressing, whose group must fit inside one block.
-        self._mamba_ckpt_window: int = 1
-        if gdn_spec_ckpt_blocks_enabled(self.vllm_config):
-            self._mamba_ckpt_window = self._mamba_slot_stride
+        self._mamba_slot_stride: int = num_ckpts
+        self._mamba_ckpt_window: int = (num_ckpts if unified_kv_layout_enabled(
+            self.vllm_config) else 1)
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
@@ -2709,8 +2713,7 @@ class TPUModelRunner(GPUModelRunner):
         pooler_output_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
-        mamba_state_indices_list: list[torch.Tensor | list[torch.Tensor]
-                                       | None] = []
+        mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = (self._is_async_drafter)
 
@@ -2846,19 +2849,18 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
+            ctx = self._attn_metadata_builder_ctx
             if self.mamba_slot_read_offsets is None:
+                # No mamba layers, or no spec decoding: nothing to roll back.
                 mamba_state_indices_list.append(None)
-            elif (self._attn_metadata_builder_ctx.mamba_state_indices
-                  is not None):
+            elif ctx.mamba_state_indices is not None:
                 # Compact pool: one shared slot id per request across groups.
-                mamba_state_indices_list.append(
-                    self._attn_metadata_builder_ctx.mamba_state_indices)
+                mamba_state_indices_list.append([ctx.mamba_state_indices])
             else:
                 # Unified pool: one state block per request per mamba group,
                 # captured by the group builders during metadata build.
                 mamba_state_indices_list.append(
-                    self._attn_metadata_builder_ctx.unified_mamba_state_indices
-                )
+                    ctx.unified_mamba_state_indices)
             if is_draft_model:
                 # Capture this chunk's draft inputs while they are valid.
                 draft_chunks.append(
@@ -2920,37 +2922,34 @@ class TPUModelRunner(GPUModelRunner):
         return self._sampling_generator
 
     @torch.no_grad()
-    def _update_mamba_slot_read_offsets(self, state_indices: torch.Tensor
-                                        | list[torch.Tensor] | None,
+    def _update_mamba_slot_read_offsets(self,
+                                        indices_per_group: list[torch.Tensor]
+                                        | None,
                                         next_tokens: torch.Tensor | None,
                                         num_reqs: int) -> None:
         """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
 
-        `state_indices` holds the base slot per batch position for the chunk
-        (padded tail = slot 0, the null block, so its writes are harmless).
+        Each entry holds one mamba group's base slot per batch position for
+        the chunk (padded tail = slot 0, the null block, so its writes are
+        harmless); all groups get the same offsets, since the buffer is
+        indexed by slot/block id and groups allocate distinct ones. The
+        compact pool shares one slot tensor across groups and so passes a
+        single-element list.
+
         The offset is `num_accepted - 1` derived from the rejection-sampler
         output for verify chunks, and 0 for non-spec chunks (prefill / plain
         decode) — which also resets a group's offset after prefill. The next
-        step's GDN kernel resumes each request from
-        `base_slot + offset` (the checkpoint of its last accepted token).
-
-        Compact pool: one shared slot tensor addresses every mamba group.
-        Unified pool: a list with each mamba group's per-request state
-        block, all scattered with the same offsets (the buffer is indexed
-        by pool block id and each group allocates distinct blocks).
+        step's GDN kernel resumes each request from checkpoint `offset` of
+        its state block (the checkpoint of its last accepted token).
         """
-        if self.mamba_slot_read_offsets is None or state_indices is None:
-            return
-        indices_per_group = (state_indices if isinstance(state_indices, list)
-                             else [state_indices])
-        if not indices_per_group:
+        if self.mamba_slot_read_offsets is None or not indices_per_group:
             return
         offsets = torch.zeros(indices_per_group[0].shape[0],
                               dtype=torch.int32,
                               device=indices_per_group[0].device)
         if next_tokens is not None:
             # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
-            # last accepted token is at base + num_valid - 1.
+            # last accepted token is at offset num_valid - 1.
             num_valid = (next_tokens[:num_reqs]
                          != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
             offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
@@ -4819,12 +4818,10 @@ class TPUModelRunner(GPUModelRunner):
                 and not self._uniform_mamba_layout):
             self._init_mamba_slot_pool(allocated_mamba_num_blocks)
 
-        # For hybrid models with spec decoding, keep a per-slot device buffer
-        # of mamba read offsets (num_accepted - 1 from each request's last
-        # verify step). The GDN kernel reads a request's initial state from
-        # `base_slot + offset`, which is how rejected draft tokens are rolled
-        # back (by selecting the checkpoint of the last accepted token, never
-        # by copying state).
+        # Compact pool counterpart of the read-offset buffer allocated in
+        # `initialize_kv_cache`, indexed over the mamba slot pool rather
+        # than the unified pool's blocks: here checkpoint `offset` of a
+        # request is the slot `base_slot + offset`.
         if (allocated_mamba_num_blocks is not None
                 and self.speculative_config is not None):
             if self._uniform_mamba_layout:

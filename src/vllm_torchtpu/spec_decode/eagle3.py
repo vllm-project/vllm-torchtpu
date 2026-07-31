@@ -1180,10 +1180,9 @@ class Eagle3Proposer:
                                      device=runner.device)
         # Mirrors the real loop carry, which stays mrope-shaped across steps
         # (propose() pads it with _maybe_pad_dim1 when pos.ndim == 2).
-        loop_positions = (torch.zeros(
-            (3, p), dtype=torch.int32, device=runner.device)
-                          if runner.uses_mrope else torch.zeros(
-                              p, dtype=torch.int32, device=runner.device))
+        loop_positions = torch.zeros((3, p) if runner.uses_mrope else (p, ),
+                                     dtype=torch.int32,
+                                     device=runner.device)
         loop_hidden = torch.zeros((p, draft_hidden),
                                   dtype=dtype,
                                   device=runner.device)
