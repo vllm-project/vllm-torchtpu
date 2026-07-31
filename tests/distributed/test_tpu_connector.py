@@ -138,6 +138,7 @@ def _make_raiden_scheduler(*,
                            dp_rank: int = 0,
                            tp_size: int = 1,
                            pcp_size: int = 1,
+                           interleave_size: int = 1,
                            kv_ips: Any = "127.0.0.1",
                            kv_ports: Any = 9100):
     """Construct a TPURaidenConnectorScheduler with network calls patched."""
@@ -145,7 +146,8 @@ def _make_raiden_scheduler(*,
                             block_size=block_size,
                             dp_rank=dp_rank,
                             tp_size=tp_size,
-                            pcp_size=pcp_size)
+                            pcp_size=pcp_size,
+                            interleave_size=interleave_size)
     with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value=kv_ips), \
          patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=kv_ports):
         return TPURaidenConnectorScheduler(cfg)
@@ -913,6 +915,74 @@ class TestTPURaidenConnectorScheduler:
             with pytest.raises(ValueError, match="must cover every PCP"):
                 producer.request_finished(req, [100])
 
+    @pytest.mark.parametrize("computed_tokens", (15, 1792))
+    def test_v3_stage3_finish_declines_prefix_short_of_full_pcp_coverage(
+            self, computed_tokens):
+        """A prefix leaving any PCP rank with no owned tokens is not offered
+        for transfer: Raiden rejects a reshard plan whose pool group has no
+        schedule entries, so the decoder must recompute it locally."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8,
+                                          interleave_size=256)
+        req = MagicMock()
+        req.request_id = f"short-prefix-{computed_tokens}"
+        req.num_prompt_tokens = computed_tokens + 1
+        req.num_computed_tokens = computed_tokens
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True):
+            delay, params = producer.request_finished(req, [100])
+            meta = producer.build_connector_meta()
+
+        assert not delay
+        assert params == {}
+        assert meta.reqs_to_send == {}
+        assert req.request_id not in producer._stage3_finished_sends
+
+    def test_v3_stage3_finish_admits_smallest_full_pcp_coverage_prefix(self):
+        """1793 tokens is the shortest prefix owning tokens on all eight
+        ranks at interleave 256; it must still be offered for transfer."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8,
+                                          interleave_size=256)
+        req = MagicMock()
+        req.request_id = "coverage-boundary"
+        req.num_prompt_tokens = 1794
+        req.num_computed_tokens = 1793
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                           "producer-engine-9",
+                           create=True), patch(
+                               f"{_MOD}.tpu_envs."
+                               "TPU_RAIDEN_TRANSFER_PARALLELISM",
+                               8,
+                               create=True), patch(
+                                   f"{_MOD}.get_uuid",
+                                   return_value=779), patch(
+                                       f"{_MOD}.dist_utils."
+                                       "get_p2p_wait_pull_timeout",
+                                       return_value=30.0):
+            delay, params = producer.request_finished(req, [100])
+            meta = producer.build_connector_meta()
+
+        assert delay
+        assert params["num_tokens"] == 1793
+        assert meta.reqs_to_send[req.request_id].num_tokens == 1793
+
     def test_v3_stage3_finish_dedup_refuses_unsafe_inflight_eviction(self):
         producer = _make_raiden_scheduler(is_producer=True,
                                           block_size=4096,
@@ -921,8 +991,10 @@ class TestTPURaidenConnectorScheduler:
         for index in range(3):
             req = MagicMock()
             req.request_id = f"bounded-{index}"
-            req.num_prompt_tokens = 2
-            req.num_computed_tokens = 1
+            # Long enough that every PCP rank owns tokens and the finish is
+            # admitted for transfer; this test exercises dedup capacity only.
+            req.num_prompt_tokens = 9
+            req.num_computed_tokens = 8
             req.status = RequestStatus.FINISHED_LENGTH_CAPPED
             requests.append(req)
 
