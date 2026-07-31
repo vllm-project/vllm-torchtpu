@@ -973,7 +973,12 @@ class TestHybridSpecConsistencyAssert(unittest.TestCase):
         # only the hybrid consistency check is under test.
         with patch.object(CPUOffloadingSpec, "__init__",
                           lambda self, *a, **k: None):
-            return TPUCPUOffloadingSpec(vllm_config, kv_cache_config)
+            offloading_config = MagicMock()
+            offloading_config.cache.blocks_per_chunk = 1
+            vllm_config.parallel_config.prefill_context_parallel_size = 1
+            vllm_config.parallel_config.decode_context_parallel_size = 1
+            return TPUCPUOffloadingSpec(offloading_config, vllm_config,
+                                        kv_cache_config)
 
     def test_hybrid_with_mamba_group_ok(self):
         spec = self._make_spec(is_hybrid=True, with_mamba_group=True)
@@ -990,6 +995,94 @@ class TestHybridSpecConsistencyAssert(unittest.TestCase):
     def test_dense_with_mamba_group_asserts(self):
         with self.assertRaises(AssertionError):
             self._make_spec(is_hybrid=False, with_mamba_group=True)
+
+
+class TestOffloadingConnectorSpecPatch(unittest.TestCase):
+    """The OffloadingConnector ctor patch keeps raw cache metadata across
+    vLLM 0.26's normalized OffloadingConfig boundary for the TPU spec."""
+
+    def test_worker_spec_receives_normalized_and_raw_configs(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1 import \
+            KVConnectorRole
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
+            config as offloading_config_mod
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
+            worker as offloading_worker_mod
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
+            OffloadingConnector
+
+        from vllm_torchtpu import _patch_vllm_offloading_connector_spec
+        from vllm_torchtpu.offload import cpu_tpu
+
+        _patch_vllm_offloading_connector_spec()
+
+        vllm_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "spec_name": "TPUCPUOffloadingSpec",
+            "spec_module_path": "vllm_torchtpu.offload.cpu_tpu",
+        }
+        kv_cache_config = MagicMock()
+        offloading_config = MagicMock()
+        spec = MagicMock()
+        worker = MagicMock()
+
+        with (
+                patch.object(offloading_config_mod,
+                             "build_offloading_config",
+                             return_value=offloading_config) as build,
+                patch.object(cpu_tpu,
+                             "TPUCPUOffloadingSpec",
+                             return_value=spec) as spec_cls,
+                patch.object(offloading_worker_mod,
+                             "OffloadingConnectorWorker",
+                             return_value=worker) as worker_cls,
+        ):
+            connector = OffloadingConnector(vllm_config,
+                                            KVConnectorRole.WORKER,
+                                            kv_cache_config)
+
+        build.assert_called_once_with(vllm_config, kv_cache_config)
+        spec_cls.assert_called_once_with(offloading_config, vllm_config,
+                                         kv_cache_config)
+        worker_cls.assert_called_once_with(spec, kv_cache_config)
+        self.assertIs(connector.connector_worker, worker)
+        self.assertIsNone(connector.connector_scheduler)
+
+    def test_non_tpu_spec_uses_stock_construction(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1 import \
+            KVConnectorRole
+        from vllm.distributed.kv_transfer.kv_connector.v1 import \
+            offloading_connector as connector_mod
+        from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
+        from vllm_torchtpu import _patch_vllm_offloading_connector_spec
+
+        _patch_vllm_offloading_connector_spec()
+
+        vllm_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector_extra_config = {}
+        kv_cache_config = MagicMock()
+
+        # The stock construction path resolves these in the
+        # offloading_connector module namespace.
+        with (
+                patch.object(connector_mod,
+                             "build_offloading_config",
+                             return_value=MagicMock()),
+                patch.object(OffloadingSpecFactory,
+                             "create_spec",
+                             return_value=MagicMock()) as create_spec,
+                patch.object(connector_mod,
+                             "OffloadingConnectorWorker",
+                             return_value=MagicMock()),
+        ):
+            connector_mod.OffloadingConnector(vllm_config,
+                                              KVConnectorRole.WORKER,
+                                              kv_cache_config)
+
+        # The stock path routes through the factory; the TPU path never
+        # touches it.
+        create_spec.assert_called_once()
 
 
 class TestEstimateKvConnectorHbmReserve(unittest.TestCase):

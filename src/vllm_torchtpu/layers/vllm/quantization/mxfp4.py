@@ -157,9 +157,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     Inherits from Mxfp4MoEMethod to reuse its create_weights() method,
     but bypasses its __init__ to avoid the GPU backend assertion.
     """
-    # Upstream Mxfp4MoEMethod.__init__ defines is_k3_situ_aiter for GPU AITER kernels.
-    # Since __init__ is bypassed on TPU, explicitly define it here as False.
-    is_k3_situ_aiter: bool = False
 
     @property
     def is_monolithic(self) -> bool:
@@ -239,12 +236,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
-        moe_routing.register_experts_start_buffer(
-            layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            experts_start=moe_routing.get_experts_start(layer),
         )
 
     def get_fused_moe_quant_config(
@@ -301,7 +296,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=layer.w2_bias,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            experts_start=layer._experts_start,
+            experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )

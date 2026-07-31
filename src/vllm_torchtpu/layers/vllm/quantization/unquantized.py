@@ -226,12 +226,10 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                          f"w2={list(layer.w2_weight.shape)}")
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
-        moe_routing.register_experts_start_buffer(
-            layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            experts_start=moe_routing.get_experts_start(layer),
         )
 
     def _forward_monolithic_tpu(
@@ -277,7 +275,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w2_bias=getattr(layer, 'w2_bias', None),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            experts_start=layer._experts_start,
+            experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
