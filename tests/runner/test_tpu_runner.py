@@ -1843,6 +1843,10 @@ class TestUnifiedReadOffsetMigration:
         runner = MagicMock(spec=TPUModelRunner)
         runner.cache_config = MagicMock()
         runner.cache_config.block_size = block_size
+        # The collector strides the mamba block tables by the mamba groups'
+        # spec block size (times the cp world), not by the attention block
+        # size; with cp=1 the two coincide here.
+        runner._mamba_state_block_size = block_size
         runner.device = torch.device("cpu")
         runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
         runner._mamba_state_pos = {}

@@ -809,7 +809,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     # its 1-token decode front segment.
                     request_distribution = attn_metadata.request_distribution
                     slot_read_offsets = getattr(attn_metadata,
-                                                "mamba_slot_read_offsets", None)
+                                                "mamba_slot_read_offsets",
+                                                None)
                     mamba_request_distribution = getattr(
                         attn_metadata, "mamba_request_distribution", None)
                     if mamba_request_distribution is not None:
@@ -817,14 +818,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     if self.num_spec > 0:
                         assert slot_read_offsets is not None, (
                             "Speculative decoding with GDN layers requires "
-                            "mamba_slot_read_offsets in the attention metadata.")
+                            "mamba_slot_read_offsets in the attention metadata."
+                        )
                     ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices",
                                            None)
                     core_attn_out = self.gdn_pooled_op(
                         mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
-                        self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
-                        attn_metadata.query_start_loc, request_distribution,
-                        attn_metadata.seq_lens, slot_read_offsets, ckpt_indices)
+                        self.conv1d.bias, self.A_log, self.dt_bias,
+                        state_indices, attn_metadata.query_start_loc,
+                        request_distribution, attn_metadata.seq_lens,
+                        slot_read_offsets, ckpt_indices)
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError(
                         "GDN op returned an incompatible output shape.")
