@@ -241,12 +241,12 @@ def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
         vllm_config, monkeypatch):
     """One block per checkpoint means the fit floor stops scaling with K.
 
-    Same config as the affine test above, which lands on 2560 tokens for
-    K=1 (and would keep growing with K). With the checkpoints held in
-    `num_spec` extra ordinary blocks, the block only has to fit a single
-    state, so the floor is the no-spec one for every K.
+    This is what the unified pool does for every speculative config: the
+    checkpoints live in `num_spec` extra ordinary blocks, so a block only
+    has to fit a single state and the floor is the no-spec one for every K.
+    The affine test above still lands on 2560 for K=1 because it leaves the
+    unified pool off, which is the only remaining user of that addressing.
     """
-    monkeypatch.setenv("TPU_VLLM_GDN_SPEC_CKPT_BLOCKS", "1")
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     sizes = {}
     for num_spec in (1, 3, 7):

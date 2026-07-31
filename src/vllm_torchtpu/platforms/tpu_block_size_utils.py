@@ -31,16 +31,13 @@ def gdn_spec_ckpt_blocks_enabled(vllm_config: "VllmConfig") -> bool:
     Follows vLLM's `MambaSpec.num_speculative_blocks` scheme: each request
     is allocated `num_spec` extra blocks and the kernel is handed one block
     index per checkpoint, so the pool block only ever has to hold a single
-    state. The alternative (the default) keeps the whole checkpoint group
-    inside one block, which makes block_size scale with
-    `num_speculative_tokens`.
+    state. The superseded alternative kept the whole checkpoint group inside
+    one block, which made block_size scale with `num_speculative_tokens`
+    (Qwen3.5-397B at TP=1, K=4: 21760 tokens instead of 4352).
 
     Only meaningful for the unified pool with speculative decoding; the
     compact layout already gives each request its own consecutive slots.
     """
-    from vllm_torchtpu import envs as tpu_envs
-    if not tpu_envs.TPU_VLLM_GDN_SPEC_CKPT_BLOCKS:
-        return False
     return (unified_kv_layout_enabled(vllm_config)
             and vllm_config.speculative_config is not None)
 
