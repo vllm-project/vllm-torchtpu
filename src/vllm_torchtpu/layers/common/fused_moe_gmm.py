@@ -262,7 +262,7 @@ def fused_moe_func(
     w2_bias: jax.Array | None,
     topk_weights: jax.Array,
     topk_ids: jax.Array,
-    experts_start: int | None = None,
+    experts_start: jax.Array | None = None,
     topk: int = 1,
     activation: str = "silu",
     use_ep: bool = False,
@@ -273,11 +273,16 @@ def fused_moe_func(
     """Run MoE with precomputed expert ids and weights.
 
     For linear EP placement, ``experts_start`` is the first global expert id
-    owned by this shard, bound as a Python int (compile-time constant) by the
-    torch bridge. The kernel remaps global ids to local ids with an elementwise
-    subtract and masks non-local experts. ``use_ep`` is a static flag enabling
-    EP routing; ``use_sparse_core`` is a static flag selecting the #193
-    SparseCore ragged gather/gather-reduce (vs the pre-#193 plain-JAX path).
+    owned by this shard, passed as a 0-d int32 array (real traced data, not a
+    Python int/compile-time constant -- every EP rank owns a different value,
+    and binding it as a constant would make each rank JIT-compile a
+    structurally different program under the same custom-op name, which
+    desyncs the in-graph EP collectives). The kernel remaps global ids to
+    local ids with an elementwise subtract and masks non-local experts.
+    ``use_ep`` is a static flag enabling EP routing (identical across ranks,
+    safe to bind as a compile-time constant); ``use_sparse_core`` is a static
+    flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
+    pre-#193 plain-JAX path).
 
     For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the weights.
     Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier containers are
@@ -307,7 +312,7 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
-    if experts_start is not None:
+    if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights,

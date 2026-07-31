@@ -119,6 +119,31 @@ def get_experts_start(layer) -> int | None:
             min(layer.moe_config.ep_rank, remainder))
 
 
+def register_experts_start_buffer(layer, *, device: torch.device) -> None:
+    """Register ``layer._experts_start`` as a persistent 0-d int32 buffer
+    (``None`` for non-EP layers).
+
+    Call once per layer -- e.g. from ``process_weights_after_loading`` --
+    before the first forward call. Registering this as a buffer, rather than
+    wrapping ``get_experts_start``'s Python int in a fresh tensor on every
+    forward call, keeps it as stable module state that flows through
+    ``fused_moe_gmm`` as real tensor data instead of a Python int. This
+    matters under expert parallelism: every EP rank owns a different
+    ``experts_start`` value, and binding it as a Python int into the fused
+    MoE kernel's JIT closure (the previous behavior) made each rank compile a
+    structurally different program under the identical custom-op name --
+    confirmed (2026-07-30) to desync the in-graph EP all-to-all/gather
+    collectives and halt the TPU core during warmup. Same class of bug as the
+    GDN/PCP rank fix in fa8faaf5 ("Make GDN PCP weight sharding rank-uniform
+    in the compiled graph"); same fix shape -- rank-derived values must reach
+    the compiled graph as runtime data, not compile-time constants.
+    """
+    experts_start = get_experts_start(layer)
+    buffer = (torch.tensor(experts_start, dtype=torch.int32, device=device)
+              if experts_start is not None else None)
+    layer.register_buffer("_experts_start", buffer, persistent=False)
+
+
 def validate_linear_ep_placement(layer) -> None:
     """Validate that this layer uses linear EP placement.
 
