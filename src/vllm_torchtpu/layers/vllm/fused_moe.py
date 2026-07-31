@@ -78,7 +78,7 @@ def _build_fused_moe_custom_op(
     *,
     topk: int,
     activation: str,
-    experts_start: Optional[int],
+    use_ep: bool,
     rhs_quant_dtype=None,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
@@ -92,12 +92,25 @@ def _build_fused_moe_custom_op(
     # yet, so that also needs an upstream OOT-backend hook.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
 
+    # `experts_start` is deliberately NOT bound here via functools.partial.
+    # Under expert parallelism it differs per EP rank (each shard owns a
+    # different slice of the global expert table), and every rank builds
+    # this op under the identical `op_name` (the cache below is keyed on
+    # `use_ep`, not on the rank-specific value). Binding a per-rank Python
+    # int into the closure would make every rank JIT-compile a structurally
+    # different program under the same op name -- confirmed to desync the
+    # in-graph EP all-to-all/gather collectives and halt the TPU core
+    # during warmup (2026-07-30; same class of bug as the GDN/PCP fix in
+    # fa8faaf5, "Make GDN PCP weight sharding rank-uniform in the compiled
+    # graph"). `experts_start` is instead passed as a genuine call-time
+    # tensor argument (see `fused_moe_gmm` below), so it flows through
+    # `jax.jit` as traced data -- identical compiled program on every rank,
+    # only the runtime value differs.
     wrapped_fn = functools.partial(
         fused_moe_func,
-        experts_start=experts_start,
         topk=topk,
         activation=activation,
-        use_ep=experts_start is not None,
+        use_ep=use_ep,
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
         rhs_quant_dtype=rhs_quant_dtype)
@@ -111,7 +124,7 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, experts_start, rhs_quant_dtype)
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -120,17 +133,17 @@ def _get_fused_moe_custom_op(
     *,
     topk: int,
     activation: str,
-    experts_start: Optional[int],
+    use_ep: bool,
     rhs_quant_dtype=None,
 ):
-    cache_key = (topk, activation, experts_start, rhs_quant_dtype)
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
     return _build_fused_moe_custom_op(
         topk=topk,
         activation=activation,
-        experts_start=experts_start,
+        use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
     )
 
@@ -139,14 +152,14 @@ def prebuild_fused_moe_kernel(
     *,
     topk: int,
     activation: str,
-    experts_start: Optional[int],
+    use_ep: bool,
     rhs_quant_dtype=None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
-        experts_start=experts_start,
+        use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
     )
 
@@ -161,7 +174,7 @@ def fused_moe_gmm(
     w2_bias: Optional[torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    experts_start: Optional[int],
+    experts_start: Optional[torch.Tensor],
     topk: int,
     activation: str,
     rhs_quant_dtype=None,
@@ -169,18 +182,29 @@ def fused_moe_gmm(
     """Fused MoE forward pass with precomputed routing.
 
     ``experts_start`` is the first global expert id owned by this shard under
-    linear EP placement (or ``None`` for non-EP). It is a Python int derived at
-    load time from ``ep_rank``, ``ep_size``, and ``global_num_experts``, baked
-    into the JAX kernel closure as a compile-time constant -- so the global->
-    local remap is a literal subtract fused into the routing loop. When
-    present, the sparse-core parity path dispatches ragged gather/gather-reduce.
+    linear EP placement (or ``None`` for non-EP) -- see
+    ``moe_routing.get_experts_start_buffer``. It must be a 0-d int32 tensor
+    (a persistent buffer registered once per layer), not a Python int: every
+    EP rank owns a different value, and passing it as real tensor data (vs.
+    binding it as a Python int into the compiled closure) keeps the compiled
+    program identical across ranks. The kernel remaps global ids to local ids
+    with an elementwise subtract and masks non-local experts. When present,
+    the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
+    use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
-        experts_start=experts_start,
+        use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
     )
+    if experts_start is None:
+        # The compiled program for use_ep=False never reads this operand
+        # (see the `if use_ep:` guard in fused_moe_func), but the custom op
+        # still needs a concrete tensor to call with a fixed arity.
+        experts_start = torch.zeros((),
+                                    dtype=torch.int32,
+                                    device=hidden_states.device)
     return fused_moe(
         hidden_states,
         w1,
@@ -191,4 +215,5 @@ def fused_moe_gmm(
         w2_bias,
         topk_weights,
         topk_ids,
+        experts_start,
     )
