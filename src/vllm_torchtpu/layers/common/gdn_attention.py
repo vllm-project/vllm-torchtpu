@@ -25,6 +25,7 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.utils import \
@@ -732,10 +733,12 @@ def run_jax_gdn_attention_pooled_local(
     conv_dim = conv_weight.shape[0]
     per_tok_elems = math.prod(recurrent_state.shape[2:])
     tok_bytes = per_tok_elems * jnp.dtype(recurrent_state.dtype).itemsize
-    ssm_bytes = n_v * d_k * d_v * 4
-    conv_bytes = (kernel_size - 1) * conv_dim * 2
-    assert ssm_bytes % tok_bytes == 0, (ssm_bytes, tok_bytes)
-    ssm_ntok = ssm_bytes // tok_bytes
+    state_layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=n_v * d_k * d_v * 4,
+        conv_bytes=(kernel_size - 1) * conv_dim * 2,
+        token_bytes=tok_bytes,
+    )
+    ssm_ntok = state_layout.ssm_tokens
     assert ssm_ntok <= pool_block_tokens, (
         "ssm state does not fit the attention page", ssm_ntok,
         pool_block_tokens)
@@ -743,10 +746,8 @@ def run_jax_gdn_attention_pooled_local(
     # The conv slot occupies whole tokens right after the ssm region,
     # padded up so the slot's token range satisfies the tok0 % ntok == 0
     # layout rule; the pad tokens are dead bytes inside the slot.
-    conv_ntok = 1
-    while (conv_ntok * tok_bytes < conv_bytes or ssm_ntok % conv_ntok != 0):
-        conv_ntok *= 2
-    assert ssm_ntok + conv_ntok <= pool_block_tokens, (
+    conv_ntok = state_layout.conv_tokens
+    assert state_layout.required_tokens <= pool_block_tokens, (
         "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
         pool_block_tokens)
 

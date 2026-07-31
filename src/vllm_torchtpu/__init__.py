@@ -8,6 +8,60 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
+    """Require a common local prefix hit on a hybrid KV producer.
+
+    vLLM 0.26.0 lets a hybrid model with any KV connector resume from the
+    deepest per-group local hit. That is valid on a consumer when the connector
+    transfers the missing groups, but a producer has no external state to fill
+    the gap. In particular, FA can have a cached page where Mamba has no state
+    checkpoint, and resuming from the FA-only boundary corrupts generation.
+
+    This is the producer-only subset of the reconciliation merged upstream in
+    vllm-project/vllm#48425. Keep it local to the coordinator instance so
+    consumer-side divergent lookup and remote suffix transfer are unchanged.
+    """
+    from types import MethodType
+
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
+    kv_transfer_config = scheduler.vllm_config.kv_transfer_config
+    coordinator = scheduler.kv_cache_manager.coordinator
+    if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
+            or not scheduler.has_mamba_layers
+            or not isinstance(coordinator, HybridKVCacheCoordinator)):
+        return
+
+    def find_common_prefix_hit(self, block_hashes, max_cache_hit_length):
+        blocks, hit_length, _ = self.find_longest_cache_hit(
+            block_hashes, max_cache_hit_length)
+        per_group_hits = (hit_length, ) * len(
+            self.kv_cache_config.kv_cache_groups)
+        return blocks, per_group_hits
+
+    coordinator.find_longest_cache_hit_per_group = MethodType(
+        find_common_prefix_hit, coordinator)
+    logger.info("Reconciled hybrid producer prefix hits to a common boundary.")
+
+
+def _patch_vllm_hybrid_producer_prefix_hits() -> None:
+    """Backport vLLM's hybrid connector hit reconciliation to 0.26.0."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if Scheduler.__dict__.get("_tpu_hybrid_producer_prefix_hit_patch", False):
+        return
+
+    original_init = Scheduler.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _reconcile_hybrid_producer_prefix_hits(self)
+
+    Scheduler.__init__ = patched_init
+    Scheduler._tpu_hybrid_producer_prefix_hit_patch = True
+    logger.info("Applied TPU patch: reconcile hybrid producer prefix hits.")
+
+
 def _patch_vllm_aot_compile_cache_key() -> None:
     """Include the TPU compiler hash in vLLM's outer AOT cache key."""
     from vllm.compilation import caching
@@ -391,6 +445,10 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
+    # Platform activation can happen from inside the first Scheduler.__init__.
+    # Install this constructor patch at the engine-core boundary instead, before
+    # the first scheduler is created.
+    _patch_vllm_hybrid_producer_prefix_hits()
 
     from vllm.v1.engine.core import EngineCoreProc
 

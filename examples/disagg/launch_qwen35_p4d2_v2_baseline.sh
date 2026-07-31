@@ -103,8 +103,10 @@ DECODE_TP="${DECODE_TP:-2}"
 PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET="${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET:-0}"
 DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET="${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET:-4}"
 
-BLOCK_SIZE="${BLOCK_SIZE:-}"
-block_size_label="${BLOCK_SIZE:-auto}"
+PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-}"
+DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-1536}"
+prefill_block_size_label="${PREFILL_BLOCK_SIZE:-auto}"
+decode_block_size_label="${DECODE_BLOCK_SIZE:-auto}"
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-128}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
@@ -222,10 +224,6 @@ common_args=(
   --compilation-config "${compilation_config}"
 )
 
-if [[ -n "${BLOCK_SIZE}" ]]; then
-  common_args+=(--block-size "${BLOCK_SIZE}")
-fi
-
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
   common_args+=(--enable-prefix-caching)
 else
@@ -259,7 +257,8 @@ CONNECTOR=TPUConnectorV2
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector
 PREFILL_TP=${PREFILL_TP}
 DECODE_TP=${DECODE_TP}
-BLOCK_SIZE=${block_size_label}
+PREFILL_BLOCK_SIZE=${prefill_block_size_label}
+DECODE_BLOCK_SIZE=${decode_block_size_label}
 NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
 ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}
@@ -312,6 +311,14 @@ EOF
 
 prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --tensor-parallel-size "${PREFILL_TP}" --kv-transfer-config "${p_kv}")
 decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --tensor-parallel-size "${DECODE_TP}" --kv-transfer-config "${d_kv}")
+if [[ -n "${PREFILL_BLOCK_SIZE}" ]]; then
+  prefill_args+=(--block-size "${PREFILL_BLOCK_SIZE}")
+fi
+if [[ -n "${DECODE_BLOCK_SIZE}" ]]; then
+  decode_args+=(--block-size "${DECODE_BLOCK_SIZE}")
+fi
+printf '%q ' "${prefill_args[@]}" >"${RUN_DIR}/prefill_vllm_args.quoted"
+printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 
 prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
 decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
