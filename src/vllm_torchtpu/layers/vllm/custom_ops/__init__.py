@@ -15,6 +15,8 @@
 from vllm_torchtpu.layers.vllm.custom_ops import \
     gdn_attention_op as gdn_attention_op
 from vllm_torchtpu.layers.vllm.custom_ops import \
+    kda_attention_op as kda_attention_op
+from vllm_torchtpu.layers.vllm.custom_ops import \
     mla_attention_op as mla_attention_op
 
 
