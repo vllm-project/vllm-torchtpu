@@ -157,6 +157,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     Inherits from Mxfp4MoEMethod to reuse its create_weights() method,
     but bypasses its __init__ to avoid the GPU backend assertion.
     """
+    # Upstream Mxfp4MoEMethod.__init__ defines is_k3_situ_aiter for GPU AITER kernels.
+    # Since __init__ is bypassed on TPU, explicitly define it here as False.
+    is_k3_situ_aiter: bool = False
 
     @property
     def is_monolithic(self) -> bool:

@@ -18,7 +18,6 @@ steps:
     steps:
       - label: "Integration: qwen35-p4d2-disagg-correctness"
         key: "integration_qwen35_p4d2_disagg_correctness"
-        if: 'build.env("NIGHTLY") == "1"'
         agents:
           queue: "tpu_v7x_8_queue"
         env:

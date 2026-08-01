@@ -2,7 +2,6 @@
   "isl1024_osl1024_c512": {
     "completed": 320,
     "median_tpot_ms": 20.22,
-    "median_ttft_ms": 4950.8,
     "num_prompts": 320,
     "output_token_throughput": 9623.5,
     "total_token_throughput": 19209.0
@@ -10,7 +9,6 @@
   "isl1024_osl1024_c1024": {
     "completed": 320,
     "median_tpot_ms": 15.61,
-    "median_ttft_ms": 1900.5,
     "num_prompts": 320,
     "output_token_throughput": 12169.5,
     "total_token_throughput": 24291.5
@@ -18,7 +16,6 @@
   "isl1024_osl1024_c2048": {
     "completed": 320,
     "median_tpot_ms": 15.89,
-    "median_ttft_ms": 2180.8,
     "num_prompts": 320,
     "output_token_throughput": 12378.5,
     "total_token_throughput": 24709.5
