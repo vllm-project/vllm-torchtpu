@@ -14,6 +14,12 @@ from collections.abc import Sequence
 
 from .common import TAG_GDN_CONV, TAG_GDN_SSM
 
+# Physical granule of the admitted raw TPU FP8 pool layout: byte ranges
+# whose offsets and sizes are whole multiples of this are placement-exact
+# under the tiled physical layout, so raw span lowering fails closed on
+# anything finer.
+_TPU_PHYSICAL_TOKEN_BYTES = 1024
+
 
 @dataclasses.dataclass(frozen=True)
 class PoolByteSpan:
@@ -149,19 +155,24 @@ def lower_gdn_state_shard_spans(
     parallelism: int,
     regions: Sequence[object],
 ) -> PoolSpanRegistration:
-    """Lower one PCP rank's GDN head shard into a full destination state.
+    """Lower one rank's GDN head shard into a full destination state.
 
-    The compact-live conv layout on each source rank is ``taps`` rows of
-    ``[q_local | k_local | v_local]``.  The non-PCP destination layout is
-    ``[q_rank0..N | k_rank0..N | v_rank0..N]`` in every row, so a contiguous
-    whole-slot copy cannot preserve head order.  Three strided spans scatter
-    the local q/k/v runs into their rank-ordered destination ranges.  SSM
-    state is already head-major and therefore needs one contiguous span at a
-    rank-dependent destination offset.
+    Under the QK pair-blocked conv layout the rank-local conv row is
+    ``[QK | V]`` where the QK block shares whole pool tokens (Q and K
+    row-pairs interleaved) and V is whole-token aligned.  The full-width
+    destination stores the rank QK blocks in rank order followed by the
+    rank V blocks in rank order, which is exactly the stored order the
+    pooled kernel's ``rows_perm`` maps back to logical ``[Q | K | V]``.
+    Each rank therefore contributes two contiguous spans per tap; every
+    span offset and size is a whole multiple of the physical pool token,
+    so the raw (physical-byte) transport moves them placement-exactly.
 
-    ``regions`` comes from the admitted source pool manifest.  Validating its
-    exact dense GDN shape here keeps the byte declaration tied to the layout
-    used by the model kernel instead of relying on pinned model sizes.
+    SSM state is head-major and whole-token aligned: one contiguous span
+    at a rank-dependent destination offset.
+
+    ``regions`` comes from the admitted source pool manifest.  The legacy
+    ``gdn_conv_q``/``gdn_conv_k`` vocabulary is rejected: its half-token
+    Q/K extents are not placement-exact under the raw tiled layout.
     """
     if not tag:
         raise ValueError("state pool tag must not be empty")
@@ -209,6 +220,13 @@ def lower_gdn_state_shard_spans(
                 f"offset={offset}, stride={stride}, "
                 f"head_bytes={packed_head_bytes}")
         local_live = heads * packed_head_bytes
+        if local_live % _TPU_PHYSICAL_TOKEN_BYTES:
+            raise ValueError(
+                "raw TPU GDN SSM shard must contain whole physical tokens: "
+                f"bytes={local_live}")
+        if (transfer_rank * local_live) % _TPU_PHYSICAL_TOKEN_BYTES:
+            raise ValueError(
+                "raw TPU GDN SSM destination must be token aligned")
         return PoolSpanRegistration(
             tag=tag,
             block_ids=(int(block_id), ),
@@ -222,64 +240,80 @@ def lower_gdn_state_shard_spans(
             declared_bytes=local_live,
         )
 
-    expected_names = {"gdn_conv_q", "gdn_conv_k", "gdn_conv_v"}
-    if set(normalized) != expected_names:
-        raise ValueError("GDN conv layout requires q/k/v regions, got "
-                         f"{sorted(normalized)}")
-    q = normalized["gdn_conv_q"]
-    k = normalized["gdn_conv_k"]
-    v = normalized["gdn_conv_v"]
-    taps = q[3]
-    if k[3] != taps or v[3] != taps:
-        raise ValueError("GDN conv q/k/v regions disagree on tap count")
-    q_bytes = q[2] * q[4]
-    k_bytes = k[2] * k[4]
-    v_bytes = v[2] * v[4]
-    local_row_bytes = q_bytes + k_bytes + v_bytes
-    if ((q[0], k[0], v[0]) != (0, q_bytes, q_bytes + k_bytes)
-            or any(region[1] != local_row_bytes for region in (q, k, v))):
+    names = set(normalized)
+    if names == {"gdn_conv_qk", "gdn_conv_v"}:
+        # QK pair-blocked layout (source transfer degree >= 8): the rank's
+        # QK block shares whole pool tokens, so one QK span and one V span
+        # per tap are placement-exact.
+        qk = normalized["gdn_conv_qk"]
+        v = normalized["gdn_conv_v"]
+        taps = qk[3]
+        if v[3] != taps:
+            raise ValueError("GDN conv qk/v regions disagree on tap count")
+        segments = (("qk", qk, qk[2] * qk[4]), ("v", v, v[2] * v[4]))
+    elif names == {"gdn_conv_q", "gdn_conv_k", "gdn_conv_v"}:
+        # Segment-major layout (source transfer degree < 8): each per-rank
+        # segment is a whole-token multiple on its own, so the classic one
+        # span per segment per tap is placement-exact.  At degree >= 8 the
+        # Q/K segments are sub-token and the alignment guard below fails
+        # this path closed.
+        q = normalized["gdn_conv_q"]
+        k = normalized["gdn_conv_k"]
+        v = normalized["gdn_conv_v"]
+        taps = q[3]
+        if k[3] != taps or v[3] != taps:
+            raise ValueError("GDN conv q/k/v regions disagree on tap count")
+        segments = (("q", q, q[2] * q[4]), ("k", k, k[2] * k[4]),
+                    ("v", v, v[2] * v[4]))
+    else:
         raise ValueError(
-            "GDN conv compact layout must be dense tap-major q/k/v: "
-            f"offsets={(q[0], k[0], v[0])}, "
-            f"strides={(q[1], k[1], v[1])}, row={local_row_bytes}")
+            "GDN conv regions must be {gdn_conv_qk, gdn_conv_v} "
+            "(QK pair-blocked layout, TPU_GDN_CONV_QK_PAIR_LAYOUT) or "
+            "{gdn_conv_q, gdn_conv_k, gdn_conv_v}: got "
+            f"{sorted(names)}")
 
+    local_row_bytes = sum(size for _, _, size in segments)
+    expected_offset = 0
+    for name, region, size in segments:
+        if region[0] != expected_offset:
+            raise ValueError(
+                "GDN conv compact layout must be dense tap-major: "
+                f"{name} offset={region[0]}, expected={expected_offset}")
+        if region[1] != local_row_bytes:
+            raise ValueError(
+                "GDN conv regions must share the tap row stride: "
+                f"{name} stride={region[1]}, row={local_row_bytes}")
+        expected_offset += size
     dst_row_bytes = parallelism * local_row_bytes
-    spans = (
-        PoolByteSpan(
-            src_block_ordinal=0,
-            src_offset_bytes=0,
-            dst_block_index=0,
-            dst_offset_bytes=transfer_rank * q_bytes,
-            size_bytes=q_bytes,
-            src_stride_bytes=local_row_bytes,
-            dst_stride_bytes=dst_row_bytes,
-            count=taps,
-        ),
-        PoolByteSpan(
-            src_block_ordinal=0,
-            src_offset_bytes=q_bytes,
-            dst_block_index=0,
-            dst_offset_bytes=parallelism * q_bytes + transfer_rank * k_bytes,
-            size_bytes=k_bytes,
-            src_stride_bytes=local_row_bytes,
-            dst_stride_bytes=dst_row_bytes,
-            count=taps,
-        ),
-        PoolByteSpan(
-            src_block_ordinal=0,
-            src_offset_bytes=q_bytes + k_bytes,
-            dst_block_index=0,
-            dst_offset_bytes=(parallelism * (q_bytes + k_bytes) +
-                              transfer_rank * v_bytes),
-            size_bytes=v_bytes,
-            src_stride_bytes=local_row_bytes,
-            dst_stride_bytes=dst_row_bytes,
-            count=taps,
-        ),
-    )
+    for name, value in ([(name, size) for name, _, size in segments] +
+                        [("row", local_row_bytes),
+                         ("dst_row", dst_row_bytes)]):
+        if value % _TPU_PHYSICAL_TOKEN_BYTES:
+            raise ValueError(
+                "raw TPU GDN conv extents must be whole physical tokens "
+                "(sub-token Q/K segments need the QK pair-blocked layout): "
+                f"{name}={value}")
+
+    spans = []
+    src_offset = 0
+    dst_segment_base = 0
+    for _, _, size in segments:
+        spans.append(
+            PoolByteSpan(
+                src_block_ordinal=0,
+                src_offset_bytes=src_offset,
+                dst_block_index=0,
+                dst_offset_bytes=dst_segment_base + transfer_rank * size,
+                size_bytes=size,
+                src_stride_bytes=local_row_bytes,
+                dst_stride_bytes=dst_row_bytes,
+                count=taps,
+            ))
+        src_offset += size
+        dst_segment_base += parallelism * size
     return PoolSpanRegistration(
         tag=tag,
         block_ids=(int(block_id), ),
-        spans=spans,
+        spans=tuple(spans),
         declared_bytes=taps * local_row_bytes,
     )

@@ -25,6 +25,7 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
@@ -768,6 +769,7 @@ def run_jax_gdn_attention_pooled_local(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
     )
     recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,

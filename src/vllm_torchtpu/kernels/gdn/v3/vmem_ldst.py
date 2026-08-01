@@ -171,7 +171,12 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
         for j in range(region.nblocks)
     ]
     arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
-    return arr[:region.rows_used].reshape(shape)
+    arr = arr[:region.rows_used]
+    if region.rows_perm is not None:
+        # Static row gather from the stored order to the logical order;
+        # sublane-dim slices + concat only, no lane crossing.
+        arr = jnp.concat([arr[p][None] for p in region.rows_perm], axis=0)
+    return arr.reshape(shape)
 
 
 def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
@@ -184,6 +189,13 @@ def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
     rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
     arr = values.astype(region.view_dtype)
     arr = arr.reshape(-1, out_lanes)
+    if region.rows_perm is not None:
+        # Inverse of the load-side gather: logical row i is stored at
+        # typed row rows_perm[i].
+        inverse = [0] * len(region.rows_perm)
+        for logical, stored in enumerate(region.rows_perm):
+            inverse[stored] = logical
+        arr = jnp.concat([arr[i][None] for i in inverse], axis=0)
     capacity = region.nblocks * rows_pb
     if region.rows_used < capacity:
         arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
