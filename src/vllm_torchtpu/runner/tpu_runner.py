@@ -1522,6 +1522,14 @@ class TPUModelRunner(GPUModelRunner):
         the GDN op (which scans the full length every step) cannot alias an
         active slot — the null-tail invariant.
 
+        `num_reqs` may exceed the requests actually in the persistent batch:
+        an idle DP rank replaying a peer's collective trace passes the
+        coordinated shape (`num_reqs_max_model_len`) while its own batch is
+        empty or shorter. Those positions carry no request, so they keep the
+        null slot the tail already uses; only the live prefix is assigned.
+        Without this, `run_dp_dummy_draft` walks off the end of `req_ids`
+        with `IndexError` on the compact layout, killing the engine.
+
         Slot assignment follows the request through upstream vLLM's
         condense/swap reordering automatically because the map is keyed on the
         stable req_id, not the moving persistent-batch position.
@@ -1536,7 +1544,8 @@ class TPUModelRunner(GPUModelRunner):
         indices = self.mamba_state_indices_cpu[:target_num_reqs]
         indices.fill_(0)
         req_ids = self.input_batch.req_ids
-        for i in range(num_reqs):
+        num_live = max(0, min(num_reqs, len(req_ids) - start_index))
+        for i in range(num_live):
             req_id = req_ids[start_index + i]
             assert req_id is not None
             slot = self._mamba_slot_by_req_id.get(req_id)
@@ -4232,9 +4241,18 @@ class TPUModelRunner(GPUModelRunner):
                 # can leak into the dynamic=False gather wrapper. The caller
                 # retries once (forward now compiled -> concrete shapes), so log
                 # quietly and let the retry surface a genuine failure.
-                logger.debug(
-                    "spec-decode warmup P=%d first attempt failed; retrying",
-                    P)
+                # WARNING, not DEBUG: this except catches a *rank-local*
+                # exception raised inside a *collective* region. The raising
+                # rank unwinds and retries while its peers stay blocked in
+                # the collective, so a swallowed failure here surfaces as a
+                # cluster-wide hang with no log line to explain it. Keep it
+                # visible even on the quiet first attempt.
+                logger.warning(
+                    "spec-decode warmup P=%d first attempt failed; retrying. "
+                    "Under DP/EP this can desynchronize ranks — if startup "
+                    "hangs after this line, that is the cause.",
+                    P,
+                    exc_info=True)
             else:
                 logger.exception("spec-decode warmup P=%d failed; continuing",
                                  P)
