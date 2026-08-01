@@ -13,12 +13,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm_torchtpu.kernels.kimi_k3 import kda_step, naive_ragged_kda
+from vllm_torchtpu.kernels.kimi_k3 import naive_kda, naive_kda_step
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
     kimi_short_conv_scan
 
 
-def test_kda_pallas_abi_shapes_and_dtypes() -> None:
+def test_naive_kda_abi_shapes_and_dtypes() -> None:
     num_tokens, num_heads, head_dim = 5, 2, 128
     recurrent_state = jnp.zeros((8, num_heads, head_dim, head_dim),
                                 jnp.float32)
@@ -36,7 +36,7 @@ def test_kda_pallas_abi_shapes_and_dtypes() -> None:
         jnp.asarray([2, 7, 0], jnp.int32),
     )
     output, new_state = jax.eval_shape(
-        functools.partial(naive_ragged_kda, lower_bound=None, eps=1e-5),
+        functools.partial(naive_kda, lower_bound=None, eps=1e-5),
         *args,
     )
     assert output.shape == (num_tokens, num_heads, head_dim)
@@ -46,7 +46,7 @@ def test_kda_pallas_abi_shapes_and_dtypes() -> None:
 
 
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
-def test_kda_step_matches_independent_torch_reference(
+def test_naive_kda_step_matches_independent_torch_reference(
         lower_bound: float | None) -> None:
     torch.manual_seed(10)
     num_tokens, num_heads, head_dim = 4, 2, 4
@@ -69,7 +69,7 @@ def test_kda_step_matches_independent_torch_reference(
     jax_state = jnp.asarray(state.numpy())
     actual_outputs = []
     for token_idx in range(num_tokens):
-        output, jax_state = kda_step(
+        output, jax_state = naive_kda_step(
             jnp.asarray(query[token_idx].numpy(), dtype=jnp.bfloat16),
             jnp.asarray(key[token_idx].numpy(), dtype=jnp.bfloat16),
             jnp.asarray(value[token_idx].numpy(), dtype=jnp.bfloat16),

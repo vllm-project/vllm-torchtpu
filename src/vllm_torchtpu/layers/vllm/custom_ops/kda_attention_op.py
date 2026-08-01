@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.kimi_k3 import ragged_kda
+from vllm_torchtpu.kernels.kimi_k3 import naive_kda
 
 
 def kimi_short_conv_scan(
@@ -177,7 +177,7 @@ def build_kimi_kda_op(
     eps: float,
 ):
     """Build the layer-specific Pallas KDA recurrence custom op."""
-    wrapped = functools.partial(ragged_kda, lower_bound=lower_bound, eps=eps)
+    wrapped = functools.partial(naive_kda, lower_bound=lower_bound, eps=eps)
     op_name = f"pallas::kimi_kda_{prefix.replace('.', '_')}"
     kda_op = pallas.jax_op(op_name, wrapped, donate_argnums=(4, ))
 

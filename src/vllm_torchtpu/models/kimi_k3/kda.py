@@ -9,34 +9,30 @@ import jax.numpy as jnp
 import torch
 from einops import rearrange
 from torch import nn
+from torch_tpu._internal import pallas
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.utils import divide
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               MergedColumnParallelLinear,
+                                               ReplicatedLinear,
+                                               RowParallelLinear)
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator, MambaStateShapeCalculator,
+    is_conv_state_dim_first)
+from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_torchtpu.kernels.kimi_k3 import (kda_decode, kda_forward,
-                                           naive_ragged_kda)
+from vllm_torchtpu.kernels.kimi_k3 import chunk_kda, decode_kda, naive_kda
 
 __all__ = ["KdaMetadata", "KimiK3DeltaAttention", "GatedRMSNormSigmoid"]
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
-# Opt-in escape hatch: route both prefill and decode through the plain-XLA
-# recurrence in `kernels/kimi_k3/naive_kda.py` instead of the two Pallas kernels.
 _USE_NAIVE_KDA_ENV = "TPU_VLLM_USE_NAIVE_KDA"
 
 
 def use_naive_kda() -> bool:
-    """Whether ``TPU_VLLM_USE_NAIVE_KDA=1`` selects the naive recurrence.
-
-    The naive path is one token-at-a-time ``jax.lax.scan`` over the whole batch:
-    far slower than either Pallas kernel, but it is the same code the kernels are
-    validated against, so it is the useful thing to switch to when a numerical
-    problem needs to be attributed to a kernel rather than to the layer.
-
-    Read per forward rather than cached at construction, so it can be toggled
-    without rebuilding the model -- and so a test can set it with
-    ``monkeypatch.setenv``. The cost is one dict lookup per layer per step.
-
-    Only the exact string ``"1"`` enables it, matching this repo's other env
-    flags (``VLLM_TPU_OFFLOAD_RAIDEN``, ``VLLM_TPU_DEBUG_PCP_LAYOUT``).
-    """
+    """Return whether the plain-XLA recurrence is enabled."""
     return os.environ.get(_USE_NAIVE_KDA_ENV, "0") == "1"
 
 
@@ -45,11 +41,7 @@ def use_naive_kda() -> bool:
 # ---------------------------------------------------------------------------
 @dataclasses.dataclass
 class KdaMetadata:
-    """The subset of upstream ``KimiK3KDAMetadata`` this prototype consumes.
-
-    Kept as a standalone dataclass so accuracy tests can drive the layer
-    directly without standing up a vLLM engine and forward context. In a real
-    integration this would be built by the TPU attention-metadata builder.
+    """Metadata consumed by the TPU KDA layer.
 
     Attributes:
         num_prefills / num_decodes: batch composition. A batch is treated as
@@ -178,7 +170,7 @@ def _causal_conv1d_update(
 # ---------------------------------------------------------------------------
 # JAX side: the two kernel call sites
 # ---------------------------------------------------------------------------
-def _kda_prefill_jax(
+def _chunk_kda_adapter(
     q: jax.Array,  # [1, T, H, D]
     k: jax.Array,
     v: jax.Array,
@@ -208,7 +200,7 @@ def _kda_prefill_jax(
     init = jnp.where(has_initial_state[:, None, None, None], init, 0.0)
     init = init[None]  # [1, N, H, K, V]
 
-    out, final_state = kda_forward(
+    out, final_state = chunk_kda(
         hm(q),
         hm(k),
         hm(v),
@@ -233,7 +225,7 @@ def _kda_prefill_jax(
     return out, pool
 
 
-def _kda_decode_jax(
+def _decode_kda_adapter(
     q: jax.Array,  # [1, N, H, D]
     k: jax.Array,
     v: jax.Array,
@@ -249,7 +241,7 @@ def _kda_decode_jax(
 ) -> tuple[jax.Array, jax.Array]:
     """Single-token recurrent KDA; returns (out, updated pool)."""
     n_v, d_k = q.shape[2], q.shape[3]
-    out, pool = kda_decode(
+    out, pool = decode_kda(
         q[0],
         k[0],
         v[0],
@@ -261,13 +253,13 @@ def _kda_decode_jax(
         state_indices,
         has_initial_state,
         lower_bound=lower_bound,
-        # TODO(gnovack) - Determine correct state layout ([d_v, d_k] vs. [d_k, d_v]); ported kernel and vllm reference disagree)
+        # vLLM stores recurrent state as [d_v, d_k].
         state_transposed=True,
     )
     return out[None], pool  # [1, N, H, V]
 
 
-def _kda_naive_jax(
+def _naive_kda_adapter(
     mixed_qkv: jax.Array,  # [T, 3 * H * D]  post-conv, already activated
     raw_gate: jax.Array,  # [T, H * D]      raw gate (g1)
     raw_beta: jax.Array,  # [T, H]          RAW, not sigmoided
@@ -292,7 +284,7 @@ def _kda_naive_jax(
     Three conventions differ from the Pallas kernels, and all three are handled
     here rather than at the call site so that ``_forward`` stays readable:
 
-    * **beta is raw.** ``naive_ragged_kda`` applies the sigmoid itself, so this
+    * **beta is raw.** ``naive_kda`` applies the sigmoid itself, so this
       must NOT be handed pre-activated beta -- doing so squashes the delta-rule
       update towards sigmoid(0.5) and is nearly silent.
     * **it fuses the output norm and gate.** ``norm_weight``/``eps`` are the
@@ -301,9 +293,9 @@ def _kda_naive_jax(
     * **state orientation.** The pool stores each slot as ``[V, K]``; the naive
       recurrence works in ``[K, V]`` like the kernels do, and cannot detect the
       difference because the two dims are equal. Swap on load and on store,
-      exactly as ``_kda_prefill_jax`` does.
+      exactly as ``_chunk_kda_adapter`` does.
     """
-    out, new_state = naive_ragged_kda(
+    out, new_state = naive_kda(
         mixed_qkv,
         raw_gate,
         raw_beta,
@@ -330,15 +322,6 @@ class KimiK3DeltaAttention(nn.Module):
 
     def __init__(self, config, vllm_config, prefix: str = "") -> None:
         super().__init__()
-        from vllm.distributed import get_tensor_model_parallel_world_size
-        from vllm.distributed.utils import divide
-        from vllm.model_executor.layers.linear import (
-            ColumnParallelLinear, MergedColumnParallelLinear, ReplicatedLinear,
-            RowParallelLinear)
-        from vllm.model_executor.models.utils import extract_layer_index
-        from vllm.model_executor.utils import set_weight_attrs
-
-        del extract_layer_index  # kept for parity with upstream's imports
 
         self.prefix = prefix
         self.config = config
@@ -362,31 +345,8 @@ class KimiK3DeltaAttention(nn.Module):
             "use_full_rank_gate",
             False), ("KimiK3DeltaAttention requires a full-rank gate")
 
-        # Upstream fuses q, k, v, output-gate, f_a and beta into one
-        # `in_proj_qkvgfab` and needs _KimiGDNMergedColumnParallelLinear to make
-        # it work at TP > 1: shard 4 (f_a, of size head_dim) has to be
-        # REPLICATED, since head_dim is the *contraction* dim of f_b_proj and so
-        # cannot be split across ranks. A plain MergedColumnParallelLinear splits
-        # every shard alike and is therefore only correct at tp_size == 1.
-        #
-        # Rather than port that subclass, split the projections by TP behaviour
-        # and let each one use the linear that already has the right semantics:
-        #
-        #   in_proj_qkv  q, k, v    3 x projection_size  column-parallel (merged)
-        #   g_proj       out-gate   projection_size      column-parallel
-        #   f_a_proj     f_a        head_dim             REPLICATED
-        #   b_proj       beta       num_heads            column-parallel
-        #
-        # q/k/v stay merged because that is what `mixed_qkv` is -- the packed
-        # input the short conv1d consumes -- and a merged column-parallel linear
-        # over three equal shards gives exactly the local [q|k|v] layout it wants
-        # at any TP size. Splitting them further would only add a cat per layer.
-        #
-        # This also drops upstream's `in_proj_padding`: the 16-row alignment
-        # existed to pad the *merged* row count (and to dodge an Inductor issue
-        # with the row-strided G view), and neither applies once the projections
-        # are separate. Weight names change accordingly -- see build_module in
-        # scripts/kernels/bench_kda_module_tpu.py.
+        # f_a is replicated because it is the contraction input to f_b_proj;
+        # q/k/v and the gates remain column-parallel.
         self.in_proj_qkv = MergedColumnParallelLinear(
             self.hidden_size,
             [self.projection_size] * 3,
@@ -467,20 +427,16 @@ class KimiK3DeltaAttention(nn.Module):
 
         # (conv_state, recurrent_state); assigned by the runner, or by a test.
         self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._prefill_op = None
+        self._chunk_op = None
         self._decode_op = None
         self._naive_op = None
 
     # -- state shapes, for whoever allocates the cache -----------------------
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
-        from vllm.model_executor.layers.mamba.mamba_utils import \
-            MambaStateDtypeCalculator
         return MambaStateDtypeCalculator.kda_state_dtype(
             self.model_config.dtype, self.cache_config.mamba_cache_dtype)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        from vllm.model_executor.layers.mamba.mamba_utils import \
-            MambaStateShapeCalculator
         return MambaStateShapeCalculator.kda_state_shape(
             self.tp_size,
             self.num_heads,
@@ -490,71 +446,43 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
     # -- torch <-> jax op construction --------------------------------------
-    def _get_prefill_op(self, n_max: int):
+    def _get_chunk_op(self, n_max: int):
         """Build (and cache per n_max) the prefill jax_op.
 
         ``N_max`` is static to the kernel, so one op is compiled per distinct
         sequence count. A real integration would bucket this the way the runner
         buckets token counts.
         """
-        from torch_tpu._internal import pallas
-
         key = ("prefill", n_max)
-        if self._prefill_op is not None and self._prefill_op[0] == key:
-            return self._prefill_op[1]
+        if self._chunk_op is not None and self._chunk_op[0] == key:
+            return self._chunk_op[1]
 
-        fn = functools.partial(_kda_prefill_jax,
+        fn = functools.partial(_chunk_kda_adapter,
                                lower_bound=self.gate_lower_bound,
                                n_max=n_max)
 
-        def wrapped(
-                q: jax.Array, k: jax.Array, v: jax.Array, g: jax.Array,
-                beta: jax.Array, pool: jax.Array, a_log: jax.Array,
-                dt_bias: jax.Array, segment_ids: jax.Array,
-                state_indices: jax.Array,
-                has_initial_state: jax.Array) -> tuple[jax.Array, jax.Array]:
-            return fn(q, k, v, g, beta, pool, a_log, dt_bias, segment_ids,
-                      state_indices, has_initial_state)
-
         name = (f"pallas::kda_prefill_{self.prefix.replace('.', '_')}"
                 f"_n{n_max}")
-        # NOT donated. Donating the pool (as gdn_attention_op.py does) consumes
-        # the caller's buffer, but `_forward` also writes the result back with
-        # `recurrent_state.copy_(new_pool)` and the same cache tensor is reused
-        # on the next call -- torch_tpu then rejects the second execution with
-        # "Donation requested for invalid buffer", and the failure is only
-        # visible as a MaterializationWorker error while the caller sees stale
-        # results. Correctness first for a prototype; the cost is one pool-sized
-        # copy per layer per step, which is what to revisit when this is wired
-        # into the runner and the cache lifetime is owned there.
-        op = pallas.jax_op(name, wrapped)
+        # The caller reuses the cache tensor after copying the result back, so
+        # the pool cannot be donated to this op.
+        op = pallas.jax_op(name, fn)
 
         def _fake(q, _k, _v, _g, _beta, pool, *args, **kwargs):
             return (torch.empty_like(q), torch.empty_like(pool))
 
         op.register_fake(_fake)
-        self._prefill_op = (key, op)
+        self._chunk_op = (key, op)
         return op
 
     def _get_decode_op(self):
-        from torch_tpu._internal import pallas
-
         if self._decode_op is not None:
             return self._decode_op
 
-        fn = functools.partial(_kda_decode_jax,
+        fn = functools.partial(_decode_kda_adapter,
                                lower_bound=self.gate_lower_bound)
 
-        def wrapped(
-                q: jax.Array, k: jax.Array, v: jax.Array, g: jax.Array,
-                beta: jax.Array, pool: jax.Array, a_log: jax.Array,
-                dt_bias: jax.Array, state_indices: jax.Array,
-                has_initial_state: jax.Array) -> tuple[jax.Array, jax.Array]:
-            return fn(q, k, v, g, beta, pool, a_log, dt_bias, state_indices,
-                      has_initial_state)
-
         name = f"pallas::kda_decode_{self.prefix.replace('.', '_')}"
-        op = pallas.jax_op(name, wrapped)  # not donated; see _get_prefill_op
+        op = pallas.jax_op(name, fn)  # not donated; see _get_chunk_op
 
         def _fake(q, _k, _v, _g, _beta, pool, *args, **kwargs):
             return (torch.empty_like(q), torch.empty_like(pool))
@@ -569,30 +497,15 @@ class KimiK3DeltaAttention(nn.Module):
         One op for both batch kinds: unlike the prefill kernel there is no static
         ``N_max`` to specialise on, so nothing needs bucketing.
         """
-        from torch_tpu._internal import pallas
-
-        # getattr, not plain attribute access: harnesses that hand-build this
-        # module (the module test, scripts/kernels/bench_kda_module_tpu.py) skip
-        # __init__ and so may not have the cache slot.
         if getattr(self, "_naive_op", None) is not None:
             return self._naive_op
 
-        fn = functools.partial(_kda_naive_jax,
+        fn = functools.partial(_naive_kda_adapter,
                                lower_bound=self.gate_lower_bound,
                                eps=self.o_norm.eps)
 
-        def wrapped(mixed_qkv: jax.Array, raw_gate: jax.Array,
-                    raw_beta: jax.Array, output_gate: jax.Array,
-                    pool: jax.Array, a_log: jax.Array, dt_bias: jax.Array,
-                    norm_weight: jax.Array, query_start_loc: jax.Array,
-                    state_indices: jax.Array,
-                    seq_lens: jax.Array) -> tuple[jax.Array, jax.Array]:
-            return fn(mixed_qkv, raw_gate, raw_beta, output_gate, pool, a_log,
-                      dt_bias, norm_weight, query_start_loc, state_indices,
-                      seq_lens)
-
         name = f"pallas::kda_naive_{self.prefix.replace('.', '_')}"
-        op = pallas.jax_op(name, wrapped)  # not donated; see _get_prefill_op
+        op = pallas.jax_op(name, fn)  # not donated; see _get_chunk_op
 
         def _fake(mixed_qkv, _raw_gate, _raw_beta, _output_gate, pool, *args,
                   **kwargs):
@@ -664,7 +577,6 @@ class KimiK3DeltaAttention(nn.Module):
         metadata: KdaMetadata | None = None,
     ) -> None:
         if metadata is None:
-            from vllm.forward_context import get_forward_context
             raw = get_forward_context().attn_metadata
             if raw is None:
                 return
@@ -707,31 +619,15 @@ class KimiK3DeltaAttention(nn.Module):
         # dim-at-(-2); the torch reference conv here wants
         # [num_slots, state_len, dim], so normalize the other way. transpose()
         # returns a view, so in-place writes still land in the real cache.
-        try:
-            from vllm.model_executor.layers.mamba.mamba_utils import \
-                is_conv_state_dim_first
-            if is_conv_state_dim_first():
-                conv_state = conv_state.transpose(-1, -2)
-        except ImportError:
-            pass
+        if is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
 
         n = m.num_actual_tokens
         mixed_qkv = mixed_qkv[:n]
         g1 = g1[:, :n]
         beta = beta[:, :n]
 
-        # beta arrives RAW from the projection. Upstream hands it to the kernel as
-        # `raw_beta=beta` and the kernel applies the sigmoid itself; the two Pallas
-        # kernels do not (they take beta already activated, like the reference in
-        # tests/kernels/test_kda.py), so it has to happen here -- but NOT for the
-        # naive path, which sigmoids internally like upstream.
-        #
-        # Getting this wrong is nearly silent: raw beta is ~N(0, 0.17) where
-        # sigmoid(beta) ~ 0.5, so the delta-rule update is scaled ~0 and the
-        # module's output collapses to ~1/3 of its correct magnitude while the
-        # recurrent state still looks approximately right. Against the GPU dump
-        # that showed up as output rmse_rel 1.03 with final_conv_state and
-        # final_recurrent_state both passing.
+        # Pallas takes activated beta; the naive recurrence activates it itself.
         if not naive:
             beta = torch.sigmoid(beta.float()).to(beta.dtype)
 
@@ -777,11 +673,7 @@ class KimiK3DeltaAttention(nn.Module):
             # in", which is the only thing the kernel reads it for; +1 where
             # has_initial_state is set reproduces this metadata's flag exactly.
             seq_lens = query_lens + has_init
-            # NOTE the asymmetry: g1 is [1, T, H, D] (already sliced to n above)
-            # but g2 is [T, H, D] -- `forward` builds them with different einops
-            # patterns. So g2 is sliced on dim 0, not dim 1. Slicing g2 the same
-            # way as g1 takes the *head* axis instead, which is a no-op whenever
-            # n >= num_heads and so only shows up on short batches.
+            # g1 is [1, T, H, D], while g2 is [T, H, D].
             op = self._get_naive_op()
             out, new_pool = op(conv_out, g1.reshape(n,
                                                     -1), beta.reshape(n, -1),
@@ -800,7 +692,7 @@ class KimiK3DeltaAttention(nn.Module):
         if is_prefill:
             segment_ids = self._segment_ids(m.query_start_loc, n,
                                             mixed_qkv.device)
-            op = self._get_prefill_op(num_seqs)
+            op = self._get_chunk_op(num_seqs)
             out, new_pool = op(q, k, v, g1, beta, recurrent_state, self.A_log,
                                self.dt_bias, segment_ids, state_indices,
                                has_init)

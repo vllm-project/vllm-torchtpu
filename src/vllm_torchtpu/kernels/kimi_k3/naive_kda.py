@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 
 
-def kda_step(
+def naive_kda_step(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
@@ -71,7 +71,7 @@ def kda_step(
     static_argnames=("lower_bound", "eps"),
     donate_argnames=("recurrent_state", ),
 )
-def naive_ragged_kda(
+def naive_kda(
     mixed_qkv: jax.Array,
     raw_gate: jax.Array,
     beta: jax.Array,
@@ -142,7 +142,7 @@ def naive_ragged_kda(
         token_state = jnp.where(is_first & ~has_initial_state[sequence_id],
                                 jnp.zeros_like(token_state), token_state)
         qkv = qkv_token.reshape(3, num_heads, head_dim)
-        output, next_token_state = kda_step(
+        output, next_token_state = naive_kda_step(
             qkv[0],
             qkv[1],
             qkv[2],

@@ -14,10 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Chunked Kimi Delta Attention (KDA) Pallas TPU kernel -- the prefill path.
-
-**Forward only.** Inference needs no gradients, so tokamax's backward kernel, its
-``op.Op`` wrapper and its custom VJP are not ported.
+"""Chunked Kimi Delta Attention (KDA) Pallas TPU prefill kernel.
 
 KDA is the per-channel-gated variant of the gated delta rule used by Kimi models.
 It differs from the Qwen-style GDN kernel in ``kernels/gdn/``: the decay ``g`` is
@@ -25,67 +22,38 @@ per channel (shape ``[H, B, T, K]``) rather than per head.
 
 Layout note -- the kernel is **head-major** (``[H, B, T, K]``), whereas vLLM's
 model code and its naive reference are batch-major (``[B, T, H, K]``). Callers
-must transpose; ``kda_forward`` does not, to keep it a faithful passthrough.
+must transpose; ``chunk_kda`` does not.
 
 Usage::
 
-    from vllm_torchtpu.kernels.kimi_k3 import kda_forward
+    from vllm_torchtpu.kernels.kimi_k3 import chunk_kda
 
-    o, final_state = kda_forward(q, k, v, g, beta, scale=..., chunk_size=64)
+    o, final_state = chunk_kda(q, k, v, g, beta, scale=..., chunk_size=64)
 
-The single-token recurrent path used for decode is a separate kernel, in
-``decode_kda.py``; see its docstring for why the two are not one kernel, and
-``README.md`` for the chunked-vs-recurrent trade-off.
+The single-token recurrent decode path is implemented in ``decode_kda.py``.
 
 Provenance
 ----------
-Derived from **tokamax**'s experimental KDA op
-(``tokamax/_src/ops/experimental/kda/``, branch ``antgroup/kda-pallas-kernel``),
-Apache-2.0, hence the DeepMind and Ant Group notices above. It has since been
-edited substantially and is no longer a mechanical copy: the backward pass,
-context-parallel support, the chunked gated-delta-rule implementation (which
-duplicated ``kernels/gdn/v3``), the unfused intra-chunk variants and the float32
-fallback were all removed, so the kernel is scoped to what Kimi-K3 needs --
-bfloat16, varlen ``segment_ids``, ``chunk_size=64``. Annotations were converted
-from ``jaxtyping`` to this repo's ``jax.Array`` + shape-comment convention.
-
-Structure
----------
-Migrated from the former ``kernels/kda/`` package, which split this across six
-modules. The sections below are those modules, in dependency order and otherwise
-unchanged:
-
-1. layout, varlen and alignment helpers   (was ``utils.py``)
-2. shared data contracts                  (was ``pallas_tpu_types.py``)
-3. tiling heuristics                      (was ``common.py``)
-4. the forward kernels                    (was ``pallas_tpu_fwd.py``)
-5. input canonicalization                 (was ``preprocess.py``)
-6. the public entry point                 (was the package ``__init__.py``)
-
-See ``tests/kernels/test_kda.py`` for correctness against vLLM's naive recurrent
-reference, and ``docs/ops/kda/chunk_kda_fwd_design_doc.md`` in the tokamax
-checkout for the algorithm.
+Derived from tokamax's Apache-2.0 KDA op. This inference-only port supports the
+Kimi-K3 configuration: bfloat16 inputs, variable-length ``segment_ids``, and a
+chunk size of 64.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import math
 import os
-from typing import Any, TypeAlias
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-__all__ = ["chunk_kda_fwd_custom", "kda_forward"]
+__all__ = ["chunk_kda"]
 
 
-# ---------------------------------------------------------------------------
-# 1. Layout, varlen and alignment helpers (was utils.py)
-# ---------------------------------------------------------------------------
 def exp2(x):
     """Base-2 exponential, matching Triton's tl.exp2."""
     return jnp.exp2(x.astype(jnp.float32))
@@ -100,35 +68,8 @@ def cdiv(x, y: int):
     return (x + y - 1) // y
 
 
-def l2norm_fwd(x: jax.Array, eps: float = 1e-6):
-    x_f = x.astype(jnp.float32)
-    rstd = jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=-1) + eps)
-    return (x_f * rstd[..., None]).astype(x.dtype), rstd.astype(jnp.float32)
-
-
-def segment_ids_to_cu_seqlens(
-    segment_ids: jax.Array | None,
-    *,
-    initial_state: jax.Array | None,
-    N_max: int | None,
-) -> tuple[jax.Array | None, int | None]:
-    if segment_ids is None:
-        return None, N_max
-    if N_max is None:
-        if initial_state is None:
-            raise ValueError(
-                "`N_max` is required when `segment_ids` is provided without "
-                "`initial_state`.")
-        N_max = initial_state.shape[1]
-    return segment_ids_to_seqlens(segment_ids, max_segs=N_max), N_max
-
-
 def align_up(x, align: int):
     return cdiv(x, align) * align
-
-
-def prepare_lens(cu_seqlens: jax.Array) -> jax.Array:
-    return cu_seqlens[1:] - cu_seqlens[:-1]
 
 
 def _align_seqs(
@@ -288,50 +229,6 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
     return o[:, :, gather_idx]
 
 
-def align_segment_ids(
-    segment_ids: jax.Array,
-    N_max: int,
-    chunk_size: int,
-) -> jax.Array:
-    """Align 1D segment IDs to chunk boundaries, matching `_align_seqs`."""
-    if segment_ids.ndim != 1:
-        raise ValueError(f"`segment_ids` must be 1D, got {segment_ids.shape}.")
-    T = segment_ids.shape[0]
-
-    is_boundary = jnp.concatenate([
-        jnp.ones(1, dtype=jnp.bool_),
-        segment_ids[1:] != segment_ids[:-1],
-    ])
-    seg_idx = jnp.cumsum(is_boundary.astype(jnp.int32)) - 1
-    positions = jnp.arange(T, dtype=jnp.int32)
-
-    seg_starts = jnp.full(N_max, T, dtype=jnp.int32).at[seg_idx].min(positions)
-    seg_ends = jnp.zeros(N_max, dtype=jnp.int32).at[seg_idx].max(positions + 1)
-    seg_lens = jnp.maximum(seg_ends - seg_starts, 0)
-    seg_labels = segment_ids[jnp.minimum(seg_starts, T - 1)]
-
-    is_real = (seg_labels > 0) & (seg_lens > 0)
-    aligned_lens = jnp.where(is_real, align_up(seg_lens, chunk_size), 0)
-    aligned_starts = jnp.concatenate([
-        jnp.zeros(1, dtype=jnp.int32),
-        jnp.cumsum(aligned_lens)[:-1],
-    ])
-
-    T_aligned = (
-        (T + N_max *
-         (chunk_size - 1) + chunk_size - 1) // chunk_size) * chunk_size
-    out = jnp.zeros((T_aligned, ), dtype=jnp.int32)
-    apos = jnp.arange(T_aligned, dtype=jnp.int32)
-
-    def body(i, ids):
-        start = aligned_starts[i]
-        end = start + aligned_lens[i]
-        mask = is_real[i] & (apos >= start) & (apos < end)
-        return jnp.where(mask, seg_labels[i], ids)
-
-    return jax.lax.fori_loop(0, N_max, body, out)
-
-
 def segment_ids_to_seqlens(
     segment_ids: jax.Array,
     max_segs: int,
@@ -386,7 +283,7 @@ def prepare_chunk_indices(
             for b in range(cu_seqlens.shape[0])
         ]
         return jnp.stack(rows, axis=0)
-    lens = prepare_lens(cu_seqlens)
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
     n_chunks = cdiv(lens, chunk_size)
     num_seqs = len(lens)
     if max_T is None:
@@ -410,73 +307,8 @@ def prepare_chunk_indices(
     return jnp.stack([seq_ids, block_ids], axis=1)
 
 
-# TPU hardware parameters come from Pallas rather than a hand-maintained table.
-# The port shipped a ~100-line `TpuConfig` with per-generation presets and its own
-# device-kind sniffing, but only three values were ever read, and all three are
-# available from `pltpu.get_tpu_info()` -- which is what the rest of this repo
-# already uses (see kernels/gdn/v3/config.py).
 _VMEM_FRACTION = 0.9
 
-
-def vmem_limit_bytes() -> int:
-    """VMEM budget for a kernel, as a fraction of the core's capacity."""
-    return int(_VMEM_FRACTION * pltpu.get_tpu_info().vmem_capacity_bytes)
-
-
-def block_align_minor() -> int:
-    """Second-minor (sublane) block alignment."""
-    return pltpu.get_tpu_info().num_sublanes
-
-
-def block_align_major() -> int:
-    """Minor (lane) block alignment."""
-    return pltpu.get_tpu_info().num_lanes
-
-
-# ---------------------------------------------------------------------------
-# 2. Shared data contracts (was pallas_tpu_types.py)
-# ---------------------------------------------------------------------------
-CpMetadata: TypeAlias = tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-] | None
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, slots=True)
-class KdaResiduals:
-    """Prepared forward values consumed by the custom backward."""
-
-    q: jax.Array  # [H, B, T_ALIGNED, K]
-    k: jax.Array  # [H, B, T_ALIGNED, K]
-    v: jax.Array  # [H, B, T_ALIGNED, V]
-    beta: jax.Array  # [H, B, T_ALIGNED]
-    g_cumsum: jax.Array | None  # [H, B, T_ALIGNED, K]
-    aqk: jax.Array  # [H, B, T_ALIGNED, BT]
-    akk: jax.Array  # [H, B, T_ALIGNED, BT]
-    initial_state: (
-        jax.Array | None  # [B, H, K, V] or [B, N, H, K, V]
-    )
-    g_org: jax.Array | None  # [H, B, T_ALIGNED, K]
-    a_log: jax.Array | None  # [H]
-    dt_bias: jax.Array | None  # [H*K]
-    h: jax.Array | None  # [H, B, NT, K, V]
-    g_dtype_marker: jax.Array  # scalar
-    q_rstd: jax.Array | None  # [H, B, T_ALIGNED]
-    k_rstd: jax.Array | None  # [H, B, T_ALIGNED]
-    cu_seqlens: jax.Array | None  # [B, N_CU] or [N_CU]
-    aligned_cu_seqlens: jax.Array | None  # [B, N_CU] or [N_CU]
-    chunk_indices: jax.Array | None  # [B, NT, 2] or [NT, 2]
-    aligned_segment_ids: jax.Array | None  # [B, T_ALIGNED]
-    segment_ids: jax.Array | None  # [B, T_ORIG]
-    cp_metadata: CpMetadata
-
-
-# ---------------------------------------------------------------------------
-# 3. Tiling heuristics (was common.py)
-# ---------------------------------------------------------------------------
 RCP_LN2 = 1.0 / math.log(2)
 
 # =============================================================================
@@ -490,75 +322,21 @@ def estimate_mini_batch(
     *,
     max_mb: int = 16,
     vmem_budget: int | None = None,
-    align_minor: int | None = None,
 ) -> int:
-    """Estimate the optimal mini-batch size to maximise VMEM utilisation.
-
-  This mirrors the backward auto-tune pattern used throughout the KDA kernels:
-  compute the largest MB that fits within the hardware VMEM budget, cap it,
-  and then adjust downward so that ``total`` is evenly divisible by ``MB``.
-
-  Args:
-      per_tile_bytes: Estimated VMEM footprint (bytes) for **one** tile/head.
-      total: Number of tiles (or heads) to partition.
-      max_mb: Upper bound on MB (default 16).
-      vmem_budget: VMEM budget in bytes. ``None`` (default) queries
-          ``vmem_limit_bytes()`` at call time.
-      align_minor: TPU block_align_minor constraint. ``None`` (default)
-          queries ``block_align_minor()``.  When provided,
-          the function prefers MB values that satisfy this alignment.
-
-  Returns:
-      Mini-batch size ``MB`` such that ``total % MB == 0`` (best-effort).
-  """
+    """Choose the largest mini-batch that fits VMEM and divides ``total``."""
     if vmem_budget is None:
-        vmem_budget = vmem_limit_bytes()
-    if align_minor is None:
-        align_minor = block_align_minor()
+        vmem_budget = int(_VMEM_FRACTION *
+                          pltpu.get_tpu_info().vmem_capacity_bytes)
 
     per_tile_bytes = max(1, per_tile_bytes)
     MB = max(1, vmem_budget // per_tile_bytes)
     MB = max(1, min(MB, total, max_mb))
 
-    # Try to find an MB that divides total evenly.
     while total % MB != 0 and MB > 1:
         MB -= 1
 
     return MB
 
-
-# =============================================================================
-# Chunk-local cumsum helpers
-# =============================================================================
-
-# =============================================================================
-# Fixed-length: Hillis-Steele scan (optimal for head_first=False)
-# =============================================================================
-
-# =============================================================================
-# Public API
-# =============================================================================
-
-# =============================================================================
-# Delta-rule hidden-state kernels
-# =============================================================================
-
-# ---------------------------------------------------------------------------
-# Pallas TPU kernels for delta-rule inter-chunk state propagation
-# ---------------------------------------------------------------------------
-
-# ── Varlen Pallas kernel ────────────────────────────────────────────────────
-
-# ── Non-varlen Pallas kernel ────────────────────────────────────────────────
-
-# ── Public dispatch function ────────────────────────────────────────────────
-
-# ---------------------------------------------------------------------------
-# 4. The forward kernels (was pallas_tpu_fwd.py)
-# ---------------------------------------------------------------------------
-# =============================================================================
-# Exact intra-chunk fallback for float32
-# =============================================================================
 
 # =============================================================================
 # Fused gate cumsum and intra-chunk solve
@@ -575,10 +353,8 @@ def _fused_gate_intra_kernel(
     dt_bias_ref,
     u_out_ref,
     w_out_ref,
-    qg_out_ref,
     kg_out_ref,
     Aqk_out_ref,
-    Akk_inv_out_ref,
     g_cumsum_out_ref,
     *,
     chunk_size: int,
@@ -586,18 +362,14 @@ def _fused_gate_intra_kernel(
     value_dim: int,
     scale: float,
     cumsum_scale: float,
-    fuse_cumsum: bool,
-    disable_recompute: bool,
-    safe_gate: bool,
     use_gate_in_kernel: bool,
     lower_bound: float | None,
     mini_batch: int = 1,
 ):
-    """Fused Pallas kernel: gate activation + cumsum + BC=16 Aqk/L + Neumann inversion.
+    """Fused Pallas kernel: gate activation + cumsum + intra-chunk solve.
 
-  When fuse_cumsum=True, g_ref contains raw gate values (not cumsum'd).
-  The kernel applies gate activation (if use_gate_in_kernel) and chunk-local
-  prefix sum via tril matmul before proceeding to the Aqk/L construction.
+  The kernel applies gate activation (if requested) and a chunk-local prefix
+  sum before constructing Aqk/L.
 
   For bfloat16 inputs, uses Neumann series inversion.
   For float32 inputs, falls back to exact forward substitution.
@@ -639,17 +411,13 @@ def _fused_gate_intra_kernel(
             g_f32 = lower_bound * jax.nn.sigmoid(
                 jnp.exp(A_val)[:, None, None] * g_f32)
 
-    if fuse_cumsum:
-        tril = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-        # tril[BT,BT] @ g_f32[MB,BT,K] → [MB,BT,K]: contract on BT, batch on MB
-        g_cumsum = jax.lax.dot_general(
-            tril,
-            g_f32,
-            (((1, ), (1, )), ((), ())),
-            preferred_element_type=jnp.float32,
-        ).transpose(1, 0, 2) * cumsum_scale  # [BT,MB,K] → [MB,BT,K]
-    else:
-        g_cumsum = g_f32
+    tril = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
+    g_cumsum = jax.lax.dot_general(
+        tril,
+        g_f32,
+        (((1, ), (1, )), ((), ())),
+        preferred_element_type=jnp.float32,
+    ).transpose(1, 0, 2) * cumsum_scale
 
     q_f32 = q.astype(jnp.float32)
     k_f32 = k.astype(jnp.float32)
@@ -670,10 +438,6 @@ def _fused_gate_intra_kernel(
     # inside one sub-block one factor becomes 0 and the other inf, giving
     # 0 * inf = NaN. Measured on real layer-0 weights: 26 of 32 heads NaN,
     # which reached the sampler as non-finite logits and produced empty output.
-    # `safe_gate` only moved the reference row from 0 to BC//2, halving the
-    # worst-case exponent -- nowhere near enough, and no chunk size helps
-    # because the span is already per-token.
-    #
     # So the diagonal block is computed *pairwise* instead. For causal pairs
     # r >= t the exponent g_r - g_t is non-positive (g_cumsum is monotonically
     # decreasing, since the activated gate is <= 0), so exp2 cannot overflow and
@@ -684,15 +448,11 @@ def _fused_gate_intra_kernel(
     #
     # This costs the single fused matmul on the diagonal blocks (NC of them, each
     # BC x BC x K) in exchange for being numerically valid at any gate
-    # magnitude. `safe_gate` is consequently unused and kept only for API
-    # compatibility.
-    #
     # PRECONDITION: the activated gate is <= 0, i.e. `lower_bound` (when given)
-    # is negative. `kda_forward` validates this.
+    # is negative. `chunk_kda` validates this.
     #
     # Use broadcasted_iota for 2D indices to avoid Mosaic-unsupported i1
     # shape casts (e.g. (BT,) -> (BT, 1) on bool tensors).
-    del safe_gate  # no longer selects a reference row; see above
     row_iota_bt_k = jax.lax.broadcasted_iota(jnp.int32, (BT, K), dimension=0)
     row_iota_bc = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=0)
     col_iota_bc = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=1)
@@ -825,9 +585,7 @@ def _fused_gate_intra_kernel(
                               axis=-1)  # [MB, BT, V+K]
 
         if NC_inv == 1:
-            # P already equals (I + L)^{-1} (no off-diagonal blocks).
             result = _dot_batch(P, rhs)
-            A_inv = P
         else:
             # Fuse `P @ [F | rhs]` to share a matmul; split out G and P_rhs.
             F_and_rhs = jnp.concatenate([F, rhs], axis=-1)  # [MB, BT, BT+V+K]
@@ -837,9 +595,7 @@ def _fused_gate_intra_kernel(
 
             # Compute inv_I_G = (I + G)^{-1} = sum_{k=0}^{NC_inv-1} (-G)^k via
             # Horner doubling. Build the matrix first (small (MB,BT,BT) matmuls),
-            # then apply once to P_rhs and once to P (small + medium matmuls).
-            # For NC_inv=8: 4 × (MB,BT,BT,BT) mm + 1 × (MB,BT,BT,V+K) mm + 1 × (MB,BT,BT,BT) mm
-            # vs sequential: 6 × (MB,BT,BT,BT) mm + 1 × (MB,BT,BT,V+K+BT) mm.
+            # then apply once to P_rhs.
             H_mat = -G
             inv_I_G = I_bt[None] + H_mat  # (I + H)
             Hk = H_mat
@@ -850,7 +606,6 @@ def _fused_gate_intra_kernel(
                                                Hk)  # inv_I_G @ (I + Hk)
 
             result = _dot_batch(inv_I_G, P_rhs)  # [MB, BT, V+K]
-            A_inv = _dot_batch(inv_I_G, P)  # [MB, BT, BT] = (I+L)^{-1}
     else:
         # The float32 branch used exact forward substitution instead of the Neumann
         # series. Removed with the rest of the fp32 path: Kimi-K3 runs bfloat16, so
@@ -862,30 +617,15 @@ def _fused_gate_intra_kernel(
     u = result[:, :, :V]  # [MB, BT, V]
     w = result[:, :, V:V + K]  # [MB, BT, K]
 
-    # --- kg, qg ---
+    # --- kg ---
     g_last = g_cumsum[:, BT - 1:BT, :]  # [MB, 1, K]
     kg = k_f32 * exp2(g_last - g_cumsum)
-    qg = q_f32 * exp2(g_cumsum) if disable_recompute else jnp.zeros_like(q_f32)
 
-    # --- Store all MB heads ---
     u_out_ref[:, 0, 0] = u.astype(u_out_ref.dtype)
     w_out_ref[:, 0, 0] = w.astype(w_out_ref.dtype)
-    qg_out_ref[:, 0, 0] = qg.astype(qg_out_ref.dtype)
     kg_out_ref[:, 0, 0] = kg.astype(kg_out_ref.dtype)
     Aqk_out_ref[:, 0, 0] = Aqk.astype(Aqk_out_ref.dtype)
-    Akk_inv_out_ref[:, 0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
     g_cumsum_out_ref[:, 0, 0] = g_cumsum
-
-
-def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
-    """Auto-compute mini-batch size for intra fused kernel.
-
-  Each head needs VMEM for intermediates: BT*K + BT*V + 2*BT*BT (Aqk, L).
-  Uses hardware VMEM budget via ``estimate_mini_batch``.
-  """
-    elem_size = dtype.itemsize if dtype is not None else 4
-    per_head = (BT * K + BT * V + 2 * BT * BT) * elem_size
-    return estimate_mini_batch(per_head, H, max_mb=16)
 
 
 @functools.partial(
@@ -893,8 +633,6 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
     static_argnames=[
         "chunk_size",
         "scale",
-        "safe_gate",
-        "disable_recompute",
         "cumsum_scale",
         "use_gate_in_kernel",
         "lower_bound",
@@ -909,8 +647,6 @@ def pallas_kda_fwd_intra_fused(
     beta: jax.Array,  # [H, B, T]
     scale: float,
     chunk_size: int = 64,
-    safe_gate: bool = True,
-    disable_recompute: bool = False,
     cumsum_scale: float = RCP_LN2,
     A_log: jax.Array | None = None,  # [H]
     dt_bias: jax.Array | None = None,  # [H*K]
@@ -920,17 +656,11 @@ def pallas_kda_fwd_intra_fused(
 ) -> tuple[
         jax.Array,  # [H, B, T, K]
         jax.Array,  # [H, B, T, V]
-        jax.Array | None,  # [H, B, T, K]
         jax.Array,  # [H, B, T, K]
-        jax.Array,  # [H, B, T, BT]
         jax.Array,  # [H, B, T, BT]
         jax.Array,  # [H, B, T, K]
 ]:
-    """Fuses gate cumsum with the fixed-length intra-chunk solve.
-
-  Heads are mini-batched to amortize DMA. `qg` is retained only when
-  `disable_recompute` is true.
-  """
+    """Fuse gate cumsum with the fixed-length intra-chunk solve."""
     H, B, T, K = q.shape
     V = v.shape[-1]
     BT = chunk_size
@@ -941,7 +671,8 @@ def pallas_kda_fwd_intra_fused(
         assert A_log is not None, "A_log required when use_gate_in_kernel=True"
 
     if mini_batch is None:
-        MB = _compute_intra_fused_mini_batch(H, BT, K, V, dtype=q.dtype)
+        per_head = (BT * K + BT * V + 2 * BT * BT) * q.dtype.itemsize
+        MB = estimate_mini_batch(per_head, H, max_mb=16)
     else:
         MB = mini_batch
         assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"
@@ -978,7 +709,7 @@ def pallas_kda_fwd_intra_fused(
             block_shape=(MB, 1, 1, 1, last_dim),
         )
 
-    (u_r, w_r, qg_r, kg_r, Aqk_r, Akk_inv_r, g_cumsum_r) = pl.pallas_call(
+    u_r, w_r, kg_r, Aqk_r, g_cumsum_r = pl.pallas_call(
         functools.partial(
             _fused_gate_intra_kernel,
             chunk_size=BT,
@@ -986,9 +717,6 @@ def pallas_kda_fwd_intra_fused(
             value_dim=V,
             scale=scale,
             cumsum_scale=cumsum_scale,
-            fuse_cumsum=True,
-            disable_recompute=disable_recompute,
-            safe_gate=safe_gate,
             use_gate_in_kernel=use_gate_in_kernel,
             lower_bound=lower_bound,
             mini_batch=MB,
@@ -998,8 +726,6 @@ def pallas_kda_fwd_intra_fused(
             jax.ShapeDtypeStruct((H, B, NC, BT, V), k.dtype),
             jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
             jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
-            jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
-            jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
             jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
             jax.ShapeDtypeStruct((H, B, NC, BT, K), jnp.float32),
         ],
@@ -1016,8 +742,6 @@ def pallas_kda_fwd_intra_fused(
             _make_spec(V),
             _make_spec(K),
             _make_spec(K),
-            _make_spec(K),
-            _make_spec(BT),
             _make_spec(BT),
             _make_spec(K),
         ],
@@ -1030,70 +754,10 @@ def pallas_kda_fwd_intra_fused(
     w_out = w_r.reshape(H, B, T, K)
     u_out = u_r.reshape(H, B, T, V)
     kg_out = kg_r.reshape(H, B, T, K)
-    qg_out = (qg_r.reshape(H, B, T, K) if disable_recompute else None)
     Aqk_flat = Aqk_r.reshape(H, B, NC * BT, BT)
-    Akk_flat = Akk_inv_r.reshape(H, B, NC * BT, BT)
     g_cumsum_out = g_cumsum_r.reshape(H, B, T, K)
 
-    return w_out, u_out, qg_out, kg_out, Aqk_flat, Akk_flat, g_cumsum_out
-
-
-def kda_fwd_intra_fused(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array,
-    beta: jax.Array,
-    scale: float,
-    cu_seqlens: jax.Array | None = None,
-    chunk_size: int = 64,
-    chunk_indices: jax.Array | None = None,
-    safe_gate: bool = True,
-    disable_recompute: bool = False,
-    cumsum_scale: float = RCP_LN2,
-    A_log: jax.Array | None = None,
-    dt_bias: jax.Array | None = None,
-    use_gate_in_kernel: bool = False,
-    lower_bound: float | None = None,
-):
-    """Fused gate cumsum + intra-chunk solve entry.
-
-  Args:
-      g: [H, B, T, K] -- raw gate input (NOT cumsum'd).
-      Other args: q/k/v/beta plus the gate activation params.
-
-  Returns:
-      7-tuple: (w, u, qg, kg, Aqk, Akk, g_cumsum).
-  """
-    assert chunk_size == 64, f"Expected chunk_size=64, got {chunk_size}"
-    if q.dtype == jnp.float32:
-        # Upstream had an fp32 fallback here (separate gate cumsum + an unfused
-        # intra solve without BC=16 tiling) to dodge BC=16 rounding in near-zero
-        # gate scenarios. Kimi-K3 runs bfloat16, so that path was never exercised in
-        # production and is removed; fp32 now fails loudly rather than silently
-        # taking untested code.
-        raise NotImplementedError(
-            "float32 inputs are not supported; this kernel is scoped to Kimi-K3's "
-            "bfloat16 path. Cast q/k/v/g to bfloat16.")
-
-    # The caller has already BT-aligned varlen inputs, so the same contiguous
-    # fused kernel handles both fixed-length and variable-length batches.
-    return pallas_kda_fwd_intra_fused(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        chunk_size=chunk_size,
-        safe_gate=safe_gate,
-        disable_recompute=disable_recompute,
-        cumsum_scale=cumsum_scale,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        use_gate_in_kernel=use_gate_in_kernel,
-        lower_bound=lower_bound,
-    )
+    return w_out, u_out, kg_out, Aqk_flat, g_cumsum_out
 
 
 # =============================================================================
@@ -1117,8 +781,6 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     # Outputs
     o_ref,  # [MB, 1, BT, V_ALIGNED]
     ht_ref,  # [1, MB, K_PADSIZE, V_ALIGNED] or None
-    h_out_ref,  # [MB, 1, 1, K_PADSIZE, V_ALIGNED] or None  -- per-chunk pre-update h
-    v_new_out_ref,  # [MB, 1, BT, V_ALIGNED] or None         -- per-token v_new
     # Scratch
     scratch_ref,  # [MB, K_PADSIZE, V_ALIGNED]
     *,
@@ -1126,8 +788,6 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     scale,
     USE_INITIAL_STATE,
     STORE_FINAL_STATE,
-    STORE_H,
-    STORE_V_NEW,
     MB,
     OUTPUT_PRECISION,
 ):
@@ -1164,11 +824,6 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     # h: pre-update state for all MB heads in this tile.
     b_h = scratch_ref[:]  # [MB, K, V]
 
-    # Spill pre-update h (saved residual for bwd; tagged with
-    # checkpoint_name("kda_residuals") at the custom_vjp boundary).
-    if STORE_H:
-        h_out_ref[:, 0, 0] = b_h.astype(h_out_ref.dtype)  # [MB, K, V]
-
     b_w = w_ref[:, 0, :]  # [MB, BT, K]
     b_u = u_ref[:, 0, :]  # [MB, BT, V]
 
@@ -1181,10 +836,6 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )  # [MB, BT, V]
-
-    # Spill v_new (used by bwd Stage 0 when disable_recompute=True).
-    if STORE_V_NEW:
-        v_new_out_ref[:, 0, :] = b_v_new.astype(v_new_out_ref.dtype)
 
     # Stage 4 inter-chunk output: scale * (q * exp2(g - g_ref)) @ (h * exp2(g_ref))
     # Reference-point stabilization mirrors the production varlen kernel's
@@ -1253,9 +904,6 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
         "output_final_state",
         "scale",
         "chunk_size",
-        "store_h",
-        "store_v_new",
-        "store_intermediates",
         "mini_batch",
     ],
 )
@@ -1272,26 +920,12 @@ def chunk_kda_fwd_h_o_varlen(
     output_final_state: bool = False,
     scale: float = 1.0,
     chunk_size: int = 64,
-    store_h: bool = False,
-    store_v_new: bool = False,
-    store_intermediates: bool | None = None,
     mini_batch: int | None = None,
 ) -> tuple[
         jax.Array,  # [H, B, T, V]
         jax.Array | None,  # [B, N, H, K, V]
-        jax.Array | None,  # [H, B, NT, K, V]
-        jax.Array | None,  # [H, B, T, V]
 ]:
-    """Fuses varlen state propagation with output projection.
-
-  The recurrent state remains in VMEM. `store_h` and `store_v_new` spill
-  only the intermediates needed by backward; `store_intermediates` is the
-  legacy alias that enables both.
-  """
-    # Back-compat shim: old single-flag callers map to both stores.
-    if store_intermediates is not None:
-        store_h = store_h or store_intermediates
-        store_v_new = store_v_new or store_intermediates
+    """Fuse variable-length state propagation with output projection."""
     H, B, T, K = q.shape
     V = u.shape[-1]
     BT = chunk_size
@@ -1310,7 +944,7 @@ def chunk_kda_fwd_h_o_varlen(
             f"initial_state has N={initial_state.shape[1]}, expected {N}")
     assert K <= 256, "current kernel does not support K > 256."
 
-    align_major = block_align_major()
+    align_major = pltpu.get_tpu_info().num_lanes
     K_PADSIZE = int(align_up(K, align_major))
     V_ALIGNED = int(align_up(V, align_major))
 
@@ -1397,29 +1031,10 @@ def chunk_kda_fwd_h_o_varlen(
         index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref:
         (b, chunk_to_seq_ref[b, c], h, 0, 0),
     ) if output_final_state else None)
-    # Per-chunk h spill (pre-update, used by bwd save-h fast path). Layout
-    # [H, B, NT, K_PADSIZE, V_ALIGNED]
-    h_out_spec = (pl.BlockSpec(
-        [MB, 1, 1, K_PADSIZE, V_ALIGNED],
-        index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref:
-        (h, b, c, 0, 0),
-    ) if store_h else None)
-    # Per-token v_new spill, [H, B, T_alloc, V_ALIGNED].
-    v_new_out_spec = (pl.BlockSpec([MB, 1, BT, V_ALIGNED],
-                                   index_map=_t_index_map)
-                      if store_v_new else None)
-
     o_shape = jax.ShapeDtypeStruct([H, B, T_alloc, V_ALIGNED], jnp.float32)
     ht_shape = (jax.ShapeDtypeStruct([B, N, H, K_PADSIZE, V_ALIGNED],
                                      jnp.float32)
                 if output_final_state else None)
-    # h_per_chunk dtype mirrors u (as the unfused reference did
-    # which produces h in u.dtype, typically bf16/fp32).
-    h_out_shape = (jax.ShapeDtypeStruct([H, B, NT, K_PADSIZE, V_ALIGNED],
-                                        u.dtype) if store_h else None)
-    v_new_out_shape = (jax.ShapeDtypeStruct([H, B, T_alloc, V_ALIGNED],
-                                            u.dtype) if store_v_new else None)
-
     scratch = pltpu.VMEM((MB, K_PADSIZE, V_ALIGNED), jnp.float32)
     grid = (H // MB, B, NT)
     interpret = get_interpret()
@@ -1430,15 +1045,13 @@ def chunk_kda_fwd_h_o_varlen(
     _output_prec = (jax.lax.Precision.DEFAULT
                     if q.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST)
 
-    o_out, ht_out, h_out, v_new_out = pl.pallas_call(
+    o_out, ht_out = pl.pallas_call(
         functools.partial(
             _chunk_kda_fwd_h_o_varlen_kernel,
             BT=BT,
             scale=scale,
             USE_INITIAL_STATE=(h0 is not None),
             STORE_FINAL_STATE=output_final_state,
-            STORE_H=store_h,
-            STORE_V_NEW=store_v_new,
             MB=MB,
             OUTPUT_PRECISION=_output_prec,
         ),
@@ -1454,14 +1067,14 @@ def chunk_kda_fwd_h_o_varlen(
                 bspec_a,  # A
                 bspec_h0,  # h0
             ],
-            out_specs=[o_spec, ht_spec, h_out_spec, v_new_out_spec],
+            out_specs=[o_spec, ht_spec],
             scratch_shapes=[scratch],
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
             disable_bounds_checks=True,
         ),
-        out_shape=[o_shape, ht_shape, h_out_shape, v_new_out_shape],
+        out_shape=[o_shape, ht_shape],
         interpret=interpret,
     )(cu_seqlens.astype(jnp.int32), chunk_to_seq, w_t, u_t, kg_t, gk_t, q_t,
       A_t, h0)
@@ -1493,64 +1106,36 @@ def chunk_kda_fwd_h_o_varlen(
     else:
         ht_out = None
 
-    # Post-process spilled intermediates (independently controlled).
-    if store_h:
-        # h_out: [1, NT, H, K_PADSIZE, V_ALIGNED] -> trim K/V padding back.
-        if V_ALIGNED > V:
-            h_out = h_out[..., :V]
-        if K_PADSIZE > K:
-            h_out = h_out[..., :K, :]
-
-    else:
-        h_out = None
-    if store_v_new:
-        if V_ALIGNED > V:
-            v_new_out = v_new_out[..., :V]
-    else:
-        v_new_out = None
-
-    return o_out, ht_out, h_out, v_new_out
+    return o_out, ht_out
 
 
-def chunk_kda_fwd_custom(
-    q: jax.Array,  # [H, B, T_ALIGNED, K]
-    k: jax.Array,  # [H, B, T_ALIGNED, K]
-    v: jax.Array,  # [H, B, T_ALIGNED, V]
-    g: jax.Array,  # [H, B, T_ALIGNED, K]
-    beta: jax.Array,  # [H, B, T_ALIGNED]
-    A_log: jax.Array | None = None,  # [H]
-    dt_bias: jax.Array | None = None,  # [H*K]
-    scale: float | None = None,
-    initial_state: (
-        jax.Array | None  # [B, H, K, V] or [B, N, H, K, V]
-    ) = None,
-    output_final_state: bool = False,
-    use_gate_in_kernel: bool = False,
-    segment_ids: jax.Array | None = None,  # [B, T]
-    safe_gate: bool = True,
-    lower_bound: float | None = None,
-    disable_recompute: bool = True,
-    chunk_size: int = 64,
-    return_residuals: bool = False,
-    cu_seqlens: jax.Array | None = None,  # [B, N_CU]
-    aligned_cu_seqlens: jax.Array | None = None,  # [B, N_CU]
-    chunk_indices: jax.Array | None = None,  # [B, NT, 2]
-    aligned_segment_ids: jax.Array | None = None,  # [B, T_ALIGNED]
-    q_rstd: jax.Array | None = None,  # [H, B, T_ALIGNED]
-    k_rstd: jax.Array | None = None,  # [H, B, T_ALIGNED]
-    cp_metadata: (tuple[jax.Array, jax.Array, jax.Array, jax.Array]
-                  | None) = None,
+def _run_chunk_kda(
+        q: jax.Array,  # [H, B, T_ALIGNED, K]
+        k: jax.Array,  # [H, B, T_ALIGNED, K]
+        v: jax.Array,  # [H, B, T_ALIGNED, V]
+        g: jax.Array,  # [H, B, T_ALIGNED, K]
+        beta: jax.Array,  # [H, B, T_ALIGNED]
+        A_log: jax.Array | None = None,  # [H]
+        dt_bias: jax.Array | None = None,  # [H*K]
+        scale: float | None = None,
+        initial_state: (
+            jax.Array | None  # [B, H, K, V] or [B, N, H, K, V]
+        ) = None,
+        output_final_state: bool = False,
+        use_gate_in_kernel: bool = False,
+        segment_ids: jax.Array | None = None,  # [B, T]
+        lower_bound: float | None = None,
+        chunk_size: int = 64,
+        cu_seqlens: jax.Array | None = None,  # [B, N_CU]
+        aligned_cu_seqlens: jax.Array | None = None,  # [B, N_CU]
+        chunk_indices: jax.Array | None = None,  # [B, NT, 2]
 ) -> tuple[
-        tuple[
-            jax.Array,  # [H, B, T, V]
-            jax.Array | None,  # [B, H, K, V] or [B, N, H, K, V]
-        ],
-        KdaResiduals | None,
+        jax.Array,  # [H, B, T, V]
+        jax.Array | None,  # [B, H, K, V] or [B, N, H, K, V]
 ]:
-    """Runs forward on inputs canonicalized by the Tokamax TPU adapter."""
+    """Run the kernel on canonicalized inputs."""
     original_cu_seqlens = cu_seqlens
     cu_seqlens = aligned_cu_seqlens
-    save_for_backward = return_residuals and disable_recompute
 
     H, B, T, K = q.shape
     BT = chunk_size
@@ -1559,18 +1144,14 @@ def chunk_kda_fwd_custom(
     # ------------------------------------------------------------------
     # Step 1 + 2 (Fused): Gate cumsum + Intra-chunk solve
     # ------------------------------------------------------------------
-    w, u, qg, kg, Aqk, Akk, g_cumsum = kda_fwd_intra_fused(
+    w, u, kg, Aqk, g_cumsum = pallas_kda_fwd_intra_fused(
         q=q,
         k=k,
         v=v,
         g=g,
         beta=beta,
         scale=scale,
-        cu_seqlens=cu_seqlens,
         chunk_size=BT,
-        chunk_indices=chunk_indices,
-        safe_gate=safe_gate,
-        disable_recompute=save_for_backward,
         cumsum_scale=RCP_LN2,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -1613,7 +1194,7 @@ def chunk_kda_fwd_custom(
         stage34_initial_state = (initial_state[:, None, ...]
                                  if initial_state is not None else None)
 
-    o, final_state, h, v_new = chunk_kda_fwd_h_o_varlen(
+    o, final_state = chunk_kda_fwd_h_o_varlen(
         w=w,
         u=u,
         kg=kg,
@@ -1626,22 +1207,9 @@ def chunk_kda_fwd_custom(
         output_final_state=output_final_state,
         scale=scale,
         chunk_size=BT,
-        store_h=disable_recompute,
-        store_v_new=False,
     )
     if not _is_varlen and final_state is not None:
         final_state = final_state[:, 0]
-
-    # ------------------------------------------------------------------
-    # Drop intermediates that backward will recompute or never consume.
-    # ------------------------------------------------------------------
-    if not save_for_backward:
-        # `h` stays bound because the residuals below still read it; the rest are
-        # dropped outright so the buffers can be freed.
-        del w, u, qg, kg, v_new
-        h = None
-        if use_gate_in_kernel:
-            g_cumsum = None
 
     output = o
     cu_seqlens = original_cu_seqlens
@@ -1656,45 +1224,13 @@ def chunk_kda_fwd_custom(
             segment_ids.shape[1],
         )
 
-    output = (output.astype(q.dtype), final_state)
-    if not return_residuals:
-        return output, None
-
-    g_org = g if use_gate_in_kernel else None
-
-    # Keep the prepared inputs: the Op-level VJP also retains the original
-    # arguments, but these copies may be varlen-aligned and L2-normalized.
-    residuals = KdaResiduals(
-        q=q,
-        k=k,
-        v=v,
-        beta=beta,
-        g_cumsum=g_cumsum,
-        aqk=Aqk,
-        akk=Akk,
-        initial_state=initial_state,
-        g_org=g_org,
-        a_log=A_log,
-        dt_bias=dt_bias,
-        h=h,
-        g_dtype_marker=jnp.zeros((), dtype=g.dtype),
-        q_rstd=q_rstd,
-        k_rstd=k_rstd,
-        cu_seqlens=cu_seqlens,
-        aligned_cu_seqlens=aligned_cu_seqlens,
-        chunk_indices=chunk_indices,
-        aligned_segment_ids=aligned_segment_ids,
-        segment_ids=segment_ids,
-        cp_metadata=cp_metadata,
-    )
-    return output, residuals
+    return output.astype(q.dtype), final_state
 
 
 # ---------------------------------------------------------------------------
-# 5. Input canonicalization (was preprocess.py)
+# Input canonicalization
 # ---------------------------------------------------------------------------
-@dataclasses.dataclass(frozen=True)
-class _PreparedKdaInputs:
+class _PreparedKdaInputs(NamedTuple):
     q: jax.Array
     k: jax.Array
     v: jax.Array
@@ -1704,10 +1240,6 @@ class _PreparedKdaInputs:
     cu_seqlens: jax.Array | None
     aligned_cu_seqlens: jax.Array | None
     chunk_indices: jax.Array | None
-    aligned_segment_ids: jax.Array | None
-    q_rstd: jax.Array | None
-    k_rstd: jax.Array | None
-    cp_metadata: CpMetadata
 
 
 def check_inputs_support(
@@ -1715,16 +1247,13 @@ def check_inputs_support(
     v: jax.Array,
     *,
     initial_state: jax.Array | None,
-    output_final_state: bool,
     segment_ids: jax.Array | None,
     chunk_size: int,
-    N_max: int | None,
 ) -> None:
     """Checks whether the Pallas TPU backend supports the static inputs."""
-    if q.dtype not in (jnp.bfloat16, jnp.float32):
+    if q.dtype != jnp.bfloat16:
         raise NotImplementedError(
-            "`pallas_tpu` currently supports bfloat16 and float32 inputs only."
-        )
+            "The KDA Pallas kernel supports bfloat16 inputs only.")
     heads, batch, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
     if heads < 1 or batch < 1 or seq_len < 1:
@@ -1762,23 +1291,23 @@ def _preprocess_inputs(
     beta: jax.Array,
     *,
     initial_state: jax.Array | None,
-    output_final_state: bool,
     use_qk_l2norm_in_kernel: bool,
     use_gate_in_kernel: bool,
     segment_ids: jax.Array | None,
     chunk_size: int,
     N_max: int | None,
 ) -> _PreparedKdaInputs:
-    """Canonicalizes inputs shared by the forward and backward kernels."""
-    # Context parallelism is not supported (Kimi-K3 does not use it), so the
-    # varlen metadata always comes from segment_ids.
-    cu_seqlens = None
-    if cu_seqlens is None:
-        cu_seqlens, N_max = segment_ids_to_cu_seqlens(
-            segment_ids,
-            initial_state=initial_state,
-            N_max=N_max,
-        )
+    """Canonicalize inputs for the forward kernel."""
+    if segment_ids is None:
+        cu_seqlens = None
+    else:
+        if N_max is None:
+            if initial_state is None:
+                raise ValueError(
+                    "`N_max` is required when `segment_ids` is provided "
+                    "without `initial_state`.")
+            N_max = initial_state.shape[1]
+        cu_seqlens = segment_ids_to_seqlens(segment_ids, max_segs=N_max)
 
     aligned_cu_seqlens = None
     chunk_indices = None
@@ -1846,24 +1375,17 @@ def _preprocess_inputs(
                     "`initial_state` state count must match aligned segment "
                     f"count {state_count}; got {initial_state.shape[1]}.")
 
-    aligned_segment_ids = None
-    if aligned_cu_seqlens is not None and segment_ids is not None:
-        effective_n_max = (N_max if N_max is not None else
-                           aligned_cu_seqlens.shape[-1] - 1)
-        aligned_segment_ids = jnp.stack([
-            align_segment_ids(segment_ids[batch_index], effective_n_max,
-                              chunk_size)
-            for batch_index in range(segment_ids.shape[0])
-        ])
-
     if use_qk_l2norm_in_kernel:
-        q_prepared, q_rstd = l2norm_fwd(q_aligned)
-        k_prepared, k_rstd = l2norm_fwd(k_aligned)
+        q_f32 = q_aligned.astype(jnp.float32)
+        k_f32 = k_aligned.astype(jnp.float32)
+        q_prepared = (q_f32 * jax.lax.rsqrt(
+            jnp.sum(q_f32 * q_f32, axis=-1, keepdims=True) + 1e-6)).astype(
+                q_aligned.dtype)
+        k_prepared = (k_f32 * jax.lax.rsqrt(
+            jnp.sum(k_f32 * k_f32, axis=-1, keepdims=True) + 1e-6)).astype(
+                k_aligned.dtype)
     else:
         q_prepared, k_prepared = q_aligned, k_aligned
-        q_rstd = k_rstd = None
-
-    cp_metadata = None
 
     return _PreparedKdaInputs(
         q=q_prepared,
@@ -1875,17 +1397,10 @@ def _preprocess_inputs(
         cu_seqlens=cu_seqlens,
         aligned_cu_seqlens=aligned_cu_seqlens,
         chunk_indices=chunk_indices,
-        aligned_segment_ids=aligned_segment_ids,
-        q_rstd=q_rstd,
-        k_rstd=k_rstd,
-        cp_metadata=cp_metadata,
     )
 
 
-# ---------------------------------------------------------------------------
-# 6. Public entry point (was the kernels/kda package __init__.py)
-# ---------------------------------------------------------------------------
-def kda_forward(
+def chunk_kda(
     q,
     k,
     v,
@@ -1902,13 +1417,10 @@ def kda_forward(
     safe_gate: bool = True,
     lower_bound: float | None = None,
     chunk_size: int = 64,
-    **kwargs: Any,
+    use_qk_l2norm_in_kernel: bool = False,
+    N_max: int | None = None,
 ):
     """Run the KDA forward kernel and return ``(output, final_state)``.
-
-    Thin wrapper over :func:`chunk_kda_fwd_custom` that drops the residuals
-    (needed only for a backward pass) so callers get the tuple they actually
-    want. Argument meanings are unchanged from tokamax:
 
     Args:
       q, k: ``[H, B, T, K]`` queries and keys.
@@ -1924,32 +1436,18 @@ def kda_forward(
       output_final_state: whether to return the final state (else ``None``).
       use_gate_in_kernel: treat ``g`` as raw gate input.
       segment_ids: ``[B, T]`` 1-indexed varlen segment IDs, 0 for padding.
-      safe_gate: match the kernel's gate validation.
+      safe_gate: deprecated compatibility argument; ignored.
       lower_bound: optional sigmoid-gate lower bound.
       chunk_size: chunk length used by the kernel.
-      **kwargs: forwarded verbatim (varlen metadata such as ``cu_seqlens``,
-        ``chunk_indices`` and ``aligned_segment_ids``).
+      use_qk_l2norm_in_kernel: normalize queries and keys before the kernel.
+      N_max: static maximum sequence count for variable-length inputs.
 
     Returns:
       ``(output, final_state)`` where output is ``[H, B, T, V]`` and
-      ``final_state`` is ``[B, N, H, K, V]`` (segment dim always present, as in
-      tokamax) or ``None`` unless ``output_final_state`` is set.
+      ``final_state`` is ``[B, N, H, K, V]`` or ``None``.
 
-    Note:
-      ``chunk_kda_fwd_custom`` expects inputs already canonicalized by
-      tokamax's TPU adapter (padding to chunk multiples, optional q/k L2 norm,
-      varlen metadata, resolved ``scale``). This function reproduces that
-      adapter: the default-``scale`` resolution from ``base.KimiDeltaAttention``
-      and ``check_inputs_support`` / ``_preprocess_inputs`` from
-      ``PallasTpuKimiDeltaAttention``. Calling the kernel directly with raw
-      arguments fails (e.g. ``scale=None`` gives "unsupported operand type(s)
-      for *: 'NoneType' and ...").
     """
-    use_qk_l2norm_in_kernel = kwargs.pop("use_qk_l2norm_in_kernel", False)
-    N_max = kwargs.pop("N_max", None)
-    disable_recompute = kwargs.pop("disable_recompute", True)
-
-    # base.KimiDeltaAttention.bind resolves the default scale from the key dim.
+    del safe_gate
     if scale is None:
         scale = q.shape[-1]**-0.5
 
@@ -1985,10 +1483,8 @@ def kda_forward(
         q,
         v,
         initial_state=initial_state,
-        output_final_state=output_final_state,
         segment_ids=segment_ids,
         chunk_size=chunk_size,
-        N_max=N_max,
     )
 
     prepared = _preprocess_inputs(
@@ -1998,7 +1494,6 @@ def kda_forward(
         g,
         beta,
         initial_state=initial_state,
-        output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
@@ -2006,7 +1501,7 @@ def kda_forward(
         N_max=N_max,
     )
 
-    (value, final_state), _residuals = chunk_kda_fwd_custom(
+    value, final_state = _run_chunk_kda(
         prepared.q,
         prepared.k,
         prepared.v,
@@ -2019,21 +1514,13 @@ def kda_forward(
         output_final_state=output_final_state,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
-        safe_gate=safe_gate,
         lower_bound=lower_bound,
-        disable_recompute=disable_recompute,
         chunk_size=chunk_size,
-        return_residuals=False,
         cu_seqlens=prepared.cu_seqlens,
         aligned_cu_seqlens=prepared.aligned_cu_seqlens,
         chunk_indices=prepared.chunk_indices,
-        aligned_segment_ids=prepared.aligned_segment_ids,
-        q_rstd=prepared.q_rstd,
-        k_rstd=prepared.k_rstd,
-        cp_metadata=prepared.cp_metadata,
-        **kwargs,
     )
-    # Match tokamax: always expose the segment dim on the returned state.
+    # Keep the segment dimension for fixed-length batches too.
     if final_state is not None and final_state.ndim == 4:
         final_state = final_state[:, None]
     return value, final_state

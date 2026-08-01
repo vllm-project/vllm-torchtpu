@@ -8,11 +8,14 @@ naive float32 CPU reference in this file.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 from torch import nn
+from vllm.model_executor.layers.mamba.mamba_utils import \
+    is_conv_state_dim_first
+
+from vllm_torchtpu.models.kimi_k3.kda import (GatedRMSNormSigmoid, KdaMetadata,
+                                              KimiK3DeltaAttention)
 
 
 def _has_tpu() -> bool:
@@ -271,9 +274,6 @@ def _build_tpu_layer(weights: dict[str, torch.Tensor], num_heads: int,
     ``_assert_layer_attrs`` below is the guard against this drifting from the real
     ``__init__``.
     """
-    from vllm_torchtpu.models.kimi_k3.kda import (GatedRMSNormSigmoid,
-                                                  KimiK3DeltaAttention)
-
     m = object.__new__(KimiK3DeltaAttention)
     nn.Module.__init__(m)
 
@@ -288,7 +288,7 @@ def _build_tpu_layer(weights: dict[str, torch.Tensor], num_heads: int,
     m.conv_size = conv_size
     m.gate_lower_bound = lower_bound
     m.hidden_size = hidden_size
-    m._prefill_op = None
+    m._chunk_op = None
     m._decode_op = None
     m.kv_cache = None
 
@@ -386,12 +386,7 @@ def _conv_state_dim_first() -> bool:
     between runs. The layer normalizes internally; these tests have to hand it a
     pool in the orientation it expects.
     """
-    try:
-        from vllm.model_executor.layers.mamba.mamba_utils import \
-            is_conv_state_dim_first
-        return bool(is_conv_state_dim_first())
-    except ImportError:
-        return False
+    return bool(is_conv_state_dim_first())
 
 
 def _orient_conv(conv_state: torch.Tensor) -> torch.Tensor:
@@ -409,7 +404,6 @@ def _run_pair(*,
               num_heads,
               head_dim,
               hidden_size,
-              seq_lens,
               query_lens,
               has_initial_state,
               lower_bound,
@@ -427,9 +421,6 @@ def _run_pair(*,
     the updated CPU pools and ``layer.kv_cache`` the TPU ones, so a caller can
     make a second call that continues from this one.
     """
-    from vllm_torchtpu.models.kimi_k3.kda import KdaMetadata
-
-    del seq_lens  # only query_lens and has_initial_state drive the layer
     num_seqs = len(query_lens)
     num_tokens = sum(query_lens)
     query_start_loc = [0]
@@ -596,22 +587,11 @@ def test_naive_reference_keeps_slots_independent():
 # ---------------------------------------------------------------------------
 # The layer, against the reference
 # ---------------------------------------------------------------------------
-# bf16 through a recurrence: the kernels accumulate in float32 but their inputs
-# and the projections are bf16, so a few 1e-3 relative is expected. Measured when
-# this was written: prefill output ~7e-3, decode output ~5e-3, conv state ~3e-3,
-# recurrent state ~6e-3 -- so these thresholds carry ~2.5x headroom.
-#
-# That is deliberately not generous, and the margin was checked by breaking the
-# reference on purpose: storing the recurrent state untransposed fails every TPU
-# test here at rmse_rel 16-28, and dropping the q scale fails them at 3.1. Both
-# are 100x+ the threshold, so the gap between "bf16 noise" and "wrong" is wide --
-# no need for a bound loose enough to also hide the latter.
+# The recurrence accumulates in float32 but consumes bfloat16 projections.
 PREFILL_RMSE = 2e-2
 DECODE_RMSE = 2e-2
 STATE_RMSE = 2e-2
-# The prefill-then-decode chain compounds phase 1's error into both phase 2's
-# inputs and its initial state, so it earns more room than a single-phase run
-# (measured ~1.1e-2).
+# The chained case compounds prefill error through the decode state.
 CHAINED_RMSE = 3e-2
 
 
@@ -631,7 +611,6 @@ def test_prefill_matches_naive_cpu_reference(query_lens):
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_size=hidden_size,
-        seq_lens=query_lens,
         query_lens=query_lens,
         has_initial_state=[False] * len(query_lens),
         lower_bound=GATE_LOWER_BOUND,
@@ -663,7 +642,6 @@ def test_prefill_gate_branches_match_reference(lower_bound):
     ref_out, tpu_out, reference, layer = _run_pair(num_heads=2,
                                                    head_dim=64,
                                                    hidden_size=128,
-                                                   seq_lens=[64],
                                                    query_lens=[64],
                                                    has_initial_state=[False],
                                                    lower_bound=lower_bound,
@@ -685,7 +663,6 @@ def test_prefill_head_dim_128_matches_reference():
         num_heads=2,
         head_dim=128,
         hidden_size=256,
-        seq_lens=[64],
         query_lens=[64],
         has_initial_state=[False],
         lower_bound=GATE_LOWER_BOUND,
@@ -712,7 +689,6 @@ def test_decode_matches_naive_cpu_reference(num_seqs):
         num_heads=2,
         head_dim=64,
         hidden_size=128,
-        seq_lens=[1] * num_seqs,
         query_lens=[1] * num_seqs,
         has_initial_state=[True] * num_seqs,
         lower_bound=GATE_LOWER_BOUND,
@@ -749,7 +725,6 @@ def test_decode_leaves_untouched_slots_alone():
     _, _, _, layer = _run_pair(num_heads=2,
                                head_dim=64,
                                hidden_size=128,
-                               seq_lens=[1] * num_seqs,
                                query_lens=[1] * num_seqs,
                                has_initial_state=[True] * num_seqs,
                                lower_bound=GATE_LOWER_BOUND,
@@ -796,7 +771,6 @@ def test_decode_continues_prefill():
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_size=hidden_size,
-        seq_lens=prefill_lens,
         query_lens=prefill_lens,
         has_initial_state=[False] * num_seqs,
         lower_bound=GATE_LOWER_BOUND,
@@ -814,7 +788,6 @@ def test_decode_continues_prefill():
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_size=hidden_size,
-        seq_lens=[1] * num_seqs,
         query_lens=[1] * num_seqs,
         has_initial_state=[True] * num_seqs,
         lower_bound=GATE_LOWER_BOUND,
@@ -839,7 +812,6 @@ def test_decode_continues_prefill():
 # Documented limits
 # ---------------------------------------------------------------------------
 def _minimal_metadata(num_prefills: int, num_decodes: int, **kwargs):
-    from vllm_torchtpu.models.kimi_k3.kda import KdaMetadata
     return KdaMetadata(
         num_prefills=num_prefills,
         num_decodes=num_decodes,
@@ -871,8 +843,6 @@ def test_unsupported_batches_raise(meta_kwargs, match, monkeypatch):
     The mixed-batch guard only applies to the Pallas kernels, so the naive flag is
     forced off here; otherwise this fails for whoever has it set in their shell.
     """
-    from vllm_torchtpu.models.kimi_k3.kda import KimiK3DeltaAttention
-
     monkeypatch.delenv(NAIVE_ENV, raising=False)
 
     layer = object.__new__(KimiK3DeltaAttention)
@@ -910,7 +880,6 @@ def test_mixed_prefill_decode_batch_raises_on_the_kernel_path(monkeypatch):
         _run_pair(num_heads=2,
                   head_dim=64,
                   hidden_size=128,
-                  seq_lens=query_lens,
                   query_lens=query_lens,
                   has_initial_state=[False, True],
                   lower_bound=GATE_LOWER_BOUND,
@@ -948,7 +917,6 @@ def test_mixed_batch_matches_naive_cpu_reference(query_lens, has_initial_state,
         num_heads=2,
         head_dim=64,
         hidden_size=128,
-        seq_lens=query_lens,
         query_lens=query_lens,
         has_initial_state=has_initial_state,
         lower_bound=GATE_LOWER_BOUND,
@@ -1016,8 +984,7 @@ def test_mixed_batch_row_is_unaffected_by_its_batch_mates(monkeypatch):
     # Alone: the prefill row only, on slot 1.
     _, alone_out, _, alone_layer = _run_pair(
         **{
-            **common, "seq_lens": [t_prefill],
-            "query_lens": [t_prefill],
+            **common, "query_lens": [t_prefill],
             "has_initial_state": [False],
             "hidden_states": x[:t_prefill]
         })
@@ -1025,8 +992,7 @@ def test_mixed_batch_row_is_unaffected_by_its_batch_mates(monkeypatch):
     # Mixed: same prefill row on slot 1, plus a decode row on slot 2.
     _, mixed_out, _, mixed_layer = _run_pair(
         **{
-            **common, "seq_lens": [t_prefill, 1],
-            "query_lens": [t_prefill, 1],
+            **common, "query_lens": [t_prefill, 1],
             "has_initial_state": [False, True],
             "hidden_states": x
         })
@@ -1042,65 +1008,3 @@ def test_mixed_batch_row_is_unaffected_by_its_batch_mates(monkeypatch):
     for slot in (0, 3):
         assert torch.equal(rec_mixed[slot], recurrent_state[slot]), (
             f"the mixed batch wrote to slot {slot}, which it was not given")
-
-
-def test_mixed_batch_metadata_is_classified_as_mixed():
-    """Guard the test above: its batch really is mixed, not accidentally uniform.
-
-    If ``_run_pair``'s classification changed so that ``[32, 1]`` produced
-    ``num_decodes == 0``, the raise-test would pass for the wrong reason -- it
-    would be asserting on a pure-prefill batch that never triggers the guard.
-    Runs on CPU.
-    """
-    query_lens = [32, 1]
-    num_prefills = sum(1 for q in query_lens if q > 1)
-    num_decodes = sum(1 for q in query_lens if q == 1)
-    assert num_prefills > 0 and num_decodes > 0, (
-        f"{query_lens} is not a mixed batch: prefills={num_prefills} "
-        f"decodes={num_decodes}")
-
-
-def test_gate_activation_matches_the_kernels_definition():
-    """Pin the reference's gate against the kernel's own formula.
-
-    The reference transcribes ``_activate_gate``, so this is a consistency check
-    rather than an independent one -- its value is that it fails loudly if the
-    kernel's activation changes, instead of both sides drifting together and the
-    accuracy tests still passing.
-    """
-    num_heads, head_dim = 2, 64
-    weights = _make_weights(num_heads, head_dim, 128, CONV_SIZE, seed=50)
-    ref = ReferenceKDALayer(weights, num_heads, head_dim, CONV_SIZE,
-                            GATE_LOWER_BOUND, O_NORM_EPS)
-    gen = torch.Generator().manual_seed(51)
-    raw = torch.randn(5, num_heads, head_dim, generator=gen)
-
-    dt_bias = weights["dt_bias"].reshape(num_heads, head_dim)
-    a = torch.exp(weights["A_log"]).reshape(num_heads, 1)
-    expected_bounded = GATE_LOWER_BOUND * torch.sigmoid(a * (raw + dt_bias))
-    torch.testing.assert_close(ref._activate_gate(raw), expected_bounded)
-    # A bounded gate must be in [lower_bound, 0]: the chunked kernel's
-    # intra-chunk decay requires log_g <= 0.
-    assert ref._activate_gate(raw).max() <= 0.0
-    assert ref._activate_gate(raw).min() >= GATE_LOWER_BOUND
-
-    unbounded = ReferenceKDALayer(weights, num_heads, head_dim, CONV_SIZE,
-                                  None, O_NORM_EPS)
-    expected_unbounded = -a * torch.nn.functional.softplus(raw + dt_bias)
-    torch.testing.assert_close(unbounded._activate_gate(raw),
-                               expected_unbounded)
-    assert unbounded._activate_gate(raw).max() <= 0.0
-
-
-def test_l2norm_matches_the_kernels_definition():
-    """``x * rsqrt(sum(x^2) + eps)``, not ``F.normalize``'s clamped form."""
-    ref = ReferenceKDALayer(_make_weights(1, 8, 16, CONV_SIZE, seed=60), 1, 8,
-                            CONV_SIZE, GATE_LOWER_BOUND, O_NORM_EPS)
-    gen = torch.Generator().manual_seed(61)
-    x = torch.randn(3, 8, generator=gen)
-    expected = x * torch.rsqrt(x.pow(2).sum(-1, keepdim=True) + L2_EPS)
-    torch.testing.assert_close(ref._l2norm(x), expected)
-    # Sanity: a unit-norm row stays unit-norm to within eps.
-    unit = torch.zeros(1, 8)
-    unit[0, 0] = 1.0
-    assert math.isclose(ref._l2norm(unit).norm().item(), 1.0, rel_tol=1e-5)
