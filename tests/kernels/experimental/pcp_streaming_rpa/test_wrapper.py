@@ -15,9 +15,12 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import \
     compute_pcp_rank_major_slot_ids_from_metadata
+
+pytestmark = pytest.mark.multichip
 
 
 def test_metadata_slot_ids_support_smaller_interleave_than_page_size():

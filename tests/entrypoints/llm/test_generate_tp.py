@@ -12,6 +12,8 @@ import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 
+pytestmark = pytest.mark.multichip
+
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
@@ -31,6 +33,9 @@ def _get_local_tpu_chip_count() -> int:
 ])
 def test_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     tp_size = _get_local_tpu_chip_count()
+    if tp_size < 8:
+        pytest.skip(f"TP test expects an 8-chip agent, found {tp_size} chips; "
+                    "running here would silently reduce TP coverage")
 
     llm = LLM(
         model=MODEL_NAME,

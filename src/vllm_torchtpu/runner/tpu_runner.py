@@ -854,6 +854,7 @@ class TPUModelRunner(GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
+                            indexes_kv_by_block_stride=True,
                         )
                     else:
                         kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -862,6 +863,7 @@ class TPUModelRunner(GPUModelRunner):
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
+                            indexes_kv_by_block_stride=True,
                         )
                 elif attn_module.attn_type in (
                         AttentionType.ENCODER,
@@ -894,6 +896,7 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                     page_size_padded=page_size_padded,
+                    indexes_kv_by_block_stride=True,
                 )
             else:
                 continue

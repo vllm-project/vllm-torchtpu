@@ -459,6 +459,13 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES"
     ]
 
+    # The "Platform" base class has import_kernels() that tries to import
+    # vllm._C, which is not available in the TPU Platform setup.
+    # Override it to do nothing so we won't cause confusing warning logs.
+    @classmethod
+    def import_kernels(cls) -> None:
+        return
+
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
