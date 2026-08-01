@@ -19,6 +19,7 @@ test runner.
 """
 
 import collections
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +27,8 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2, interleave_lane)
+                                                   gmm_v2, interleave_lane,
+                                                   situ_and_mul)
 
 _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"])
@@ -46,6 +48,37 @@ def _assert_allclose(actual, expected, atol=1e-5, rtol=1e-5) -> None:
                                np.asarray(expected),
                                atol=atol,
                                rtol=rtol)
+
+
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+def test_situ_and_mul(linear_beta):
+    gate = jnp.asarray([-3.0, 0.5, 7.0])
+    up = jnp.asarray([-30.0, 2.0, 40.0])
+    expected_gate = 4.0 * jnp.tanh(gate / 4.0) * jax.nn.sigmoid(gate)
+    expected_up = (up if linear_beta is None else linear_beta *
+                   jnp.tanh(up / linear_beta))
+
+    _assert_allclose(situ_and_mul(gate, up, 4.0, linear_beta),
+                     expected_gate * expected_up)
+
+
+@pytest.mark.parametrize("linear_beta", ["none", "25.0"])
+def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=1),
+    )
+    gate = jnp.asarray([-3.0, 0.5, 7.0])
+    up = jnp.asarray([-30.0, 2.0, 40.0])
+    expected = situ_and_mul(
+        gate,
+        up,
+        beta=4.0,
+        linear_beta=None if linear_beta == "none" else float(linear_beta),
+    )
+
+    actual = apply_act_fn(interleave_lane(gate, up), f"situ:4.0:{linear_beta}")
+    _assert_allclose(actual, expected)
 
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
