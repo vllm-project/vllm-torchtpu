@@ -1,0 +1,18 @@
+# Dockerfile.override for torchtpu-vllm.
+# This Dockerfile builds a local-wheel-override variant image that overrides the pre-installed
+# torch-tpu with a local wheel from an override source.
+
+ARG BASE_IMAGE
+ARG OVERRIDE_SOURCE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu:nightly-latest"
+
+# Step 1: The Siphon (extract local wheels from override source image)
+FROM $OVERRIDE_SOURCE AS override-source
+
+# Step 2: The Override Variant (reinstall torch-tpu wheel without dependencies)
+FROM $BASE_IMAGE AS override-variant
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=from=override-source,source=/,target=/override-source,ro \
+    set -eu; \
+    set -- /override-source/opt/wheels/*.whl; \
+    if [ ! -e "$1" ]; then echo "No torch-tpu wheels found in OVERRIDE_SOURCE" >&2; exit 1; fi; \
+    uv pip install --system --force-reinstall --no-deps "$@";

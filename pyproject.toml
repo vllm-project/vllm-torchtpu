@@ -1,0 +1,121 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm_torchtpu"
+dynamic = ["version"]
+description = ""
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "vllm_torchtpu Contributors" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "tpu-info",
+    "portpicker",
+    "pathwaysutils",
+    "vllm==0.26.0",
+    "torch==2.11.0",
+    "torch-tpu==0.1.1.dev20260728090214",
+    # Required for N-gram speculative decoding
+    # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
+    # cpu.txt, ...) except tpu.txt, so it's missing
+    # when installing vllm as a plain PyPI dependency for our TPU platform.
+    "numba==0.65.0",
+    # Some multimodal-capable checkpoints (e.g. Gemma4) import torchvision at
+    # class-definition time in their HF processor module, so this is needed
+    # even for text-only serving. Pinned to match torch==2.11.0 exactly (see
+    # torchvision's own METADATA). NOTE: torch-tpu's custom torch build is
+    # incompatible with torchvision's compiled `nms` op specifically (see
+    # README troubleshooting tip) - plain import and non-nms ops are fine.
+    "torchvision==0.26.0",
+    # See the JAX fori-loop lowering monkey-patch in
+    # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
+    # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
+    "jax==0.10.2",
+    "jaxlib==0.10.2",
+    # This libtpu pin needs the workarounds in src/vllm_torchtpu/env_override.py
+    # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
+    # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
+    # bumping.
+    "libtpu==0.0.43",
+    "ray[default]",
+    "ray[data]",
+]
+
+[project.optional-dependencies]
+# Required for running tests
+test = [
+    "pytest",
+    "pytest-mock",
+    "pytest-timeout",
+    "parameterized",
+]
+
+# Dev tools (linting, formatting)
+dev = [
+    "yapf>=0.43.0",
+]
+
+# These are required for running any benchmarking
+# See more information at scripts/vllm/benchmarking/README.md
+benchmarking = [
+    "nltk",
+    "evaluate",
+    "datasets",
+    "rouge-score",
+    "scikit-learn",
+    "pandas",
+    "lm-eval[api]==0.5.0.dev1",
+    "evalplus",
+]
+
+[project.entry-points."vllm.platform_plugins"]
+# Standard vLLM out-of-tree platform plugin discovery. The function returns
+# the dotted class path when this platform should activate, else None. See
+# https://docs.vllm.ai/en/latest/design/plugin_system/
+torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
+
+[project.entry-points."vllm.general_plugins"]
+torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+
+[tool.pytest.ini_options]
+markers = [
+    "nightly: tests that only run in the nightly CI workflow",
+]
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["sitecustomize"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vllm_torchtpu*"]
+
+[tool.setuptools_scm]
+
+[tool.uv]
+keyring-provider = "subprocess"
+
+[[tool.uv.index]]
+name = "torch-tpu-registry"
+# torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
+# and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
+url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+explicit = true
+
+[tool.uv.sources]
+torch-tpu = { index = "torch-tpu-registry" }

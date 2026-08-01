@@ -1,0 +1,6 @@
+{
+  "mmlu_pro": {
+    "exact_match,custom-extract": 0.7687001329787234,
+    "exact_match_stderr,custom-extract": 0.003722724117728774
+  }
+}

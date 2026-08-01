@@ -1,0 +1,10 @@
+# CODEOWNERS file for torchtpu-vllm
+# This file defines code ownership for different parts of the repository.
+# Each line is a file pattern followed by one or more owners.
+# Owners are notified when PRs modify code in their areas.
+#
+# Order matters - the last matching pattern takes precedence.
+# Analysis includes full history from tpu_commons, tpu_inference, and torchtpu-vllm paths.
+
+# Default owners for everything in the repo (fallback)
+* @qizzzh @Geyuhao @angelayi @colin2328
