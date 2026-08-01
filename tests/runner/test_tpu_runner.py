@@ -1600,6 +1600,40 @@ class TestCompactMambaSlotPool:
         # Padded tail points at the null slot (0).
         assert idx[2] == 0 and idx[3] == 0
 
+    def test_idle_dp_rank_gets_all_null_slots(self):
+        """An idle DP rank asks for the coordinated shape with an empty batch.
+
+        `run_dp_dummy_draft` replays a busy peer's collective trace using
+        `num_reqs_max_model_len`, but the idle rank has no scheduled
+        requests. Walking the real `req_ids` for that many positions used to
+        raise `IndexError: list index out of range` inside the dummy draft
+        and kill the engine (compact layout only -- the unified pool builds
+        its indices from the block table and never reaches this code).
+        """
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, [])  # idle rank: nothing scheduled
+
+        idx = runner._build_mamba_state_indices(start_index=0,
+                                                num_reqs=4,
+                                                target_num_reqs=4).cpu()
+        # Every position is the null slot: no real request to address, and
+        # the dummy forward must not touch a live request's state.
+        assert [int(v) for v in idx] == [0, 0, 0, 0]
+        # No slots were consumed, so a later real request still gets one.
+        assert len(runner._free_mamba_slots) == 4
+
+    def test_partially_filled_batch_assigns_only_live_prefix(self):
+        """Coordinated `num_reqs` above the live count keeps the tail null."""
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a"])
+
+        # Peer coordinated 4; this rank only has 1 request.
+        idx = runner._build_mamba_state_indices(0, 4, 4).cpu()
+        assert int(idx[0]) != 0
+        assert [int(v) for v in idx[1:]] == [0, 0, 0]
+
     def test_slot_follows_req_id_through_condense(self):
         """A request keeps its slot even when its persistent-batch position
         changes (upstream condense moves it to a lower index)."""
