@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm_torchtpu.kernels.kimi_k3 import kda_step, ragged_kda
+from vllm_torchtpu.kernels.kimi_k3 import kda_step, naive_ragged_kda
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
     kimi_short_conv_scan
 
@@ -36,7 +36,7 @@ def test_kda_pallas_abi_shapes_and_dtypes() -> None:
         jnp.asarray([2, 7, 0], jnp.int32),
     )
     output, new_state = jax.eval_shape(
-        functools.partial(ragged_kda, lower_bound=None, eps=1e-5),
+        functools.partial(naive_ragged_kda, lower_bound=None, eps=1e-5),
         *args,
     )
     assert output.shape == (num_tokens, num_heads, head_dim)

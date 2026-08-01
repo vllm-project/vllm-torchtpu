@@ -71,7 +71,7 @@ def kda_step(
     static_argnames=("lower_bound", "eps"),
     donate_argnames=("recurrent_state", ),
 )
-def ragged_kda(
+def naive_ragged_kda(
     mixed_qkv: jax.Array,
     raw_gate: jax.Array,
     beta: jax.Array,
