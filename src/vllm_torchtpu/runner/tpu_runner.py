@@ -785,7 +785,8 @@ class TPUModelRunner(GPUModelRunner):
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
-        has_attention = any(isinstance(m, Attention) for m in layers.values())
+        has_attention = any(
+            isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
         if has_attention and has_mamba and not self._unified_kv_layout:
             self._update_mamba_page_size_padded(layers)
@@ -1071,12 +1072,11 @@ class TPUModelRunner(GPUModelRunner):
         first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        attn_page_size_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            self.block_size,
-            num_kv_heads,
-            first_attn_module.head_size,
-            self.kv_cache_dtype,
-        )
+        attention_backend = (PallasMLAttentionBackend if isinstance(
+            first_attn_module, MLAAttention) else PallasAttentionBackend)
+        attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
+            self.block_size, num_kv_heads, first_attn_module.head_size,
+            self.kv_cache_dtype)
 
         mamba_modules = [
             m for m in layers.values() if isinstance(m, MambaBase)
