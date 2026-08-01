@@ -77,7 +77,11 @@ benchmarking = [
     "scikit-learn",
     "pandas",
     "lm-eval[api]==0.5.0.dev1",
-    "evalplus",
+    # evalplus is NOT listed here: its gemini backend dep (google-generativeai)
+    # requires protobuf<6 while vllm>=0.26 requires protobuf>=6.30, so any
+    # resolver-visible "evalplus" gets silently backtracked to 0.2.x, whose CLI
+    # is incompatible with scripts/vllm/benchmarking/run_eval_flow.sh. It is
+    # installed with --no-deps in docker/Dockerfile (dev stage) instead.
 ]
 
 [project.entry-points."vllm.platform_plugins"]

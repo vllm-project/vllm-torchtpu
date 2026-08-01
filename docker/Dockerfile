@@ -82,6 +82,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     uv pip install --system -e ".[test,benchmarking]"
 
+# evalplus 0.3.1 (fire-style CLI used by run_eval_flow.sh) cannot be resolved
+# normally: its gemini backend dep google-generativeai requires protobuf<6,
+# while vllm>=0.26 requires protobuf>=6.30, so uv backtracks to evalplus 0.2.x
+# whose evaluate CLI is incompatible (requires --dataset/--samples, no openai
+# backend). The gemini/anthropic providers are imported lazily and unused in CI,
+# so install evalplus without deps and add only what the openai path imports
+# (openai/transformers/datasets/numpy/rich/psutil already come from the stack).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --no-deps evalplus==0.3.1 && \
+    uv pip install --system "wget>=3.2" "tempdir>=0.7.1" \
+      "multipledispatch>=0.6.0" "appdirs>=1.4.4" "termcolor>=2.0.0" \
+      "fire>=0.6.0" "tree-sitter>=0.22.0" "tree-sitter-python>=0.21.0" \
+      "stop-sequencer>=1.2.3"
+
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
 CMD ["/bin/bash"]
 
