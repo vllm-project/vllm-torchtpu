@@ -18,8 +18,6 @@ python examples/offline_safety_model_inference.py \
     --max-num_batched_tokens=4096
 """
 
-import os
-
 from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -216,9 +214,6 @@ def main(args: dict):
 
 
 if __name__ == "__main__":
-    # Skip long warmup for local simple test.
-    os.environ['SKIP_JAX_PRECOMPILE'] = '1'
-
     parser = create_parser()
     args: dict = vars(parser.parse_args())
 

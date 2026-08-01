@@ -132,7 +132,6 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
-    SKIP_JAX_PRECOMPILE=1 \
     \
     vllm serve $MODEL \
     --port $PORT \
@@ -164,7 +163,6 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
-    SKIP_JAX_PRECOMPILE=1 \
     \
     vllm serve $MODEL \
     --port $PORT \
