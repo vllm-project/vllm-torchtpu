@@ -31,6 +31,19 @@ _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 
 
+def get_fused_moe_activation(activation, moe_config) -> str:
+    """Encode vLLM's activation config for the Pallas GMM kernel."""
+    activation = (activation.value
+                  if hasattr(activation, "value") else str(activation))
+    if activation != "situ":
+        return activation
+
+    beta = moe_config.activation_situ_beta
+    linear_beta = moe_config.activation_situ_linear_beta
+    assert beta is not None
+    return f"situ:{beta}:{'none' if linear_beta is None else linear_beta}"
+
+
 def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     """One-time NVFP4 load transform: packed uint8 ``[..., N, K//2]`` -> native
     fp4 ``torch.float4_e2m1fn_x2`` ``[..., K, N]`` (K-major).
