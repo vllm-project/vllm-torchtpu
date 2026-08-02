@@ -1021,30 +1021,6 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
-        if pcp_size > 1:
-            interleave_tokens = int(parallel_config.cp_kv_cache_interleave_size
-                                    or 0)
-            if interleave_tokens <= 0:
-                raise ValueError("Stage-3 PCP source requires a positive "
-                                 "cp_kv_cache_interleave_size")
-            # Raiden fails a reshard plan whose pool group has no schedule
-            # entries, and a prefix shorter than the last rank's first
-            # interleave slice leaves that rank with nothing to declare.
-            # Decline the transfer so the decoder recomputes the short prefix.
-            min_transfer_tokens = (pcp_size - 1) * interleave_tokens + 1
-            if num_tokens < min_transfer_tokens:
-                logger.info(
-                    "TPURaidenConnectorScheduler Stage-3 send declined "
-                    "req_id=%s num_tokens=%d min_transfer_tokens=%d "
-                    "pcp_size=%d interleave_tokens=%d; decode recomputes "
-                    "the prefix locally",
-                    request.request_id,
-                    num_tokens,
-                    min_transfer_tokens,
-                    pcp_size,
-                    interleave_tokens,
-                )
-                return False, {}
         scheduler_block_tokens = self.block_size * pcp_size
         expected_scheduler_blocks = (
             (num_tokens + scheduler_block_tokens - 1) //
