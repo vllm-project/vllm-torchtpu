@@ -127,6 +127,45 @@ def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
     ] == [4096, 4096]
 
 
+def test_hybrid_full_attention_mamba_pcp_coordinator_from_scheduler_call():
+    # The Scheduler constructs the KVCacheManager with pcp_world_size=1
+    # regardless of parallel config, so the coordinator patch must recover
+    # the PCP factor from scheduler_block_size instead of the argument.
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core.kv_cache_coordinator import (HybridKVCacheCoordinator,
+                                                   get_kv_cache_coordinator)
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], _full_spec(block_size=4096)),
+            KVCacheGroupSpec(["gdn"], _mamba_spec()),
+        ],
+    )
+    coordinator = get_kv_cache_coordinator(
+        kv_cache_config=kv_cache_config,
+        max_model_len=65536,
+        max_in_flight_tokens=4096,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        scheduler_block_size=32768,
+        hash_block_size=32768,
+    )
+
+    assert isinstance(coordinator, HybridKVCacheCoordinator)
+    assert [
+        manager.block_size for manager in coordinator.single_type_managers
+    ] == [32768, 32768]
+    assert [
+        group.kv_cache_spec.block_size
+        for group in kv_cache_config.kv_cache_groups
+    ] == [4096, 4096]
+
+
 def test_hybrid_pcp_patch_keeps_non_mamba_scope():
     _patch_vllm_hybrid_pcp_block_sizes()
     from vllm.v1.core import kv_cache_utils
