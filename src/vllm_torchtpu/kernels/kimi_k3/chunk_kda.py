@@ -343,7 +343,7 @@ def estimate_mini_batch(
 # =============================================================================
 
 
-def _fused_gate_intra_kernel(
+def _fused_gate_intra_body(
     q_ref,
     k_ref,
     g_ref,
@@ -628,6 +628,51 @@ def _fused_gate_intra_kernel(
     g_cumsum_out_ref[:, 0, 0] = g_cumsum
 
 
+def _fused_gate_intra_kernel(
+    q_ref,
+    k_ref,
+    g_ref,
+    beta_ref,
+    v_ref,
+    A_log_ref,
+    dt_bias_ref,
+    num_chunks_ref,  # [B] int32, in SMEM
+    u_out_ref,
+    w_out_ref,
+    kg_out_ref,
+    Aqk_out_ref,
+    g_cumsum_out_ref,
+    **kwargs,
+):
+    """Run the intra-chunk solve only on chunks that hold real tokens.
+
+    ``num_chunks_ref[b]`` is the chunk count actually occupied by this batch
+    element, computed on device from the aligned cu_seqlens. Because
+    ``_align_seqs`` packs the segments back to back -- an empty segment
+    contributes zero aligned length -- the occupied chunks are a contiguous
+    prefix, so one scalar bounds them.
+
+    Stage 3+4 requires the padded tail to be zero (see the padding semantics
+    note in `_run_chunk_kda`), so the skipped branch still writes zeros, which
+    costs a store rather than the solve.
+    """
+    chunk = pl.program_id(2)
+    batch = pl.program_id(1)
+    occupied = chunk < num_chunks_ref[batch]
+
+    @pl.when(occupied)
+    def _run():
+        _fused_gate_intra_body(q_ref, k_ref, g_ref, beta_ref, v_ref, A_log_ref,
+                               dt_bias_ref, u_out_ref, w_out_ref, kg_out_ref,
+                               Aqk_out_ref, g_cumsum_out_ref, **kwargs)
+
+    @pl.when(jnp.logical_not(occupied))
+    def _zero():
+        for ref in (u_out_ref, w_out_ref, kg_out_ref, Aqk_out_ref,
+                    g_cumsum_out_ref):
+            ref[...] = jnp.zeros_like(ref)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -640,19 +685,20 @@ def _fused_gate_intra_kernel(
     ],
 )
 def pallas_kda_fwd_intra_fused(
-    q: jax.Array,  # [H, B, T, K]
-    k: jax.Array,  # [H, B, T, K]
-    v: jax.Array,  # [H, B, T, V]
-    g: jax.Array,  # [H, B, T, K]
-    beta: jax.Array,  # [H, B, T]
-    scale: float,
-    chunk_size: int = 64,
-    cumsum_scale: float = RCP_LN2,
-    A_log: jax.Array | None = None,  # [H]
-    dt_bias: jax.Array | None = None,  # [H*K]
-    use_gate_in_kernel: bool = False,
-    lower_bound: float | None = None,
-    mini_batch: int | None = None,
+        q: jax.Array,  # [H, B, T, K]
+        k: jax.Array,  # [H, B, T, K]
+        v: jax.Array,  # [H, B, T, V]
+        g: jax.Array,  # [H, B, T, K]
+        beta: jax.Array,  # [H, B, T]
+        scale: float,
+        chunk_size: int = 64,
+        cumsum_scale: float = RCP_LN2,
+        A_log: jax.Array | None = None,  # [H]
+        dt_bias: jax.Array | None = None,  # [H*K]
+        use_gate_in_kernel: bool = False,
+        lower_bound: float | None = None,
+        mini_batch: int | None = None,
+        num_chunks: jax.Array | None = None,  # [B] int32
 ) -> tuple[
         jax.Array,  # [H, B, T, K]
         jax.Array,  # [H, B, T, V]
@@ -660,7 +706,11 @@ def pallas_kda_fwd_intra_fused(
         jax.Array,  # [H, B, T, BT]
         jax.Array,  # [H, B, T, K]
 ]:
-    """Fuse gate cumsum with the fixed-length intra-chunk solve."""
+    """Fuse gate cumsum with the fixed-length intra-chunk solve.
+
+    ``num_chunks`` bounds the occupied chunks per batch element; see
+    `_fused_gate_intra_kernel`. ``None`` means every chunk holds real tokens.
+    """
     H, B, T, K = q.shape
     V = v.shape[-1]
     BT = chunk_size
@@ -695,6 +745,9 @@ def pallas_kda_fwd_intra_fused(
         dt_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
 
     grid = (H // MB, B, NC)
+    if num_chunks is None:
+        num_chunks = jnp.full((B, ), NC, dtype=jnp.int32)
+    num_chunks = jnp.broadcast_to(num_chunks.astype(jnp.int32), (B, ))
 
     # Grid is (head block, batch, chunk); `c` is the chunk index.
     def _make_spec(last_dim):
@@ -737,6 +790,7 @@ def pallas_kda_fwd_intra_fused(
             _make_spec(V),
             _make_per_head_spec(1),
             _make_per_head_spec(K),
+            pl.BlockSpec(memory_space=pltpu.SMEM),  # num_chunks
         ],
         out_specs=[
             _make_spec(V),
@@ -748,7 +802,7 @@ def pallas_kda_fwd_intra_fused(
         grid=grid,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "parallel"), ),
-    )(q_r, k_r, g_r, beta_r, v_r, A_log_r, dt_bias_r)
+    )(q_r, k_r, g_r, beta_r, v_r, A_log_r, dt_bias_r, num_chunks)
 
     # --- Reshape back to [H, B, T, D] (head-first) ---
     w_out = w_r.reshape(H, B, T, K)
@@ -1141,6 +1195,18 @@ def _run_chunk_kda(
     BT = chunk_size
 
     _is_varlen = cu_seqlens is not None
+    # How many chunks actually hold tokens. `_align_seqs` packs the segments
+    # back to back and gives an empty segment zero aligned length, so the
+    # occupied chunks are a contiguous prefix and the total aligned length
+    # bounds them. Device-valued, so it shrinks with the batch's real content
+    # while T (and so the grid) stays static.
+    if _is_varlen:
+        aligned_total = (cu_seqlens[..., -1]
+                         if cu_seqlens.ndim == 2 else cu_seqlens[-1][None])
+        num_chunks = cdiv(aligned_total.astype(jnp.int32), BT)
+    else:
+        num_chunks = None
+
     # ------------------------------------------------------------------
     # Step 1 + 2 (Fused): Gate cumsum + Intra-chunk solve
     # ------------------------------------------------------------------
@@ -1157,6 +1223,7 @@ def _run_chunk_kda(
         dt_bias=dt_bias,
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
+        num_chunks=num_chunks,
     )
 
     # ------------------------------------------------------------------
