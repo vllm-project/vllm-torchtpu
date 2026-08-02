@@ -34,6 +34,20 @@ Stage-2 hardening and hybrid coverage:
 - Recovered-directory learning (lookup HIT teaches the advisory state),
   RAIDEN_SHM_MODEL_UID derivation, and hybrid unified-pool geometry
   resolution (attention-spec filtering, page uniformity).
+
+Phase-4 cross-instance sharing:
+- Global lookup: REMOTE peer slices are a HIT only with the registry
+  enabled, a dead registry degrades to local-only, an in-flight fetch
+  reports HIT_PENDING.
+- Receiver flow: prepare_load installs peer mappings via
+  insert_and_lock(on_host=True), submit partitions load() vs read_remote()
+  by live status, the finalizer polls poll_remote_read_status.
+- Failure paths: landing-capacity rejection fails the job cleanly, a failed
+  read deletes the local install (registry keeps the peer mapping) and
+  remote-quarantines the keys without blocking local stores.
+- Compatibility namespace: sub-hashes carry the namespace prefix end to end
+  (including displaced-key recovery), and derive_offload_namespace is
+  deterministic and config-sensitive.
 """
 import enum
 import sys
@@ -101,14 +115,25 @@ class FakeKVCacheStore:
         self.fail_insert_and_lock = False
         self.fail_save = False
         self.fail_load = False
+        self.fail_read_remote = False
         self.raiden_id = object()
+        # Global-registry contents (phase 4): sub-hash -> peer REMOTE slice.
+        # Consulted by lookup(enable_global=True) for local misses, like
+        # raiden's registry fallback; registry_down mirrors raiden's
+        # swallow-registry-errors behavior (local results only).
+        self.global_entries: dict[bytes, FakeRaidenBlockID] = {}
+        self.registry_down = False
         # Terminal outcomes queued by the test, drained by the polls.
         self._save_done: list[bytes] = []
         self._save_failed: list[bytes] = []
         self._load_done: list[bytes] = []
         self._load_failed: list[bytes] = []
+        self._remote_done: list[bytes] = []
+        self._remote_failed: list[bytes] = []
         self._saving: list[bytes] = []
         self._loading: list[bytes] = []
+        self._remote_reading: list[bytes] = []
+        self._remote_device_ids: dict[bytes, int] = {}
 
     # -- store surface used by the manager -----------------------------
 
@@ -120,8 +145,18 @@ class FakeKVCacheStore:
         for h in block_hashes:
             entry = self.entries.get(h)
             if entry is None:
+                if enable_global and not self.registry_down:
+                    remote = self.global_entries.get(h)
+                    if remote is not None:
+                        out.append((h, remote))
+                        continue
                 break
-            out.append((h, SimpleNamespace(status=entry.status)))
+            out.append((
+                h,
+                SimpleNamespace(status=entry.status,
+                                device_block_id=entry.device_block_id,
+                                host_block_id=-1),
+            ))
         return out
 
     def pin(self, block_hashes) -> bool:
@@ -194,6 +229,24 @@ class FakeKVCacheStore:
         self._loading.extend(block_hashes)
         return True
 
+    def read_remote(self, block_hashes, device_block_ids=None):
+        self.calls.append(
+            _Call("read_remote",
+                  (list(block_hashes), list(device_block_ids or []))))
+        if self.fail_read_remote:
+            return False
+        # Mirror raiden's preconditions: every hash must be locally
+        # installed in REMOTE status and pinned.
+        for h in block_hashes:
+            entry = self.entries.get(h)
+            if (entry is None or entry.status != FakeBlockStatus.REMOTE
+                    or entry.pin_count <= 0 or h in self._remote_reading):
+                return False
+        self._remote_reading.extend(block_hashes)
+        for h, d in zip(block_hashes, device_block_ids or []):
+            self._remote_device_ids[h] = d
+        return True
+
     def poll_save_status(self):
         done, self._save_done = self._save_done, []
         failed, self._save_failed = self._save_failed, []
@@ -203,6 +256,11 @@ class FakeKVCacheStore:
         done, self._load_done = self._load_done, []
         failed, self._load_failed = self._load_failed, []
         return done, failed, list(self._loading)
+
+    def poll_remote_read_status(self):
+        done, self._remote_done = self._remote_done, []
+        failed, self._remote_failed = self._remote_failed, []
+        return done, failed, list(self._remote_reading)
 
     # -- test controls --------------------------------------------------
 
@@ -219,6 +277,19 @@ class FakeKVCacheStore:
         for h in block_hashes:
             self._loading.remove(h)
             (self._load_done if success else self._load_failed).append(h)
+
+    def complete_remote_read(self, block_hashes, success=True) -> None:
+        for h in block_hashes:
+            self._remote_reading.remove(h)
+            if success:
+                entry = self.entries[h]
+                entry.status = FakeBlockStatus.HOST_AND_HBM
+                entry.device_block_id = self._remote_device_ids.get(h, -1)
+                self._remote_done.append(h)
+            else:
+                # A failed read leaves the entry REMOTE (destination device
+                # blocks undefined, nothing points at them).
+                self._remote_failed.append(h)
 
     def calls_named(self, name: str) -> list[_Call]:
         return [c for c in self.calls if c.name == name]
@@ -272,7 +343,7 @@ class FakeKVCacheStoreV2(FakeKVCacheStore):
 
     def clear(self) -> int:
         self.calls.append(_Call("clear", ()))
-        if self._saving or self._loading:
+        if self._saving or self._loading or self._remote_reading:
             raise RuntimeError("KVCacheStore clear failed: transfers in "
                                "flight")
         if any(e.pin_count > 0 for e in self.entries.values()):
@@ -282,7 +353,7 @@ class FakeKVCacheStoreV2(FakeKVCacheStore):
         return cleared
 
 
-def make_manager(store, *, f=4, num_blocks=8, world_size=2):
+def make_manager(store, *, f=4, num_blocks=8, world_size=2, **kwargs):
     from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
     return RaidenOffloadingManager(
         capacity_kernel_blocks=num_blocks * f,
@@ -293,16 +364,37 @@ def make_manager(store, *, f=4, num_blocks=8, world_size=2):
         raiden_job_name="test",
         store=store,
         store_types=FAKE_STORE_TYPES,
+        **kwargs,
     )
 
 
-def sub_hashes(key: bytes, f: int = 4) -> list[bytes]:
-    return [key + i.to_bytes(4, "big") for i in range(f)]
+def make_global_manager(store, **kwargs):
+    """Manager with the phase-4 global registry enabled."""
+    return make_manager(store,
+                        global_registry_address="registry:50051",
+                        store_server_ip="10.0.0.1",
+                        **kwargs)
+
+
+def sub_hashes(key: bytes, f: int = 4, ns: bytes = b"") -> list[bytes]:
+    return [ns + key + i.to_bytes(4, "big") for i in range(f)]
 
 
 def seed_host_entries(store, key: bytes, f: int = 4) -> None:
     for h in sub_hashes(key, f):
         store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+
+
+def seed_global_entries(store,
+                        key: bytes,
+                        f: int = 4,
+                        ns: bytes = b"") -> None:
+    """Publish a peer's REMOTE slices for `key` in the fake registry."""
+    for i, h in enumerate(sub_hashes(key, f, ns)):
+        store.global_entries[h] = FakeRaidenBlockID(
+            raiden_id=object(),
+            host_block_id=100 + i,
+            status=FakeBlockStatus.REMOTE)
 
 
 class TestRegistrationGate(unittest.TestCase):
@@ -1061,6 +1153,257 @@ class TestShmModelUid(unittest.TestCase):
             uid,
             derive_shm_model_uid(self._cfg(), **{
                 **kwargs, "capacity_kernel_blocks": 999
+            }))
+
+
+class TestRemoteReadFlow(unittest.TestCase):
+    """Phase-4 receiver flow against the fake registry."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore(registered_workers=2)
+        self.manager = make_global_manager(self.store)
+
+    def test_remote_hit_requires_global_enabled(self):
+        seed_global_entries(self.store, _key(1))
+        local_manager = make_manager(self.store)
+        self.assertEqual(local_manager.lookup(_key(1), _ctx()),
+                         LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
+                         LookupResult.HIT)
+
+    def test_registry_down_degrades_to_local_only(self):
+        seed_global_entries(self.store, _key(1))
+        seed_host_entries(self.store, _key(2))
+        self.store.registry_down = True
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
+                         LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(2), _ctx()),
+                         LookupResult.HIT)
+
+    def test_receiver_flow_end_to_end(self):
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        # The peer slices were installed locally: on_host=True, entries
+        # REMOTE and pinned.
+        (ial, ) = self.store.calls_named("insert_and_lock")
+        self.assertEqual(ial.args[0], sub_hashes(key))
+        self.assertTrue(ial.args[2])
+        for h in sub_hashes(key):
+            self.assertEqual(self.store.entries[h].status,
+                             FakeBlockStatus.REMOTE)
+            self.assertEqual(self.store.entries[h].pin_count, 1)
+
+        self.manager.submit_load_job(7, [key], [5], "req")
+        # Everything was remote: one read_remote straight into the expanded
+        # kernel-block destinations, no local load.
+        self.assertEqual(self.store.calls_named("load"), [])
+        (rr, ) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args, (sub_hashes(key), [20, 21, 22, 23]))
+        self.assertTrue(self.manager.has_pending_work())
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+
+        # A concurrent lookup while the fetch is in flight must not launch
+        # a second read of the same hashes.
+        self.assertEqual(self.manager.lookup(key, _ctx()),
+                         LookupResult.HIT_PENDING)
+
+        self.store.complete_remote_read(sub_hashes(key))
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+        self.assertEqual(fj.req_id, "req")
+        for h in sub_hashes(key):
+            self.assertEqual(self.store.entries[h].status,
+                             FakeBlockStatus.HOST_AND_HBM)
+            self.assertEqual(self.store.entries[h].pin_count, 0)
+        # The fetched prefix is now an ordinary local hit.
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.assertFalse(self.manager.has_pending_work())
+
+    def test_mixed_local_and_remote_job(self):
+        local_key, remote_key = _key(1), _key(2)
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        self.assertEqual(self.manager.lookup(local_key, _ctx()),
+                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(remote_key, _ctx()),
+                         LookupResult.HIT)
+        spec = self.manager.prepare_load([local_key, remote_key], _ctx())
+        self.assertTrue(spec.pinned)
+
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "req")
+        (ld, ) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (sub_hashes(local_key), [20, 21, 22, 23]))
+        (rr, ) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args, (sub_hashes(remote_key), [24, 25, 26, 27]))
+
+        # Both halves must resolve before the job is terminal.
+        self.store.complete_load(sub_hashes(local_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(sub_hashes(remote_key))
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+
+    def test_remote_failure_deletes_install_and_remote_quarantines(self):
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+
+        self.store.complete_remote_read(sub_hashes(key), success=False)
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        self.assertEqual(fj.failed_gpu_block_ids, [5])
+        # The local install was deleted (landing blocks freed); the fake
+        # registry still has the peer mapping.
+        for h in sub_hashes(key):
+            self.assertNotIn(h, self.store.entries)
+            self.assertIn(h, self.store.global_entries)
+        # Remote-quarantined: the registry entry no longer surfaces...
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.MISS)
+        # ...but the key is NOT store-quarantined — it can still be computed
+        # and offloaded locally.
+        out = self.manager.prepare_store([key], _ctx())
+        self.assertEqual(out.keys_to_store, [key])
+
+    def test_landing_capacity_failure_fails_job_cleanly(self):
+        local_key, remote_key = _key(1), _key(2)
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        self.manager.lookup(local_key, _ctx())
+        self.manager.lookup(remote_key, _ctx())
+        self.store.fail_insert_and_lock = True
+        spec = self.manager.prepare_load([local_key, remote_key], _ctx())
+        self.assertFalse(spec.pinned)
+        # The local pins taken before the rejection were unwound.
+        for h in sub_hashes(local_key):
+            self.assertEqual(self.store.entries[h].pin_count, 0)
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6],
+                                     "req",
+                                     pinned=spec.pinned)
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        self.assertEqual(fj.failed_gpu_block_ids, [5, 6])
+        self.assertEqual(self.store.calls_named("read_remote"), [])
+
+    def test_read_remote_launch_failure_after_local_load(self):
+        local_key, remote_key = _key(1), _key(2)
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        self.manager.lookup(local_key, _ctx())
+        self.manager.lookup(remote_key, _ctx())
+        self.manager.prepare_load([local_key, remote_key], _ctx())
+        self.store.fail_read_remote = True
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "req")
+        # The local load launched first and is in flight: the job stays
+        # non-terminal until it resolves, then fails exactly once.
+        self.assertTrue(self.manager.has_pending_work())
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_load(sub_hashes(local_key))
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        self.assertEqual(fj.failed_gpu_block_ids, [5, 6])
+        # Cleanup deleted the REMOTE install but preserved the HOST entries.
+        for h in sub_hashes(remote_key):
+            self.assertNotIn(h, self.store.entries)
+        for h in sub_hashes(local_key):
+            self.assertEqual(self.store.entries[h].status,
+                             FakeBlockStatus.HOST)
+            self.assertEqual(self.store.entries[h].pin_count, 0)
+
+    def test_stale_stash_degenerates_to_local_load(self):
+        # A key stashed as remote that became local before prepare_load must
+        # end up in the load() half, not read_remote().
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        # Another request fetched it meanwhile: now locally HOST.
+        for h in sub_hashes(key):
+            self.store.global_entries.pop(h)
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.manager.submit_load_job(7, [key], [5], "req")
+        (ld, ) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (sub_hashes(key), [20, 21, 22, 23]))
+        self.assertEqual(self.store.calls_named("read_remote"), [])
+
+
+class TestNamespace(unittest.TestCase):
+    """Compatibility-namespaced keys flow through every store surface."""
+
+    NS = b"NS16bytes--------"[:16]
+
+    def setUp(self):
+        self.store = FakeKVCacheStoreV2(registered_workers=2)
+        self.manager = make_global_manager(self.store, key_namespace=self.NS)
+
+    def test_namespace_prefixes_every_sub_hash(self):
+        key = _key(1)
+        self.manager.prepare_store([key], _ctx())
+        self.manager.submit_store_job(1, [key], [3])
+        (ial, ) = self.store.calls_named("insert_and_lock_detailed")
+        self.assertEqual(ial.args[0], sub_hashes(key, ns=self.NS))
+        (sv, ) = self.store.calls_named("save")
+        self.assertEqual(sv.args[0], sub_hashes(key, ns=self.NS))
+
+    def test_displaced_key_recovery_strips_namespace(self):
+        seed_host_entries(self.store, _key(9))
+        for h in sub_hashes(_key(9)):
+            entry = self.store.entries.pop(h)
+            self.store.entries[self.NS + h] = entry
+        self.store.displace_next = sub_hashes(_key(9), ns=self.NS)
+        self.manager.prepare_store([_key(1)], _ctx())
+        self.manager.submit_store_job(1, [_key(1)], [3])
+        self.store.complete_save(sub_hashes(_key(1), ns=self.NS))
+        self.manager.poll_finished_jobs()
+        (event, ) = self.manager.take_events()
+        self.assertEqual(list(event.keys), [_key(9)])
+
+    def test_namespaced_remote_flow(self):
+        key = _key(1)
+        seed_global_entries(self.store, key, ns=self.NS)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+        (rr, ) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], sub_hashes(key, ns=self.NS))
+
+    def test_derive_offload_namespace_config_sensitivity(self):
+        from vllm_torchtpu.offload.raiden_store import derive_offload_namespace
+
+        def cfg(model="m", revision="r", quant=None, algo="sha256"):
+            c = MagicMock()
+            c.model_config.model = model
+            c.model_config.revision = revision
+            c.model_config.quantization = quant
+            c.cache_config.prefix_caching_hash_algo = algo
+            return c
+
+        kwargs = dict(kernel_block_size=256,
+                      per_block_shape=(256, 8, 2, 128),
+                      kv_dtype="bfloat16",
+                      gpu_block_size=1280,
+                      world_size=4,
+                      num_kv_cache_groups=1,
+                      num_kv_cache_tensors=64)
+        ns = derive_offload_namespace(cfg(), **kwargs)
+        self.assertEqual(len(ns), 16)
+        self.assertEqual(ns, derive_offload_namespace(cfg(), **kwargs))
+        # A registry key must never match across incompatible engines.
+        self.assertNotEqual(ns,
+                            derive_offload_namespace(cfg(model="o"), **kwargs))
+        self.assertNotEqual(
+            ns, derive_offload_namespace(cfg(quant="fp8"), **kwargs))
+        self.assertNotEqual(
+            ns, derive_offload_namespace(cfg(algo="sha256_cbor"), **kwargs))
+        self.assertNotEqual(
+            ns, derive_offload_namespace(cfg(), **{
+                **kwargs, "world_size": 8
             }))
 
 

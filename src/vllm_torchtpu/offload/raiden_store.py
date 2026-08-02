@@ -49,6 +49,20 @@ events through `take_events`; `reset_cache` empties the store via the public
 `clear()`. On a wheel-#1 tpu_raiden, classification falls back to
 per-sub-hash peeks, no events are emitted, and `reset_cache` raises.
 
+Phase 4 (cross-instance KV sharing, enabled by `global_registry_address`):
+saved blocks are published to the global registry by raiden, so a prefix
+computed by any replica is a `REMOTE` hit everywhere. The receiver flow is
+`lookup(enable_global=True)` -> stash the peer `REMOTE` slices ->
+`insert_and_lock(remote_slices, on_host=True)` in prepare_load (installs the
+peer mapping locally, reserves host landing capacity, pins) ->
+`read_remote(hashes, device_block_ids)` straight into HBM at job-submit ->
+`poll_remote_read_status` in the finalizer. Success leaves the entries
+`HOST_AND_HBM` (the host landing blocks make a later local load cheap);
+failure `release_and_delete`s the batch, which frees the landing blocks and
+removes the local install while the registry keeps the peer mapping.
+Registry keys are namespaced by engine compatibility (§4 of the design), and
+raiden itself degrades a dead registry to local-only lookups.
+
 See `raiden_connector.py` for the connector wiring (fence + echo channel).
 """
 from __future__ import annotations
@@ -140,6 +154,10 @@ class Admission:
     # through get_block_ids_with_load_errors on failure.
     req_id: str | None = None
     dst_gpu_block_ids: list[int] = field(default_factory=list)
+    # Loads only (phase 4): the sub-hashes fetched from a peer via
+    # read_remote rather than the local host pool. Drives the remote poll
+    # and the weaker remote-only quarantine on failure.
+    remote_sub_hashes: set[bytes] = field(default_factory=set)
     # Stores only: the sub-hashes actually saved (newly admitted HBM entries;
     # pre-existing HOST entries were pinned, not re-saved), the subset the
     # poll reported failed (retry targets), and the remaining retry budget.
@@ -182,6 +200,10 @@ class RaidenOffloadingManager(OffloadingManager):
         world_size: int,
         raiden_controller_port: int,
         raiden_job_name: str,
+        global_registry_address: str = "",
+        raiden_orchestrator_address: str = "",
+        store_server_ip: str = "",
+        key_namespace: bytes = b"",
         store: object | None = None,
         store_types: object | None = None,
     ):
@@ -190,6 +212,16 @@ class RaidenOffloadingManager(OffloadingManager):
         self._capacity_keys = num_offloaded_blocks
         self._f = sub_blocks_per_key
         self._world_size = world_size
+        self._ns = key_namespace
+        # Cross-instance sharing: consuming REMOTE hits needs only the
+        # registry; publishing this replica's own blocks additionally needs a
+        # peer-reachable store_server_ip (raiden logs the asymmetry too).
+        self._enable_global = bool(global_registry_address)
+        if self._enable_global and not store_server_ip:
+            logger.warning(
+                "[kv-offload-v2] global registry configured without "
+                "store_server_ip: this replica consumes remote KV but "
+                "publishes nothing (peers cannot discover it).")
 
         if store is None:
             from tpu_raiden.api.torch import kv_cache_store as store_types
@@ -202,12 +234,18 @@ class RaidenOffloadingManager(OffloadingManager):
                 num_shards=1,
                 shard_size_bytes=1,
                 raiden_controller_port=raiden_controller_port,
+                global_registry_address=global_registry_address,
+                raiden_orchestrator_address=raiden_orchestrator_address,
+                store_server_ip=store_server_ip,
             )
             logger.info(
                 "[kv-offload-v2] KVCacheStore up: capacity=%d kernel blocks "
-                "(%d offloaded blocks x %d), controller at %s",
+                "(%d offloaded blocks x %d), controller at %s%s",
                 capacity_kernel_blocks, num_offloaded_blocks,
-                sub_blocks_per_key, store.raiden_controller_address)
+                sub_blocks_per_key, store.raiden_controller_address,
+                (f", published at {store.store_server_address or '<nothing>'}"
+                 f" in registry {global_registry_address}"
+                 if self._enable_global else ""))
         else:
             # Injected store (tests): the caller supplies the module holding
             # BlockStatus / RaidenBlockID so tpu_raiden isn't imported.
@@ -251,6 +289,20 @@ class RaidenOffloadingManager(OffloadingManager):
         # age out through normal LRU pressure.
         self._quarantined_keys: set[OffloadKey] = set()
 
+        # Remote-fetch quarantine (phase 4): keys whose read_remote failed
+        # terminally. Weaker than the full quarantine — only the *global*
+        # fallback is suppressed (a dead peer or stale registry entry must
+        # not fail-loop), while local stores and loads of the same key stay
+        # allowed: the key may well be computed and stored locally later.
+        self._remote_quarantined_keys: set[OffloadKey] = set()
+
+        # Peer slices stashed by the last global lookup, keyed by sub-hash.
+        # Consumed by prepare_load's insert_and_lock(on_host=True); entries
+        # are overwritten by later lookups, so staleness is bounded by the
+        # lookup->prepare_load window of one scheduler step (a stale peer
+        # mapping surfaces as a failed read, not corruption).
+        self._remote_slices: dict[bytes, object] = {}
+
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
@@ -261,7 +313,12 @@ class RaidenOffloadingManager(OffloadingManager):
     # -- sub-hash / block-id expansion ----------------------------------
 
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
-        return [key + i.to_bytes(4, "big") for i in range(self._f)]
+        # The namespace prefix (phase 4) makes registry keys byte-distinct
+        # across incompatible engines; locally it is inert.
+        return [self._ns + key + i.to_bytes(4, "big") for i in range(self._f)]
+
+    def _key_of(self, sub_hash: bytes) -> OffloadKey:
+        return OffloadKey(sub_hash[len(self._ns):-4])
 
     def _expand_keys(self, keys: list[OffloadKey]) -> list[bytes]:
         out: list[bytes] = []
@@ -313,12 +370,19 @@ class RaidenOffloadingManager(OffloadingManager):
         sub_hashes = self._sub_hashes(key)
         # Raiden lookup halts at the first miss (prefix semantics), which is
         # exactly all-or-nothing over one key's sub-hashes. Peek only: no
-        # LRU-recency update, eviction candidates report as misses.
-        matches = self._store.lookup(sub_hashes)
+        # LRU-recency update, eviction candidates report as misses. With the
+        # global registry enabled, local misses fall through to a registry
+        # lookup and come back as REMOTE peer slices (raiden swallows
+        # registry outages, so a dead registry degrades to local-only).
+        allow_remote = (self._enable_global
+                        and key not in self._remote_quarantined_keys)
+        matches = self._store.lookup(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
             self._stored_keys.discard(key)
             return LookupResult.MISS
-        for _, block in matches:
+        all_local = True
+        remote_slices: dict[bytes, object] = {}
+        for h, block in matches:
             status = block.status
             if status in (self._block_status.HOST,
                           self._block_status.HOST_AND_HBM):
@@ -327,8 +391,18 @@ class RaidenOffloadingManager(OffloadingManager):
                 # Save still in flight (should be covered by the in-flight
                 # set above; kept as a consistency net).
                 return LookupResult.HIT_PENDING
-            # REMOTE entries become loadable in phase 4 (read_remote).
+            if status == self._block_status.REMOTE and allow_remote:
+                if h in self._hash_to_admission:
+                    # A read_remote for this sub-hash is already in flight;
+                    # a second launch on the same hash must not race it.
+                    return LookupResult.HIT_PENDING
+                all_local = False
+                remote_slices[h] = block
+                continue
             return LookupResult.MISS
+        if not all_local:
+            self._remote_slices.update(remote_slices)
+            return LookupResult.HIT
         # Learn hits the advisory state has not seen: entries recovered from
         # the shm-backed directory across a restart predate this process, and
         # this keeps touch/prepare_store treating them like our own stores.
@@ -351,7 +425,23 @@ class RaidenOffloadingManager(OffloadingManager):
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
         sub_hashes = self._expand_keys(keys)
-        if not self._store.pin(sub_hashes):
+        # Remote sub-hashes (stashed by the global lookup) are installed and
+        # pinned via insert_and_lock(on_host=True): it inserts the peer
+        # mapping and reserves host landing capacity for new entries, and
+        # only pins (slices untouched) any that became local since the stash
+        # — submit_load_job re-partitions by live status, so a stale stash
+        # entry degenerates to a plain local load.
+        remote_hashes: list[bytes] = []
+        remote_slices: list[object] = []
+        local_hashes: list[bytes] = []
+        for h in sub_hashes:
+            block = self._remote_slices.pop(h, None)
+            if block is not None:
+                remote_hashes.append(h)
+                remote_slices.append(block)
+            else:
+                local_hashes.append(h)
+        if local_hashes and not self._store.pin(local_hashes):
             # Lost the race against eviction between lookup and pin (raiden's
             # pin is all-or-nothing, so nothing is held). The manager
             # interface has no failure return here; hand the connector an
@@ -360,8 +450,22 @@ class RaidenOffloadingManager(OffloadingManager):
             logger.warning(
                 "[kv-offload-v2] prepare_load lost %d sub-blocks for request "
                 "%s to eviction between lookup and pin; the load job will "
-                "fail cleanly and the blocks recompute", len(sub_hashes),
+                "fail cleanly and the blocks recompute", len(local_hashes),
                 req_context.req_id)
+            return RaidenLoadStoreSpec(keys, pinned=False)
+        if remote_hashes and not self._store.insert_and_lock(
+                remote_hashes, remote_slices, on_host=True):
+            # Landing capacity is exhausted (capacity pressure with pinned
+            # entries) — rolled back inside raiden, nothing remote is held.
+            # Never launch read_remote for an uninstalled batch; fail the
+            # job cleanly and let the blocks recompute.
+            if local_hashes:
+                self._store.release(local_hashes)
+            logger.warning(
+                "[kv-offload-v2] prepare_load could not reserve landing "
+                "capacity for %d remote sub-blocks (request %s); the load "
+                "job will fail cleanly and the blocks recompute",
+                len(remote_hashes), req_context.req_id)
             return RaidenLoadStoreSpec(keys, pinned=False)
         return RaidenLoadStoreSpec(keys)
 
@@ -433,6 +537,8 @@ class RaidenOffloadingManager(OffloadingManager):
         self._stored_keys.clear()
         self._inflight_store_keys.clear()
         self._quarantined_keys.clear()
+        self._remote_quarantined_keys.clear()
+        self._remote_slices.clear()
         self._pending_events.clear()
         logger.info(
             "[kv-offload-v2] reset_cache: cleared %d store entries; advisory "
@@ -483,7 +589,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 to_save = list(result.inserted)
                 seen: set[OffloadKey] = set()
                 for h, _ in result.displaced:
-                    key = OffloadKey(h[:-4])
+                    key = self._key_of(h)
                     if key not in seen:
                         seen.add(key)
                         displaced_keys.append(key)
@@ -578,19 +684,65 @@ class RaidenOffloadingManager(OffloadingManager):
             return
         sub_hashes = self._expand_keys(keys)
         device_ids = self._expand_gpu_blocks(gpu_block_ids)
-        if not self._store.load(sub_hashes, device_ids):
-            # Failed launch leaves HOST entries intact; destination blocks
-            # are undefined and vLLM recomputes them.
-            self._store.release(sub_hashes)
+        # Partition by live directory status: REMOTE sub-hashes (installed by
+        # prepare_load's insert_and_lock) are fetched from their peer with
+        # read_remote, everything else comes from the local host pool. The
+        # live peek — not the lookup-time stash — decides, so a sub-hash that
+        # became local in between is simply loaded.
+        remote_hashes: list[bytes] = []
+        remote_device_ids: list[int] = []
+        local_hashes: list[bytes] = []
+        local_device_ids: list[int] = []
+        for h, d in zip(sub_hashes, device_ids):
+            if self._sub_hash_status(h) == self._block_status.REMOTE:
+                remote_hashes.append(h)
+                remote_device_ids.append(d)
+            else:
+                local_hashes.append(h)
+                local_device_ids.append(d)
+
+        def _fail_launch(what: str, in_flight: list[bytes]) -> None:
             logger.error(
-                "[kv-offload-v2] load job %d (req %s): load() launch failed "
-                "for %d sub-blocks", job_id, req_id, len(sub_hashes))
+                "[kv-offload-v2] load job %d (req %s): %s launch failed "
+                "(%d local, %d remote sub-blocks)", job_id, req_id, what,
+                len(local_hashes), len(remote_hashes))
+            if in_flight:
+                # The other launch already succeeded: the job must stay
+                # non-terminal until its transfer resolves, then the
+                # finalizer runs the failure cleanup exactly once.
+                admission = Admission(
+                    job_id=job_id,
+                    op=AdmissionOp.LOAD,
+                    keys=keys,
+                    sub_hashes=sub_hashes,
+                    pending=set(in_flight),
+                    failed=True,
+                    req_id=req_id,
+                    dst_gpu_block_ids=list(gpu_block_ids),
+                    remote_sub_hashes=set(remote_hashes),
+                )
+                self._admissions[job_id] = admission
+                for h in in_flight:
+                    self._hash_to_admission[h] = admission
+                return
+            # Nothing in flight: immediate terminal failure. HOST entries
+            # stay intact; freshly installed REMOTE entries are deleted
+            # (landing blocks freed, the registry keeps the peer mapping).
+            self._store.release_and_delete(sub_hashes)
             self._finished.append(
                 FinishedJob(job_id=job_id,
                             op=AdmissionOp.LOAD,
                             success=False,
                             req_id=req_id,
                             failed_gpu_block_ids=list(gpu_block_ids)))
+
+        if local_hashes and not self._store.load(local_hashes,
+                                                 local_device_ids):
+            _fail_launch("load()", [])
+            return
+        if remote_hashes and not self._store.read_remote(
+                remote_hashes, remote_device_ids):
+            _fail_launch("read_remote()", local_hashes)
             return
         admission = Admission(
             job_id=job_id,
@@ -600,6 +752,7 @@ class RaidenOffloadingManager(OffloadingManager):
             pending=set(sub_hashes),
             req_id=req_id,
             dst_gpu_block_ids=list(gpu_block_ids),
+            remote_sub_hashes=set(remote_hashes),
         )
         self._admissions[job_id] = admission
         for h in sub_hashes:
@@ -616,6 +769,20 @@ class RaidenOffloadingManager(OffloadingManager):
     # -- finalizer --------------------------------------------------------
 
     def _quarantine(self, admission: Admission) -> None:
+        if (admission.op == AdmissionOp.LOAD and admission.remote_sub_hashes
+                and all(h in admission.remote_sub_hashes
+                        for h in admission.failed_sub_hashes)):
+            # Every failed sub-hash was a peer fetch: suppress only the
+            # global fallback for these keys (a dead peer or stale registry
+            # entry must not fail-loop), keep local stores/loads allowed.
+            self._remote_quarantined_keys.update(admission.keys)
+            logger.error(
+                "[kv-offload-v2] remote-quarantining %d keys after a "
+                "terminal read_remote failure (job %d); they fall back to "
+                "local-only (%d keys remote-quarantined in total)",
+                len(admission.keys), admission.job_id,
+                len(self._remote_quarantined_keys))
+            return
         self._quarantined_keys.update(admission.keys)
         logger.error(
             "[kv-offload-v2] quarantining %d keys after a terminal %s "
@@ -646,10 +813,17 @@ class RaidenOffloadingManager(OffloadingManager):
                             op=AdmissionOp.STORE,
                             success=success))
         else:
-            # Loads: release the pins taken in prepare_load. On failure the
-            # HOST entries stay intact; only the destination device blocks
-            # are undefined and get recomputed.
-            self._store.release(admission.sub_hashes)
+            # Loads: release the pins taken in prepare_load. On success a
+            # plain release (remote fetches are HOST_AND_HBM by now). On
+            # failure release_and_delete: HOST entries stay intact, but
+            # still-REMOTE installs from prepare_load are deleted — their
+            # host landing blocks are freed while the registry keeps the
+            # peer mapping. The destination device blocks are undefined
+            # either way and get recomputed.
+            if success:
+                self._store.release(admission.sub_hashes)
+            else:
+                self._store.release_and_delete(admission.sub_hashes)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -665,14 +839,23 @@ class RaidenOffloadingManager(OffloadingManager):
             return
         has_stores = any(a.op == AdmissionOp.STORE
                          for a in self._admissions.values())
-        has_loads = any(a.op == AdmissionOp.LOAD
-                        for a in self._admissions.values())
+        has_loads = any(
+            a.op == AdmissionOp.LOAD and any(h not in a.remote_sub_hashes
+                                             for h in a.pending)
+            for a in self._admissions.values())
+        has_remote = any(
+            a.op == AdmissionOp.LOAD and any(h in a.remote_sub_hashes
+                                             for h in a.pending)
+            for a in self._admissions.values())
         results: list[tuple[list[bytes], list[bytes]]] = []
         if has_stores:
             done, failed, _pending = self._store.poll_save_status()
             results.append((done, failed))
         if has_loads:
             done, failed, _pending = self._store.poll_load_status()
+            results.append((done, failed))
+        if has_remote:
+            done, failed, _pending = self._store.poll_remote_read_status()
             results.append((done, failed))
         # Keyed by job_id: a mixed batch whose last hashes resolve in the
         # same poll (some done, some failed) must finalize exactly once.
@@ -770,20 +953,53 @@ class RaidenOffloadingManager(OffloadingManager):
             time.sleep(0.0005)
 
 
-def derive_shm_model_uid(vllm_config: VllmConfig, *, kernel_block_size: int,
-                         per_block_shape: tuple[int, ...], kv_dtype: object,
-                         gpu_block_size: int, world_size: int,
-                         capacity_kernel_blocks: int) -> str:
+def derive_offload_namespace(vllm_config: VllmConfig, *,
+                             kernel_block_size: int,
+                             per_block_shape: tuple[int, ...],
+                             kv_dtype: object, gpu_block_size: int,
+                             world_size: int, num_kv_cache_groups: int,
+                             num_kv_cache_tensors: int) -> bytes:
+    """Compatibility namespace prefixed to every store/registry key (§4).
+
+    A registry key must never match across incompatible engines: covers
+    model+revision and quantization (weight identity), KV dtype and the
+    kernel-row layout, scheduler and raiden block geometry, the TP shard
+    topology (read_remote pulls per-shard bytes), the KV group/tensor
+    structure, and the block-hash algorithm plus a scheme version. vLLM's
+    prefix-cache hashes themselves are deterministic for every supported
+    algo in the pinned 0.26.0, and already fold in LoRA/MM extras.
+    """
+    model_config = vllm_config.model_config
+    material = repr(
+        (model_config.model, model_config.revision, model_config.quantization,
+         str(kv_dtype), kernel_block_size, per_block_shape, gpu_block_size,
+         world_size, num_kv_cache_groups, num_kv_cache_tensors,
+         vllm_config.cache_config.prefix_caching_hash_algo,
+         "kv-offload-v2-ns1"))
+    return hashlib.sha256(material.encode()).digest()[:16]
+
+
+def derive_shm_model_uid(vllm_config: VllmConfig,
+                         *,
+                         kernel_block_size: int,
+                         per_block_shape: tuple[int, ...],
+                         kv_dtype: object,
+                         gpu_block_size: int,
+                         world_size: int,
+                         capacity_kernel_blocks: int,
+                         key_namespace: bytes = b"") -> str:
     """Deterministic RAIDEN_SHM_MODEL_UID for shm-backed restart recovery.
 
-    Covers everything that must match for recovered host bytes to be valid;
+    Covers everything that must match for recovered host bytes to be valid —
+    including the key namespace, since recovered directory hashes embed it;
     an incompatible restart therefore fails raiden's segment validation and
     cold-starts instead of serving garbage.
     """
     material = repr(
         (vllm_config.model_config.model, vllm_config.model_config.revision,
          str(kv_dtype), kernel_block_size, per_block_shape, gpu_block_size,
-         world_size, capacity_kernel_blocks, "kv-offload-v2-subhash"))
+         world_size, capacity_kernel_blocks, key_namespace,
+         "kv-offload-v2-subhash"))
     return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
@@ -1049,6 +1265,33 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.capacity_kernel_blocks = (self.num_offloaded_blocks *
                                        self.gpu_block_size_factor)
 
+        # Cross-instance KV sharing (phase 4): configured entirely from
+        # kv_connector_extra_config. The registry address turns on global
+        # lookups + read_remote; store_server_ip is the pod IP peers dial to
+        # pull this replica's blocks (bind-and-advertise, so it must be an
+        # IP this process can bind — without it the replica consumes remote
+        # KV but publishes nothing).
+        self.global_registry_address = str(
+            self.extra_config.get("global_registry_address", ""))
+        self.raiden_orchestrator_address = str(
+            self.extra_config.get("raiden_orchestrator_address", ""))
+        self.store_server_ip = str(self.extra_config.get(
+            "store_server_ip", ""))
+
+        # Every store/registry key carries the compatibility namespace, so
+        # incompatible engines can never share registry entries; locally it
+        # is inert.
+        self.key_namespace = derive_offload_namespace(
+            vllm_config,
+            kernel_block_size=kernel_block_size,
+            per_block_shape=per_block_shape,
+            kv_dtype=kv_dtype,
+            gpu_block_size=gpu_block_size,
+            world_size=self.world_size,
+            num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
+            num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
+        )
+
         # Restart recovery: RAIDEN_SHM_KEY (recipe-set) moves the workers'
         # host KV pools and the store's metadata table into shared memory;
         # re-attach and directory recovery then happen inside the plain
@@ -1069,7 +1312,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     kv_dtype=kv_dtype,
                     gpu_block_size=gpu_block_size,
                     world_size=self.world_size,
-                    capacity_kernel_blocks=self.capacity_kernel_blocks))
+                    capacity_kernel_blocks=self.capacity_kernel_blocks,
+                    key_namespace=self.key_namespace))
             logger.info(
                 "[kv-offload-v2] shm recovery enabled: RAIDEN_SHM_KEY=%s "
                 "RAIDEN_SHM_MODEL_UID=%s", os.environ["RAIDEN_SHM_KEY"],
@@ -1093,8 +1337,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.raiden_controller_port = dp_rank + int(
             self.extra_config.get("raiden_controller_port",
                                   _DEFAULT_CONTROLLER_PORT))
+        # With store_server_ip set, the store binds its controller on that
+        # IP (bind-and-advertise), so the workers must dial it there —
+        # 127.0.0.1 would no longer reach the controller.
         self.raiden_controller_host = str(
-            self.extra_config.get("raiden_controller_host", "127.0.0.1"))
+            self.extra_config.get("raiden_controller_host",
+                                  self.store_server_ip or "127.0.0.1"))
         self.raiden_job_name = str(
             self.extra_config.get("raiden_job_name",
                                   f"vllm-offload-{config.engine_id}"))
@@ -1113,6 +1361,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 world_size=self.world_size,
                 raiden_controller_port=self.raiden_controller_port,
                 raiden_job_name=self.raiden_job_name,
+                global_registry_address=self.global_registry_address,
+                raiden_orchestrator_address=self.raiden_orchestrator_address,
+                store_server_ip=self.store_server_ip,
+                key_namespace=self.key_namespace,
             )
         return self._manager
 
