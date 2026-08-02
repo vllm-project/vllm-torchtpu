@@ -31,7 +31,6 @@ from vllm_torchtpu.layers.common.sequence_layout import (
         "sequence_layout_kind",
         "sequence_layout_protocol",
         "sequence_layout_version",
-        "is_decode_only",
     ],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
@@ -77,13 +76,6 @@ class AttentionMetadata(object):
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
-    # True when every scheduled request contributes exactly one token, i.e. the
-    # batch is pure decode. A *meta* field, so it is part of the traced
-    # structure rather than a traced value: layers that keep separate
-    # prefill/decode kernels (KDA) select one on the host and get one compiled
-    # graph per branch. Device-driven layers (GDN) ignore it and keep reading
-    # `request_distribution`.
-    is_decode_only: bool = False
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
@@ -117,8 +109,6 @@ class AttentionMetadataBuilderContext:
     mamba_request_distribution: torch.Tensor | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
-    # See AttentionMetadata.is_decode_only.
-    is_decode_only: bool = False
 
 
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
@@ -232,5 +222,4 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
-            is_decode_only=ctx.is_decode_only,
         )

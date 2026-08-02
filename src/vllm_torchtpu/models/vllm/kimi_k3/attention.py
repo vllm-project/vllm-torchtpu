@@ -388,8 +388,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
         )
-        # The decode op fuses the short convolution, so it replaces `sconv_op`
-        # on the decode path rather than following it.
+        # Built but not dispatched yet: see `_core_attention`. Fuses the short
+        # convolution, so when it is wired in it replaces `sconv_op` rather
+        # than following it.
         self.decode_kda_op = build_kimi_decode_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,
@@ -480,35 +481,19 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         recurrent_cache: torch.Tensor,
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        """Short convolution and KDA recurrence, on whichever path fits.
+        """Short convolution and KDA recurrence.
 
-        `is_decode_only` is a host-side property of the batch, so the branch
-        below selects a kernel rather than a value: one compiled graph per
-        branch, and the runner's dummy runs trace the decode one. Any batch that
-        is not pure decode -- prefill, chunked prefill, or a mix of prefill and
-        decode rows -- goes through the chunked kernel, which treats a 1-token
-        row as a length-1 segment.
+        One path, deliberately. A host-side branch on batch composition cannot
+        work here: vLLM's `TorchCompileWithNoGuardsWrapper` drops every Dynamo
+        guard and traces the model once, so the first trace's branch is frozen
+        into the graph for every later step regardless of the real batch. The
+        chunked kernel handles every composition -- a 1-token row is a
+        length-1 segment -- so it is the only recurrence dispatched here.
+
+        `decode_kda_op` is faster on pure decode but unreachable until the
+        dispatch is device-driven the way GDN's is, which needs the chunked
+        kernel to be cheap on an empty segment list first.
         """
-        if metadata.is_decode_only and not self.use_naive_kda:
-            # Fuses the short convolution, so `sconv_op` is skipped here.
-            return self.decode_kda_op(
-                mixed_qkv,
-                sconv_cache,
-                self.q_conv1d.weight,
-                self.k_conv1d.weight,
-                self.v_conv1d.weight,
-                raw_gate,
-                beta,
-                output_gate,
-                recurrent_cache,
-                self.A_log,
-                self.dt_bias,
-                self.o_norm.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-            )
-
         mixed_qkv = self.sconv_op(
             mixed_qkv,
             sconv_cache,

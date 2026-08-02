@@ -2232,7 +2232,6 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
             sequence_layout_descriptor=layout_plan.descriptor,
-            is_decode_only=is_decode_only,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -3329,9 +3328,6 @@ class TPUModelRunner(GPUModelRunner):
                 position_ids_override=position_ids,
                 mamba_state_indices=dummy_mamba_state_indices,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
-                # Dummy runs schedule one token per request (see
-                # `query_lens` above), so they trace the decode branch.
-                is_decode_only=True,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(

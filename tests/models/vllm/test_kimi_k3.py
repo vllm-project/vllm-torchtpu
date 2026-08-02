@@ -427,8 +427,6 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
-        # Two tokens in one request, so this batch takes the chunked kernel.
-        is_decode_only=False,
     )
     layer._metadata = lambda: metadata
 
@@ -549,8 +547,6 @@ def test_kda_custom_ops_compile_as_one_full_graph(
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
-        # Two tokens in one request, so this batch takes the chunked kernel.
-        is_decode_only=False,
     )
     layer._metadata = lambda: metadata
     hidden_states = torch.ones(2, 4)

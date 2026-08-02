@@ -49,11 +49,10 @@ GATE_LOWER_BOUND = -5.0
 O_NORM_EPS = 1e-5
 L2_EPS = 1e-6
 
-# Which recurrence a test wants. "auto" is production behaviour: the layer picks
-# the decode kernel for a pure-decode batch and the chunked one otherwise.
+# Which recurrence a test wants. "auto" is production behaviour: the chunked
+# kernel for every batch (see `_core_attention` for why there is only one path).
 PATH_AUTO = "auto"
 PATH_NAIVE = "naive"
-PATH_CHUNK = "chunk"
 
 
 # ---------------------------------------------------------------------------
@@ -265,12 +264,11 @@ class _Metadata:
     """
 
     def __init__(self, *, query_start_loc: torch.Tensor,
-                 mamba_state_indices: torch.Tensor, seq_lens: torch.Tensor,
-                 is_decode_only: bool) -> None:
+                 mamba_state_indices: torch.Tensor,
+                 seq_lens: torch.Tensor) -> None:
         self.query_start_loc = query_start_loc
         self.mamba_state_indices = mamba_state_indices
         self.seq_lens = seq_lens
-        self.is_decode_only = is_decode_only
 
 
 def _make_weights(num_heads: int, head_dim: int, hidden_size: int,
@@ -490,16 +488,14 @@ def _run_pair(*,
               hidden_states=None):
     """Run the same batch through the TPU layer and the CPU reference.
 
-    ``path`` selects the recurrence: ``PATH_AUTO`` leaves the layer to choose
-    (decode kernel for a pure-decode batch, chunked otherwise), ``PATH_NAIVE``
-    forces the reference scan, and ``PATH_CHUNK`` forces the chunked kernel even
-    for a pure-decode batch -- which is how the 1-token-segment case gets covered.
+    ``path`` selects the recurrence: ``PATH_AUTO`` is production behaviour (the
+    chunked kernel) and ``PATH_NAIVE`` forces the reference scan.
 
     Returns ``(ref_out, tpu_out, reference, layer)`` where ``reference`` carries
     the updated CPU pools and ``layer.kv_cache`` the TPU ones, so a caller can
     make a second call that continues from this one.
     """
-    assert path in (PATH_AUTO, PATH_NAIVE, PATH_CHUNK)
+    assert path in (PATH_AUTO, PATH_NAIVE)
     num_seqs = len(query_lens)
     num_tokens = sum(query_lens)
     query_start_loc = [0]
@@ -551,7 +547,6 @@ def _run_pair(*,
     query_lens_t = torch.tensor(query_lens, dtype=torch.int32)
     carry = torch.tensor([1 if h else 0 for h in has_initial_state],
                          dtype=torch.int32)
-    is_decode_only = all(q == 1 for q in query_lens) and path != PATH_CHUNK
     meta = _Metadata(
         query_start_loc=qsl.to(device),
         mamba_state_indices=torch.tensor(state_indices,
@@ -559,7 +554,6 @@ def _run_pair(*,
         # The ops read carry-in as seq_len > query_len, so +1 is enough to mark
         # it; the absolute sequence length is not used.
         seq_lens=(query_lens_t + carry).to(device),
-        is_decode_only=is_decode_only,
     )
     layer._metadata = lambda: meta
     positions = torch.arange(num_tokens, dtype=torch.long, device=device)
@@ -706,19 +700,17 @@ def _stub_dispatch_layer(*, use_naive_kda: bool):
     return layer, calls, activations
 
 
-@pytest.mark.parametrize("is_decode_only,use_naive_kda,expected", [
-    (True, False, ["decode"]),
-    (False, False, ["sconv", "chunk"]),
-    (True, True, ["sconv", "naive"]),
-    (False, True, ["sconv", "naive"]),
+@pytest.mark.parametrize("use_naive_kda,expected", [
+    (False, ["sconv", "chunk"]),
+    (True, ["sconv", "naive"]),
 ])
-def test_core_attention_selects_the_expected_ops(is_decode_only, use_naive_kda,
-                                                 expected):
-    """Which of the three recurrences runs, and whether `sconv_op` runs with it.
+def test_core_attention_selects_the_expected_ops(use_naive_kda, expected):
+    """Which recurrence runs, and that `sconv_op` always runs in front of it.
 
-    A host-side branch, so this runs anywhere. It is worth pinning: the decode op
-    fuses the short convolution, so running `sconv_op` in front of it would
-    convolve twice and quietly corrupt every decode step.
+    A host-side branch, so this runs anywhere. Worth pinning even though there
+    is only one composition path: the decode op fuses the short convolution, so
+    if it is ever dispatched here without dropping `sconv_op` the input would be
+    convolved twice and every decode step would be quietly wrong.
     """
     layer, calls, activations = _stub_dispatch_layer(
         use_naive_kda=use_naive_kda)
@@ -726,7 +718,6 @@ def test_core_attention_selects_the_expected_ops(is_decode_only, use_naive_kda,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         mamba_state_indices=torch.tensor([1, 2], dtype=torch.int32),
         seq_lens=torch.tensor([2, 2], dtype=torch.int32),
-        is_decode_only=is_decode_only,
     )
     layer._core_attention(
         activations,
@@ -1073,12 +1064,10 @@ def test_mixed_batch_matches_naive_cpu_reference(query_lens, has_initial_state,
 @requires_tpu
 @pytest.mark.parametrize("num_seqs", [1, 4])
 def test_decode_batch_through_the_chunked_kernel_matches_reference(num_seqs):
-    """A pure-decode batch forced onto the chunked kernel.
+    """A pure-decode batch on the chunked kernel, which is what production runs.
 
-    Not how production dispatches -- the decode kernel is faster -- but it is the
-    property that lets mixed batches take the chunked path: the chunked kernel
-    must be correct on a length-1 segment, where every token is simultaneously
-    the first and last of its chunk.
+    The chunked kernel must be correct on a length-1 segment, where every token
+    is simultaneously the first and last of its chunk.
     """
     state_indices = list(range(1, num_seqs + 1))
     ref_out, tpu_out, reference, layer = _run_pair(
@@ -1090,7 +1079,7 @@ def test_decode_batch_through_the_chunked_kernel_matches_reference(num_seqs):
         lower_bound=GATE_LOWER_BOUND,
         dtype=torch.bfloat16,
         device=torch.device("tpu"),
-        path=PATH_CHUNK,
+        path=PATH_AUTO,
         seed=60 + num_seqs)
 
     tag = f"chunked decode n{num_seqs}"
@@ -1106,8 +1095,8 @@ def test_decode_batch_through_the_chunked_kernel_matches_reference(num_seqs):
     ([1, 1, 1], [True, True, True]),
     ([48, 1], [True, True]),
 ])
-def test_all_three_recurrences_agree(query_lens, has_initial_state):
-    """The three ops must be interchangeable on the same batch.
+def test_both_recurrences_agree(query_lens, has_initial_state):
+    """The dispatched ops must be interchangeable on the same batch.
 
     Each of them handles beta's activation, the output norm, the output gate and
     the recurrent-pool layout separately, so a convention that drifts in one of
@@ -1127,13 +1116,13 @@ def test_all_three_recurrences_agree(query_lens, has_initial_state):
 
     outputs = {}
     states = {}
-    for path in (PATH_AUTO, PATH_CHUNK, PATH_NAIVE):
+    for path in (PATH_AUTO, PATH_NAIVE):
         _, tpu_out, _, layer = _run_pair(**common, path=path)
         outputs[path] = tpu_out
         _, states[path] = _final_pools(layer)
 
     slots = _touched(list(range(1, len(query_lens) + 1)))
-    for path in (PATH_CHUNK, PATH_NAIVE):
+    for path in (PATH_NAIVE, ):
         _assert_close(f"output {PATH_AUTO} vs {path}", outputs[PATH_AUTO],
                       outputs[path], DECODE_RMSE)
         _assert_close(f"recurrent_state {PATH_AUTO} vs {path}",
