@@ -396,6 +396,9 @@ class TPUModelRunner(GPUModelRunner):
         # `initialize_kv_cache` once the mamba pool size is known. See
         # `AttentionMetadata.mamba_slot_read_offsets`.
         self.mamba_slot_read_offsets: torch.Tensor | None = None
+        # req_ids whose read offset has been initialized since they entered
+        # the batch; see `_reset_read_offsets_for_new_requests`.
+        self._mamba_offset_seeded: set[str] = set()
         self._mamba_align_mode: bool = (
             self.vllm_config.cache_config.mamba_cache_mode == "align")
         self._mamba_apc_copier: MambaApcStateCopier | None = None
@@ -2764,6 +2767,10 @@ class TPUModelRunner(GPUModelRunner):
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
             self._flush_mamba_state_seed_copies()
 
+            # A recycled slot/block still carries the previous request's read
+            # offset; clear it before this chunk's forward gathers it.
+            self._reset_read_offsets_for_new_requests(start_index, num_reqs)
+
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices)
             # Async spec: the drafts the target verifies live in the substituted
@@ -2972,6 +2979,86 @@ class TPUModelRunner(GPUModelRunner):
         for group_indices in indices_per_group:
             self.mamba_slot_read_offsets.index_put_((group_indices.long(), ),
                                                     offsets)
+
+    def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
+        """This chunk's mamba state slot/block ids, one tensor per group.
+
+        The compact pool shares one slot tensor across every mamba group, so
+        it yields a single-element list; the unified pool allocates a
+        distinct state block per group and the group builders collect them
+        during the metadata build.
+        """
+        ctx = self._attn_metadata_builder_ctx
+        if self.mamba_slot_read_offsets is None or ctx is None:
+            return None
+        if ctx.mamba_state_indices is not None:
+            return [ctx.mamba_state_indices]
+        return ctx.unified_mamba_state_indices
+
+    @torch.no_grad()
+    def _reset_read_offsets_for_new_requests(self, start_index: int,
+                                             num_reqs: int) -> None:
+        """Zero the read offset of every request entering the batch.
+
+        `mamba_slot_read_offsets` is indexed by slot/block id, but a slot
+        outlives the request that wrote it. A request that leaves the batch
+        mid-verify-window leaves `num_accepted - 1` behind, and both layouts
+        hand that storage straight to the next request:
+
+          * compact -- `_build_mamba_state_indices` returns the slot to
+            `_free_mamba_slots` and pops it for a new req_id;
+          * unified -- vLLM's block manager frees the state block and
+            reallocates it.
+
+        Nothing else clears the entry. `_update_mamba_slot_read_offsets`
+        only covers requests already in the batch and runs *after* the
+        forward, and the seed-copy migration is doubly gated (align mode
+        and the unified layout), so it never runs for a compact/`none`
+        deployment at all. The new owner's first forward would then resume
+        from a checkpoint belonging to the previous conversation — silent
+        GDN state corruption, not a crash.
+
+        The scatter is issued UNCONDITIONALLY, every step, whether or not
+        any request is new. Under EP-DP lockstep every rank must run the
+        same device program, and which requests are new is rank-local: an
+        early return on "nothing to reset" makes one rank skip device work
+        its peers perform, they fall out of step, and the next collective
+        deadlocks. The mask makes an all-old batch a no-op instead —
+        already-seen requests and padded positions are redirected to slot 0,
+        the null block, whose offset is 0 regardless.
+        """
+        if self.mamba_slot_read_offsets is None:
+            return
+        groups = self._mamba_state_index_groups()
+        if not groups:
+            return
+        req_ids = self.input_batch.req_ids
+        # Forget requests that have left, so a later req_id reusing the same
+        # string is still treated as new.
+        self._mamba_offset_seeded &= set(
+            self.input_batch.req_id_to_index.keys())
+
+        width = groups[0].shape[0]
+        keep = torch.zeros(width, dtype=torch.bool)
+        for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
+            req_id = req_ids[start_index + i]
+            if req_id is None or i >= width:
+                continue
+            if req_id not in self._mamba_offset_seeded:
+                self._mamba_offset_seeded.add(req_id)
+                keep[i] = True
+        # No `if nothing_new: return` here — see the docstring. The device
+        # work below must be issued on every rank on every step.
+        keep_dev = keep.to(groups[0].device, non_blocking=True)
+        zeros = torch.zeros(width,
+                            dtype=self.mamba_slot_read_offsets.dtype,
+                            device=self.mamba_slot_read_offsets.device)
+        for group_indices in groups:
+            # Non-new rows collapse onto the null slot; writing 0 there is a
+            # no-op, which keeps this scatter one fixed shape.
+            targets = torch.where(keep_dev, group_indices,
+                                  torch.zeros_like(group_indices))
+            self.mamba_slot_read_offsets.index_put_((targets.long(), ), zeros)
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"

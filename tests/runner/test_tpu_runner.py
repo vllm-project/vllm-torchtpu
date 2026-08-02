@@ -1869,6 +1869,83 @@ class TestMambaSlotReadOffsets:
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
 
 
+class TestReadOffsetsClearedOnReallocation:
+    """A recycled slot/block must not carry a read offset into its next owner.
+
+    `mamba_slot_read_offsets` is indexed by slot/block id, not by request.
+    When a request leaves mid-verify-window its `num_accepted - 1` stays in
+    the buffer, and both layouts hand that storage to the next request --
+    compact via `_free_mamba_slots`, unified via the block manager. The new
+    owner's first forward would then resume from a checkpoint belonging to
+    the previous conversation: silent GDN state corruption, no crash.
+    """
+
+    def _make_runner(self, num_blocks=8, width=2):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
+                                                     dtype=torch.int32)
+        runner._mamba_offset_seeded = set()
+        runner.input_batch = MagicMock()
+        runner._mamba_state_index_groups = (
+            TPUModelRunner._mamba_state_index_groups.__get__(runner))
+        runner._reset_read_offsets_for_new_requests = (
+            TPUModelRunner._reset_read_offsets_for_new_requests.__get__(runner)
+        )
+        return runner
+
+    def _set_batch(self, runner, req_ids, state_indices):
+        runner.input_batch.req_ids = list(req_ids)
+        runner.input_batch.req_id_to_index = {
+            r: i
+            for i, r in enumerate(req_ids)
+        }
+        ctx = MagicMock()
+        ctx.mamba_state_indices = torch.tensor(state_indices,
+                                               dtype=torch.int32)
+        ctx.unified_mamba_state_indices = None
+        runner._attn_metadata_builder_ctx = ctx
+
+    def test_recycled_slot_does_not_inherit_stale_offset(self):
+        runner = self._make_runner()
+        # Request "a" owns slot 5 and ended a verify step having accepted 3
+        # tokens, so slot 5 carries offset 2.
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner.mamba_slot_read_offsets[5] = 2
+
+        # "a" leaves; a new conversation "b" is handed the same slot.
+        self._set_batch(runner, ["b"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+
+        assert int(runner.mamba_slot_read_offsets[5]) == 0, (
+            "new request inherited the previous request's checkpoint")
+
+    def test_continuing_request_keeps_its_offset(self):
+        """The reset must not clobber a request still mid-window."""
+        runner = self._make_runner()
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner.mamba_slot_read_offsets[5] = 2
+
+        # Same request, next step: its offset is still live.
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert int(runner.mamba_slot_read_offsets[5]) == 2
+
+    def test_null_slot_absorbs_padded_and_seen_rows(self):
+        runner = self._make_runner()
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        runner.mamba_slot_read_offsets[5] = 2
+        runner.mamba_slot_read_offsets[6] = 1
+
+        # "a" stays, "c" replaces "b" on slot 6.
+        self._set_batch(runner, ["a", "c"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert int(runner.mamba_slot_read_offsets[5]) == 2  # untouched
+        assert int(runner.mamba_slot_read_offsets[6]) == 0  # cleared
+        assert int(runner.mamba_slot_read_offsets[0]) == 0  # null stays 0
+
+
 class TestUnifiedReadOffsetMigration:
     """The align-mode seed-copy collector must migrate the per-block read
     offsets together with the state when a request's state block moves."""
