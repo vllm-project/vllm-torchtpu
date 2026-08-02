@@ -53,6 +53,7 @@ from vllm_torchtpu.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
@@ -123,12 +124,6 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return None
 
 
-def _get_activation_str(activation) -> str:
-    """Convert MoEActivation enum or string to plain string."""
-    return activation.value if hasattr(activation,
-                                       'value') else str(activation)
-
-
 class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """
     TPU-native implementation of unquantized RoutedExperts.
@@ -157,7 +152,8 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Pre-compute activation string: layer.activation is a MoEActivation
         # enum in v0.17.1 but the Pallas kernel expects a plain string.
         # Resolve here (outside torch.compile) and stash on the layer.
-        activation_str = _get_activation_str(layer.activation)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
         layer._tpu_activation_str = activation_str
 
         w13_weight = layer.w13_weight.data

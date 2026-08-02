@@ -1,26 +1,23 @@
 {
   "isl1024_osl1024_c64": {
     "completed": 320,
-    "median_tpot_ms": 32.202297569364184,
-    "median_ttft_ms": 179.66524953953922,
+    "median_tpot_ms": 28.596782990276182,
     "num_prompts": 320,
-    "output_token_throughput": 1720.583598610166,
-    "total_token_throughput": 3434.605845014321
+    "output_token_throughput": 2110.5144365553924,
+    "total_token_throughput": 4219.906110696252
   },
   "isl1024_osl8192_c64": {
-    "completed": 319,
-    "median_tpot_ms": 30.906860666839773,
-    "median_ttft_ms": 184.75619796663523,
+    "completed": 320,
+    "median_tpot_ms": 26.7753138162695,
     "num_prompts": 320,
-    "output_token_throughput": 1790.5713628312103,
-    "total_token_throughput": 2013.5971757060338
+    "output_token_throughput": 2240.8021487228266,
+    "total_token_throughput": 2520.869184965272
   },
   "isl8192_osl1024_c64": {
     "completed": 320,
-    "median_tpot_ms": 63.70884297592157,
-    "median_ttft_ms": 879.1078794747591,
+    "median_tpot_ms": 53.36636206247191,
     "num_prompts": 320,
-    "output_token_throughput": 910.663008317546,
-    "total_token_throughput": 8168.012989116838
+    "output_token_throughput": 1133.613461421795,
+    "total_token_throughput": 10193.96299938773
   }
 }

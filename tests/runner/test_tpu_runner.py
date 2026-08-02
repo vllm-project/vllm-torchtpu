@@ -176,56 +176,64 @@ def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
         )
 
 
+def _fake_phased_runner(additional_config=None,
+                        torch_profiler_dir="/tmp/phased",
+                        max_iterations=0,
+                        delay_iterations=0,
+                        profiler_rank=2,
+                        profiler_world_size=4):
+    """A stand-in for TPUModelRunner carrying only what phased profiling reads.
+
+    No parallel_config: the phased profiler must not reach for it.
+    """
+    return SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config=additional_config
+                                    if additional_config is not None else {},
+                                    profiler_config=SimpleNamespace(
+                                        torch_profiler_dir=torch_profiler_dir,
+                                        max_iterations=max_iterations,
+                                        delay_iterations=delay_iterations)),
+        _profiler_rank=profiler_rank,
+        _profiler_world_size=profiler_world_size,
+    )
+
+
+def _init_phased_runner(monkeypatch, phased_enabled=True, **runner_kwargs):
+    """Build a fake runner and run _init_phased_profiling over it.
+
+    `phased_enabled` drives only the env var, independently of the trace
+    directory, so a test can exercise either guard in isolation.
+    """
+    if phased_enabled:
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+    else:
+        monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
+    runner = _fake_phased_runner(**runner_kwargs)
+    TPUModelRunner._init_phased_profiling(runner)
+    return runner
+
+
 class TestInitPhasedProfiling:
-    """Verify _init_phased_profiling reads from additional_config/profiler_config
-    instead of PHASED_PROFILER_* env vars."""
+    """Verify _init_phased_profiling is selected by USE_PHASED_PROFILER and
+    reads its directory from profiler_config. It only resolves the directory;
+    start_phased_profiling/stop_phased_profiling (below) own arming the
+    profiler itself, since that is now triggered from TPUWorker.profile()."""
 
-    def _fake_runner(self,
-                     additional_config,
-                     max_iterations=0,
-                     delay_iterations=0,
-                     profiler_rank=2,
-                     profiler_world_size=4):
-        # No parallel_config: the phased profiler must not reach for it.
-        return SimpleNamespace(
-            vllm_config=SimpleNamespace(
-                additional_config=additional_config,
-                profiler_config=SimpleNamespace(
-                    max_iterations=max_iterations,
-                    delay_iterations=delay_iterations)),
-            _profiler_rank=profiler_rank,
-            _profiler_world_size=profiler_world_size,
-        )
-
-    def test_disabled_when_dir_not_set(self):
-        runner = self._fake_runner(additional_config={})
-        TPUModelRunner._init_phased_profiling(runner)
+    def test_disabled_when_env_not_set(self, monkeypatch):
+        runner = _init_phased_runner(monkeypatch, phased_enabled=False)
         assert runner.phased_profiling_dir == ""
         assert runner.phase_based_profiler is None
 
-    def test_enabled_uses_config_values(self):
-        runner = self._fake_runner(
-            additional_config={
-                "phased_profiling_dir": "/tmp/phased",
-                "phased_profiler_decode_only_kv_len_threshold": 128,
-            },
-            max_iterations=20,
-            delay_iterations=3,
-        )
-        with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
-        ) as mock_profiler_cls:
-            TPUModelRunner._init_phased_profiling(runner)
+    def test_disabled_when_dir_not_set(self, monkeypatch):
+        """The env var alone is not enough; traces need somewhere to go."""
+        runner = _init_phased_runner(monkeypatch, torch_profiler_dir="")
+        assert runner.phased_profiling_dir == ""
+        assert runner.phase_based_profiler is None
 
+    def test_enabled_resolves_dir_without_arming(self, monkeypatch):
+        runner = _init_phased_runner(monkeypatch)
         assert runner.phased_profiling_dir == "/tmp/phased"
-        mock_profiler_cls.assert_called_once_with(
-            "/tmp/phased",
-            worker_rank=2,
-            world_size=4,
-            num_steps_to_profile_for=20,
-            num_decode_steps_to_skip=3,
-            decode_kv_len_threshold=128,
-        )
+        assert runner.phase_based_profiler is None
 
     def test_profiler_rank_kwargs_have_no_default(self):
         """Guards the reason they are required.
@@ -240,33 +248,96 @@ class TestInitPhasedProfiling:
             assert params[name].default is inspect.Parameter.empty
             assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
 
-    def test_uses_worker_supplied_slice_global_rank(self):
-        """parallel_config.rank is TPxPP-scoped: every DP replica calls itself
-        rank 0, so their traces would collide. The worker passes the
-        slice-global rank instead, and it is the only source."""
-        runner = self._fake_runner(
-            additional_config={"phased_profiling_dir": "/tmp/phased"},
-            profiler_rank=9,
-            profiler_world_size=16,
+
+class TestStartStopPhasedProfiling:
+    """start_phased_profiling/stop_phased_profiling arm/disarm the phase
+    profiler; TPUWorker.profile() is the only caller, mirroring how it
+    start/stops the standard torch profiler."""
+
+    def test_start_when_dir_not_set_warns_and_noops(self, monkeypatch):
+        """Phased mode is on, but there is nowhere to write traces."""
+        runner = _init_phased_runner(monkeypatch, torch_profiler_dir="")
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(runner)
+
+        mock_profiler_cls.assert_not_called()
+        assert runner.phase_based_profiler is None
+
+    def test_start_uses_config_values(self, monkeypatch):
+        runner = _init_phased_runner(
+            monkeypatch,
+            additional_config={
+                "phased_profiler_decode_only_kv_len_threshold": 128,
+            },
+            max_iterations=20,
+            delay_iterations=3,
         )
         with patch(
                 "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
-            TPUModelRunner._init_phased_profiling(runner)
+            TPUModelRunner.start_phased_profiling(runner)
+
+        mock_profiler_cls.assert_called_once_with(
+            "/tmp/phased",
+            worker_rank=2,
+            world_size=4,
+            num_steps_to_profile_for=20,
+            num_decode_steps_to_skip=3,
+            decode_kv_len_threshold=128,
+        )
+        assert runner.phase_based_profiler is mock_profiler_cls.return_value
+
+    def test_profile_prefix_scopes_the_phase_dirs(self, monkeypatch):
+        """Same scoping the standard profiler gives /start_profile's prefix:
+        it names the run, and the phase subdirectories sit beneath it."""
+        runner = _init_phased_runner(monkeypatch)
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(runner, "decode")
+
+        assert mock_profiler_cls.call_args.args[0] == "/tmp/phased/decode"
+
+    def test_start_twice_is_a_noop(self, monkeypatch):
+        """Already armed; a second /start_profile must not replace it and
+        lose the phases it has already marked as seen."""
+        runner = _init_phased_runner(monkeypatch)
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(runner)
+            first_profiler = runner.phase_based_profiler
+            TPUModelRunner.start_phased_profiling(runner)
+
+        mock_profiler_cls.assert_called_once()
+        assert runner.phase_based_profiler is first_profiler
+
+    def test_uses_worker_supplied_slice_global_rank(self, monkeypatch):
+        """parallel_config.rank is TPxPP-scoped: every DP replica calls itself
+        rank 0, so their traces would collide. The worker passes the
+        slice-global rank instead, and it is the only source."""
+        runner = _init_phased_runner(monkeypatch,
+                                     profiler_rank=9,
+                                     profiler_world_size=16)
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(runner)
 
         assert mock_profiler_cls.call_args.kwargs["worker_rank"] == 9
         assert mock_profiler_cls.call_args.kwargs["world_size"] == 16
 
-    def test_falls_back_to_default_num_steps_when_max_iterations_unset(self):
-        runner = self._fake_runner(
-            additional_config={"phased_profiling_dir": "/tmp/phased"},
-            max_iterations=0,
-            delay_iterations=0,
-        )
+    def test_falls_back_to_default_num_steps_when_max_iterations_unset(
+            self, monkeypatch):
+        runner = _init_phased_runner(monkeypatch,
+                                     max_iterations=0,
+                                     delay_iterations=0)
         with patch(
                 "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
-            TPUModelRunner._init_phased_profiling(runner)
+            TPUModelRunner.start_phased_profiling(runner)
 
         assert (
             mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] ==
@@ -274,6 +345,26 @@ class TestInitPhasedProfiling:
         assert (
             mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"] ==
             runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+
+    def test_stop_finishes_and_clears_the_profiler(self, monkeypatch):
+        runner = _init_phased_runner(monkeypatch)
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(runner)
+            armed_profiler = mock_profiler_cls.return_value
+
+            TPUModelRunner.stop_phased_profiling(runner)
+
+        armed_profiler.finish.assert_called_once_with()
+        assert runner.phase_based_profiler is None
+
+    def test_stop_when_not_running_warns_and_noops(self, monkeypatch):
+        runner = _init_phased_runner(monkeypatch)
+
+        TPUModelRunner.stop_phased_profiling(runner)
+
+        assert runner.phase_based_profiler is None
 
 
 class DummyMamba(MambaBase):

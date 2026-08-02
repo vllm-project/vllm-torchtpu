@@ -19,6 +19,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+pytestmark = pytest.mark.multichip
+
 P = jax.sharding.PartitionSpec
 AXIS = "pcp"
 BLOCK = 16

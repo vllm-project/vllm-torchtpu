@@ -27,6 +27,8 @@ from vllm_torchtpu.kernels.collectives import util
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import \
     broadcast_minor
 
+pytestmark = pytest.mark.multichip
+
 P = jax.sharding.PartitionSpec
 AXIS = "pcp"
 PCP_SIZE = 4

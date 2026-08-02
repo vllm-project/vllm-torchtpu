@@ -9,7 +9,9 @@ repos:
     rev: v5.0.0
     hooks:
     -   id: check-yaml
-        exclude: ^mkdocs\.yml$ # Exclude mkdocs.yml from this check
+        # mkdocs.yml uses mkdocs-specific tags; the lm_eval_tasks yamls use
+        # lm-eval's !function tag. Neither parses with plain safe_load.
+        exclude: ^(mkdocs\.yml|scripts/vllm/benchmarking/lm_eval_tasks/.*\.ya?ml)$
     -   id: end-of-file-fixer
     -   id: trailing-whitespace
 - repo: https://github.com/PyCQA/isort

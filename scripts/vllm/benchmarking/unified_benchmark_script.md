@@ -6,8 +6,6 @@ Use one terminal for the server and another for the benchmark client.
 ## Server
 
 ```bash
-export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
-
 vllm serve --model=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
   --tensor-parallel-size=8 --data-parallel-size=1 \
   --max-model-len=16384 --max-num-batched-tokens=8192 --max-num-seqs=512 \

@@ -25,6 +25,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
 
 
@@ -226,8 +227,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         except Exception:
             pass
 
-        activation_str = (layer.activation if isinstance(
-            layer.activation, str) else layer.activation.value)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
         moe_routing.register_experts_start_buffer(
             layer, device=layer.w13_weight_packed.device)
         prebuild_fused_moe_kernel(
@@ -244,8 +245,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = (layer.activation if isinstance(
-            layer.activation, str) else layer.activation.value)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
 
         # Handle custom routing function if present
         custom_routing_fn = getattr(layer, "custom_routing_function", None)

@@ -1,0 +1,33 @@
+# mbpp_plus (EvalPlus dataset) scored with evalplus-style instruct protocol:
+# chat request + code-block extraction (see utils.extract_code), and — unlike
+# the bundled mbpp[_plus] tasks, which only check the 3 base assertions in
+# test_list — graded against the dataset's full "plus" test suite ({{test}}),
+# which is what evalplus's MBPP+ number measures. The bundled instruct
+# variants rely on gen_prefix assistant-prefill, which OpenAI-style chat APIs
+# cannot do. The filter is named none to keep the historical metric key
+# ("pass_at_1,none") used by check_regression.py / upload_results.py.
+task: mbpp_plus_tpu
+dataset_path: evalplus/mbppplus
+dataset_name: null
+unsafe_code: true
+output_type: generate_until
+test_split: test
+doc_to_text: "You are an expert Python programmer, and here is your task:\n{{ prompt }}\nYour code should satisfy the following assertion:\n```python\n{{ test_list[0] }}\n```\nReply with the complete function in a Python markdown code block."
+doc_to_target: "{{test}}"
+metric_list:
+  - metric: !function utils.pass_at_1
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until: []
+  max_gen_toks: 2048
+  do_sample: false
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "none"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.extract_code
+metadata:
+  version: 2.0

@@ -214,6 +214,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.kv_b_proj = mla_modules.kv_b_proj
         self.rotary_emb = mla_modules.rotary_emb
         self.o_proj = mla_modules.o_proj
+        self.g_proj = getattr(mla_modules, "g_proj", None)
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
@@ -313,6 +314,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                           self.num_heads * self.v_head_dim),
         )
 
+        if self.g_proj is not None:
+            attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         return self.o_proj(attn_out)[0]
 
 

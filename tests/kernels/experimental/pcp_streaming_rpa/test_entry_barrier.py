@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.multichip
+
 WORLD_SIZE = 8
 PAGE_SIZE = 256
 LOCAL_PADDED_TOKENS = 2048

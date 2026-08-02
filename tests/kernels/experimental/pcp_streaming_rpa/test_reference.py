@@ -19,6 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import pytest
 from schedule_reference import \
     generate_pcp_streaming_schedule_reference  # noqa: E402
 
@@ -26,6 +27,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     build_pcp_rank_major_token_order
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import \
     execute_pcp_streaming_reference
+
+pytestmark = pytest.mark.multichip
 
 
 def _pack_q_rank_major(q_full, token_order, pcp_size):
