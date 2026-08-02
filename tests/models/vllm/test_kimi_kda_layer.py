@@ -1,9 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Module-level accuracy tests for the TPU Kimi KDA layer.
 
-Validates ``KimiK3DeltaAttention`` end to end -- projections, short conv1d, KDA
+Validates ``KimiDeltaAttention`` end to end -- projections, short conv1d, KDA
 recurrence, gated norm, output projection and both KV-state pools -- against a
 naive float32 CPU reference in this file.
+
+Three interchangeable recurrences live behind the layer's one signature and all
+three are covered here:
+
+* ``decode_kda_op`` -- fused conv + recurrent Pallas kernel, one token per
+  sequence. Selected when the batch is pure decode.
+* ``chunk_kda_op`` -- chunked Pallas kernel. Selected for everything else, and
+  correct for a 1-token row too (it is just a length-1 segment).
+* ``kda_op`` -- the plain-XLA reference scan, selected for every batch when
+  ``VLLM_TPU_USE_NAIVE_KDA=1``.
+
+Every kernel here reads the recurrent pool as ``[num_slots, H, K, V]``.
 """
 
 from __future__ import annotations
@@ -14,8 +26,8 @@ from torch import nn
 from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
 
-from vllm_torchtpu.models.kimi_k3.kda import (GatedRMSNormSigmoid, KdaMetadata,
-                                              KimiK3DeltaAttention)
+import vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op as kda_ops
+from vllm_torchtpu.models.vllm.kimi_k3.attention import KimiDeltaAttention
 
 
 def _has_tpu() -> bool:
@@ -33,14 +45,20 @@ requires_tpu = pytest.mark.skipif(not _has_tpu(),
 # over every token. head_dim 64 and 128 are both exercised because 128 is the
 # real checkpoint's value and the kernels tile the channel axis.
 CONV_SIZE = 4
-# The layer's opt-in switch to the naive recurrence. Tests that care which
-# path runs set or clear it explicitly rather than inheriting the shell's.
-NAIVE_ENV = "TPU_VLLM_USE_NAIVE_KDA"
 GATE_LOWER_BOUND = -5.0
 O_NORM_EPS = 1e-5
 L2_EPS = 1e-6
 
+# Which recurrence a test wants. "auto" is production behaviour: the layer picks
+# the decode kernel for a pure-decode batch and the chunked one otherwise.
+PATH_AUTO = "auto"
+PATH_NAIVE = "naive"
+PATH_CHUNK = "chunk"
 
+
+# ---------------------------------------------------------------------------
+# The reference
+# ---------------------------------------------------------------------------
 class ReferenceKDALayer:
     """Naive float32 CPU implementation of the whole KDA module."""
 
@@ -124,8 +142,7 @@ class ReferenceKDALayer:
         is ``[t, num_heads]``. The state ``S`` is ``[num_heads, K, V]``.
         """
         if has_init:
-            # Stored transposed; the recurrence works in [K, V].
-            state = self.recurrent_state[slot].transpose(-1, -2).clone()
+            state = self.recurrent_state[slot].clone()
         else:
             state = torch.zeros(self.num_heads, self.head_dim, self.head_dim)
 
@@ -143,7 +160,7 @@ class ReferenceKDALayer:
             state = state + torch.einsum("hk,hv->hkv", k_t, v_new)
             out[t] = torch.einsum("hk,hkv->hv", q_t, state)
 
-        self.recurrent_state[slot] = state.transpose(-1, -2)
+        self.recurrent_state[slot] = state
         return out
 
     # -- the module ---------------------------------------------------------
@@ -223,12 +240,37 @@ class _WrappedLinear(nn.Module):
 
 
 class _ConvHolder(nn.Module):
-    """Holds ``weight`` of shape ``[3 * proj, 1, conv_size]`` and a null bias."""
+    """Holds ``weight`` of shape ``[proj, 1, conv_size]``, like ``CausalDepthwiseConv1d``."""
 
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
         self.weight = nn.Parameter(weight.unsqueeze(1))
-        self.bias = None
+
+
+class _NormWeight(nn.Module):
+    """Stand-in for ``RMSNorm``: only ``weight`` is read, by the kernels."""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight)
+
+
+class _Metadata:
+    """The subset of ``AttentionMetadata`` the KDA layer reads.
+
+    Constructed directly rather than through the real builder, which needs a
+    runner and an initialized KV cache. ``seq_lens`` carries the carry-in flag
+    the way the production metadata does: a sequence carries state iff its
+    ``seq_len`` exceeds the number of tokens scheduled for it this step.
+    """
+
+    def __init__(self, *, query_start_loc: torch.Tensor,
+                 mamba_state_indices: torch.Tensor, seq_lens: torch.Tensor,
+                 is_decode_only: bool) -> None:
+        self.query_start_loc = query_start_loc
+        self.mamba_state_indices = mamba_state_indices
+        self.seq_lens = seq_lens
+        self.is_decode_only = is_decode_only
 
 
 def _make_weights(num_heads: int, head_dim: int, hidden_size: int,
@@ -262,65 +304,95 @@ def _make_weights(num_heads: int, head_dim: int, hidden_size: int,
 
 def _build_tpu_layer(weights: dict[str, torch.Tensor], num_heads: int,
                      head_dim: int, hidden_size: int, conv_size: int,
-                     lower_bound: float | None, dtype, device):
-    """Hand-build ``KimiK3DeltaAttention`` on the given weights.
+                     lower_bound: float | None, dtype, device, *,
+                     use_naive_kda: bool):
+    """Hand-build ``KimiDeltaAttention`` on the given weights.
 
-    The real ``__init__`` builds vLLM parallel linears, which needs an initialized
-    TP group, which needs a ``ModelConfig`` -- i.e. a model on disk. This bypasses
-    that and substitutes plain ``nn.Linear``, which at TP=1 is numerically
-    identical (``nn.Linear.weight`` is ``[out, in]``, same as
-    ``ColumnParallelLinear``'s and ``ReplicatedLinear``'s).
+    The real ``__init__`` builds vLLM parallel linears, which needs an
+    initialized TP group, which needs a ``ModelConfig`` -- i.e. a model on disk.
+    This bypasses that and substitutes plain ``nn.Linear``, which at TP=1 is
+    numerically identical (``nn.Linear.weight`` is ``[out, in]``, same as
+    ``ColumnParallelLinear``'s and ``ReplicatedLinear``'s). The custom ops are
+    the real ones.
 
-    ``_assert_layer_attrs`` below is the guard against this drifting from the real
-    ``__init__``.
+    ``_assert_layer_attrs`` below is the guard against this drifting from the
+    real ``__init__``.
     """
-    m = object.__new__(KimiK3DeltaAttention)
+    m = object.__new__(KimiDeltaAttention)
     nn.Module.__init__(m)
 
     proj = num_heads * head_dim
-    m.prefix = "model.layers.0.kda"
+    m.prefix = "model.layers.0.linear_attn"
     m.head_dim = head_dim
+    m.total_heads = num_heads
     m.num_heads = num_heads
     m.tp_size = 1
-    m.local_num_heads = num_heads
     m.projection_size = proj
     m.local_projection_size = proj
     m.conv_size = conv_size
     m.gate_lower_bound = lower_bound
-    m.hidden_size = hidden_size
-    m._chunk_op = None
-    m._decode_op = None
+    m.use_full_rank_gate = True
     m.kv_cache = None
+    m.use_naive_kda = use_naive_kda
 
     def to_dev(t, dt):
         return t.detach().clone().to(dt).to(device)
 
-    m.in_proj_qkv = _WrappedLinear(to_dev(weights["in_proj_qkv"], dtype))
+    # The layer projects q, k and v separately and concatenates; the reference
+    # keeps one [3 * proj, hidden] weight. Same GEMM, so split it three ways.
+    q_w, k_w, v_w = weights["in_proj_qkv"].split(proj, dim=0)
+    m.q_proj = _WrappedLinear(to_dev(q_w, dtype))
+    m.k_proj = _WrappedLinear(to_dev(k_w, dtype))
+    m.v_proj = _WrappedLinear(to_dev(v_w, dtype))
     m.g_proj = _WrappedLinear(to_dev(weights["g_proj"], dtype))
     m.f_a_proj = _WrappedLinear(to_dev(weights["f_a_proj"], dtype))
     m.b_proj = _WrappedLinear(to_dev(weights["b_proj"], dtype))
     m.f_b_proj = _WrappedLinear(to_dev(weights["f_b_proj"], dtype))
     m.o_proj = _WrappedLinear(to_dev(weights["o_proj"], dtype))
-    # conv1d, dt_bias and A_log are float32 in the layer.
-    m.conv1d = _ConvHolder(to_dev(weights["conv1d"], torch.float32))
+    # Same split for the depthwise convolution, which the layer also keeps per
+    # projection. conv1d, dt_bias and A_log are float32 in the layer.
+    q_c, k_c, v_c = weights["conv1d"].split(proj, dim=0)
+    m.q_conv1d = _ConvHolder(to_dev(q_c, torch.float32))
+    m.k_conv1d = _ConvHolder(to_dev(k_c, torch.float32))
+    m.v_conv1d = _ConvHolder(to_dev(v_c, torch.float32))
     m.dt_bias = nn.Parameter(to_dev(weights["dt_bias"], torch.float32))
     m.A_log = nn.Parameter(to_dev(weights["A_log"], torch.float32))
+    m.o_norm = _NormWeight(to_dev(weights["o_norm"], torch.float32))
 
-    m.o_norm = GatedRMSNormSigmoid(head_dim, eps=O_NORM_EPS).to(device)
-    m.o_norm.weight.data = to_dev(weights["o_norm"], torch.float32)
+    m.sconv_op = kda_ops.build_kimi_sconv_op(
+        m.prefix,
+        kernel_size=conv_size,
+        state_dim_first=is_conv_state_dim_first(),
+    )
+    m.kda_op = kda_ops.build_kimi_kda_op(
+        m.prefix,
+        lower_bound=lower_bound,
+        eps=O_NORM_EPS,
+    )
+    m.chunk_kda_op = kda_ops.build_kimi_chunk_kda_op(
+        m.prefix,
+        lower_bound=lower_bound,
+        eps=O_NORM_EPS,
+    )
+    m.decode_kda_op = kda_ops.build_kimi_decode_kda_op(
+        m.prefix,
+        lower_bound=lower_bound,
+        eps=O_NORM_EPS,
+        state_dim_first=is_conv_state_dim_first(),
+    )
     return m
 
 
 def _assert_layer_attrs(layer) -> None:
     """Fail loudly if the layer grows a projection this harness does not set.
 
-    The hand-build above skips ``__init__``, so a new submodule added to the layer
-    would otherwise surface as an ``AttributeError`` deep inside ``forward`` --
-    or worse, as a silently stale value from a previous test.
+    The hand-build above skips ``__init__``, so a new submodule added to the
+    layer would otherwise surface as an ``AttributeError`` deep inside
+    ``forward`` -- or worse, as a silently stale value from a previous test.
     """
     expected = {
-        "in_proj_qkv", "g_proj", "f_a_proj", "b_proj", "f_b_proj", "o_proj",
-        "conv1d", "o_norm"
+        "q_proj", "k_proj", "v_proj", "g_proj", "f_a_proj", "b_proj",
+        "f_b_proj", "o_proj", "q_conv1d", "k_conv1d", "v_conv1d", "o_norm"
     }
     actual = {name for name, _ in layer.named_children()}
     assert actual == expected, (
@@ -349,7 +421,7 @@ def _assert_close(name: str, ref: torch.Tensor, got: torch.Tensor,
     rmse = (ref - got).pow(2).mean().sqrt().item()
     base = ref.pow(2).mean().sqrt().item()
     rel = rmse / (base + 1e-8)
-    print(f"{name:>34} | max_abs={max_abs:.6f} | rmse_rel={rel:.6f} "
+    print(f"{name:>38} | max_abs={max_abs:.6f} | rmse_rel={rel:.6f} "
           f"| thr={rmse_ratio}")
     assert rel < rmse_ratio, (
         f"{name}: rmse_rel {rel:.6f} >= {rmse_ratio} (max_abs {max_abs:.6f})")
@@ -410,6 +482,7 @@ def _run_pair(*,
               dtype,
               device,
               seed,
+              path=PATH_AUTO,
               conv_state=None,
               recurrent_state=None,
               weights=None,
@@ -417,10 +490,16 @@ def _run_pair(*,
               hidden_states=None):
     """Run the same batch through the TPU layer and the CPU reference.
 
+    ``path`` selects the recurrence: ``PATH_AUTO`` leaves the layer to choose
+    (decode kernel for a pure-decode batch, chunked otherwise), ``PATH_NAIVE``
+    forces the reference scan, and ``PATH_CHUNK`` forces the chunked kernel even
+    for a pure-decode batch -- which is how the 1-token-segment case gets covered.
+
     Returns ``(ref_out, tpu_out, reference, layer)`` where ``reference`` carries
     the updated CPU pools and ``layer.kv_cache`` the TPU ones, so a caller can
     make a second call that continues from this one.
     """
+    assert path in (PATH_AUTO, PATH_NAIVE, PATH_CHUNK)
     num_seqs = len(query_lens)
     num_tokens = sum(query_lens)
     query_start_loc = [0]
@@ -455,27 +534,37 @@ def _run_pair(*,
                                 has_initial_state)
 
     # --- TPU layer ---
-    layer = _build_tpu_layer(weights, num_heads, head_dim, hidden_size,
-                             CONV_SIZE, lower_bound, dtype, device)
+    layer = _build_tpu_layer(weights,
+                             num_heads,
+                             head_dim,
+                             hidden_size,
+                             CONV_SIZE,
+                             lower_bound,
+                             dtype,
+                             device,
+                             use_naive_kda=path == PATH_NAIVE)
     _assert_layer_attrs(layer)
     layer.kv_cache = (_orient_conv(conv_state.clone()).to(device),
                       recurrent_state.clone().to(device))
-    meta = KdaMetadata(
-        num_prefills=sum(1 for q in query_lens if q > 1),
-        num_decodes=sum(1 for q in query_lens if q == 1),
-        query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32),
-        state_indices=torch.tensor(state_indices,
-                                   dtype=torch.int32).to(device),
-        has_initial_state=torch.tensor(
-            [1 if h else 0 for h in has_initial_state],
-            dtype=torch.int32).to(device),
-        num_actual_tokens=num_tokens,
+
+    qsl = torch.tensor(query_start_loc, dtype=torch.int32)
+    query_lens_t = torch.tensor(query_lens, dtype=torch.int32)
+    carry = torch.tensor([1 if h else 0 for h in has_initial_state],
+                         dtype=torch.int32)
+    is_decode_only = all(q == 1 for q in query_lens) and path != PATH_CHUNK
+    meta = _Metadata(
+        query_start_loc=qsl.to(device),
+        mamba_state_indices=torch.tensor(state_indices,
+                                         dtype=torch.int32).to(device),
+        # The ops read carry-in as seq_len > query_len, so +1 is enough to mark
+        # it; the absolute sequence length is not used.
+        seq_lens=(query_lens_t + carry).to(device),
+        is_decode_only=is_decode_only,
     )
+    layer._metadata = lambda: meta
     positions = torch.arange(num_tokens, dtype=torch.long, device=device)
     with torch.inference_mode():
-        tpu_out = layer(hidden_states.to(dtype).to(device),
-                        positions,
-                        metadata=meta)
+        tpu_out = layer(positions, hidden_states.to(dtype).to(device))
 
     return ref_out, tpu_out, reference, layer
 
@@ -585,6 +674,73 @@ def test_naive_reference_keeps_slots_independent():
 
 
 # ---------------------------------------------------------------------------
+# Dispatch, on the host
+# ---------------------------------------------------------------------------
+def _stub_dispatch_layer(*, use_naive_kda: bool):
+    """A layer whose four custom ops just record that they ran."""
+    layer = object.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.use_naive_kda = use_naive_kda
+    layer.q_conv1d = _ConvHolder(torch.zeros(2, 3))
+    layer.k_conv1d = _ConvHolder(torch.zeros(2, 3))
+    layer.v_conv1d = _ConvHolder(torch.zeros(2, 3))
+    layer.o_norm = _NormWeight(torch.ones(1))
+    layer.A_log = nn.Parameter(torch.zeros(2))
+    layer.dt_bias = nn.Parameter(torch.zeros(2))
+
+    calls: list[str] = []
+
+    def record(name, result):
+
+        def op(*args, **kwargs):
+            calls.append(name)
+            return result
+
+        return op
+
+    activations = torch.zeros(2, 6)
+    layer.sconv_op = record("sconv", activations)
+    layer.kda_op = record("naive", torch.zeros(2, 2, 1))
+    layer.chunk_kda_op = record("chunk", torch.zeros(2, 2, 1))
+    layer.decode_kda_op = record("decode", torch.zeros(2, 2, 1))
+    return layer, calls, activations
+
+
+@pytest.mark.parametrize("is_decode_only,use_naive_kda,expected", [
+    (True, False, ["decode"]),
+    (False, False, ["sconv", "chunk"]),
+    (True, True, ["sconv", "naive"]),
+    (False, True, ["sconv", "naive"]),
+])
+def test_core_attention_selects_the_expected_ops(is_decode_only, use_naive_kda,
+                                                 expected):
+    """Which of the three recurrences runs, and whether `sconv_op` runs with it.
+
+    A host-side branch, so this runs anywhere. It is worth pinning: the decode op
+    fuses the short convolution, so running `sconv_op` in front of it would
+    convolve twice and quietly corrupt every decode step.
+    """
+    layer, calls, activations = _stub_dispatch_layer(
+        use_naive_kda=use_naive_kda)
+    metadata = _Metadata(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+        is_decode_only=is_decode_only,
+    )
+    layer._core_attention(
+        activations,
+        torch.zeros(2, 2),
+        torch.zeros(2, 2),
+        torch.zeros(2, 2),
+        torch.zeros(3, 3, 6),
+        torch.zeros(3, 2, 1, 1),
+        metadata,
+    )
+    assert calls == expected
+
+
+# ---------------------------------------------------------------------------
 # The layer, against the reference
 # ---------------------------------------------------------------------------
 # The recurrence accumulates in float32 but consumes bfloat16 projections.
@@ -677,6 +833,38 @@ def test_prefill_head_dim_128_matches_reference():
 
 
 @requires_tpu
+def test_chunk_path_leaves_rows_with_no_scheduled_tokens_alone():
+    """A request scheduled zero tokens this step must keep its state.
+
+    The chunked kernel hands back a final state for *every* segment it is given,
+    including empty ones, where that state is the (zeroed) initial state. Writing
+    those back would wipe a live slot, so the bridge routes them to the reserved
+    null block instead. Padded request slots in a real batch are exactly this
+    case, which makes it a silent-corruption bug rather than a crash.
+    """
+    conv_state, recurrent_state = _make_pools(3, 2, 64, CONV_SIZE, seed=51)
+    _, _, _, layer = _run_pair(num_heads=2,
+                               head_dim=64,
+                               hidden_size=128,
+                               query_lens=[32, 0],
+                               has_initial_state=[False, False],
+                               lower_bound=GATE_LOWER_BOUND,
+                               dtype=torch.bfloat16,
+                               device=torch.device("tpu"),
+                               seed=50,
+                               conv_state=conv_state,
+                               recurrent_state=recurrent_state)
+
+    conv_after, rec_after = _final_pools(layer)
+    assert torch.equal(
+        rec_after[2],
+        recurrent_state[2]), ("the empty row's recurrent slot was overwritten")
+    assert torch.equal(
+        conv_after[2],
+        conv_state[2]), ("the empty row's conv slot was overwritten")
+
+
+@requires_tpu
 @pytest.mark.parametrize("num_seqs", [1, 4, 8])
 def test_decode_matches_naive_cpu_reference(num_seqs):
     """Pure decode -- one token per sequence through the recurrent kernel.
@@ -705,6 +893,29 @@ def test_decode_matches_naive_cpu_reference(num_seqs):
                   conv_after[slots], STATE_RMSE)
     _assert_close(f"{tag} recurrent_state", reference.recurrent_state[slots],
                   rec_after[slots], STATE_RMSE)
+
+
+@requires_tpu
+def test_decode_without_initial_state_ignores_stale_slot_contents():
+    """A new sequence must start from zero even when its slot contains data."""
+    ref_out, tpu_out, reference, layer = _run_pair(
+        num_heads=2,
+        head_dim=64,
+        hidden_size=128,
+        query_lens=[1],
+        has_initial_state=[False],
+        lower_bound=GATE_LOWER_BOUND,
+        dtype=torch.bfloat16,
+        device=torch.device("tpu"),
+        seed=29,
+    )
+
+    _assert_close("fresh decode output", ref_out, tpu_out, DECODE_RMSE)
+    conv_after, rec_after = _final_pools(layer)
+    _assert_close("fresh decode conv_state", reference.conv_state[[1]],
+                  conv_after[[1]], STATE_RMSE)
+    _assert_close("fresh decode recurrent_state",
+                  reference.recurrent_state[[1]], rec_after[[1]], STATE_RMSE)
 
 
 @requires_tpu
@@ -809,86 +1020,10 @@ def test_decode_continues_prefill():
 
 
 # ---------------------------------------------------------------------------
-# Documented limits
+# Mixed batches, and the three paths against each other
 # ---------------------------------------------------------------------------
-def _minimal_metadata(num_prefills: int, num_decodes: int, **kwargs):
-    return KdaMetadata(
-        num_prefills=num_prefills,
-        num_decodes=num_decodes,
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        state_indices=torch.tensor([1], dtype=torch.int32),
-        has_initial_state=torch.tensor([1], dtype=torch.int32),
-        num_actual_tokens=1,
-        **kwargs,
-    )
-
-
-@pytest.mark.parametrize("meta_kwargs,match", [
-    ({
-        "num_prefills": 0,
-        "num_decodes": 1,
-        "num_spec_decodes": 2
-    }, "Speculative decoding"),
-    ({
-        "num_prefills": 1,
-        "num_decodes": 1
-    }, "Mixed prefill\\+decode"),
-])
-def test_unsupported_batches_raise(meta_kwargs, match, monkeypatch):
-    """The two batch shapes the layer refuses rather than guessing.
-
-    Asserted, not skipped: both are silent-wrong-answer territory if a future
-    change drops the guard. Runs on CPU -- it never reaches a kernel.
-
-    The mixed-batch guard only applies to the Pallas kernels, so the naive flag is
-    forced off here; otherwise this fails for whoever has it set in their shell.
-    """
-    monkeypatch.delenv(NAIVE_ENV, raising=False)
-
-    layer = object.__new__(KimiK3DeltaAttention)
-    nn.Module.__init__(layer)
-    layer.prefix = "test"
-
-    meta = _minimal_metadata(**meta_kwargs)
-    with pytest.raises(NotImplementedError, match=match):
-        layer._forward(mixed_qkv=torch.zeros(1, 3),
-                       g1=torch.zeros(1, 1, 1, 1),
-                       g2=torch.zeros(1, 1, 1, 1),
-                       beta=torch.zeros(1, 1, 1),
-                       core_attn_out=torch.zeros(1, 1, 1, 1),
-                       metadata=meta)
-
-
 @requires_tpu
-def test_mixed_prefill_decode_batch_raises_on_the_kernel_path(monkeypatch):
-    """A *real* mixed batch, through the public ``forward``, must refuse.
-
-    ``test_unsupported_batches_raise`` covers the same guard but reaches straight
-    into ``_forward`` with hand-written metadata, so it would keep passing if the
-    guard moved or if ``forward`` grew a path that reached the kernels before the
-    check. This builds an actual batch -- one 32-token prefill plus one 1-token
-    decode, real weights, real state pools -- and asserts the refusal survives the
-    whole entry path.
-
-    Kernel path only. The naive path computes mixed batches, and
-    ``test_mixed_batch_matches_naive_cpu_reference`` checks that it gets them
-    right.
-    """
-    monkeypatch.delenv(NAIVE_ENV, raising=False)
-    query_lens = [32, 1]  # one prefill, one decode -> mixed
-    with pytest.raises(NotImplementedError, match="Mixed prefill\\+decode"):
-        _run_pair(num_heads=2,
-                  head_dim=64,
-                  hidden_size=128,
-                  query_lens=query_lens,
-                  has_initial_state=[False, True],
-                  lower_bound=GATE_LOWER_BOUND,
-                  dtype=torch.bfloat16,
-                  device=torch.device("tpu"),
-                  seed=70)
-
-
-@requires_tpu
+@pytest.mark.parametrize("path", [PATH_AUTO, PATH_NAIVE])
 @pytest.mark.parametrize("query_lens,has_initial_state", [
     ([32, 1], [False, True]),
     ([1, 32], [True, False]),
@@ -896,12 +1031,12 @@ def test_mixed_prefill_decode_batch_raises_on_the_kernel_path(monkeypatch):
     ([96, 1, 1], [True, True, True]),
 ])
 def test_mixed_batch_matches_naive_cpu_reference(query_lens, has_initial_state,
-                                                 monkeypatch):
-    """Mixed prefill+decode through the naive path, against the CPU reference.
+                                                 path):
+    """Mixed prefill+decode against the CPU reference, on both paths.
 
-    The naive recurrence scans token by token and reads each token's sequence from
-    ``query_start_loc``, so a mixed batch is just rows of differing length -- no
-    splitting needed. These cases cover both orderings (prefill-first and
+    Neither path needs the batch split: the chunked kernel treats a 1-token row
+    as a length-1 segment, and the naive scan reads each token's sequence from
+    ``query_start_loc``. These cases cover both orderings (prefill-first and
     decode-first, since nothing in the layer assumes one), several decode rows
     among prefills, and prefill rows that do and do not carry state in.
 
@@ -909,7 +1044,6 @@ def test_mixed_batch_matches_naive_cpu_reference(query_lens, has_initial_state,
     row credited to the wrong ``query_start_loc`` entry would read the wrong slot
     and the per-slot state comparison below would fail.
     """
-    monkeypatch.setenv(NAIVE_ENV, "1")
     num_seqs = len(query_lens)
     state_indices = list(range(1, num_seqs + 1))
 
@@ -922,9 +1056,10 @@ def test_mixed_batch_matches_naive_cpu_reference(query_lens, has_initial_state,
         lower_bound=GATE_LOWER_BOUND,
         dtype=torch.bfloat16,
         device=torch.device("tpu"),
+        path=path,
         seed=80 + num_seqs)
 
-    tag = f"mixed{query_lens}"
+    tag = f"mixed{query_lens} {path}"
     _assert_close(f"{tag} output", ref_out, tpu_out, PREFILL_RMSE)
 
     conv_after, rec_after = _final_pools(layer)
@@ -936,22 +1071,101 @@ def test_mixed_batch_matches_naive_cpu_reference(query_lens, has_initial_state,
 
 
 @requires_tpu
-def test_mixed_batch_row_is_unaffected_by_its_batch_mates(monkeypatch):
+@pytest.mark.parametrize("num_seqs", [1, 4])
+def test_decode_batch_through_the_chunked_kernel_matches_reference(num_seqs):
+    """A pure-decode batch forced onto the chunked kernel.
+
+    Not how production dispatches -- the decode kernel is faster -- but it is the
+    property that lets mixed batches take the chunked path: the chunked kernel
+    must be correct on a length-1 segment, where every token is simultaneously
+    the first and last of its chunk.
+    """
+    state_indices = list(range(1, num_seqs + 1))
+    ref_out, tpu_out, reference, layer = _run_pair(
+        num_heads=2,
+        head_dim=64,
+        hidden_size=128,
+        query_lens=[1] * num_seqs,
+        has_initial_state=[True] * num_seqs,
+        lower_bound=GATE_LOWER_BOUND,
+        dtype=torch.bfloat16,
+        device=torch.device("tpu"),
+        path=PATH_CHUNK,
+        seed=60 + num_seqs)
+
+    tag = f"chunked decode n{num_seqs}"
+    _assert_close(f"{tag} output", ref_out, tpu_out, DECODE_RMSE)
+    _, rec_after = _final_pools(layer)
+    slots = _touched(state_indices)
+    _assert_close(f"{tag} recurrent_state", reference.recurrent_state[slots],
+                  rec_after[slots], STATE_RMSE)
+
+
+@requires_tpu
+@pytest.mark.parametrize("query_lens,has_initial_state", [
+    ([1, 1, 1], [True, True, True]),
+    ([48, 1], [True, True]),
+])
+def test_all_three_recurrences_agree(query_lens, has_initial_state):
+    """The three ops must be interchangeable on the same batch.
+
+    Each of them handles beta's activation, the output norm, the output gate and
+    the recurrent-pool layout separately, so a convention that drifts in one of
+    them -- a missing sigmoid, a transposed slot -- shows up here as a
+    disagreement even when every path is individually self-consistent and its own
+    state comparison passes.
+    """
+    common = dict(num_heads=2,
+                  head_dim=64,
+                  hidden_size=128,
+                  query_lens=query_lens,
+                  has_initial_state=has_initial_state,
+                  lower_bound=GATE_LOWER_BOUND,
+                  dtype=torch.bfloat16,
+                  device=torch.device("tpu"),
+                  seed=100 + len(query_lens))
+
+    outputs = {}
+    states = {}
+    for path in (PATH_AUTO, PATH_CHUNK, PATH_NAIVE):
+        _, tpu_out, _, layer = _run_pair(**common, path=path)
+        outputs[path] = tpu_out
+        _, states[path] = _final_pools(layer)
+
+    slots = _touched(list(range(1, len(query_lens) + 1)))
+    for path in (PATH_CHUNK, PATH_NAIVE):
+        _assert_close(f"output {PATH_AUTO} vs {path}", outputs[PATH_AUTO],
+                      outputs[path], DECODE_RMSE)
+        _assert_close(f"recurrent_state {PATH_AUTO} vs {path}",
+                      states[PATH_AUTO][slots], states[path][slots],
+                      STATE_RMSE)
+
+
+@requires_tpu
+@pytest.mark.parametrize("path", [PATH_AUTO, PATH_NAIVE])
+def test_mixed_batch_row_is_unaffected_by_its_batch_mates(path):
     """A row's result must not depend on which other rows share its batch.
 
-    The naive path threads the whole state pool through one ``jax.lax.scan`` over
-    every token in the batch, so a bug in the per-token slot indexing could let one
-    sequence read or clobber another's state and still leave every row looking
-    plausible. This runs the *same* prefill row -- identical weights, identical
-    hidden states, identical starting pools, same slot -- once alone and once with
-    a decode row appended, and requires its output and its state slot to come out
-    the same either way.
+    Both paths thread the whole state pool through one call, so a bug in the
+    per-token slot indexing could let one sequence read or clobber another's state
+    and still leave every row looking plausible. This runs the *same* prefill row
+    -- identical weights, identical hidden states, identical starting pools, same
+    slot -- once alone and once with a decode row appended, and requires its
+    output and its state slot to come out the same either way.
 
     Sharing the hidden states explicitly is the point: deriving them from a seed
     would give the two runs different tensors (different token counts) and the
     comparison would be meaningless.
+
+    The bar differs by path. The naive scan is token-by-token, so adding a row
+    changes nothing about the surviving row's arithmetic and the two runs come
+    out bit-identical. The chunked kernel pads every segment up to a chunk
+    boundary, so a second row changes the padded token count and with it the
+    tiling and the summation order: the same row lands within 5e-4 rmse-relative
+    (max_abs 2e-6), not on the same bits. Both bars stay far below a real
+    cross-contamination bug, which moves the result by rmse-relative >1.
     """
-    monkeypatch.setenv(NAIVE_ENV, "1")
+    identical = 1e-6 if path == PATH_NAIVE else 5e-3
     num_heads, head_dim, hidden_size = 2, 64, 128
     t_prefill = 32
     weights = _make_weights(num_heads,
@@ -977,6 +1191,7 @@ def test_mixed_batch_row_is_unaffected_by_its_batch_mates(monkeypatch):
                   dtype=torch.bfloat16,
                   device=torch.device("tpu"),
                   seed=93,
+                  path=path,
                   conv_state=conv_state,
                   recurrent_state=recurrent_state,
                   weights=weights)
@@ -998,12 +1213,12 @@ def test_mixed_batch_row_is_unaffected_by_its_batch_mates(monkeypatch):
         })
 
     _assert_close("prefill row output alone vs mixed", alone_out,
-                  mixed_out[:t_prefill], 1e-6)
+                  mixed_out[:t_prefill], identical)
 
     _, rec_alone = _final_pools(alone_layer)
     _, rec_mixed = _final_pools(mixed_layer)
     _assert_close("prefill row state alone vs mixed", rec_alone[1],
-                  rec_mixed[1], 1e-6)
+                  rec_mixed[1], identical)
     # Slot 3 is in neither batch, and slot 0 is the reserved null block.
     for slot in (0, 3):
         assert torch.equal(rec_mixed[slot], recurrent_state[slot]), (

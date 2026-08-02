@@ -28,9 +28,32 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
-    build_kimi_kda_op, build_kimi_sconv_op)
+    build_kimi_chunk_kda_op, build_kimi_decode_kda_op, build_kimi_kda_op,
+    build_kimi_sconv_op)
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+_USE_NAIVE_KDA_ENV = "VLLM_TPU_USE_NAIVE_KDA"
+
+
+def use_naive_kda() -> bool:
+    """Whether to run the plain-XLA KDA recurrence instead of the Pallas pair.
+
+    The reference scan is correct for every batch composition but processes one
+    token per sequential step. Keep it available for debugging and for A/B
+    measurements against the Pallas kernels.
+
+    Read through `vllm_torchtpu.envs` rather than `os.environ` on purpose: every
+    variable in that registry is folded into the TPU compile-cache key by
+    `compute_tpu_compilation_hash`. Reading the environment directly would leave
+    the two paths sharing one cache entry, so flipping the flag would replay the
+    other path's compiled graph and measure the wrong kernel.
+    """
+    return bool(getattr(envs, _USE_NAIVE_KDA_ENV))
 
 
 def _load_a_log(parameter: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -337,15 +360,41 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
         )
         self.kv_cache = None
+        self.use_naive_kda = use_naive_kda()
+        if self.use_naive_kda:
+            logger.warning_once(
+                "KDA is using the plain-XLA reference recurrence because "
+                "%s=1. It scans one token per sequential step; expect it to be "
+                "much slower than the Pallas kernels.", _USE_NAIVE_KDA_ENV)
+        else:
+            logger.info_once(
+                "KDA is using the Pallas kernels: chunked for prefill and "
+                "mixed batches, fused conv+recurrent for pure decode.")
         self.sconv_op = build_kimi_sconv_op(
             prefix,
             kernel_size=self.conv_size,
             state_dim_first=is_conv_state_dim_first(),
         )
+        # Three interchangeable recurrences behind one signature; `forward`
+        # picks per step. `kda_op` is the reference scan, used for everything
+        # when VLLM_TPU_USE_NAIVE_KDA=1 and never otherwise.
         self.kda_op = build_kimi_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
+        )
+        self.chunk_kda_op = build_kimi_chunk_kda_op(
+            prefix,
+            lower_bound=self.gate_lower_bound,
+            eps=config.rms_norm_eps,
+        )
+        # The decode op fuses the short convolution, so it replaces `sconv_op`
+        # on the decode path rather than following it.
+        self.decode_kda_op = build_kimi_decode_kda_op(
+            prefix,
+            lower_bound=self.gate_lower_bound,
+            eps=config.rms_norm_eps,
+            state_dim_first=is_conv_state_dim_first(),
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -408,18 +457,46 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output = torch.zeros_like(query)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
-            mixed_qkv = self.sconv_op(
+            output = self._core_attention(
+                mixed_qkv,
+                raw_gate,
+                beta,
+                output_gate,
+                sconv_cache,
+                recurrent_cache,
+                metadata,
+            ).flatten(1)
+
+        output, _ = self.o_proj(output)
+        return output
+
+    def _core_attention(
+        self,
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        sconv_cache: torch.Tensor,
+        recurrent_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Short convolution and KDA recurrence, on whichever path fits.
+
+        `is_decode_only` is a host-side property of the batch, so the branch
+        below selects a kernel rather than a value: one compiled graph per
+        branch, and the runner's dummy runs trace the decode one. Any batch that
+        is not pure decode -- prefill, chunked prefill, or a mix of prefill and
+        decode rows -- goes through the chunked kernel, which treats a 1-token
+        row as a length-1 segment.
+        """
+        if metadata.is_decode_only and not self.use_naive_kda:
+            # Fuses the short convolution, so `sconv_op` is skipped here.
+            return self.decode_kda_op(
                 mixed_qkv,
                 sconv_cache,
                 self.q_conv1d.weight,
                 self.k_conv1d.weight,
                 self.v_conv1d.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-            )
-            output = self.kda_op(
-                mixed_qkv,
                 raw_gate,
                 beta,
                 output_gate,
@@ -430,7 +507,29 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.query_start_loc,
                 metadata.mamba_state_indices,
                 metadata.seq_lens,
-            ).flatten(1)
+            )
 
-        output, _ = self.o_proj(output)
-        return output
+        mixed_qkv = self.sconv_op(
+            mixed_qkv,
+            sconv_cache,
+            self.q_conv1d.weight,
+            self.k_conv1d.weight,
+            self.v_conv1d.weight,
+            metadata.query_start_loc,
+            metadata.mamba_state_indices,
+            metadata.seq_lens,
+        )
+        recurrence = self.kda_op if self.use_naive_kda else self.chunk_kda_op
+        return recurrence(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            recurrent_cache,
+            self.A_log,
+            self.dt_bias,
+            self.o_norm.weight,
+            metadata.query_start_loc,
+            metadata.mamba_state_indices,
+            metadata.seq_lens,
+        )

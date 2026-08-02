@@ -262,6 +262,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
+
+    # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
+    # chunked/decode kernels. Declared here, and not read straight from
+    # os.environ, so that `compute_tpu_compilation_hash` folds it into the
+    # compile-cache key: it changes the traced graph, so a run that flips it
+    # must not replay the other path's cached executable.
+    "VLLM_TPU_USE_NAIVE_KDA":
+    env_bool("VLLM_TPU_USE_NAIVE_KDA"),
 }
 
 
