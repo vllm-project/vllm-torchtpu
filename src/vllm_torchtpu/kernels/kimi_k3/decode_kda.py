@@ -231,9 +231,8 @@ def decode_kda(
     projection_size = n_v * d_k
     mixed_dim = mixed_qkv.shape[-1]
     if mixed_dim != 3 * projection_size:
-        raise ValueError(
-            f"mixed_qkv must have width 3 * n_v * d_k = "
-            f"{3 * projection_size}, got {mixed_dim}.")
+        raise ValueError(f"mixed_qkv must have width 3 * n_v * d_k = "
+                         f"{3 * projection_size}, got {mixed_dim}.")
     if conv_weight.ndim != 3 or conv_weight.shape[:2] != (mixed_dim, 1):
         raise ValueError(
             "conv_weight must have shape [mixed_dim, 1, kernel_size], got "
@@ -243,9 +242,8 @@ def decode_kda(
     expected_conv_tail = ((mixed_dim, state_len) if conv_state_dim_first else
                           (state_len, mixed_dim))
     if conv_state.shape[1:] != expected_conv_tail:
-        raise ValueError(
-            f"conv_state must end in {expected_conv_tail}, got "
-            f"{conv_state.shape}.")
+        raise ValueError(f"conv_state must end in {expected_conv_tail}, got "
+                         f"{conv_state.shape}.")
     d_v = state.shape[-1]
     if d_v != d_k:
         raise ValueError(
@@ -278,8 +276,8 @@ def decode_kda(
     conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v,
                                     d_k)
     mixed_qkv = mixed_qkv.reshape(num_seqs, 3, n_v, d_k)
-    conv_weight = jnp.swapaxes(conv_weight[:, 0, :], 0, 1).reshape(
-        kernel_size, 3, n_v, d_k)
+    conv_weight = jnp.swapaxes(conv_weight[:, 0, :], 0,
+                               1).reshape(kernel_size, 3, n_v, d_k)
 
     # Per-sequence activations are indexed by grid step; the state pool is
     # indexed by that step's slot. Weights are resident (index_map -> 0).
@@ -290,8 +288,7 @@ def decode_kda(
         num_scalar_prefetch=2,
         grid=(num_seqs, ),
         in_specs=[
-            pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi:
-                         (s, 0, 0, 0)),
+            pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi: (s, 0, 0, 0)),
             pl.BlockSpec((1, n_v, d_k), seq_map),  # g
             # beta is carried as [num_seqs, n_v, 1]: Pallas requires a block's
             # last two dims to be divisible by (8, 128) or match the array, and
@@ -328,7 +325,10 @@ def decode_kda(
         kernel,
         grid_spec=grid_spec,
         out_shape=out_shapes,
-        input_output_aliases={5: 1, 9: 2},
+        input_output_aliases={
+            5: 1,
+            9: 2
+        },
         name="kda_decode_fused_conv_recurrent",
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary", ),
