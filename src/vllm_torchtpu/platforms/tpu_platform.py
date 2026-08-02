@@ -164,6 +164,25 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
                 "(TPU_KERNEL_ITER_MODE).")
 
 
+def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
+    """Fail fast on phased-profiling settings that would silently do nothing.
+
+    Both mistakes below produce a run that looks healthy and writes no
+    traces, which is only discovered once the benchmark has finished.
+    """
+    assert "phased_profiling_dir" not in vllm_config.additional_config, (
+        "Legacy additional_config['phased_profiling_dir'] is no longer "
+        "supported. Set USE_PHASED_PROFILER=true and "
+        "--profiler-config.torch_profiler_dir=<dir> instead.")
+    if envs.USE_PHASED_PROFILER:
+        # torch_profiler_dir truthy already implies profiler == "torch";
+        # ProfilerConfig's own validator rejects the dir without it.
+        assert vllm_config.profiler_config.torch_profiler_dir, (
+            "USE_PHASED_PROFILER is set but there is nowhere to write traces. "
+            "Add --profiler-config.profiler=torch with "
+            "--profiler-config.torch_profiler_dir=<dir>.")
+
+
 def apply_tpu_patches() -> None:
     """Apply all module-level patches required for TorchTPU.
 
@@ -463,6 +482,13 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES"
     ]
 
+    # The "Platform" base class has import_kernels() that tries to import
+    # vllm._C, which is not available in the TPU Platform setup.
+    # Override it to do nothing so we won't cause confusing warning logs.
+    @classmethod
+    def import_kernels(cls) -> None:
+        return
+
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
@@ -599,6 +625,7 @@ class TpuPlatform(Platform):
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
+        _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
 

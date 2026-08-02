@@ -93,12 +93,10 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
-  -e EVALPLUS_DATASETS="${EVALPLUS_DATASETS:-}" \
-  -e EVALPLUS_PARALLEL="${EVALPLUS_PARALLEL:-}" \
   -e FORCE_COLOR="1" \
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
-  -e RUN_EVALPLUS="${RUN_EVALPLUS:-}" \
+  -e RUN_CODE_EVAL="${RUN_CODE_EVAL:-}" \
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
@@ -108,7 +106,9 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16
   ${PROXY_PORT:+-e PROXY_PORT="${PROXY_PORT}"} \
   ${RUN_ROOT:+-e RUN_ROOT="${RUN_ROOT}"} \
   ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"} \
+  ${TPU_ACCELERATOR_TYPE:+-e TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"} \
   ${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:+-e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}"} \
+  ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"} \
   "${TEST_SUITE_VARS[@]}" \
   "${SPANNER_EVAL_VARS[@]}" \
   "${IMAGE_TAG}" \

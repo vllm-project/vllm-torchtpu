@@ -1,0 +1,33 @@
+# humaneval_plus (EvalPlus dataset) scored with evalplus-style instruct
+# protocol: the problem is posed as a chat request and the solution is
+# extracted from the response's code block (see utils.extract_code_instruct),
+# mirroring the evalplus CLI's chat prompting + sanitization. The bundled
+# humaneval[_plus] tasks instead do raw prompt-continuation, which heavily
+# penalizes instruct-tuned models; their bundled instruct variants rely on
+# gen_prefix assistant-prefill, which OpenAI-style chat APIs cannot do.
+# The filter is named create_test to keep the historical metric key
+# ("pass_at_1,create_test") used by check_regression.py / upload_results.py.
+task: humaneval_plus_tpu
+dataset_path: evalplus/humanevalplus
+unsafe_code: true
+output_type: generate_until
+test_split: test
+doc_to_text: "Write a solution to the following problem and make sure that it passes the tests. Reply with the complete function in a Python markdown code block:\n```python\n{{ prompt }}\n```\n"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+metric_list:
+  - metric: !function utils.pass_at_1
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until: []
+  max_gen_toks: 2048
+  do_sample: false
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.extract_code_instruct
+metadata:
+  version: 2.0

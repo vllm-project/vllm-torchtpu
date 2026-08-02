@@ -82,6 +82,37 @@ def test_phased_profiler_full_cycle(profiler_fixture):
             PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR + 1)
 
 
+def test_phased_profiler_finish_stops_a_phase_mid_capture(profiler_fixture):
+    """finish() force-closes a phase before its step budget runs out; this is
+    what stop_phased_profiling() calls when /stop_profile arrives early."""
+    profiler = profiler_fixture["profiler"]
+    mock_context = profiler_fixture["mock_context"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    mock_determine_phase.return_value = InferencePhase.PREFILL_HEAVY
+    profiler.step({"num_reqs": 2, "total_num_scheduled_tokens": 100})
+    assert profiler.current_phase == "prefill_heavy"
+    mock_context.__exit__.assert_not_called()
+
+    profiler.finish()
+
+    mock_context.__exit__.assert_called_once_with(None, None, None)
+    assert profiler.current_phase == ""
+    # Otherwise a reused profiler never starts a new phase: step() only calls
+    # _start_profiling when profiling_n_steps_left <= 0.
+    assert profiler.profiling_n_steps_left == 0
+
+
+def test_phased_profiler_finish_when_idle_is_a_noop(profiler_fixture):
+    """No phase capture in progress; finish() must not touch profile_context."""
+    profiler = profiler_fixture["profiler"]
+    mock_context = profiler_fixture["mock_context"]
+
+    profiler.finish()
+
+    mock_context.__exit__.assert_not_called()
+
+
 def test_phased_profiler_ignores_initial_request(profiler_fixture):
     """Tests that profiling is not triggered for initial single-token requests."""
     profiler = profiler_fixture["profiler"]

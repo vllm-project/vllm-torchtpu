@@ -24,6 +24,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.collectives import util
 
+pytestmark = pytest.mark.multichip
+
 P = jax.sharding.PartitionSpec
 AXIS = "pcp"
 PCP_SIZE = 4

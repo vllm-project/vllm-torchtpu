@@ -1,0 +1,6 @@
+{
+  "mbpp_plus_tpu": {
+    "pass_at_1,none": 0.7936507936507936,
+    "pass_at_1_stderr,none": 0.02084229093011469
+  }
+}

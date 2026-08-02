@@ -27,6 +27,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from schedule_reference import \
     generate_pcp_streaming_schedule_reference  # noqa: E402
 
+pytestmark = pytest.mark.multichip
+
 
 def _stage_schedule_step_kernel(packed_ref, o_ref, dma_sem, sched_vmem_ref):
     step = pl.program_id(0)

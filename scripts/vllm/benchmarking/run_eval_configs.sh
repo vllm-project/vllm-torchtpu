@@ -31,8 +31,8 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
         --run-lm-eval
         --results-dir "/perf_eval_results/$config_name"
     )
-    if [ "${RUN_EVALPLUS:-0}" = "1" ]; then
-        eval_args+=(--run-evalplus)
+    if [ "${RUN_CODE_EVAL:-0}" = "1" ]; then
+        eval_args+=(--run-code-eval)
     fi
 
     if ! bash ./scripts/vllm/benchmarking/run_eval_flow.sh "${eval_args[@]}"; then

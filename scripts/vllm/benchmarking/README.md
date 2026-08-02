@@ -37,17 +37,21 @@ CI (`.github/workflows/perf.yml`) runs `check_regression.py` three times against
 the same live server:
 
 - `--mode perf` compares benchmark JSON to `baselines/perf/<config>.baseline.json`
-  (5% tolerance). Gated metrics: median TTFT, median TPOT, total token
-  throughput, output token throughput, and a baseline-relative completed-request
-  floor.
-- `--mode eval` runs `lm_eval` over `mmlu_llama,mmlu_pro` against the vLLM
-  chat-completions endpoint and compares accuracy to
-  `baselines/eval/<config>.baseline.json` (1.5pp tolerance). Only keys present in
-  the baseline are gated.
-- `--mode evalplus` (nightly only) runs EvalPlus over `humaneval,mbpp` and
-  compares to `baselines/evalplus/<config>.baseline.json` (1.5pp tolerance). The
-  PR guard skips EvalPlus; the nightly job uploads results either way and gates
-  only when a baseline file exists.
+  (5% tolerance). Gated metrics: median TPOT, total token throughput, output
+  token throughput, a baseline-relative completed-request floor, and median
+  TTFT only where the baseline entry carries it — under closed-loop load
+  beyond the prefill-admission capacity (DP x max-num-batched-tokens /
+  prompt-len), median TTFT is queue-position noise, so nightly baselines are
+  calibrated with `--gate-ttft-max-concurrency 0` to omit it.
+- `--mode eval` compares `lm_eval` accuracy to
+  `baselines/eval/<config>.<task>.baseline.json` (1.5pp tolerance). Only keys
+  present in the baseline are gated. MMLU tasks (`mmlu_llama`, `mmlu_pro`) run
+  against the chat-completions endpoint; code-generation tasks
+  (`humaneval_plus_tpu`, `mbpp_plus_tpu` — the full EvalPlus datasets,
+  nightly only via `--run-code-eval`) also run against the chat-completions
+  endpoint with evalplus-style instruct prompting + code-block extraction
+  (see `lm_eval_tasks/`) and gate pass@1. Each task gates only when its
+  baseline file exists.
 
 ## What It Does
 
@@ -70,10 +74,6 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --results-dir <DIR> \
   --baseline scripts/vllm/benchmarking/baselines/eval/<config>.baseline.json
 
-python3 scripts/vllm/benchmarking/check_regression.py \
-  --mode evalplus \
-  --results-dir <DIR> \
-  --baseline scripts/vllm/benchmarking/baselines/evalplus/<config>.baseline.json
 ```
 
 ## Prerequisites
@@ -90,7 +90,6 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 - `isl<N>_osl<N>_c<N>.json` — per-combo results from benchmark_serving.py
 - `server.log` — vLLM server output
 - `benchmark.log` — run metadata
-- `evalplus/` — EvalPlus generated samples, logs, and `*_eval_results.json`
 
 ## Environment Variables
 
@@ -98,6 +97,4 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 |----------|---------|-------------|
 | `PORT` | `8000` | Server port |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
-| `EVALPLUS_DATASETS` | `humaneval mbpp` | Nightly EvalPlus datasets to run against the live server |
-| `EVALPLUS_PARALLEL` | `8` | Nightly EvalPlus local correctness-check worker count |
-| `VLLM_MOE_ROUTING_SIMULATION_STRATEGY` | `uniform_random` | MoE routing for consistent results |
+| `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |

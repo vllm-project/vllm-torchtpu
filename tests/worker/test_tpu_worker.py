@@ -48,7 +48,7 @@ def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(
     assert os.environ["WORLD_SIZE"] == "8"
 
 
-def _make_vllm_config(profiler_torch_dir=None, phased_profiling_dir=""):
+def _make_vllm_config(profiler_torch_dir=None):
     """Build a minimal mock VllmConfig for TPUWorker.__init__."""
     cfg = MagicMock()
     cfg.model_config.dtype = torch.bfloat16
@@ -56,12 +56,14 @@ def _make_vllm_config(profiler_torch_dir=None, phased_profiling_dir=""):
     cfg.parallel_config.pipeline_parallel_size = 1
     cfg.compilation_config.compile_ranges_endpoints = []
     cfg.profiler_config.torch_profiler_dir = profiler_torch_dir
-    cfg.additional_config = {"phased_profiling_dir": phased_profiling_dir}
+    cfg.additional_config = {}
     return cfg
 
 
 def _build_worker(vllm_config, rank=0):
     """Construct a TPUWorker with heavy side-effects mocked out."""
+    # envs is deliberately not patched: __init__ reads nothing from it, and
+    # profile() must see the real USE_PHASED_PROFILER that tests monkeypatch.
     with (
             patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches"),
             patch(
@@ -112,14 +114,46 @@ class TestProfilerDir:
         worker = _build_worker(cfg)
         assert worker.profile_dir is None
 
-    def test_phased_profiling_disables_manual_profiler(self):
-        """additional_config['phased_profiling_dir'] takes precedence over
-        profiler_config.torch_profiler_dir to avoid conflicting profiler
-        contexts."""
-        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir",
-                                phased_profiling_dir="/phased/profiler/dir")
+
+class TestProfileDispatchesToPhasedProfiler:
+    """USE_PHASED_PROFILER makes profile() arm/disarm TPUModelRunner's phase
+    profiler instead of opening a worker-owned profiler context."""
+
+    def test_start_arms_the_model_runners_phased_profiler(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
         worker = _build_worker(cfg)
-        assert worker.profile_dir is None
+        worker.model_runner = MagicMock()
+
+        worker.profile(is_start=True)
+
+        worker.model_runner.start_phased_profiling.assert_called_once_with(
+            None)
+        worker.model_runner.stop_phased_profiling.assert_not_called()
+        assert worker.profile_context is None
+
+    def test_start_forwards_the_profile_prefix(self, monkeypatch):
+        """The prefix must not be dropped just because this is a phased run."""
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg)
+        worker.model_runner = MagicMock()
+
+        worker.profile(is_start=True, profile_prefix="decode")
+
+        worker.model_runner.start_phased_profiling.assert_called_once_with(
+            "decode")
+
+    def test_stop_disarms_the_model_runners_phased_profiler(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg)
+        worker.model_runner = MagicMock()
+
+        worker.profile(is_start=False)
+
+        worker.model_runner.stop_phased_profiling.assert_called_once_with()
+        worker.model_runner.start_phased_profiling.assert_not_called()
 
 
 class TestProfileCaptureAndMerge:

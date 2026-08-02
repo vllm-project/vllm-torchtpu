@@ -25,6 +25,8 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     ScheduleField, pack_pcp_streaming_schedule_fields)
 
+pytestmark = pytest.mark.multichip
+
 P = jax.sharding.PartitionSpec
 AXIS = "pcp"
 

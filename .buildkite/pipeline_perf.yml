@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-x-perf-eval-defaults: &perf_eval_defaults
-  env:
-    BENCHMARK_WARMUP_RUNS: "1"
-
 steps:
   - group: "Perf and Eval on TPU"
     depends_on: "build_docker"
     steps:
       - label: "Perf/Eval: General suite (TPU v7x-8)"
         key: "perf_eval_general_tpu_v7x_8"
-        <<: *perf_eval_defaults
         agents:
           queue: "tpu_v7x_8_queue"
         parallelism: 3
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
           - |
@@ -52,28 +51,82 @@ steps:
           - "perf_eval_results/**/*"
 
       # Nightly runs
-      - label: "Perf/Eval: qwen3-coder-480b-fp8-tp8-ep (Nightly)"
-        key: "perf_qwen3_coder_480b_fp8_tp8_ep"
+      - label: "Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep (TPU v7x-8)"
+        key: "perf_nightly_qwen3_coder_480b_fp8_tp8_ep"
         if: 'build.env("NIGHTLY") == "1"'
         agents:
           queue: "tpu_v7x_8_queue"
         env:
-          EVALPLUS_DATASETS: "humaneval mbpp"
-          EVALPLUS_PARALLEL: "8"
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          # One discarded warmup pass per cell buffers scheduling-regime noise
+          # (golden cmds used num-warmups=0; the measured invocation is
+          # unchanged, warmup runs are discarded duplicates).
+          BENCHMARK_WARMUP_RUNS: "1"
         commands:
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep --run-lm-eval --run-evalplus --results-dir /perf_eval_results"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep --run-lm-eval --run-code-eval --results-dir /perf_eval_results/qwen3-coder-480b-fp8-tp8-ep"
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      - label: "Perf/Eval: qwen3.5-397b-fp8-tp8-ep (Nightly)"
-        key: "perf_qwen3_5_397b_fp8_tp8_ep"
+      # Perf-only: quality evals for this model run on the -ep (short) config;
+      # they don't depend on max-model-len, so running them again here would
+      # duplicate work (and this config has no eval baselines).
+      - label: "Perf: Nightly qwen3-coder-480b-fp8-tp8-ep-full (TPU v7x-8)"
+        key: "perf_nightly_qwen3_coder_480b_fp8_tp8_ep_full"
         if: 'build.env("NIGHTLY") == "1"'
         agents:
           queue: "tpu_v7x_8_queue"
         env:
-          EVALPLUS_DATASETS: "humaneval mbpp"
-          EVALPLUS_PARALLEL: "8"
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
         commands:
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp8-ep --run-lm-eval --run-evalplus --results-dir /perf_eval_results"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep-full --results-dir /perf_eval_results/qwen3-coder-480b-fp8-tp8-ep-full"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      # Qwen3.5-397B parallelism sweep: three layouts, each benched at
+      # concurrency 64/256/512. Quality evals (MMLU + code-gen via lm-eval)
+      # run only on the tp1-dp8 layout — model quality is independent of
+      # parallelism.
+      - label: "Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep (TPU v7x-8)"
+        key: "perf_nightly_qwen3_5_397b_fp8_tp1_dp8_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp1-dp8-ep --run-lm-eval --run-code-eval --results-dir /perf_eval_results/qwen3.5-397b-fp8-tp1-dp8-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      - label: "Perf: Nightly qwen3.5-397b-fp8-tp2-dp4-ep (TPU v7x-8)"
+        key: "perf_nightly_qwen3_5_397b_fp8_tp2_dp4_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp2-dp4-ep --results-dir /perf_eval_results/qwen3.5-397b-fp8-tp2-dp4-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
+        key: "perf_nightly_qwen3_5_397b_fp8_tp8_dp1_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp8-dp1-ep --results-dir /perf_eval_results/qwen3.5-397b-fp8-tp8-dp1-ep"
         artifact_paths:
           - "perf_eval_results/**/*"
