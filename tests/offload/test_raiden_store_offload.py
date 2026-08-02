@@ -23,6 +23,17 @@ tpu_raiden wheel, or torch_tpu runtime is required:
 - Worker-side connector: fence sync + ack, completion echoes to
   completed_jobs/finished_recving, failed-load block-ID reporting, and
   worker-metadata aggregation.
+
+Stage-2 hardening and hybrid coverage:
+- Store batch cap, save retry-once (suppressed during drains), and the
+  poison-key quarantine on terminal transfer failures.
+- Submit-time sub-hash classification: mixed batches (recovered entries or
+  partial-failure leftovers) save only the newly admitted HBM sub-hashes —
+  raiden's save() rejects any batch containing non-HBM hashes.
+- prepare_load pin races fail the job cleanly instead of raising.
+- Recovered-directory learning (lookup HIT teaches the advisory state),
+  RAIDEN_SHM_MODEL_UID derivation, and hybrid unified-pool geometry
+  resolution (attention-spec filtering, page uniformity).
 """
 import enum
 import sys
@@ -163,6 +174,15 @@ class FakeKVCacheStore:
         self.calls.append(_Call("save", (list(block_hashes), )))
         if self.fail_save:
             return False
+        # Mirror raiden's synchronous preconditions (kv_cache_store.cc
+        # Save): every hash must exist, be HBM status, be pinned, and not
+        # already be saving — else the WHOLE launch fails. This is what
+        # forces the manager to classify mixed batches before saving.
+        for h in block_hashes:
+            entry = self.entries.get(h)
+            if (entry is None or entry.status != FakeBlockStatus.HBM
+                    or entry.pin_count <= 0 or h in self._saving):
+                return False
         self._saving.extend(block_hashes)
         return True
 
@@ -326,30 +346,54 @@ class TestStoreJobLifecycle(unittest.TestCase):
         out = self.manager.prepare_store([_key(0), _key(1)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(1)])
 
-    def test_partial_batch_failure_release_and_deletes_exact_batch(self):
+    def test_partial_batch_failure_retries_then_cleans_exact_batch(self):
         self._admit([_key(0), _key(1)], [5, 9])
         batch = sub_hashes(_key(0)) + sub_hashes(_key(1))
-        # One sub-block fails, the rest succeed: the whole job is a failure
-        # and cleanup uses the exact admitted batch, exactly once.
+        # One sub-block fails, the rest succeed: the failed subset is
+        # retried once (committed sub-hashes are NOT re-saved — they are
+        # HOST_AND_HBM now and would fail save()'s HBM precondition).
         self.store.complete_save(batch[:1], success=False)
         self.assertEqual(self.manager.poll_finished_jobs(), [])
         self.store.complete_save(batch[1:], success=True)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        retry = self.store.calls_named("save")[-1]
+        self.assertEqual(retry.args[0], batch[:1])
+        # The retry fails too: the job is terminal, cleanup uses the exact
+        # admitted batch exactly once, and the keys are quarantined.
+        self.store.complete_save(batch[:1], success=False)
         (fj, ) = self.manager.poll_finished_jobs()
         self.assertFalse(fj.success)
         (rad, ) = self.store.calls_named("release_and_delete")
         self.assertEqual(rad.args[0], batch)
         self.assertEqual(self.store.calls_named("release"), [])
-        # Keys are re-admittable afterwards.
-        out = self.manager.prepare_store([_key(0)], _ctx())
-        self.assertEqual(out.keys_to_store, [_key(0)])
+        out = self.manager.prepare_store([_key(0), _key(1)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.MISS)
+
+    def test_save_retry_succeeds_and_marks_stored(self):
+        self._admit([_key(0)], [5])
+        batch = sub_hashes(_key(0))
+        self.store.complete_save(batch, success=False)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        retry = self.store.calls_named("save")[-1]
+        self.assertEqual(retry.args[0], batch)
+        self.store.complete_save(batch, success=True)
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.HIT)
 
     def test_mixed_terminal_hashes_in_one_poll_finalize_once(self):
         self._admit([_key(0)], [5])
         batch = sub_hashes(_key(0))
         # Some sub-blocks fail and the rest succeed, all observed by the
-        # same poll: exactly one terminal (failed) job, one cleanup.
+        # same poll: one retry of the failed subset, then (failing again)
+        # exactly one terminal job and one cleanup.
         self.store.complete_save(batch[:1], success=False)
         self.store.complete_save(batch[1:], success=True)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_save(batch[:1], success=False)
         finished = self.manager.poll_finished_jobs()
         self.assertEqual(len(finished), 1)
         self.assertFalse(finished[0].success)
@@ -443,9 +487,20 @@ class TestLoadJobLifecycle(unittest.TestCase):
         for h in sub_hashes(_key(0)):
             self.assertEqual(self.store.entries[h].pin_count, 0)
 
-    def test_prepare_load_pin_failure_raises(self):
-        with self.assertRaises(RuntimeError):
-            self.manager.prepare_load([_key(9)], _ctx("r1"))
+    def test_prepare_load_pin_failure_fails_job_cleanly(self):
+        # Losing the lookup->pin race against eviction must not crash the
+        # engine: the spec comes back unpinned and the submitted job fails
+        # immediately, reporting its destination blocks for recompute.
+        spec = self.manager.prepare_load([_key(9)], _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        self.manager.submit_load_job(3, [_key(9)], [10],
+                                     "r1",
+                                     pinned=spec.pinned)
+        self.assertEqual(self.store.calls_named("load"), [])
+        self.assertEqual(self.store.calls_named("release"), [])
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        self.assertEqual(fj.failed_gpu_block_ids, [10])
 
 
 class TestTouchAndMisc(unittest.TestCase):
@@ -718,6 +773,198 @@ class TestWorkerSideConnector(unittest.TestCase):
         merged = a.aggregate(b)
         self.assertEqual(merged.completed_jobs, {3: 2, 4: 1})
         self.assertEqual(merged.fenced_jobs, {7: 2})
+
+
+class TestFailureHardening(unittest.TestCase):
+    """Stage-2 hardening: batch cap, drain-suppressed retries, and the
+    poison-key quarantine."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore(registered_workers=2)
+        self.manager = make_manager(self.store)
+
+    def test_store_batch_cap_truncates_keys(self):
+        import vllm_torchtpu.offload.raiden_store as rs
+        keys = [_key(i) for i in range(5)]
+        with patch.object(rs, "_MAX_STORE_KEYS_PER_JOB", 2):
+            out = self.manager.prepare_store(keys, _ctx())
+        # Dropped keys are not accepted, so the scheduler re-offers them
+        # next step; only the accepted prefix is tracked in flight.
+        self.assertEqual(out.keys_to_store, keys[:2])
+        self.manager.on_store_job_cancelled(keys[:2])
+        out = self.manager.prepare_store(keys, _ctx())
+        self.assertEqual(out.keys_to_store, keys)
+
+    def test_drain_suppresses_save_retry(self):
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.manager.submit_store_job(4, out.keys_to_store, [5])
+        # Queue a failure, then drain: the job must finalize as failed with
+        # exactly one save() attempt — its source blocks are about to be
+        # reused, so a retry would read garbage.
+        self.store.complete_save(sub_hashes(_key(0)), success=False)
+        drained = self.manager.drain_jobs({4})
+        self.assertEqual([(fj.job_id, fj.success) for fj in drained],
+                         [(4, False)])
+        self.assertEqual(len(self.store.calls_named("save")), 1)
+        self.assertEqual(len(self.store.calls_named("release_and_delete")), 1)
+
+    def test_failed_load_quarantines_keys(self):
+        seed_host_entries(self.store, _key(0))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.HIT)
+        self.manager.prepare_load([_key(0)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0)], [10], "r1")
+        self.store.complete_load(sub_hashes(_key(0)), success=False)
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        # The HOST entries survive, but the key is quarantined: no repeat
+        # load/recompute loop, no re-admission.
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.MISS)
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
+
+
+class TestMixedBatchesAndRecovery(unittest.TestCase):
+    """Sub-hash classification at submit time: pre-existing HOST entries
+    (recovered across a restart, or committed by a partially failed earlier
+    save) are locked but never re-saved — raiden's save() rejects the whole
+    launch if any hash is not HBM status."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore(registered_workers=2)
+        self.manager = make_manager(self.store)
+
+    def test_mixed_batch_saves_only_new_sub_hashes(self):
+        batch = sub_hashes(_key(0))
+        # Two of four sub-blocks already committed (partial crash window).
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [_key(0)])
+        self.manager.submit_store_job(7, [_key(0)], [5])
+        (save, ) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], batch[2:])
+        self.store.complete_save(batch[2:])
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+        # Cleanup released the exact admitted batch: the pre-existing HOST
+        # entries were pinned by insert_and_lock and must be unpinned too.
+        (release, ) = self.store.calls_named("release")
+        self.assertEqual(release.args[0], batch)
+        for h in batch:
+            self.assertEqual(self.store.entries[h].pin_count, 0)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.HIT)
+
+    def test_all_host_batch_finishes_without_save(self):
+        seed_host_entries(self.store, _key(0))
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.manager.submit_store_job(7, out.keys_to_store, [5])
+        self.assertEqual(self.store.calls_named("save"), [])
+        (release, ) = self.store.calls_named("release")
+        self.assertEqual(release.args[0], sub_hashes(_key(0)))
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+        self.assertFalse(self.manager.has_pending_work())
+        # Learned as stored: not re-admitted.
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
+
+    def test_lookup_learns_recovered_keys_for_touch(self):
+        # Entries recovered from shm predate this process's advisory state;
+        # a HIT must teach the manager so touch reaches them.
+        seed_host_entries(self.store, _key(0))
+        self.manager.touch([_key(0)], _ctx())
+        self.assertEqual(self.store.calls_named("pin"), [])
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.HIT)
+        self.manager.touch([_key(0)], _ctx())
+        (pin, ) = self.store.calls_named("pin")
+        self.assertEqual(pin.args[0], sub_hashes(_key(0)))
+
+
+class TestShmModelUid(unittest.TestCase):
+
+    def _cfg(self, model="m", revision="r"):
+        cfg = MagicMock()
+        cfg.model_config.model = model
+        cfg.model_config.revision = revision
+        return cfg
+
+    def test_uid_is_deterministic_and_config_sensitive(self):
+        from vllm_torchtpu.offload.raiden_store import derive_shm_model_uid
+        kwargs = dict(kernel_block_size=256,
+                      per_block_shape=(256, 8, 2, 128),
+                      kv_dtype="bfloat16",
+                      gpu_block_size=1280,
+                      world_size=4,
+                      capacity_kernel_blocks=1000)
+        uid = derive_shm_model_uid(self._cfg(), **kwargs)
+        self.assertEqual(uid, derive_shm_model_uid(self._cfg(), **kwargs))
+        self.assertNotEqual(
+            uid, derive_shm_model_uid(self._cfg(model="other"), **kwargs))
+        self.assertNotEqual(
+            uid,
+            derive_shm_model_uid(self._cfg(), **{
+                **kwargs, "capacity_kernel_blocks": 999
+            }))
+
+
+class TestHybridGeometry(unittest.TestCase):
+    """resolve_kernel_geometry on hybrid unified-pool group structures."""
+
+    def _resolve(self, groups, unified=True):
+        from vllm_torchtpu.offload import raiden_store as rs
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups])
+        backend = MagicMock()
+        backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
+        with patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                   "_find_non_ssm_backend", return_value=backend), \
+             patch("vllm.v1.worker.utils.select_common_block_size",
+                   return_value=256), \
+             patch("vllm_torchtpu.platforms.tpu_block_size_utils."
+                   "unified_kv_layout_enabled", return_value=unified):
+            return rs.resolve_kernel_geometry(MagicMock(), kv_cache_config)
+
+    def _attn_spec(self, page=1310720):
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        spec = MagicMock(spec=FullAttentionSpec)
+        spec.block_size = 1280
+        spec.num_kv_heads = 8
+        spec.head_size = 128
+        spec.dtype = "bfloat16"
+        spec.page_size_bytes = page
+        return spec
+
+    def _mamba_spec(self, page=1310720):
+        from vllm.v1.kv_cache_interface import MambaSpec
+        spec = MagicMock(spec=MambaSpec)
+        spec.page_size_bytes = page
+        return spec
+
+    def test_hybrid_uses_attention_geometry_with_mamba_group_first(self):
+        # Group order follows model layer order; group 0 being Mamba must
+        # not break the attention-spec selection.
+        kernel, shape, dtype, gpu_block = self._resolve(
+            [self._mamba_spec(), self._attn_spec()])
+        self.assertEqual((kernel, gpu_block), (256, 1280))
+        self.assertEqual(shape, (256, 8, 2, 128))
+        self.assertEqual(dtype, "bfloat16")
+
+    def test_hybrid_requires_unified_pool(self):
+        with self.assertRaises(AssertionError):
+            self._resolve(
+                [self._mamba_spec(), self._attn_spec()], unified=False)
+
+    def test_hybrid_rejects_mismatched_page_sizes(self):
+        with self.assertRaises(AssertionError):
+            self._resolve([self._mamba_spec(page=999), self._attn_spec()])
+
+    def test_dense_rejects_non_full_attention(self):
+        with self.assertRaises(AssertionError):
+            self._resolve([self._mamba_spec()])
 
 
 class TestRaidenStoreWorkerStub(unittest.TestCase):

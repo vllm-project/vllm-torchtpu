@@ -824,15 +824,17 @@ class TpuPlatform(Platform):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    == "OffloadingConnector" and is_hybrid)
+                                    in ("OffloadingConnector",
+                                        "TPURaidenOffloadingConnector")
+                                    and is_hybrid)
             if (is_hybrid_offloading
                     and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
                 # Hybrid CPU offloading transfers whole pool rows; the
                 # typed-view layout has no uniform per-block row to copy.
                 raise ValueError(
-                    "CPU offloading (OffloadingConnector) on hybrid "
-                    "attention+Mamba models requires the unified block "
-                    "pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+                    f"CPU offloading ({kv_transfer_config.kv_connector}) "
+                    "on hybrid attention+Mamba models requires the unified "
+                    "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

@@ -171,8 +171,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             gpu_block_ids = dst_spec.block_ids.tolist()
             assert len(gpu_block_ids) == len(
                 src_spec.keys), (len(gpu_block_ids), len(src_spec.keys))
-            manager.submit_load_job(job_id, src_spec.keys, gpu_block_ids,
-                                    job.req_id)
+            manager.submit_load_job(job_id,
+                                    src_spec.keys,
+                                    gpu_block_ids,
+                                    job.req_id,
+                                    pinned=src_spec.pinned)
 
         # jobs_to_flush: the jobs' source blocks are about to be reused.
         # Fence-pending stores are cancelled (nothing was admitted yet);

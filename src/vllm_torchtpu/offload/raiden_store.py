@@ -28,14 +28,26 @@ to `gpu_block_size_factor` store entries with derived sub-hashes
 device-contiguous, so raiden's copy coalescing fuses them back into single
 DMAs.
 
-Phase-1 constraints (asserted): dense single-KV-group models,
-`blocks_per_chunk == 1` (one OffloadKey = one scheduler GPU block).
+Supported models: dense full-attention (single KV group) and hybrid
+attention+Mamba models on the TPU unified block pool, where every group's
+blocks are fungible rows of the same buffers at scheduler-block granularity
+— GPU block IDs are pool row IDs for every group, so one sub-hash mapping
+covers both. Constraints (asserted): `blocks_per_chunk == 1` (one OffloadKey
+= one scheduler GPU block), no context parallelism.
+
+Phase-2 hardening: store jobs are batch-capped and retried once on transfer
+failure; keys that fail terminally are quarantined (reported MISS, never
+re-admitted). With `RAIDEN_SHM_KEY` set, the host pools and the store
+directory live in shared memory and survive an engine-process crash; the
+directory is recovered inside the plain constructors on restart, gated by a
+config-derived `RAIDEN_SHM_MODEL_UID`.
 
 See `raiden_connector.py` for the connector wiring (fence + echo channel).
 """
 from __future__ import annotations
 
 import enum
+import hashlib
 import os
 import time
 from dataclasses import dataclass, field
@@ -60,6 +72,19 @@ logger = init_logger(__name__)
 _DRAIN_TIMEOUT_S = float(
     os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
 
+# Store-job batch cap (offload keys per job). One raiden save() batch is one
+# joined failure unit, so modest batches keep one bad block from failing
+# unrelated work; keys beyond the cap are simply re-offered by the scheduler
+# on the next step.
+_MAX_STORE_KEYS_PER_JOB = int(
+    os.environ.get("VLLM_TPU_OFFLOAD_MAX_STORE_KEYS_PER_JOB", "64"))
+
+# A save whose transfer failed is retried this many times (§5.4: a failed
+# save leaves the entry HBM+pinned and a second save() works). Retries are
+# suppressed for drained jobs: a drain means the source blocks are about to
+# be reused, so re-reading them would ship garbage.
+_SAVE_RETRIES = int(os.environ.get("VLLM_TPU_OFFLOAD_SAVE_RETRIES", "1"))
+
 _DEFAULT_CONTROLLER_PORT = 51515
 
 
@@ -68,13 +93,19 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
 
     Device block IDs are bound later, at job-submit time, from the matching
     `GPULoadStoreSpec` (they are not known to the manager interface).
+
+    `pinned` is False when prepare_load lost the race against eviction (the
+    manager interface has no failure return there); the load job then fails
+    cleanly at submit time and vLLM recomputes the blocks.
     """
 
-    def __init__(self, keys: list[OffloadKey]):
+    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
         self.keys = keys
+        self.pinned = pinned
 
     def __repr__(self) -> str:
-        return f"RaidenLoadStoreSpec({len(self.keys)} keys)"
+        return (f"RaidenLoadStoreSpec({len(self.keys)} keys"
+                f"{'' if self.pinned else ', unpinned'})")
 
 
 class AdmissionOp(enum.Enum):
@@ -102,6 +133,12 @@ class Admission:
     # through get_block_ids_with_load_errors on failure.
     req_id: str | None = None
     dst_gpu_block_ids: list[int] = field(default_factory=list)
+    # Stores only: the sub-hashes actually saved (newly admitted HBM entries;
+    # pre-existing HOST entries were pinned, not re-saved), the subset the
+    # poll reported failed (retry targets), and the remaining retry budget.
+    saved_sub_hashes: list[bytes] = field(default_factory=list)
+    failed_sub_hashes: list[bytes] = field(default_factory=list)
+    retries_left: int = 0
 
 
 @dataclass
@@ -180,6 +217,14 @@ class RaidenOffloadingManager(OffloadingManager):
         self._stored_keys: set[OffloadKey] = set()
         self._inflight_store_keys: set[OffloadKey] = set()
 
+        # Poison-key quarantine: keys whose transfer failed terminally
+        # (stores: after the retry budget; loads: first terminal failure).
+        # Quarantined keys report MISS and are never re-admitted, so a
+        # persistently failing block cannot fail-loop through fence/save or
+        # load/recompute cycles. Any HOST leftovers they have in the store
+        # age out through normal LRU pressure.
+        self._quarantined_keys: set[OffloadKey] = set()
+
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
@@ -198,6 +243,11 @@ class RaidenOffloadingManager(OffloadingManager):
     def _expand_gpu_blocks(self, gpu_block_ids: list[int]) -> list[int]:
         f = self._f
         return [b * f + i for b in gpu_block_ids for i in range(f)]
+
+    def _sub_hash_status(self, sub_hash: bytes):
+        """Peek one sub-hash's directory status (None when absent)."""
+        matches = self._store.lookup([sub_hash])
+        return matches[0][1].status if matches else None
 
     # -- registration gate ----------------------------------------------
 
@@ -227,6 +277,8 @@ class RaidenOffloadingManager(OffloadingManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if not self.is_gate_open():
             return LookupResult.MISS
+        if key in self._quarantined_keys:
+            return LookupResult.MISS
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
@@ -248,6 +300,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 return LookupResult.HIT_PENDING
             # REMOTE entries become loadable in phase 4 (read_remote).
             return LookupResult.MISS
+        # Learn hits the advisory state has not seen: entries recovered from
+        # the shm-backed directory across a restart predate this process, and
+        # this keeps touch/prepare_store treating them like our own stores.
+        self._stored_keys.add(key)
         return LookupResult.HIT
 
     def touch(self, keys, req_context: ReqContext) -> None:
@@ -267,13 +323,17 @@ class RaidenOffloadingManager(OffloadingManager):
         keys = list(keys)
         sub_hashes = self._expand_keys(keys)
         if not self._store.pin(sub_hashes):
-            # The contract guarantees every key is offloaded; a failed pin
-            # means the directory and the scheduler diverged.
-            raise RuntimeError(
-                "[kv-offload-v2] prepare_load failed to pin "
-                f"{len(sub_hashes)} sub-blocks for request "
-                f"{req_context.req_id}; store directory diverged from "
-                "scheduler state")
+            # Lost the race against eviction between lookup and pin (raiden's
+            # pin is all-or-nothing, so nothing is held). The manager
+            # interface has no failure return here; hand the connector an
+            # unpinned spec so submit_load_job fails the job cleanly and the
+            # scheduler recomputes the blocks.
+            logger.warning(
+                "[kv-offload-v2] prepare_load lost %d sub-blocks for request "
+                "%s to eviction between lookup and pin; the load job will "
+                "fail cleanly and the blocks recompute", len(sub_hashes),
+                req_context.req_id)
+            return RaidenLoadStoreSpec(keys, pinned=False)
         return RaidenLoadStoreSpec(keys)
 
     def complete_load(self, keys, req_context: ReqContext) -> None:
@@ -290,9 +350,14 @@ class RaidenOffloadingManager(OffloadingManager):
             # nothing advances, the chunks are retried next step.
             return None
         keys_to_store = [
-            k for k in keys if k not in self._stored_keys
-            and k not in self._inflight_store_keys
+            k for k in keys if k not in self._stored_keys and k not in
+            self._inflight_store_keys and k not in self._quarantined_keys
         ]
+        # Batch cap: one store job is one raiden save() failure unit, so
+        # keep it modest. Dropped keys are not accepted, so the scheduler
+        # re-offers them next step (per-group chunk advancement only moves
+        # past accepted keys).
+        keys_to_store = keys_to_store[:_MAX_STORE_KEYS_PER_JOB]
         if len(keys_to_store) > self._capacity_keys:
             return None
         # Atomic admission happens at job-submit time via insert_and_lock;
@@ -365,13 +430,34 @@ class RaidenOffloadingManager(OffloadingManager):
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE,
                             success=False))
             return
-        if not self._store.save(sub_hashes):
+        # Save only the newly admitted HBM entries. Pre-existing HOST /
+        # HOST_AND_HBM sub-hashes (recovered across a restart, or committed
+        # by a partially failed earlier save) were locked without touching
+        # their slices; their bytes are valid (content-addressed) and
+        # passing them to save() would fail the whole launch on its
+        # HBM-status precondition. insert_and_lock returns a bare bool, so
+        # classify with per-sub-hash peeks (in-process, and only on the
+        # store path).
+        to_save = [
+            h for h in sub_hashes
+            if self._sub_hash_status(h) == self._block_status.HBM
+        ]
+        if not to_save:
+            # Every sub-hash was already host-resident: nothing to transfer.
+            # Release the exact admitted batch and finish successfully.
+            self._store.release(sub_hashes)
+            self._inflight_store_keys.difference_update(keys)
+            self._stored_keys.update(keys)
+            self._finished.append(
+                FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True))
+            return
+        if not self._store.save(to_save):
             # Synchronous launch failure: revert the admission exactly once
             # with the exact batch; never entered into the poll path.
             self._store.release_and_delete(sub_hashes)
             logger.error(
                 "[kv-offload-v2] store job %d: save() launch failed for %d "
-                "sub-blocks", job_id, len(sub_hashes))
+                "sub-blocks", job_id, len(to_save))
             self._inflight_store_keys.difference_update(keys)
             self._finished.append(
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE,
@@ -382,16 +468,32 @@ class RaidenOffloadingManager(OffloadingManager):
             op=AdmissionOp.STORE,
             keys=keys,
             sub_hashes=sub_hashes,
-            pending=set(sub_hashes),
+            pending=set(to_save),
+            saved_sub_hashes=to_save,
+            retries_left=_SAVE_RETRIES,
         )
         self._admissions[job_id] = admission
-        for h in sub_hashes:
+        for h in to_save:
             self._hash_to_admission[h] = admission
 
-    def submit_load_job(self, job_id: int, keys: list[OffloadKey],
-                        gpu_block_ids: list[int], req_id: str) -> None:
+    def submit_load_job(self,
+                        job_id: int,
+                        keys: list[OffloadKey],
+                        gpu_block_ids: list[int],
+                        req_id: str,
+                        pinned: bool = True) -> None:
         """Launch a load job; entries were pinned in prepare_load."""
         assert len(keys) == len(gpu_block_ids), (len(keys), len(gpu_block_ids))
+        if not pinned:
+            # prepare_load lost the pin race; nothing is held, so fail the
+            # job without touching the store and let vLLM recompute.
+            self._finished.append(
+                FinishedJob(job_id=job_id,
+                            op=AdmissionOp.LOAD,
+                            success=False,
+                            req_id=req_id,
+                            failed_gpu_block_ids=list(gpu_block_ids)))
+            return
         sub_hashes = self._expand_keys(keys)
         device_ids = self._expand_gpu_blocks(gpu_block_ids)
         if not self._store.load(sub_hashes, device_ids):
@@ -431,11 +533,21 @@ class RaidenOffloadingManager(OffloadingManager):
 
     # -- finalizer --------------------------------------------------------
 
+    def _quarantine(self, admission: Admission) -> None:
+        self._quarantined_keys.update(admission.keys)
+        logger.error(
+            "[kv-offload-v2] quarantining %d keys after a terminal %s "
+            "transfer failure (job %d); they will not be offloaded again "
+            "(%d keys quarantined in total)", len(admission.keys),
+            admission.op.value, admission.job_id, len(self._quarantined_keys))
+
     def _finalize(self, admission: Admission) -> None:
         del self._admissions[admission.job_id]
         for h in admission.sub_hashes:
             self._hash_to_admission.pop(h, None)
         success = not admission.failed
+        if not success:
+            self._quarantine(admission)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
             if success:
@@ -488,6 +600,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 if admission is None:
                     continue
                 admission.failed = True
+                admission.failed_sub_hashes.append(h)
                 admission.pending.discard(h)
                 if not admission.pending:
                     newly_terminal[admission.job_id] = admission
@@ -499,7 +612,40 @@ class RaidenOffloadingManager(OffloadingManager):
                 if not admission.pending:
                     newly_terminal[admission.job_id] = admission
         for admission in newly_terminal.values():
+            if self._maybe_retry_save(admission):
+                continue
             self._finalize(admission)
+
+    def _maybe_retry_save(self, admission: Admission) -> bool:
+        """Re-issue the failed subset of a store job's save, at most
+        `retries_left` times.
+
+        Safe by §5.4: a failed save leaves its entries HBM + pinned with the
+        host slot freed, and the job stays non-terminal so the connector's
+        pending-job gate keeps the source device blocks retained. Committed
+        sub-hashes are not re-saved. drain_jobs zeroes retries_left first —
+        after a flush the source blocks are about to be reused, so a retry
+        would read garbage.
+        """
+        if (admission.op != AdmissionOp.STORE or not admission.failed
+                or admission.retries_left <= 0):
+            return False
+        retry_hashes = admission.failed_sub_hashes
+        admission.retries_left -= 1
+        if not self._store.save(retry_hashes):
+            logger.error(
+                "[kv-offload-v2] store job %d: save() retry launch failed "
+                "for %d sub-blocks; job fails", admission.job_id,
+                len(retry_hashes))
+            return False
+        logger.warning(
+            "[kv-offload-v2] store job %d: retrying save of %d failed "
+            "sub-blocks (%d retries left)", admission.job_id,
+            len(retry_hashes), admission.retries_left)
+        admission.pending = set(retry_hashes)
+        admission.failed_sub_hashes = []
+        admission.failed = False
+        return True
 
     def poll_finished_jobs(self) -> list[FinishedJob]:
         """Poll raiden completion and return newly terminal jobs."""
@@ -515,6 +661,12 @@ class RaidenOffloadingManager(OffloadingManager):
         scheduler drains before shipping this step's metadata, so the DMA
         completes before the forward that overwrites the blocks.
         """
+        # No retries once a job is being drained: its source blocks are
+        # being handed back, so re-reading them would save garbage.
+        for jid in job_ids:
+            admission = self._admissions.get(jid)
+            if admission is not None:
+                admission.retries_left = 0
         deadline = time.perf_counter() + _DRAIN_TIMEOUT_S
         drained: list[FinishedJob] = []
         while True:
@@ -535,6 +687,23 @@ class RaidenOffloadingManager(OffloadingManager):
             time.sleep(0.0005)
 
 
+def derive_shm_model_uid(vllm_config: VllmConfig, *, kernel_block_size: int,
+                         per_block_shape: tuple[int, ...], kv_dtype: object,
+                         gpu_block_size: int, world_size: int,
+                         capacity_kernel_blocks: int) -> str:
+    """Deterministic RAIDEN_SHM_MODEL_UID for shm-backed restart recovery.
+
+    Covers everything that must match for recovered host bytes to be valid;
+    an incompatible restart therefore fails raiden's segment validation and
+    cold-starts instead of serving garbage.
+    """
+    material = repr(
+        (vllm_config.model_config.model, vllm_config.model_config.revision,
+         str(kv_dtype), kernel_block_size, per_block_shape, gpu_block_size,
+         world_size, capacity_kernel_blocks, "kv-offload-v2-subhash"))
+    return hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
 def resolve_kernel_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> tuple[int, tuple[int, ...], object, int]:
@@ -542,19 +711,55 @@ def resolve_kernel_geometry(
 
     Shared by the scheduler side (capacity sizing, sub-hash factor) and the
     worker side (device view rebuild) so their geometry can never diverge.
+
+    Dense models: the single group's full-attention spec defines everything.
+
+    Hybrid attention+Mamba models: requires the TPU unified block pool, in
+    which every group's blocks are fungible rows of the same attention-shaped
+    buffers at scheduler-block granularity with one padded page size. GPU
+    block IDs are then pool row IDs for *every* group, so the dense sub-hash
+    and kernel-row expansion applies unchanged; the attention geometry defines
+    the row unit (the mamba state lives inside attention-shaped pages).
     """
+    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.worker.utils import select_common_block_size
 
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     groups = kv_cache_config.kv_cache_groups
-    assert len(groups) == 1, (
-        "[kv-offload-v2] phase 1 supports dense single-KV-group models only; "
-        f"got {len(groups)} groups")
-    spec0 = groups[0].kv_cache_spec
-    assert isinstance(spec0, FullAttentionSpec), (
-        "[kv-offload-v2] phase 1 supports full-attention models only; got "
-        f"{type(spec0).__name__}")
+    assert groups, "[kv-offload-v2] no KV cache groups"
+    if len(groups) == 1:
+        spec0 = groups[0].kv_cache_spec
+        assert isinstance(spec0, FullAttentionSpec), (
+            "[kv-offload-v2] single-group models must be full-attention; "
+            f"got {type(spec0).__name__}")
+    else:
+        # Hybrid: group order follows model layer order, so group 0 may be
+        # a Mamba group — filter for the attention groups instead.
+        from vllm_torchtpu.platforms.tpu_block_size_utils import \
+            unified_kv_layout_enabled
+        assert unified_kv_layout_enabled(vllm_config), (
+            "[kv-offload-v2] hybrid models require the unified block pool "
+            "(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)")
+        attn_specs = [
+            g.kv_cache_spec for g in groups
+            if isinstance(g.kv_cache_spec, AttentionSpec)
+        ]
+        assert attn_specs, (
+            "[kv-offload-v2] hybrid model has no attention KV group")
+        spec0 = attn_specs[0]
+        assert all((s.block_size, s.num_kv_heads, s.head_size, s.dtype,
+                    s.page_size_bytes) == (spec0.block_size,
+                                           spec0.num_kv_heads, spec0.head_size,
+                                           spec0.dtype, spec0.page_size_bytes)
+                   for s in attn_specs), (
+                       "[kv-offload-v2] attention groups disagree on geometry")
+        # The normalizer pads every group's page to the shared pool page, so
+        # pool rows sit at scheduler-block granularity for all groups.
+        assert all(g.kv_cache_spec.page_size_bytes == spec0.page_size_bytes
+                   for g in groups), (
+                       "[kv-offload-v2] unified pool groups must share one "
+                       "padded page size")
 
     backend_cls = TpuPlatform._find_non_ssm_backend(vllm_config)
     assert backend_cls is not None, (
@@ -615,6 +820,17 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # must keep the physical kernel-block leading dimension.
         device_tensors: list[torch.Tensor] = []
         for kv_cache_tensor in kv_caches.tensors:
+            # One canonical row must be exactly gpu_block_size_factor kernel
+            # rows. On the hybrid unified pool this is the load-bearing
+            # uniformity check: every pool buffer carries the same padded
+            # page, so pool rows are fungible across groups and GPU block
+            # IDs are pool row IDs for every group.
+            assert kv_cache_tensor.page_size_bytes == (
+                gpu_block_size_factor * bytes_per_kernel_block), (
+                    "canonical page size does not match the kernel-row "
+                    f"geometry: page={kv_cache_tensor.page_size_bytes}, "
+                    f"factor={gpu_block_size_factor}, "
+                    f"kernel_row_bytes={bytes_per_kernel_block}")
             int8_view = kv_cache_tensor.tensor
             storage_bytes = int8_view.numel() * int8_view.element_size()
             assert storage_bytes % bytes_per_kernel_block == 0, (
@@ -702,13 +918,26 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.kv_cache_config = kv_cache_config
 
         assert config.cache.blocks_per_chunk == 1, (
-            "[kv-offload-v2] phase 1 requires blocks_per_chunk == 1 (one "
-            "OffloadKey = one scheduler GPU block); got "
+            "[kv-offload-v2] requires blocks_per_chunk == 1 (one OffloadKey "
+            "= one scheduler GPU block); got "
             f"{config.cache.blocks_per_chunk}")
         parallel = config.parallel
         assert parallel.pcp_size == 1 and parallel.dcp_size == 1, (
-            "[kv-offload-v2] phase 1 does not support context parallelism")
+            "[kv-offload-v2] does not support context parallelism yet")
         self.world_size = parallel.world_size
+
+        # Consistency net (mirrors the V1 spec): the model-level hybrid flag
+        # and the KV group composition must agree, since the geometry
+        # resolver branches on the group structure.
+        from vllm.v1.kv_cache_interface import MambaSpec
+        self.is_hybrid_model = vllm_config.model_config.is_hybrid
+        has_mamba_group = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            for g in kv_cache_config.kv_cache_groups)
+        assert self.is_hybrid_model == has_mamba_group, (
+            "[kv-offload-v2] model_config.is_hybrid="
+            f"{self.is_hybrid_model} but the KV cache groups "
+            f"{'contain' if has_mamba_group else 'lack'} a MambaSpec group")
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
@@ -737,7 +966,48 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.capacity_kernel_blocks = (self.num_offloaded_blocks *
                                        self.gpu_block_size_factor)
 
-        self.raiden_controller_port = int(
+        # Restart recovery: RAIDEN_SHM_KEY (recipe-set) moves the workers'
+        # host KV pools and the store's metadata table into shared memory;
+        # re-attach and directory recovery then happen inside the plain
+        # raiden constructors on the next start. The model UID gates the
+        # re-attach, so derive it from everything that must match for the
+        # surviving bytes to be valid — an incompatible restart (different
+        # model, dtype, geometry, world size, or offload capacity) fails
+        # validation and cold-starts instead of serving garbage. Both the
+        # scheduler and worker processes construct this spec before creating
+        # any raiden object, so setting it here covers both sides.
+        if os.environ.get("RAIDEN_SHM_KEY"):
+            os.environ.setdefault(
+                "RAIDEN_SHM_MODEL_UID",
+                derive_shm_model_uid(
+                    vllm_config,
+                    kernel_block_size=kernel_block_size,
+                    per_block_shape=per_block_shape,
+                    kv_dtype=kv_dtype,
+                    gpu_block_size=gpu_block_size,
+                    world_size=self.world_size,
+                    capacity_kernel_blocks=self.capacity_kernel_blocks))
+            logger.info(
+                "[kv-offload-v2] shm recovery enabled: RAIDEN_SHM_KEY=%s "
+                "RAIDEN_SHM_MODEL_UID=%s", os.environ["RAIDEN_SHM_KEY"],
+                os.environ["RAIDEN_SHM_MODEL_UID"])
+
+        # Each DP engine owns a full V2 stack (store + in-process
+        # controller) and DP-local engines share one host, so offset the
+        # configured port by the local DP rank — with a static port every
+        # engine past the first would fail its controller bind. The workers
+        # of an engine see the same parallel config, so they derive the same
+        # address.
+        dp_rank = vllm_config.parallel_config.data_parallel_rank_local
+        if dp_rank is None:
+            dp_rank = vllm_config.parallel_config.data_parallel_rank
+        if (vllm_config.parallel_config.data_parallel_size > 1
+                and os.environ.get("RAIDEN_SHM_KEY")):
+            raise ValueError(
+                "[kv-offload-v2] shm restart recovery (RAIDEN_SHM_KEY) is "
+                "not supported with data parallelism: DP-local engines "
+                "would collide on the per-host shm segment names")
+        self.raiden_controller_port = dp_rank + int(
             self.extra_config.get("raiden_controller_port",
                                   _DEFAULT_CONTROLLER_PORT))
         self.raiden_controller_host = str(
@@ -745,6 +1015,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.raiden_job_name = str(
             self.extra_config.get("raiden_job_name",
                                   f"vllm-offload-{config.engine_id}"))
+        if dp_rank:
+            self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
