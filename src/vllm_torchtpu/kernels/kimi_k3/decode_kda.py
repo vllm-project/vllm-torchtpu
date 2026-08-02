@@ -5,11 +5,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Single-token KDA decode kernel with paged recurrent state.
+"""Single-token KDA decode kernel with paged convolution and recurrent state.
 
-This adapts GDN v3's recurrent path to KDA's per-channel gate. It gathers each
-sequence's state slot inside Pallas and leaves convolution and output
-normalization to the caller.
+This adapts GDN v3's fused convolution/recurrent path to KDA's per-channel
+gate. It gathers both state slots inside Pallas, performs the short convolution
+and SiLU, and feeds the result directly into the recurrent update. Output
+normalization remains with the caller.
 """
 
 from __future__ import annotations
@@ -93,20 +94,22 @@ def _kernel(
     state_indices_ref,  # [num_seqs] int32
     has_initial_state_ref,  # [num_seqs] int32
     # Inputs.
-    q_ref,  # [1, n_v, d_k]
-    k_ref,  # [1, n_v, d_k]
-    v_ref,  # [1, n_v, d_v]
+    mixed_qkv_ref,  # [1, 3, n_v, d_k]
     g_ref,  # [1, n_v, d_k]  raw gate
     beta_ref,  # [1, n_v, 1]  already activated
+    conv_state_ref,  # [1, kernel_size - 1, 3, n_v, d_k]
+    conv_weight_ref,  # [kernel_size, 3, n_v, d_k]
     a_log_ref,  # [n_v, 1]
     dt_bias_ref,  # [n_v, d_k]
     state_ref,  # [1, n_v, d_k, d_v]  paged slot
     # Outputs.
     out_ref,  # [1, n_v, d_v]
+    conv_state_out_ref,  # aliased to conv_state_ref
     state_out_ref,  # [1, n_v, d_k, d_v]  aliased to state_ref
     *,
     n_v: int,
     d_k: int,
+    kernel_size: int,
     lower_bound: float | None,
     compute_dtype,
     scale: float,
@@ -126,9 +129,20 @@ def _kernel(
     valid = slot > 0
     use_carried_state = jnp.logical_and(valid, has_initial_state_ref[s] != 0)
 
-    q = q_ref[0].astype(compute_dtype)  # [n_v, d_k]
-    k = k_ref[0].astype(compute_dtype)
-    v = v_ref[0].astype(compute_dtype)
+    mixed_qkv = mixed_qkv_ref[0].astype(compute_dtype)
+    stored_conv = conv_state_ref[0].astype(compute_dtype)
+    prev_conv = stored_conv
+    prev_conv = jnp.where(use_carried_state, prev_conv, 0.0)
+
+    conv_weight = conv_weight_ref[...].astype(compute_dtype)
+    conv_out = mixed_qkv * conv_weight[kernel_size - 1]
+    for tap in range(kernel_size - 1):
+        conv_out += prev_conv[tap] * conv_weight[tap]
+    conv_out = jax.nn.silu(conv_out).astype(mixed_qkv_ref.dtype)
+
+    q = conv_out[0].astype(compute_dtype)
+    k = conv_out[1].astype(compute_dtype)
+    v = conv_out[2].astype(compute_dtype)
 
     q = _l2_norm(q) * scale
     k = _l2_norm(k)
@@ -163,27 +177,30 @@ def _kernel(
 
     new_stored = (jnp.swapaxes(new_state, -1, -2)
                   if state_transposed else new_state)
+    new_conv = jnp.concat([prev_conv[1:], mixed_qkv[None]], axis=0)
+    new_stored_conv = new_conv
     # Invalid entries emit zeros and leave their slot as found. Their writes land
     # on slot 0, which is reserved and never handed to a request.
     out = jnp.where(valid, out, 0.0)
+    new_stored_conv = jnp.where(valid, new_stored_conv, stored_conv)
     new_stored = jnp.where(valid, new_stored, stored)
 
     out_ref[0] = out.astype(out_ref.dtype)
+    conv_state_out_ref[0] = new_stored_conv.astype(conv_state_out_ref.dtype)
     state_out_ref[0] = new_stored.astype(state_out_ref.dtype)
 
 
 @functools.partial(
     jax.jit,
-    donate_argnames=("state", ),
     static_argnames=("lower_bound", "compute_dtype", "scale",
-                     "state_transposed"),
+                     "conv_state_dim_first", "state_transposed"),
 )
 def decode_kda(
-    q: jax.Array,  # [num_seqs, n_v, d_k]
-    k: jax.Array,  # [num_seqs, n_v, d_k]
-    v: jax.Array,  # [num_seqs, n_v, d_v]
+    mixed_qkv: jax.Array,  # [num_seqs, 3 * n_v * d_k]
     g: jax.Array,  # [num_seqs, n_v, d_k]  raw gate
     beta: jax.Array,  # [num_seqs, n_v]    already activated
+    conv_state: jax.Array,  # paged short-convolution state
+    conv_weight: jax.Array,  # [3 * n_v * d_k, 1, kernel_size]
     state: jax.Array,  # [num_slots, n_v, d_k, d_v]  slot 0 reserved
     a_log: jax.Array,  # [n_v]
     dt_bias: jax.Array | None,  # [n_v, d_k]
@@ -193,8 +210,9 @@ def decode_kda(
     lower_bound: float | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
     scale: float | None = None,
+    conv_state_dim_first: bool = False,
     state_transposed: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One KDA decode step for ``num_seqs`` sequences, one token each.
 
     The grid runs one sequence per step, so each step's state slot is fetched by
@@ -206,12 +224,32 @@ def decode_kda(
     ``state_transposed`` says the pool stores each slot as ``[d_v, d_k]`` instead
     of this kernel's ``[d_k, d_v]``. Set it for vLLM-owned KDA state pools.
 
-    Returns ``(out, state)`` where ``out`` is ``[num_seqs, n_v, d_v]`` and
-    ``state`` is the updated pool. ``state`` is donated, so the pool is updated
-    in place.
+    Returns ``(out, conv_state, state)``. The Pallas call aliases its local
+    state operands; the caller retains ownership of the original cache buffers.
     """
-    num_seqs, n_v, d_k = q.shape
-    d_v = v.shape[-1]
+    num_seqs, n_v, d_k = g.shape
+    projection_size = n_v * d_k
+    mixed_dim = mixed_qkv.shape[-1]
+    if mixed_dim != 3 * projection_size:
+        raise ValueError(
+            f"mixed_qkv must have width 3 * n_v * d_k = "
+            f"{3 * projection_size}, got {mixed_dim}.")
+    if conv_weight.ndim != 3 or conv_weight.shape[:2] != (mixed_dim, 1):
+        raise ValueError(
+            "conv_weight must have shape [mixed_dim, 1, kernel_size], got "
+            f"{conv_weight.shape}.")
+    kernel_size = conv_weight.shape[-1]
+    state_len = kernel_size - 1
+    expected_conv_tail = ((mixed_dim, state_len) if conv_state_dim_first else
+                          (state_len, mixed_dim))
+    if conv_state.shape[1:] != expected_conv_tail:
+        raise ValueError(
+            f"conv_state must end in {expected_conv_tail}, got "
+            f"{conv_state.shape}.")
+    d_v = state.shape[-1]
+    if d_v != d_k:
+        raise ValueError(
+            f"KDA decode currently requires d_v == d_k, got {d_v} and {d_k}.")
     if scale is None:
         scale = d_k**-0.5
     if dt_bias is None:
@@ -227,11 +265,21 @@ def decode_kda(
         _kernel,
         n_v=n_v,
         d_k=d_k,
+        kernel_size=kernel_size,
         lower_bound=lower_bound,
         compute_dtype=jnp.dtype(compute_dtype),
         scale=float(scale),
         state_transposed=bool(state_transposed),
     )
+
+    conv_state_shape = conv_state.shape
+    if conv_state_dim_first:
+        conv_state = jnp.swapaxes(conv_state, 1, 2)
+    conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v,
+                                    d_k)
+    mixed_qkv = mixed_qkv.reshape(num_seqs, 3, n_v, d_k)
+    conv_weight = jnp.swapaxes(conv_weight[:, 0, :], 0, 1).reshape(
+        kernel_size, 3, n_v, d_k)
 
     # Per-sequence activations are indexed by grid step; the state pool is
     # indexed by that step's slot. Weights are resident (index_map -> 0).
@@ -242,14 +290,17 @@ def decode_kda(
         num_scalar_prefetch=2,
         grid=(num_seqs, ),
         in_specs=[
-            pl.BlockSpec((1, n_v, d_k), seq_map),  # q
-            pl.BlockSpec((1, n_v, d_k), seq_map),  # k
-            pl.BlockSpec((1, n_v, d_v), seq_map),  # v
+            pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi:
+                         (s, 0, 0, 0)),
             pl.BlockSpec((1, n_v, d_k), seq_map),  # g
             # beta is carried as [num_seqs, n_v, 1]: Pallas requires a block's
             # last two dims to be divisible by (8, 128) or match the array, and
             # a 2-D [num_seqs, n_v] array blocked as [1, n_v] satisfies neither.
             pl.BlockSpec((1, n_v, 1), seq_map),  # beta
+            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
+                         (si[s], 0, 0, 0, 0)),  # convolution state
+            pl.BlockSpec((kernel_size, 3, n_v, d_k), lambda s, si, hi:
+                         (0, 0, 0, 0)),  # convolution weight
             pl.BlockSpec((n_v, 1), lambda s, si, hi: (0, 0)),  # a_log
             pl.BlockSpec((n_v, d_k), lambda s, si, hi: (0, 0)),  # dt_bias
             # Paged state: this is the gather, expressed as a DMA.
@@ -258,25 +309,27 @@ def decode_kda(
         ],
         out_specs=[
             pl.BlockSpec((1, n_v, d_v), seq_map),  # out
+            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
+                         (si[s], 0, 0, 0, 0)),  # convolution state
             pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi:
                          (si[s], 0, 0, 0)),  # state
         ],
     )
 
     out_shapes = [
-        jax.ShapeDtypeStruct((num_seqs, n_v, d_v), v.dtype),
+        jax.ShapeDtypeStruct((num_seqs, n_v, d_v), mixed_qkv.dtype),
+        jax.ShapeDtypeStruct(conv_state.shape, conv_state.dtype),
         jax.ShapeDtypeStruct(state.shape, state.dtype),
     ]
 
-    # Alias the state pool in->out so the update is in place. Operand order is
-    # (scalar prefetch..., q, k, v, g, beta, a_log, dt_bias, state); the state
-    # is operand 9 and maps to output 1.
-    return pl.pallas_call(
+    # Alias both state pools in->out. Operand order is (scalar prefetch...,
+    # mixed_qkv, g, beta, conv_state, conv_weight, a_log, dt_bias, state).
+    out, conv_state, state = pl.pallas_call(
         kernel,
         grid_spec=grid_spec,
         out_shape=out_shapes,
-        input_output_aliases={9: 1},
-        name="kda_decode_recurrent",
+        input_output_aliases={5: 1, 9: 2},
+        name="kda_decode_fused_conv_recurrent",
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary", ),
             vmem_limit_bytes=int(0.9 *
@@ -285,12 +338,16 @@ def decode_kda(
     )(
         state_indices.astype(jnp.int32),
         has_initial_state.astype(jnp.int32),
-        q,
-        k,
-        v,
+        mixed_qkv,
         g,
         beta.reshape(num_seqs, n_v, 1),
+        conv_state,
+        conv_weight,
         a_log_2d,
         dt_bias,
         state,
     )
+    conv_state = conv_state.reshape(conv_state.shape[0], state_len, mixed_dim)
+    if conv_state_dim_first:
+        conv_state = jnp.swapaxes(conv_state, 1, 2)
+    return out, conv_state.reshape(conv_state_shape), state

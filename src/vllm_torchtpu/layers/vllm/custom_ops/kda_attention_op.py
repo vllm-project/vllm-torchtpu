@@ -14,6 +14,8 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.causal_conv1d.causal_conv1d import \
+    ragged_causal_conv1d
 from vllm_torchtpu.kernels.kimi_k3 import naive_kda
 
 
@@ -25,12 +27,7 @@ def kimi_short_conv_scan(
     state_indices: jax.Array,
     seq_lens: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """Correctness-first Kimi short convolution using an XLA scan.
-
-    The shared Pallas ragged-convolution kernel can halt the TPU when many
-    donated recurrent buffers are embedded in Kimi's compiled hybrid graph.
-    Keep this model-local fallback until that kernel interaction is fixed.
-    """
+    """Reference Kimi short convolution using an XLA scan."""
     num_tokens = x.shape[0]
     kernel_size = conv_weight.shape[-1]
     weights = jnp.swapaxes(conv_weight[:, 0, :], 0, 1)
@@ -122,13 +119,20 @@ def build_kimi_sconv_op(
         state = (jnp.swapaxes(conv_state, 1, 2)
                  if state_dim_first else conv_state)
         weight = jnp.concatenate((q_weight, k_weight, v_weight), axis=0)
-        output, new_state = kimi_short_conv_scan(
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        has_initial_state = seq_lens > query_lens
+        distribution = jnp.asarray((0, num_sequences, num_sequences),
+                                   dtype=jnp.int32)
+        output, new_state = ragged_causal_conv1d(
             mixed_qkv,
             state,
             weight,
+            None,
             query_start_loc,
             state_indices,
-            seq_lens,
+            distribution,
+            has_initial_state,
+            kernel_size=kernel_size,
         )
         if state_dim_first:
             new_state = jnp.swapaxes(new_state, 1, 2)
@@ -137,7 +141,10 @@ def build_kimi_sconv_op(
         return new_state, jax.nn.silu(output)
 
     op_name = f"pallas::kimi_sconv_{prefix.replace('.', '_')}"
-    sconv_op = pallas.jax_op(op_name, sconv_core, donate_argnums=(1, ))
+    # Keep ownership of the torch cache buffer. The ragged Pallas kernel aliases
+    # its JAX-local state input, but donating the outer bridge input conflicts
+    # with torch_tpu's lazy cache views. Explicit writeback below is reliable.
+    sconv_op = pallas.jax_op(op_name, sconv_core)
 
     def _fake_sconv(mixed_qkv, conv_state, *args, **kwargs):
         return torch.empty_like(conv_state), torch.empty_like(mixed_qkv)

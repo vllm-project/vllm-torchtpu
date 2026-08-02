@@ -23,6 +23,8 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_torchtpu.kernels.kimi_k3 import chunk_kda, decode_kda, naive_kda
+from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
+    build_kimi_sconv_op
 
 __all__ = ["KdaMetadata", "KimiK3DeltaAttention", "GatedRMSNormSigmoid"]
 
@@ -52,6 +54,9 @@ class KdaMetadata:
         state_indices: ``[num_seqs]`` slot per sequence in the state pool.
         has_initial_state: ``[num_seqs]`` bool -- whether the sequence carries
             recurrent/conv state in from a previous step.
+        segment_ids: optional precomputed ``[1, num_tokens]`` segment IDs for
+            chunked prefill. Constructing these inside the layer is a temporary
+            fallback and is not graph-friendly.
         num_actual_tokens: tokens before padding.
     """
     num_prefills: int
@@ -61,6 +66,7 @@ class KdaMetadata:
     has_initial_state: torch.Tensor
     num_actual_tokens: int
     num_spec_decodes: int = 0
+    segment_ids: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -83,64 +89,6 @@ class GatedRMSNormSigmoid(nn.Module):
         g_f = g.float()
         out = x_normed * torch.sigmoid(g_f)
         return out.to(x.dtype)
-
-
-# ---------------------------------------------------------------------------
-# causal conv1d, torch reference
-# ---------------------------------------------------------------------------
-def _causal_conv1d_varlen(
-        x: torch.Tensor,  # [num_tokens, dim]
-        conv_state: torch.Tensor,  # [num_slots, state_len, dim]
-        weight: torch.Tensor,  # [dim, kernel_size]
-        bias: torch.Tensor | None,
-        query_start_loc: torch.Tensor,  # [num_seqs + 1]
-        state_indices: torch.Tensor,  # [num_seqs]
-        has_initial_state: torch.Tensor,  # [num_seqs]
-) -> torch.Tensor:
-    """Prefill conv1d + SiLU, per sequence, writing back the tail state.
-
-    Reference implementation: loops over sequences on the host. Correct and easy
-    to check against upstream, but it materialises one conv per sequence and
-    cannot be traced into a single graph --- replace with
-    ``kernels.causal_conv1d.ragged_causal_conv1d`` before this is used for
-    anything but validation.
-    """
-    dim, kernel_size = weight.shape
-    state_len = conv_state.shape[1]
-    out = torch.empty_like(x)
-    starts = query_start_loc.tolist()
-    slots = state_indices.tolist()
-    has_init = has_initial_state.tolist()
-
-    for i in range(len(starts) - 1):
-        s, e = starts[i], starts[i + 1]
-        if e <= s:
-            continue
-        seq = x[s:e]  # [t, dim]
-        # Left-pad with carried state (or zeros on the first chunk).
-        if has_init[i]:
-            prev = conv_state[slots[i], -(kernel_size - 1):, :]
-        else:
-            prev = torch.zeros(kernel_size - 1,
-                               dim,
-                               dtype=x.dtype,
-                               device=x.device)
-        padded = torch.cat([prev.to(x.dtype), seq], dim=0)  # [t + w - 1, dim]
-        # Depthwise causal conv: out[t] = sum_j padded[t + j] * weight[:, j]
-        windows = padded.unfold(0, kernel_size, 1)  # [t, dim, w]
-        y = (windows * weight.unsqueeze(0)).sum(-1)
-        if bias is not None:
-            y = y + bias
-        out[s:e] = torch.nn.functional.silu(y).to(out.dtype)
-
-        # Tail becomes the next step's state, right-aligned as vLLM stores it.
-        tail = padded[-(state_len):] if padded.shape[0] >= state_len else \
-            torch.cat([
-                torch.zeros(state_len - padded.shape[0], dim,
-                            dtype=padded.dtype, device=padded.device), padded
-            ], dim=0)
-        conv_state[slots[i]] = tail.to(conv_state.dtype)
-    return out
 
 
 def _causal_conv1d_update(
@@ -226,10 +174,10 @@ def _chunk_kda_adapter(
 
 
 def _decode_kda_adapter(
-    q: jax.Array,  # [1, N, H, D]
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array,
+    mixed_qkv: jax.Array,  # [N, 3 * H * D], before short convolution
+    conv_state: jax.Array,
+    conv_weight: jax.Array,
+    g: jax.Array,  # [1, N, H, D]
     beta: jax.Array,  # [1, N, H]
     pool: jax.Array,  # [num_slots, H, K, V]
     a_log: jax.Array,  # [H]
@@ -238,25 +186,27 @@ def _decode_kda_adapter(
     has_initial_state: jax.Array,
     *,
     lower_bound: float | None,
-) -> tuple[jax.Array, jax.Array]:
-    """Single-token recurrent KDA; returns (out, updated pool)."""
-    n_v, d_k = q.shape[2], q.shape[3]
-    out, pool = decode_kda(
-        q[0],
-        k[0],
-        v[0],
+    conv_state_dim_first: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fused decode short convolution and recurrent KDA."""
+    n_v, d_k = g.shape[2], g.shape[3]
+    out, conv_state, pool = decode_kda(
+        mixed_qkv,
         g[0],
         beta[0],
+        conv_state,
+        conv_weight,
         pool,
         a_log,
         dt_bias.reshape(n_v, d_k),
         state_indices,
         has_initial_state,
         lower_bound=lower_bound,
+        conv_state_dim_first=conv_state_dim_first,
         # vLLM stores recurrent state as [d_v, d_k].
         state_transposed=True,
     )
-    return out[None], pool  # [1, N, H, V]
+    return out[None], conv_state, pool  # [1, N, H, V]
 
 
 def _naive_kda_adapter(
@@ -427,6 +377,8 @@ class KimiK3DeltaAttention(nn.Module):
 
         # (conv_state, recurrent_state); assigned by the runner, or by a test.
         self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._conv_state_dim_first = is_conv_state_dim_first()
+        self._conv_op = None
         self._chunk_op = None
         self._decode_op = None
         self._naive_op = None
@@ -446,6 +398,19 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
     # -- torch <-> jax op construction --------------------------------------
+    def _get_conv_op(self):
+        state_dim_first = self._conv_state_dim_first
+        key = (self.conv_size, state_dim_first)
+        if self._conv_op is not None and self._conv_op[0] == key:
+            return self._conv_op[1]
+        op = build_kimi_sconv_op(
+            self.prefix,
+            kernel_size=self.conv_size,
+            state_dim_first=state_dim_first,
+        )
+        self._conv_op = (key, op)
+        return op
+
     def _get_chunk_op(self, n_max: int):
         """Build (and cache per n_max) the prefill jax_op.
 
@@ -478,14 +443,24 @@ class KimiK3DeltaAttention(nn.Module):
         if self._decode_op is not None:
             return self._decode_op
 
-        fn = functools.partial(_decode_kda_adapter,
-                               lower_bound=self.gate_lower_bound)
+        fn = functools.partial(
+            _decode_kda_adapter,
+            lower_bound=self.gate_lower_bound,
+            conv_state_dim_first=self._conv_state_dim_first,
+        )
 
         name = f"pallas::kda_decode_{self.prefix.replace('.', '_')}"
-        op = pallas.jax_op(name, fn)  # not donated; see _get_chunk_op
+        # The vLLM cache owns these buffers across forwards. Pallas aliases its
+        # JAX-local state operands, then the caller writes the results back into
+        # the stable Torch buffers below.
+        op = pallas.jax_op(name, fn)
 
-        def _fake(q, _k, _v, _g, _beta, pool, *args, **kwargs):
-            return (torch.empty_like(q), torch.empty_like(pool))
+        def _fake(mixed_qkv, conv_state, _conv_weight, g, _beta, pool,
+                  *args, **kwargs):
+            out = torch.empty((1, mixed_qkv.size(0), g.size(2), g.size(3)),
+                              dtype=mixed_qkv.dtype,
+                              device=mixed_qkv.device)
+            return out, torch.empty_like(conv_state), torch.empty_like(pool)
 
         op.register_fake(_fake)
         self._decode_op = op
@@ -614,13 +589,6 @@ class KimiK3DeltaAttention(nn.Module):
 
         assert self.kv_cache is not None, "kv_cache must be assigned"
         conv_state, recurrent_state = self.kv_cache
-        # vLLM stores the conv state in either orientation (see
-        # MambaStateShapeCalculator._orient_conv_shape). Upstream normalizes to
-        # dim-at-(-2); the torch reference conv here wants
-        # [num_slots, state_len, dim], so normalize the other way. transpose()
-        # returns a view, so in-place writes still land in the real cache.
-        if is_conv_state_dim_first():
-            conv_state = conv_state.transpose(-1, -2)
 
         n = m.num_actual_tokens
         mixed_qkv = mixed_qkv[:n]
@@ -631,30 +599,37 @@ class KimiK3DeltaAttention(nn.Module):
         if not naive:
             beta = torch.sigmoid(beta.float()).to(beta.dtype)
 
-        # conv1d weight is stored as [3 * local_proj, 1, conv_size].
-        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
-                                               self.conv1d.weight.size(2))
-        conv_bias = self.conv1d.bias
-
         # A mixed batch (naive mode only) lands here too: `num_prefills > 0`, so
         # it takes the varlen conv, which is right for both kinds of row.
         is_prefill = m.num_prefills > 0
         if is_prefill:
-            conv_out = _causal_conv1d_varlen(
+            q_weight, k_weight, v_weight = self.conv1d.weight.split(
+                self.local_projection_size, dim=0)
+            query_start_loc = m.query_start_loc.to(
+                dtype=torch.int32, device=mixed_qkv.device)
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            seq_lens = query_lens + m.has_initial_state.to(torch.int32)
+            conv_out = self._get_conv_op()(
                 mixed_qkv,
                 conv_state,
-                conv_weights,
-                conv_bias,
-                m.query_start_loc,
-                m.state_indices,
-                m.has_initial_state,
+                q_weight,
+                k_weight,
+                v_weight,
+                query_start_loc,
+                m.state_indices.to(torch.int32),
+                seq_lens,
             )
-        else:
+        elif naive:
+            # conv1d weight is stored as [3 * local_proj, 1, conv_size].
+            conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
+                                                   self.conv1d.weight.size(2))
+            if self._conv_state_dim_first:
+                conv_state = conv_state.transpose(-1, -2)
             conv_out = _causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
                 conv_weights,
-                conv_bias,
+                self.conv1d.bias,
                 m.state_indices,
             )
 
@@ -665,8 +640,6 @@ class KimiK3DeltaAttention(nn.Module):
         if naive:
             # The naive recurrence takes the packed post-conv q|k|v and the two
             # gates flat, and derives has_initial_state from seq_lens itself.
-            # `query_start_loc` lives on the host (the reference conv1d indexes it
-            # there), so it has to be moved for the kernel.
             qsl = m.query_start_loc.to(torch.int32).to(conv_out.device)
             query_lens = qsl[1:] - qsl[:-1]
             # Any seq_len strictly greater than query_len marks "carries state
@@ -686,20 +659,40 @@ class KimiK3DeltaAttention(nn.Module):
             core_attn_out[:, :n] = out[:, :n].to(core_attn_out.dtype)
             return
 
-        q, k, v = (rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
-                   for x in conv_out.split(self.local_projection_size, dim=-1))
-
         if is_prefill:
-            segment_ids = self._segment_ids(m.query_start_loc, n,
-                                            mixed_qkv.device)
+            q, k, v = (rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
+                       for x in conv_out.split(self.local_projection_size,
+                                               dim=-1))
+            segment_ids = m.segment_ids
+            if segment_ids is None:
+                segment_ids = self._segment_ids(m.query_start_loc, n,
+                                                mixed_qkv.device)
+            else:
+                segment_ids = segment_ids.to(dtype=torch.int32,
+                                             device=mixed_qkv.device)
+                if segment_ids.shape != (1, n):
+                    raise ValueError(
+                        f"segment_ids must have shape {(1, n)}, got "
+                        f"{tuple(segment_ids.shape)}")
             op = self._get_chunk_op(num_seqs)
             out, new_pool = op(q, k, v, g1, beta, recurrent_state, self.A_log,
                                self.dt_bias, segment_ids, state_indices,
                                has_init)
         else:
             op = self._get_decode_op()
-            out, new_pool = op(q, k, v, g1, beta, recurrent_state, self.A_log,
-                               self.dt_bias, state_indices, has_init)
+            out, new_conv_state, new_pool = op(
+                mixed_qkv,
+                conv_state,
+                self.conv1d.weight,
+                g1,
+                beta,
+                recurrent_state,
+                self.A_log,
+                self.dt_bias,
+                state_indices,
+                has_init,
+            )
+            conv_state.copy_(new_conv_state)
 
         recurrent_state.copy_(new_pool)
         core_attn_out[:, :n] = out[:, :n].to(core_attn_out.dtype)
@@ -712,8 +705,8 @@ class KimiK3DeltaAttention(nn.Module):
 
         The chunked kernel takes ``segment_ids`` where upstream's
         ``chunk_kda_with_fused_gate`` takes ``cu_seqlens``; this is the
-        conversion. Built on host from ``query_start_loc``, so like the reference
-        conv1d it is not graph-friendly.
+        conversion. The Python list conversion is a temporary fallback for
+        callers that have not precomputed graph inputs.
         """
         seg = torch.zeros(1, num_tokens, dtype=torch.int32, device=device)
         starts = query_start_loc.tolist()
