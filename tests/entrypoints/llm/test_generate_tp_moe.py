@@ -12,6 +12,8 @@ import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 
+pytestmark = pytest.mark.multichip
+
 MOE_MODEL_NAME = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
 MOE_PROMPTS = [
@@ -42,8 +44,9 @@ def _print_generation_outputs(test_name: str, outputs) -> None:
 def _run_moe_generation(async_scheduling: bool,
                         enable_expert_parallel: bool = False):
     tp_size = _get_local_tpu_chip_count()
-    if tp_size < 2:
-        pytest.skip("MoE distributed test requires at least 2 local TPU chips")
+    if tp_size < 8:
+        pytest.skip(f"MoE TP test expects an 8-chip agent, found {tp_size} "
+                    "chips; running here would silently reduce TP coverage")
 
     llm = LLM(
         model=MOE_MODEL_NAME,

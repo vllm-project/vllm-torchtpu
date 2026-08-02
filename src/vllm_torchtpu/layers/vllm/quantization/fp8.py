@@ -66,6 +66,7 @@ from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.linear_common import quantized_matmul
 from vllm_torchtpu.layers.vllm.quantization.configs import (
@@ -82,12 +83,6 @@ if hasattr(torch, "float8_e5m2"):
     _MOE_REQUANT_WEIGHT_DTYPES["float8_e5m2"] = torch.float8_e5m2
 
 LinearQuantConfig = tuple[str, torch.dtype, int | None, bool]
-
-
-def _get_activation_str(activation) -> str:
-    """Convert MoEActivation enum or string to plain string."""
-    return activation.value if hasattr(activation,
-                                       'value') else str(activation)
 
 
 def _dequantize_fp8_linear(
@@ -674,7 +669,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
-        activation_str = _get_activation_str(layer.activation)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
         layer._tpu_activation_str = activation_str
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized

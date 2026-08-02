@@ -36,6 +36,8 @@ from vllm_torchtpu.layers.common.gdn_attention import (
 from vllm_torchtpu.layers.common.utils import (
     inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
 
+pytestmark = pytest.mark.multichip
+
 _GDN_PCP_NUMERICAL_CASES = (
     pytest.param(2, (20, 20, 24), 4, None, id="pcp2-multi-request-padding"),
     pytest.param(4, (34, 30), 4, None, id="pcp4-uneven-rank-split"),

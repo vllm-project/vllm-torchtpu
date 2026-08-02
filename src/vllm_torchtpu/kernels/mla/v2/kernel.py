@@ -346,6 +346,8 @@ def _mla_ragged_paged_attention_kernel(
     r_dim = q_pe_hbm_ref.shape[-1]
     q_packing = get_dtype_packing(ql_nope_hbm_ref.dtype)
     num_q_heads_per_q_packing = num_q_heads // q_packing
+    padded_num_q_heads = bq_nope_x2_ref.shape[-2]
+    padded_num_q_heads_per_q_packing = padded_num_q_heads // q_packing
     kv_dtype = cache_kv_hbm_ref.dtype
     if not transpose_kv_cache:
         total_num_pages, page_size_per_kv_packing, kv_packing, kv_dim = (
@@ -1511,14 +1513,14 @@ def _mla_ragged_paged_attention_kernel(
                       sem=sem):
                 _async_copy(
                     ql_nope_hbm_ref.at[pl.ds(q_len_start, sz)],
-                    bq_nope_vmem_ref.at[pl.ds(0, sz)],
+                    bq_nope_vmem_ref.at[pl.ds(0, sz), :num_q_heads],
                     sem,
                     wait,
                 )
 
                 _async_copy(
                     q_pe_hbm_ref.at[pl.ds(q_len_start, sz)],
-                    bq_rope_vmem_ref.at[pl.ds(0, sz)],
+                    bq_rope_vmem_ref.at[pl.ds(0, sz), :num_q_heads],
                     sem,
                     wait,
                 )
@@ -1550,7 +1552,7 @@ def _mla_ragged_paged_attention_kernel(
                       q_len_start=q_len_start,
                       sem=sem):
                 _async_copy(
-                    vmem_ref.at[pl.ds(0, sz)],
+                    vmem_ref.at[pl.ds(0, sz), :num_q_heads],
                     o_hbm_ref.at[pl.ds(q_len_start, sz)],
                     sem,
                     wait,
@@ -1637,35 +1639,37 @@ def _mla_ragged_paged_attention_kernel(
     def load_batch_bq(bq_sem_idx, *, actual_bq_sz=bq_sz):
         q_nope_ref = (bq_nope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx].reshape(
-                batch_size, bq_sz * num_q_heads_per_q_packing, lkv_dim))
+                batch_size, bq_sz, padded_num_q_heads_per_q_packing, lkv_dim))
         q_nope_vec = pltpu.bitcast(
-            q_nope_ref[:, :actual_bq_sz * num_q_heads_per_q_packing],
+            q_nope_ref[:, :actual_bq_sz],
             q_dtype,
-        ).reshape(batch_size, actual_bq_sz * num_q_heads, lkv_dim)
+        )[:, :, :num_q_heads].reshape(batch_size, actual_bq_sz * num_q_heads,
+                                      lkv_dim)
         q_rope_ref = (bq_rope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx].reshape(
-                batch_size, bq_sz * num_q_heads_per_q_packing, r_dim))
+                batch_size, bq_sz, padded_num_q_heads_per_q_packing, r_dim))
         q_rope_vec = pltpu.bitcast(
-            q_rope_ref[:, :actual_bq_sz * num_q_heads_per_q_packing],
+            q_rope_ref[:, :actual_bq_sz],
             q_dtype,
-        ).reshape(batch_size, actual_bq_sz * num_q_heads, r_dim)
+        )[:, :, :num_q_heads].reshape(batch_size, actual_bq_sz * num_q_heads,
+                                      r_dim)
         return q_nope_vec, q_rope_vec
 
     def load_bq(batch_item_idx, bq_sem_idx, *, actual_bq_sz=bq_sz):
         q_nope_ref = (bq_nope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx, batch_item_idx].reshape(
-                bq_sz * num_q_heads_per_q_packing, lkv_dim))
+                bq_sz, padded_num_q_heads_per_q_packing, lkv_dim))
         q_nope_vec = pltpu.bitcast(
-            q_nope_ref[:actual_bq_sz * num_q_heads_per_q_packing],
+            q_nope_ref[:actual_bq_sz],
             q_dtype,
-        ).reshape(actual_bq_sz * num_q_heads, lkv_dim)
+        )[:, :num_q_heads].reshape(actual_bq_sz * num_q_heads, lkv_dim)
         q_rope_ref = (bq_rope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx, batch_item_idx].reshape(
-                bq_sz * num_q_heads_per_q_packing, r_dim))
+                bq_sz, padded_num_q_heads_per_q_packing, r_dim))
         q_rope_vec = pltpu.bitcast(
-            q_rope_ref[:actual_bq_sz * num_q_heads_per_q_packing],
+            q_rope_ref[:actual_bq_sz],
             q_dtype,
-        ).reshape(actual_bq_sz * num_q_heads, r_dim)
+        )[:, :num_q_heads].reshape(actual_bq_sz * num_q_heads, r_dim)
         return q_nope_vec, q_rope_vec
 
     def load_bkv(batch_item_idx, bkv_sem_idx):
@@ -1970,9 +1974,12 @@ def _mla_ragged_paged_attention_kernel(
             # Store output from acc to bo.
             bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
                 batch_size,
-                bq_sz * num_q_heads_per_q_packing,
+                bq_sz,
+                padded_num_q_heads_per_q_packing,
                 lkv_dim,
-            )[...] = pltpu.bitcast(out, jnp.int32)
+            )[:, :, :num_q_heads_per_q_packing] = pltpu.bitcast(
+                out.reshape(batch_size, bq_sz, num_q_heads, lkv_dim),
+                jnp.int32)
 
             # Send cur bo
             start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
@@ -2416,13 +2423,17 @@ def mla_ragged_paged_attention(
                 cache_kv.dtype,
             )
 
+        q_packing = get_dtype_packing(ql_nope.dtype)
+        padded_num_q_heads_per_q_packing = unsigned_align_to(
+            num_q_heads // q_packing, 4)
+        padded_num_q_heads = padded_num_q_heads_per_q_packing * q_packing
         bq_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, bq_sz, num_q_heads, lkv_dim),
+            (2, batch_size, bq_sz, padded_num_q_heads, lkv_dim),
             ql_nope.dtype,
         )
 
         bq_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, bq_sz, num_q_heads, r_dim),
+            (2, batch_size, bq_sz, padded_num_q_heads, r_dim),
             q_pe.dtype,
         )
 

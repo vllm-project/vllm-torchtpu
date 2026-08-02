@@ -24,16 +24,15 @@ PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
 
-# `additional_config` keys that configure phased profiling.
-PHASED_PROFILING_DIR_KEY = "phased_profiling_dir"
+# Tuning knob with no `profiler_config` equivalent, so it stays in
+# `additional_config`.
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_decode_only_kv_len_threshold")
 
-# Diagnostics-only knobs: they steer profiling and never change the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
-# TPU compile cache key. Keep this in sync with the keys read above.
+# Diagnostics-only knob: it steers profiling and never changes the compiled
+# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
+# TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
-    PHASED_PROFILING_DIR_KEY,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
 })
 
@@ -283,18 +282,31 @@ class PhaseBasedProfiler:
                 batch_composition_stats)
             self.profiling_n_steps_left -= 1
             if self.profiling_n_steps_left <= 0:
-                if self.profile_context:
-                    try:
-                        self.profile_context.__exit__(None, None, None)
-                        logger.info("Stopped PyTorch profiler trace.")
-                    except Exception as e:
-                        logger.error("Failed to stop PyTorch profiler: %s", e)
-                    self.profile_context = None
+                self._finish_current_phase()
 
-                self._merge_profile_directories()
-                logger.info(
-                    f"Profiling for {self.current_phase} phase finished")
-                self.current_phase = ""
+    def _finish_current_phase(self) -> None:
+        """Closes out the phase capture in progress, if any."""
+        if self.profile_context:
+            try:
+                self.profile_context.__exit__(None, None, None)
+                logger.info("Stopped PyTorch profiler trace.")
+            except Exception as e:
+                logger.error("Failed to stop PyTorch profiler: %s", e)
+            self.profile_context = None
+
+        self._merge_profile_directories()
+        logger.info(f"Profiling for {self.current_phase} phase finished")
+        self.current_phase = ""
+        self.profiling_n_steps_left = 0
+
+    def finish(self) -> None:
+        """Force-stops a phase capture in progress.
+
+        Called when profiling is disarmed (worker.profile(is_start=False))
+        before the current phase's step budget ran out.
+        """
+        if self.current_phase:
+            self._finish_current_phase()
 
     def _merge_profile_directories(self) -> None:
         """Consolidates phase trace artifacts."""

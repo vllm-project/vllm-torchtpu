@@ -23,7 +23,8 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.platforms.tpu_platform import (
+    TpuPlatform, _validate_phased_profiling_config)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
 
@@ -351,3 +352,37 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+
+
+class TestPhasedProfilingConfigValidation:
+    """Both mistakes here yield a run that looks healthy and writes no
+    traces, so they are rejected at startup rather than ignored."""
+
+    @staticmethod
+    def _config(additional_config=None, torch_profiler_dir=""):
+        vllm_config = MagicMock()
+        vllm_config.additional_config = additional_config or {}
+        vllm_config.profiler_config.torch_profiler_dir = torch_profiler_dir
+        return vllm_config
+
+    def test_legacy_additional_config_key_is_rejected(self):
+        with pytest.raises(AssertionError, match="USE_PHASED_PROFILER"):
+            _validate_phased_profiling_config(
+                self._config({"phased_profiling_dir": "/tmp/phased"}))
+
+    def test_phased_without_a_trace_dir_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+
+        with pytest.raises(AssertionError, match="nowhere to write traces"):
+            _validate_phased_profiling_config(self._config())
+
+    def test_phased_with_a_trace_dir_passes(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+
+        _validate_phased_profiling_config(
+            self._config(torch_profiler_dir="/tmp/phased"))
+
+    def test_unprofiled_run_passes(self, monkeypatch):
+        monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
+
+        _validate_phased_profiling_config(self._config())

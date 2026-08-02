@@ -71,6 +71,23 @@ class TestTpuCompilerCache:
 
         assert disabled != enabled
 
+    def test_tpu_hash_ignores_the_phased_profiler_switch(self):
+        """Selecting a profiler must not bust the compile cache: otherwise a
+        profiled run recompiles everything, and so does the next plain one."""
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            with patch.dict(os.environ, {"USE_PHASED_PROFILER": "false"}):
+                unprofiled = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"USE_PHASED_PROFILER": "true"}):
+                phased = compute_tpu_compilation_hash(self._config())
+
+        assert unprofiled == phased
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash

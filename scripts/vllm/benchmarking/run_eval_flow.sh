@@ -7,7 +7,7 @@ HOST=""
 CONFIG_NAME=""
 RESULTS_DIR=""
 RUN_LM_EVAL=0
-RUN_EVALPLUS=0
+RUN_CODE_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
 
@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
             RUN_LM_EVAL=1
             shift
             ;;
-        --run-evalplus)
-            RUN_EVALPLUS=1
+        --run-code-eval)
+            RUN_CODE_EVAL=1
             shift
             ;;
         --host)
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-evalplus] [--host HOST] [--port PORT]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
@@ -80,43 +80,8 @@ fi
 mkdir -p "$RESULTS_DIR"
 
 PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$CONFIG_NAME.baseline.json"
-EVALPLUS_BASELINE="scripts/vllm/benchmarking/baselines/evalplus/$CONFIG_NAME.baseline.json"
 
 PERF_LOG="$RESULTS_DIR/regression_check.md"
-EVALPLUS_LOG="$RESULTS_DIR/evalplus_check.md"
-
-run_evalplus() {
-    local model="$1"
-    local results_dir="$2"
-    local root="$results_dir/evalplus"
-    local rc=0
-    rm -rf "$root"
-    mkdir -p "$root"
-
-    # Defaults if not set in env
-    local datasets="${EVALPLUS_DATASETS:-humaneval mbpp}"
-    local parallel="${EVALPLUS_PARALLEL:-8}"
-
-    for dataset in $datasets; do
-        echo "EvalPlus dataset: $dataset"
-        evalplus.evaluate "$dataset" \
-            --model "$model" \
-            --backend openai \
-            --base_url "http://$HOST:$PORT/v1" \
-            --root "$root" \
-            --greedy \
-            --n_samples 1 \
-            --bs 1 \
-            --parallel "$parallel" \
-            2>&1 | tee "$root/$dataset.log"
-        dataset_rc=${PIPESTATUS[0]}
-        if [ "$dataset_rc" -ne 0 ]; then
-            echo "ERROR: EvalPlus failed for $dataset (exit $dataset_rc)"
-            rc="$dataset_rc"
-        fi
-    done
-    return "$rc"
-}
 
 run_lm_eval() {
     local task="$1"
@@ -124,21 +89,42 @@ run_lm_eval() {
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
 
     local lm_eval_args=(
-        --model local-chat-completions
-        --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
         --tasks "$task"
-        --apply_chat_template
-        --limit 100
         --seed "0,1234,None,1234"
         --output_path "$RESULTS_DIR"
     )
 
-    if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
-        lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
-    else
-        lm_eval_args+=(--fewshot_as_multiturn true)
-        lm_eval_args+=(--gen_kwargs '{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}')
-    fi
+    case "$task" in
+        humaneval_plus_tpu|mbpp_plus_tpu)
+            # HF evaluate's code_eval metric has its own unsafe-code gate on
+            # top of lm-eval's --confirm_run_unsafe_code. No --limit: the
+            # full EvalPlus datasets (164 + 378 problems), like the evalplus
+            # CLI ran them.
+            export HF_ALLOW_CODE_EVAL=1
+            lm_eval_args+=(
+                --include_path "$SCRIPT_DIR/lm_eval_tasks"
+                --model local-chat-completions
+                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --apply_chat_template
+                --gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}'
+                --confirm_run_unsafe_code
+            )
+            ;;
+        *)
+            lm_eval_args+=(
+                --limit 100
+                --model local-chat-completions
+                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --apply_chat_template
+            )
+            if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
+                lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
+            else
+                lm_eval_args+=(--fewshot_as_multiturn true)
+                lm_eval_args+=(--gen_kwargs '{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}')
+            fi
+            ;;
+    esac
 
     echo "Running lm_eval for task: $task..."
     echo "[cmd] lm_eval ${lm_eval_args[*]}"
@@ -185,9 +171,9 @@ BENCH_ARGS+=(--port "$PORT")
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
+PERF_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("perf_tolerance", 0.05))' "$RESULTS_DIR/config.json")
 
 fail=0
-evalplus_rc=0
 
 # ========================================================
 # 3. Check Perf Regression
@@ -196,6 +182,7 @@ if [ -f "$PERF_BASELINE" ]; then
     echo "=== Checking Perf Regression ==="
     python3 scripts/vllm/benchmarking/check_regression.py \
       --mode perf \
+      --tolerance "$PERF_TOLERANCE" \
       --results-dir "$RESULTS_DIR" \
       --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
 fi
@@ -209,23 +196,11 @@ if [ "$RUN_LM_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 5. Run EvalPlus
+# 5. Run code-generation evals (EvalPlus datasets via lm-eval)
 # ========================================================
-if [ "$RUN_EVALPLUS" = "1" ]; then
-    echo "=== Running EvalPlus ==="
-    run_evalplus "$MODEL" "$RESULTS_DIR" || evalplus_rc=$?
-
-    if [ "$evalplus_rc" -ne 0 ]; then
-        fail=1
-    fi
-
-    if [ -f "$EVALPLUS_BASELINE" ]; then
-        echo "=== Checking EvalPlus Regression ==="
-        python3 scripts/vllm/benchmarking/check_regression.py \
-          --mode evalplus \
-          --results-dir "$RESULTS_DIR" \
-          --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || { echo "::error::EvalPlus regression check failed! See logs above for details."; fail=1; }
-    fi
+if [ "$RUN_CODE_EVAL" = "1" ]; then
+    run_lm_eval "humaneval_plus_tpu"
+    run_lm_eval "mbpp_plus_tpu"
 fi
 
 # ========================================================

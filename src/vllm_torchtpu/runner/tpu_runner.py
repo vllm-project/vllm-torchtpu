@@ -558,37 +558,66 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
 
     def _init_phased_profiling(self) -> None:
-        """Initializes the phase-based profiler if configured via
-        additional_config['phased_profiling_dir']."""
-        additional_config = self.vllm_config.additional_config
-        self.phased_profiling_dir = additional_config.get(
-            runner_utils.PHASED_PROFILING_DIR_KEY, "")
+        """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
+
+        The trace directory comes from `profiler_config`, the same field the
+        standard torch profiler uses; the env var only selects which profiler
+        consumes it. The profiler itself is armed later by
+        `start_phased_profiling`/`stop_phased_profiling`, called from
+        TPUWorker.profile() so both profilers share one trigger.
+        """
+        profiler_config = self.vllm_config.profiler_config
+        self.phased_profiling_dir = (profiler_config.torch_profiler_dir
+                                     if envs.USE_PHASED_PROFILER else "")
         self.phase_based_profiler = None
-        if self.phased_profiling_dir:
-            profiler_config = self.vllm_config.profiler_config
-            # Deliberately not read from parallel_config: its rank is
-            # TPxPP-scoped, so every DP replica would call itself rank 0 and
-            # their traces would overwrite each other on merge. The worker
-            # resolves the slice-global rank from the TPU rank binding and
-            # passes it in.
-            global_rank = self._profiler_rank
-            world_size = self._profiler_world_size
-            decode_kv_len_threshold = additional_config.get(
-                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
-                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
-            self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
-                self.phased_profiling_dir,
-                worker_rank=global_rank,
-                world_size=world_size,
-                # max_iterations defaults to 0 ("no limit") for standard torch
-                # profiling; that's meaningless for the phased profiler, so
-                # fall back to its own default when unset.
-                num_steps_to_profile_for=(
-                    profiler_config.max_iterations
-                    or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
-                num_decode_steps_to_skip=profiler_config.delay_iterations,
-                decode_kv_len_threshold=decode_kv_len_threshold,
-            )
+
+    def start_phased_profiling(self,
+                               profile_prefix: str | None = None) -> None:
+        """Arms the phase-based profiler. Called from TPUWorker.profile()."""
+        if not self.phased_profiling_dir:
+            logger.warning(
+                "Phased profiling directory is not set. Skipping profiling.")
+            return
+        if self.phase_based_profiler is not None:
+            logger.warning(
+                "Phased profiler is already running. Ignoring start request.")
+            return
+        profiler_config = self.vllm_config.profiler_config
+        additional_config = self.vllm_config.additional_config
+        decode_kv_len_threshold = additional_config.get(
+            runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+            runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+        # Same scoping as the standard profiler: the prefix names the run, and
+        # the per-phase subdirectories sit beneath it.
+        profile_dir = self.phased_profiling_dir
+        if profile_prefix:
+            profile_dir = os.path.join(profile_dir, profile_prefix)
+        # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
+        # so every DP replica would call itself rank 0 and their traces would
+        # overwrite each other on merge. The worker resolves the slice-global
+        # rank from the TPU rank binding and passes it in.
+        self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
+            profile_dir,
+            worker_rank=self._profiler_rank,
+            world_size=self._profiler_world_size,
+            # max_iterations defaults to 0 ("no limit") for standard torch
+            # profiling; that's meaningless for the phased profiler, so fall
+            # back to its own default when unset.
+            num_steps_to_profile_for=(
+                profiler_config.max_iterations
+                or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
+            num_decode_steps_to_skip=profiler_config.delay_iterations,
+            decode_kv_len_threshold=decode_kv_len_threshold,
+        )
+
+    def stop_phased_profiling(self) -> None:
+        """Disarms the phase-based profiler. Called from TPUWorker.profile()."""
+        if self.phase_based_profiler is None:
+            logger.warning(
+                "Phased profiler is not running. Ignoring stop request.")
+            return
+        self.phase_based_profiler.finish()
+        self.phase_based_profiler = None
 
     # ----- Backend hooks overridden from GPUModelRunner -----
 
@@ -785,7 +814,8 @@ class TPUModelRunner(GPUModelRunner):
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
-        has_attention = any(isinstance(m, Attention) for m in layers.values())
+        has_attention = any(
+            isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
         if has_attention and has_mamba and not self._unified_kv_layout:
             self._update_mamba_page_size_padded(layers)
@@ -854,6 +884,7 @@ class TPUModelRunner(GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
+                            indexes_kv_by_block_stride=True,
                         )
                     else:
                         kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -862,6 +893,7 @@ class TPUModelRunner(GPUModelRunner):
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
+                            indexes_kv_by_block_stride=True,
                         )
                 elif attn_module.attn_type in (
                         AttentionType.ENCODER,
@@ -894,6 +926,7 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                     page_size_padded=page_size_padded,
+                    indexes_kv_by_block_stride=True,
                 )
             else:
                 continue
@@ -1071,12 +1104,11 @@ class TPUModelRunner(GPUModelRunner):
         first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        attn_page_size_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            self.block_size,
-            num_kv_heads,
-            first_attn_module.head_size,
-            self.kv_cache_dtype,
-        )
+        attention_backend = (PallasMLAttentionBackend if isinstance(
+            first_attn_module, MLAAttention) else PallasAttentionBackend)
+        attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
+            self.block_size, num_kv_heads, first_attn_module.head_size,
+            self.kv_cache_dtype)
 
         mamba_modules = [
             m for m in layers.values() if isinstance(m, MambaBase)

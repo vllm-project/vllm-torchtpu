@@ -401,6 +401,17 @@ class PallasAttentionBackend(AttentionBackend):
     def get_min_page_size(vllm_config: VllmConfig) -> int:
         return get_tpu_min_page_size(vllm_config)
 
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return True
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False, ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (1, 0, 2, 3, 4, 5)
+        return (0, 1, 2, 3, 4)
+
     @staticmethod
     def get_max_num_seqs(model_len: int, page_size: int) -> int:
         num_page_per_req = cdiv(model_len, page_size)
@@ -982,6 +993,17 @@ class PallasMLAttentionBackend(AttentionBackend):
     @staticmethod
     def get_min_page_size(vllm_config: VllmConfig) -> int:
         return get_tpu_min_page_size(vllm_config)
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return True
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False, ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (1, 0, 2, 3, 4)
+        return (0, 1, 2, 3)
 
 
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):

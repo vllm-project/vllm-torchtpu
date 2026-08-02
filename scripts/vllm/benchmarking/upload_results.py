@@ -36,6 +36,9 @@ ACC_KEYS = (
     "acc,none",
     "exact_match,none",
     "acc_norm,none",
+    "pass@1,create_test",
+    "pass_at_1,create_test",
+    "pass_at_1,none",
 )
 
 
@@ -77,49 +80,6 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
         except Exception as e:
             print(
                 f"Warning: Failed to parse lm-eval results from {latest}: {e}",
-                file=sys.stderr)
-
-    # 2. Parse EvalPlus results
-    evalplus_jsons = sorted(results_dir.rglob("*_eval_results.json")) + sorted(
-        results_dir.rglob("eval_results.json"))
-    # Dedup
-    evalplus_jsons = sorted(list(set(evalplus_jsons)))
-    for path in evalplus_jsons:
-        try:
-            dataset_name = path.parent.parent.name if path.name == "eval_results.json" else path.parent.name
-            with open(path, "r") as fh:
-                data = json.load(fh)
-
-            totals = []
-            base_correct = []
-            plus_correct = []
-            saw_plus = False
-
-            for task_results in (data.get("eval") or {}).values():
-                if not isinstance(task_results, list) or not task_results:
-                    continue
-                totals.append(len(task_results))
-                base_correct.append(
-                    sum(r.get("base_status") == "pass" for r in task_results))
-                plus_count = 0
-                for r in task_results:
-                    if r.get("plus_status") is not None:
-                        saw_plus = True
-                        if r.get("base_status") == "pass" and r.get(
-                                "plus_status") == "pass":
-                            plus_count += 1
-                plus_correct.append(plus_count)
-
-            if totals:
-                base_pass = sum(base_correct) / sum(totals)
-                metrics[f"{dataset_name}_base_pass@1"] = base_pass
-                if saw_plus:
-                    plus_pass = sum(plus_correct) / sum(totals)
-                    metrics[f"{dataset_name}_plus_pass@1"] = plus_pass
-
-        except Exception as e:
-            print(
-                f"Warning: Failed to parse evalplus results from {path}: {e}",
                 file=sys.stderr)
 
     return metrics

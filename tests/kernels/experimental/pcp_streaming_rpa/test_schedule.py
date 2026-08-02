@@ -34,6 +34,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     generate_pcp_streaming_schedule_from_metadata_host,
     unpack_pcp_streaming_schedule_field, validate_pcp_streaming_schedule)
 
+pytestmark = pytest.mark.multichip
+
 
 def _assert_schedule_equal(actual: PcpStreamingSchedule,
                            expected: PcpStreamingSchedule):
