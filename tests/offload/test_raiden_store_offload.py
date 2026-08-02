@@ -224,6 +224,64 @@ class FakeKVCacheStore:
         return [c for c in self.calls if c.name == name]
 
 
+class FakeKVCacheStoreV2(FakeKVCacheStore):
+    """Fake with the wheel-#2 primitives (insert_and_lock_detailed, clear).
+
+    The base fake deliberately lacks them so the manager's wheel-#1
+    fallback paths (per-sub-hash classification, reset_cache raising) keep
+    their coverage.
+    """
+
+    def __init__(self, registered_workers: int = 0):
+        super().__init__(registered_workers)
+        # Hashes the next insert_and_lock_detailed reports as displaced
+        # (their entries are dropped from the directory, mirroring a real
+        # displacement to the candidate list).
+        self.displace_next: list[bytes] = []
+
+    def insert_and_lock_detailed(self, block_hashes, slices, on_host):
+        self.calls.append(
+            _Call("insert_and_lock_detailed",
+                  (list(block_hashes), list(slices), on_host)))
+        if self.fail_insert_and_lock:
+            return SimpleNamespace(success=False,
+                                   existing=[],
+                                   inserted=[],
+                                   displaced=[])
+        existing, inserted = [], []
+        for h, s in zip(block_hashes, slices):
+            entry = self.entries.get(h)
+            if entry is None:
+                self.entries[h] = _Entry(status=s.status,
+                                         device_block_id=s.device_block_id,
+                                         pin_count=1)
+                inserted.append(h)
+            else:
+                entry.pin_count += 1
+                existing.append(h)
+        displaced = []
+        for h in self.displace_next:
+            entry = self.entries.pop(h, None)
+            if entry is not None:
+                displaced.append((h, SimpleNamespace(status=entry.status)))
+        self.displace_next = []
+        return SimpleNamespace(success=True,
+                               existing=existing,
+                               inserted=inserted,
+                               displaced=displaced)
+
+    def clear(self) -> int:
+        self.calls.append(_Call("clear", ()))
+        if self._saving or self._loading:
+            raise RuntimeError("KVCacheStore clear failed: transfers in "
+                               "flight")
+        if any(e.pin_count > 0 for e in self.entries.values()):
+            raise RuntimeError("KVCacheStore clear failed: pinned")
+        cleared = len(self.entries)
+        self.entries.clear()
+        return cleared
+
+
 def make_manager(store, *, f=4, num_blocks=8, world_size=2):
     from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
     return RaidenOffloadingManager(
@@ -882,6 +940,101 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
         self.manager.touch([_key(0)], _ctx())
         (pin, ) = self.store.calls_named("pin")
         self.assertEqual(pin.args[0], sub_hashes(_key(0)))
+
+
+class TestWheel2DetailedAndReset(unittest.TestCase):
+    """Stage-3 paths on a wheel-#2 store: classification via the detailed
+    insert_and_lock result, displacement -> eviction events, and reset_cache
+    through the public clear()."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStoreV2(registered_workers=2)
+        self.manager = make_manager(self.store)
+
+    def _store_key(self, key, gpu_block, job_id):
+        out = self.manager.prepare_store([key], _ctx())
+        self.manager.submit_store_job(job_id, out.keys_to_store, [gpu_block])
+
+    def test_detailed_result_replaces_probe_classification(self):
+        batch = sub_hashes(_key(0))
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        self._store_key(_key(0), 5, 7)
+        # No per-sub-hash peeks: classification came from the result.
+        (call, ) = self.store.calls_named("insert_and_lock_detailed")
+        self.assertEqual(call.args[0], batch)
+        (save, ) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], batch[2:])
+        self.assertEqual(self.store.calls_named("insert_and_lock"), [])
+
+        self.store.complete_save(batch[2:])
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+
+    def test_displacement_commits_only_on_success(self):
+        # key 1 is stored, then displaced by key 2's admission.
+        seed_host_entries(self.store, _key(1))
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
+                         LookupResult.HIT)
+
+        self.store.displace_next = sub_hashes(_key(1))
+        self._store_key(_key(2), 5, 7)
+        # Not yet: a failed job would restore the candidates.
+        self.assertEqual(list(self.manager.take_events()), [])
+
+        self.store.complete_save(sub_hashes(_key(2)))
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+        (event, ) = self.manager.take_events()
+        self.assertEqual(event.keys, [_key(1)])
+        self.assertTrue(event.removed)
+        self.assertEqual(list(self.manager.take_events()), [])
+        # The displaced key is forgotten: MISS and re-admittable.
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
+                         LookupResult.MISS)
+        out = self.manager.prepare_store([_key(1)], _ctx())
+        self.assertEqual(out.keys_to_store, [_key(1)])
+
+    def test_displacement_dropped_on_failure(self):
+        seed_host_entries(self.store, _key(1))
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
+                         LookupResult.HIT)
+
+        self.store.displace_next = sub_hashes(_key(1))
+        self._store_key(_key(2), 5, 7)
+        batch = sub_hashes(_key(2))
+        self.store.complete_save(batch, success=False)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])  # retry
+        self.store.complete_save(batch, success=False)
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        # Rollback restored the candidates: no eviction events.
+        self.assertEqual(list(self.manager.take_events()), [])
+
+    def test_reset_cache_drains_clears_and_resets_state(self):
+        # A stored key, an in-flight store, and a quarantined key all reset.
+        seed_host_entries(self.store, _key(0))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.HIT)
+        self._store_key(_key(1), 5, 7)
+        self.store.complete_save(sub_hashes(_key(1)))
+
+        self.manager.reset_cache()
+        (clear_call, ) = self.store.calls_named("clear")
+        self.assertEqual(clear_call.args, ())
+        self.assertEqual(self.store.entries, {})
+        self.assertFalse(self.manager.has_pending_work())
+        # Advisory state gone: everything is a MISS and re-admittable.
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.MISS)
+        out = self.manager.prepare_store([_key(0), _key(1)], _ctx())
+        self.assertEqual(out.keys_to_store, [_key(0), _key(1)])
+
+    def test_reset_cache_without_clear_raises(self):
+        legacy = FakeKVCacheStore(registered_workers=2)
+        manager = make_manager(legacy)
+        with self.assertRaises(NotImplementedError):
+            manager.reset_cache()
 
 
 class TestShmModelUid(unittest.TestCase):

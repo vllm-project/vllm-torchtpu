@@ -42,6 +42,13 @@ directory live in shared memory and survive an engine-process crash; the
 directory is recovered inside the plain constructors on restart, gated by a
 config-derived `RAIDEN_SHM_MODEL_UID`.
 
+Phase 3 (wheel #2 primitives, detected at runtime): store-job batches are
+classified by `insert_and_lock_detailed` (existing entries pinned in place,
+only newly inserted ones saved) with displacements surfaced as eviction
+events through `take_events`; `reset_cache` empties the store via the public
+`clear()`. On a wheel-#1 tpu_raiden, classification falls back to
+per-sub-hash peeks, no events are emitted, and `reset_cache` raises.
+
 See `raiden_connector.py` for the connector wiring (fence + echo channel).
 """
 from __future__ import annotations
@@ -55,11 +62,11 @@ from dataclasses import dataclass, field
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.kv_offload.base import (CanonicalKVCaches, LoadStoreSpec,
-                                     LookupResult, OffloadingManager,
-                                     OffloadingSpec, OffloadingWorker,
-                                     OffloadKey, PrepareStoreOutput,
-                                     ReqContext, RequestOffloadingContext,
-                                     TransferResult)
+                                     LookupResult, OffloadingEvent,
+                                     OffloadingManager, OffloadingSpec,
+                                     OffloadingWorker, OffloadKey,
+                                     PrepareStoreOutput, ReqContext,
+                                     RequestOffloadingContext, TransferResult)
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 from vllm_torchtpu.logger import init_logger
@@ -139,6 +146,11 @@ class Admission:
     saved_sub_hashes: list[bytes] = field(default_factory=list)
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
+    # Stores only: keys whose entries this admission displaced into the
+    # eviction-candidate list. Committed (as eviction events + advisory
+    # forget) only if the job SUCCEEDS — a failed job's rollback restores
+    # the candidates.
+    displaced_keys: list[OffloadKey] = field(default_factory=list)
 
 
 @dataclass
@@ -205,6 +217,20 @@ class RaidenOffloadingManager(OffloadingManager):
         self._block_id_cls = store_types.RaidenBlockID
         self._raiden_id = self._store.raiden_id
 
+        # Wheel-#2 primitives. hasattr is deliberate: the tpu_raiden wheel is
+        # pinned per recipe and wheel #1 genuinely lacks both — store-job
+        # classification then falls back to per-sub-hash peeks (no eviction
+        # events) and reset_cache stays unsupported.
+        self._has_detailed = hasattr(self._store, "insert_and_lock_detailed")
+        self._has_clear = hasattr(self._store, "clear")
+        if not (self._has_detailed and self._has_clear):
+            logger.warning(
+                "[kv-offload-v2] tpu_raiden wheel predates wheel #2 "
+                "(insert_and_lock_detailed=%s, clear=%s): store-job "
+                "classification uses per-sub-hash peeks, eviction events are "
+                "unavailable, and reset_cache raises.", self._has_detailed,
+                self._has_clear)
+
         # Registration gate: stores/loads stay disabled until every rank's
         # KVCacheManager has registered with the store's controller. A
         # partial worker set would otherwise silently partial-save and
@@ -228,6 +254,9 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+        # Eviction events for take_events(): populated when a successful
+        # store job's admission displaced entries (wheel #2 detailed result).
+        self._pending_events: list[OffloadingEvent] = []
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -380,17 +409,34 @@ class RaidenOffloadingManager(OffloadingManager):
         return
 
     def take_events(self):
-        return ()
+        events = self._pending_events
+        self._pending_events = []
+        return events
 
     def has_pending_work(self) -> bool:
         return bool(self._admissions)
 
     def reset_cache(self) -> None:
-        raise NotImplementedError(
-            "[kv-offload-v2] reset_cache is unsupported until raiden ships a "
-            "public clear/evict_all: release_and_delete is a rollback "
-            "primitive that preserves HOST entries, so a vLLM-side reset "
-            "would silently not clear the cache.")
+        if not self._has_clear:
+            raise NotImplementedError(
+                "[kv-offload-v2] reset_cache requires the wheel-#2 "
+                "tpu_raiden clear() primitive: release_and_delete is a "
+                "rollback that preserves HOST entries, so a vLLM-side reset "
+                "would silently not clear the cache. Install a wheel built "
+                "from the raiden_controller branch with KVCacheStore.Clear.")
+        # The connector scheduler flushed every live job before calling us;
+        # drain whatever is still in flight so no pins survive (clear()
+        # rejects otherwise), with retries suppressed by the drain.
+        if self._admissions:
+            self.drain_jobs(set(self._admissions.keys()))
+        cleared = self._store.clear()
+        self._stored_keys.clear()
+        self._inflight_store_keys.clear()
+        self._quarantined_keys.clear()
+        self._pending_events.clear()
+        logger.info(
+            "[kv-offload-v2] reset_cache: cleared %d store entries; advisory "
+            "state and quarantine reset.", cleared)
 
     def shutdown(self) -> None:
         if self._admissions:
@@ -419,7 +465,38 @@ class RaidenOffloadingManager(OffloadingManager):
                 status=self._block_status.HBM,
             ) for d in device_ids
         ]
-        if not self._store.insert_and_lock(sub_hashes, slices, on_host=False):
+        # Save only the newly admitted HBM entries. Pre-existing HOST /
+        # HOST_AND_HBM sub-hashes (recovered across a restart, or committed
+        # by a partially failed earlier save) were locked without touching
+        # their slices; their bytes are valid (content-addressed) and
+        # passing them to save() would fail the whole launch on its
+        # HBM-status precondition. Wheel #2's detailed result classifies the
+        # batch directly (and reports displacements); on wheel #1, classify
+        # with per-sub-hash peeks after a bare insert_and_lock.
+        displaced_keys: list[OffloadKey] = []
+        if self._has_detailed:
+            result = self._store.insert_and_lock_detailed(sub_hashes,
+                                                          slices,
+                                                          on_host=False)
+            admitted = result.success
+            if admitted:
+                to_save = list(result.inserted)
+                seen: set[OffloadKey] = set()
+                for h, _ in result.displaced:
+                    key = OffloadKey(h[:-4])
+                    if key not in seen:
+                        seen.add(key)
+                        displaced_keys.append(key)
+        else:
+            admitted = self._store.insert_and_lock(sub_hashes,
+                                                   slices,
+                                                   on_host=False)
+            if admitted:
+                to_save = [
+                    h for h in sub_hashes
+                    if self._sub_hash_status(h) == self._block_status.HBM
+                ]
+        if not admitted:
             # Rolled back inside raiden; no save issued, no cleanup owed.
             logger.warning(
                 "[kv-offload-v2] store job %d: insert_and_lock rejected %d "
@@ -430,30 +507,20 @@ class RaidenOffloadingManager(OffloadingManager):
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE,
                             success=False))
             return
-        # Save only the newly admitted HBM entries. Pre-existing HOST /
-        # HOST_AND_HBM sub-hashes (recovered across a restart, or committed
-        # by a partially failed earlier save) were locked without touching
-        # their slices; their bytes are valid (content-addressed) and
-        # passing them to save() would fail the whole launch on its
-        # HBM-status precondition. insert_and_lock returns a bare bool, so
-        # classify with per-sub-hash peeks (in-process, and only on the
-        # store path).
-        to_save = [
-            h for h in sub_hashes
-            if self._sub_hash_status(h) == self._block_status.HBM
-        ]
         if not to_save:
             # Every sub-hash was already host-resident: nothing to transfer.
             # Release the exact admitted batch and finish successfully.
             self._store.release(sub_hashes)
             self._inflight_store_keys.difference_update(keys)
             self._stored_keys.update(keys)
+            self._commit_displacement(displaced_keys)
             self._finished.append(
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True))
             return
         if not self._store.save(to_save):
             # Synchronous launch failure: revert the admission exactly once
-            # with the exact batch; never entered into the poll path.
+            # with the exact batch; never entered into the poll path. The
+            # rollback restores displaced candidates, so no events.
             self._store.release_and_delete(sub_hashes)
             logger.error(
                 "[kv-offload-v2] store job %d: save() launch failed for %d "
@@ -471,10 +538,25 @@ class RaidenOffloadingManager(OffloadingManager):
             pending=set(to_save),
             saved_sub_hashes=to_save,
             retries_left=_SAVE_RETRIES,
+            displaced_keys=displaced_keys,
         )
         self._admissions[job_id] = admission
         for h in to_save:
             self._hash_to_admission[h] = admission
+
+    def _commit_displacement(self, displaced_keys: list[OffloadKey]) -> None:
+        """A successful admission's displacements are permanent: surface them
+        as eviction events and forget them in the advisory state, so the
+        scheduler stops treating the keys as stored and a later re-offer
+        re-admits them. (A failed admission's rollback restores the
+        candidates instead — never commit those.)"""
+        if not displaced_keys:
+            return
+        self._stored_keys.difference_update(displaced_keys)
+        self._pending_events.append(
+            OffloadingEvent(keys=list(displaced_keys),
+                            medium="raiden_host",
+                            removed=True))
 
     def submit_load_job(self,
                         job_id: int,
@@ -554,6 +636,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 # Unpin the exact admitted batch; entries become evictable.
                 self._store.release(admission.sub_hashes)
                 self._stored_keys.update(admission.keys)
+                self._commit_displacement(admission.displaced_keys)
             else:
                 # Unpin and delete the newly admitted HBM entries, restoring
                 # displaced candidates.
