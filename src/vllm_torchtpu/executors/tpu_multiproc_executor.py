@@ -9,7 +9,13 @@ instead of all 14 shapes sharing a single window and timing out.
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+# Each worker derives its attention block count from its own measured free HBM,
+# so the counts differ by a little rounding noise. The bound has to scale: at a
+# few thousand blocks a handful is a real discrepancy, while Kimi Linear's ~484k
+# small MLA blocks land 10 apart (0.002%) on a healthy run. Allow whichever is
+# larger, and keep taking the minimum so every rank can hold what is allocated.
 _NUM_BLOCKS_OVERRIDE_TOL = 4
+_NUM_BLOCKS_OVERRIDE_REL_TOL = 1e-3
 
 
 class TpuMultiprocExecutor(MultiprocExecutor):
@@ -33,8 +39,14 @@ class TpuMultiprocExecutor(MultiprocExecutor):
                 if ovr is not None
             ]
             if overrides:
-                assert max(overrides) - min(
-                    overrides) <= _NUM_BLOCKS_OVERRIDE_TOL
+                tol = max(_NUM_BLOCKS_OVERRIDE_TOL,
+                          _NUM_BLOCKS_OVERRIDE_REL_TOL * max(overrides))
+                assert max(overrides) - min(overrides) <= tol, (
+                    "workers disagree on the attention block count by more "
+                    f"than {tol:.0f} blocks: {overrides}. Each worker derives "
+                    "it from its own measured free HBM, so a spread this wide "
+                    "means the ranks are not holding comparable amounts of "
+                    "memory.")
                 self.vllm_config.cache_config.num_gpu_blocks_override = min(
                     overrides)
 

@@ -87,6 +87,11 @@ torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+# Replaces vLLM's in-tree Kimi models, whose KDA path is Triton-based and cannot
+# run on TPU. Must be an entry point rather than a call from register_layers:
+# both run before architecture resolution, but only this one names the module
+# that owns the registration.
+torchtpu_models = "vllm_torchtpu.models:register_models"
 
 [tool.pytest.ini_options]
 markers = [
