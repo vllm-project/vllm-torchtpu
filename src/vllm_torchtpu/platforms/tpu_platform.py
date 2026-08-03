@@ -946,26 +946,37 @@ class TpuPlatform(Platform):
 
 def _get_exponential_token_paddings(min_token_size: int,
                                     max_token_size: int) -> list[int]:
-    """Sizes doubling from min_token_size until max_token_size is covered."""
+    """Sizes doubling from min_token_size, capped exactly at max_token_size.
+
+    The last bucket is max_token_size itself rather than the next power of
+    two above it: the scheduler never schedules more than max_token_size
+    tokens in one step, so a bucket larger than that only wastes compile
+    time and HBM (each bucket's compiled program stays resident) without
+    ever being used. (e.g. max_token_size=5000 will produce buckets
+    [..., 4096, 5000] rather than [..., 4096, 8192]).
+    """
     paddings = []
     num = min_token_size
-    while True:
+    while num < max_token_size:
         paddings.append(num)
-        if num >= max_token_size:
-            return paddings
         num *= 2
+    paddings.append(max_token_size)
+    return paddings
 
 
 def _get_linear_then_exponential_token_paddings(
         min_token_size: int, max_token_size: int, linear_until: int,
         linear_interval: int) -> list[int]:
-    """Sizes stepping by ``linear_interval`` to ``linear_until``, doubling after."""
+    """Sizes stepping by ``linear_interval`` to ``linear_until``, doubling
+    after, capped exactly at max_token_size (see _get_exponential_token_paddings)."""
     linear_end = min(linear_until, max_token_size)
     paddings = sorted(
         {min_token_size}
         | set(range(linear_interval, linear_end + 1, linear_interval)))
-    while paddings[-1] < max_token_size:
+    while paddings[-1] * 2 < max_token_size:
         paddings.append(paddings[-1] * 2)
+    if paddings[-1] < max_token_size:
+        paddings.append(max_token_size)
     return paddings
 
 
