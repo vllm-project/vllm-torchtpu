@@ -185,6 +185,38 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
+def _patch_moe_explicit_pcp_collectives() -> None:
+    """Keep PCP MoE dispatch/combine explicit for TorchTPU.
+
+    vLLM treats PCP+EP as an all-to-all-kernel configuration and therefore
+    skips the explicit PCP all-gather/reduce-scatter in ``MoERunner``.  The
+    TorchTPU monolithic MoE kernels only compute local expert contributions;
+    they do not implement internal PCP dispatch/combine.  Do not let PCP by
+    itself select that internal-kernel contract until the backend supports it.
+    """
+    from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
+
+    if getattr(FusedMoEParallelConfig, "_tpu_explicit_pcp_collectives_patch",
+               False):
+        return
+
+    upstream_property = FusedMoEParallelConfig.use_all2all_kernels
+    upstream_getter = upstream_property.fget
+    assert upstream_getter is not None
+
+    def use_all2all_kernels(self):
+        if (self.use_ep and self.pcp_size > 1 and self.dp_size == 1
+                and not self.is_sequence_parallel):
+            return False
+        return upstream_getter(self)
+
+    FusedMoEParallelConfig.use_all2all_kernels = property(
+        use_all2all_kernels, doc=upstream_property.__doc__)
+    FusedMoEParallelConfig._tpu_explicit_pcp_collectives_patch = True
+    logger.info(
+        "Applied TPU patch: use explicit PCP collectives for monolithic MoE.")
+
+
 def _patch_expert_map_host_lookup() -> None:
     """Serve expert-map lookups from a host-side copy of the expert map.
 
@@ -622,7 +654,33 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                                  hash_block_size,
                                                  metrics_collector=None):
             groups = kv_cache_config.kv_cache_groups
-            if (pcp_world_size > 1 and _is_attention_mamba_hybrid(groups)):
+            logical_pcp_world_size = pcp_world_size
+            if (pcp_world_size == 1 and _is_attention_mamba_hybrid(groups)):
+                # vLLM 0.26's Scheduler already folds PCP into
+                # scheduler_block_size, but hard-codes pcp_world_size=1 when
+                # constructing KVCacheManager. Recover the folded PCP factor
+                # from the logical scheduler block and the rank-local specs.
+                physical_scheduler_block_size = math.lcm(
+                    *(_effective_block_size(group.kv_cache_spec, 1)
+                      for group in groups))
+                if scheduler_block_size % physical_scheduler_block_size != 0:
+                    raise ValueError(
+                        "Logical scheduler block size must be divisible by "
+                        "the physical hybrid KV cache block size. Got "
+                        f"scheduler_block_size={scheduler_block_size}, "
+                        "physical_scheduler_block_size="
+                        f"{physical_scheduler_block_size}.")
+                logical_pcp_world_size = (scheduler_block_size //
+                                          physical_scheduler_block_size)
+                if logical_pcp_world_size > 1:
+                    logger.info(
+                        "Inferred PCP world size %d from logical scheduler "
+                        "block size %d and physical block size %d.",
+                        logical_pcp_world_size, scheduler_block_size,
+                        physical_scheduler_block_size)
+
+            if (logical_pcp_world_size > 1
+                    and _is_attention_mamba_hybrid(groups)):
                 if dcp_world_size != 1:
                     raise ValueError("TPU hybrid PCP cache coordination does "
                                      "not support DCP.")
@@ -636,7 +694,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     kv_cache_groups=[
                         replace(group,
                                 kv_cache_spec=_with_effective_block_size(
-                                    group.kv_cache_spec, pcp_world_size))
+                                    group.kv_cache_spec,
+                                    logical_pcp_world_size))
                         for group in kv_cache_config.kv_cache_groups
                     ])
                 pcp_world_size = 1

@@ -16,13 +16,13 @@ steps:
   - group: "Integration Tests on TPU"
     depends_on: "build_docker"
     steps:
-      - label: "Integration: qwen35-p4d2-disagg-correctness"
-        key: "integration_qwen35_p4d2_disagg_correctness"
+      - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
+        key: "integration_qwen35_pcp4_dp4_disagg_correctness"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
-          RUN_ROOT: "/perf_eval_results/qwen35_p4d2_disagg_ci"
+          RUN_ROOT: "/perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh"
         artifact_paths:
