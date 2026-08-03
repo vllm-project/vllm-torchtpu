@@ -149,10 +149,13 @@ if [[ "${MODEL_PATH}" == /* || "${MODEL_PATH}" == ./* || "${MODEL_PATH}" == ../*
     exit 2
   fi
 fi
-if [[ ! "${COMPILE_SIZES}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
-  echo "COMPILE_SIZES must be a comma-separated integer list: ${COMPILE_SIZES}" >&2
-  exit 2
-fi
+for compile_sizes_name in COMPILE_SIZES PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZES; do
+  compile_sizes_value="${!compile_sizes_name}"
+  if [[ ! "${compile_sizes_value}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "${compile_sizes_name} must be a comma-separated integer list: ${compile_sizes_value}" >&2
+    exit 2
+  fi
+done
 
 managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}")
 for offset in 0 1 2 3; do
