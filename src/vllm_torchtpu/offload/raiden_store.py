@@ -110,6 +110,12 @@ _MAX_STORE_KEYS_PER_JOB = int(
 # be reused, so re-reading them would ship garbage.
 _SAVE_RETRIES = int(os.environ.get("VLLM_TPU_OFFLOAD_SAVE_RETRIES", "1"))
 
+# Diagnostic only: log the namespaced sub-hash of every store batch and of
+# every registry-eligible lookup miss, so two replicas' key spaces can be
+# diffed from their logs (j-c92b643e: cross-replica lookups missed 100%
+# despite both replicas provably publishing and querying the registry).
+_DEBUG_KEYS = os.environ.get("VLLM_TPU_OFFLOAD_DEBUG_KEYS", "") == "1"
+
 _DEFAULT_CONTROLLER_PORT = 51515
 
 
@@ -263,9 +269,10 @@ class RaidenOffloadingManager(OffloadingManager):
             )
             logger.info(
                 "[kv-offload-v2] KVCacheStore up: capacity=%d kernel blocks "
-                "(%d offloaded blocks x %d), controller at %s%s",
-                capacity_kernel_blocks, num_offloaded_blocks,
-                sub_blocks_per_key, store.raiden_controller_address,
+                "(%d offloaded blocks x %d), namespace=%s, controller at "
+                "%s%s", capacity_kernel_blocks, num_offloaded_blocks,
+                sub_blocks_per_key, key_namespace.hex(),
+                store.raiden_controller_address,
                 (f", published at {store.store_server_address or '<nothing>'}"
                  f" in registry {global_registry_address}"
                  if self._enable_global else ""))
@@ -413,6 +420,10 @@ class RaidenOffloadingManager(OffloadingManager):
                         and key not in self._remote_quarantined_keys)
         matches = self._store.lookup(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
+            if _DEBUG_KEYS and allow_remote:
+                logger.info(
+                    "[kv-offload-v2] DEBUG_KEYS global-miss sub_hash=%s",
+                    sub_hashes[len(matches)].hex())
             self._stored_keys.discard(key)
             return LookupResult.MISS
         all_local = True
@@ -689,6 +700,10 @@ class RaidenOffloadingManager(OffloadingManager):
                     displaced_keys=displaced_keys,
                 ))
             return
+        if _DEBUG_KEYS and to_save:
+            logger.info(
+                "[kv-offload-v2] DEBUG_KEYS store-batch n=%d first=%s "
+                "last=%s", len(to_save), to_save[0].hex(), to_save[-1].hex())
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.STORE,
