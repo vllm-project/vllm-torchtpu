@@ -340,7 +340,7 @@ class TPUModelRunner(GPUModelRunner):
         self.original_parallel_config = vllm_config.parallel_config
         self.device_config = vllm_config.device_config
 
-        # Set by `_update_mamba_page_size_padded` for hybrid attention+mamba
+        # Set by `_update_*_page_size_padded` for hybrid attention
         # models so vLLM sees a uniform page size across groups.
         self._hybrid_uniform_page_size_bytes: int | None = None
 
@@ -817,8 +817,10 @@ class TPUModelRunner(GPUModelRunner):
         has_attention = any(
             isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
-        if has_attention and has_mamba and not self._unified_kv_layout:
-            self._update_mamba_page_size_padded(layers)
+        if has_attention and not self._unified_kv_layout:
+            self._update_attention_page_size_padded(layers)
+            if has_mamba:
+                self._update_mamba_page_size_padded(layers)
 
         hma_enabled = (
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
@@ -1053,6 +1055,63 @@ class TPUModelRunner(GPUModelRunner):
                     f"{target_layer_name}, but the target cache was not "
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+    def _update_attention_page_size_padded(
+            self, layers: dict[str, AttentionLayerBase]) -> None:
+        """Pad attention page sizes so vLLM's num_blocks matches what
+        the TPU allocates per layer.
+
+        If every attention layer already has the same natural TPU page
+        size, there's nothing to compensate for: leave
+        `mamba_page_size_padded` as a no-op default.
+
+        If they differ, vLLM's own `unify_kv_cache_spec_page_size` will
+        rescale the smaller layer's `block_size` to match but leaves
+        its `page_size_padded` at the old, now-too-small
+        value, which trips `AttentionSpec.page_size_bytes`'s own
+        `page_size_padded >= real_page_size_bytes` assertion. Instead,
+        pin every layer's `page_size_padded` to the max natural size
+        up front (mirroring the Mamba-hybrid case below), so all
+        layers already report equal `page_size_bytes` and
+        `unify_kv_cache_spec_page_size` is a no-op.
+
+        NOTE: Cannot leave `page_size_padded=None` on every layer, because
+        vLLM core uses `page_size_padded` to size `num_blocks` against the HBM
+        budget. With `page_size_padded=None`, that sizing falls back to
+        generic page-size formula (https://github.com/vllm-project/vllm/blob/48aa8d8d7529d2314858d8487cc0a21789fc7ec1/vllm/v1/kv_cache_interface.py#L204-L218)
+        which has no notion of TPU's packing/alignment rules (e.g.
+        fp8 packs 4 elements per 32-bit lane, so `num_kv_heads * 2` gets
+        rounded up to a multiple of 4 in the actual TPU tensor -- see
+        `get_kv_cache_shape`). Where that rounding changes the byte count --
+        e.g. a GQA layer TP-sharded down to a single KV head -- the real TPU
+        allocation ends up larger than vLLM's generic formula accounted for,
+        so `num_blocks` is silently oversized and HBM usage silently exceeds
+        `gpu_memory_utilization`'s target, instead of failing loudly the way
+        this assertion does. `page_size_padded` has to stay pinned to the
+        true, packing-aware size on every layer; this function's job is only
+        to make sure every layer is pinned to the *same* one.
+        """
+        attn_page_sizes = {
+            PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                self.block_size,
+                m.num_kv_heads,
+                m.head_size,
+                self.kv_cache_dtype,
+            )
+            for m in layers.values() if isinstance(m, Attention)
+        }
+        if len(attn_page_sizes) > 1:
+            uniform_page_size_bytes = max(attn_page_sizes)
+            self._hybrid_uniform_page_size_bytes = uniform_page_size_bytes
+            self.cache_config.mamba_page_size_padded = uniform_page_size_bytes
+            logger.info(
+                "Pure-attention hybrid KV cache: padding every layer "
+                "spec to %d bytes (max of native sizes %s). Avoids "
+                "vLLM's unify_kv_cache_spec_page_size leaving a stale "
+                "page_size_padded behind when layer head_dims differ.",
+                uniform_page_size_bytes, sorted(attn_page_sizes))
+        else:
+            self.cache_config.mamba_page_size_padded = attn_page_sizes.pop()
 
     def _update_mamba_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
