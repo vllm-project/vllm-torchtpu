@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -64,6 +65,9 @@ class KimiMoE(nn.Module):
 
         hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
+        vllm_config = get_current_vllm_config_or_none()
+        self.use_ep = (vllm_config is not None
+                       and vllm_config.parallel_config.enable_expert_parallel)
         routed_expert_hidden_size = getattr(config,
                                             "routed_expert_hidden_size", None)
         expert_hidden_size = (routed_expert_hidden_size
@@ -118,8 +122,8 @@ class KimiMoE(nn.Module):
         padded_intermediate_size = config.moe_intermediate_size
         min_per_partition = getattr(config,
                                     "min_moe_intermediate_per_partition", 256)
-        if (self.tp_size > 1 and padded_intermediate_size // self.tp_size
-                < min_per_partition):
+        if (not self.use_ep and self.tp_size > 1 and
+                padded_intermediate_size // self.tp_size < min_per_partition):
             padded_intermediate_size = min_per_partition * self.tp_size
 
         situ_beta = (getattr(config, "activation_situ_beta", None)
