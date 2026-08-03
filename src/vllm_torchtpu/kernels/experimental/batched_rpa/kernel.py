@@ -244,9 +244,23 @@ def rpa_body(
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
-                k_head = kv_in_vref[b_idx, kv_head * 2, :, :, 0:cfgs.bkv_sz]
-                v_head = kv_in_vref[b_idx, kv_head * 2 + 1, :, :,
-                                    0:cfgs.bkv_sz]
+                k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
+                v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
+                target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
+                k_head_ref = k_slice.reshape(target_shape)
+                v_head_ref = v_slice.reshape(target_shape)
+                pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+
+                k_head_loaded = utils.strided_load(
+                    k_head_ref, 0, pack_dim, 1, dtype=cfgs.serve.dtype_kv
+                )
+                v_head_loaded = utils.strided_load(
+                    v_head_ref, 0, pack_dim, 1, dtype=cfgs.serve.dtype_kv
+                )
+
+                k_head = k_head_loaded[:, : cfgs.bkv_sz]
+                v_head = v_head_loaded[:, : cfgs.bkv_sz]
+
                 ks.append(k_head.reshape(cfgs.aligned_kv_head_dim,
                                          cfgs.bkv_sz))
                 vs.append(v_head.reshape(cfgs.aligned_kv_head_dim,
