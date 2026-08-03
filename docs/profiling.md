@@ -141,7 +141,15 @@ continuous trace blends both. The phased profiler instead classifies every
 engine step by its batch composition and captures a **separate, bounded trace
 the first time each phase appears**.
 
-### Running it
+Whichever way you run it, two things have to be true: the server process must
+see `USE_PHASED_PROFILER=true` and a trace directory, and something must call
+`/start_profile` and `/stop_profile` around the traffic. The difference between
+the two options below is only *who* makes those two calls.
+
+### Option 1: through the benchmark harness
+
+`run_benchmarks.sh` makes the profile calls for you, so this is the whole
+command — no `curl` needed:
 
 ```bash
 rm -rf /tmp/vllm_phased_profile
@@ -151,9 +159,47 @@ EXTRA_SERVE_ARGS='--profiler-config.profiler torch --profiler-config.torch_profi
 ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3.5-35b-fp8-tp4-ep
 ```
 
-The same flags work on a plain `vllm serve` command; the phased profiler is
-armed by the same `/start_profile` and `/stop_profile` endpoints as the standard
-one.
+The harness makes both calls itself: it infers `CAPTURE_PROFILE=1` from the
+trace directory in `EXTRA_SERVE_ARGS`
+([as above](#through-the-benchmark-harness)) and passes `--profile` to
+`vllm bench serve`, which POSTs to the two endpoints around the measured run.
+Warmup passes are excluded.
+
+### Option 2: against your own `vllm serve`
+
+Start the server yourself, then bracket your own traffic with the profile
+endpoints:
+
+```bash
+rm -rf /tmp/vllm_phased_profile
+
+USE_PHASED_PROFILER=true vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+  --tensor-parallel-size 4 \
+  --enable-expert-parallel \
+  --attention-backend CUSTOM \
+  --profiler-config.profiler torch \
+  --profiler-config.torch_profiler_dir /tmp/vllm_phased_profile \
+  --profiler-config.max_iterations 5 \
+  --profiler-config.ignore_frontend true
+```
+
+Once the server is up:
+
+```bash
+curl -X POST http://localhost:8000/start_profile
+#  ... send the traffic you want to trace ...
+curl -X POST http://localhost:8000/stop_profile
+```
+
+`USE_PHASED_PROFILER` must be exported into the server's own environment — it is
+read by the TPU workers, so setting it only in the shell that runs `curl` has no
+effect.
+
+Two flags in that command are easy to miss. `--attention-backend CUSTOM` selects
+the batched-RPA Pallas kernel; without it vLLM falls back to `FLASH_ATTN` with
+`block_size=16`, so you would be profiling a backend you do not serve with.
+`--profiler-config.ignore_frontend true` suppresses the AsyncLLM CPU profiler,
+which otherwise ignores the iteration limits and warns about the added overhead.
 
 Clear the trace directory between runs. Phases accumulate into per-phase
 subdirectories, and traces from an earlier run are easy to mistake for the
