@@ -854,6 +854,166 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertFalse(manager.is_job_launched(7))
 
 
+class _FakeFinishedRequest:
+    """Request stand-in for the finished-request store path."""
+
+    def __init__(self, req_id, num_tokens, num_computed_tokens, status):
+        self.request_id = req_id
+        self.num_tokens = num_tokens
+        self.num_computed_tokens = num_computed_tokens
+        self.num_prompt_tokens = num_tokens
+        self.status = status
+        self.kv_transfer_params = None
+
+    def is_finished(self):
+        return True
+
+
+class TestFinishedRequestStoreBuild(unittest.TestCase):
+    """_build_store_jobs on aborted/finished requests, against the real
+    upstream state machine (config, RequestOffloadState, req_status).
+
+    An aborted request's offload_keys cover every full token block (hashes
+    exist as soon as tokens are known) while block_ids only cover what got
+    allocated before the abort; the stock _build_store_jobs dies on its
+    slice-length assert (seen in job j-841170b1 when the eval pod killed
+    its background stressors, aborting their in-flight requests). The
+    TPURaidenOffloadingScheduler override trims the keys to the chunks
+    whose blocks were allocated AND computed before delegating.
+    """
+
+    TPC = 4  # tokens_per_chunk (= tokens_per_block, blocks_per_chunk=1)
+
+    def _make_sched(self, manager):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            GroupOffloadConfig, SchedulerOffloadConfig)
+
+        from vllm_torchtpu.offload.raiden_connector import \
+            TPURaidenOffloadingScheduler
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SchedulerOffloadConfig(
+            kv_group_configs=(GroupOffloadConfig(
+                group_idx=0,
+                tokens_per_block=self.TPC,
+                tokens_per_chunk=self.TPC,
+                hashes_per_chunk=1,
+                kv_event_group_spec=MagicMock(),
+                sliding_window_size_in_chunks=None), ),
+            blocks_per_chunk=1,
+            num_workers=2,
+            offload_prompt_only=False)
+        sched.manager = manager
+        sched._raiden_manager = manager
+        sched._fence_pending = {}
+        sched._req_status = {}
+        sched._jobs = {}
+        sched._job_counter = 0
+        sched._block_id_to_pending_jobs = {}
+        sched._current_batch_allocated_block_ids = set()
+        sched._current_batch_jobs_to_flush = set()
+        sched._connector_stats = MagicMock()
+        sched._events_tracker = MagicMock()
+        return sched
+
+    def _track(self, sched, req, keys, block_ids):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
+            RequestOffloadState  # noqa: E501
+        from vllm.v1.kv_offload.base import RequestOffloadingContext
+        req_status = RequestOffloadState(
+            config=sched.config,
+            req=req,
+            req_context=_ctx(req.request_id),
+            offloading_context=RequestOffloadingContext())
+        req_status.group_states[0].offload_keys.extend(keys)
+        req_status.group_states[0].block_ids.extend(block_ids)
+        sched._req_status[req.request_id] = req_status
+        return req_status
+
+    def _add_pending_store_job(self, sched, req_status, job_id=99):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
+            TransferJobStatus  # noqa: E501
+        req_status.transfer_jobs.add(job_id)
+        sched._jobs[job_id] = TransferJobStatus(
+            req_id=req_status.req.request_id,
+            pending_count=2,
+            keys=set(),
+            is_store=True)
+
+    def _sched_output(self, req_id):
+        return SimpleNamespace(num_scheduled_tokens={},
+                               finished_req_ids={req_id})
+
+    def _aborted_setup(self,
+                       num_tokens=32,
+                       num_computed_tokens=12,
+                       num_blocks=3):
+        from vllm.v1.request import RequestStatus
+        store = FakeKVCacheStore(registered_workers=2)
+        sched = self._make_sched(make_manager(store))
+        req = _FakeFinishedRequest("r1", num_tokens, num_computed_tokens,
+                                   RequestStatus.FINISHED_ABORTED)
+        keys = [_key(i) for i in range(num_tokens // self.TPC)]
+        req_status = self._track(sched, req, keys,
+                                 list(range(1, num_blocks + 1)))
+        self._add_pending_store_job(sched, req_status)
+        return sched, keys
+
+    def test_stock_build_store_jobs_crashes_on_aborted_request(self):
+        # The upstream shape this override exists for: if this stops
+        # raising on a vllm uprev, the override can likely be dropped.
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
+            OffloadingConnectorScheduler  # noqa: E501
+        sched, _ = self._aborted_setup()
+        with self.assertRaises(AssertionError):
+            OffloadingConnectorScheduler._build_store_jobs(
+                sched, self._sched_output("r1"))
+
+    def test_aborted_request_stores_only_allocated_computed_chunks(self):
+        # 8 chunks of hashes, 3 blocks allocated, 12 tokens (3 chunks)
+        # computed: exactly chunks 0-2 are stored.
+        sched, keys = self._aborted_setup()
+        jobs = sched._build_store_jobs(self._sched_output("r1"))
+        (job, ) = jobs.values()
+        self.assertEqual(job.dst_spec.keys, keys[:3])
+        self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2, 3])
+
+    def test_aborted_request_caps_at_computed_tokens(self):
+        # 3 blocks allocated but only 10 tokens (2 chunks) computed — the
+        # third block's KV was never written and must not be stored.
+        sched, keys = self._aborted_setup(num_computed_tokens=10)
+        jobs = sched._build_store_jobs(self._sched_output("r1"))
+        (job, ) = jobs.values()
+        self.assertEqual(job.dst_spec.keys, keys[:2])
+        self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2])
+
+    def test_waiting_abort_with_no_blocks_builds_no_job(self):
+        # Aborted straight out of the waiting queue: hashes exist for the
+        # whole prompt but nothing was ever allocated.
+        from vllm.v1.request import RequestStatus
+        store = FakeKVCacheStore(registered_workers=2)
+        sched = self._make_sched(make_manager(store))
+        req = _FakeFinishedRequest("r1", 32, 0, RequestStatus.FINISHED_ABORTED)
+        self._track(sched, req, [_key(i) for i in range(8)], [])
+        jobs = sched._build_store_jobs(self._sched_output("r1"))
+        self.assertEqual(jobs, {})
+        self.assertNotIn("r1", sched._req_status)
+
+    def test_normally_finished_request_keys_untouched(self):
+        # Normal finish: computed = num_tokens - 1, both chunks backed by
+        # blocks. The computed-tokens cap must NOT apply (it would drop the
+        # final chunk the stock scheduler deliberately stores at finish).
+        from vllm.v1.request import RequestStatus
+        store = FakeKVCacheStore(registered_workers=2)
+        sched = self._make_sched(make_manager(store))
+        req = _FakeFinishedRequest("r1", 8, 7, RequestStatus.FINISHED_STOPPED)
+        keys = [_key(0), _key(1)]
+        self._track(sched, req, keys, [1, 2])
+        jobs = sched._build_store_jobs(self._sched_output("r1"))
+        (job, ) = jobs.values()
+        self.assertEqual(job.dst_spec.keys, keys)
+        self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2])
+
+
 class TestWorkerSideConnector(unittest.TestCase):
 
     def _make_worker_connector(self):

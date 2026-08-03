@@ -46,6 +46,12 @@ Two things still ride the scheduler<->worker metadata channel:
 `jobs_to_flush` (blocks about to be reused) is handled scheduler-side:
 fence-pending stores are cancelled, launched jobs are drained by blocking on
 the store polls before this step's metadata ships.
+
+`_build_store_jobs` is additionally overridden to survive aborted requests:
+the stock finished-request store path asserts offload_keys and block_ids
+line up, which an abort violates (hashes cover all known tokens, blocks only
+what was allocated); the override trims the keys to the allocated+computed
+chunks first.
 """
 from __future__ import annotations
 
@@ -57,7 +63,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
-    OffloadingConnectorMetadata, OffloadingWorkerMetadata)
+    OffloadingConnectorMetadata, OffloadingWorkerMetadata, TransferJob)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import \
     build_offloading_config
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
@@ -70,6 +76,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import GPULoadStoreSpec, OffloadKey
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (AdmissionOp,
@@ -138,6 +145,36 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+
+    def _build_store_jobs(
+            self, scheduler_output: SchedulerOutput) -> dict[int, TransferJob]:
+        # A request aborted mid-flight reaches the stock finished-request
+        # store path with offload_keys covering every full token block
+        # (block hashes exist as soon as the tokens are known) while
+        # group_state.block_ids only covers the blocks actually allocated
+        # before the abort — the stock slice-length assert then kills the
+        # engine. Drop the keys of chunks with no allocated blocks, and for
+        # aborted requests also of chunks past the computed tokens: their
+        # blocks may exist (allocated ahead of compute) but their KV was
+        # never written, so storing them would serve garbage on a later
+        # prefix hit. Normally finished requests are untouched — their
+        # block_ids always cover the storable chunks.
+        for req_id in scheduler_output.finished_req_ids or ():
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            req = req_status.req
+            aborted = req.status == RequestStatus.FINISHED_ABORTED
+            for group_config, group_state in zip(self.config.kv_group_configs,
+                                                 req_status.group_states):
+                max_chunks = (len(group_state.block_ids) //
+                              self.config.blocks_per_chunk)
+                if aborted:
+                    max_chunks = min(
+                        max_chunks, req.num_computed_tokens //
+                        group_config.tokens_per_chunk)
+                del group_state.offload_keys[max_chunks:]
+        return super()._build_store_jobs(scheduler_output)
 
     def build_connector_meta(
             self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:

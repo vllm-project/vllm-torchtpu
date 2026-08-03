@@ -538,9 +538,9 @@ class RaidenOffloadingManager(OffloadingManager):
             self._inflight_store_keys and k not in self._quarantined_keys
         ]
         # Batch cap: one store job is one raiden save() failure unit, so
-        # keep it modest. Dropped keys are not accepted, so the scheduler
-        # re-offers them next step (per-group chunk advancement only moves
-        # past accepted keys).
+        # keep it modest. Dropped keys are not re-offered — the 0.26.0
+        # scheduler advances its per-group chunk index past every offered
+        # chunk, so keys beyond the cap are never stored.
         keys_to_store = keys_to_store[:_MAX_STORE_KEYS_PER_JOB]
         if len(keys_to_store) > self._capacity_keys:
             return None
