@@ -34,6 +34,8 @@ def main(args: argparse.Namespace):
     engine_kwargs = dataclasses.asdict(EngineArgs.from_cli_args(args))
     if engine_kwargs.get("profiler_config") is None:
         engine_kwargs["profiler_config"] = {}
+    # ProfilerConfig rejects a trace directory without a profiler kind.
+    engine_kwargs["profiler_config"]["profiler"] = "torch"
     engine_kwargs["profiler_config"]["torch_profiler_dir"] = profile_dir
 
     if engine_kwargs.get("compilation_config") is None:
