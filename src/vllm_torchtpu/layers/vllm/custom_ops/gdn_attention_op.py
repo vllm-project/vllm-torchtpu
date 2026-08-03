@@ -663,7 +663,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         output_partition_specs = (
             PartitionSpec("pcp"),  # new pool
-            PartitionSpec(),  # output (packed rank-major, replicated)
+            PartitionSpec("pcp"),  # output
         )
         gdn_jax_op = pcp_streaming_jax_op(
             op_name,
@@ -676,8 +676,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
-            out_shape = (num_tokens * pcp_size,
-                         local_num_v_heads * self.head_v_dim)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
             return torch.empty_like(recurrent_state), torch.empty(
                 out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
 
@@ -695,7 +694,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                           dt_bias, state_indices,
                                           query_start_loc,
                                           request_distribution, seq_lens)
-            outputs = outputs.reshape(-1, local_num_v_heads * self.head_v_dim)
             recurrent_state.copy_(new_rec)
             return outputs
 
@@ -779,16 +777,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         state_indices, attn_metadata.query_start_loc,
                         attn_metadata.request_distribution,
                         attn_metadata.seq_lens)
-                    if core_attn_out.shape[0] != num_tokens:
-                        start = get_pcp_rank() * num_tokens
-                        core_attn_out = core_attn_out[start:start + num_tokens]
-                    local_core_attn_out = torch.empty(
-                        tuple(core_attn_out.shape),
-                        dtype=core_attn_out.dtype,
-                        device=core_attn_out.device,
-                    )
-                    local_core_attn_out.copy_(core_attn_out)
-                    core_attn_out = local_core_attn_out
                 else:
                     core_attn_out = self.gdn_pooled_op(
                         mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
