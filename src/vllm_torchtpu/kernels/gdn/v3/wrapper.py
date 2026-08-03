@@ -39,6 +39,7 @@ def inner_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
+    p_id: jax.Array | None = None,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -63,9 +64,13 @@ def inner_kernel(
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
         cfg: GDN configuration object.
+        p_id: Optional explicit tile index. Communication-fused outer kernels
+            pass their global compute-tile index because their surrounding
+            pipeline owns the Pallas program id.
     """
 
-    p_id = pl.program_id(0)
+    if p_id is None:
+        p_id = pl.program_id(0)
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(

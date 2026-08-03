@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     pcp_local_token_counts as _pcp_local_token_counts
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.kernels.quantized_matmul import \
+    util as quantized_matmul_util
 from vllm_torchtpu.layers.common.gdn_attention import (
     _derive_pcp_ragged_exchange_descriptors,
     _derive_pcp_rank_major_reorder_indices,
@@ -33,7 +35,8 @@ from vllm_torchtpu.layers.common.gdn_attention import (
     _select_replicated_shard_for_pcp_rank,
     _validate_pcp_ragged_exchange_layout_support,
     run_jax_gdn_attention_pcp_tp_prefill,
-    run_jax_gdn_attention_pooled_pcp_prefill)
+    run_jax_gdn_attention_pooled_pcp_prefill,
+    run_jax_gdn_attention_pooled_pcp_prefill_projection)
 from vllm_torchtpu.layers.common.utils import (
     inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
 
@@ -494,3 +497,182 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
                                    atol=5e-2)
     else:
         assert np.any(np.array(pcp_pool).view(np.uint8))
+
+
+def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline():
+    """Cover FP8 QKVZ projection, both PCP exchanges, and pooled GDN."""
+    pcp_size = 2
+    lengths = np.asarray((64, 64), dtype=np.int32)
+    interleave_size = 16
+    _require_tpu_devices(
+        pcp_size,
+        f"GDN PCP numerical test requires {pcp_size} TPU devices.",
+    )
+
+    n_kq = 2 * pcp_size
+    n_v = 2 * pcp_size
+    d_k = 128
+    d_v = 128
+    kernel_size = 4
+    num_tokens = int(lengths.sum())
+    num_blocks = len(lengths) + 1
+    qkv_dim = 2 * n_kq * d_k + n_v * d_v
+    hidden_size = qkv_dim + n_v * d_v
+
+    keys = jax.random.split(jax.random.key(0), 9)
+    hidden = jax.random.normal(keys[0], (num_tokens, hidden_size),
+                               dtype=jnp.bfloat16)
+    weight_f32 = 0.02 * jax.random.normal(
+        keys[7],
+        (hidden_size, hidden_size),
+        dtype=jnp.float32,
+    )
+    qkvz_weight, qkvz_weight_scale = quantized_matmul_util.quantize_tensor(
+        weight_f32,
+        jnp.float8_e4m3fn,
+    )
+    qkvz_weight_scale = qkvz_weight_scale[:, 0]
+    projected_qkvz = quantized_matmul_util.xla_quantized_matmul(
+        hidden,
+        qkvz_weight,
+        qkvz_weight_scale,
+    )
+    mixed_qkv = projected_qkvz[:, :qkv_dim]
+    ref_z = projected_qkvz[:, qkv_dim:]
+    b = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
+    a = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
+    conv_state = jnp.zeros((num_blocks, kernel_size - 1, qkv_dim),
+                           dtype=jnp.bfloat16)
+    recurrent_state = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
+    conv_weight = jax.random.normal(keys[3], (qkv_dim, 1, kernel_size),
+                                    dtype=jnp.bfloat16)
+    conv_bias = jax.random.normal(keys[4], (qkv_dim, ), dtype=jnp.bfloat16)
+    A_log = jax.random.normal(keys[5], (n_v, ), dtype=jnp.float32)
+    dt_bias = jax.random.normal(keys[6], (n_v, ), dtype=jnp.float32)
+
+    query_start_loc = jnp.asarray((0, 64, 128), dtype=jnp.int32)
+    state_indices = jnp.arange(1, len(lengths) + 1, dtype=jnp.int32)
+    distribution = jnp.asarray((0, len(lengths), len(lengths)),
+                               dtype=jnp.int32)
+    seq_lens = jnp.asarray(lengths, dtype=jnp.int32)
+    (_, _), ref_output = gdn_v3_wrapper.fused_conv1d_gdn(
+        mixed_qkv,
+        b,
+        a,
+        conv_state,
+        recurrent_state,
+        conv_weight,
+        conv_bias,
+        A_log,
+        dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+    )
+
+    local_required_tokens = int(
+        _pcp_local_token_counts(lengths, pcp_size, interleave_size).max())
+    projection_token_block = 2 * interleave_size
+    local_padded_tokens = max(
+        8 * projection_token_block,
+        (local_required_tokens + projection_token_block - 1) //
+        projection_token_block * projection_token_block,
+    )
+    padded_num_tokens = local_padded_tokens * pcp_size
+    token_order, _ = _build_pcp_rank_major_token_order(
+        lengths,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+    )
+    valid = token_order >= 0
+    valid_rows = np.where(valid)[0]
+    source_rows = token_order[valid]
+
+    def pack_tokens(tensor):
+        padded = jnp.pad(tensor, ((0, padded_num_tokens - num_tokens), (0, 0)))
+        return jnp.zeros_like(padded).at[valid_rows].set(padded[source_rows])
+
+    packed_hidden = pack_tokens(hidden)
+    packed_b = pack_tokens(b)
+    packed_a = pack_tokens(a)
+
+    mesh = Mesh(np.asarray(jax.devices()[:pcp_size]), ("pcp", ))
+
+    def shard_tokens(tensor):
+        return jax.device_put(tensor, NamedSharding(mesh, P("pcp", None)))
+
+    def replicate(tensor):
+        return jax.device_put(tensor, NamedSharding(mesh, P()))
+
+    pool_kernel_block_tokens = 256
+    pool_block_tokens = 512
+    pool_split = pool_block_tokens // pool_kernel_block_tokens
+    local_pool_shape = (
+        num_blocks * pool_split,
+        pool_kernel_block_tokens,
+        1,
+        4,
+        128,
+    )
+    global_pool_shape = (pcp_size * local_pool_shape[0], *local_pool_shape[1:])
+    pool = jax.device_put(
+        jnp.zeros(global_pool_shape, dtype=jnp.float8_e4m3fn),
+        NamedSharding(mesh, P("pcp")),
+    )
+
+    new_pool, pcp_output, pcp_z = (
+        run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            shard_tokens(packed_hidden),
+            replicate(qkvz_weight),
+            replicate(qkvz_weight_scale),
+            shard_tokens(packed_b),
+            shard_tokens(packed_a),
+            pool,
+            replicate(conv_weight),
+            replicate(conv_bias),
+            replicate(A_log),
+            replicate(dt_bias),
+            replicate(state_indices),
+            replicate(query_start_loc),
+            replicate(distribution),
+            replicate(seq_lens),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            pool_block_tokens=pool_block_tokens,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            mesh=mesh,
+        ))
+
+    def restore_request_order(tensor):
+        packed = np.asarray(tensor).reshape(padded_num_tokens, -1)
+        assert np.isfinite(packed).all()
+        np.testing.assert_array_equal(packed[~valid],
+                                      np.zeros_like(packed[~valid]))
+        restored = np.zeros_like(packed)
+        restored[token_order[valid]] = packed[valid]
+        return restored[:num_tokens]
+
+    np.testing.assert_allclose(
+        restore_request_order(pcp_output),
+        np.asarray(ref_output).reshape(num_tokens, -1),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    np.testing.assert_allclose(
+        restore_request_order(pcp_z),
+        np.asarray(ref_z).reshape(num_tokens, -1),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    assert np.any(np.asarray(new_pool).view(np.uint8))

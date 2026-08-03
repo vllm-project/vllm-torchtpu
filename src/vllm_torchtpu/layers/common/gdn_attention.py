@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
@@ -689,6 +690,49 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 # ---------------------------------------------------------------
 
 
+def _build_v3_pool_state_plan(
+    pool: jnp.ndarray,
+    *,
+    conv_dim: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pool_block_tokens: int,
+    qk_pair_layout: bool,
+):
+    """Describe this rank's GDN state regions in the unified pool."""
+    if pool_block_tokens % pool.shape[1] != 0:
+        raise ValueError("Manager block size must be divisible by the unified "
+                         f"pool kernel block size: {pool_block_tokens} and "
+                         f"{pool.shape[1]}.")
+    split = pool_block_tokens // pool.shape[1]
+    per_tok_elems = math.prod(pool.shape[2:])
+    tok_bytes = per_tok_elems * jnp.dtype(pool.dtype).itemsize
+    state_layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=n_v * d_k * d_v * 4,
+        conv_bytes=(kernel_size - 1) * conv_dim * 2,
+        token_bytes=tok_bytes,
+    )
+    if state_layout.required_tokens > pool_block_tokens:
+        raise ValueError("GDN state does not fit in the unified pool manager "
+                         f"block: {state_layout.required_tokens} > "
+                         f"{pool_block_tokens}.")
+    return pool_adapters.v3_state_source(
+        pool,
+        split=split,
+        ssm_ntok=state_layout.ssm_tokens,
+        conv_tok0=state_layout.ssm_tokens,
+        conv_ntok=state_layout.conv_tokens,
+        conv_dim=conv_dim,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        qk_pair_layout=qk_pair_layout,
+    )
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -721,54 +765,21 @@ def run_jax_gdn_attention_pooled_local(
     math is unmodified either way.
     """
 
-    # Backends with a fixed kernel block (batched RPA) get the pool born
-    # at kernel granularity; a manager block is `split` consecutive kernel
-    # blocks (upstream map_to_kernel_blocks). State regions address
-    # manager-block token ranges; the adapters route them (split kwarg) —
-    # the pool itself is never reshaped (an XLA reshape of the pool
-    # materializes as a pool-sized relayout copy per step).
-    assert pool_block_tokens % recurrent_state.shape[1] == 0, (
-        pool_block_tokens, recurrent_state.shape)
-    split = pool_block_tokens // recurrent_state.shape[1]
-
     conv_dim = conv_weight.shape[0]
-    per_tok_elems = math.prod(recurrent_state.shape[2:])
-    tok_bytes = per_tok_elems * jnp.dtype(recurrent_state.dtype).itemsize
-    state_layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=n_v * d_k * d_v * 4,
-        conv_bytes=(kernel_size - 1) * conv_dim * 2,
-        token_bytes=tok_bytes,
-    )
-    ssm_ntok = state_layout.ssm_tokens
-    assert ssm_ntok <= pool_block_tokens, (
-        "ssm state does not fit the attention page", ssm_ntok,
-        pool_block_tokens)
-
-    # The conv slot occupies whole tokens right after the ssm region,
-    # padded up so the slot's token range satisfies the tok0 % ntok == 0
-    # layout rule; the pad tokens are dead bytes inside the slot.
-    conv_ntok = state_layout.conv_tokens
-    assert state_layout.required_tokens <= pool_block_tokens, (
-        "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
-        pool_block_tokens)
-
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
     # contiguous DMA per slot per region) — no external gather/scatter
     # round trip. The kernel masks fresh slots via has_initial_state,
     # so a newly-allocated block's bytes are never read, and padded
     # slots move no bytes in either direction.
-    plan = pool_adapters.v3_state_source(
+    plan = _build_v3_pool_state_plan(
         recurrent_state,
-        split=split,
-        ssm_ntok=ssm_ntok,
-        conv_tok0=ssm_ntok,
-        conv_ntok=conv_ntok,
         conv_dim=conv_dim,
         n_v=n_v,
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
         qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
     )
     recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
@@ -910,6 +921,207 @@ def run_jax_gdn_attention_pooled(
     )
 
     return outputs
+
+
+def run_jax_gdn_attention_pooled_pcp_prefill_projection(
+    j_hidden_states: jnp.ndarray,
+    j_qkvz_weight: jnp.ndarray,
+    j_qkvz_weight_scale: jnp.ndarray,
+    j_b: jnp.ndarray,
+    j_a: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    j_conv_weight: jnp.ndarray,
+    j_conv_bias: Optional[jnp.ndarray],
+    j_A_log: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pool_block_tokens: int,
+    pcp_size: int,
+    interleave_size: int,
+    mesh: jax.sharding.Mesh,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
+    pcp_axis = "pcp"
+    if pcp_axis not in mesh.axis_names:
+        raise NotImplementedError(
+            "GDN pooled PCP prefill requires a pcp mesh axis.")
+    if mesh.shape[pcp_axis] != pcp_size:
+        raise ValueError(f"pcp_size={pcp_size} does not match mesh axis size "
+                         f"{mesh.shape[pcp_axis]}.")
+    if n_kq % pcp_size != 0:
+        raise ValueError(
+            f"n_kq={n_kq} must be divisible by pcp_size={pcp_size}.")
+    if n_v % pcp_size != 0:
+        raise ValueError(
+            f"n_v={n_v} must be divisible by pcp_size={pcp_size}.")
+
+    local_n_kq = n_kq // pcp_size
+    local_n_v = n_v // pcp_size
+    key_dim = n_kq * d_k
+    value_dim = n_v * d_v
+    local_conv_dim = 2 * local_n_kq * d_k + local_n_v * d_v
+
+    token_spec = P(pcp_axis, None)
+    replicated_spec = P()
+    pool_spec = P(pcp_axis)
+    in_specs = (
+        token_spec,  # hidden states
+        replicated_spec,  # QKVZ weight
+        replicated_spec,  # QKVZ scale
+        token_spec,  # b
+        token_spec,  # a
+        pool_spec,  # rank-local unified pool
+        replicated_spec,  # conv weight
+        replicated_spec if j_conv_bias is not None else None,
+        replicated_spec,  # A_log
+        replicated_spec,  # dt_bias
+        replicated_spec,  # query_start_loc
+        replicated_spec,  # state_indices
+        replicated_spec,  # distribution
+        replicated_spec,  # seq_lens
+    )
+    output_spec = P(pcp_axis, None, None)
+    out_specs = (pool_spec, output_spec, output_spec)
+
+    def _pooled_pcp_prefill_fn(
+        local_hidden_states,
+        qkvz_weight_,
+        qkvz_weight_scale_,
+        local_b,
+        local_a,
+        pool_,
+        conv_weight_,
+        conv_bias_,
+        A_log_,
+        dt_bias_,
+        query_start_loc_,
+        state_indices_,
+        distribution_,
+        seq_lens_,
+    ):
+        # BA is small enough to exchange outside the fused kernel. Restore it
+        # to request-major order before the GDN schedule consumes it.
+        local_ba = jnp.stack((local_b, local_a),
+                             axis=-1).reshape(local_b.shape[0], -1)
+        packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
+            local_ba, pcp_axis, pcp_size)
+        full_reorder = _derive_pcp_rank_major_reorder_indices(
+            query_start_loc_,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            local_padded_num_tokens=local_hidden_states.shape[0],
+            seq_lens=seq_lens_,
+        )
+        valid_mask = full_reorder >= 0
+        scatter_indices = jnp.where(valid_mask, full_reorder,
+                                    full_reorder.size)
+        ba_shard = jnp.zeros_like(packed_ba_shard).at[scatter_indices].set(
+            packed_ba_shard, mode="drop")
+        ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)
+        b_shard = ba_shard[:, :, 0]
+        a_shard = ba_shard[:, :, 1]
+
+        conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
+            conv_weight_,
+            [key_dim, key_dim, value_dim],
+            pcp_size,
+            0,
+        )
+        weight_shard = _select_replicated_shard_for_pcp_rank(
+            conv_weight_interleaved, pcp_axis, pcp_size, axis=0)
+        if conv_bias_ is None:
+            bias_shard = None
+        else:
+            conv_bias_interleaved = reorder_concatenated_tensor_for_sharding(
+                conv_bias_,
+                [key_dim, key_dim, value_dim],
+                pcp_size,
+                0,
+            )
+            bias_shard = _select_replicated_shard_for_pcp_rank(
+                conv_bias_interleaved, pcp_axis, pcp_size, axis=0)
+        A_shard = _select_replicated_shard_for_pcp_rank(A_log_,
+                                                        pcp_axis,
+                                                        pcp_size,
+                                                        axis=0)
+        dt_shard = _select_replicated_shard_for_pcp_rank(dt_bias_,
+                                                         pcp_axis,
+                                                         pcp_size,
+                                                         axis=0)
+
+        if weight_shard.shape[0] != local_conv_dim:
+            raise ValueError("GDN PCP conv weights must be PCP-local after "
+                             f"selection: expected {local_conv_dim}, got "
+                             f"{weight_shard.shape[0]}.")
+        state_plan = _build_v3_pool_state_plan(
+            pool_,
+            conv_dim=local_conv_dim,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            pool_block_tokens=pool_block_tokens,
+            qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
+        )
+
+        return gdn_v3_pcp_wrapper.fused_qkvz_projection_pcp_gdn(
+            local_hidden_states,
+            qkvz_weight_,
+            qkvz_weight_scale_,
+            b_shard,
+            a_shard,
+            pool_,
+            weight_shard,
+            bias_shard,
+            A_shard,
+            dt_shard,
+            query_start_loc_,
+            state_indices_,
+            distribution_,
+            seq_lens_,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            pcp_size=pcp_size,
+            comm_chunk_size=interleave_size,
+            mesh_axis_names=tuple(mesh.axis_names),
+            pcp_axis_name=pcp_axis,
+            state_plan=state_plan,
+        )
+
+    mapped_fn = jax.shard_map(
+        _pooled_pcp_prefill_fn,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )
+    return mapped_fn(
+        j_hidden_states,
+        j_qkvz_weight,
+        j_qkvz_weight_scale,
+        j_b,
+        j_a,
+        recurrent_state,
+        j_conv_weight,
+        j_conv_bias,
+        j_A_log,
+        j_dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        seq_lens,
+    )
 
 
 def run_jax_gdn_attention_pooled_pcp_prefill(
