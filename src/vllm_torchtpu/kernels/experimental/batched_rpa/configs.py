@@ -287,21 +287,15 @@ class RpaConfigs:
 
     @property
     def q_bytes_per_token(self) -> int:
-        return (
-            self.model.num_kv_heads
-            * self.aligned_num_q_heads_per_kv_head
-            * self.aligned_q_head_dim
-            * self.serve.dtype_q.itemsize
-        )
+        return (self.model.num_kv_heads *
+                self.aligned_num_q_heads_per_kv_head *
+                self.aligned_q_head_dim * self.serve.dtype_q.itemsize)
 
     @property
     def o_bytes_per_token(self) -> int:
-        return (
-            self.model.num_kv_heads
-            * self.aligned_num_q_heads_per_kv_head
-            * self.aligned_q_head_dim
-            * self.serve.dtype_out.itemsize
-        )
+        return (self.model.num_kv_heads *
+                self.aligned_num_q_heads_per_kv_head *
+                self.aligned_q_head_dim * self.serve.dtype_out.itemsize)
 
     @property
     def q_vmem_shape(self):
