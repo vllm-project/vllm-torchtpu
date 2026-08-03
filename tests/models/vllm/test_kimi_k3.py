@@ -168,8 +168,13 @@ def test_mxfp4_expert_weight_loader_rebinds_packed_checkpoint_name() -> None:
     )]
 
 
+@pytest.mark.parametrize(
+    ("min_per_partition", "expected_intermediate", "expected_unpadded"),
+    [(None, 1024, None), (256, 2048, 128)],
+)
 def test_small_experts_use_current_padded_weight_location(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, min_per_partition: int | None,
+        expected_intermediate: int, expected_unpadded: int | None) -> None:
 
     class FakeGate(nn.Module):
 
@@ -210,16 +215,20 @@ def test_small_experts_use_current_padded_weight_location(
         num_shared_experts=1,
         moe_intermediate_size=1024,
     )
+    if min_per_partition is not None:
+        config.min_moe_intermediate_per_partition = min_per_partition
     layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
 
-    assert fused_moe_args["intermediate_size"] == 2048
+    assert fused_moe_args["intermediate_size"] == expected_intermediate
     assert "activation_situ_beta" not in fused_moe_args
     assert "activation_situ_linear_beta" not in fused_moe_args
     assert layer.experts.moe_config.activation_situ_beta is None
     assert layer.experts.moe_config.activation_situ_linear_beta is None
-    assert layer.experts.moe_config.intermediate_size_per_partition_unpadded == 128
-    assert not layer.experts.routed_experts.w13_weight.any()
-    assert not layer.experts.routed_experts.w2_weight.any()
+    assert (layer.experts.moe_config.intermediate_size_per_partition_unpadded
+            == expected_unpadded)
+    expect_zero = expected_unpadded is not None
+    assert bool(layer.experts.routed_experts.w13_weight.any()) != expect_zero
+    assert bool(layer.experts.routed_experts.w2_weight.any()) != expect_zero
 
 
 def test_expert_parallelism_keeps_native_intermediate_size(

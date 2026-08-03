@@ -121,7 +121,7 @@ class KimiMoE(nn.Module):
 
         padded_intermediate_size = config.moe_intermediate_size
         min_per_partition = getattr(config,
-                                    "min_moe_intermediate_per_partition", 256)
+                                    "min_moe_intermediate_per_partition", 128)
         if (not self.use_ep and self.tp_size > 1 and
                 padded_intermediate_size // self.tp_size < min_per_partition):
             padded_intermediate_size = min_per_partition * self.tp_size
