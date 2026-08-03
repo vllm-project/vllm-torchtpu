@@ -108,10 +108,10 @@ Note that the standard TPU capture always spans the whole window between
 and `--profiler-config.max_iterations` limits are honored only by the
 [phased profiler](#phased-profiling), not by this mode.
 
-!!! warning
-    Profiling is not free. In benchmark runs, `--profile` costs roughly +11%
-    TTFT and −4% throughput, so never compare profile-on numbers against a
-    non-profile baseline.
+> [!WARNING]
+> Profiling is not free. In benchmark runs, `--profile` costs roughly +11%
+> TTFT and −4% throughput, so never compare profile-on numbers against a
+> non-profile baseline.
 
 ### Through the benchmark harness
 
@@ -265,18 +265,39 @@ The rank is deliberately slice-global rather than the TP×PP-scoped rank from
 `parallel_config`: with DP > 1, every replica would otherwise call itself rank 0
 and their traces would collide on merge.
 
-!!! warning "Multi-host slices"
-    Rank 0 publishes the canonical run timestamp through a marker file that the
-    other ranks poll for (5 s timeout). On a multi-host slice, the trace
-    directory must be on a filesystem that every rank shares with rank 0. If a
-    rank never sees the marker it falls back to its own timestamp — no trace is
-    lost, but that rank lands in a separate run directory. A `did not find rank
-    0's canonical-ts marker` warning in the logs is the signal.
+> [!WARNING]
+> **Multi-host slices.** Rank 0 publishes the canonical run timestamp through a
+> marker file that the other ranks poll for (5 s timeout). On a multi-host
+> slice, the trace directory must be on a filesystem that every rank shares with
+> rank 0. If a rank never sees the marker it falls back to its own timestamp —
+> no trace is lost, but that rank lands in a separate run directory. A
+> `did not find rank 0's canonical-ts marker` warning in the logs is the signal.
 
-## Fetching and viewing traces
+## Viewing traces
 
-Copy just the trace files off the TPU VM, preserving the directory hierarchy
-(XProf reads the layout, not only the file):
+### On the TPU VM
+
+The simplest option is to leave the traces where they were written and serve
+them from the VM:
+
+```bash
+xprof --logdir /tmp/vllm_phased_profile
+```
+
+If you are connected through VS Code's Remote-SSH, it detects the listening port
+and forwards it automatically, so the URL it prints opens directly in your local
+browser. Otherwise, forward that port yourself when connecting (6006 by
+default):
+
+```bash
+ssh -L 6006:localhost:6006 <tpu-vm-host>
+```
+
+### On your local machine
+
+To keep traces after the VM is torn down, or to share them, copy them down
+first. Preserve the directory hierarchy — XProf reads the
+`plugins/profile/<timestamp>/` layout, not just the individual file:
 
 ```bash
 rsync -avzm \
@@ -286,11 +307,11 @@ rsync -avzm \
   <tpu-vm-host>:/tmp/vllm_phased_profile ~/traces/
 ```
 
-Then point a viewer at it:
-
 ```bash
 xprof --logdir ~/traces/vllm_phased_profile
 ```
+
+### Reading the result
 
 Open the printed URL and pick a run from the dropdown. Each phase is a separate
 run. The Trace Viewer shows kernel execution timelines, and the Memory Profile
@@ -301,12 +322,22 @@ merged trace, so a viewer that asks you to choose a file type wants **XPlane**.
 
 ## Troubleshooting
 
-**`Legacy additional_config['phased_profiling_dir'] is no longer supported`** —
-a stale script written against the old configuration. Switch it to
-`USE_PHASED_PROFILER=true` plus `--profiler-config.torch_profiler_dir`.
+### The server fails to start
 
-**`USE_PHASED_PROFILER is set but there is nowhere to write traces`** — add
+Both messages below are assertions raised during startup validation, quoted
+verbatim so you can match them against what the server printed.
+
+**`Legacy additional_config['phased_profiling_dir'] is no longer supported`** —
+the run is using a stale script written against the old configuration. Switch it
+to `USE_PHASED_PROFILER=true` plus `--profiler-config.torch_profiler_dir`.
+
+**`USE_PHASED_PROFILER is set but there is nowhere to write traces`** —
+`USE_PHASED_PROFILER=true` was set, but `torch_profiler_dir` was left empty, so
+the profiler has no destination to write to. Rather than start up and silently
+record nothing, the server refuses. Supply the directory:
 `--profiler-config.profiler torch --profiler-config.torch_profiler_dir <dir>`.
+
+### The run produces no or unexpected traces
 
 **The run finishes but the directory is empty** — the server was configured but
 never armed. Something has to call `/start_profile`; through the benchmark

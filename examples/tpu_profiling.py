@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Implements profiling for vLLM on TPU VMs using the JAX profiler.
-# NOTE: you will need the tensorboard-plugin-profile python package to
-# visualize the results in TensorBoard.
-# Please see docs/profiler.md for more details.
+# Implements profiling for vLLM on TPU VMs using the PyTorch/XLA profiler.
+# NOTE: you will need the xprof (or tensorboard-plugin-profile) python package
+# to visualize the results.
+# Please see docs/profiling.md for more details, including how to view the
+# resulting traces and how to profile a running server instead.
 # Usage example for prefilling 1 request of 1024 tokens:
 # python3 examples/tpu_profiling.py --input-len 1024 --output-len 1   --batch-size 1
 # Usage example for decoding 256 requests of 1 token each:
@@ -108,8 +109,8 @@ def parse_args():
         "--profile-result-dir",
         type=str,
         default="profiles",
-        help=("path to save the JAX profiler output. Can be visualized "
-              "with ui.perfetto.dev, Tensorboard, or XProf"),
+        help=("path to save the profiler output. Can be visualized "
+              "with XProf or Tensorboard"),
     )
 
     parser = EngineArgs.add_cli_args(parser)
