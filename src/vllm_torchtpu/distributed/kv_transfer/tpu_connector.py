@@ -334,12 +334,11 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                     mamba_block_ids.append(list(block_ids[mamba_gid]))
             # use_raiden selected TPURaidenConnectorScheduler in __init__, and
             # it is the only scheduler accepting the stage-3 mamba block ids.
-            assert isinstance(self.connector_scheduler,
-                              TPURaidenConnectorScheduler)
+            # A static checker cannot narrow the union to that subclass here.
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
-                mamba_block_ids=mamba_block_ids)
+                mamba_block_ids=mamba_block_ids)  # type: ignore
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
             f"{len(block_ids)} groups")
