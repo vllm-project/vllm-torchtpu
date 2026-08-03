@@ -865,6 +865,20 @@ class TestTPURunner:
             self.runner.get_kv_cache_spec()
             mock_update.assert_not_called()
 
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=8192)
+    def test_update_attention_page_size_accepts_mla(self, mock_get_page_size):
+        mock_mla = MagicMock(spec=MLAAttention)
+        mock_mla.num_kv_heads = 1
+        mock_mla.head_size = 576
+
+        TPUModelRunner._update_attention_page_size_padded(
+            self.runner, {'mla_0': mock_mla})
+
+        assert self.runner.cache_config.mamba_page_size_padded == 8192
+        mock_get_page_size.assert_called_once()
+
     @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
