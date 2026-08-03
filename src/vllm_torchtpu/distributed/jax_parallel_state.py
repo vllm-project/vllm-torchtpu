@@ -43,6 +43,9 @@ class GroupCoordinator:
         return self.rank_in_group == self.world_size - 1
 
 
+_PP: Optional[GroupCoordinator] = None
+
+
 def init_pp_distributed_environment(ip: str, rank: int, world_size: int,
                                     device: Any, need_pp: bool):
     global _PP

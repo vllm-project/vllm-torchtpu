@@ -332,6 +332,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                             "absent from request block tables: "
                             f"index={mamba_gid}, groups={len(block_ids)}")
                     mamba_block_ids.append(list(block_ids[mamba_gid]))
+            # use_raiden selected TPURaidenConnectorScheduler in __init__, and
+            # it is the only scheduler accepting the stage-3 mamba block ids.
+            assert isinstance(self.connector_scheduler,
+                              TPURaidenConnectorScheduler)
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
@@ -357,8 +361,12 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     def build_kv_connector_stats(
             cls,
             data: dict[str, Any] | None = None) -> KVConnectorStats | None:
-        return (TpuKVConnectorStats(
-            data=data) if data is not None else TpuKVConnectorStats())
+        # `data` is inherited from vLLM's KVConnectorStats dataclass, which a
+        # static checker cannot see through vllm's editable install.
+        if data is not None:
+            return TpuKVConnectorStats(
+                data=data)  # type: ignore[unexpected-keyword]
+        return TpuKVConnectorStats()
 
     @classmethod
     def build_prom_metrics(

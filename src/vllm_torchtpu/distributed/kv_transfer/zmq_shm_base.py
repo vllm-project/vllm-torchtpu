@@ -1401,7 +1401,7 @@ class ZmqShmKvConnectorBase:
                 self._coord_channel_executor.submit(_pull_channel, h, ch)
                 for h in range(num_hosts) for ch in range(n_channels)
             ]
-            results: list[tuple[int, float, float, list[int],
+            results: list[tuple[int, int, float, float, list[int],
                                 Optional[zmq.Frame]]] = []
             first_error: Optional[BaseException] = None
             for fut in futures:
