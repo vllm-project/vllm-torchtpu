@@ -175,7 +175,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                                     src_spec.keys,
                                     gpu_block_ids,
                                     job.req_id,
-                                    pinned=src_spec.pinned)
+                                    pinned=src_spec.pinned,
+                                    displaced_keys=src_spec.displaced_keys)
 
         # jobs_to_flush: the jobs' source blocks are about to be reused.
         # Fence-pending stores are cancelled (nothing was admitted yet);

@@ -37,7 +37,10 @@ covers both. Constraints (asserted): `blocks_per_chunk == 1` (one OffloadKey
 
 Phase-2 hardening: store jobs are batch-capped and retried once on transfer
 failure; keys that fail terminally are quarantined (reported MISS, never
-re-admitted). With `RAIDEN_SHM_KEY` set, the host pools and the store
+re-admitted). A drain that times out poisons the still-in-flight jobs, so
+their eventual completions finalize as failures instead of committing bytes
+possibly torn by the block reuse that motivated the drain. With
+`RAIDEN_SHM_KEY` set, the host pools and the store
 directory live in shared memory and survive an engine-process crash; the
 directory is recovered inside the plain constructors on restart, gated by a
 config-derived `RAIDEN_SHM_MODEL_UID`.
@@ -54,7 +57,8 @@ saved blocks are published to the global registry by raiden, so a prefix
 computed by any replica is a `REMOTE` hit everywhere. The receiver flow is
 `lookup(enable_global=True)` -> stash the peer `REMOTE` slices ->
 `insert_and_lock(remote_slices, on_host=True)` in prepare_load (installs the
-peer mapping locally, reserves host landing capacity, pins) ->
+peer mapping locally, reserves host landing capacity, pins; on wheel #2 the
+detailed variant also reports what the landing reservation displaced) ->
 `read_remote(hashes, device_block_ids)` straight into HBM at job-submit ->
 `poll_remote_read_status` in the finalizer. Success leaves the entries
 `HOST_AND_HBM` (the host landing blocks make a later local load cheap);
@@ -118,11 +122,20 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     `pinned` is False when prepare_load lost the race against eviction (the
     manager interface has no failure return there); the load job then fails
     cleanly at submit time and vLLM recomputes the blocks.
+
+    `displaced_keys` (loads, wheel #2): keys whose entries prepare_load's
+    host-landing install displaced. Carried to submit_load_job so the
+    displacement commits with the job's outcome, exactly like a store
+    admission's.
     """
 
-    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
+    def __init__(self,
+                 keys: list[OffloadKey],
+                 pinned: bool = True,
+                 displaced_keys: list[OffloadKey] | None = None):
         self.keys = keys
         self.pinned = pinned
+        self.displaced_keys = displaced_keys or []
 
     def __repr__(self) -> str:
         return (f"RaidenLoadStoreSpec({len(self.keys)} keys"
@@ -150,6 +163,11 @@ class Admission:
     # Sub-hashes still awaiting a poll_{save,load}_status verdict.
     pending: set[bytes]
     failed: bool = False
+    # Set by a timed-out drain: the job's blocks were handed back for reuse
+    # while its transfers were still in flight, so even a store-reported
+    # success may cover torn bytes. The finalizer treats the admission as
+    # failed regardless of the poll verdict.
+    poisoned: bool = False
     # Loads only: owning request and destination GPU block IDs, reported
     # through get_block_ids_with_load_errors on failure.
     req_id: str | None = None
@@ -159,15 +177,20 @@ class Admission:
     # and the weaker remote-only quarantine on failure.
     remote_sub_hashes: set[bytes] = field(default_factory=set)
     # Stores only: the sub-hashes actually saved (newly admitted HBM entries;
-    # pre-existing HOST entries were pinned, not re-saved), the subset the
-    # poll reported failed (retry targets), and the remaining retry budget.
+    # pre-existing HOST entries were pinned, not re-saved) and the remaining
+    # retry budget for the failed subset.
     saved_sub_hashes: list[bytes] = field(default_factory=list)
+    # Sub-hashes that failed: the polls append transfer failures (stores
+    # retry exactly this subset), and launch failures pre-fill the batch
+    # that never launched. _quarantine picks the remote-only bucket iff
+    # every entry was a peer fetch.
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
-    # Stores only: keys whose entries this admission displaced into the
-    # eviction-candidate list. Committed (as eviction events + advisory
-    # forget) only if the job SUCCEEDS — a failed job's rollback restores
-    # the candidates.
+    # Keys whose entries this admission's insert displaced into the
+    # eviction-candidate list (stores: the HBM admission; loads: the
+    # phase-4 host-landing install). Committed (as eviction events +
+    # advisory forget) only if the job SUCCEEDS — a failed job's rollback
+    # restores the candidates.
     displaced_keys: list[OffloadKey] = field(default_factory=list)
 
 
@@ -335,6 +358,18 @@ class RaidenOffloadingManager(OffloadingManager):
         matches = self._store.lookup([sub_hash])
         return matches[0][1].status if matches else None
 
+    def _displaced_keys_of(self, result) -> list[OffloadKey]:
+        """Unique OffloadKeys of a detailed insert result's displacements,
+        in displacement order (sub-hashes collapse back to their key)."""
+        displaced: list[OffloadKey] = []
+        seen: set[OffloadKey] = set()
+        for h, _ in result.displaced:
+            key = self._key_of(h)
+            if key not in seen:
+                seen.add(key)
+                displaced.append(key)
+        return displaced
+
     # -- registration gate ----------------------------------------------
 
     def is_gate_open(self) -> bool:
@@ -453,21 +488,37 @@ class RaidenOffloadingManager(OffloadingManager):
                 "fail cleanly and the blocks recompute", len(local_hashes),
                 req_context.req_id)
             return RaidenLoadStoreSpec(keys, pinned=False)
-        if remote_hashes and not self._store.insert_and_lock(
-                remote_hashes, remote_slices, on_host=True):
-            # Landing capacity is exhausted (capacity pressure with pinned
-            # entries) — rolled back inside raiden, nothing remote is held.
-            # Never launch read_remote for an uninstalled batch; fail the
-            # job cleanly and let the blocks recompute.
-            if local_hashes:
-                self._store.release(local_hashes)
-            logger.warning(
-                "[kv-offload-v2] prepare_load could not reserve landing "
-                "capacity for %d remote sub-blocks (request %s); the load "
-                "job will fail cleanly and the blocks recompute",
-                len(remote_hashes), req_context.req_id)
-            return RaidenLoadStoreSpec(keys, pinned=False)
-        return RaidenLoadStoreSpec(keys)
+        displaced_keys: list[OffloadKey] = []
+        if remote_hashes:
+            # The landing reservation can displace stored entries exactly
+            # like a store admission; on wheel #2 the detailed result
+            # surfaces them, and they commit with the load's outcome.
+            if self._has_detailed:
+                result = self._store.insert_and_lock_detailed(remote_hashes,
+                                                              remote_slices,
+                                                              on_host=True)
+                installed = result.success
+                if installed:
+                    displaced_keys = self._displaced_keys_of(result)
+            else:
+                installed = self._store.insert_and_lock(remote_hashes,
+                                                        remote_slices,
+                                                        on_host=True)
+            if not installed:
+                # Landing capacity is exhausted (capacity pressure with
+                # pinned entries) — rolled back inside raiden, nothing
+                # remote is held. Never launch read_remote for an
+                # uninstalled batch; fail the job cleanly and let the
+                # blocks recompute.
+                if local_hashes:
+                    self._store.release(local_hashes)
+                logger.warning(
+                    "[kv-offload-v2] prepare_load could not reserve landing "
+                    "capacity for %d remote sub-blocks (request %s); the "
+                    "load job will fail cleanly and the blocks recompute",
+                    len(remote_hashes), req_context.req_id)
+                return RaidenLoadStoreSpec(keys, pinned=False)
+        return RaidenLoadStoreSpec(keys, displaced_keys=displaced_keys)
 
     def complete_load(self, keys, req_context: ReqContext) -> None:
         # Intentionally a no-op: the finalizer releases the pinned batch
@@ -587,12 +638,7 @@ class RaidenOffloadingManager(OffloadingManager):
             admitted = result.success
             if admitted:
                 to_save = list(result.inserted)
-                seen: set[OffloadKey] = set()
-                for h, _ in result.displaced:
-                    key = self._key_of(h)
-                    if key not in seen:
-                        seen.add(key)
-                        displaced_keys.append(key)
+                displaced_keys = self._displaced_keys_of(result)
         else:
             admitted = self._store.insert_and_lock(sub_hashes,
                                                    slices,
@@ -624,17 +670,24 @@ class RaidenOffloadingManager(OffloadingManager):
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True))
             return
         if not self._store.save(to_save):
-            # Synchronous launch failure: revert the admission exactly once
-            # with the exact batch; never entered into the poll path. The
-            # rollback restores displaced candidates, so no events.
-            self._store.release_and_delete(sub_hashes)
+            # Synchronous launch failure: never entered into the poll path;
+            # finalize an already-failed admission immediately so the
+            # cleanup (exact-batch revert, rollback of displaced candidates)
+            # and the quarantine match a polled terminal failure.
             logger.error(
                 "[kv-offload-v2] store job %d: save() launch failed for %d "
                 "sub-blocks", job_id, len(to_save))
-            self._inflight_store_keys.difference_update(keys)
-            self._finished.append(
-                FinishedJob(job_id=job_id, op=AdmissionOp.STORE,
-                            success=False))
+            self._finalize(
+                Admission(
+                    job_id=job_id,
+                    op=AdmissionOp.STORE,
+                    keys=keys,
+                    sub_hashes=sub_hashes,
+                    pending=set(),
+                    failed=True,
+                    failed_sub_hashes=list(to_save),
+                    displaced_keys=displaced_keys,
+                ))
             return
         admission = Admission(
             job_id=job_id,
@@ -664,14 +717,21 @@ class RaidenOffloadingManager(OffloadingManager):
                             medium="raiden_host",
                             removed=True))
 
-    def submit_load_job(self,
-                        job_id: int,
-                        keys: list[OffloadKey],
-                        gpu_block_ids: list[int],
-                        req_id: str,
-                        pinned: bool = True) -> None:
-        """Launch a load job; entries were pinned in prepare_load."""
+    def submit_load_job(
+            self,
+            job_id: int,
+            keys: list[OffloadKey],
+            gpu_block_ids: list[int],
+            req_id: str,
+            pinned: bool = True,
+            displaced_keys: list[OffloadKey] | None = None) -> None:
+        """Launch a load job; entries were pinned in prepare_load.
+
+        `displaced_keys` carries prepare_load's host-landing displacements;
+        they commit only if the job succeeds.
+        """
         assert len(keys) == len(gpu_block_ids), (len(keys), len(gpu_block_ids))
+        displaced_keys = list(displaced_keys or [])
         if not pinned:
             # prepare_load lost the pin race; nothing is held, so fail the
             # job without touching the store and let vLLM recompute.
@@ -701,48 +761,49 @@ class RaidenOffloadingManager(OffloadingManager):
                 local_hashes.append(h)
                 local_device_ids.append(d)
 
-        def _fail_launch(what: str, in_flight: list[bytes]) -> None:
+        def _fail_launch(what: str, failed_hashes: list[bytes],
+                         in_flight: list[bytes]) -> None:
+            # failed_hashes is the batch whose launch failed: it decides the
+            # quarantine bucket (remote-only iff every hash was a peer
+            # fetch) instead of leaving _quarantine an empty list.
             logger.error(
                 "[kv-offload-v2] load job %d (req %s): %s launch failed "
                 "(%d local, %d remote sub-blocks)", job_id, req_id, what,
                 len(local_hashes), len(remote_hashes))
+            admission = Admission(
+                job_id=job_id,
+                op=AdmissionOp.LOAD,
+                keys=keys,
+                sub_hashes=sub_hashes,
+                pending=set(in_flight),
+                failed=True,
+                req_id=req_id,
+                dst_gpu_block_ids=list(gpu_block_ids),
+                remote_sub_hashes=set(remote_hashes),
+                failed_sub_hashes=list(failed_hashes),
+                displaced_keys=displaced_keys,
+            )
             if in_flight:
                 # The other launch already succeeded: the job must stay
                 # non-terminal until its transfer resolves, then the
                 # finalizer runs the failure cleanup exactly once.
-                admission = Admission(
-                    job_id=job_id,
-                    op=AdmissionOp.LOAD,
-                    keys=keys,
-                    sub_hashes=sub_hashes,
-                    pending=set(in_flight),
-                    failed=True,
-                    req_id=req_id,
-                    dst_gpu_block_ids=list(gpu_block_ids),
-                    remote_sub_hashes=set(remote_hashes),
-                )
                 self._admissions[job_id] = admission
                 for h in in_flight:
                     self._hash_to_admission[h] = admission
                 return
-            # Nothing in flight: immediate terminal failure. HOST entries
-            # stay intact; freshly installed REMOTE entries are deleted
-            # (landing blocks freed, the registry keeps the peer mapping).
-            self._store.release_and_delete(sub_hashes)
-            self._finished.append(
-                FinishedJob(job_id=job_id,
-                            op=AdmissionOp.LOAD,
-                            success=False,
-                            req_id=req_id,
-                            failed_gpu_block_ids=list(gpu_block_ids)))
+            # Nothing in flight: immediately terminal. The finalizer keeps
+            # HOST entries intact, deletes freshly installed REMOTE entries
+            # (landing blocks freed, the registry keeps the peer mapping),
+            # and applies the same quarantine policy as a polled failure.
+            self._finalize(admission)
 
         if local_hashes and not self._store.load(local_hashes,
                                                  local_device_ids):
-            _fail_launch("load()", [])
+            _fail_launch("load()", local_hashes, [])
             return
         if remote_hashes and not self._store.read_remote(
                 remote_hashes, remote_device_ids):
-            _fail_launch("read_remote()", local_hashes)
+            _fail_launch("read_remote()", remote_hashes, local_hashes)
             return
         admission = Admission(
             job_id=job_id,
@@ -753,6 +814,7 @@ class RaidenOffloadingManager(OffloadingManager):
             req_id=req_id,
             dst_gpu_block_ids=list(gpu_block_ids),
             remote_sub_hashes=set(remote_hashes),
+            displaced_keys=displaced_keys,
         )
         self._admissions[job_id] = admission
         for h in sub_hashes:
@@ -769,12 +831,14 @@ class RaidenOffloadingManager(OffloadingManager):
     # -- finalizer --------------------------------------------------------
 
     def _quarantine(self, admission: Admission) -> None:
-        if (admission.op == AdmissionOp.LOAD and admission.remote_sub_hashes
+        if (admission.op == AdmissionOp.LOAD and admission.failed_sub_hashes
                 and all(h in admission.remote_sub_hashes
                         for h in admission.failed_sub_hashes)):
             # Every failed sub-hash was a peer fetch: suppress only the
             # global fallback for these keys (a dead peer or stale registry
             # entry must not fail-loop), keep local stores/loads allowed.
+            # (A poisoned admission has no failed sub-hashes and lands in
+            # the full quarantine below.)
             self._remote_quarantined_keys.update(admission.keys)
             logger.error(
                 "[kv-offload-v2] remote-quarantining %d keys after a "
@@ -791,10 +855,13 @@ class RaidenOffloadingManager(OffloadingManager):
             admission.op.value, admission.job_id, len(self._quarantined_keys))
 
     def _finalize(self, admission: Admission) -> None:
-        del self._admissions[admission.job_id]
+        # Launch failures finalize an admission that was never registered,
+        # so the pop tolerates absence; both paths share this one terminal
+        # transition (cleanup, quarantine, finished-job report).
+        self._admissions.pop(admission.job_id, None)
         for h in admission.sub_hashes:
             self._hash_to_admission.pop(h, None)
-        success = not admission.failed
+        success = not (admission.failed or admission.poisoned)
         if not success:
             self._quarantine(admission)
         if admission.op == AdmissionOp.STORE:
@@ -814,7 +881,8 @@ class RaidenOffloadingManager(OffloadingManager):
                             success=success))
         else:
             # Loads: release the pins taken in prepare_load. On success a
-            # plain release (remote fetches are HOST_AND_HBM by now). On
+            # plain release (remote fetches are HOST_AND_HBM by now), and
+            # the host-landing install's displacements become permanent. On
             # failure release_and_delete: HOST entries stay intact, but
             # still-REMOTE installs from prepare_load are deleted — their
             # host landing blocks are freed while the registry keeps the
@@ -822,6 +890,7 @@ class RaidenOffloadingManager(OffloadingManager):
             # either way and get recomputed.
             if success:
                 self._store.release(admission.sub_hashes)
+                self._commit_displacement(admission.displaced_keys)
             else:
                 self._store.release_and_delete(admission.sub_hashes)
             self._finished.append(
@@ -926,6 +995,14 @@ class RaidenOffloadingManager(OffloadingManager):
         Used when a job's source device blocks are about to be reused: the
         scheduler drains before shipping this step's metadata, so the DMA
         completes before the forward that overwrites the blocks.
+
+        On timeout the still-in-flight admissions are poisoned rather than
+        waited on forever or left to commit: the store has no abort API, so
+        the jobs stay live until their polls resolve, but the finalizer
+        then treats them as failed — the reuse may tear the bytes under the
+        transfer, so even a reported success must not be committed. A
+        poisoned job counts as drained for later calls (waiting on it again
+        buys nothing).
         """
         # No retries once a job is being drained: its source blocks are
         # being handed back, so re-reading them would save garbage.
@@ -941,14 +1018,22 @@ class RaidenOffloadingManager(OffloadingManager):
             self._finished = [
                 f for f in self._finished if f.job_id not in job_ids
             ]
-            if not any(jid in self._admissions for jid in job_ids):
+            live = [
+                jid for jid in job_ids if jid in self._admissions
+                and not self._admissions[jid].poisoned
+            ]
+            if not live:
                 return drained
             if time.perf_counter() >= deadline:
+                for jid in live:
+                    self._admissions[jid].poisoned = True
                 logger.error(
-                    "[kv-offload-v2] drain timed out after %.1fs for jobs %s;"
-                    " their transfers are still in flight and their blocks "
-                    "are about to be reused", _DRAIN_TIMEOUT_S,
-                    sorted(jid for jid in job_ids if jid in self._admissions))
+                    "[kv-offload-v2] drain timed out after %.1fs; poisoned "
+                    "jobs %s (%d keys): their transfers are still in flight "
+                    "while their blocks are reused, so they will finalize "
+                    "as failures and their keys quarantine", _DRAIN_TIMEOUT_S,
+                    sorted(live),
+                    sum(len(self._admissions[jid].keys) for jid in live))
                 return drained
             time.sleep(0.0005)
 

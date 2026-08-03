@@ -27,6 +27,9 @@ tpu_raiden wheel, or torch_tpu runtime is required:
 Stage-2 hardening and hybrid coverage:
 - Store batch cap, save retry-once (suppressed during drains), and the
   poison-key quarantine on terminal transfer failures.
+- Launch failures share the polled-failure quarantine policy, and a drain
+  timeout poisons the still-in-flight jobs so their eventual completions
+  finalize as failures instead of committing.
 - Submit-time sub-hash classification: mixed batches (recovered entries or
   partial-failure leftovers) save only the newly admitted HBM sub-hashes —
   raiden's save() rejects any batch containing non-HBM hashes.
@@ -43,8 +46,11 @@ Phase-4 cross-instance sharing:
   insert_and_lock(on_host=True), submit partitions load() vs read_remote()
   by live status, the finalizer polls poll_remote_read_status.
 - Failure paths: landing-capacity rejection fails the job cleanly, a failed
-  read deletes the local install (registry keeps the peer mapping) and
-  remote-quarantines the keys without blocking local stores.
+  read (polled or at launch) deletes the local install (registry keeps the
+  peer mapping) and remote-quarantines the keys without blocking local
+  stores.
+- Host-landing displacements (wheel #2): prepare_load's detailed insert
+  carries them to the load job, committing only on success.
 - Compatibility namespace: sub-hashes carry the namespace prefix end to end
   (including displaced-key recovery), and derive_offload_namespace is
   deterministic and config-sensitive.
@@ -974,6 +980,66 @@ class TestFailureHardening(unittest.TestCase):
         out = self.manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [])
 
+    def test_failed_save_launch_quarantines_keys(self):
+        self.store.fail_save = True
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.manager.submit_store_job(4, out.keys_to_store, [5])
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        # Same policy as a polled terminal failure: no fail-loop through
+        # repeated fence/save cycles.
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.MISS)
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
+
+    def test_failed_load_launch_quarantines_keys(self):
+        seed_host_entries(self.store, _key(0))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.HIT)
+        self.store.fail_load = True
+        self.manager.prepare_load([_key(0)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0)], [10], "r1")
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        self.assertEqual(fj.failed_gpu_block_ids, [10])
+        # Full quarantine despite the intact HOST entries: no repeat
+        # load/recompute loop, no re-admission.
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.MISS)
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
+
+    def test_drain_timeout_poisons_inflight_job(self):
+        import vllm_torchtpu.offload.raiden_store as rs
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.manager.submit_store_job(4, out.keys_to_store, [5])
+        # The save never completes: the drain must give up in bounded time,
+        # leaving the job live but poisoned.
+        with patch.object(rs, "_DRAIN_TIMEOUT_S", 0.01):
+            self.assertEqual(self.manager.drain_jobs({4}), [])
+            # A repeat drain of an already-poisoned job returns immediately.
+            self.assertEqual(self.manager.drain_jobs({4}), [])
+        self.assertTrue(self.manager.is_job_launched(4))
+
+        # The store eventually reports the save done — but the source blocks
+        # were handed back at drain time, so the job must finalize as a
+        # failure: exact-batch revert, nothing committed, keys quarantined.
+        self.store.complete_save(sub_hashes(_key(0)))
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        self.assertEqual(fj.job_id, 4)
+        (rad, ) = self.store.calls_named("release_and_delete")
+        self.assertEqual(rad.args[0], sub_hashes(_key(0)))
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.MISS)
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
+        # Terminal exactly once: nothing further to report or echo.
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.assertFalse(self.manager.has_pending_work())
+
 
 class TestMixedBatchesAndRecovery(unittest.TestCase):
     """Sub-hash classification at submit time: pre-existing HOST entries
@@ -1314,6 +1380,35 @@ class TestRemoteReadFlow(unittest.TestCase):
             self.assertEqual(self.store.entries[h].status,
                              FakeBlockStatus.HOST)
             self.assertEqual(self.store.entries[h].pin_count, 0)
+        # Only the remote fetch failed: remote-only quarantine — the peer
+        # mapping stops surfacing while both keys stay locally usable.
+        self.assertEqual(self.manager.lookup(remote_key, _ctx()),
+                         LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(local_key, _ctx()),
+                         LookupResult.HIT)
+
+    def test_read_remote_launch_failure_remote_quarantines(self):
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx())
+        self.store.fail_read_remote = True
+        self.manager.submit_load_job(7, [key], [5], "req")
+        # Nothing was in flight: immediately terminal, install deleted
+        # (landing blocks freed, registry keeps the peer mapping).
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        self.assertEqual(fj.failed_gpu_block_ids, [5])
+        for h in sub_hashes(key):
+            self.assertNotIn(h, self.store.entries)
+            self.assertIn(h, self.store.global_entries)
+        # Remote-only quarantine, same as a polled read failure: a dead
+        # peer or stale registry entry must not fail-loop through the
+        # global fallback...
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.MISS)
+        # ...but the key can still be computed and offloaded locally.
+        out = self.manager.prepare_store([key], _ctx())
+        self.assertEqual(out.keys_to_store, [key])
 
     def test_stale_stash_degenerates_to_local_load(self):
         # A key stashed as remote that became local before prepare_load must
@@ -1331,6 +1426,66 @@ class TestRemoteReadFlow(unittest.TestCase):
         (ld, ) = self.store.calls_named("load")
         self.assertEqual(ld.args, (sub_hashes(key), [20, 21, 22, 23]))
         self.assertEqual(self.store.calls_named("read_remote"), [])
+
+
+class TestRemoteLandingDisplacement(unittest.TestCase):
+    """Phase 4 on a wheel-#2 store: prepare_load's host-landing install goes
+    through the detailed insert, so entries it displaces commit exactly like
+    a store admission's — eviction event + advisory forget on success,
+    rollback on failure."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStoreV2(registered_workers=2)
+        self.manager = make_global_manager(self.store)
+        # A locally stored key the landing reservation will displace.
+        seed_host_entries(self.store, _key(1))
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
+                         LookupResult.HIT)
+        seed_global_entries(self.store, _key(2))
+        self.assertEqual(self.manager.lookup(_key(2), _ctx()),
+                         LookupResult.HIT)
+        self.store.displace_next = sub_hashes(_key(1))
+
+    def _prepare_and_submit(self):
+        spec = self.manager.prepare_load([_key(2)], _ctx("r1"))
+        self.assertTrue(spec.pinned)
+        # The detailed insert installed the peer mapping (on_host=True) and
+        # surfaced the displacement on the spec.
+        (ial, ) = self.store.calls_named("insert_and_lock_detailed")
+        self.assertEqual(ial.args[0], sub_hashes(_key(2)))
+        self.assertTrue(ial.args[2])
+        self.assertEqual(self.store.calls_named("insert_and_lock"), [])
+        self.assertEqual(spec.displaced_keys, [_key(1)])
+        self.manager.submit_load_job(7, [_key(2)], [5],
+                                     "r1",
+                                     displaced_keys=spec.displaced_keys)
+        # Not yet committed: a failed read would restore the candidates.
+        self.assertEqual(list(self.manager.take_events()), [])
+
+    def test_displacement_commits_on_load_success(self):
+        self._prepare_and_submit()
+        self.store.complete_remote_read(sub_hashes(_key(2)))
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(fj.success)
+        (event, ) = self.manager.take_events()
+        self.assertEqual(list(event.keys), [_key(1)])
+        self.assertTrue(event.removed)
+        self.assertEqual(list(self.manager.take_events()), [])
+        # Forgotten in the advisory state: re-admittable immediately.
+        out = self.manager.prepare_store([_key(1)], _ctx())
+        self.assertEqual(out.keys_to_store, [_key(1)])
+
+    def test_displacement_dropped_on_load_failure(self):
+        self._prepare_and_submit()
+        self.store.complete_remote_read(sub_hashes(_key(2)), success=False)
+        (fj, ) = self.manager.poll_finished_jobs()
+        self.assertFalse(fj.success)
+        # Rollback semantics, mirroring the store path: no removed event,
+        # and the displaced key is still treated as stored by the advisory
+        # filter (its candidates were restored inside raiden).
+        self.assertEqual(list(self.manager.take_events()), [])
+        out = self.manager.prepare_store([_key(1)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
 
 
 class TestNamespace(unittest.TestCase):
