@@ -55,6 +55,8 @@ TPU_MULTIHOST_TOPOLOGY_MAP = {
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ("vllm.model_executor.layers.vocab_parallel_embedding",
      "get_masked_input_and_mask"),
+    ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router",
+     "grouped_topk"),
     ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
     ("vllm.v1.sample.ops.topk_topp_sampler", "compiled_random_sample"),
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),

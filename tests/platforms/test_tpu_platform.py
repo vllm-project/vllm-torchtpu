@@ -23,10 +23,37 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 
+import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import (
     TpuPlatform, _validate_phased_profiling_config)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
+
+
+def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
+    target = (
+        "vllm.model_executor.layers.fused_moe.router.grouped_topk_router")
+
+    def original_grouped_topk():
+        pass
+
+    def compiled_grouped_topk():
+        pass
+
+    compiled_grouped_topk.__wrapped__ = original_grouped_topk
+    grouped_topk_module = SimpleNamespace(grouped_topk=compiled_grouped_topk)
+
+    def fake_import_module(module_path):
+        if module_path == target:
+            return grouped_topk_module
+        return SimpleNamespace()
+
+    monkeypatch.setattr("importlib.import_module", fake_import_module)
+    monkeypatch.setattr(tpu_platform, "_dynamic_compile_unwrapped", False)
+
+    tpu_platform._unwrap_dynamic_compile_fns()
+
+    assert grouped_topk_module.grouped_topk is original_grouped_topk
 
 
 def test_scheduler_mamba_split_accepts_external_kv_tokens():
