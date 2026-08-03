@@ -1051,12 +1051,8 @@ def derive_offload_namespace(vllm_config: VllmConfig, *,
     kernel-row layout, scheduler and raiden block geometry, the TP shard
     topology (read_remote pulls per-shard bytes), the KV group/tensor
     structure, and the block-hash algorithm plus a scheme version. vLLM's
-    prefix-cache hashes already fold in LoRA/MM extras, but they are only
-    deterministic across processes when PYTHONHASHSEED is set: the hash
-    chain is seeded with NONE_HASH = os.urandom(32) otherwise. Registry
-    sharing (phase 4) therefore also requires every replica to run with the
-    same PYTHONHASHSEED; without it, peer entries are unmatchable (a silent
-    no-op, not corruption, since the hashes simply never collide).
+    prefix-cache hashes themselves are deterministic for every supported
+    algo in the pinned 0.26.0, and already fold in LoRA/MM extras.
     """
     model_config = vllm_config.model_config
     material = repr(
@@ -1080,18 +1076,15 @@ def derive_shm_model_uid(vllm_config: VllmConfig,
     """Deterministic RAIDEN_SHM_MODEL_UID for shm-backed restart recovery.
 
     Covers everything that must match for recovered host bytes to be valid —
-    including the key namespace, since recovered directory hashes embed it,
-    and PYTHONHASHSEED, since vLLM seeds its block-hash chain from it (a
-    restart under a different seed can never match the recovered hashes, so
-    it must cold-start rather than hold a directory of dead entries). An
-    incompatible restart therefore fails raiden's segment validation and
+    including the key namespace, since recovered directory hashes embed it;
+    an incompatible restart therefore fails raiden's segment validation and
     cold-starts instead of serving garbage.
     """
     material = repr(
         (vllm_config.model_config.model, vllm_config.model_config.revision,
          str(kv_dtype), kernel_block_size, per_block_shape, gpu_block_size,
          world_size, capacity_kernel_blocks, key_namespace,
-         os.environ.get("PYTHONHASHSEED"), "kv-offload-v2-subhash"))
+         "kv-offload-v2-subhash"))
     return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
@@ -1413,18 +1406,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # scheduler and worker processes construct this spec before creating
         # any raiden object, so setting it here covers both sides.
         if os.environ.get("RAIDEN_SHM_KEY"):
-            # Without PYTHONHASHSEED, vLLM seeds its block-hash chain with
-            # NONE_HASH = os.urandom(32) per process, so a restarted engine
-            # can never match the recovered directory: recovery silently
-            # degrades to an inert store that misses every lookup. Fail fast
-            # instead — the whole point of RAIDEN_SHM_KEY is the restart.
-            if os.environ.get("PYTHONHASHSEED") is None:
-                raise ValueError(
-                    "[kv-offload-v2] shm restart recovery (RAIDEN_SHM_KEY) "
-                    "requires PYTHONHASHSEED to be set to a fixed value: "
-                    "vLLM's block hashes are seeded per process otherwise, "
-                    "so recovered entries could never be matched after a "
-                    "restart.")
             os.environ.setdefault(
                 "RAIDEN_SHM_MODEL_UID",
                 derive_shm_model_uid(
