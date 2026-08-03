@@ -46,6 +46,7 @@ class KimiMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         reduce_results: bool = True,
+        use_sequence_parallel: bool = False,
         situ_beta: float | None = None,
         situ_linear_beta: float | None = None,
     ) -> None:
@@ -55,6 +56,7 @@ class KimiMLP(nn.Module):
             [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
+            disable_tp=use_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -63,6 +65,7 @@ class KimiMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            disable_tp=use_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act == "silu":

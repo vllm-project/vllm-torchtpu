@@ -501,6 +501,7 @@ class TPUModelRunner(GPUModelRunner):
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
+        self._logits_hidden_state_buffers: dict[int, torch.Tensor] = {}
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (min(
@@ -2660,9 +2661,13 @@ class TPUModelRunner(GPUModelRunner):
                     hidden_states,
                     layout_plan,
                 )
+                hidden_states = self._materialize_logits_hidden_states(
+                    hidden_states, num_tokens_padded)
                 logits = self.compute_selected_logits(hidden_states,
                                                       logits_indices)
             else:
+                sample_hidden_states = self._materialize_logits_hidden_states(
+                    sample_hidden_states, sample_hidden_states.shape[0])
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
 
@@ -3448,6 +3453,7 @@ class TPUModelRunner(GPUModelRunner):
                 _idx = torch.zeros(num_reqs,
                                    dtype=torch.int32,
                                    device=out.device)
+                out = self._materialize_logits_hidden_states(out, num_tokens)
                 _ = self.compute_selected_logits(out, _idx)
             sync.synchronize(out, wait=True)
         self._hidden_states_dtype = out.dtype
@@ -4616,6 +4622,28 @@ class TPUModelRunner(GPUModelRunner):
             return torch.empty((0, ), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    def _materialize_logits_hidden_states(self, hidden_states: torch.Tensor,
+                                          num_tokens: int) -> torch.Tensor:
+        """Give the separately compiled logits graph a concrete input shape.
+
+        Functional sequence-parallel collectives preserve symbolic layout
+        metadata at the compiled-backbone boundary. TorchTPU does not accept
+        SymInts as inputs to another compiled graph, even when the scheduler
+        bucket is fixed. Reuse one small activation buffer per bucket to make
+        that boundary concrete.
+        """
+        num_tokens = int(num_tokens)
+        buffer = self._logits_hidden_state_buffers.get(num_tokens)
+        if buffer is None:
+            buffer = torch.empty(
+                (num_tokens, self.model_config.get_hidden_size()),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            self._logits_hidden_state_buffers[num_tokens] = buffer
+        buffer.copy_(hidden_states)
+        return buffer
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(

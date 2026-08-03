@@ -27,6 +27,10 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
+from .sequence_parallel import all_gather as sp_all_gather
+from .sequence_parallel import is_kimi_sequence_parallel
+from .sequence_parallel import reduce_scatter as sp_reduce_scatter
+from .sequence_parallel import shard as sp_shard
 
 
 class KimiDecoderLayer(nn.Module):
@@ -39,6 +43,8 @@ class KimiDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
+        self.use_sequence_parallel = is_kimi_sequence_parallel(
+            vllm_config.parallel_config)
         if config.is_kda_layer(self.layer_idx):
             self.self_attn = KimiDeltaAttention(
                 config,
@@ -52,6 +58,9 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
             )
 
+        if self.use_sequence_parallel:
+            self.self_attn.o_proj.reduce_results = False
+
         is_moe = (config.num_experts is not None
                   and self.layer_idx >= config.first_k_dense_replace
                   and self.layer_idx % config.moe_layer_freq == 0)
@@ -61,6 +70,7 @@ class KimiDecoderLayer(nn.Module):
                 config,
                 vllm_config.quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
+                use_sequence_parallel=self.use_sequence_parallel,
             )
         else:
             self.mlp = KimiMLP(
@@ -69,6 +79,7 @@ class KimiDecoderLayer(nn.Module):
                 config.hidden_act,
                 quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.mlp",
+                use_sequence_parallel=self.use_sequence_parallel,
                 situ_beta=getattr(config, "activation_situ_beta", None),
                 situ_linear_beta=getattr(config, "activation_situ_linear_beta",
                                          None),
@@ -96,10 +107,16 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residuals: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        full_num_tokens = positions.shape[0]
         if self.attn_res_block_size is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+            if self.use_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)
+                hidden_states = hidden_states[:full_num_tokens]
             hidden_states = self.self_attn(positions, hidden_states)
+            if self.use_sequence_parallel:
+                hidden_states = sp_reduce_scatter(hidden_states)
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -120,7 +137,12 @@ class KimiDecoderLayer(nn.Module):
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)
+            hidden_states = hidden_states[:full_num_tokens]
         hidden_states = self.self_attn(positions, hidden_states)
+        if self.use_sequence_parallel:
+            hidden_states = sp_reduce_scatter(hidden_states)
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
         hidden_states = self.mlp_res(prefix_sum, block_residuals)
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -142,6 +164,8 @@ class KimiModel(nn.Module):
         super().__init__()
         config: KimiLinearConfig = vllm_config.model_config.hf_text_config
         self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
+        self.use_sequence_parallel = is_kimi_sequence_parallel(
+            vllm_config.parallel_config)
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -182,6 +206,10 @@ class KimiModel(nn.Module):
         ) if self.attn_res_block_size is not None else None)
         assert hidden_states is not None
 
+        full_num_tokens = positions.shape[0]
+        if self.use_sequence_parallel:
+            hidden_states = sp_shard(hidden_states)
+
         for layer in self.layers:
             hidden_states, block_residuals = layer(
                 positions,
@@ -192,7 +220,11 @@ class KimiModel(nn.Module):
         if block_residuals is not None:
             hidden_states = self.output_attn_res(hidden_states,
                                                  block_residuals)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)
+            hidden_states = hidden_states[:full_num_tokens]
+        return hidden_states
 
 
 class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):

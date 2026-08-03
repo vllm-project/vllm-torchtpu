@@ -306,10 +306,11 @@ def _patch_rowparallel_defer_bias() -> None:
 
 
 def _patch_disable_sequence_parallel_moe() -> None:
-    """Disable vLLM's sequence-parallel MoE on TPU.
+    """Disable vLLM's generic sequence-parallel MoE selection on TPU.
 
-    The sequence-parallel path is tied to vLLM all2all MoE backends. The TPU
-    communicator handles EP with unsplit token buffers.
+    Most TPU models still use unsplit token buffers. Models with a complete
+    TPU implementation, currently Kimi, opt in explicitly when constructing
+    their attention, dense MLP, and FusedMoE layers.
     """
     from vllm.config.parallel import ParallelConfig
 

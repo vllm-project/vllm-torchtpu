@@ -455,6 +455,7 @@ class TestTPURunner:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        self.runner._logits_hidden_state_buffers = {}
 
         # Bind the actual methods to our mock
         self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
@@ -486,6 +487,19 @@ class TestTPURunner:
             __get__(self.runner))
         self.runner._add_shared_kv_cache_aliases = (
             TPUModelRunner._add_shared_kv_cache_aliases.__get__(self.runner))
+
+    def test_materialize_logits_hidden_states_reuses_bucket_buffer(self):
+        hidden_size = self.runner.model_config.get_hidden_size()
+        first = torch.randn(4, hidden_size, dtype=torch.bfloat16)
+        second = torch.randn(4, hidden_size, dtype=torch.bfloat16)
+
+        first_result = TPUModelRunner._materialize_logits_hidden_states(
+            self.runner, first, 4)
+        second_result = TPUModelRunner._materialize_logits_hidden_states(
+            self.runner, second, 4)
+
+        assert first_result.data_ptr() == second_result.data_ptr()
+        torch.testing.assert_close(second_result, second)
 
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',

@@ -25,14 +25,17 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         norm: RMSNorm | None,
         up_proj: ReplicatedLinear,
+        use_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.use_sequence_parallel = use_sequence_parallel
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        reduced_before_norm = self.norm is not None and self.tp_size > 1
+        reduced_before_norm = (self.norm is not None and self.tp_size > 1
+                               and not self.use_sequence_parallel)
         if reduced_before_norm:
             # Routed experts shard their intermediate dimension across TP
             # ranks.  K3 normalizes the summed latent output, so reducing only
@@ -57,6 +60,7 @@ class KimiMoE(nn.Module):
         config: KimiLinearConfig,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        use_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
         assert config.num_experts is not None
@@ -68,6 +72,7 @@ class KimiMoE(nn.Module):
         vllm_config = get_current_vllm_config_or_none()
         self.use_ep = (vllm_config is not None
                        and vllm_config.parallel_config.enable_expert_parallel)
+        self.use_sequence_parallel = use_sequence_parallel
         routed_expert_hidden_size = getattr(config,
                                             "routed_expert_hidden_size", None)
         expert_hidden_size = (routed_expert_hidden_size
@@ -103,9 +108,10 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.routed_expert_up_proj",
         ) if self.routed_expert_down_proj is not None else None)
         routed_output_transform = (KimiRoutedOutputTransform(
-            self.routed_expert_norm, self.routed_expert_up_proj)
-                                   if self.routed_expert_up_proj is not None
-                                   else None)
+            self.routed_expert_norm,
+            self.routed_expert_up_proj,
+            use_sequence_parallel=use_sequence_parallel,
+        ) if self.routed_expert_up_proj is not None else None)
 
         self.shared_experts = (KimiMLP(
             hidden_size,
@@ -114,6 +120,7 @@ class KimiMoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.shared_experts",
             reduce_results=False,
+            use_sequence_parallel=use_sequence_parallel,
             situ_beta=getattr(config, "activation_situ_beta", None),
             situ_linear_beta=getattr(config, "activation_situ_linear_beta",
                                      None),
@@ -155,6 +162,7 @@ class KimiMoE(nn.Module):
             routed_scaling_factor=config.routed_scaling_factor,
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=routed_output_transform,
+            is_sequence_parallel=use_sequence_parallel,
         )
         # SITU parameters used to be accepted directly by FusedMoE. Current
         # vLLM keeps activation-specific settings on the runner's MoE config.

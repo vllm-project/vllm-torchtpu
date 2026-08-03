@@ -20,10 +20,13 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
+import vllm_torchtpu.models.vllm.kimi_k3.layers as kimi_layers
+import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+import vllm_torchtpu.models.vllm.kimi_k3.sequence_parallel as kimi_sp
+from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.vllm.custom_ops import \
     kda_attention_op as kimi_custom_ops
-from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiLinearForCausalLM,
                                                KimiModel,
@@ -41,7 +44,7 @@ def test_kimi_architectures_are_registered() -> None:
         for architecture in architectures
     }
     try:
-        register_models()
+        register_layers()
         for architecture in architectures:
             registered = ModelRegistry.models[architecture]
             assert registered.load_model_cls() is KimiLinearForCausalLM
@@ -331,6 +334,247 @@ def test_latent_moe_reduces_before_norm(
     # The division compensates for DefaultMoERunner's final TP reduction.
     torch.testing.assert_close(transform(hidden_states),
                                (hidden_states + 1).square() / 2)
+
+
+def test_latent_moe_skips_legacy_tp_reduction_with_sequence_parallel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class SquareNorm(nn.Module):
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states.square()
+
+    class IdentityLinear(nn.Module):
+
+        def forward(self, hidden_states: torch.Tensor):
+            return hidden_states, None
+
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: 2)
+
+    def unexpected_all_reduce(hidden_states):
+        raise AssertionError("SP output was already reduced-scattered")
+
+    monkeypatch.setattr(kimi_moe, "tensor_model_parallel_all_reduce",
+                        unexpected_all_reduce)
+    transform = kimi_moe.KimiRoutedOutputTransform(SquareNorm(),
+                                                   IdentityLinear(),
+                                                   use_sequence_parallel=True)
+    hidden_states = torch.tensor([[2.0, 3.0]])
+
+    torch.testing.assert_close(transform(hidden_states),
+                               hidden_states.square())
+
+
+def test_kimi_mlp_replicates_weights_with_sequence_parallel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    constructor_args: list[tuple[str, bool]] = []
+
+    class FakeLinear(nn.Module):
+
+        def __init__(self, *args, disable_tp=False, **kwargs) -> None:
+            super().__init__()
+            del args, kwargs
+            constructor_args.append((type(self).__name__, disable_tp))
+
+        def forward(self, hidden_states):
+            return hidden_states, None
+
+    class FakeColumn(FakeLinear):
+        pass
+
+    class FakeRow(FakeLinear):
+        pass
+
+    monkeypatch.setattr(kimi_layers, "MergedColumnParallelLinear", FakeColumn)
+    monkeypatch.setattr(kimi_layers, "RowParallelLinear", FakeRow)
+    monkeypatch.setattr(kimi_layers, "SiluAndMul", nn.Identity)
+    kimi_layers.KimiMLP(
+        16,
+        32,
+        "silu",
+        use_sequence_parallel=True,
+    )
+
+    assert constructor_args == [("FakeColumn", True), ("FakeRow", True)]
+
+
+def test_latent_moe_enables_fused_moe_sequence_parallel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class FakeLinear(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+        def forward(self, hidden_states):
+            return hidden_states, None
+
+    class FakeMLP(FakeLinear):
+        pass
+
+    class FakeNorm(FakeLinear):
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class FakeGate(FakeLinear):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            self.e_score_correction_bias = None
+
+    class FakeRunner(nn.Module):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.routed_experts = SimpleNamespace(activation=None)
+            self.moe_config = SimpleNamespace()
+
+    fused_moe_args = {}
+
+    def fake_fused_moe(**kwargs):
+        fused_moe_args.update(kwargs)
+        return FakeRunner()
+
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(
+        enable_expert_parallel=True))
+    monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none",
+                        lambda: vllm_config)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: 4)
+    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(kimi_moe, "ReplicatedLinear", FakeLinear)
+    monkeypatch.setattr(kimi_moe, "RMSNorm", FakeNorm)
+    monkeypatch.setattr(kimi_moe, "KimiMLP", FakeMLP)
+    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        hidden_act="silu",
+        num_experts=8,
+        num_experts_per_token=2,
+        num_shared_experts=1,
+        moe_intermediate_size=128,
+        routed_expert_hidden_size=8,
+        latent_moe_use_norm=True,
+    )
+    layer = kimi_moe.KimiMoE(
+        config,
+        quant_config=None,
+        prefix="moe",
+        use_sequence_parallel=True,
+    )
+
+    assert fused_moe_args["is_sequence_parallel"] is True
+    transform = fused_moe_args["routed_output_transform"]
+    assert transform.use_sequence_parallel is True
+    assert layer.shared_experts is not None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, True),
+        ({
+            "pipeline_parallel_size": 2
+        }, False),
+        ({
+            "enable_expert_parallel": False
+        }, False),
+        ({
+            "tensor_parallel_size": 1
+        }, False),
+        ({
+            "data_parallel_size": 1
+        }, False),
+    ],
+)
+def test_kimi_sequence_parallel_activation(overrides, expected) -> None:
+    values = dict(
+        pipeline_parallel_size=1,
+        enable_expert_parallel=True,
+        tensor_parallel_size=4,
+        data_parallel_size=2,
+    )
+    values.update(overrides)
+    assert kimi_sp.is_kimi_sequence_parallel(
+        SimpleNamespace(**values)) is expected
+
+
+def test_sequence_parallel_helpers_pad_shard_and_gather(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(kimi_sp, "get_tp_group",
+                        lambda: SimpleNamespace(device_communicator=None))
+    monkeypatch.setattr(kimi_sp, "get_tensor_model_parallel_world_size",
+                        lambda: 2)
+    monkeypatch.setattr(kimi_sp, "sequence_parallel_chunk",
+                        lambda values: values[2:4])
+    monkeypatch.setattr(
+        kimi_sp,
+        "tensor_model_parallel_all_gather",
+        lambda values, dim: calls.append(
+            ("gather", values.shape, dim)) or values.repeat(2, 1),
+    )
+    monkeypatch.setattr(
+        kimi_sp,
+        "tensor_model_parallel_reduce_scatter",
+        lambda values, dim: calls.append(
+            ("scatter", values.shape, dim)) or values[:values.shape[0] // 2],
+    )
+    values = torch.arange(10).view(5, 2)
+
+    torch.testing.assert_close(kimi_sp.shard(values), values[2:4])
+    assert kimi_sp.all_gather(values[:2]).shape == (4, 2)
+    scattered = kimi_sp.reduce_scatter(values)
+    assert scattered.shape == (3, 2)
+    assert calls == [("gather", torch.Size([2, 2]), 0),
+                     ("scatter", torch.Size([6, 2]), 0)]
+
+
+def test_decoder_sequence_parallel_collective_order(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class Identity(nn.Module):
+
+        def forward(self, values):
+            return values
+
+    class Attention(nn.Module):
+
+        def forward(self, positions, values):
+            calls.append(("attention", values.shape[0], positions.shape[0]))
+            return values + 10
+
+    layer = kimi_model.KimiDecoderLayer.__new__(kimi_model.KimiDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.use_sequence_parallel = True
+    layer.attn_res_block_size = None
+    layer.input_layernorm = Identity()
+    layer.self_attn = Attention()
+    layer.post_attention_layernorm = Identity()
+    layer.is_moe = False
+    layer.mlp = Identity()
+
+    def gather(values):
+        calls.append(("gather", values.shape[0]))
+        return torch.cat((values, values[:1]), dim=0)
+
+    def reduce_scatter(values):
+        calls.append(("scatter", values.shape[0]))
+        return values[:2]
+
+    monkeypatch.setattr(kimi_model, "sp_all_gather", gather)
+    monkeypatch.setattr(kimi_model, "sp_reduce_scatter", reduce_scatter)
+    hidden_states = torch.ones(2, 4)
+    output, block_residuals = layer(torch.arange(3),
+                                    hidden_states,
+                                    block_residuals=None)
+
+    assert block_residuals is None
+    assert calls == [("gather", 2), ("attention", 3, 3), ("scatter", 3)]
+    torch.testing.assert_close(output, torch.full_like(output, 24))
 
 
 def test_model_has_no_public_cache_or_pp_api() -> None:

@@ -7,17 +7,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TPU device communicator for EP across data-parallel engines.
 
-Dispatch gathers tokens across DP ranks that share the same TP rank. Combine
-sums those matching-TP partials across DP and returns this DP rank's token
-slice. vLLM's existing ``reduce_results`` TP all-reduce remains responsible for
-the final TP-side reduction. Callers must pass equal token counts on each DP
-rank.
+Ordinary DP dispatch/combine communicates across the DP group. Sequence-
+parallel MoE instead communicates across the full EP group so that TP token
+shards are routed exactly once. Callers must pass equal token counts per rank.
 """
 
 import torch
+import torch.distributed._functional_collectives as funcol
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -35,8 +34,60 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
-    def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
-        return get_dp_group().all_gather(x, dim=0)
+    def custom_all_gather(self,
+                          input_: torch.Tensor,
+                          dim: int = 0) -> torch.Tensor:
+        """SP all-gather without allocating a symbolically sized output.
+
+        The base communicator creates the destination with ``torch.empty``.
+        TorchTPU cannot export that allocation when the token dimension is a
+        SymInt. Functional collectives carry the symbolic result shape through
+        the graph and are lowered by the distributed backend instead.
+        """
+        if self.world_size == 1:
+            return input_
+        if dim < 0:
+            dim += input_.dim()
+        input_shape = input_.shape
+        gathered = funcol.wait_tensor(
+            funcol.all_gather_tensor(input_.contiguous(), 0,
+                                     self.device_group))
+        gathered = gathered.reshape((self.world_size, ) + input_shape)
+        gathered = gathered.movedim(0, dim)
+        return gathered.reshape(input_shape[:dim] +
+                                (self.world_size * input_shape[dim], ) +
+                                input_shape[dim + 1:])
+
+    def custom_reduce_scatter(self,
+                              input_: torch.Tensor,
+                              dim: int = 0) -> torch.Tensor:
+        """SP reduce-scatter without a symbolically sized allocation."""
+        if self.world_size == 1:
+            return input_
+        if dim < 0:
+            dim += input_.dim()
+        input_ = input_.movedim(dim, 0).contiguous()
+        output = funcol.wait_tensor(
+            funcol.reduce_scatter_tensor(input_, "sum", 0, self.device_group))
+        return output.movedim(0, dim).contiguous()
+
+    @staticmethod
+    def _dispatch_group(is_sequence_parallel: bool):
+        return get_ep_group() if is_sequence_parallel else get_dp_group()
+
+    @staticmethod
+    def _all_gather(group, input_: torch.Tensor,
+                    is_sequence_parallel: bool) -> torch.Tensor:
+        if is_sequence_parallel:
+            return group.device_communicator.custom_all_gather(input_)
+        return group.all_gather(input_, dim=0)
+
+    @staticmethod
+    def _reduce_scatter(group, input_: torch.Tensor,
+                        is_sequence_parallel: bool) -> torch.Tensor:
+        if is_sequence_parallel:
+            return group.device_communicator.custom_reduce_scatter(input_)
+        return group.reduce_scatter(input_, dim=0)
 
     def dispatch_router_logits(
         self,
@@ -48,11 +99,13 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if extra_tensors is not None:
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator")
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        group = self._dispatch_group(is_sequence_parallel)
+        if group.world_size == 1:
             return hidden_states, router_logits
-        hidden_states = self._dp_gather(hidden_states)
-        router_logits = self._dp_gather(router_logits)
+        hidden_states = self._all_gather(group, hidden_states,
+                                         is_sequence_parallel)
+        router_logits = self._all_gather(group, router_logits,
+                                         is_sequence_parallel)
         return hidden_states, router_logits
 
     def dispatch(
@@ -66,18 +119,20 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if extra_tensors is not None:
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator")
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        group = self._dispatch_group(is_sequence_parallel)
+        if group.world_size == 1:
             return hidden_states, topk_weights, topk_ids
-        hidden_states = self._dp_gather(hidden_states)
-        topk_weights = self._dp_gather(topk_weights)
-        topk_ids = self._dp_gather(topk_ids)
+        hidden_states = self._all_gather(group, hidden_states,
+                                         is_sequence_parallel)
+        topk_weights = self._all_gather(group, topk_weights,
+                                        is_sequence_parallel)
+        topk_ids = self._all_gather(group, topk_ids, is_sequence_parallel)
         return hidden_states, topk_weights, topk_ids
 
     def combine(self,
                 hidden_states: torch.Tensor,
                 is_sequence_parallel: bool = False) -> torch.Tensor:
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        group = self._dispatch_group(is_sequence_parallel)
+        if group.world_size == 1:
             return hidden_states
-        return dp.reduce_scatter(hidden_states, dim=0)
+        return self._reduce_scatter(group, hidden_states, is_sequence_parallel)
