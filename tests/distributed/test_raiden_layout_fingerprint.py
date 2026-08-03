@@ -36,7 +36,8 @@ def _manifest(*, page_tokens=4096):
     )
 
 
-def test_measured_fa_layout_fingerprint_golden():
+def test_measured_fa_layout_fingerprint_golden(monkeypatch):
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
     manifest = _manifest()
     fingerprint, payload = rlf.measured_fa_layout_fingerprint(
         manifest,
@@ -54,12 +55,36 @@ def test_measured_fa_layout_fingerprint_golden():
         "minor_to_major": [4, 3, 2, 1, 0],
         "tiles": [[4, 128], [4, 1]],
         "element_size_in_bits": 8,
+        "gdn_conv_layout": "legacy-split-qk",
     }
     assert fingerprint == (
-        "50348350151774fe672b36456717bf46f1119e296a0423d325bfd743b0584e7c")
+        "0ddf18228f657fb11c8b6a5ddf0826b1f3020cf88fde96833832eedbd3cf9811")
     assert rlf.canonical_layout_fingerprint(
         dict(reversed(list(payload.items())))) == fingerprint
     assert rlf.fa_page_tokens(manifest) == 4096
+
+
+def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):
+    """A mixed-layout disagg pair must not share a fingerprint: the conv
+    geometries are size-identical, so the layout version in the payload is
+    the only thing that fails such a pair closed."""
+
+    def measure():
+        return rlf.measured_fa_layout_fingerprint(
+            _manifest(),
+            layout_getter=lambda tensor:
+            ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
+            package_version=lambda package: "unused",
+        )
+
+    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
+    pair_fingerprint, pair_payload = measure()
+    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0")
+    legacy_fingerprint, legacy_payload = measure()
+
+    assert pair_payload["gdn_conv_layout"] == "qk-pair-v1"
+    assert legacy_payload["gdn_conv_layout"] == "legacy-split-qk"
+    assert pair_fingerprint != legacy_fingerprint
 
 
 @pytest.mark.parametrize(

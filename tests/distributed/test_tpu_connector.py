@@ -1666,17 +1666,18 @@ class TestTPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.kv_transfer.v2.raiden_pool_manifest import (  # noqa: E501
             BINDING_ALIASED_RAW, PoolEntry, PoolManifest, RegionSpec)
 
+        # Qwen3.5-35B TP8 shard geometry with the QK pair-blocked layout:
+        # every raw extent is a whole 1024-byte physical pool token.
         conv_regions = (
-            RegionSpec("gdn_conv_q", 0, 32, 4, 3, 2),
-            RegionSpec("gdn_conv_k", 8, 32, 4, 3, 2),
-            RegionSpec("gdn_conv_v", 16, 32, 4, 3, 4),
+            RegionSpec("gdn_conv_qk", 0, 2048, 1024, 3, 1),
+            RegionSpec("gdn_conv_v", 1024, 2048, 256, 3, 4),
         )
-        ssm_regions = (RegionSpec("gdn_ssm", 0, 16, 16, 4), )
+        ssm_regions = (RegionSpec("gdn_ssm", 0, 1024, 1024, 4), )
         manifest = PoolManifest(
             binding=BINDING_ALIASED_RAW,
             storages=[],
             pools=[
-                PoolEntry("gdn.conv.g0", "linear.0", 0, 64, 4096, 32,
+                PoolEntry("gdn.conv.g0", "linear.0", 0, 2048, 8192, 32,
                           conv_regions, "bfloat16"),
                 PoolEntry("gdn.ssm.g0", "linear.0", 0, 0, 4096, 32,
                           ssm_regions, "float32"),
@@ -1688,6 +1689,11 @@ class TestTPURaidenConnectorWorker:
                                      dp_size=1,
                                      pcp_size=8)
         worker._raiden_manifest = manifest
+        worker._raiden_layout_fingerprint_payload = {
+            "minor_to_major": [4, 3, 2, 1, 0],
+            "tiles": [[4, 128], [4, 1]],
+            "element_size_in_bits": 8,
+        }
         worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
         worker._stage3_state_group_count = 1
         facade = _FakeRaidenControllerFacade()
@@ -1702,16 +1708,17 @@ class TestTPURaidenConnectorWorker:
         conv, ssm = registrations
         assert conv.tag == "gdn.conv.g0"
         assert conv.block_ids == (17, )
-        assert conv.declared_bytes == 96
+        assert conv.declared_bytes == 6144
         assert conv.spans == (
-            PoolByteSpan(0, 0, 0, transfer_rank * 8, 8, 32, 256, 3),
-            PoolByteSpan(0, 8, 0, 64 + transfer_rank * 8, 8, 32, 256, 3),
-            PoolByteSpan(0, 16, 0, 128 + transfer_rank * 16, 16, 32, 256, 3),
+            PoolByteSpan(0, 0, 0, transfer_rank * 1024, 1024, 2048, 16384, 3),
+            PoolByteSpan(0, 1024, 0, 8192 + transfer_rank * 1024, 1024, 2048,
+                         16384, 3),
         )
         assert ssm.tag == "gdn.ssm.g0"
         assert ssm.block_ids == (17, )
-        assert ssm.declared_bytes == 64
-        assert ssm.spans == (PoolByteSpan(0, 0, 0, transfer_rank * 64, 64), )
+        assert ssm.declared_bytes == 4096
+        assert ssm.spans == (PoolByteSpan(0, 0, 0, transfer_rank * 4096,
+                                          4096), )
 
     def test_v3_stage3_producer_registers_rank_stripe_and_releases_on_done(
             self):

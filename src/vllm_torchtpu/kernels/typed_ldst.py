@@ -17,41 +17,32 @@ A block ref holds bytes in the layout of its owning buffer (e.g. one
 kernel block of the unified KV pool). Consumers that pack a different
 element type into those bytes access them through a typed view: Mosaic
 ``ref.bitcast`` (which rescales the second-minor dim by the element-size
-ratio) plus an optional 128-lane split. The split maps each 128-wide
-lane slice to a contiguous range of rows — lane slice ``i`` carries rows
-``[i * n, (i + 1) * n)`` — so a narrower-lane state view is a pair of
-128-aligned lane slices concatenated along rows, with no lane-crossing
-relayout. The pool gather/scatter kernels and the GDN V3 state seam
-share these helpers so the bytes they exchange are identical.
+ratio) plus an optional narrowing reshape, both applied to the *ref*
+before the load. Reshaping the ref keeps every access one whole vector
+register; splitting lanes after the load costs a lane-crossing relayout
+instead (measured on v7: 366 bundles / 448 vrot for the post-load split
+against 87 / 0 for the ref-level reshape, on a 256 KiB pool block).
+The pool gather/scatter kernels and the GDN V3 state seam share these
+helpers so the bytes they exchange are identical.
 """
 import jax
 import jax.numpy as jnp
 
 
-def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
-    """Reads a raw block ref as ``(rows, lanes // lane_split)`` view_dtype."""
+def _typed_view(block_ref, view_dtype, lane_split: int):
+    """Raw block ref as a ``(rows, lanes // lane_split)`` view_dtype ref."""
     if jnp.dtype(block_ref.dtype) != jnp.dtype(view_dtype):
         block_ref = block_ref.bitcast(jnp.dtype(view_dtype))
-    lanes = block_ref.shape[-1]
-    arr = block_ref[...].reshape(-1, lanes)
-    if lane_split > 1:
-        out_lanes = lanes // lane_split
-        arr = jnp.concatenate([
-            arr[:, i * out_lanes:(i + 1) * out_lanes]
-            for i in range(lane_split)
-        ],
-                              axis=0)
-    return arr
+    return block_ref.reshape(-1, block_ref.shape[-1] // lane_split)
+
+
+def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
+    """Reads a raw block ref as ``(rows, lanes // lane_split)`` view_dtype."""
+    return _typed_view(block_ref, view_dtype, lane_split)[...]
 
 
 def store_typed(block_ref, values: jax.Array, *, lane_split: int = 1) -> None:
-    """Inverse of ``load_typed``: lane-merges ``values`` and stores them
-    through a bitcast view of the raw block ref, which is fully written."""
-    if lane_split > 1:
-        rows = values.shape[0] // lane_split
-        values = jnp.concatenate(
-            [values[i * rows:(i + 1) * rows] for i in range(lane_split)],
-            axis=-1)
-    if jnp.dtype(block_ref.dtype) != jnp.dtype(values.dtype):
-        block_ref = block_ref.bitcast(jnp.dtype(values.dtype))
-    block_ref[...] = values.reshape(block_ref.shape)
+    """Inverse of ``load_typed``: stores ``values`` through a typed view of
+    the raw block ref, which is fully written."""
+    ref = _typed_view(block_ref, values.dtype, lane_split)
+    ref[...] = values.reshape(ref.shape)

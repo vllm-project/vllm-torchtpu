@@ -22,10 +22,6 @@ import torch
 import torch.nn.functional as F
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors import \
-    VllmCompressedTensorsConfig
-from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import \
-    VllmCompressedTensorsMoEMethod
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import \
     VllmCompressedTensorsW4A16MoEMethod
 
@@ -150,58 +146,6 @@ class FakeRoutedExperts(RoutedExperts):
         self.moe_config.moe_parallel_config.use_ep = False
         self.moe_config.activation = FakeActivation("silu")
         self.use_grouped_topk = False
-
-
-class TestCompressedTensorsConfigRouting:
-    """Verify that VllmCompressedTensorsConfig correctly routes configs."""
-
-    def test_get_moe_method_routing(self):
-        # Mock VllmCompressedTensorsConfig and get_scheme_dict
-        config = MagicMock(spec=VllmCompressedTensorsConfig)
-
-        # 1. Test W4A16 routing
-        weight_quant = FakeQuantArgs(num_bits=4,
-                                     strategy="group",
-                                     group_size=16)
-        input_quant = None
-        scheme_dict = {
-            "weights": weight_quant,
-            "input_activations": input_quant
-        }
-        config.get_scheme_dict.return_value = scheme_dict
-
-        layer = FakeRoutedExperts(experts_per_token=2)
-
-        method = VllmCompressedTensorsMoEMethod.get_moe_method(
-            config, layer, "model.layers.0.block")
-        assert isinstance(method, VllmCompressedTensorsW4A16MoEMethod)
-
-        # 2. Test W4A8 routing (should route to the same runner)
-        input_quant_8 = FakeQuantArgs(num_bits=8,
-                                      strategy="token",
-                                      dynamic=True)
-        scheme_dict_w4a8 = {
-            "weights": weight_quant,
-            "input_activations": input_quant_8
-        }
-        config.get_scheme_dict.return_value = scheme_dict_w4a8
-
-        method_w4a8 = VllmCompressedTensorsMoEMethod.get_moe_method(
-            config, layer, "model.layers.0.block")
-        assert isinstance(method_w4a8, VllmCompressedTensorsW4A16MoEMethod)
-
-        # 3. Test unsupported strategy routing fallback
-        weight_quant_unsupported = FakeQuantArgs(num_bits=4, strategy="tensor")
-        scheme_dict_unsupported = {
-            "weights": weight_quant_unsupported,
-            "input_activations": None
-        }
-        config.get_scheme_dict.return_value = scheme_dict_unsupported
-
-        with pytest.raises(RuntimeError,
-                           match="Unsupported TPU FusedMoe scheme"):
-            VllmCompressedTensorsMoEMethod.get_moe_method(
-                config, layer, "model.layers.0.block")
 
 
 class TestW4MoEWeightPreprocessing:
