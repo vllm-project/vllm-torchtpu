@@ -1346,6 +1346,8 @@ class TestTPURaidenConnectorWorker:
     def test_v1_qwen35_explicit_pool_admission_golden(self):
         cases = (
             (True, "pcp8_prefill", 8, 1),
+            (True, "dp4_prefill", 1, 4),
+            (True, "dp8_prefill", 1, 8),
             (False, "dp8_decode", 1, 8),
         )
         for is_producer, expected_topology, pcp_size, dp_size in cases:

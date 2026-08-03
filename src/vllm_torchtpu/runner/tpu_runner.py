@@ -29,7 +29,8 @@ from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
-                                          has_kv_transfer_group)
+                                          has_kv_transfer_group,
+                                          kv_transfer_state)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import (Attention,
@@ -646,6 +647,22 @@ class TPUModelRunner(GPUModelRunner):
 
     def _sync_device(self) -> None:
         torch.tpu.synchronize()
+
+    @contextmanager
+    def _disable_kv_connector_for_warmup(self) -> Iterator[None]:
+        """Isolate worker-local synthetic warmup from the KV connector.
+
+        Synthetic scheduler outputs do not pass through the scheduler and
+        therefore have no connector metadata. This mirrors upstream GPU
+        warmup's ``kv_connector.set_disabled(True)`` scope, including disabling
+        layer-wise connector hooks while preserving the connector for serving.
+        """
+        saved_agent = kv_transfer_state._KV_CONNECTOR_AGENT
+        kv_transfer_state._KV_CONNECTOR_AGENT = None
+        try:
+            yield
+        finally:
+            kv_transfer_state._KV_CONNECTOR_AGENT = saved_agent
 
     def maybe_setup_kv_connector(self,
                                  scheduler_output,
@@ -3966,7 +3983,8 @@ class TPUModelRunner(GPUModelRunner):
                 # differently, so the first real request would otherwise compile
                 # a handful of new graphs. Warm those by running the REAL
                 # two-phase spec-decode path once on a synthetic request.
-                self._warmup_spec_decode()
+                with self._disable_kv_connector_for_warmup():
+                    self._warmup_spec_decode()
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
@@ -4109,13 +4127,15 @@ class TPUModelRunner(GPUModelRunner):
             # ---- decode all R together: real nr=R propose + verify + sample ---
             nct = [P] * R
             for t in range(n_decode):
-                creq = CachedRequestData(req_ids=list(rids),
-                                         resumed_req_ids=set(),
-                                         new_token_ids=[],
-                                         all_token_ids={},
-                                         new_block_ids=[None] * R,
-                                         num_computed_tokens=list(nct),
-                                         num_output_tokens=[t + 1] * R)
+                creq = CachedRequestData(
+                    req_ids=list(rids),
+                    resumed_req_ids=set(),
+                    new_token_ids=[],
+                    all_token_ids={rid: [0] * (P + t + 1)
+                                   for rid in rids},
+                    new_block_ids=[None] * R,
+                    num_computed_tokens=list(nct),
+                    num_output_tokens=[t + 1] * R)
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
                 so.num_scheduled_tokens = {rid: 1 + K for rid in rids}

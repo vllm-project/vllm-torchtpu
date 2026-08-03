@@ -139,6 +139,113 @@ def test_no_forward_output_preserves_invalid_block_ids():
     assert output.kv_connector_output.invalid_block_group_index == 2
 
 
+def test_kv_connector_disabled_scope_bypasses_connector_setup():
+    """Synthetic warmup must not require scheduler-built connector metadata."""
+    connector = object()
+    runner = SimpleNamespace()
+    runner._disable_kv_connector_for_warmup = (
+        TPUModelRunner._disable_kv_connector_for_warmup.__get__(runner))
+    runner.maybe_setup_kv_connector = (
+        TPUModelRunner.maybe_setup_kv_connector.__get__(runner))
+    scheduler_output = SimpleNamespace(kv_connector_metadata=None)
+
+    with patch.object(tpu_runner.kv_transfer_state, "_KV_CONNECTOR_AGENT",
+                      connector):
+        with runner._disable_kv_connector_for_warmup():
+            runner.maybe_setup_kv_connector(scheduler_output)
+            assert not tpu_runner.has_kv_transfer_group()
+
+        assert tpu_runner.kv_transfer_state._KV_CONNECTOR_AGENT is connector
+
+
+def test_kv_connector_disabled_scope_restores_agent_after_exception():
+    """A failed warmup must not leave real PD requests without a connector."""
+    connector = object()
+    runner = SimpleNamespace()
+    runner._disable_kv_connector_for_warmup = (
+        TPUModelRunner._disable_kv_connector_for_warmup.__get__(runner))
+
+    with patch.object(tpu_runner.kv_transfer_state, "_KV_CONNECTOR_AGENT",
+                      connector):
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            with runner._disable_kv_connector_for_warmup():
+                raise RuntimeError("warmup failed")
+
+        assert tpu_runner.kv_transfer_state._KV_CONNECTOR_AGENT is connector
+
+
+def test_capture_model_disables_connector_around_spec_warmup():
+    """The MTP warmup must be isolated without changing serving state."""
+    events = []
+
+    @contextlib.contextmanager
+    def disabled_scope():
+        events.append("connector-disabled")
+        try:
+            yield
+        finally:
+            events.append("connector-restored")
+
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        maybe_setup_dummy_loras=lambda _: contextlib.nullcontext(),
+        lora_config=None,
+        _precompile_timed=lambda _: contextlib.nullcontext(),
+        num_tokens_paddings=[],
+        _precompile_sampling_subgraphs=lambda: None,
+        _is_async_drafter=True,
+        drafter=SimpleNamespace(precompile=lambda: None),
+        _precompile_rejection_sampler=lambda: None,
+        _disable_kv_connector_for_warmup=disabled_scope,
+        _warmup_spec_decode=lambda: events.append("spec-warmup"),
+    )
+
+    TPUModelRunner.capture_model(runner)
+
+    assert events == [
+        "connector-disabled",
+        "spec-warmup",
+        "connector-restored",
+    ]
+
+
+def test_async_spec_batch_warmup_propagates_token_history():
+    """Async warmup cached requests must carry recoverable token history."""
+    cached_requests = []
+
+    def execute_model(scheduler_output):
+        if scheduler_output.scheduled_cached_reqs is not None:
+            cached_requests.append(scheduler_output.scheduled_cached_reqs)
+        return None
+
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        max_model_len=128,
+        max_num_tokens=64,
+        kv_cache_config=SimpleNamespace(
+            num_blocks=64,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+            ],
+        ),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda _: None,
+    )
+
+    TPUModelRunner._warmup_spec_batch(runner, R=2, P=16)
+
+    assert cached_requests
+    for request_data in cached_requests:
+        assert set(request_data.all_token_ids) == set(request_data.req_ids)
+        for req_id, num_output_tokens in zip(request_data.req_ids,
+                                             request_data.num_output_tokens):
+            assert len(
+                request_data.all_token_ids[req_id]) == 16 + num_output_tokens
+
+
 def test_build_kv_connector_output_supports_vllm_023():
     with patch.object(
             tpu_runner,
