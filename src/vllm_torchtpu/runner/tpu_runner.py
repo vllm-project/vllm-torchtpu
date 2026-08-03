@@ -2068,6 +2068,8 @@ class TPUModelRunner(GPUModelRunner):
                 seq.tolist()
                 for seq in pre_next_tokens_cpu[valid_mask].split(gen_lens)
             ]
+            logger.info("SPEC_VERIFY_HOST: req_ids=%s, num_drafts=%s, accepted_tokens=%s",
+                        pre_req_ids, pre_num_draft_per_req, valid_sampled_token_ids)
 
         for i in pre_discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()

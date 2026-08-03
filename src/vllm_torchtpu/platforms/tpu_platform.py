@@ -230,9 +230,14 @@ def apply_tpu_patches() -> None:
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env)
+                               _patch_dflash_bypass_v2_runner_check,
+                               _patch_multiproc_worker_global_rank_env,
+                               _patch_vllm_config_triton_tpu
+                               )
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    _patch_dflash_bypass_v2_runner_check()
+    _patch_vllm_config_triton_tpu()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).

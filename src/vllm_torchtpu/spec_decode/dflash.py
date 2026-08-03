@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import contextlib
+import copy
+import dataclasses
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -143,14 +145,21 @@ class DFlashProposer:
                             self._draft_replicated,
                             force_share=True)
 
-        # Configure draft attention kernels for DFlash decoding
+        if hasattr(self.draft_model, "get_draft_attn_causal"):
+            layer_causal_list = self.draft_model.get_draft_attn_causal()
+        elif hasattr(self.draft_model.model, "get_draft_attn_causal"):
+            layer_causal_list = self.draft_model.model.get_draft_attn_causal()
+        else:
+            raise RuntimeError(
+                "Draft model does not support get_draft_attn_causal")
+
         with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
             for i, layer in enumerate(self.draft_model.model.layers):
                 attn_impl = layer.self_attn.attn.impl
                 if isinstance(attn_impl, PallasAttentionBackendImpl):
                     attn_impl.layer_idx = i
-                    # DFlash uses non-causal attention across its parallel mask tokens
-                    attn_impl.use_causal_mask = False
+                    use_causal = layer_causal_list[i]
+                    attn_impl.use_causal_mask = use_causal
                     attn_impl.initialize_kernel(layer.self_attn.attn)
 
     def _load_draft_model(self) -> None:
@@ -158,12 +167,16 @@ class DFlashProposer:
         model_loader = get_model_loader(self.vllm_config.load_config)
         draft_tp1_ctx = (_force_draft_tp1() if self._draft_replicated else
                          contextlib.nullcontext())
+        draft_vllm_config = copy.copy(self.vllm_config)
+        draft_model_config = copy.copy(
+            self.speculative_config.draft_model_config)
+        draft_model_config.runner_type = "draft"
         with set_model_tag("dflash_head"), set_vllm_model_wrapper_context(
                 mesh=self.runner.mesh), set_current_vllm_config(
-                    self.vllm_config), draft_tp1_ctx:
+                    draft_vllm_config), draft_tp1_ctx:
             self.draft_model = model_loader.load_model(
-                vllm_config=self.vllm_config,
-                model_config=self.speculative_config.draft_model_config,
+                vllm_config=draft_vllm_config,
+                model_config=draft_model_config,
             )
 
     def _get_padded_len(self, target_len: int) -> int:
@@ -195,6 +208,11 @@ class DFlashProposer:
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             padded_num_reqs, block_size)
 
+        mamba_state_indices = (runner._build_mamba_state_indices(
+            chunk.start_index, chunk.num_reqs, padded_num_reqs)
+                               if getattr(runner, "_has_mamba_state", False)
+                               else None)
+
         saved_ctx = runner._attn_metadata_builder_ctx
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=padded_num_reqs,
@@ -203,6 +221,8 @@ class DFlashProposer:
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            mamba_state_indices=mamba_state_indices,
+            position_ids_override=chunk_ctx.position_ids_override,
         )
         slot_mappings_dict = runner.empty_slot_mappings
 
@@ -242,6 +262,7 @@ class DFlashProposer:
 
         The base token is the last verified token from the target model.
         """
+        logger.debug("DFlash: Starting _prepare_dflash_inputs. num_reqs=%s", chunk.num_reqs)
         # 1. Calculate static padded shapes
         num_reqs = chunk.num_reqs
         K = self.speculative_config.num_speculative_tokens
@@ -257,6 +278,8 @@ class DFlashProposer:
 
         query_start_loc_device = chunk.attn_ctx.query_start_loc
         position_ids_device = chunk.position_ids
+        if position_ids_device.dim() > 1:
+            position_ids_device = position_ids_device[0]
 
         # Route to the appropriate pre-compiled XLA Graph
         if next_tokens_device is not None:
@@ -287,6 +310,20 @@ class DFlashProposer:
 
         return input_ids, positions, seq_lens
 
+    def _build_draft_layer_metadata(
+        self,
+        attn_metadata: dict[str, "AttentionMetadata"],
+    ) -> tuple["AttentionMetadata", ...]:
+        default_md = next(iter(attn_metadata.values()), None)
+        draft_md_list = []
+        for layer in self.draft_model.model.layers:
+            layer_name = getattr(layer.self_attn.attn, "layer_name", "")
+            md = attn_metadata.get(layer_name, default_md)
+            if getattr(md, "block_tables", None) is not None and md.block_tables.dim() > 1:
+                md = dataclasses.replace(md, block_tables=md.block_tables.reshape(-1))
+            draft_md_list.append(md)
+        return tuple(draft_md_list)
+
     def _update_draft_kv_cache_from_target(self,
                                            chunk,
                                            num_rejected_tokens_np=None
@@ -308,20 +345,15 @@ class DFlashProposer:
                                                      tuple)) else target_hidden
         num_tokens = aux_hidden.shape[0]
 
-        positions = chunk.position_ids[:num_tokens]
-
-        draft_attn_metadata = next(iter(chunk.attn_metadata.values()))
+        positions = chunk.position_ids
+        if positions.dim() > 1:
+            positions = positions[0]
+        positions = positions[:num_tokens]
+        draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
 
         with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
-            kv_caches = [
-                layer.self_attn.attn.kv_cache
-                for layer in self.draft_model.model.layers
-            ]
-            _, new_kv_caches = self._tpu_precompute_and_update_kv_cache(
-                target_hidden, positions, draft_attn_metadata, kv_caches)
-            for layer, new_kv in zip(self.draft_model.model.layers,
-                                     new_kv_caches):
-                layer.self_attn.attn.kv_cache = new_kv
+            self._tpu_precompute_and_update_kv_cache(
+                target_hidden, positions, draft_md_tuple)
 
     @torch.no_grad()
     def propose(
@@ -329,7 +361,7 @@ class DFlashProposer:
         sampled_token_ids: list[list[int]],
         discard_sampled_tokens_req_indices: list[int],
         num_rejected_tokens_np: np.ndarray | None,
-        scheduler_output,
+        scheduler_output=None,
         return_device: bool = False,
         next_tokens_per_chunk: list[torch.Tensor] | None = None,
         device_seed: torch.Tensor | None = None,
@@ -449,10 +481,6 @@ class DFlashProposer:
                         use_max_model_len=False,
                     )
 
-    def clear_keep_alives(self) -> None:
-        """Explicitly clear references to dummy outputs used to prevent DCE, preventing cross-batch memory leaks."""
-        self._keep_alive_outputs_list = None
-
     def _dummy_precompute_and_update_kv_cache(
         self,
         num_tokens: int,
@@ -496,14 +524,10 @@ class DFlashProposer:
         )
 
         with set_vllm_model_wrapper_context(mesh=runner.mesh):
-            kv_caches = [
-                layer.self_attn.attn.kv_cache
-                for layer in self.draft_model.model.layers
-            ]
-            _, dummy_outputs = self._tpu_precompute_and_update_kv_cache(
-                dummy_hidden, dummy_positions, dummy_attn_metadata, kv_caches)
-            for out in dummy_outputs:
-                sync.synchronize(out, wait=True)
+            out = self._tpu_precompute_and_update_kv_cache(
+                dummy_hidden, dummy_positions,
+                tuple([dummy_attn_metadata] * len(self.draft_model.model.layers)))
+            sync.synchronize(out, wait=True)
 
     def _dummy_draft_forward(
         self,
@@ -595,9 +619,8 @@ class DFlashProposer:
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor]
         | torch.Tensor,
         positions: torch.Tensor,
-        draft_attn_metadata: "AttentionMetadata",
-        kv_caches: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        draft_md_tuple: tuple["AttentionMetadata", ...],
+    ) -> torch.Tensor:
         """
         Projects target model hidden states directly into the draft model's KV space.
 
@@ -616,10 +639,6 @@ class DFlashProposer:
         if hasattr(self.draft_model, "combine_hidden_states"):
             target_hidden = self.draft_model.combine_hidden_states(
                 target_hidden)
-        elif fc_layer := getattr(self_model, "fc", None):
-            target_hidden = fc_layer(target_hidden)
-            if isinstance(target_hidden, tuple):
-                target_hidden = target_hidden[0]
 
         if hasattr(self_model, "hidden_norm"):
             target_hidden = self_model.hidden_norm(target_hidden)
@@ -661,11 +680,10 @@ class DFlashProposer:
         roped_k_all = roped_k_flat.view(L, num_ctx, nkv, hd)
         roped_q_all = dummy_q_roped_flat.view(L, num_ctx, nq, hd)
 
-        new_kv_caches = []
         # 2. update kv cache in the compiled graph so XLA can fuse the mutations
         for i, layer in enumerate(self.draft_model.model.layers):
-            kv_cache = kv_caches[i]
             attn_obj = layer.self_attn.attn
+            kv_cache = attn_obj.kv_cache
             attn_impl = attn_obj.impl
 
             # Use normal forward pass to run RPA v3 and update KV cache
@@ -675,11 +693,10 @@ class DFlashProposer:
                 key=roped_k_all[i],
                 value=all_v[i],
                 kv_cache=kv_cache,
-                attn_metadata=draft_attn_metadata,
+                attn_metadata=(draft_md_tuple[i] if isinstance(draft_md_tuple, (tuple, list)) else draft_md_tuple),
             )
-            new_kv_caches.append(kv_cache)
 
-        return hidden_states, new_kv_caches
+        return hidden_states
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(

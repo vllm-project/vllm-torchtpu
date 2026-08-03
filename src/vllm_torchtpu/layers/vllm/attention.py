@@ -811,6 +811,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
         value = value.view(k_len, self.num_kv_heads, self.head_size)
         assert key.shape == value.shape
 
+        pool_head_dim = kv_cache.shape[-1]
+        if query.shape[-1] < pool_head_dim:
+            pad_size = pool_head_dim - query.shape[-1]
+            query = torch.nn.functional.pad(query, (0, pad_size))
+            key = torch.nn.functional.pad(key, (0, pad_size))
+            value = torch.nn.functional.pad(value, (0, pad_size))
+
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float
@@ -864,6 +871,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             attn_metadata.request_distribution,
             sink,
         )
+
+        if outputs.shape[-1] > self.head_size:
+            outputs = outputs[..., :self.head_size]
 
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():

@@ -881,6 +881,79 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     "block sizes.")
 
 
+def _patch_dflash_bypass_v2_runner_check() -> None:
+    """Bypass V2 model runner check in DFlash for TPU execution.
+
+    Upstream ``qwen3_dflash._resolve_layer_attention`` enforces
+    ``use_v2_model_runner`` for mixed SWA/full attention DFlash drafters.
+    TPU uses TPUModelRunner which handles mixed attention without Triton V2 runner.
+    """
+    try:
+        from vllm.model_executor.models import qwen3_dflash
+    except ImportError:
+        return
+
+    if getattr(qwen3_dflash, "_tpu_bypass_v2_runner_patch", False):
+        return
+
+    original_resolve = qwen3_dflash._resolve_layer_attention
+
+    def patched_resolve(config, layer_idx: int):
+        dflash_config = getattr(config, "dflash_config", None) or {}
+        layer_types = getattr(config, "layer_types", None)
+        use_swa = dflash_config.get("use_swa", False)
+
+        any_sliding = False
+        if layer_types is not None:
+            num_sliding = sum(lt == qwen3_dflash._SLIDING_ATTENTION for lt in layer_types)
+            any_sliding = num_sliding > 0
+
+        if layer_types is None or (use_swa and not any_sliding):
+            is_sliding = use_swa
+        else:
+            is_sliding = layer_types[layer_idx] == qwen3_dflash._SLIDING_ATTENTION
+
+        sliding_window = None
+        if is_sliding:
+            sliding_window = dflash_config.get(
+                "swa_window_size", getattr(config, "sliding_window", None)
+            )
+            if sliding_window is None:
+                raise ValueError(
+                    "DFlash sliding attention requires a window size configured in "
+                    "dflash_config.swa_window_size or the top-level sliding_window."
+                )
+
+        return sliding_window, qwen3_dflash._dflash_layer_causal(config, layer_idx)
+
+    qwen3_dflash._resolve_layer_attention = patched_resolve
+    qwen3_dflash._tpu_bypass_v2_runner_patch = True
+    logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
+
+
+def _patch_vllm_config_triton_tpu() -> None:
+    """Bypass V2 model runner Triton check on TPU.
+
+    The config forces use_v2_model_runner=True for hybrid DFlash drafters.
+    When it validates V2, it crashes on TPU because HAS_TRITON is False.
+    TPU uses TPUModelRunner instead, so we can safely bypass this.
+    """
+    from vllm.config.vllm import VllmConfig
+
+    if getattr(VllmConfig, "_tpu_triton_patch_applied", False):
+        return
+
+    original_validate = VllmConfig._validate_v2_model_runner
+
+    def patched_validate(self):
+        if getattr(self, "device_config", None) and self.device_config.device_type == "tpu":
+            return
+        return original_validate(self)
+
+    VllmConfig._validate_v2_model_runner = patched_validate
+    VllmConfig._tpu_triton_patch_applied = True
+    logger.info("Applied TPU patch: bypass V2 model runner Triton check.")
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations
