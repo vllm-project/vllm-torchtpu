@@ -978,7 +978,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
     )
-    out_specs = (pool_spec, replicated_spec)
+    output_spec = P(pcp_axis, None, None)
+    out_specs = (pool_spec, output_spec)
 
     def _pooled_pcp_prefill_fn(
         local_qkv,
@@ -1000,12 +1001,10 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             pcp_size,
             -1,
         )
-        packed_qkv_shard = _exchange_pcp_token_shards_for_head_shards(
-            interleaved_qkv, pcp_axis, pcp_size)
-        packed_b_shard = _exchange_pcp_token_shards_for_head_shards(
-            local_b, pcp_axis, pcp_size)
-        packed_a_shard = _exchange_pcp_token_shards_for_head_shards(
-            local_a, pcp_axis, pcp_size)
+        local_ba = jnp.stack((local_b, local_a),
+                             axis=-1).reshape(local_b.shape[0], -1)
+        packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
+            local_ba, pcp_axis, pcp_size)
 
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
@@ -1017,14 +1016,35 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder,
                                     full_reorder.size)
-        gather_indices = jnp.where(valid_mask, full_reorder, 0)
+        gather_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
 
-        qkv_shard = jnp.zeros_like(packed_qkv_shard).at[scatter_indices].set(
-            packed_qkv_shard, mode="drop")
-        b_shard = jnp.zeros_like(packed_b_shard).at[scatter_indices].set(
-            packed_b_shard, mode="drop")
-        a_shard = jnp.zeros_like(packed_a_shard).at[scatter_indices].set(
-            packed_a_shard, mode="drop")
+        (input_starts_by_rank, send_sizes_by_rank,
+         output_starts_by_rank) = _derive_pcp_ragged_exchange_descriptors(
+             full_reorder,
+             pcp_size=pcp_size,
+             interleave_size=interleave_size,
+             local_padded_num_tokens=local_qkv.shape[0],
+             max_num_requests=query_start_loc_.shape[0] - 1,
+         )
+        descriptors_by_rank = jnp.stack(
+            (input_starts_by_rank, send_sizes_by_rank, output_starts_by_rank),
+            axis=-1,
+        )
+        local_descriptors = _select_replicated_shard_for_pcp_rank(
+            descriptors_by_rank, pcp_axis, pcp_size, axis=0)[0]
+
+        qkv_shard = _ragged_exchange_pcp_token_shards_for_head_shards(
+            interleaved_qkv,
+            pcp_axis,
+            pcp_size,
+            local_descriptors,
+            send_sizes_by_rank,
+        )
+        ba_shard = jnp.zeros_like(packed_ba_shard).at[scatter_indices].set(
+            packed_ba_shard, mode="drop")
+        ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)
+        b_shard = ba_shard[:, :, 0]
+        a_shard = ba_shard[:, :, 1]
 
         conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
             conv_weight_,
@@ -1075,13 +1095,19 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             pool_block_tokens=pool_block_tokens,
         )
 
-        seq_output = jax.lax.all_gather(seq_output_shard,
-                                        axis_name=pcp_axis,
-                                        axis=-1,
-                                        tiled=True)
-
-        packed_output = seq_output[gather_indices]
-        packed_output = jnp.where(valid_mask[:, None], packed_output, 0.0)
+        seq_output_shard = seq_output_shard.reshape(seq_output_shard.shape[0],
+                                                    local_n_v, d_v)
+        seq_output_shard = jnp.concatenate(
+            (seq_output_shard,
+             jnp.zeros((1, local_n_v, d_v), dtype=seq_output_shard.dtype)),
+            axis=0,
+        )
+        packed_output_shard = seq_output_shard[gather_indices]
+        packed_output = jax.lax.all_to_all(packed_output_shard,
+                                           axis_name=pcp_axis,
+                                           split_axis=0,
+                                           concat_axis=1,
+                                           tiled=True)
         return new_pool, packed_output
 
     mapped_fn = jax.shard_map(

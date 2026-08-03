@@ -32,7 +32,8 @@ from vllm_torchtpu.layers.common.gdn_attention import (
     _exchange_pcp_token_shards_for_head_shards,
     _select_replicated_shard_for_pcp_rank,
     _validate_pcp_ragged_exchange_layout_support,
-    run_jax_gdn_attention_pcp_tp_prefill)
+    run_jax_gdn_attention_pcp_tp_prefill,
+    run_jax_gdn_attention_pooled_pcp_prefill)
 from vllm_torchtpu.layers.common.utils import (
     inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
 
@@ -293,8 +294,9 @@ def _require_tpu_devices(min_count, reason):
     ("pcp_size", "lengths", "interleave_size", "token_start_offsets"),
     _GDN_PCP_NUMERICAL_CASES,
 )
+@pytest.mark.parametrize("state_layout", ("split", "unified_pool"))
 def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
-        pcp_size, lengths, interleave_size, token_start_offsets):
+        pcp_size, lengths, interleave_size, token_start_offsets, state_layout):
     _require_tpu_devices(
         pcp_size,
         f"GDN PCP numerical test requires {pcp_size} TPU devices.",
@@ -413,23 +415,26 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         return jax.device_put(x, NamedSharding(mesh, P(None, 'pcp', None,
                                                        None)))
 
+    def shard_pool(x):
+        return jax.device_put(x, NamedSharding(mesh, P('pcp')))
+
     def replicate(x):
         return jax.device_put(x, NamedSharding(mesh, P()))
 
-    (pcp_conv, pcp_rec), pcp_output = run_jax_gdn_attention_pcp_tp_prefill(
+    common_pcp_args = (
         shard_tokens(packed_qkv),
         shard_tokens(packed_b),
         shard_tokens(packed_a),
-        shard_conv_state(conv_state0),
-        shard_rec_state(rec_state0),
-        replicate(conv_weight0),
-        replicate(conv_bias0),
-        replicate(A_log0),
-        replicate(dt_bias0),
-        replicate(state_indices),
-        replicate(query_start_loc),
-        replicate(distribution),
-        replicate(seq_lens),
+    )
+    common_pcp_kwargs = dict(
+        j_conv_weight=replicate(conv_weight0),
+        j_conv_bias=replicate(conv_bias0),
+        j_A_log=replicate(A_log0),
+        j_dt_bias=replicate(dt_bias0),
+        state_indices=replicate(state_indices),
+        query_start_loc=replicate(query_start_loc),
+        distribution=replicate(distribution),
+        seq_lens=replicate(seq_lens),
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -439,6 +444,33 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         interleave_size=interleave_size,
         mesh=mesh,
     )
+    if state_layout == "split":
+        (pcp_conv, pcp_rec), pcp_output = run_jax_gdn_attention_pcp_tp_prefill(
+            *common_pcp_args,
+            conv_state=shard_conv_state(conv_state0),
+            recurrent_state=shard_rec_state(rec_state0),
+            **common_pcp_kwargs,
+        )
+    else:
+        pool_kernel_block_tokens = 256
+        pool_block_tokens = 512
+        pool_split = pool_block_tokens // pool_kernel_block_tokens
+        local_pool_shape = (
+            num_blocks * pool_split,
+            pool_kernel_block_tokens,
+            1,
+            4,
+            128,
+        )
+        global_pool_shape = (pcp_size * local_pool_shape[0],
+                             *local_pool_shape[1:])
+        pcp_pool, pcp_output = run_jax_gdn_attention_pooled_pcp_prefill(
+            *common_pcp_args,
+            recurrent_state=shard_pool(
+                jnp.zeros(global_pool_shape, dtype=jnp.float8_e4m3fn)),
+            pool_block_tokens=pool_block_tokens,
+            **common_pcp_kwargs,
+        )
 
     pcp_output_np = np.array(pcp_output).reshape(padded_num_tokens, -1)
     pcp_output_seq = np.zeros((padded_num_tokens, pcp_output_np.shape[1]),
@@ -449,13 +481,16 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
                                np.array(ref_output),
                                rtol=5e-2,
                                atol=5e-2)
-    pcp_conv_raw = inverse_reorder_for_sharding(pcp_conv, qkv_split_sizes,
-                                                pcp_size, -1)
-    np.testing.assert_allclose(np.array(pcp_conv_raw),
-                               np.array(ref_conv),
-                               rtol=5e-2,
-                               atol=5e-2)
-    np.testing.assert_allclose(np.array(pcp_rec),
-                               np.array(ref_rec),
-                               rtol=5e-2,
-                               atol=5e-2)
+    if state_layout == "split":
+        pcp_conv_raw = inverse_reorder_for_sharding(pcp_conv, qkv_split_sizes,
+                                                    pcp_size, -1)
+        np.testing.assert_allclose(np.array(pcp_conv_raw),
+                                   np.array(ref_conv),
+                                   rtol=5e-2,
+                                   atol=5e-2)
+        np.testing.assert_allclose(np.array(pcp_rec),
+                                   np.array(ref_rec),
+                                   rtol=5e-2,
+                                   atol=5e-2)
+    else:
+        assert np.any(np.array(pcp_pool).view(np.uint8))
