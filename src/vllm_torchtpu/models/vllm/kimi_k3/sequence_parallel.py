@@ -28,7 +28,16 @@ def is_kimi_sequence_parallel(parallel_config: ParallelConfig) -> bool:
 
 def shard(hidden_states: torch.Tensor) -> torch.Tensor:
     """Pad and return this TP rank's contiguous token shard."""
-    return sequence_parallel_chunk(hidden_states)
+    if hidden_states.ndim == 2:
+        return sequence_parallel_chunk(hidden_states)
+
+    # vLLM's generic helper pads with ``(0, 0, 0, pad_len)``, which is
+    # specific to [tokens, hidden]. Kimi-K3 carries [tokens, 1, hidden]
+    # states, where that tuple pads the singleton axis instead of tokens.
+    # Remove that structural axis while applying the custom op, then restore
+    # it; this also retains the op's compile-safe symbolic output shape.
+    assert hidden_states.ndim == 3 and hidden_states.shape[1] == 1
+    return sequence_parallel_chunk(hidden_states.squeeze(1)).unsqueeze(1)
 
 
 def all_gather(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -42,6 +51,10 @@ def all_gather(hidden_states: torch.Tensor) -> torch.Tensor:
 
 def reduce_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     """Sum TP partials and return this rank's padded token shard."""
+    restore_structural_axis = hidden_states.ndim == 3
+    if restore_structural_axis:
+        assert hidden_states.shape[1] == 1
+        hidden_states = hidden_states.squeeze(1)
     tp_size = get_tensor_model_parallel_world_size()
     padding = (-hidden_states.shape[0]) % tp_size
     if padding:
@@ -49,5 +62,7 @@ def reduce_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     communicator = get_tp_group().device_communicator
     custom = getattr(communicator, "custom_reduce_scatter", None)
     if custom is not None:
-        return custom(hidden_states)
-    return tensor_model_parallel_reduce_scatter(hidden_states, dim=0)
+        result = custom(hidden_states)
+    else:
+        result = tensor_model_parallel_reduce_scatter(hidden_states, dim=0)
+    return result.unsqueeze(1) if restore_structural_axis else result

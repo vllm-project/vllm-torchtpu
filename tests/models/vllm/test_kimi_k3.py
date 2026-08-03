@@ -532,6 +532,78 @@ def test_sequence_parallel_helpers_pad_shard_and_gather(
                      ("scatter", torch.Size([6, 2]), 0)]
 
 
+def test_sequence_parallel_shard_pads_kimi_k3_token_axis(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_shapes = []
+
+    def chunk(values):
+        seen_shapes.append(values.shape)
+        padded = torch.cat([values, torch.zeros_like(values[:1])])
+        return padded[3:]
+
+    monkeypatch.setattr(kimi_sp, "sequence_parallel_chunk", chunk)
+    values = torch.arange(10).view(5, 1, 2)
+
+    result = kimi_sp.shard(values)
+
+    expected = torch.cat([values[3:], torch.zeros_like(values[:1])])
+    torch.testing.assert_close(result, expected)
+    assert seen_shapes == [torch.Size([5, 2])]
+
+
+def test_sequence_parallel_reduce_scatter_pads_kimi_k3_token_axis(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_shapes = []
+    communicator = SimpleNamespace(
+        custom_reduce_scatter=lambda values: seen_shapes.append(
+            values.shape) or values[:values.shape[0] // 2])
+    monkeypatch.setattr(
+        kimi_sp, "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=communicator))
+    monkeypatch.setattr(kimi_sp, "get_tensor_model_parallel_world_size",
+                        lambda: 2)
+    values = torch.arange(10).view(5, 1, 2)
+
+    result = kimi_sp.reduce_scatter(values)
+
+    assert result.shape == (3, 1, 2)
+    assert seen_shapes == [torch.Size([6, 2])]
+
+
+def test_kimi_attention_residual_buffer_uses_sharded_token_count(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class CheckLayer(nn.Module):
+
+        def forward(self, positions, hidden_states, block_residuals):
+            assert block_residuals.shape == (hidden_states.shape[0], 0,
+                                             hidden_states.shape[1])
+            return hidden_states, block_residuals
+
+    class IdentityResidual(nn.Module):
+
+        def forward(self, hidden_states, block_residuals):
+            return hidden_states
+
+    model = KimiModel.__new__(KimiModel)
+    nn.Module.__init__(model)
+    model.attn_res_block_size = 4
+    model.use_sequence_parallel = True
+    model.layers = nn.ModuleList([CheckLayer()])
+    model.output_attn_res = IdentityResidual()
+    model.norm = nn.Identity()
+    monkeypatch.setattr(kimi_model, "sp_shard", lambda values: values[:2])
+    monkeypatch.setattr(kimi_model, "sp_all_gather", lambda values: values)
+
+    values = torch.randn(5, 8)
+    result = KimiModel.forward(model,
+                               None,
+                               torch.arange(5),
+                               inputs_embeds=values)
+
+    assert result.shape == (2, 8)
+
+
 def test_decoder_sequence_parallel_collective_order(
         monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []

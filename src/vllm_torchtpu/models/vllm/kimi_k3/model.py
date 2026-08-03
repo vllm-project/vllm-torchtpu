@@ -199,16 +199,16 @@ class KimiModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = (inputs_embeds if inputs_embeds is not None else
                          self.embed_input_ids(input_ids))
-        block_residuals = (hidden_states.new_empty(
-            hidden_states.shape[0],
-            0,
-            hidden_states.shape[1],
-        ) if self.attn_res_block_size is not None else None)
         assert hidden_states is not None
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
+        # Build the empty residual stack as a view. TorchTPU cannot export a
+        # new_empty whose token dimension is the symbolic result of the SP
+        # chunk op.
+        block_residuals = (hidden_states.unsqueeze(-2)[:, :0, :]
+                           if self.attn_res_block_size is not None else None)
 
         for layer in self.layers:
             hidden_states, block_residuals = layer(
