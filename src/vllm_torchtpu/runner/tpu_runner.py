@@ -1091,16 +1091,28 @@ class TPUModelRunner(GPUModelRunner):
         true, packing-aware size on every layer; this function's job is only
         to make sure every layer is pinned to the *same* one.
         """
-        attn_page_sizes = {
-            PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                self.block_size,
-                m.num_kv_heads,
-                m.head_size,
-                self.kv_cache_dtype,
-            )
-            for m in layers.values() if isinstance(m, Attention)
-        }
-        if len(attn_page_sizes) > 1:
+        attn_page_sizes = set()
+        for m in layers.values():
+            if isinstance(m, Attention):
+                attn_page_sizes.add(
+                    PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        self.block_size,
+                        m.num_kv_heads,
+                        m.head_size,
+                        self.kv_cache_dtype,
+                    ))
+            elif isinstance(m, MLAAttention):
+                attn_page_sizes.add(
+                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                        self.block_size,
+                        1,
+                        m.head_size,
+                        self.kv_cache_dtype,
+                    ))
+
+        if not attn_page_sizes:
+            return
+        elif len(attn_page_sizes) > 1:
             uniform_page_size_bytes = max(attn_page_sizes)
             self._hybrid_uniform_page_size_bytes = uniform_page_size_bytes
             self.cache_config.mamba_page_size_padded = uniform_page_size_bytes
