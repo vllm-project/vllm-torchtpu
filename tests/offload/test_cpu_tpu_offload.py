@@ -960,12 +960,17 @@ class TestHybridSpecConsistencyAssert(unittest.TestCase):
         vllm_config = MagicMock()
         vllm_config.model_config.is_hybrid = is_hybrid
         kv_cache_config = MagicMock()
+        # __init__ derives gpu_block_size from every group's spec, so each
+        # fake spec needs a concrete block_size (a MambaSpec mock doesn't
+        # expose dataclass fields without defaults).
         attn_group = MagicMock()
-        attn_group.kv_cache_spec = object()
+        attn_group.kv_cache_spec = MagicMock()
+        attn_group.kv_cache_spec.block_size = 16
         groups = [attn_group]
         if with_mamba_group:
             mamba_group = MagicMock()
             mamba_group.kv_cache_spec = MagicMock(spec=MambaSpec)
+            mamba_group.kv_cache_spec.block_size = 16
             groups.append(mamba_group)
         kv_cache_config.kv_cache_groups = groups
 
