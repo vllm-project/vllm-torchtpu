@@ -1571,6 +1571,7 @@ class TestHybridGeometry(unittest.TestCase):
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups])
         backend = MagicMock()
         backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
+        backend.is_ssm.return_value = False
         with patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
                    "_find_non_ssm_backend", return_value=backend), \
              patch("vllm.v1.worker.utils.select_common_block_size",
@@ -1616,6 +1617,33 @@ class TestHybridGeometry(unittest.TestCase):
     def test_dense_rejects_non_full_attention(self):
         with self.assertRaises(AssertionError):
             self._resolve([self._mamba_spec()])
+
+    def test_scheduler_process_falls_back_to_attn_selector(self):
+        # The scheduler-role connector runs in the EngineCore process, where
+        # the model is never instantiated and _find_non_ssm_backend's layer
+        # registry is empty (returns None); the selector fallback must
+        # resolve the backend instead of asserting out.
+        from contextlib import nullcontext
+
+        from vllm_torchtpu.offload import raiden_store as rs
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=self._attn_spec())])
+        backend = MagicMock()
+        backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
+        backend.is_ssm.return_value = False
+        with patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                   "_find_non_ssm_backend", return_value=None), \
+             patch("vllm.v1.attention.selector.get_attn_backend",
+                   return_value=backend) as selector, \
+             patch("vllm.config.set_current_vllm_config",
+                   return_value=nullcontext()), \
+             patch("vllm.v1.worker.utils.select_common_block_size",
+                   return_value=256):
+            kernel, shape, dtype, gpu_block = rs.resolve_kernel_geometry(
+                MagicMock(), kv_cache_config)
+        self.assertEqual((kernel, gpu_block), (256, 1280))
+        self.assertEqual(shape, (256, 8, 2, 128))
+        selector.assert_called_once()
 
 
 class TestRaidenStoreWorkerStub(unittest.TestCase):

@@ -1146,8 +1146,26 @@ def resolve_kernel_geometry(
                        "padded page size")
 
     backend_cls = TpuPlatform._find_non_ssm_backend(vllm_config)
+    if backend_cls is None:
+        # _find_non_ssm_backend walks the instantiated model's layers, but the
+        # scheduler-role connector lives in the EngineCore process where the
+        # model is never built and that registry is empty. Resolve the backend
+        # the same way the workers' attention layers will instead.
+        from vllm.config import set_current_vllm_config
+        from vllm.v1.attention.selector import get_attn_backend
+        model_config = vllm_config.model_config
+        with set_current_vllm_config(vllm_config):
+            backend_cls = get_attn_backend(
+                head_size=model_config.get_head_size(),
+                dtype=model_config.dtype,
+                kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+                use_mla=model_config.use_mla,
+            )
     assert backend_cls is not None, (
         "[kv-offload-v2] requires a non-SSM attention backend")
+    assert not backend_cls.is_ssm(), (
+        "[kv-offload-v2] resolved attention backend is SSM: "
+        f"{backend_cls.get_name()}")
     kernel_block_size = select_common_block_size(spec0.block_size,
                                                  [backend_cls])
     full_5d_shape = backend_cls.get_kv_cache_shape(
