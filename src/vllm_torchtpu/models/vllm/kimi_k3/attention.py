@@ -28,9 +28,27 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
-    build_kimi_kda_op, build_kimi_sconv_op)
+    build_kimi_chunk_kda_op, build_kimi_kda_op, build_kimi_sconv_op)
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+_USE_NAIVE_KDA_ENV = "VLLM_TPU_USE_NAIVE_KDA"
+
+
+def use_naive_kda() -> bool:
+    """Whether to run the plain-XLA KDA recurrence instead of the Pallas kernel.
+
+    Read through `vllm_torchtpu.envs` rather than `os.environ` on purpose: every
+    variable in that registry is folded into the TPU compile-cache key by
+    `compute_tpu_compilation_hash`. Reading the environment directly would leave
+    the two paths sharing one cache entry, so flipping the flag would replay the
+    other path's compiled graph and measure the wrong kernel.
+    """
+    return bool(getattr(envs, _USE_NAIVE_KDA_ENV))
 
 
 def _load_a_log(parameter: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -337,12 +355,18 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
         )
         self.kv_cache = None
+        self.use_naive_kda = use_naive_kda()
         self.sconv_op = build_kimi_sconv_op(
             prefix,
             kernel_size=self.conv_size,
             state_dim_first=is_conv_state_dim_first(),
         )
         self.kda_op = build_kimi_kda_op(
+            prefix,
+            lower_bound=self.gate_lower_bound,
+            eps=config.rms_norm_eps,
+        )
+        self.chunk_kda_op = build_kimi_chunk_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
@@ -408,29 +432,50 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output = torch.zeros_like(query)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
-            mixed_qkv = self.sconv_op(
-                mixed_qkv,
-                sconv_cache,
-                self.q_conv1d.weight,
-                self.k_conv1d.weight,
-                self.v_conv1d.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-            )
-            output = self.kda_op(
+            output = self._core_attention(
                 mixed_qkv,
                 raw_gate,
                 beta,
                 output_gate,
+                sconv_cache,
                 recurrent_cache,
-                self.A_log,
-                self.dt_bias,
-                self.o_norm.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
+                metadata,
             ).flatten(1)
 
         output, _ = self.o_proj(output)
         return output
+
+    def _core_attention(
+        self,
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        sconv_cache: torch.Tensor,
+        recurrent_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        mixed_qkv = self.sconv_op(
+            mixed_qkv,
+            sconv_cache,
+            self.q_conv1d.weight,
+            self.k_conv1d.weight,
+            self.v_conv1d.weight,
+            metadata.query_start_loc,
+            metadata.mamba_state_indices,
+            metadata.seq_lens,
+        )
+        recurrence = self.kda_op if self.use_naive_kda else self.chunk_kda_op
+        return recurrence(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            recurrent_cache,
+            self.A_log,
+            self.dt_bias,
+            self.o_norm.weight,
+            metadata.query_start_loc,
+            metadata.mamba_state_indices,
+            metadata.seq_lens,
+        )

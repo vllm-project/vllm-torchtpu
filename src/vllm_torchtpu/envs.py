@@ -274,6 +274,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+
+    # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
+    # chunked kernel.
+    "VLLM_TPU_USE_NAIVE_KDA":
+    env_bool("VLLM_TPU_USE_NAIVE_KDA"),
 }
 
 

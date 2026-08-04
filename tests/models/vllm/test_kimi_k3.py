@@ -469,6 +469,7 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -487,16 +488,25 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         assert args[0] is sconv_cache
         return mixed_qkv
 
-    def kda_op(mixed_qkv, *args):
-        calls.append("kda")
+    def chunk_kda_op(mixed_qkv, *args):
+        calls.append("chunk")
         assert args[3] is recurrent_cache
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
+    def unexpected(name):
+
+        def op(*args, **kwargs):
+            raise AssertionError(f"{name} must not run for this batch")
+
+        return op
+
     layer.sconv_op = sconv_op
-    layer.kda_op = kda_op
+    layer.chunk_kda_op = chunk_kda_op
+    # The reference scan is only reachable via VLLM_TPU_USE_NAIVE_KDA.
+    layer.kda_op = unexpected("kda_op")
 
     output = layer(torch.arange(2), torch.ones(2, 4))
-    assert calls == ["sconv", "kda"]
+    assert calls == ["sconv", "chunk"]
     torch.testing.assert_close(output, torch.arange(8).view(2, 4).float())
 
 
@@ -564,12 +574,18 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
     layer.sconv_op = kimi_custom_ops.build_kimi_sconv_op(
         "test_compile",
         kernel_size=3,
         state_dim_first=True,
     )
     layer.kda_op = kimi_custom_ops.build_kimi_kda_op(
+        "test_compile",
+        lower_bound=None,
+        eps=1e-5,
+    )
+    layer.chunk_kda_op = kimi_custom_ops.build_kimi_chunk_kda_op(
         "test_compile",
         lower_bound=None,
         eps=1e-5,
