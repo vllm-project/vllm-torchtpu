@@ -269,12 +269,12 @@ def _fused_ep_moe_kernel(
 
     def sync_barrier():
         barrier_sem = pltpu.get_barrier_semaphore()
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             barrier_sem,
             device_id=get_mesh_device_id(right_id),
             device_id_type=pltpu.DeviceIdType.MESH,
         )
-        pltpu.semaphore_wait(barrier_sem, 1)
+        pl.semaphore_wait(barrier_sem, 1)
 
     def start_fetch_b_gating(bt_id, priority=0):
         is_valid = jnp.logical_and(0 <= bt_id, bt_id < num_bt)
