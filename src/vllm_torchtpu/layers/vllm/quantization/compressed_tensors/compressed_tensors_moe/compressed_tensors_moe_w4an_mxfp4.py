@@ -7,6 +7,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm_torchtpu.layers.common.quantization import e8m0_to_fp32
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 get_fused_moe_activation,
                                                  load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import (
@@ -47,8 +48,36 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                                intermediate_size_per_partition, params_dtype,
                                **extra_weight_attrs)
 
+    def _neutralize_padded_scales(self, layer: RoutedExperts) -> None:
+        """Make unloaded E8M0 padding finite without initializing full buffers.
+
+        The checkpoint loader only writes the logical intermediate width into
+        the ``torch.empty`` CPU scratchpads. An untouched padding byte can be
+        ``0xff``, which E8M0 conversion maps to infinity and can turn a padded
+        zero weight into NaN. Zero only those unloaded scale slices in place;
+        do not replace the full parameter/scratch allocation with
+        ``torch.zeros``, whose extra initialization caused peak-memory OOMs for
+        large models.
+        """
+        unpadded_size = self.moe.intermediate_size_per_partition_unpadded
+        padded_size = self.moe.intermediate_size_per_partition
+        if unpadded_size >= padded_size:
+            return
+        if unpadded_size % self.group_size != 0:
+            raise ValueError(
+                "MXFP4 unpadded intermediate size per partition must be "
+                f"divisible by {self.group_size}, got {unpadded_size}.")
+
+        w13_scale = layer.w13_weight_scale._cpu_scratch.data
+        w2_scale = layer.w2_weight_scale._cpu_scratch.data
+        w13_scale[:, unpadded_size:padded_size, :].zero_()
+        w13_scale[:, padded_size + unpadded_size:2 * padded_size, :].zero_()
+        w2_scale[:, :, unpadded_size // self.group_size:].zero_()
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
+
+        self._neutralize_padded_scales(layer)
 
         # Retrieve weights from the CPU scratchpad and move to TPU
         w13_weight_packed = layer.w13_weight_packed._cpu_scratch.data.to("tpu")
@@ -104,12 +133,18 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         release_memory_to_os()
 
-        activation_str = (layer.activation if isinstance(
-            layer.activation, str) else layer.activation.value)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
+        layer._tpu_activation_str = activation_str
+        use_ep = layer.moe_config.moe_parallel_config.use_ep
+        if use_ep:
+            moe_routing.validate_linear_ep_placement(layer)
+        moe_routing.register_experts_start_buffer(
+            layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
-            experts_start=moe_routing.get_experts_start(layer),
+            use_ep=use_ep,
         )
 
     def apply_monolithic(
@@ -119,15 +154,15 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = (layer.activation if isinstance(
-            layer.activation, str) else layer.activation.value)
+        activation_str = layer._tpu_activation_str
 
         # Handle custom routing function if present
         custom_routing_fn = getattr(layer, "custom_routing_function", None)
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
-                gating_output=router_logits,
+                gating_output=moe_routing.maybe_force_random_routing(
+                    router_logits),
                 topk=layer.moe_config.experts_per_token,
                 # renormalize=getattr(layer.moe_config, "norm_topk_prob", getattr(layer, "renormalize", True)))
                 renormalize=layer.renormalize)
@@ -156,7 +191,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             w2_bias=None,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            experts_start=moe_routing.get_experts_start(layer),
+            experts_start=layer._experts_start,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             rhs_quant_dtype=None,

@@ -30,6 +30,8 @@ def test_mxfp4_create_weights_and_process():
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 64
+    moe_config.intermediate_size_per_partition_unpadded = 64
 
     method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
     layer = FakeRoutedExperts(experts_per_token=2)
@@ -85,7 +87,13 @@ def test_mxfp4_create_weights_and_process():
                       "", expert_id)
 
     # 2. process_weights_after_loading
-    method.process_weights_after_loading(layer)
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+    ) as mock_prebuild:
+        method.process_weights_after_loading(layer)
+    mock_prebuild.assert_called_once_with(topk=2,
+                                          activation="silu",
+                                          use_ep=False)
 
     # Validate output
     assert hasattr(layer, "w13_weight")
@@ -121,3 +129,60 @@ def test_mxfp4_create_weights_and_process():
 
         assert out.shape == x.shape
         mock_gmm.assert_called_once()
+        assert mock_gmm.call_args.kwargs["experts_start"] is None
+
+
+def test_mxfp4_create_weights_does_not_zero_initialize():
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts()
+
+    with patch("torch.zeros",
+               side_effect=AssertionError("must use torch.empty")):
+        method.create_weights(
+            layer=layer,
+            num_experts=2,
+            hidden_size=128,
+            intermediate_size_per_partition=64,
+            params_dtype=torch.bfloat16,
+        )
+
+    for name in ("w13_weight_packed", "w2_weight_packed", "w13_weight_scale",
+                 "w2_weight_scale"):
+        assert hasattr(layer, name)
+
+
+def test_mxfp4_neutralizes_only_unloaded_padded_scales():
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.intermediate_size_per_partition = 64
+    moe_config.intermediate_size_per_partition_unpadded = 32
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts()
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size_per_partition=64,
+        params_dtype=torch.bfloat16,
+    )
+
+    for parameter in (layer.w13_weight_scale, layer.w2_weight_scale):
+        parameter._cpu_scratch = torch.nn.Parameter(torch.empty_like(
+            parameter, device="cpu"),
+                                                    requires_grad=False)
+        parameter._cpu_scratch.data.fill_(0xff)
+
+    method._neutralize_padded_scales(layer)
+
+    w13_scale = layer.w13_weight_scale._cpu_scratch
+    w2_scale = layer.w2_weight_scale._cpu_scratch
+    assert torch.all(w13_scale[:, :32, :] == 0xff)
+    assert not w13_scale[:, 32:64, :].any()
+    assert torch.all(w13_scale[:, 64:96, :] == 0xff)
+    assert not w13_scale[:, 96:, :].any()
+    assert torch.all(w2_scale[:, :, :1] == 0xff)
+    assert not w2_scale[:, :, 1:].any()
