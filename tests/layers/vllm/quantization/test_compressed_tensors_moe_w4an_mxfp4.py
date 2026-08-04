@@ -154,6 +154,42 @@ def test_mxfp4_create_weights_does_not_zero_initialize():
         assert hasattr(layer, name)
 
 
+def test_mxfp4_processes_directly_materialized_dummy_weights():
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 64
+    moe_config.intermediate_size_per_partition_unpadded = 64
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer._expert_routing_tables = lambda: (None, None)
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size_per_partition=64,
+        params_dtype=torch.bfloat16,
+    )
+
+    # vLLM's dummy loader initializes materialized parameters without calling
+    # the checkpoint weight-loader hook, so no CPU scratchpads are created.
+    for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,
+                      layer.w2_weight_packed, layer.w2_weight_scale):
+        assert not hasattr(parameter, "_cpu_scratch")
+        parameter.data.zero_()
+
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+    ):
+        method.process_weights_after_loading(layer)
+
+    assert hasattr(layer, "w13_weight")
+    assert hasattr(layer, "w2_weight")
+    assert not hasattr(layer, "w13_weight_packed")
+    assert not hasattr(layer, "w2_weight_packed")
+
+
 def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     moe_config = MagicMock()
     moe_config.tp_size = 1

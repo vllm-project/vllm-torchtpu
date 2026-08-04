@@ -25,6 +25,18 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     def is_monolithic(self) -> bool:
         return True
 
+    @staticmethod
+    def _loaded_data(parameter: torch.nn.Parameter) -> torch.Tensor:
+        """Return checkpoint scratch data or an already-materialized weight.
+
+        Normal checkpoint loading uses the CPU scratchpad installed by
+        ``get_cpu_weight_loader_hook``. Other loaders, notably vLLM's dummy
+        loader, materialize the parameter directly and never invoke that
+        hook.
+        """
+        scratch = getattr(parameter, "_cpu_scratch", None)
+        return parameter.data if scratch is None else scratch.data
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -68,8 +80,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 "MXFP4 unpadded intermediate size per partition must be "
                 f"divisible by {self.group_size}, got {unpadded_size}.")
 
-        w13_scale = layer.w13_weight_scale._cpu_scratch.data
-        w2_scale = layer.w2_weight_scale._cpu_scratch.data
+        w13_scale = self._loaded_data(layer.w13_weight_scale)
+        w2_scale = self._loaded_data(layer.w2_weight_scale)
         w13_scale[:, unpadded_size:padded_size, :].zero_()
         w13_scale[:, padded_size + unpadded_size:2 * padded_size, :].zero_()
         w2_scale[:, :, unpadded_size // self.group_size:].zero_()
@@ -79,11 +91,12 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         self._neutralize_padded_scales(layer)
 
-        # Retrieve weights from the CPU scratchpad and move to TPU
-        w13_weight_packed = layer.w13_weight_packed._cpu_scratch.data.to("tpu")
-        w13_weight_scale = layer.w13_weight_scale._cpu_scratch.data.to("tpu")
-        w2_weight_packed = layer.w2_weight_packed._cpu_scratch.data.to("tpu")
-        w2_weight_scale = layer.w2_weight_scale._cpu_scratch.data.to("tpu")
+        # Retrieve scratchpad or directly materialized weights and move to TPU.
+        w13_weight_packed = self._loaded_data(
+            layer.w13_weight_packed).to("tpu")
+        w13_weight_scale = self._loaded_data(layer.w13_weight_scale).to("tpu")
+        w2_weight_packed = self._loaded_data(layer.w2_weight_packed).to("tpu")
+        w2_weight_scale = self._loaded_data(layer.w2_weight_scale).to("tpu")
 
         # Convert e8m0 scales to fp32
         w13_scale = e8m0_to_fp32(w13_weight_scale)
@@ -103,10 +116,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_weight = load_kmajor_fp4(w2_weight_packed)
 
         # Clean up CPU scratchpads
-        delattr(layer.w13_weight_packed, "_cpu_scratch")
-        delattr(layer.w13_weight_scale, "_cpu_scratch")
-        delattr(layer.w2_weight_packed, "_cpu_scratch")
-        delattr(layer.w2_weight_scale, "_cpu_scratch")
+        for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,
+                          layer.w2_weight_packed, layer.w2_weight_scale):
+            if hasattr(parameter, "_cpu_scratch"):
+                delattr(parameter, "_cpu_scratch")
 
         # Update layer parameters
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
