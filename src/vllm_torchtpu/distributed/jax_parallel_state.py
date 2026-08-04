@@ -43,6 +43,9 @@ class GroupCoordinator:
         return self.rank_in_group == self.world_size - 1
 
 
+# Previously only bound via `global _PP` inside
+# init_pp_distributed_environment, so reading `_PP` before that ran raised
+# NameError instead of the intended AssertionError in get_pp_group().
 _PP: Optional[GroupCoordinator] = None
 
 

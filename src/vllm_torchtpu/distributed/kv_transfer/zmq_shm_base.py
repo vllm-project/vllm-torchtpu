@@ -1401,6 +1401,8 @@ class ZmqShmKvConnectorBase:
                 self._coord_channel_executor.submit(_pull_channel, h, ch)
                 for h in range(num_hosts) for ch in range(n_channels)
             ]
+            # Annotation was stale: _pull_channel returns 6 values
+            # (h, ch, wire_ms, unpack_ms, ranks_handled, header_frame), not 5.
             results: list[tuple[int, int, float, float, list[int],
                                 Optional[zmq.Frame]]] = []
             first_error: Optional[BaseException] = None
