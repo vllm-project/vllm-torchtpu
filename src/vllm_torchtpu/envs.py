@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_MOE_SKIP_PADDED_TOKENS: bool = False
 
 
 def env_with_choices(
@@ -269,11 +270,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
-
     # Most model length cap for TPU compile bucketing
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
+    # Skip padded tokens from MoE, otherwise they will route like
+    # real tokens and activate experts whose output is thrown away.
+    "TPU_MOE_SKIP_PADDED_TOKENS":
+    env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
 }
 
 

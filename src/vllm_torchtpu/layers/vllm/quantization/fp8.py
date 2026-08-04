@@ -64,7 +64,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
-from vllm_torchtpu.layers.vllm import moe_routing
+from vllm_torchtpu.layers.vllm import moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
@@ -758,6 +758,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 scoring_fn=layer.scoring_func,
                 layer=layer,
             )
+
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights)
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).

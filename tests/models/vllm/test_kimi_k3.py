@@ -21,9 +21,9 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.vllm.custom_ops import \
     kda_attention_op as kimi_custom_ops
-from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiLinearForCausalLM,
                                                KimiModel,
@@ -41,7 +41,7 @@ def test_kimi_architectures_are_registered() -> None:
         for architecture in architectures
     }
     try:
-        register_models()
+        register_layers()
         for architecture in architectures:
             registered = ModelRegistry.models[architecture]
             assert registered.load_model_cls() is KimiLinearForCausalLM

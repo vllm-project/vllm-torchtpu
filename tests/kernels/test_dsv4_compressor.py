@@ -218,25 +218,23 @@ def _make_inputs(
                                             rope_head_dim, quant_block)
     cache = np.zeros(cache_shape, dtype=np.uint8)
 
-    return {
-        "kv_score": kv_score,
-        "ape": ape,
-        "norm_weight": norm_weight,
-        "cos_sin_cache": cos_sin_cache,
-        "positions": positions,
-        "slot_mapping": slot_mapping,
-        "block_table": block_table,
-        "token_to_req_indices": token_to_req_indices,
-        "kv_slot_mapping": kv_slot_mapping,
-        "cache": cache,
-        "state_block_size": state_block_size,
-        "head_dim": head_dim,
-        "rope_head_dim": rope_head_dim,
-        "compress_ratio": compress_ratio,
-        "overlap": overlap,
-        "rms_eps": 1e-6,
-        "quant_block": quant_block,
-    }
+    return dict(kv_score=kv_score,
+                ape=ape,
+                norm_weight=norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                token_to_req_indices=token_to_req_indices,
+                kv_slot_mapping=kv_slot_mapping,
+                cache=cache,
+                state_block_size=state_block_size,
+                head_dim=head_dim,
+                rope_head_dim=rope_head_dim,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rms_eps=1e-6,
+                quant_block=quant_block)
 
 
 def _to_jax(kw):
@@ -397,12 +395,6 @@ def test_compressor_forward_eval_shape():
 
 def test_compressor_forward_runs_on_tpu():
     """Executes on TPU and confirms the backend really is TPU."""
-    try:
-        backend = jax.default_backend()
-    except Exception as exc:
-        pytest.skip(f"JAX TPU backend failed to initialize: {exc}")
-    if backend != "tpu":
-        pytest.skip(f"Expected JAX TPU backend, got {backend}.")
 
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
     ref_deq = _naive_reference(kw)
@@ -418,3 +410,58 @@ def test_compressor_forward_runs_on_tpu():
                                ref_deq[slots],
                                rtol=2e-2,
                                atol=2e-2)
+
+
+def test_interleaved_rope_correctness():
+    """Verifies interleaved_rope functional stack+reshape matches analytical reference."""
+    from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+        interleaved_rope
+    rng = np.random.default_rng(42)
+    x = rng.normal(size=(2, 8, 64)).astype(np.float32)
+    cos_sin = rng.normal(size=(2, 8, 64)).astype(np.float32)
+
+    even = x[..., 0::2]
+    odd = x[..., 1::2]
+    cos = cos_sin[..., :32]
+    sin = cos_sin[..., 32:64]
+    new_even = even * cos - odd * sin
+    new_odd = odd * cos + even * sin
+
+    out_jax = interleaved_rope(jnp.asarray(x),
+                               jnp.asarray(cos_sin),
+                               rope_head_dim=64)
+    out_ref = np.empty_like(x)
+    out_ref[..., 0::2] = new_even
+    out_ref[..., 1::2] = new_odd
+    np.testing.assert_allclose(np.asarray(out_jax),
+                               out_ref,
+                               rtol=1e-5,
+                               atol=1e-5)
+
+
+def test_gather_state_windows_modulo_wraparound():
+    """Verifies gather_state_windows wraps around block_table via modulo max_blocks."""
+    from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+        gather_state_windows
+    positions = jnp.array([68], dtype=jnp.int32)
+    token_to_req = jnp.array([0], dtype=jnp.int32)
+    block_table = jnp.array([[10, 11, 12, 13]], dtype=jnp.int32)
+    num_pages = 20
+    rows = 1
+    width = 128
+    cache = jnp.zeros((num_pages, rows, 1, width), dtype=jnp.uint8)
+    cache = cache.at[10, ...].set(10).at[13, ...].set(13)
+
+    kv_window, score_window, valid_mask = gather_state_windows(
+        cache,
+        positions,
+        block_table,
+        token_to_req,
+        block_size=16,
+        head_dim=512,
+        compress_ratio=4,
+        overlap=False,
+    )
+    assert jnp.all(
+        kv_window ==
+        10), f"Expected wrapped block value 10, got {kv_window[0, 0, 0, 0]}"

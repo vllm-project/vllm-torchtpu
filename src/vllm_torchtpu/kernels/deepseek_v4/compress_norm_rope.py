@@ -228,8 +228,9 @@ def interleaved_rope(
     num_pairs = head_dim // 2
     nope_pairs = num_pairs - half_rope
 
-    even = x[..., 0::2]
-    odd = x[..., 1::2]
+    pairs = x.reshape(*x.shape[:-1], num_pairs, 2)
+    even = pairs[..., 0]
+    odd = pairs[..., 1]
 
     cos = cos_sin[..., :half_rope]
     sin = cos_sin[..., half_rope:rope_head_dim]
@@ -241,10 +242,9 @@ def interleaved_rope(
     new_even = even * cos_full - odd * sin_full
     new_odd = odd * cos_full + even * sin_full
 
-    out = jnp.empty_like(x)
-    out = out.at[..., 0::2].set(new_even)
-    out = out.at[..., 1::2].set(new_odd)
-    return out
+    # Functional stack+reshape avoids uninitialized buffer elements from strided scatters on TPU.
+    out = jnp.stack([new_even, new_odd], axis=-1)
+    return out.reshape(x.shape)
 
 
 def compress_norm_rope(
@@ -305,7 +305,8 @@ def gather_state_windows(
     req = token_to_req_indices[:, None]
     # Gather page numbers (optimized to 1D indexing to avoid 2D index bitpacking)
     max_blocks = block_table.shape[-1]
-    flat_index = req * max_blocks + (safe_pos // block_size)
+    # Wrap around max_blocks so out-of-bounds positions do not alias into adjacent block tables.
+    flat_index = req * max_blocks + (safe_pos // block_size) % max_blocks
     block_numbers = block_table.reshape(-1)[flat_index]
     block_offsets = safe_pos % block_size
 
@@ -402,6 +403,7 @@ def compress_norm_rope_store(
 
     num_pages, rows, packing, width = cache.shape
     pad = width - record.shape[-1]
+
     if pad < 0:
         raise ValueError(
             f"packed record {record.shape[-1]}B exceeds cache width {width}B")
@@ -412,7 +414,7 @@ def compress_norm_rope_store(
                           compress_ratio, num_slots)
     flat = cache.reshape(num_slots, width)
     flat = flat.at[dest].set(record, mode="drop")
-    return flat.reshape(num_pages, rows, packing, width)
+    return flat.reshape(*cache.shape)
 
 
 def compress_norm_rope_store_indexer(
@@ -465,6 +467,7 @@ def compress_norm_rope_store_indexer(
 
     num_pages, rows, packing, width = cache.shape
     pad = width - record.shape[-1]
+
     if pad < 0:
         raise ValueError(
             f"packed record {record.shape[-1]}B exceeds cache width {width}B")
@@ -475,4 +478,4 @@ def compress_norm_rope_store_indexer(
                           compress_ratio, num_slots)
     flat = cache.reshape(num_slots, width)
     flat = flat.at[dest].set(record, mode="drop")
-    return flat.reshape(num_pages, rows, packing, width)
+    return flat.reshape(*cache.shape)

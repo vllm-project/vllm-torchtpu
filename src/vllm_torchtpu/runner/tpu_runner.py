@@ -67,6 +67,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
+from vllm_torchtpu.layers.vllm import token_padding
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend,
                                                  PallasMLAttentionBackend)
@@ -555,6 +556,10 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+
+        # Tracks token padding in each step.
+        self._token_padding_state: token_padding.TokenPaddingState | None = None
+
         self._init_phased_profiling()
 
     def _init_phased_profiling(self) -> None:
@@ -2640,6 +2645,8 @@ class TPUModelRunner(GPUModelRunner):
             # and packs the tokens into inputs_embeds; use whichever exists.
             num_tokens_padded = (input_ids if input_ids is not None else
                                  inputs_embeds).shape[0]
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                self._token_padding_update(num_tokens_padded)
             with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -3275,6 +3282,11 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            self._token_padding_state = token_padding.TokenPaddingState.create(
+                self.max_num_tokens, self.device)
+            token_padding.set_padding_state(self._token_padding_state)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
@@ -3432,6 +3444,10 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in self._attn_layer_names
             }
 
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            assert self._token_padding_state is not None
+            # Every row of a dummy step is padding.
+            self._token_padding_state.update(0, num_tokens)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -4565,6 +4581,18 @@ class TPUModelRunner(GPUModelRunner):
         # the same HBM pressure as runtime.
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
+
+    def _token_padding_update(self, num_tokens_padded: int) -> None:
+        """Record which of this step's token rows are padding."""
+        if self._token_padding_state is None:
+            return
+        plan = self._last_sequence_layout_plan
+        if plan is not None and plan.kind is SequenceLayoutKind.ALL:
+            num_valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
+        else:
+            # Padding-mask support is currently limited to the ALL layout.
+            num_valid_tokens = num_tokens_padded
+        self._token_padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         # @support_torch_compile annotations will be put on the vLLM model if it

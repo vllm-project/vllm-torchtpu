@@ -126,7 +126,8 @@ def _build_fused_moe_custom_op(
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
-        rhs_quant_dtype=rhs_quant_dtype)
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 

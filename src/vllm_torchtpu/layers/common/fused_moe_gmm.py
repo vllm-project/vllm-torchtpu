@@ -103,6 +103,7 @@ def prepare_routed_gmm_inputs(
     use_ep: bool,
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
+    skip_padded_tokens: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -119,7 +120,13 @@ def prepare_routed_gmm_inputs(
     token_indices_flat = jnp.arange(num_tokens_local,
                                     dtype=jnp.int32).repeat(topk)
 
-    valid_mask = topk_indices_flat >= 0
+    if skip_padded_tokens:
+        # Padded tokens keep their selected expert ids, but carry zero
+        # expert routing weights. Treat them as invalid to remove them
+        # from GMM work.
+        valid_mask = (topk_indices_flat >= 0) & (topk_weights_flat != 0)
+    else:
+        valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
     argsort_revert_indices = jnp.argsort(sorted_indices)
@@ -176,6 +183,7 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -211,11 +219,19 @@ def moe_gmm(
                            zero_initialize=False,
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
-
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
+            if skip_padded_tokens:
+                # Zero out the GMM output rows of padded tokens that
+                # skipped the GMM computation, otherwise those
+                # uninitialized values can be NaN and the one-hot matmul
+                # would spread them to every token in the batch.
+                computed = jnp.arange(
+                    gmm2_res.shape[0],
+                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
@@ -250,6 +266,7 @@ def moe_gmm(
         "use_sparse_core",
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
+        "skip_padded_tokens",
     ),
 )
 def fused_moe_func(
@@ -269,6 +286,7 @@ def fused_moe_func(
     use_sparse_core: bool = True,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -329,6 +347,7 @@ def fused_moe_func(
          use_ep=use_ep,
          use_sparse_core=use_sparse_core,
          onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+         skip_padded_tokens=skip_padded_tokens,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
@@ -350,5 +369,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
     )
     return x[:num_tokens, :hidden_size]
