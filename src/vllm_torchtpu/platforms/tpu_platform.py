@@ -876,15 +876,43 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
         backend_cls = cls._find_non_ssm_backend(vllm_config)
 
-        is_hybrid = vllm_config.model_config.is_hybrid
-        if not is_hybrid and not cache_config.user_specified_block_size:
-            default = backend_cls.get_page_size(vllm_config)
+        # `_find_non_ssm_backend` returns whichever non-SSM AttentionLayerBase
+        # layer it iterates *first* -- for DeepSeek-V4 (which registers
+        # several distinct attention-layer-base kinds: main MLA attention,
+        # SWA cache, indexer, compressor state), that has historically landed
+        # on `VllmDeepseekV4SWACache`, which doesn't override
+        # `get_attn_backend()` and so inherits upstream's
+        # `DeepseekV4SWACache.get_attn_backend()` -> `DeepseekSparseSWABackend`
+        # -- a CUDA-reference backend whose `get_preferred_block_size()` is
+        # hardcoded to return 256 *unconditionally*, ignoring whatever
+        # TPU-computed default is passed in. That silently overrode the real
+        # TPU MLA backend's preferred page size (`PallasMLAttentionBackend.
+        # get_page_size()` = 1024) with 256. tpu-inference's
+        # `check_and_update_config` sidesteps this exact failure mode by
+        # never going through generic backend detection for MLA models at
+        # all -- it directly applies its own `PallasMLAttentionBackend.
+        # get_page_size()` unconditionally. Match that here.
+        if (vllm_config.model_config.use_mla
+                and not cache_config.user_specified_block_size):
+            from vllm_torchtpu.layers.vllm.attention import \
+                PallasMLAttentionBackend
+            cache_config.block_size = (  # type: ignore[assignment]
+                PallasMLAttentionBackend.get_page_size(vllm_config))
+        elif (not vllm_config.model_config.is_hybrid
+              and not cache_config.user_specified_block_size):
+            if hasattr(backend_cls, "get_page_size"):
+                default = backend_cls.get_page_size(vllm_config)
+            else:
+                default = cache_config.block_size
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
         if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
-        min_page_size = backend_cls.get_min_page_size(vllm_config)
+        if hasattr(backend_cls, "get_min_page_size"):
+            min_page_size = backend_cls.get_min_page_size(vllm_config)
+        else:
+            min_page_size = 1
         if min_page_size > cache_config.block_size:
             logger.warning(
                 "Increase the page size from %s to %s to make sure there's"

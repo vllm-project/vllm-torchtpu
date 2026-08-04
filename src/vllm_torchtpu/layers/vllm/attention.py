@@ -896,7 +896,11 @@ class PallasMLAttentionBackend(AttentionBackend):
         "fp8_ds_mla",
     ]
 
-    # DeepSeek-V4 MLA packed-cache constants (64-dim RoPE tail, 64-wide UE8M0 blocks).
+    # DeepSeek-V4 MLA packed-cache constants (see
+    # kernels/deepseek_v4/compress_norm_rope.py's module docstring): the
+    # RoPE tail is 64 elements, kept in bf16; NoPE is fp8-quantized in
+    # 64-wide UE8M0 blocks. head_size (512) is the semantic latent dim;
+    # NoPE = head_size - rope_head_dim.
     _DS_MLA_ROPE_HEAD_DIM = 64
     _DS_MLA_QUANT_BLOCK = 64
 
@@ -914,7 +918,12 @@ class PallasMLAttentionBackend(AttentionBackend):
 
     @staticmethod
     def _is_ds_mla_packed_cache(cache_dtype_str: str | torch.dtype) -> bool:
-        # Recognizes both raw "fp8_ds_mla" string and resolved torch.uint8 dtype.
+        # `get_kv_cache_page_size_bytes` below resolves the string to a
+        # torch.dtype *before* calling `get_kv_cache_shape`, so this needs to
+        # recognize both the raw "fp8_ds_mla" string and its resolved
+        # torch.uint8 dtype. torch.uint8 is not otherwise a supported literal
+        # kv-cache dtype for this MLA backend (see `supported_kv_cache_dtypes`
+        # above), so any uint8 reaching here means the DSV4 packed format.
         if isinstance(cache_dtype_str,
                       str) and cache_dtype_str.lower().strip() == "fp8_ds_mla":
             return True
@@ -933,7 +942,10 @@ class PallasMLAttentionBackend(AttentionBackend):
                 and cache_dtype_str.lower().strip() == "auto"):
             return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
         if PallasMLAttentionBackend._is_ds_mla_packed_cache(cache_dtype_str):
-            # Packed layout is [nope fp8 | rope bf16 | UE8M0 scales] padded to 128-aligned minor dim.
+            # Packed layout is [nope fp8 | rope bf16 | UE8M0 scales], padded
+            # to a 128-aligned minor dim -- NOT a uniform array of `head_size`
+            # elements of one dtype, so this bypasses the generic
+            # dtype-packing path below entirely.
             rope_head_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
             quant_block = PallasMLAttentionBackend._DS_MLA_QUANT_BLOCK
             nope_dim = head_size - rope_head_dim
