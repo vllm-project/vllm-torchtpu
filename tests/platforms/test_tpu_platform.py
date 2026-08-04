@@ -386,3 +386,24 @@ class TestPhasedProfilingConfigValidation:
         monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
 
         _validate_phased_profiling_config(self._config())
+
+
+def test_plugin_registers_tpu_kv_connectors_by_name():
+    # The API server's multi-connector stats path resolves child connectors
+    # via get_connector_class_by_name (registry-only), but recipes load the
+    # TPU connectors through kv_connector_module_path, which never
+    # registers them. The plugin entry point must register all three so a
+    # stats batch naming a child cannot kill the AsyncLLM output handler
+    # in a process that never instantiated a connector.
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    from vllm_torchtpu.platforms import register_tpu_platform
+
+    register_tpu_platform()
+    register_tpu_platform()  # idempotent: must not raise on re-entry
+
+    for name in ("TPURaidenConnector", "TPUMultiConnector",
+                 "TPURaidenOffloadingConnector"):
+        cls = KVConnectorFactory.get_connector_class_by_name(name)
+        assert cls.__name__ == name
