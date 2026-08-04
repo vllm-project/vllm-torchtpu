@@ -332,9 +332,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                             "absent from request block tables: "
                             f"index={mamba_gid}, groups={len(block_ids)}")
                     mamba_block_ids.append(list(block_ids[mamba_gid]))
-            # use_raiden selected TPURaidenConnectorScheduler in __init__, and
-            # it is the only scheduler accepting the stage-3 mamba block ids.
-            # A static checker cannot narrow the union to that subclass here.
+            # The use_hma branch returned above, so use_raiden here means
+            # __init__ selected TPURaidenConnectorScheduler -- the only one
+            # of the three schedulers accepting mamba block ids. The checker
+            # cannot narrow the union to that subclass.
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
