@@ -244,13 +244,24 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                     f"full-attention KV cache group, got {fa_groups}")
             self._stage3_fa_group_index = fa_groups[0]
         self._stage3_mamba_group_indices: list[int] = []
+        self._stage3_mamba_num_speculative_blocks: list[int] = []
         if use_raiden and _use_raiden_stage3_transport():
-            mamba_groups = [
-                index
-                for index, group in enumerate(kv_cache_config.kv_cache_groups)
-                if isinstance(group.kv_cache_spec, MambaSpec)
-            ]
+            mamba_groups: list[int] = []
+            mamba_num_speculative_blocks: list[int] = []
+            for index, group in enumerate(kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                if not isinstance(spec, MambaSpec):
+                    continue
+                if spec.num_speculative_blocks < 0:
+                    raise ValueError(
+                        "MambaSpec.num_speculative_blocks must be "
+                        f"non-negative, got {spec.num_speculative_blocks}")
+                mamba_groups.append(index)
+                mamba_num_speculative_blocks.append(
+                    int(spec.num_speculative_blocks))
             self._stage3_mamba_group_indices = mamba_groups
+            self._stage3_mamba_num_speculative_blocks = (
+                mamba_num_speculative_blocks)
         if use_hma:
             scheduler_cls = TPUConnectorHMAScheduler
             worker_cls = TPUConnectorHMAWorker
@@ -272,6 +283,8 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                     self._stage3_fa_group_index)
                 self.connector_scheduler._stage3_mamba_group_indices = (
                     self._stage3_mamba_group_indices)
+                self.connector_scheduler._stage3_mamba_num_speculative_blocks = (
+                    self._stage3_mamba_num_speculative_blocks)
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
@@ -764,6 +777,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             int, ...], int, dict[str, Any]]] = OrderedDict()
         self._stage3_fa_group_index = 0
         self._stage3_mamba_group_indices: list[int] = []
+        self._stage3_mamba_num_speculative_blocks: list[int] = []
         # Get DP rank and TP size from config and stagger kv_port and side_channel_port
         dp_rank = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
         tp_size = vllm_config.parallel_config.tensor_parallel_size if vllm_config.parallel_config else 1
@@ -774,6 +788,35 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             self.kv_port = int(port_base) + 2 * dp_rank * tp_size
         logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
+
+    def _select_stage3_committed_mamba_blocks(
+        self,
+        mamba_block_ids: list[list[int]],
+        *,
+        endpoint: str,
+    ) -> list[int]:
+        num_speculative_blocks = self._stage3_mamba_num_speculative_blocks
+        if len(mamba_block_ids) != len(num_speculative_blocks):
+            raise ValueError(
+                "GDN state reshard metadata does not match the mamba KV "
+                f"cache groups: tables={len(mamba_block_ids)}, "
+                f"specs={len(num_speculative_blocks)}")
+
+        committed: list[int] = []
+        for ordinal, (group_ids, num_spec_blocks) in enumerate(
+                zip(mamba_block_ids, num_speculative_blocks, strict=True)):
+            required_blocks = num_spec_blocks + 1
+            if len(group_ids) < required_blocks:
+                raise ValueError(
+                    f"GDN state reshard: {endpoint} mamba table cannot hold "
+                    "the committed state and speculative checkpoints "
+                    f"(ordinal {ordinal}, blocks={len(group_ids)}, "
+                    f"required={required_blocks})")
+            # vLLM appends K speculative checkpoint blocks after the current
+            # positional state block. Select that state relative to the tail
+            # so the result remains correct after the request spans pages.
+            committed.append(int(group_ids[-required_blocks]))
+        return committed
 
     def get_num_new_matched_tokens(
         self,
@@ -959,9 +1002,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"num_tokens={num_tokens}, page_tokens={self.block_size}")
         mamba_state_block_ids: Optional[list[int]] = None
         if self._stage3_mamba_group_indices:
-            # Live state = last live entry; 'align' mode pads the head of
-            # the table with the null block.
-            mamba_state_block_ids = []
+            mamba_block_ids: list[list[int]] = []
             for mamba_gid in self._stage3_mamba_group_indices:
                 if mamba_gid >= len(grouped_block_ids):
                     raise ValueError(
@@ -973,7 +1014,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     raise ValueError(
                         "GDN state reshard: destination mamba table is empty "
                         f"(group {mamba_gid})")
-                mamba_state_block_ids.append(int(mamba_ids[-1]))
+                mamba_block_ids.append(mamba_ids)
+            mamba_state_block_ids = self._select_stage3_committed_mamba_blocks(
+                mamba_block_ids, endpoint="destination")
         self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
             uuid=uuid,
             source_req_id=source_req_id,
@@ -1097,13 +1140,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if not mamba_block_ids:
                 raise ValueError("GDN state is present but the producer's "
                                  "mamba block tables were not provided")
-            mamba_state_block_ids = []
-            for ordinal, group_ids in enumerate(mamba_block_ids):
-                if not group_ids:
-                    raise ValueError(
-                        "GDN state reshard: producer mamba table is empty "
-                        f"(ordinal {ordinal})")
-                mamba_state_block_ids.append(int(group_ids[-1]))
+            mamba_state_block_ids = self._select_stage3_committed_mamba_blocks(
+                mamba_block_ids, endpoint="producer")
         uuid = get_uuid()
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())

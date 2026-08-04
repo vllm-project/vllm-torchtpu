@@ -59,9 +59,11 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
     )
 
 
-def _make_stage3_hybrid_kv_cache_config(*,
-                                        fa_group_index: int = 2
-                                        ) -> KVCacheConfig:
+def _make_stage3_hybrid_kv_cache_config(
+    *,
+    fa_group_index: int = 2,
+    num_speculative_blocks: int = 0,
+) -> KVCacheConfig:
     fa_group = KVCacheGroupSpec(
         layer_names=["model.layers.2.self_attn"],
         kv_cache_spec=FullAttentionSpec(
@@ -78,6 +80,7 @@ def _make_stage3_hybrid_kv_cache_config(*,
                 block_size=16,
                 shapes=((1, ), ),
                 dtypes=(torch.bfloat16, ),
+                num_speculative_blocks=num_speculative_blocks,
             ),
         ) for index in range(3)
     ]
@@ -367,6 +370,92 @@ class TestTPUConnector:
         mock_raiden_sched_cls.return_value.request_finished.assert_called_once_with(
             request, [30, 31], mamba_block_ids=[[10], [20], [40]])
         mock_raiden_worker_cls.assert_not_called()
+
+    def test_stage3_mtp_producer_sends_committed_mamba_checkpoint(self):
+        cfg = _make_vllm_config(is_producer=True, block_size=16)
+        cache_config = _make_stage3_hybrid_kv_cache_config(
+            fa_group_index=0, num_speculative_blocks=3)
+        request = MagicMock(
+            request_id="prefill-mtp-k3",
+            num_prompt_tokens=32,
+            num_computed_tokens=31,
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+            kv_transfer_params=None,
+        )
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.dist_utils.get_kv_ips",
+                   return_value="127.0.0.1"), \
+             patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                   "prefill-controller.test:27000",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
+                   "prefill",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                   "producer-engine",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   1,
+                   create=True), \
+             patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                   return_value=30.0), \
+             patch(f"{_MOD}.get_uuid", return_value=123):
+            connector = TPURaidenConnector(cfg, KVConnectorRole.SCHEDULER,
+                                           cache_config)
+            connector.request_finished_all_groups(
+                request,
+                (
+                    [100, 101],
+                    [10, 11, 12, 13, 14],
+                    [20, 21, 22, 23, 24],
+                    [30, 31, 32, 33, 34],
+                ),
+            )
+
+        send = connector.connector_scheduler.reqs_to_send[request.request_id]
+        assert send.mamba_state_block_ids == [11, 21, 31]
+
+    def test_stage3_mtp_consumer_loads_committed_mamba_checkpoint(self):
+        cfg = _make_vllm_config(is_producer=False, block_size=16)
+        cache_config = _make_stage3_hybrid_kv_cache_config(
+            fa_group_index=0, num_speculative_blocks=3)
+        request = MagicMock(
+            request_id="decode-mtp-k3",
+            kv_transfer_params={
+                "req_id": "prefill-mtp-k3",
+                "uuid": 123,
+                "num_tokens": 31,
+                "src_controller_address": "prefill-controller.test:27000",
+                "src_job_name": "prefill",
+                "src_engine_id": "producer-engine",
+                "src_data_replica_idx": 0,
+                "src_parallelism": 1,
+            },
+        )
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = (
+            [100, 101],
+            [10, 11, 12, 13, 14],
+            [20, 21, 22, 23, 24],
+            [30, 31, 32, 33, 34],
+        )
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.dist_utils.get_kv_ips",
+                   return_value="127.0.0.1"), \
+             patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
+            connector = TPURaidenConnector(cfg, KVConnectorRole.SCHEDULER,
+                                           cache_config)
+            connector.update_state_after_alloc(request, blocks, 31)
+
+        load = connector.connector_scheduler.reqs_to_load[request.request_id]
+        assert load.mamba_state_block_ids == [11, 21, 31]
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
