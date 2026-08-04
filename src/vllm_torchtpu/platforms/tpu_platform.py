@@ -183,6 +183,40 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
             "--profiler-config.torch_profiler_dir=<dir>.")
 
 
+def _register_tpu_kv_connectors() -> None:
+    """Register the TPU KV connectors in the factory's name registry.
+
+    Recipes load these via kv_connector_module_path, which resolves the
+    class without registering it, and the API server process never
+    instantiates connectors at all — but its metrics path rebuilds
+    TPUMultiConnector child stats through get_connector_class_by_name,
+    which is registry-only. Without this, the first stats batch naming a
+    child (e.g. TPURaidenOffloadingConnector) kills the AsyncLLM output
+    handler with "Connector ... is not registered" and every subsequent
+    request 500s (j-39fe6677).
+
+    Called from check_and_update_config, which runs in every process that
+    constructs a VllmConfig (the API server included) — NOT from the
+    platform plugin entry point: that runs inside vllm.platforms' own
+    module initialization, where importing the factory reaches back for
+    the still-unset current_platform and dies (j-7c3c871b). Lazy loaders:
+    nothing is imported until a name is actually looked up.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    for name, module_path in (
+        ("TPURaidenConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
+        ("TPUMultiConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"),
+        ("TPURaidenOffloadingConnector",
+         "vllm_torchtpu.offload.raiden_connector"),
+    ):
+        if name not in KVConnectorFactory._registry:
+            KVConnectorFactory.register_connector(name, module_path, name)
+
+
 def apply_tpu_patches() -> None:
     """Apply all module-level patches required for TorchTPU.
 
@@ -628,6 +662,7 @@ class TpuPlatform(Platform):
         _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
+        _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
