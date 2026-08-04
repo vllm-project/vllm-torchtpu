@@ -219,7 +219,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     # Outputs.
     gdn_out_ref: jax.Array,
     packed_out_ref: jax.Array,
-    state_source_out_ref: jax.Array,
+    conv_state_updates_ref: jax.Array,
+    recurrent_state_updates_ref: jax.Array,
     projected_qkv_ref: jax.Array,
     z_ref: jax.Array,
     active_rows_out_ref: jax.Array,
@@ -256,7 +257,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     pcp_axis_name: str,
 ) -> None:
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
-    del packed_out_hbm_ref, state_source_out_ref
+    del packed_out_hbm_ref
 
     rank = lax.axis_index(pcp_axis_name)
     active_rows_smem_ref[0] = stage_metadata_ref.rank_active_row_end[rank]
@@ -747,6 +748,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             conv_state_ref=state_source_ref,
             recurrent_state_ref=state_source_ref,
             cfg=cfg,
+            conv_state_output_ref=conv_state_updates_ref,
+            recurrent_state_output_ref=recurrent_state_updates_ref,
         ))
 
     num_tiles = metadata_ref.num_tiles[...]
@@ -1114,6 +1117,50 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     )
 
 
+def _scatter_compact_state_updates(
+    state_source: jax.Array,
+    updates: jax.Array,
+    state_indices: jax.Array,
+    query_start_loc: jax.Array,
+    num_active_seqs: jax.Array,
+    *,
+    state_stride: int,
+    region: config.StateRegion,
+) -> jax.Array:
+    """Apply raw per-sequence state tiles to a donated unified pool.
+
+    Pallas emits only the state bytes touched by this invocation.  Expressing
+    the final pool update with native dynamic slices keeps the mutation visible
+    to JAX/XLA and allows donation to reuse the input allocation, without
+    making the whole pool a Pallas output.
+    """
+    num_sequences = state_indices.shape[0]
+    active_bound = jnp.minimum(num_active_seqs, num_sequences)
+
+    def _apply_one(sequence_id, pool):
+        state_index = state_indices[sequence_id]
+        block_start = state_index * state_stride + region.kb0
+        has_tokens = (query_start_loc[sequence_id + 1]
+                      > query_start_loc[sequence_id])
+        valid = jnp.logical_and(has_tokens, state_index >= 0)
+        valid = jnp.logical_and(
+            valid,
+            block_start + region.nblocks <= state_source.shape[0],
+        )
+
+        def _write(pool):
+            start_indices = (block_start, region.row0,
+                             *(0, ) * (state_source.ndim - 2))
+            return lax.dynamic_update_slice(pool, updates[sequence_id],
+                                            start_indices)
+
+        return lax.cond(valid, _write, lambda pool: pool, pool)
+
+    # A runtime loop scales the update work with the live request count rather
+    # than the compile bucket's maximum sequence capacity.
+    return lax.fori_loop(0, active_bound, _apply_one, state_source)
+
+
 @functools.partial(
     jax.jit,
     donate_argnames=("state_source", ),
@@ -1404,6 +1451,25 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         act_out_dtype,
     )
+    state_update_tail = state_source.shape[2:]
+    conv_state_updates_shape = jax.ShapeDtypeStruct(
+        (
+            state_indices.shape[0],
+            state_plan.conv.nblocks,
+            state_plan.conv.nrows,
+            *state_update_tail,
+        ),
+        state_source.dtype,
+    )
+    recurrent_state_updates_shape = jax.ShapeDtypeStruct(
+        (
+            state_indices.shape[0],
+            state_plan.recurrent.nblocks,
+            state_plan.recurrent.nrows,
+            *state_update_tail,
+        ),
+        state_source.dtype,
+    )
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -1451,7 +1517,6 @@ def fused_qkvz_projection_pcp_gdn(
     stage_metadata_leaves = len(jax.tree_util.tree_leaves(stage_metadata_obj))
     state_input_offset = metadata_leaves + stage_metadata_leaves
     input_output_aliases = {
-        state_input_offset + 5: 2,
         state_input_offset + 6: 0,
         state_input_offset + 7: 1,
     }
@@ -1462,8 +1527,8 @@ def fused_qkvz_projection_pcp_gdn(
     # the same 90% hardware budget as the production GMM kernels.
     vmem_limit_bytes = int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
 
-    (gdn_out, packed_out, state_source, _projected_qkv, z,
-     active_rows) = pl.pallas_call(
+    (gdn_out, packed_out, conv_state_updates, recurrent_state_updates,
+     _projected_qkv, z, active_rows) = pl.pallas_call(
          functools.partial(
              _pcp_qkvz_projection_gdn_outer_kernel,
              cfg=cfg,
@@ -1476,7 +1541,8 @@ def fused_qkvz_projection_pcp_gdn(
          out_shape=(
              zero_gdn_out,
              zero_packed_out,
-             state_source,
+             conv_state_updates_shape,
+             recurrent_state_updates_shape,
              projected_qkv_shape,
              z_shape,
              jax.ShapeDtypeStruct((1, ), jnp.int32),
@@ -1495,6 +1561,7 @@ def fused_qkvz_projection_pcp_gdn(
              weights_spec,
          ),
          out_specs=(
+             hbm_spec,
              hbm_spec,
              hbm_spec,
              hbm_spec,
@@ -1552,6 +1619,26 @@ def fused_qkvz_projection_pcp_gdn(
          zero_packed_out,
          weights,
      )
+
+    num_active_seqs = distribution[-1]
+    state_source = _scatter_compact_state_updates(
+        state_source,
+        conv_state_updates,
+        state_indices,
+        query_start_loc,
+        num_active_seqs,
+        state_stride=state_plan.stride,
+        region=state_plan.conv,
+    )
+    state_source = _scatter_compact_state_updates(
+        state_source,
+        recurrent_state_updates,
+        state_indices,
+        query_start_loc,
+        num_active_seqs,
+        state_stride=state_plan.stride,
+        region=state_plan.recurrent,
+    )
 
     packed_out = packed_out.reshape(local_num_tokens, n_v, d_v)
     value_tile_rows = shard_value_dim // _TPU_TILE_COLUMNS

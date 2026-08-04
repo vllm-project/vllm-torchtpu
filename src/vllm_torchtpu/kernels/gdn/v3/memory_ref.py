@@ -388,6 +388,14 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
     region: config.StateRegion = dataclasses.field(metadata=dict(static=True))
     stride: int = dataclasses.field(metadata=dict(static=True))
+    # The PCP fused kernel writes one compact update per sequence and applies
+    # those updates to the donated pool outside Pallas.  Keeping the compact
+    # output ref here lets the regular buffered pipeline retain its state
+    # copy-in schedule without exposing the whole pool as a Pallas output.
+    # Other V3 callers leave this unset and continue to write directly to the
+    # aliased external source.
+    compact_output_ref: Any | None = dataclasses.field(
+        default=None, metadata=dict(static=True))
 
     def _src_slice(self, ref: jax.Ref, state_idx, count):
         base = state_idx * self.stride + self.region.kb0
@@ -395,6 +403,30 @@ class ExternalStateBufferedRef(StateBufferedRef):
             return ref.at[pl.ds(base, count)]
         return ref.at[pl.ds(base, count),
                       pl.ds(self.region.row0, self.region.nrows)]
+
+    def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        if self.compact_output_ref is None:
+            return super().copy_out(dst_ref, grid_indices)
+
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_out_slot
+        sem = self.sem_sends.at[slot]
+        vmem_ref = self.window_ref.at[slot]
+        p_id = grid_indices[0]
+
+        for idx in range(self.cfg.seq_tile_size):
+            is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
+            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+            dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
+
+            pltpu.make_async_copy(
+                vmem_ref.at[idx, pl.ds(0, dma_size)],
+                self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
+                sem,
+            ).start()
 
     def _unit(self) -> int:
         return self.region.nblocks
@@ -419,6 +451,8 @@ def create_allocs(
     conv_state_ref: jax.Array,
     recurrent_state_ref: jax.Array,
     cfg: config.GDNConfig,
+    conv_state_output_ref: jax.Array | None = None,
+    recurrent_state_output_ref: jax.Array | None = None,
 ) -> tuple[
         InBufferedRef,
         InBufferedRef,
@@ -427,6 +461,18 @@ def create_allocs(
         StateBufferedRef,
         OutBufferedRef,
 ]:
+    compact_state_output = conv_state_output_ref is not None
+    if compact_state_output != (recurrent_state_output_ref is not None):
+        raise ValueError(
+            "Conv and recurrent compact state outputs must be set together.")
+    if compact_state_output and cfg.state_plan is None:
+        raise ValueError(
+            "Compact state outputs require an external state source plan.")
+    if compact_state_output and cfg.window_size != 1:
+        raise ValueError(
+            "Compact external state outputs do not support checkpoint "
+            f"windows, got window_size={cfg.window_size}.")
+
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     ba_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
 
@@ -515,10 +561,12 @@ def create_allocs(
         conv_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=conv_shape),
             dtype_or_type=conv_state_ref,
-            region=plan.conv)
+            region=plan.conv,
+            compact_output_ref=conv_state_output_ref)
         recurrent_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=recurrent_shape),
             dtype_or_type=conv_state_ref,
-            region=plan.recurrent)
+            region=plan.recurrent,
+            compact_output_ref=recurrent_state_output_ref)
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

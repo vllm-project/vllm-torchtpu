@@ -662,10 +662,43 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                              conv_bias, A_log, dt_bias,
                                              state_indices, query_start_loc,
                                              request_distribution, seq_lens)
-            recurrent_state.copy_(new_rec)
+            # Rebind the donated pool instead of copying the full unified pool
+            # back into its old storage.  This function is exposed as a
+            # mutation-aware custom op below, so AOT functionalization threads
+            # the updated pool between layers and TorchTPU can preserve the
+            # Pallas input/output alias.
+            recurrent_state.set_(new_rec)
             return outputs, z
 
-        return gdn_impl
+        stateful_op_name = ("vllm_torchtpu::gdn_attention_pooled_pcp_stateful_"
+                            f"{self.prefix.replace('.', '_')}")
+        stateful_gdn_op = torch.library.custom_op(
+            stateful_op_name,
+            gdn_impl,
+            mutates_args={"recurrent_state"},
+        )
+
+        def _fake_stateful_gdn(
+                hidden_states: torch.Tensor, qkvz_weight: torch.Tensor,
+                qkvz_weight_scale: torch.Tensor, b: torch.Tensor,
+                a: torch.Tensor, recurrent_state: torch.Tensor,
+                conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
+                A_log: torch.Tensor, dt_bias: torch.Tensor,
+                state_indices: torch.Tensor, query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor,
+                seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            del (qkvz_weight, qkvz_weight_scale, b, a, recurrent_state,
+                 conv_weight, conv_bias, A_log, dt_bias, state_indices,
+                 query_start_loc, request_distribution, seq_lens)
+            num_tokens = hidden_states.size(0)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            output = torch.empty(out_shape,
+                                 dtype=hidden_states.dtype,
+                                 device=hidden_states.device)
+            return output, torch.empty_like(output)
+
+        stateful_gdn_op.register_fake(_fake_stateful_gdn)
+        return stateful_gdn_op
 
     def _require_pcp_projection_parameters(
             self) -> tuple[torch.Tensor, torch.Tensor]:
