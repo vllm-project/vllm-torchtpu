@@ -713,7 +713,6 @@ def _build_v3_pool_state_plan(
     kernel_size: int,
     pool_block_tokens: int,
     qk_pair_layout: bool,
-    window: int = 1,
 ):
     """Describe this rank's GDN state regions in the unified pool."""
     if pool_block_tokens % pool.shape[1] != 0:
@@ -744,7 +743,6 @@ def _build_v3_pool_state_plan(
         d_v=d_v,
         kernel_size=kernel_size,
         qk_pair_layout=qk_pair_layout,
-        window=window,
     )
 
 
@@ -785,10 +783,6 @@ def run_jax_gdn_attention_pooled_local(
     """
 
     conv_dim = conv_weight.shape[0]
-    # Speculative decoding keeps one state checkpoint per verify window
-    # position; the plan below is told how many so the kernel can address
-    # them. Without spec decode the window is 1.
-    window = num_spec_tokens + 1
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
     # contiguous DMA per slot per region) — no external gather/scatter

@@ -1885,9 +1885,12 @@ class TestReadOffsetsClearedOnReallocation:
         runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
                                                      dtype=torch.int32)
         runner._mamba_offset_seeded = set()
+        runner._read_offset_scratch = {}
         runner.input_batch = MagicMock()
         runner._mamba_state_index_groups = (
             TPUModelRunner._mamba_state_index_groups.__get__(runner))
+        runner._read_offset_reset_scratch = (
+            TPUModelRunner._read_offset_reset_scratch.__get__(runner))
         runner._reset_read_offsets_for_new_requests = (
             TPUModelRunner._reset_read_offsets_for_new_requests.__get__(runner)
         )
@@ -1948,12 +1951,32 @@ class TestReadOffsetsClearedOnReallocation:
 
 class TestUnifiedReadOffsetMigration:
     """The align-mode seed-copy collector must migrate the per-block read
-    offsets together with the state when a request's state block moves."""
+    offsets together with the state when a request's state block moves.
 
-    def _make_runner(self, *, block_table, computed, scheduled, block_size=4):
+    These pin the no-checkpoint-group gate (`_mamba_ckpt_window == 1`),
+    where the offset simply follows the state block. With a checkpoint
+    group the group slides with the state column and the contract is
+    different -- the resumed checkpoint moves and the offset resets to 0;
+    that is covered in tests/runner/test_mamba_state_seed_copies.py.
+    """
+
+    def _make_runner(self,
+                     *,
+                     block_table,
+                     computed,
+                     scheduled,
+                     block_size=4,
+                     ckpt_window=1):
         runner = MagicMock(spec=TPUModelRunner)
         runner.cache_config = MagicMock()
         runner.cache_config.block_size = block_size
+        runner._mamba_ckpt_window = ckpt_window
+        runner._bucket_len = TPUModelRunner._bucket_len
+        runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
+        for name in ("_pad_dev_to_bucket", "_expand_pool_split",
+                     "_spec_seed_sources"):
+            setattr(runner, name,
+                    getattr(TPUModelRunner, name).__get__(runner))
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block
         # size; with cp=1 the two coincide here.
@@ -2011,6 +2034,24 @@ class TestUnifiedReadOffsetMigration:
         assert int(runner.mamba_slot_read_offsets[5]) == 3
         assert int(runner.mamba_slot_read_offsets[9]) == 0
         assert not runner._pending_mamba_state_copies
+
+    def test_checkpoint_group_crossing_seeds_the_resumed_checkpoint(self):
+        # With a checkpoint group the whole group slides with the state
+        # column, so the block to carry over is the checkpoint the request
+        # resumes from -- not the old state block, which would leave it
+        # resuming one checkpoint late. It lands as checkpoint 0, so the
+        # offset resets.
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 11]],
+            computed=[7],
+            scheduled=[2],
+            ckpt_window=3)
+        # Pre-crossing group is columns 1..3 = blocks (5, 9, 11).
+        runner.mamba_slot_read_offsets[5] = 2
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        _, src_t, dst_t = runner._pending_mamba_state_copies[0]
+        assert int(src_t[0]) == 11 and int(dst_t[0]) == 9
+        assert int(runner.mamba_slot_read_offsets[9]) == 0
 
     def test_rollback_crossing_migrates_offsets_backward(self):
         # A rejected verify window can pull the state position back into the

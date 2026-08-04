@@ -772,6 +772,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         gdn_pooled_pcp_op = self.gdn_pooled_pcp_op
         assert gdn_pooled_pcp_op is not None
+        # This path passes the plain `request_distribution` and no rollback
+        # metadata, so it must never see a verify window.
+        # `_build_pooled_pcp_gdn_op` already refuses to build with
+        # num_spec > 0; assert here so the invariant is visible at the call
+        # site that depends on it.
+        assert self.num_spec == 0, (
+            "Speculative decoding is not supported with GDN pooled PCP "
+            "streaming prefill.")
         qkvz_weight, qkvz_weight_scale = (
             self._require_pcp_projection_parameters())
         ba, _ = self.in_proj_ba(hidden_states)
@@ -954,6 +962,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         raise RuntimeError(
                             "GDN PCP prefill op was not initialized during model "
                             "loading.")
+                    # As above: PCP passes the plain `request_distribution`
+                    # and no `slot_read_offsets`, so a verify window must
+                    # never reach it. `_build_gdn_op(pcp_streaming=True)`
+                    # already refuses to build with num_spec > 0.
+                    assert self.num_spec == 0, (
+                        "Speculative decoding is not supported with GDN PCP "
+                        "streaming prefill.")
                     core_attn_out = gdn_pcp_op(
                         mixed_qkv, b, a, conv_state, recurrent_state,
                         self.conv1d.weight, self.conv1d.bias, self.A_log,

@@ -399,6 +399,12 @@ class TPUModelRunner(GPUModelRunner):
         # req_ids whose read offset has been initialized since they entered
         # the batch; see `_reset_read_offsets_for_new_requests`.
         self._mamba_offset_seeded: set[str] = set()
+        # Per-width reusable buffers for that per-step reset; see
+        # `_read_offset_reset_scratch`.
+        self._read_offset_scratch: dict[tuple[int, str],
+                                        tuple[torch.Tensor, torch.Tensor,
+                                              torch.Tensor,
+                                              torch.Tensor]] = {}
         self._mamba_align_mode: bool = (
             self.vllm_config.cache_config.mamba_cache_mode == "align")
         self._mamba_apc_copier: MambaApcStateCopier | None = None
@@ -1682,20 +1688,68 @@ class TPUModelRunner(GPUModelRunner):
         if not crossings:
             return
 
+        # Speculative decoding: the checkpoint group slides with the state
+        # column. vLLM's MambaManager appends one block and never shifts, so
+        # after the crossing what was checkpoint 1 IS the state block,
+        # checkpoint 2 is checkpoint 1, and a fresh block appears at the
+        # end. Carrying the old state block over would therefore leave the
+        # request resuming one checkpoint late (and, at the top of the
+        # window, off an uninitialized block). What must move instead is the
+        # checkpoint the request is about to resume from — which becomes
+        # checkpoint 0 of the new group, so the read offset resets to 0.
+        # That index lives in the device-resident read-offset buffer, hence
+        # the device-side gather in `_spec_seed_sources`.
+        window = self._mamba_ckpt_window
+        spec_seed = self.mamba_slot_read_offsets is not None and window > 1
+
         per_raw: dict[int, tuple[torch.Tensor, list[int], list[int]]] = {}
-        # Manager-level (src, dst) block pairs across mamba groups: with
-        # spec decoding the per-block read offsets must follow the state
-        # (and its checkpoints) to the request's new state block.
+        per_raw_dev: dict[int, tuple[torch.Tensor, list[torch.Tensor],
+                                     list[torch.Tensor]]] = {}
+        # Manager-level (src, dst) block pairs across mamba groups: without
+        # spec decoding the per-block read offsets just follow the state to
+        # the request's new state block.
         offset_pairs: list[tuple[int, int]] = []
+        spec_dsts: list[int] = []
         for gid, raws in self._mamba_copy_plan:
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
+            state_srcs: list[int] = []
+            ckpt_rows: list[list[int]] = []
             for row, prev, curr in crossings:
                 src = int(bt[row, prev])
                 dst = int(bt[row, curr])
-                if src != dst and src != 0 and dst != 0:
-                    pairs.append((src, dst))
+                if src == dst or src == 0 or dst == 0:
+                    continue
+                pairs.append((src, dst))
+                if spec_seed:
+                    state_srcs.append(src)
+                    # The pre-crossing group's checkpoint blocks. A column
+                    # the manager has not filled reads past the row or lands
+                    # on the null block; either way fall back to the state
+                    # block, so a short row seeds from live state instead of
+                    # from nothing. The offset never names one in practice —
+                    # it is bounded by the accepted count.
+                    row_ckpts = []
+                    for t in range(window):
+                        col = prev + t
+                        ckpt = int(bt[row, col]) if col < row_width else 0
+                        row_ckpts.append(ckpt if ckpt != 0 else src)
+                    ckpt_rows.append(row_ckpts)
             if not pairs:
+                continue
+            if spec_seed:
+                dsts_g = [d for _, d in pairs]
+                spec_dsts.extend(dsts_g)
+                src_t = self._spec_seed_sources(state_srcs, ckpt_rows)
+                dst_t = torch.tensor(dsts_g,
+                                     dtype=torch.int32).to(self.device,
+                                                           non_blocking=True)
+                src_t, dst_t = self._expand_pool_split(src_t, dst_t)
+                for raw in raws:
+                    entry = per_raw_dev.setdefault(id(raw), (raw, [], []))
+                    entry[1].append(src_t)
+                    entry[2].append(dst_t)
                 continue
             offset_pairs.extend(pairs)
             if self._pool_block_split > 1:
@@ -1709,16 +1763,23 @@ class TPUModelRunner(GPUModelRunner):
                 entry[1].extend(p[0] for p in pairs)
                 entry[2].extend(p[1] for p in pairs)
 
-        if self.mamba_slot_read_offsets is not None and offset_pairs:
+        if spec_seed and spec_dsts:
+            # The seeded checkpoint is checkpoint 0 of the new group.
+            dst_t = torch.tensor(self._pad_to_bucket(spec_dsts),
+                                 dtype=torch.long).to(self.device,
+                                                      non_blocking=True)
+            assert self.mamba_slot_read_offsets is not None
+            self.mamba_slot_read_offsets.index_put_(
+                (dst_t, ),
+                torch.zeros(dst_t.shape[0],
+                            dtype=self.mamba_slot_read_offsets.dtype,
+                            device=self.mamba_slot_read_offsets.device))
+        elif self.mamba_slot_read_offsets is not None and offset_pairs:
             # Migrate the read offsets with the state: gather at the old
             # blocks, scatter at the new ones (both device-side, before the
             # forward that reads the buffer). Padding with (0, 0) null-block
             # self-copies keeps the shapes on the seed-copy bucket ladder.
-            padded = 8
-            while padded < len(offset_pairs):
-                padded *= 4
-            offset_pairs = offset_pairs + [(0, 0)
-                                           ] * (padded - len(offset_pairs))
+            offset_pairs = self._pad_to_bucket(offset_pairs, pad=(0, 0))
             src_t = torch.tensor([s for s, _ in offset_pairs],
                                  dtype=torch.long).to(self.device,
                                                       non_blocking=True)
@@ -1728,20 +1789,82 @@ class TPUModelRunner(GPUModelRunner):
             self.mamba_slot_read_offsets.index_put_(
                 (dst_t, ), self.mamba_slot_read_offsets[src_t])
 
-        for raw, srcs, dsts in per_raw.values():
-            # Pad the pair count to a small bucket ladder so the copy op
-            # compiles for a handful of shapes; (0, 0) pads are null-block
-            # self-copies.
-            padded = 8
-            while padded < len(srcs):
-                padded *= 4
-            srcs = srcs + [0] * (padded - len(srcs))
-            dsts = dsts + [0] * (padded - len(dsts))
-            src_t = torch.tensor(srcs, dtype=torch.int32).to(self.device,
-                                                             non_blocking=True)
-            dst_t = torch.tensor(dsts, dtype=torch.int32).to(self.device,
-                                                             non_blocking=True)
+        for raw, srcs_dev, dsts_dev in per_raw_dev.values():
+            src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev))
+            dst_t = self._pad_dev_to_bucket(torch.cat(dsts_dev))
             self._pending_mamba_state_copies.append((raw, src_t, dst_t))
+
+        for raw, srcs, dsts in per_raw.values():
+            src_t = torch.tensor(self._pad_to_bucket(srcs),
+                                 dtype=torch.int32).to(self.device,
+                                                       non_blocking=True)
+            dst_t = torch.tensor(self._pad_to_bucket(dsts),
+                                 dtype=torch.int32).to(self.device,
+                                                       non_blocking=True)
+            self._pending_mamba_state_copies.append((raw, src_t, dst_t))
+
+    @staticmethod
+    def _bucket_len(n: int) -> int:
+        """Smallest ladder length >= `n`, so the copy op sees few shapes."""
+        padded = 8
+        while padded < n:
+            padded *= 4
+        return padded
+
+    @classmethod
+    def _pad_to_bucket(cls, values: list, pad=0) -> list:
+        """Pad a CPU pair/id list up to the seed-copy bucket ladder.
+
+        Pads are the null block, i.e. `(0, 0)` self-copies that move no
+        live state.
+        """
+        return values + [pad] * (cls._bucket_len(len(values)) - len(values))
+
+    def _pad_dev_to_bucket(self, ids: torch.Tensor) -> torch.Tensor:
+        """`_pad_to_bucket` for an already-on-device id tensor."""
+        n = int(ids.shape[0])
+        padded = self._bucket_len(n)
+        if padded == n:
+            return ids
+        return torch.cat([
+            ids,
+            torch.zeros(padded - n, dtype=ids.dtype, device=ids.device),
+        ])
+
+    def _expand_pool_split(
+            self, src: torch.Tensor,
+            dst: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Device twin of the manager-block -> pool-block expansion.
+
+        The pool is born at kernel granularity: a manager state block is
+        `split` consecutive pool blocks.
+        """
+        split = self._pool_block_split
+        if split <= 1:
+            return src, dst
+        j = torch.arange(split, dtype=src.dtype, device=src.device)
+        return ((src.unsqueeze(1) * split + j).reshape(-1),
+                (dst.unsqueeze(1) * split + j).reshape(-1))
+
+    def _spec_seed_sources(self, state_srcs: list[int],
+                           ckpt_rows: list[list[int]]) -> torch.Tensor:
+        """Seed source per crossing: the checkpoint being resumed from.
+
+        `mamba_slot_read_offsets` is device-resident and indexed by block
+        id, so which of the window's blocks holds the last accepted token's
+        state is only known on device — the choice is a gather there rather
+        than a CPU lookup.
+        """
+        offsets = self.mamba_slot_read_offsets
+        assert offsets is not None
+        state_t = torch.tensor(state_srcs,
+                               dtype=torch.long).to(self.device,
+                                                    non_blocking=True)
+        ckpt_t = torch.tensor(ckpt_rows,
+                              dtype=torch.int32).to(self.device,
+                                                    non_blocking=True)
+        off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
@@ -3039,7 +3162,9 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.req_id_to_index.keys())
 
         width = groups[0].shape[0]
-        keep = torch.zeros(width, dtype=torch.bool)
+        keep, keep_dev, zeros, null = self._read_offset_reset_scratch(
+            width, groups[0].device)
+        keep.zero_()
         for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
             req_id = req_ids[start_index + i]
             if req_id is None or i >= width:
@@ -3049,16 +3174,38 @@ class TPUModelRunner(GPUModelRunner):
                 keep[i] = True
         # No `if nothing_new: return` here — see the docstring. The device
         # work below must be issued on every rank on every step.
-        keep_dev = keep.to(groups[0].device, non_blocking=True)
-        zeros = torch.zeros(width,
-                            dtype=self.mamba_slot_read_offsets.dtype,
-                            device=self.mamba_slot_read_offsets.device)
+        keep_dev.copy_(keep, non_blocking=True)
         for group_indices in groups:
             # Non-new rows collapse onto the null slot; writing 0 there is a
             # no-op, which keeps this scatter one fixed shape.
-            targets = torch.where(keep_dev, group_indices,
-                                  torch.zeros_like(group_indices))
+            targets = torch.where(keep_dev, group_indices, null)
             self.mamba_slot_read_offsets.index_put_((targets.long(), ), zeros)
+
+    def _read_offset_reset_scratch(
+        self, width: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reusable `(keep_cpu, keep_dev, zeros, null)` of length `width`.
+
+        `_reset_read_offsets_for_new_requests` runs on every step, so its
+        working set is allocated once per width rather than per step. Width
+        is the padded batch bucket, so this holds one entry per bucket —
+        a handful for the life of the process. `null` is a 0-d zero that
+        broadcasts in the `torch.where`, replacing a full-width
+        `zeros_like` per mamba group per step.
+        """
+        assert self.mamba_slot_read_offsets is not None
+        key = (width, str(device))
+        entry = self._read_offset_scratch.get(key)
+        if entry is None:
+            offsets = self.mamba_slot_read_offsets
+            entry = (
+                torch.zeros(width, dtype=torch.bool),
+                torch.zeros(width, dtype=torch.bool, device=device),
+                torch.zeros(width, dtype=offsets.dtype, device=offsets.device),
+                torch.zeros((), dtype=torch.int32, device=device),
+            )
+            self._read_offset_scratch[key] = entry
+        return entry
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"

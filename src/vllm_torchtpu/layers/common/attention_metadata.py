@@ -166,6 +166,19 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             assert runner.most_model_len is not None
             target_num_blocks = cdiv(runner.most_model_len,
                                      self.target_block_size)
+            if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
+                # Speculative decoding: the manager appends
+                # `num_speculative_blocks` (= window - 1) checkpoint blocks
+                # after the request's positional state block, so a mamba row
+                # is that much wider than the positional part alone. This
+                # mirrors `MambaSpec.max_num_blocks_per_req`, which the
+                # use_max_model_len branch above already gets for free.
+                # Without it the row stops short of the checkpoint group and
+                # `in_row` below silently redirects checkpoints to the null
+                # block, costing rollback accuracy with no error.
+                target_num_blocks = min(
+                    target_num_blocks + ctx.mamba_ckpt_window - 1,
+                    block_table_obj.max_num_blocks_per_req)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
