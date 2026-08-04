@@ -179,7 +179,7 @@ def probe_pcp_local_rank_remap(
                                                    str]) -> tuple[int, ...]:
     master_port = portpicker.pick_unused_port()
     sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
-    sb_addresses = ",".join(f"localhost:{port}" for port in sb_ports)
+    sb_addresses = ",".join(f"127.0.0.1:{port}" for port in sb_ports)
     topology = os.environ.get("TORCH_TPU_TOPOLOGY") or get_topology(world_size)
 
     logger.info("Probing PCP LOCAL_RANK remap for world_size=%d topology=%s.",
@@ -195,7 +195,7 @@ def probe_pcp_local_rank_remap(
                 "WORLD_SIZE": str(world_size),
                 "LOCAL_WORLD_SIZE": str(world_size),
                 "GROUP_RANK": "0",
-                "MASTER_ADDR": "localhost",
+                "MASTER_ADDR": "127.0.0.1",
                 "MASTER_PORT": str(master_port),
                 "TORCH_TPU_TOPOLOGY": topology,
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES": sb_addresses,
