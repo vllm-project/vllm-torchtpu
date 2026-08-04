@@ -8,6 +8,7 @@ CONFIG_NAME=""
 RESULTS_DIR=""
 RUN_LM_EVAL=0
 RUN_CODE_EVAL=0
+RUN_MM_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
 
@@ -30,6 +31,10 @@ while [[ $# -gt 0 ]]; do
             RUN_CODE_EVAL=1
             shift
             ;;
+        --run-mm-eval)
+            RUN_MM_EVAL=1
+            shift
+            ;;
         --host)
             HOST="$2"
             START_SERVER=0
@@ -46,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--host HOST] [--port PORT]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
@@ -142,6 +147,63 @@ run_lm_eval() {
     fi
 }
 
+# Multimodal eval via evalscope (https://evalscope.readthedocs.io/), hitting
+# the live OpenAI-compatible endpoint directly -- lm-eval has no multimodal
+# support, so mmmu_pro can't go through run_lm_eval. --limit is applied
+# *per subset* by evalscope (30 subjects in mmmu_pro), not overall, so
+# MM_EVAL_LIMIT=10 means <=300 total samples, not 10.
+run_mm_eval() {
+    local task="$1"
+    local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
+    local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
+    local mm_workdir="${RESULTS_DIR}/${task}_evalscope"
+    local mm_limit="${MM_EVAL_LIMIT:-4}"
+    local mm_batch_size="${MM_EVAL_BATCH_SIZE:-128}"
+
+    echo "Running evalscope for task: $task (limit=$mm_limit/subset, eval-batch-size=$mm_batch_size)..."
+    rm -rf "$mm_workdir"
+    evalscope eval \
+        --model "$MODEL" \
+        --eval-type openai_api \
+        --api-url "http://$HOST:$PORT/v1/chat/completions" \
+        --api-key EMPTY \
+        --datasets "$task" \
+        --limit "$mm_limit" \
+        --eval-batch-size "$mm_batch_size" \
+        --no-timestamp \
+        --work-dir "$mm_workdir"
+
+    local report_json
+    report_json=$(find "$mm_workdir" -path "*/reports/*/${task}.json" | head -1)
+    if [ -z "$report_json" ]; then
+        echo "::error::evalscope did not produce a ${task}.json report under $mm_workdir"
+        fail=1
+        return
+    fi
+
+    # Translate evalscope's report into check_regression.py's lm-eval-style
+    # results_*.json schema ({"results": {task: {"acc,none": score}}}) so the
+    # existing eval regression/calibrate machinery works unmodified.
+    python3 -c "
+import json
+report = json.load(open('$report_json'))
+out = {'results': {'$task': {'acc,none': report['score']}}}
+json.dump(out, open('$RESULTS_DIR/results_${task}.json', 'w'), indent=2)
+print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + ')')
+"
+
+    if [ -f "$baseline" ]; then
+        echo "=== Checking Eval Regression for $task ==="
+        python3 scripts/vllm/benchmarking/check_regression.py \
+          --mode eval \
+          --tolerance "$EVAL_TOLERANCE" \
+          --results-dir "$RESULTS_DIR" \
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+    else
+        echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
+    fi
+}
+
 # ========================================================
 # 1. Initial Cleanup
 # ========================================================
@@ -204,7 +266,19 @@ if [ "$RUN_CODE_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 6. Upload results to Spanner
+# 6. Run multimodal evals (evalscope, live API endpoint)
+# ========================================================
+if [ "$RUN_MM_EVAL" = "1" ]; then
+    if ! command -v evalscope &>/dev/null; then
+        echo "::error::--run-mm-eval requires the 'evalscope' CLI (pip install evalscope)."
+        fail=1
+    else
+        run_mm_eval "mmmu_pro"
+    fi
+fi
+
+# ========================================================
+# 7. Upload results to Spanner
 # ========================================================
 echo "=== Uploading results to Spanner ==="
 UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")

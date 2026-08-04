@@ -34,6 +34,9 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     if [ "${RUN_CODE_EVAL:-0}" = "1" ]; then
         eval_args+=(--run-code-eval)
     fi
+    if [[ "$config_name" == *multimodal* ]]; then
+        eval_args+=(--run-mm-eval)
+    fi
 
     if ! bash ./scripts/vllm/benchmarking/run_eval_flow.sh "${eval_args[@]}"; then
         echo "::error::Perf/Eval failed for config: $config_name"
