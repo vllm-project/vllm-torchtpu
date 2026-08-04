@@ -9,11 +9,11 @@ The output is XPlane protobuf (`*.xplane.pb`), readable in
 
 There are three ways to profile a workload:
 
-| Approach | Best for |
-|---|---|
-| [`examples/tpu_profiling.py`](#offline-profiling-with-examplestpu_profilingpy) | Isolating a single shape — one prefill or one decode batch, offline |
-| [Server-side capture](#server-side-capture-vllm-serve) | A real serving window under `vllm bench serve` or your own client |
-| [Phased profiling](#phased-profiling) | One trace per inference phase from a single mixed benchmark run |
+| Approach | Also called | Best for |
+|---|---|---|
+| [`examples/tpu_profiling.py`](#offline-profiling-with-examplestpu_profilingpy) | non-phased, on-demand profiling | Isolating a single shape — one prefill or one decode batch, offline |
+| [Server-side capture](#server-side-capture-vllm-serve) | end-to-end (e2e) profiling | A real serving window under `vllm bench serve` or your own client |
+| [Phased profiling](#phased-profiling) | phased profiling | One trace per inference phase from a single mixed benchmark run |
 
 ## Prerequisites
 
@@ -362,6 +362,15 @@ xprof --logdir ~/traces/vllm_phased_profile
 Open the printed URL and pick a run from the dropdown. Each phase is a separate
 run. The Trace Viewer shows kernel execution timelines, and the Memory Profile
 and Op Profile views cover HBM usage and MXU utilization.
+
+### Seeing every rank at once
+
+Because all of a run's ranks are merged into one `plugins/profile/<timestamp>/`
+directory, pointing XProf at the run directory loads them together — use the
+host picker to switch between ranks, or view them side by side, without merging
+anything by hand. This is the reason the capture goes through the rank-prefix
+merge described above; a per-rank directory layout would force you to open each
+rank as a separate session.
 
 Note that TorchTPU serializes individual raw XPlane chunks rather than a single
 merged trace, so a viewer that asks you to choose a file type wants **XPlane**.
