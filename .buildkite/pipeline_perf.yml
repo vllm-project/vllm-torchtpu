@@ -34,8 +34,7 @@ steps:
               qwen3-30b-a3b-nvfp4-tp8-ep \
               qwen3.5-35b-fp8-tp4-ep \
               qwen3.5-35b-fp8-dp8-ep \
-              qwen3.5-35b-fp8-dp4-tp2-ep \
-              gemma-4-26b-fp8-dp4-tp2-ep-text
+              qwen3.5-35b-fp8-dp4-tp2-ep
         artifact_paths:
           - "perf_eval_results/**/*"
 
