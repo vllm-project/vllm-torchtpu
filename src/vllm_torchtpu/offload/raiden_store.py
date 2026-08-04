@@ -265,7 +265,20 @@ class RaidenOffloadingManager(OffloadingManager):
                 "publishes nothing (peers cannot discover it).")
 
         if store is None:
-            from tpu_raiden.api.torch import kv_cache_store as store_types
+            # Bind the native extension rather than
+            # tpu_raiden.api.torch.kv_cache_store: that Python wrapper is not
+            # packaged in the torch wheel, while the extension it wraps is.
+            # The extension exports the same names (KVCacheStore, RaidenId,
+            # RaidenBlockID, BlockStatus) with the same keyword arguments;
+            # the only difference that reaches this module is
+            # insert_and_lock_detailed returning the raw
+            # (success, existing, inserted, displaced) tuple instead of a
+            # dataclass. The loader call is what the wrapper does first and
+            # is required before importing the extension; it is idempotent.
+            from tpu_raiden.api.torch import torch_tpu_common_loader
+            torch_tpu_common_loader.load_torch_tpu_common()
+            from tpu_raiden.frameworks.torch import \
+                _tpu_raiden_torch as store_types
             store = store_types.KVCacheStore(
                 capacity=capacity_kernel_blocks,
                 raiden_id=store_types.RaidenId(raiden_job_name, "0",
@@ -377,12 +390,12 @@ class RaidenOffloadingManager(OffloadingManager):
         matches = self._store.lookup([sub_hash])
         return matches[0][1].status if matches else None
 
-    def _displaced_keys_of(self, result) -> list[OffloadKey]:
+    def _displaced_keys_of(self, raw_displaced) -> list[OffloadKey]:
         """Unique OffloadKeys of a detailed insert result's displacements,
         in displacement order (sub-hashes collapse back to their key)."""
         displaced: list[OffloadKey] = []
         seen: set[OffloadKey] = set()
-        for h, _ in result.displaced:
+        for h, _ in raw_displaced:
             key = self._key_of(h)
             if key not in seen:
                 seen.add(key)
@@ -517,12 +530,12 @@ class RaidenOffloadingManager(OffloadingManager):
             # like a store admission; on wheel #2 the detailed result
             # surfaces them, and they commit with the load's outcome.
             if self._has_detailed:
-                result = self._store.insert_and_lock_detailed(remote_hashes,
-                                                              remote_slices,
-                                                              on_host=True)
-                installed = result.success
+                installed, _existing, _inserted, raw_displaced = (
+                    self._store.insert_and_lock_detailed(remote_hashes,
+                                                         remote_slices,
+                                                         on_host=True))
                 if installed:
-                    displaced_keys = self._displaced_keys_of(result)
+                    displaced_keys = self._displaced_keys_of(raw_displaced)
             else:
                 installed = self._store.insert_and_lock(remote_hashes,
                                                         remote_slices,
@@ -655,13 +668,13 @@ class RaidenOffloadingManager(OffloadingManager):
         # with per-sub-hash peeks after a bare insert_and_lock.
         displaced_keys: list[OffloadKey] = []
         if self._has_detailed:
-            result = self._store.insert_and_lock_detailed(sub_hashes,
-                                                          slices,
-                                                          on_host=False)
-            admitted = result.success
+            admitted, _existing, inserted, raw_displaced = (
+                self._store.insert_and_lock_detailed(sub_hashes,
+                                                     slices,
+                                                     on_host=False))
             if admitted:
-                to_save = list(result.inserted)
-                displaced_keys = self._displaced_keys_of(result)
+                to_save = list(inserted)
+                displaced_keys = self._displaced_keys_of(raw_displaced)
         else:
             admitted = self._store.insert_and_lock(sub_hashes,
                                                    slices,

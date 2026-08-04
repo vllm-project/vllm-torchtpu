@@ -317,14 +317,14 @@ class FakeKVCacheStoreV2(FakeKVCacheStore):
         self.displace_next: list[bytes] = []
 
     def insert_and_lock_detailed(self, block_hashes, slices, on_host):
+        # Returns the raw (success, existing, inserted, displaced) tuple the
+        # native _tpu_raiden_torch binding returns, not the dataclass the
+        # unpackaged api/torch wrapper builds on top of it.
         self.calls.append(
             _Call("insert_and_lock_detailed",
                   (list(block_hashes), list(slices), on_host)))
         if self.fail_insert_and_lock:
-            return SimpleNamespace(success=False,
-                                   existing=[],
-                                   inserted=[],
-                                   displaced=[])
+            return (False, [], [], [])
         existing, inserted = [], []
         for h, s in zip(block_hashes, slices):
             entry = self.entries.get(h)
@@ -342,10 +342,7 @@ class FakeKVCacheStoreV2(FakeKVCacheStore):
             if entry is not None:
                 displaced.append((h, SimpleNamespace(status=entry.status)))
         self.displace_next = []
-        return SimpleNamespace(success=True,
-                               existing=existing,
-                               inserted=inserted,
-                               displaced=displaced)
+        return (True, existing, inserted, displaced)
 
     def clear(self) -> int:
         self.calls.append(_Call("clear", ()))
