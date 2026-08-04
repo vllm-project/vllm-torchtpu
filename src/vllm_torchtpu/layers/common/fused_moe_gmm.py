@@ -20,6 +20,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
+    blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
@@ -27,6 +29,9 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
     ragged_gather_reduce as ragged_gather_reduce_v3
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _select_ragged_gather_reduce(version: str):
@@ -183,7 +188,7 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -239,7 +244,7 @@ def prepare_routed_gmm_inputs(
     else:
         x = hidden_states_local[token_indices_sorted]
     return (x, group_sizes_local, argsort_revert_indices, topk_weights_flat,
-            valid_mask)
+            valid_mask, sorted_indices)
 
 
 def moe_gmm(
@@ -254,6 +259,7 @@ def moe_gmm(
     argsort_revert_indices: jax.Array,
     topk_weights_flat: jax.Array,
     valid_mask_flat: jax.Array,
+    sorted_indices: jax.Array,
     *,
     activation: str,
     num_tokens: int,
@@ -302,6 +308,28 @@ def moe_gmm(
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
+            # The flattened route index identifies its source token because
+            # each token contributes exactly `topk` consecutive routes.
+            token_indices_sorted = sorted_indices // topk
+            topk_weights_sorted = topk_weights_flat[sorted_indices]
+            valid_count = group_sizes.sum(dtype=jnp.int32)[None]
+            if (envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on" and
+                    can_use_blockwise_onehot_unpermute(gmm2_res,
+                                                       token_indices_sorted,
+                                                       topk_weights_sorted,
+                                                       valid_count,
+                                                       num_tokens=num_tokens)):
+                logger.info_once(
+                    "Selected owner_output blockwise one-hot unpermute: "
+                    "routes=%d hidden=%d tokens=%d", gmm2_res.shape[0],
+                    gmm2_res.shape[1], num_tokens)
+                return blockwise_onehot_unpermute(
+                    gmm2_res,
+                    token_indices_sorted,
+                    topk_weights_sorted,
+                    valid_count,
+                    num_tokens=num_tokens,
+                ).astype(x.dtype)
             if skip_padded_tokens:
                 # Zero out the GMM output rows of padded tokens that
                 # skipped the GMM computation, otherwise those
@@ -416,8 +444,8 @@ def fused_moe_func(
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    (x, group_sizes, argsort_revert_indices, topk_weights_flat,
-     valid_mask) = prepare_routed_gmm_inputs(
+    (x, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
+     sorted_indices) = prepare_routed_gmm_inputs(
          hidden_states,
          topk_ids,
          topk_weights,
@@ -441,6 +469,7 @@ def fused_moe_func(
         argsort_revert_indices,
         topk_weights_flat,
         valid_mask,
+        sorted_indices,
         activation=activation,
         num_tokens=num_tokens,
         topk=topk,

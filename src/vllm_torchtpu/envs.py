@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -297,6 +298,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    # Select the blockwise owner-output kernel after the outer one-hot MoE
+    # threshold has selected the TensorCore path. "off" keeps the dense
+    # one-hot combine; "on" enables the kernel for every shape that passes
+    # its dtype, alignment, and VMEM safety checks.
+    "TPU_MOE_OWNER_OUTPUT_MODE":
+    env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
+                     "off", ["off", "on"],
+                     case_sensitive=False),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":

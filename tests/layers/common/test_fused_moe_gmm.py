@@ -14,6 +14,7 @@
 """Tests for the local-routing fused MoE GMM wrapper."""
 
 import types
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +24,8 @@ import pytest
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 from vllm_torchtpu.layers.common import fused_moe_gmm
-from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
+from vllm_torchtpu.layers.common.fused_moe_gmm import (
+    fused_moe_func, moe_gmm, prepare_routed_gmm_inputs)
 
 
 @pytest.mark.parametrize("version", ["v1", "v2", "v3"])
@@ -49,6 +51,26 @@ def test_ragged_gather_reduce_uses_configured_version():
     expected = fused_moe_gmm._select_ragged_gather_reduce(
         envs.RAGGED_GATHER_REDUCE_VERSION)
     assert fused_moe_gmm.ragged_gather_reduce is expected
+
+
+def test_owner_output_mode_defaults_to_off(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_OWNER_OUTPUT_MODE", raising=False)
+    getter = envs.environment_variables["TPU_MOE_OWNER_OUTPUT_MODE"]
+    assert getter() == "off"
+
+
+@pytest.mark.parametrize("value", ["off", "on", "OFF", "ON"])
+def test_owner_output_mode_accepts_off_and_on(monkeypatch, value):
+    monkeypatch.setenv("TPU_MOE_OWNER_OUTPUT_MODE", value)
+    getter = envs.environment_variables["TPU_MOE_OWNER_OUTPUT_MODE"]
+    assert getter().lower() == value.lower()
+
+
+def test_owner_output_mode_rejects_invalid_value(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_OWNER_OUTPUT_MODE", "auto")
+    getter = envs.environment_variables["TPU_MOE_OWNER_OUTPUT_MODE"]
+    with pytest.raises(ValueError, match="TPU_MOE_OWNER_OUTPUT_MODE"):
+        getter()
 
 
 def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
@@ -83,6 +105,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
         argsort_revert_indices=jnp.array([0, 1], dtype=jnp.int32),
         topk_weights_flat=jnp.array([0.25, 0.75], dtype=jnp.float32),
         valid_mask_flat=jnp.array([True, True]),
+        sorted_indices=jnp.array([0, 1], dtype=jnp.int32),
         activation="silu",
         num_tokens=1,
         topk=2,
@@ -138,6 +161,110 @@ def _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias, topk_weights,
         out = out.at[token_id].set(token_out)
 
     return out[:, :hidden_size].astype(hidden_states.dtype)
+
+
+def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
+    hidden_states = jnp.arange(6, dtype=jnp.bfloat16).reshape(3, 2)
+    topk_indices = jnp.array([[1, 0], [0, -1], [1, 0]], dtype=jnp.int32)
+    topk_weights = jnp.array([[0.1, 0.2], [0.3, 0.0], [0.4, 0.5]],
+                             dtype=jnp.bfloat16)
+    flat_indices = np.asarray(topk_indices).reshape(-1)
+    valid = flat_indices >= 0
+    sorted_indices_expected = np.argsort(np.where(valid, flat_indices, 2),
+                                         kind="stable")
+
+    (_, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
+     sorted_indices) = prepare_routed_gmm_inputs(
+         hidden_states,
+         topk_indices,
+         topk_weights,
+         local_num_experts=2,
+         topk=2,
+         use_ep=True,
+         use_sparse_core=True,
+         onehot_moe_permute_threshold=6,
+     )
+
+    np.testing.assert_array_equal(
+        argsort_revert_indices,
+        np.argsort(sorted_indices_expected, kind="stable"),
+    )
+    np.testing.assert_array_equal(topk_weights_flat,
+                                  np.asarray(topk_weights).reshape(-1))
+    np.testing.assert_array_equal(valid_mask, valid)
+    np.testing.assert_array_equal(sorted_indices, sorted_indices_expected)
+    np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
+
+
+@pytest.mark.parametrize(("mode", "owner_called"), [("on", True),
+                                                    ("off", False)])
+def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
+    x = jnp.zeros((4, 2), dtype=jnp.bfloat16)
+    w1 = jnp.zeros((2, 2, 4), dtype=jnp.bfloat16)
+    w2 = jnp.zeros((2, 2, 2), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([2, 2], dtype=jnp.int32)
+    argsort_revert_indices = jnp.array([2, 0, 1, 3], dtype=jnp.int32)
+    topk_weights_flat = jnp.array([0.1, 0.2, 0.3, 0.4], dtype=jnp.bfloat16)
+    valid_mask = jnp.ones((4, ), dtype=jnp.bool_)
+    sorted_indices = jnp.array([1, 2, 0, 3], dtype=jnp.int32)
+    gmm1_res = jnp.zeros((4, 2), dtype=jnp.bfloat16)
+    gmm2_res = jnp.zeros((4, 2), dtype=jnp.bfloat16)
+    expected = jnp.ones((2, 2), dtype=jnp.bfloat16)
+
+    with patch.object(
+            envs,
+            "TPU_MOE_OWNER_OUTPUT_MODE",
+            mode,
+    ), patch.object(
+            fused_moe_gmm,
+            "gmm_wrapper",
+            side_effect=[gmm1_res, gmm2_res],
+    ), patch.object(
+            fused_moe_gmm,
+            "can_use_blockwise_onehot_unpermute",
+            return_value=True,
+    ) as support_check, patch.object(
+            fused_moe_gmm,
+            "blockwise_onehot_unpermute",
+            return_value=expected,
+    ) as owner_kernel:
+        actual = moe_gmm(
+            x,
+            w1,
+            None,
+            None,
+            w2,
+            None,
+            None,
+            group_sizes,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask,
+            sorted_indices,
+            activation="silu",
+            num_tokens=2,
+            topk=2,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=4,
+        )
+
+    if not owner_called:
+        np.testing.assert_array_equal(actual, jnp.zeros_like(expected))
+        support_check.assert_not_called()
+        owner_kernel.assert_not_called()
+        return
+
+    np.testing.assert_array_equal(actual, expected)
+    support_check.assert_called_once()
+    owner_kernel.assert_called_once()
+    call = owner_kernel.call_args
+    np.testing.assert_array_equal(call.args[0], gmm2_res)
+    np.testing.assert_array_equal(call.args[1], sorted_indices // 2)
+    np.testing.assert_array_equal(call.args[2],
+                                  topk_weights_flat[sorted_indices])
+    np.testing.assert_array_equal(call.args[3], np.array([4], dtype=np.int32))
+    assert call.kwargs == {"num_tokens": 2}
 
 
 def test_fused_moe_local_routing_matches_reference():
@@ -611,6 +738,8 @@ def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
             group_sizes=jnp.array([rows], dtype=jnp.int32),
             argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
                                              dtype=jnp.int32),
+            sorted_indices=jnp.array([4, 2, 6, 0, 7, 5, 1, 3],
+                                     dtype=jnp.int32),
             topk_weights_flat=jnp.linspace(0.1, 0.8, rows, dtype=jnp.float32),
             valid_mask_flat=jnp.array(
                 [True, True, False, True, True, False, True, True]),
@@ -652,6 +781,7 @@ def _small_moe_gmm_kwargs(num_tokens=4, topk=2, hidden=8):
         group_sizes=jnp.array([rows], dtype=jnp.int32),
         argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
                                          dtype=jnp.int32),
+        sorted_indices=jnp.array([4, 2, 6, 0, 7, 5, 1, 3], dtype=jnp.int32),
         topk_weights_flat=jnp.full((rows, ), 0.5, dtype=jnp.bfloat16),
         valid_mask_flat=jnp.ones((rows, ), dtype=bool),
         activation="silu",
