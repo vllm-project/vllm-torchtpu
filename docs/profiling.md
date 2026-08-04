@@ -99,6 +99,16 @@ curl -X POST http://localhost:8000/stop_profile
 `vllm bench serve --profile` fires those two endpoints around its main run for
 you.
 
+Those are two separate steps, and the rest of this page keeps them distinct:
+
+* **Configured** — the server was started with a profiler kind and a trace
+  directory, so the profile endpoints will work. Nothing is being recorded yet.
+* **Armed** — `/start_profile` has been called, so the profiler is now watching
+  and will write a trace. `/stop_profile` disarms it.
+
+A server can be configured but never armed, which is the most common reason a
+run finishes having written nothing.
+
 `--profiler-config.ignore_frontend true` skips the AsyncLLM frontend's CPU
 profiler; only the TPU XPlane trace is of interest here, and the CPU trace is
 pure overhead.
@@ -127,9 +137,10 @@ CAPTURE_PROFILE=1 ./scripts/vllm/benchmarking/run_benchmarks.sh \
 
 `CAPTURE_PROFILE=1` is *inferred* whenever `EXTRA_SERVE_ARGS` contains
 `--profiler-config.torch_profiler_dir`, which then also chooses the destination.
-Without that inference the server would be armed but the client would never send
-`--profile`, and the run would silently produce no traces. Set
-`CAPTURE_PROFILE=0` to opt back out.
+Without that inference the server would be configured but never armed — the
+client would not send `--profile`, so nothing would call `/start_profile` and
+the run would silently produce no traces. Set `CAPTURE_PROFILE=0` to opt back
+out.
 
 Warmup passes are never profiled. Prefer a single ISL/OSL case so the trace maps
 to one workload shape.
@@ -245,7 +256,7 @@ again. A phase that the workload never produces simply yields no subdirectory.
 | `--profiler-config.profiler torch` | Required alongside the trace directory; `ProfilerConfig` rejects the directory without it. |
 | `--profiler-config.torch_profiler_dir <dir>` | Root directory for traces. The same field the standard profiler uses — the env var only decides which profiler consumes it. |
 | `--profiler-config.max_iterations N` | Engine steps captured per phase. Upstream's default of `0` means "no limit", which is meaningless here, so the phased profiler falls back to **15** when it is unset. |
-| `--profiler-config.delay_iterations N` | Number of `decode_heavy` steps to skip before arming that phase's capture. Useful for stepping past compilation and warmup. Default `0`. Only affects `decode_heavy`. |
+| `--profiler-config.delay_iterations N` | Number of `decode_heavy` steps to skip before starting that phase's capture. Useful for stepping past compilation and warmup. Default `0`. Only affects `decode_heavy`. |
 | `--additional-config '{"phased_profiler_decode_only_kv_len_threshold": N}'` | Skip `decode_only` steps until the batch's minimum KV length reaches `N`, so the trace shows steady-state context lengths rather than the first few decodes. Default `-1` (disabled). This knob has no `profiler_config` equivalent, so it stays in `additional_config`; it is excluded from the TPU compile cache key, so setting it does not force a recompile. |
 
 `EXTRA_SERVE_ARGS` is an environment variable read by `run_benchmarks.sh` and
