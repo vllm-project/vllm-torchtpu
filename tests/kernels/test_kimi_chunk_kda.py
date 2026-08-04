@@ -362,8 +362,8 @@ def test_chunk_kda_leaves_trailing_empty_segments_at_their_initial_state(
 def test_chunk_kda_zeroes_the_padded_token_rows() -> None:
     """Output rows past the last real token must be zero, not stale.
 
-    The token axis is padded up to the runner's bucket, and those rows are
-    gathered from the aligned layout's tail on the way out.
+    The token axis is padded up to the runner's bucket. Every tile scatters only
+    the rows it owns, so nothing writes this range and it has to arrive zeroed.
     """
     num_tokens = 128
     output, expected, _, _ = _run([40, 24], num_tokens=num_tokens)
@@ -372,6 +372,56 @@ def test_chunk_kda_zeroes_the_padded_token_rows() -> None:
         np.asarray(output[:, 64:], np.float32),
         np.zeros((HEADS, num_tokens - 64, HEAD_DIM), np.float32),
     )
+
+
+@pytest.mark.parametrize(
+    "query_lens",
+    [
+        [1] * 8,  # every tile is one row of a CHUNK-row buffer
+        [3, 5, 7],  # short tiles back to back
+        [1, 130, 1],  # a one-token segment either side of a long one
+        [70, 1],  # a short trailing tile followed by one token
+    ],
+)
+def test_chunk_kda_masks_the_rows_a_tile_does_not_own(query_lens) -> None:
+    """A tile shorter than a chunk must ignore the rest of its staging buffer.
+
+    The buffer is reused across tiles and only the owned rows are DMA'd into it,
+    so the rest still holds the *previous* tile's tokens -- a different segment.
+    Those rows are masked to zero. If they were not, a short segment would mix in
+    its neighbour's tokens, and the chunk's total gate decay -- which stage 3
+    applies to the whole recurrent state -- would over-decay it.
+    """
+    output, expected_output, final_state, expected_state = _run(
+        query_lens, with_initial_state=True)
+    _assert_close(output, expected_output, rtol=3e-2, name="output")
+    _assert_close(final_state, expected_state, rtol=3e-2, name="final state")
+
+
+def test_chunk_kda_is_unchanged_by_the_size_of_the_request_bucket() -> None:
+    """Padding the request axis must not change the answer, bit for bit.
+
+    The runner fixes the request axis at startup, so the same batch is handed to
+    the kernel with a differently sized axis depending on configuration. All the
+    extra slots do is add tiles past the device-valued ``num_tiles`` bound.
+
+    This pins agreement, not cost. That padded tiles are also *cheap* -- the
+    point of the (sequence, tile) grid -- is a timing property, measured by
+    ``scripts/kernels/bench_chunk_kda.py`` rather than asserted here.
+    """
+    tight, expected, tight_state, expected_state = _run(
+        [40, 24], num_tokens=128, num_segments=2, with_initial_state=True)
+    padded, _, padded_state, _ = _run([40, 24],
+                                      num_tokens=128,
+                                      num_segments=160,
+                                      with_initial_state=True)
+    _assert_close(tight, expected, rtol=3e-2, name="output")
+    # Same segments, same tiles: the two runs must agree exactly, not merely to
+    # within the reference's tolerance.
+    np.testing.assert_array_equal(np.asarray(padded), np.asarray(tight))
+    np.testing.assert_array_equal(np.asarray(padded_state[0, :2]),
+                                  np.asarray(tight_state[0, :2]))
+    _assert_close(tight_state, expected_state, rtol=3e-2, name="final state")
 
 
 # ---------------------------------------------------------------------------
