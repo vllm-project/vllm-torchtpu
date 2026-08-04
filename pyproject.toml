@@ -33,6 +33,11 @@ dependencies = [
     # from leaking structurally incompatible pre-compiled nms operators!
     "torchvision==0.28.0",
     "torch-tpu==0.1.1.dev20260804130134",
+    # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
+    # raiden KV connector (disaggregated serving) and host KV offload. The
+    # wheel bundles one extension per supported torch ABI and dispatches to
+    # the variant matching the installed torch at import time.
+    "tpu-raiden-torch==0.0.1.dev20260807040140",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -154,3 +159,4 @@ explicit = true
 
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
+tpu-raiden-torch = { index = "torch-tpu-registry" }
