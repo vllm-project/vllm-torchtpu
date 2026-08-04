@@ -462,7 +462,8 @@ def _patch_vllm_offloading_config_build() -> None:
     """Adapt vLLM's OffloadingConfig construction to TPU PCP.
 
     ``build_offloading_config`` scales each group's ``tokens_per_block`` by
-    DCP only -- upstream has no PCP notion. TorchTPU PCP scheduler blocks
+    DCP only (it records ``pcp_size`` in the parallel config but never
+    folds PCP into block spans). TorchTPU PCP scheduler blocks
     span all PCP ranks (see ``_patch_vllm_hybrid_pcp_block_sizes``), so
     ``tokens_per_block`` must scale by PCP as well and ``tokens_per_hash``
     must come from the runtime (PCP-patched) resolve; otherwise the
@@ -774,6 +775,9 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 per_rank_lcm = math.lcm(
                     *(_effective_block_size(group.kv_cache_spec, 1)
                       for group in groups))
+                assert scheduler_block_size % per_rank_lcm == 0, (
+                    f"scheduler_block_size={scheduler_block_size} is not a "
+                    f"multiple of the per-rank block-size LCM {per_rank_lcm}")
                 pcp = max(pcp_world_size, scheduler_block_size // per_rank_lcm)
             else:
                 pcp = 1

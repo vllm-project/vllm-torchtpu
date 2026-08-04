@@ -1512,13 +1512,11 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         super().__init__(offloading_config)
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
-        parallel_config = vllm_config.parallel_config
-        context_parallel_factor = (
-            parallel_config.prefill_context_parallel_size *
-            parallel_config.decode_context_parallel_size)
-        self.gpu_block_size = tuple(
-            group.kv_cache_spec.block_size * context_parallel_factor
-            for group in kv_cache_config.kv_cache_groups)
+        # The normalized config's tokens_per_block already spans all CP
+        # ranks (DCP upstream, PCP via _patch_vllm_offloading_config_build);
+        # get_worker consumes these under the legacy attribute names.
+        self.gpu_block_size = tuple(group.tokens_per_block
+                                    for group in offloading_config.groups)
         self.block_size_factor = offloading_config.cache.blocks_per_chunk
         self._tpu_worker: TPUCPUOffloadingWorker | None = None
         # Hybrid without the unified block pool is rejected at config time
