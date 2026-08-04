@@ -168,7 +168,6 @@ printf '%q ' "${common_args[@]}" >"${RUN_DIR}/vllm_args.quoted"
 
 common_env=$(cat <<EOF
 export JAX_PLATFORMS=tpu,cpu PJRT_DEVICE=TPU TPU_BACKEND_TYPE=jax;
-export VLLM_TARGET_DEVICE=tpu;
 export VLLM_XLA_CHECK_RECOMPILATION=0;
 export USE_MOE_SPARSE_CORE=1;
 export TPUMISC_HMA_CHECKSUM_TRACE=0;
