@@ -1380,6 +1380,19 @@ class TestShmModelUid(unittest.TestCase):
             derive_shm_model_uid(self._cfg(), **{
                 **kwargs, "capacity_kernel_blocks": 999
             }))
+        # cp_geometry: empty (the pcp=1 case) must not change pre-existing
+        # UIDs — their recoverable shm segments stay valid — while an active
+        # CP layout must.
+        self.assertEqual(
+            uid, derive_shm_model_uid(self._cfg(), **kwargs, cp_geometry=()))
+        pcp_uid = derive_shm_model_uid(self._cfg(),
+                                       **kwargs,
+                                       cp_geometry=(8, 1, 1))
+        self.assertNotEqual(uid, pcp_uid)
+        self.assertNotEqual(
+            pcp_uid,
+            derive_shm_model_uid(self._cfg(), **kwargs,
+                                 cp_geometry=(8, 1, 16)))
 
 
 class TestRemoteReadFlow(unittest.TestCase):
@@ -1720,6 +1733,19 @@ class TestNamespace(unittest.TestCase):
             ns, derive_offload_namespace(cfg(), **{
                 **kwargs, "world_size": 8
             }))
+        # cp_geometry: empty (the pcp=1 case) must not change pre-existing
+        # namespaces — registry entries and shm segments outlive code
+        # upgrades — while an active CP layout must (it changes how tokens
+        # map onto each rank's pages).
+        self.assertEqual(
+            ns, derive_offload_namespace(cfg(), **kwargs, cp_geometry=()))
+        pcp_ns = derive_offload_namespace(cfg(),
+                                          **kwargs,
+                                          cp_geometry=(8, 1, 1))
+        self.assertNotEqual(ns, pcp_ns)
+        self.assertNotEqual(
+            pcp_ns,
+            derive_offload_namespace(cfg(), **kwargs, cp_geometry=(8, 1, 16)))
 
 
 class TestHybridGeometry(unittest.TestCase):

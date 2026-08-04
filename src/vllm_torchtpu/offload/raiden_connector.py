@@ -62,10 +62,10 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
+    config as offloading_config_module
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata, OffloadingWorkerMetadata, TransferJob)
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import \
-    build_offloading_config
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
     OffloadingConnectorScheduler
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
@@ -295,8 +295,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                                                                      "true"):
             os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
 
-        offloading_config = build_offloading_config(vllm_config,
-                                                    kv_cache_config)
+        # Called through the module: the PCP-aware TPU patch rebinds the
+        # module attribute, and a from-import taken before the patch ran
+        # would pin the unpatched build (rank-local tokens_per_block under
+        # PCP).
+        offloading_config = offloading_config_module.build_offloading_config(
+            vllm_config, kv_cache_config)
         spec = TPURaidenStoreOffloadingSpec(offloading_config, vllm_config,
                                             kv_cache_config)
 

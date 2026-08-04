@@ -33,7 +33,18 @@ attention+Mamba models on the TPU unified block pool, where every group's
 blocks are fungible rows of the same buffers at scheduler-block granularity
 — GPU block IDs are pool row IDs for every group, so one sub-hash mapping
 covers both. Constraints (asserted): `blocks_per_chunk == 1` (one OffloadKey
-= one scheduler GPU block), no context parallelism.
+= one scheduler GPU block), no decode context parallelism.
+
+Prefill context parallelism (PCP) is supported: the scheduler operates on
+logical blocks spanning all PCP ranks while every rank's physical page —
+and all geometry in this module — is rank-local, with scheduler block b
+mapping to each rank's local page b. `world_size` (and with it the
+registration gate, the save fanout, and the capacity math) already counts
+the PCP ranks, so the only PCP-specific pieces are the consistency net in
+the spec (the PCP-aware `build_offloading_config` patch must have scaled
+`tokens_per_block` to the logical span) and the CP geometry folded into the
+compatibility namespace. Data parallelism runs one independent V2 stack per
+engine (per-DP-rank controller port and job name).
 
 Phase-2 hardening: store jobs are batch-capped and retried once on transfer
 failure; keys that fail terminally are quarantined (reported MISS, never
@@ -78,7 +89,8 @@ import time
 from dataclasses import dataclass, field
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
+                                        KVCacheConfig)
 from vllm.v1.kv_offload.base import (CanonicalKVCaches, LoadStoreSpec,
                                      LookupResult, OffloadingEvent,
                                      OffloadingManager, OffloadingSpec,
@@ -1053,12 +1065,17 @@ class RaidenOffloadingManager(OffloadingManager):
             time.sleep(0.0005)
 
 
-def derive_offload_namespace(vllm_config: VllmConfig, *,
-                             kernel_block_size: int,
-                             per_block_shape: tuple[int, ...],
-                             kv_dtype: object, gpu_block_size: int,
-                             world_size: int, num_kv_cache_groups: int,
-                             num_kv_cache_tensors: int) -> bytes:
+def derive_offload_namespace(
+    vllm_config: VllmConfig,
+    *,
+    kernel_block_size: int,
+    per_block_shape: tuple[int, ...],
+    kv_dtype: object,
+    gpu_block_size: int,
+    world_size: int,
+    num_kv_cache_groups: int,
+    num_kv_cache_tensors: int,
+    cp_geometry: tuple[int, ...] = ()) -> bytes:
     """Compatibility namespace prefixed to every store/registry key (§4).
 
     A registry key must never match across incompatible engines: covers
@@ -1068,38 +1085,48 @@ def derive_offload_namespace(vllm_config: VllmConfig, *,
     structure, and the block-hash algorithm plus a scheme version. vLLM's
     prefix-cache hashes themselves are deterministic for every supported
     algo in the pinned 0.26.0, and already fold in LoRA/MM extras.
+
+    `cp_geometry` is `(pcp_size, dcp_size, interleave_size)` when context
+    parallelism is active (it changes how tokens map onto each rank's
+    pages) and MUST stay `()` otherwise, so existing pcp=1 namespaces are
+    unaffected by its introduction.
     """
     model_config = vllm_config.model_config
-    material = repr(
-        (model_config.model, model_config.revision, model_config.quantization,
-         str(kv_dtype), kernel_block_size, per_block_shape, gpu_block_size,
-         world_size, num_kv_cache_groups, num_kv_cache_tensors,
-         vllm_config.cache_config.prefix_caching_hash_algo,
-         "kv-offload-v2-ns1"))
+    material = repr((model_config.model, model_config.revision,
+                     model_config.quantization, str(kv_dtype),
+                     kernel_block_size, per_block_shape, gpu_block_size,
+                     world_size, num_kv_cache_groups, num_kv_cache_tensors,
+                     vllm_config.cache_config.prefix_caching_hash_algo,
+                     "kv-offload-v2-ns1") + cp_geometry)
     return hashlib.sha256(material.encode()).digest()[:16]
 
 
-def derive_shm_model_uid(vllm_config: VllmConfig,
-                         *,
-                         kernel_block_size: int,
-                         per_block_shape: tuple[int, ...],
-                         kv_dtype: object,
-                         gpu_block_size: int,
-                         world_size: int,
-                         capacity_kernel_blocks: int,
-                         key_namespace: bytes = b"") -> str:
+def derive_shm_model_uid(
+    vllm_config: VllmConfig,
+    *,
+    kernel_block_size: int,
+    per_block_shape: tuple[int, ...],
+    kv_dtype: object,
+    gpu_block_size: int,
+    world_size: int,
+    capacity_kernel_blocks: int,
+    key_namespace: bytes = b"",
+    cp_geometry: tuple[int, ...] = ()) -> str:
     """Deterministic RAIDEN_SHM_MODEL_UID for shm-backed restart recovery.
 
     Covers everything that must match for recovered host bytes to be valid —
     including the key namespace, since recovered directory hashes embed it;
     an incompatible restart therefore fails raiden's segment validation and
-    cold-starts instead of serving garbage.
+    cold-starts instead of serving garbage. `cp_geometry` follows the same
+    contract as in `derive_offload_namespace`: non-empty only under context
+    parallelism, so pcp=1 UIDs (and their recoverable segments) are
+    unaffected by its introduction.
     """
-    material = repr(
-        (vllm_config.model_config.model, vllm_config.model_config.revision,
-         str(kv_dtype), kernel_block_size, per_block_shape, gpu_block_size,
-         world_size, capacity_kernel_blocks, key_namespace,
-         "kv-offload-v2-subhash"))
+    material = repr((vllm_config.model_config.model,
+                     vllm_config.model_config.revision, str(kv_dtype),
+                     kernel_block_size, per_block_shape, gpu_block_size,
+                     world_size, capacity_kernel_blocks, key_namespace,
+                     "kv-offload-v2-subhash") + cp_geometry)
     return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
@@ -1339,8 +1366,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             "= one scheduler GPU block); got "
             f"{config.cache.blocks_per_chunk}")
         parallel = config.parallel
-        assert parallel.pcp_size == 1 and parallel.dcp_size == 1, (
-            "[kv-offload-v2] does not support context parallelism yet")
+        assert parallel.dcp_size == 1, (
+            "[kv-offload-v2] does not support decode context parallelism")
+        # PCP ranks are part of the worker world (world_size = TP*PP*PCP), so
+        # the registration gate, the save fanout, and the all-ranks capacity
+        # math below already count them.
         self.world_size = parallel.world_size
 
         # Consistency net (mirrors the V1 spec): the model-level hybrid flag
@@ -1367,6 +1397,33 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                                                    kv_cache_config)
         assert gpu_block_size % kernel_block_size == 0
         self.gpu_block_size_factor = gpu_block_size // kernel_block_size
+
+        # Consistency net for PCP: the scheduler chunks (and hashes) at the
+        # logical all-PCP-rank block span while kv_cache_config specs — and
+        # every device/host mapping in this module — are rank-local. The
+        # PCP-aware build_offloading_config patch is what scales each
+        # group's tokens_per_block to that logical span; if it did not run,
+        # OffloadKeys would cover 1/pcp of a scheduler block and every
+        # key<->block mapping would be silently wrong.
+        for group_config, group in zip(config.groups,
+                                       kv_cache_config.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, AttentionSpec):
+                assert group_config.tokens_per_block == (
+                    group.kv_cache_spec.block_size * parallel.pcp_size), (
+                        "[kv-offload-v2] offloading group tokens_per_block="
+                        f"{group_config.tokens_per_block} != rank-local "
+                        f"block_size={group.kv_cache_spec.block_size} x "
+                        f"pcp={parallel.pcp_size}; the PCP-aware "
+                        "OffloadingConfig build patch did not run")
+
+        # Folded into the namespace / shm UID only when CP is active, so
+        # pre-existing pcp=1 namespaces (registry entries, recoverable shm
+        # segments) stay valid across this code change.
+        cp_geometry: tuple[int, ...] = ()
+        if parallel.pcp_size > 1:
+            cp_geometry = (
+                parallel.pcp_size, parallel.dcp_size,
+                vllm_config.parallel_config.cp_kv_cache_interleave_size)
 
         # Bytes of one scheduler block across all ranks decide how many
         # offloaded blocks the host budget holds; capacity and the workers'
@@ -1408,6 +1465,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             world_size=self.world_size,
             num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
             num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
+            cp_geometry=cp_geometry,
         )
 
         # Restart recovery: RAIDEN_SHM_KEY (recipe-set) moves the workers'
@@ -1431,7 +1489,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     gpu_block_size=gpu_block_size,
                     world_size=self.world_size,
                     capacity_kernel_blocks=self.capacity_kernel_blocks,
-                    key_namespace=self.key_namespace))
+                    key_namespace=self.key_namespace,
+                    cp_geometry=cp_geometry))
             logger.info(
                 "[kv-offload-v2] shm recovery enabled: RAIDEN_SHM_KEY=%s "
                 "RAIDEN_SHM_MODEL_UID=%s", os.environ["RAIDEN_SHM_KEY"],
@@ -1443,16 +1502,17 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # engine past the first would fail its controller bind. The workers
         # of an engine see the same parallel config, so they derive the same
         # address.
-        dp_rank = vllm_config.parallel_config.data_parallel_rank_local
-        if dp_rank is None:
-            dp_rank = vllm_config.parallel_config.data_parallel_rank
+        dp_rank = vllm_config.parallel_config.data_parallel_rank
+        dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
+        if dp_rank_local is None:
+            dp_rank_local = dp_rank
         if (vllm_config.parallel_config.data_parallel_size > 1
                 and os.environ.get("RAIDEN_SHM_KEY")):
             raise ValueError(
                 "[kv-offload-v2] shm restart recovery (RAIDEN_SHM_KEY) is "
                 "not supported with data parallelism: DP-local engines "
                 "would collide on the per-host shm segment names")
-        self.raiden_controller_port = dp_rank + int(
+        self.raiden_controller_port = dp_rank_local + int(
             self.extra_config.get("raiden_controller_port",
                                   _DEFAULT_CONTROLLER_PORT))
         # With store_server_ip set, the store binds its controller on that
@@ -1464,6 +1524,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.raiden_job_name = str(
             self.extra_config.get("raiden_job_name",
                                   f"vllm-offload-{config.engine_id}"))
+        # Suffix by the GLOBAL DP rank: with multi-node DP every node's
+        # first engine has local rank 0, so a local-rank suffix would give
+        # replicas sharing a recipe-set job name identical RaidenIds — and
+        # colliding global-registry entries (phase 4).
         if dp_rank:
             self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
 
