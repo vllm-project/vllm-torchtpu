@@ -259,10 +259,16 @@ class RaidenOffloadingManager(OffloadingManager):
         # peer-reachable store_server_ip (raiden logs the asymmetry too).
         self._enable_global = bool(global_registry_address)
         if self._enable_global and not store_server_ip:
-            logger.warning(
+            # KVCacheStore::Create now requires a dialable store_server_ip,
+            # so the old consume-only degradation (empty ip, no publishes)
+            # cannot be expressed anymore — and falling back to 127.0.0.1
+            # would publish an address peers cannot dial. Fail loudly; the
+            # recipe must pass the pod IP.
+            raise ValueError(
                 "[kv-offload-v2] global registry configured without "
-                "store_server_ip: this replica consumes remote KV but "
-                "publishes nothing (peers cannot discover it).")
+                "store_server_ip: peers could never dial this replica. "
+                "Set store_server_ip to the pod IP in "
+                "kv_connector_extra_config.")
 
         if store is None:
             # Bind the native extension rather than
@@ -290,7 +296,14 @@ class RaidenOffloadingManager(OffloadingManager):
                 raiden_controller_port=raiden_controller_port,
                 global_registry_address=global_registry_address,
                 raiden_orchestrator_address=raiden_orchestrator_address,
-                store_server_ip=store_server_ip,
+                # KVCacheStore::Create rejects an empty store_server_ip and
+                # names 127.0.0.1 as the same-host value. Only registry runs
+                # have a real peers-dial-this address (the pod IP from the
+                # recipe); local-only stores never publish, so localhost is
+                # exact there. Keep the raw value in self.store_server_ip
+                # checks above: a registry run that FORGOT the pod IP must
+                # keep warning, not silently publish 127.0.0.1 to peers.
+                store_server_ip=store_server_ip or "127.0.0.1",
             )
             logger.info(
                 "[kv-offload-v2] KVCacheStore up: capacity=%d kernel blocks "
