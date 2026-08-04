@@ -61,8 +61,108 @@ def _apply_scoring_fn(scoring_fn: str,
         return scores.softmax(dim=-1)
     if scoring_fn == "sigmoid":
         return scores.sigmoid()
+    if scoring_fn == "sqrtsoftplus":
+        import torch.nn.functional as F
+        return torch.sqrt(F.softplus(scores))
     raise NotImplementedError(
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
+
+
+def _sqrtsoftplus_grouped_topk(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DeepSeek-V4-only grouped top-k for scoring_func="sqrtsoftplus".
+
+    vLLM's own ``grouped_topk_router.grouped_topk`` only supports
+    softmax/sigmoid scoring (raises ``ValueError`` otherwise) -- this covers
+    the one real gap for DSV4's MegaMoE gate, which defaults to sqrtsoftplus.
+    The group-selection math below otherwise mirrors vLLM's implementation
+    exactly (same masking/topk structure), so this should stay in sync with
+    it and not be used for any other scoring function.
+    """
+    scores = torch.sqrt(torch.nn.functional.softplus(gating_output.float()))
+
+    num_token = scores.shape[0]
+    num_experts = scores.shape[-1]
+    experts_per_group = num_experts // num_expert_group
+
+    if e_score_correction_bias is not None:
+        original_scores = scores
+        scores = scores + e_score_correction_bias.unsqueeze(0)
+        group_scores = (scores.view(num_token, num_expert_group,
+                                    experts_per_group).topk(
+                                        2, dim=-1)[0].sum(dim=-1))
+    else:
+        group_scores = (scores.view(num_token, num_expert_group,
+                                    experts_per_group).max(dim=-1).values
+                        )  # [n, n_group]
+
+    use_sorted = getattr(envs, "VLLM_BATCH_INVARIANT", False)
+    group_idx = torch.topk(group_scores,
+                           k=topk_group,
+                           dim=-1,
+                           sorted=use_sorted)[1]  # [n, top_k_group]
+    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+
+    score_mask = (group_mask.unsqueeze(-1).expand(num_token, num_expert_group,
+                                                  experts_per_group).reshape(
+                                                      num_token,
+                                                      num_experts))  # [n, e]
+    tmp_scores = scores.masked_fill(~score_mask.bool(),
+                                    float("-inf"))  # [n, e]
+
+    if e_score_correction_bias is not None:
+        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+        topk_weights = original_scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(tmp_scores,
+                                            k=topk,
+                                            dim=-1,
+                                            sorted=use_sorted)
+
+    if renormalize:
+        topk_weights = topk_weights / torch.clamp(
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-6)
+
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _hash_moe_select(
+    scores: torch.Tensor,
+    hash_indices_table: torch.Tensor,
+    input_ids: torch.Tensor,
+    renormalize: bool,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DeepSeek-V4-only hash-routed MoE: expert ids fixed per token id.
+
+    Some of the reference model's early layers route by a static
+    token-id -> expert-id table (``hash_indices_table``, populated from the
+    checkpoint's ``gate.tid2eid``) instead of a learned top-k gate. This has
+    no vLLM-mainline equivalent -- it's a DeepSeek-V4-specific MoE variant.
+    """
+    flat_input_ids = input_ids.long().flatten()
+    topk_ids = hash_indices_table[flat_input_ids].long()
+    target_shape = list(scores.shape)
+    target_shape[-1] = topk_ids.shape[-1]
+    topk_ids = topk_ids.reshape(target_shape)
+    topk_weights = scores.gather(-1, topk_ids)
+
+    if renormalize:
+        topk_weights = topk_weights / torch.clamp(
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights, topk_ids
 
 
 def select_experts(
@@ -73,32 +173,86 @@ def select_experts(
     renormalize: bool,
     scoring_fn: str,
     layer=None,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute local routed ids/weights for the non-EP path."""
+    """Compute local routed ids/weights for the non-EP path.
+
+    Dispatch order: DeepSeek-V4's hash-routed MoE layers first (no mainline
+    equivalent), then vLLM's own grouped-topk path for the common case,
+    falling back to the DSV4-only sqrtsoftplus variant only when that
+    specific scoring function is requested (vLLM's ``grouped_topk`` doesn't
+    support it). This keeps every non-DSV4 model on vLLM's real, shared
+    implementation instead of a shadowing copy.
+    """
     # Profiling-only override; a no-op unless FORCE_MOE_RANDOM_ROUTING is set.
     router_logits = maybe_force_random_routing(router_logits)
-    if layer is not None and layer.use_grouped_topk:
-        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
-            grouped_topk
-        topk_weights, topk_ids = grouped_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=topk,
-            renormalize=renormalize,
-            num_expert_group=layer.num_expert_group,
-            topk_group=layer.topk_group,
-            scoring_func=scoring_fn,
-            routed_scaling_factor=layer.routed_scaling_factor,
-            e_score_correction_bias=layer.e_score_correction_bias,
+
+    hash_indices_table = getattr(layer, "hash_indices_table",
+                                 None) if layer is not None else None
+    if hash_indices_table is not None and input_ids is not None:
+        scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+        routed_scaling_factor = getattr(layer, "routed_scaling_factor", 1.0)
+        topk_weights, topk_ids = _hash_moe_select(
+            scores,
+            hash_indices_table,
+            input_ids,
+            renormalize,
+            routed_scaling_factor,
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
-        scoring_fn, router_logits),
-                                        k=topk,
-                                        dim=-1)
+    if layer is not None and layer.use_grouped_topk:
+        if scoring_fn == "sqrtsoftplus":
+            topk_weights, topk_ids = _sqrtsoftplus_grouped_topk(
+                gating_output=router_logits,
+                topk=topk,
+                renormalize=renormalize,
+                num_expert_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                routed_scaling_factor=layer.routed_scaling_factor,
+                e_score_correction_bias=layer.e_score_correction_bias,
+            )
+        else:
+            from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
+                grouped_topk
+            topk_weights, topk_ids = grouped_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=topk,
+                renormalize=renormalize,
+                num_expert_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                scoring_func=scoring_fn,
+                routed_scaling_factor=layer.routed_scaling_factor,
+                e_score_correction_bias=layer.e_score_correction_bias,
+            )
+        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
+    # Non-grouped path. e_score_correction_bias/routed_scaling_factor are
+    # optional attributes most callers don't set (getattr defaults make this
+    # identical to mainline's plain torch.topk when they're absent); DSV4's
+    # non-grouped, non-hash MoE layers are the ones that set them.
+    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+    e_score_correction_bias = getattr(layer, "e_score_correction_bias",
+                                      None) if layer is not None else None
+
+    if e_score_correction_bias is not None:
+        bias_shape = [1] * (scores.dim() - 1) + [-1]
+        bias = e_score_correction_bias.float().view(bias_shape)
+        scores_for_choice = scores + bias
+        _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
+        topk_weights = scores.gather(-1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / torch.clamp(
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
+    routed_scaling_factor = getattr(layer, "routed_scaling_factor",
+                                    1.0) if layer is not None else 1.0
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
