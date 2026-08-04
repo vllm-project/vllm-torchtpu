@@ -38,6 +38,7 @@ from vllm.model_executor.layers.attention import (Attention,
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
@@ -837,6 +838,18 @@ class TPUModelRunner(GPUModelRunner):
                 spec = attn_module.get_kv_cache_spec(self.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
+            # DSV4-style custom cache modules (e.g. VllmDeepseekV4SWACache,
+            # VllmCompressorStateCache) declare their own KV-cache spec
+            # without being vLLM Attention/MLAAttention subclasses.
+            # MLAAttention must stay excluded here: it also defines
+            # get_kv_cache_spec and is not an Attention subclass, but it has
+            # its own dedicated branch below (hybrid MLA/Mamba cache sizing)
+            # that this branch would otherwise shadow.
+            elif (not isinstance(attn_module, (Attention, MLAAttention))
+                  and hasattr(attn_module, "get_kv_cache_spec")):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
                 if (kv_tgt_layer :=
@@ -1060,6 +1073,55 @@ class TPUModelRunner(GPUModelRunner):
                     f"{target_layer_name}, but the target cache was not "
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+    def _alias_ds_v4_compressor_state_caches(
+            self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Point each DeepSeek-V4 compressor state cache at its host's tensor.
+
+        The compressor kernel writes its per-token f32 state and the
+        compressed KV through one physical buffer, addressed by two disjoint
+        block tables (state-cache granularity vs. main/indexer granularity;
+        see `deepseek_v4_compressor.py`). `VllmCompressorStateCache` keeps a
+        real `KVCacheSpec` (its own `kv_cache_group`, its own `block_size`,
+        e.g. 4/8) so vLLM's scheduler still allocates page-indices for it
+        normally -- this is a pure physical-tensor swap done *after* the
+        normal per-spec allocation above, not a group/metadata merge. (An
+        earlier version of this fix tried routing compressor state caches
+        through vLLM's generic `kv_sharing_target_layer_name` /
+        `shared_kv_cache_layers` mechanism instead; that also merges the
+        layer into the host's `kv_cache_group`, which means one shared
+        `AttentionMetadataBuilder` computes attention metadata for *both*
+        layer names using the host's `block_size` -- silently discarding the
+        state cache's own, much finer-grained addressing. Don't repeat that.)
+        Mirrors tpu-inference's `_initialize_ds_v4_kv_cache` overlay step
+        (`tpu_inference/runner/kv_cache_manager.py`), which does the same
+        name-derived index reassignment for the same reason (JAX arrays
+        can't be byte-offset views into vLLM's packed KV-cache-tensor slab,
+        so nothing merges these physically without an explicit alias step).
+        """
+        static_forward_context = (
+            self.vllm_config.compilation_config.static_forward_context)
+        state_suffix = ".compressor.state_cache"
+        for layer_name in list(kv_caches.keys()):
+            attn_module = static_forward_context.get(layer_name)
+            if not isinstance(attn_module, CompressorStateCache):
+                continue
+            assert layer_name.endswith(state_suffix), layer_name
+            base = layer_name[:-len(state_suffix)]
+            # `DeepseekCompressor.k_cache_prefix` is the owning attention
+            # layer's own prefix for the main (head_dim=512) compressor, and
+            # the indexer's own `k_cache` prefix for the indexer
+            # (head_dim=128) compressor -- mirror that naming here.
+            host_layer_name = base + ".k_cache" if base.endswith(
+                ".indexer") else base
+            if host_layer_name not in kv_caches:
+                raise ValueError(
+                    "DeepSeek-V4 compressor state cache has no "
+                    "compressed-KV layer to overlay: "
+                    f"state_cache={layer_name!r}, expected KV layer "
+                    f"{host_layer_name!r}, known layers="
+                    f"{sorted(kv_caches.keys())}")
+            kv_caches[layer_name] = kv_caches[host_layer_name]
 
     def _update_attention_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
@@ -4358,9 +4420,17 @@ class TPUModelRunner(GPUModelRunner):
             self._initialize_unified_kv_cache(kv_cache_config)
             return
 
-        attn_block_size = None
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                # DeepSeek-V4-style grouped spec: peek at a representative
+                # per-layer spec for type detection. All layers within one
+                # UniformTypeKVCacheSpecs group share the same spec type and
+                # block_size by construction, but different groups can have
+                # different block sizes (e.g. DSV4's full-MLA group vs. its
+                # several SWA sub-groups), so we don't enforce a single
+                # block_size across groups here.
+                spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
                 # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
                 continue
@@ -4369,11 +4439,6 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
                 )
-
-            block_size = spec.block_size
-            if attn_block_size is None:
-                attn_block_size = block_size
-            assert attn_block_size == block_size, "Block size across attention groups must be the same."
 
         block_sizes = [
             group.kv_cache_spec.block_size
@@ -4442,7 +4507,9 @@ class TPUModelRunner(GPUModelRunner):
             # single layer's KV cache spec.
             tensor_size = kv_cache_tensor.size
             shared_by = kv_cache_tensor.shared_by
-            if len(shared_by) > 1:
+            if len(shared_by) > 1 and any(
+                    isinstance(layer_name_to_spec[name], MambaSpec)
+                    for name in shared_by):
                 total_group_page_size = 0
                 for name in shared_by:
                     spec = layer_name_to_spec[name]
@@ -4468,6 +4535,20 @@ class TPUModelRunner(GPUModelRunner):
                     else:
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
+            elif len(shared_by) > 1:
+                # Non-Mamba multi-layer sharing (e.g. DeepSeek-V4's
+                # page-size-bucketed groups from vLLM's packed allocator):
+                # `kv_cache_tensor.size` here is NOT this group's own byte
+                # allocation -- `_get_kv_cache_config_packed` sets
+                # `size=total_size` (the sum across every emitted
+                # KVCacheTensor) on each tensor it emits, since they all
+                # alias one shared, block-strided backing buffer. Dividing
+                # that global total by one bucket's page size inflates
+                # `num_blocks` (~193x on a real DSV4 run -> spurious HBM
+                # OOM). The correct, override-respecting global block count
+                # is `kv_cache_config.num_blocks`, same as the single-layer
+                # branch.
+                num_blocks = kv_cache_config.num_blocks
             else:
                 num_blocks = kv_cache_config.num_blocks
 
@@ -4534,6 +4615,7 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     raise NotImplementedError
 
+        self._alias_ds_v4_compressor_state_caches(kv_caches)
         self._add_shared_kv_cache_aliases(kv_caches)
 
         # Mark KV cache buffers as donation candidates outside torch.compile
