@@ -36,7 +36,7 @@ scaling.
 4. WEIGHT LOADING:
    - Weights are loaded from safetensors/checkpoint
    - VllmMxfp4MoEMethod.process_weights_after_loading() is called
-   - A Pallas custom op converts packed E2M1 and E8M0 scales to the GMM layout
+   - Dequantizes MXFP4 -> FP32 -> re-quantizes for TPU kernel
 
 5. INFERENCE:
    - VllmMxfp4MoEMethod.apply() is called with input tensor
@@ -69,10 +69,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 
 from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
+from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
-                                                 get_fused_moe_activation,
-                                                 load_kmajor_mxfp4,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
@@ -141,6 +140,12 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
         return None
 
 
+def _get_activation_str(activation) -> str:
+    """Convert MoEActivation enum or string to plain string."""
+    return activation.value if hasattr(activation,
+                                       'value') else str(activation)
+
+
 class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     """
     TPU-specific implementation of MXFP4 MoE quantization.
@@ -152,6 +157,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     Inherits from Mxfp4MoEMethod to reuse its create_weights() method,
     but bypasses its __init__ to avoid the GPU backend assertion.
     """
+    # Upstream Mxfp4MoEMethod.__init__ defines is_k3_situ_aiter for GPU AITER kernels.
+    # Since __init__ is bypassed on TPU, explicitly define it here as False.
+    is_k3_situ_aiter: bool = False
 
     @property
     def is_monolithic(self) -> bool:
@@ -168,78 +176,38 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
+        assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
-        activation_str = get_fused_moe_activation(layer.activation,
-                                                  layer.moe_config)
+        activation_str = _get_activation_str(layer.activation)
         layer._tpu_activation_str = activation_str
-        if not hasattr(layer, "w13_bias"):
-            layer.w13_bias = None
-        if not hasattr(layer, "w2_bias"):
-            layer.w2_bias = None
 
-        w13_weight = layer.w13_weight.data
-        w13_scale = layer.w13_weight_scale.data
-        w2_weight = layer.w2_weight.data
-        w2_scale = layer.w2_weight_scale.data
-
-        for name, weight, scale in (("w13", w13_weight, w13_scale),
-                                    ("w2", w2_weight, w2_scale)):
-            if weight.dtype != torch.uint8 or scale.dtype != torch.uint8:
-                raise TypeError(
-                    f"{name} MXFP4 weight and scale must both be uint8; got "
-                    f"{weight.dtype} and {scale.dtype}.")
-            if weight.ndim != 3 or scale.ndim != 3:
-                raise ValueError(
-                    f"{name} MXFP4 weight and scale must be rank 3; got "
-                    f"{tuple(weight.shape)} and {tuple(scale.shape)}.")
-            if weight.shape[:2] != scale.shape[:2]:
-                raise ValueError(
-                    f"{name} MXFP4 output dimensions do not match: "
-                    f"{tuple(weight.shape)} vs {tuple(scale.shape)}.")
-            if weight.shape[-1] * 2 != scale.shape[-1] * 32:
-                raise ValueError(
-                    f"{name} MXFP4 needs one scale per 32 weights: "
-                    f"{tuple(weight.shape)} vs {tuple(scale.shape)}.")
+        w13_weight = dequantize_mxfp4_packed(
+            layer.w13_weight.data.to("cpu"),
+            layer.w13_weight_scale.data.to("cpu"),
+            axis=-1,
+            out_dtype=torch.bfloat16,
+        ).to(layer.w13_weight.device)
+        w2_weight = dequantize_mxfp4_packed(
+            layer.w2_weight.data.to("cpu"),
+            layer.w2_weight_scale.data.to("cpu"),
+            axis=-1,
+            out_dtype=torch.bfloat16,
+        ).to(layer.w2_weight.device)
 
         w13_interleave = activation_str == "swigluoai"
         if w13_interleave:
-            w13_weight = torch.cat(
-                [w13_weight[:, ::2, :], w13_weight[:, 1::2, :]], dim=1)
-            w13_scale = torch.cat(
-                [w13_scale[:, ::2, :], w13_scale[:, 1::2, :]], dim=1)
+            w1_weight = w13_weight[:, ::2, :]
+            w3_weight = w13_weight[:, 1::2, :]
+            w13_weight = torch.cat([w1_weight, w3_weight], dim=1)
 
-        w13_input_shape = tuple(w13_weight.shape)
-        w2_input_shape = tuple(w2_weight.shape)
-        w13_weight, w13_scale = load_kmajor_mxfp4(w13_weight, w13_scale)
-        w2_weight, w2_scale = load_kmajor_mxfp4(w2_weight, w2_scale)
-
-        native_fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        for name, weight, scale, input_shape in (
-            ("w13", w13_weight, w13_scale, w13_input_shape),
-            ("w2", w2_weight, w2_scale, w2_input_shape),
-        ):
-            expected_weight_shape = (input_shape[0], input_shape[2] * 2,
-                                     input_shape[1] // 2)
-            expected_scale_shape = (input_shape[0], input_shape[2] // 16, 1,
-                                    input_shape[1])
-            if weight.dtype != native_fp4_dtype or tuple(
-                    weight.shape) != expected_weight_shape:
-                raise RuntimeError(
-                    f"{name} native MXFP4 output must be packed "
-                    f"{expected_weight_shape} {native_fp4_dtype}; got "
-                    f"{tuple(weight.shape)} {weight.dtype}.")
-            if scale.dtype != torch.float32 or tuple(
-                    scale.shape) != expected_scale_shape:
-                raise RuntimeError(f"{name} MXFP4 scale output must be "
-                                   f"{expected_scale_shape} float32; got "
-                                   f"{tuple(scale.shape)} {scale.dtype}.")
+        w13_weight = w13_weight.transpose(1, 2).contiguous()
+        w2_weight = w2_weight.transpose(1, 2).contiguous()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale,
-                                                    requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale,
-                                                   requires_grad=False)
+
+        layer.w13_weight_scale = None
+        layer.w2_weight_scale = None
 
         if layer.w13_bias is not None:
             w13_bias = layer.w13_bias.data
@@ -261,21 +229,14 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         if layer.w13_weight.device.type == "tpu":
             sync.synchronize(layer.w13_weight, wait=True)
             sync.synchronize(layer.w2_weight, wait=True)
-            sync.synchronize(layer.w13_weight_scale, wait=True)
-            sync.synchronize(layer.w2_weight_scale, wait=True)
             if layer.w13_bias is not None:
                 sync.synchronize(layer.w13_bias, wait=True)
             if layer.w2_bias is not None:
                 sync.synchronize(layer.w2_bias, wait=True)
 
         logger.info_once(
-            "MXFP4 MoE weights prepared for TPU GMM: "
-            f"w13={list(layer.w13_weight.shape)} ({layer.w13_weight.dtype}), "
-            f"w2={list(layer.w2_weight.shape)} ({layer.w2_weight.dtype}), "
-            f"w13_scale={list(layer.w13_weight_scale.shape)} "
-            f"({layer.w13_weight_scale.dtype}), "
-            f"w2_scale={list(layer.w2_weight_scale.shape)} "
-            f"({layer.w2_weight_scale.dtype}).")
+            "MXFP4 weights dequantized to bfloat16 and transposed for GMM kernel."
+        )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(
@@ -302,7 +263,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str

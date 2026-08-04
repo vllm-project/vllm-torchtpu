@@ -168,8 +168,13 @@ def test_mxfp4_expert_weight_loader_rebinds_packed_checkpoint_name() -> None:
     )]
 
 
+@pytest.mark.parametrize(
+    ("min_per_partition", "expected_intermediate", "expected_unpadded"),
+    [(None, 1024, None), (256, 2048, 128)],
+)
 def test_small_experts_use_current_padded_weight_location(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, min_per_partition: int | None,
+        expected_intermediate: int, expected_unpadded: int | None) -> None:
 
     class FakeGate(nn.Module):
 
@@ -210,16 +215,62 @@ def test_small_experts_use_current_padded_weight_location(
         num_shared_experts=1,
         moe_intermediate_size=1024,
     )
+    if min_per_partition is not None:
+        config.min_moe_intermediate_per_partition = min_per_partition
     layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
 
-    assert fused_moe_args["intermediate_size"] == 2048
+    assert fused_moe_args["intermediate_size"] == expected_intermediate
     assert "activation_situ_beta" not in fused_moe_args
     assert "activation_situ_linear_beta" not in fused_moe_args
     assert layer.experts.moe_config.activation_situ_beta is None
     assert layer.experts.moe_config.activation_situ_linear_beta is None
-    assert layer.experts.moe_config.intermediate_size_per_partition_unpadded == 128
-    assert not layer.experts.routed_experts.w13_weight.any()
-    assert not layer.experts.routed_experts.w2_weight.any()
+    assert (layer.experts.moe_config.intermediate_size_per_partition_unpadded
+            == expected_unpadded)
+    expect_zero = expected_unpadded is not None
+    assert bool(layer.experts.routed_experts.w13_weight.any()) != expect_zero
+    assert bool(layer.experts.routed_experts.w2_weight.any()) != expect_zero
+
+
+def test_expert_parallelism_keeps_native_intermediate_size(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class FakeGate(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    class FakeRunner(nn.Module):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.routed_experts = nn.Module()
+            self.moe_config = SimpleNamespace()
+
+    fused_moe_args = {}
+
+    def fake_fused_moe(**kwargs):
+        fused_moe_args.update(kwargs)
+        return FakeRunner()
+
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(
+        enable_expert_parallel=True))
+    monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none",
+                        lambda: vllm_config)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: 8)
+    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        hidden_act="silu",
+        num_experts=8,
+        num_experts_per_token=2,
+        num_shared_experts=0,
+        moe_intermediate_size=1024,
+    )
+    kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+
+    assert fused_moe_args["intermediate_size"] == 1024
 
 
 def test_situ_moe_uses_tpu_activation_descriptor(

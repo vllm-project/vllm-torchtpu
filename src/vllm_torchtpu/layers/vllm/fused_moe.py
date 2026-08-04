@@ -22,14 +22,12 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.fused_moe_gmm import (fused_moe_func,
                                                        requant_unpack_kmajor,
-                                                       unpack_fp4_to_e2m1,
-                                                       unpack_mxfp4_to_kmajor)
+                                                       unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, Optional[int], Any],
                               Callable] = {}
 _load_kmajor_fp4_op = None
-_load_kmajor_mxfp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 
 
@@ -62,24 +60,6 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
         _load_kmajor_fp4_op = pallas.jax_op("pallas::nvfp4_load_kmajor",
                                             unpack_fp4_to_e2m1)
     return _load_kmajor_fp4_op(w_u8)
-
-
-def load_kmajor_mxfp4(
-        w_u8: torch.Tensor,
-        scale_u8: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """One-time MXFP4 checkpoint transform for the TPU GMM kernel.
-
-    ``w_u8`` is packed E2M1 ``[..., N, K/2]`` and ``scale_u8`` is E8M0
-    ``[..., N, K/32]``. The Pallas op returns native E2M1 with logical shape
-    ``[..., K, N]`` and FP32 scales ``[..., K/32, 1, N]``. Torch stores the
-    E2M1 result with its last dimension packed two-per-byte; the scale keeps
-    logical ``N``. Both outputs are passed directly to ``gmm_v2`` at inference.
-    """
-    global _load_kmajor_mxfp4_op
-    if _load_kmajor_mxfp4_op is None:
-        _load_kmajor_mxfp4_op = pallas.jax_op("pallas::mxfp4_load_kmajor",
-                                              unpack_mxfp4_to_kmajor)
-    return _load_kmajor_mxfp4_op(w_u8, scale_u8)
 
 
 def requant_load_kmajor_fp4(w_u8: torch.Tensor, scale_f: torch.Tensor,
@@ -146,7 +126,8 @@ def _build_fused_moe_custom_op(
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
-        rhs_quant_dtype=rhs_quant_dtype)
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 

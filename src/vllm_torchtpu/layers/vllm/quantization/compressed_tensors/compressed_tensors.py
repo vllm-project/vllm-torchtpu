@@ -46,10 +46,23 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _is_fp8_scheme(weight_quant: Optional[QuantizationArgs]) -> bool:
+def _is_weight_fp8(weight_quant: Optional[QuantizationArgs]) -> bool:
     return (weight_quant is not None
             and weight_quant.type == QuantizationType.FLOAT
             and weight_quant.num_bits == 8)
+
+
+def _is_int4_w4aN(weight_quant: Optional[QuantizationArgs]) -> bool:
+    if weight_quant is None:
+        return False
+    is_int4_weight = (int(weight_quant.num_bits) == 4
+                      and weight_quant.type == QuantizationType.INT)
+    is_group_or_channel_weight = weight_quant.strategy in [
+        QuantizationStrategy.GROUP, QuantizationStrategy.CHANNEL
+    ]
+    is_static_weight = not weight_quant.dynamic
+
+    return is_int4_weight and is_group_or_channel_weight and is_static_weight
 
 
 def _build_fp8_config(
@@ -188,7 +201,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 # This is a bypass way of handling FP8 as a compressed tensors method for this is
                 # not implemented yet in vllm-torchtpu (unlike tpu_inference). Since this was an
                 # existing code, it has been moved here to ensure backward compatibility
-                if _is_fp8_scheme(weight_quant):
+                if _is_weight_fp8(weight_quant):
                     return _build_fp8_linear_method(layer, weight_quant,
                                                     input_quant)
 

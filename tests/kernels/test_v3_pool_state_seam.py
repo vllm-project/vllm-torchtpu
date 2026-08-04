@@ -95,33 +95,6 @@ class TestV3StateSourcePlan:
             _plan(conv_tok0=KBS - 8)
 
 
-class TestRowRegrouping:
-    """CPU checks that the kernel-side row regrouping equals a row-major
-    reshape — the conv region is a row-major byte dump, so this is what
-    makes the seam's conv view line up with the adapters' bytes."""
-
-    def test_regroup_rows_is_row_major_reshape(self):
-        from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
-        arr = jnp.arange(CONV_ROWS * LANES,
-                         dtype=jnp.float32).reshape(CONV_ROWS, LANES)
-        wide = vmem_ldst._regroup_rows(arr, DIM)
-        assert wide.shape == (KERNEL_SIZE - 1, DIM)
-        assert jnp.array_equal(wide, arr.reshape(KERNEL_SIZE - 1, DIM))
-
-    def test_split_rows_inverts_regroup(self):
-        from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
-        arr = jnp.arange(CONV_ROWS * LANES,
-                         dtype=jnp.float32).reshape(CONV_ROWS, LANES)
-        wide = vmem_ldst._regroup_rows(arr, DIM)
-        assert jnp.array_equal(vmem_ldst._split_rows(wide, LANES), arr)
-
-    def test_same_width_is_identity(self):
-        from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
-        arr = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
-        assert vmem_ldst._regroup_rows(arr, 128) is arr
-        assert vmem_ldst._split_rows(arr, 128) is arr
-
-
 def test_v3_kernel_package_stays_pool_agnostic():
     """The dense path must be byte-for-byte untouched by the seam: the V3
     kernel package sees only the generic state-source plan, never the

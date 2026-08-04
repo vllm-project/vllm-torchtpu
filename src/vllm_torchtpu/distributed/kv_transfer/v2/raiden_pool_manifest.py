@@ -32,6 +32,8 @@ import dataclasses
 import math
 from typing import Any, Mapping, Sequence
 
+from vllm_torchtpu import envs as tpu_envs
+
 from .common import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
 BINDING_PRIVATE_TYPED = "private_typed"
@@ -303,6 +305,28 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
     row_stride = local_dim * itemsize
     key_bytes = geometry.key_head_dim * itemsize
     value_bytes = geometry.value_head_dim * itemsize
+    qk_bytes = 2 * geometry.local_key_heads * key_bytes
+    if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
+        # QK pair-blocked layout: the rank-local Q and K rows share whole
+        # pool tokens ([Q-pair, K-pair] per token), so the transferable
+        # unit is the combined QK block followed by the V block — two
+        # contiguous extents per tap.  Full-width states store the rank
+        # blocks in rank order, which the pooled kernel's rows_perm maps
+        # back to the logical [Q | K | V] row order.
+        return (
+            RegionSpec(name="gdn_conv_qk",
+                       offset_bytes=0,
+                       stride_bytes=row_stride,
+                       unit_bytes=qk_bytes,
+                       num_units=taps,
+                       units_per_stride=1),
+            RegionSpec(name="gdn_conv_v",
+                       offset_bytes=qk_bytes,
+                       stride_bytes=row_stride,
+                       unit_bytes=value_bytes,
+                       num_units=taps,
+                       units_per_stride=geometry.local_value_heads),
+        )
     q_offset = 0
     k_offset = geometry.local_key_heads * key_bytes
     v_offset = 2 * geometry.local_key_heads * key_bytes

@@ -228,6 +228,21 @@ def test_cache_hit_resume_copies_from_checkpoint():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
 
 
+def test_cache_hit_uses_mamba_group_block_size():
+    mamba_block_size = 768
+    fake, _ = _make_self(["b"], [2 * mamba_block_size],
+                         [[[5, 6, 7, 8, 9, 10]]],
+                         state_block_size=mamba_block_size)
+    # The runner's constructor-time attention scalars can still contain the
+    # input value after the platform derives the physical Mamba geometry.
+    fake.block_size = 16
+
+    _collect(fake, _sched({"b": mamba_block_size}))
+
+    assert fake._mamba_state_pos["b"] == 2
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7)]
+
+
 def test_decode_within_block_no_copy():
     fake, _ = _make_self(["a"], [3 * BLOCK_SIZE - 1], [[[5, 6, 7, 8]]],
                          state_pos={"a": 2})

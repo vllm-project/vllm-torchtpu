@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
+    TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_MOE_SKIP_PADDED_TOKENS: bool = False
 
 
 def env_with_choices(
@@ -113,6 +115,17 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # QK pair-blocked pooled GDN conv layout: full-width states interleave
+    # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
+    # to one whole destination pool token (2 contiguous transfer spans per
+    # rank per state group).  Identity for head-shard states.  Must match
+    # across a disagg pair; the value rides the raiden layout fingerprint.
+    # Resolution is layered (see env_override.py): an explicitly set
+    # value always wins; otherwise raiden runs derive it from
+    # TPU_RAIDEN_TRANSFER_PARALLELISM (enabled iff >= 8, and 8 is that
+    # variable's default — so it is on by default under raiden).
+    "TPU_GDN_CONV_QK_PAIR_LAYOUT":
+    env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),
@@ -257,11 +270,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
-
     # Most model length cap for TPU compile bucketing
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
+    # Skip padded tokens from MoE, otherwise they will route like
+    # real tokens and activate experts whose output is thrown away.
+    "TPU_MOE_SKIP_PADDED_TOKENS":
+    env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
 }
 
 

@@ -6,6 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+from vllm_torchtpu.kernels.kimi_k3.chunk_kda import chunk_kda
 from vllm_torchtpu.kernels.kimi_k3.kda import kda_step, ragged_kda
 
-__all__ = ["kda_step", "ragged_kda"]
+__all__ = ["chunk_kda", "kda_step", "ragged_kda"]

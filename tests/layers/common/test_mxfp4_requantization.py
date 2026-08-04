@@ -41,8 +41,6 @@ import torch
 from vllm_torchtpu.layers.common.quantization import (  # isort: skip
     dequantize_mxfp4_packed, e8m0_to_fp32, fp4_indices_to_float,
     pack_fp4_indices, quantize_tensor_to_fp4, unpack_uint8_to_fp4)
-from vllm_torchtpu.layers.common.fused_moe_gmm import (  # isort: skip
-    unpack_mxfp4_to_kmajor)
 
 # ============================================================================
 # JAX REFERENCE IMPLEMENTATION (from legacy vllm_torchtpu)
@@ -105,47 +103,6 @@ def jax_dequantize_mxfp4_packed(
     tensor_e2m1 = jax_u8_unpack_e2m1(tensor_q)
     scale_fp32 = jax_e8m0_to_fp32(scale)
     return jax_dequantize_tensor(tensor_e2m1, scale_fp32, axis, out_dtype)
-
-
-class TestNativeMXFP4Load:
-    """Validate the exact weight and scale contract passed to TPU GMM."""
-
-    def test_shapes_dtypes_and_numerics(self):
-        rng = np.random.default_rng(7)
-        packed_np = rng.integers(0, 256, size=(2, 5, 64), dtype=np.uint8)
-        scale_np = rng.integers(100, 151, size=(2, 5, 4), dtype=np.uint8)
-
-        weight, scale = unpack_mxfp4_to_kmajor(jnp.asarray(packed_np),
-                                               jnp.asarray(scale_np))
-
-        assert weight.shape == (2, 128, 5)
-        assert weight.dtype == jnp.float4_e2m1fn
-        assert scale.shape == (2, 4, 1, 5)
-        assert scale.dtype == jnp.float32
-
-        actual = (weight.astype(jnp.float32).reshape(2, 4, 32, 5) *
-                  scale).reshape(2, 128, 5)
-        expected = jax_dequantize_mxfp4_packed(
-            jnp.asarray(packed_np),
-            jnp.asarray(scale_np),
-        ).swapaxes(-1, -2)
-        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-
-    def test_rejects_wrong_scale_shape(self):
-        packed = jnp.zeros((2, 5, 64), dtype=jnp.uint8)
-        scale = jnp.zeros((2, 5, 3), dtype=jnp.uint8)
-        with pytest.raises(ValueError, match="one E8M0 scale per 32"):
-            unpack_mxfp4_to_kmajor(packed, scale)
-
-    def test_all_e8m0_scales(self):
-        packed = jnp.zeros((1, 1, 4096), dtype=jnp.uint8)
-        scale_e8m0 = jnp.arange(256, dtype=jnp.uint8).reshape(1, 1, 256)
-
-        _, scale = unpack_mxfp4_to_kmajor(packed, scale_e8m0)
-
-        expected = jax_e8m0_to_fp32(scale_e8m0).reshape(256)
-        np.testing.assert_array_equal(
-            np.asarray(scale).reshape(256), np.asarray(expected))
 
 
 def jax_quantize_tensor(

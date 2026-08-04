@@ -22,12 +22,12 @@ import pytest
 import torch
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, VllmConfig)
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheTensor,
-                                        MambaSpec)
+                                        MambaSpec, MLAAttentionSpec)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -815,6 +815,34 @@ class TestTPURunner:
             mamba_spec = kv_cache_specs[layer_name]
             assert isinstance(mamba_spec, MambaSpec)
             assert mamba_spec.page_size_padded == expected_padded_size
+
+    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=8192)
+    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
+           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
+    def test_get_kv_cache_spec_mla_mamba_hybrid(self, mock_mem_info,
+                                                mock_get_page_size,
+                                                mock_get_layers):
+        mock_mla = MagicMock(spec=MLAAttention)
+        mock_mla.num_kv_heads = 1
+        mock_mla.head_size = 576
+        layers = {'mla_0': mock_mla}
+        for i in range(3):
+            layers[f'mamba_{i}'] = DummyMamba()
+        mock_get_layers.return_value = layers
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+
+        # uniform size = one 8192-byte MLA page + three 66560-byte states
+        expected_padded_size = 207872
+        assert isinstance(kv_cache_specs['mla_0'], MLAAttentionSpec)
+        assert kv_cache_specs['mla_0'].page_size_padded == expected_padded_size
+        for i in range(3):
+            assert (kv_cache_specs[f'mamba_{i}'].page_size_padded ==
+                    expected_padded_size)
+        mock_get_page_size.assert_called()
 
     @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(

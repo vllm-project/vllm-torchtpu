@@ -252,6 +252,29 @@ class StateBufferedRef(BaseBufferedRef):
     `state_indices[s]`.
     """
 
+    # --- source-layout hooks; overridden for an external (pooled) source ---
+
+    def _src_slice(self, ref: jax.Ref, state_idx, count):
+        """One slot's source window: `count` states at the slot's index."""
+        return ref.at[pl.ds(state_idx, count)]
+
+    def _unit(self) -> int:
+        """Source rows one state occupies (checkpoints for the dense path)."""
+        return 1
+
+    def _wait_slice(self, vmem_ref: jax.Ref, count):
+        """Never-executed self-copy ref carrying the bytes to wait on.
+
+        ``count`` is a number of participating SLOTS, not source rows: one
+        slot's copy is `_unit()` rows, and this ref must cover exactly the
+        bytes those copies moved.
+        """
+        return vmem_ref.at[0, pl.ds(0, count)]
+
+    def _read_offset(self, s_idx):
+        """Spec-decode checkpoint to resume from; 0 without a window."""
+        return self.metadata_ref.s_idx_to_read_offset[s_idx]
+
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -268,13 +291,13 @@ class StateBufferedRef(BaseBufferedRef):
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[
                 s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            dma_size = jnp.where(should_read, 1, 0)
+            dma_size = jnp.where(should_read, self._unit(), 0)
 
             # Resume from the checkpoint of the last accepted token.
-            state_idx += self.metadata_ref.s_idx_to_read_offset[s_idx]
+            state_idx += self._read_offset(s_idx)
 
             pltpu.make_async_copy(
-                src_ref.at[pl.ds(state_idx, dma_size)],
+                self._src_slice(src_ref, state_idx, dma_size),
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
             ).start()
@@ -299,7 +322,7 @@ class StateBufferedRef(BaseBufferedRef):
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+        wait_ref = self._wait_slice(vmem_ref, dma_size)
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
@@ -320,11 +343,11 @@ class StateBufferedRef(BaseBufferedRef):
             # many tokens but keep only the final state.
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size = jnp.where(is_last_tile, num_ckpts, 0)
+            dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
 
             pltpu.make_async_copy(
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
-                dst_ref.at[pl.ds(state_idx, dma_size)],
+                self._src_slice(dst_ref, state_idx, dma_size),
                 sem,
             ).start()
 
@@ -346,7 +369,7 @@ class StateBufferedRef(BaseBufferedRef):
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_out` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+        wait_ref = self._wait_slice(vmem_ref, dma_size)
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
@@ -355,110 +378,36 @@ class StateBufferedRef(BaseBufferedRef):
 class ExternalStateBufferedRef(StateBufferedRef):
     """State tiles streamed from/to an indexed external state source.
 
-    Unlike ``StateBufferedRef``'s dense per-slot state tensor, the source
-    stores each slot's state as raw bytes inside a window of ``stride``
-    consecutive source blocks addressed by the slot's state index;
-    ``region`` selects the block/row range of this state within that
-    window. copy_in/copy_out move the whole region with one contiguous
-    async copy per slot, gated by the same first/last-tile and
-    has_initial_state metadata as the dense path, so padded or invalid
-    slots move no bytes in either direction. The waits count slots like
-    the dense path (each slot's copy covers its full tile). vmem_ldst
-    applies the region's typed view when the tile is loaded or stored.
+    The source stores each slot's state as raw bytes inside a window of
+    ``stride`` consecutive source blocks addressed by the slot's state
+    index; ``region`` selects the block/row range within that window. All
+    DMA scheduling — the first/last-tile and has_initial_state gating, so
+    padded slots move no bytes — is inherited; only the source addressing
+    differs. ``vmem_ldst`` applies the region's typed view on load/store.
     """
 
     region: config.StateRegion = dataclasses.field(metadata=dict(static=True))
     stride: int = dataclasses.field(metadata=dict(static=True))
 
-    def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
+    def _src_slice(self, ref: jax.Ref, state_idx, count):
         base = state_idx * self.stride + self.region.kb0
-        if self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]:
-            return src_ref.at[pl.ds(base, nblocks)]
-        return src_ref.at[pl.ds(base, nblocks),
-                          pl.ds(self.region.row0, self.region.nrows)]
+        if self.region.row0 == 0 and self.region.nrows == ref.shape[1]:
+            return ref.at[pl.ds(base, count)]
+        return ref.at[pl.ds(base, count),
+                      pl.ds(self.region.row0, self.region.nrows)]
 
-    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_copy_in_slot
-        sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        p_id = grid_indices[0]
+    def _unit(self) -> int:
+        return self.region.nblocks
 
-        for idx in range(self.cfg.seq_tile_size):
-            is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
-            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
-            should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            nblocks = jnp.where(should_read, self.region.nblocks, 0)
+    def _wait_slice(self, vmem_ref: jax.Ref, count):
+        # Each slot's copy covers its whole region tile, so the units are
+        # slots along the leading dim rather than window positions.
+        return vmem_ref.at[pl.ds(0, count)]
 
-            pltpu.make_async_copy(
-                self._region_slice(src_ref, state_idx, nblocks),
-                vmem_ref.at[idx, pl.ds(0, nblocks)],
-                sem,
-            ).start()
-
-    def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
-        assert self.sem_sends is not None
-        assert self.window_ref is not None
-        slot = self.current_copy_out_slot
-        sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        p_id = grid_indices[0]
-
-        for idx in range(self.cfg.seq_tile_size):
-            is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
-            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
-            nblocks = jnp.where(is_last_tile, self.region.nblocks, 0)
-
-            pltpu.make_async_copy(
-                vmem_ref.at[idx, pl.ds(0, nblocks)],
-                self._region_slice(dst_ref, state_idx, nblocks),
-                sem,
-            ).start()
-
-    def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_wait_in_slot
-        sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        p_id = grid_indices[0]
-
-        dma_size = 0
-        for idx in range(self.cfg.seq_tile_size):
-            is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
-            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
-            should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            dma_size += jnp.where(should_read, 1, 0)
-
-        # Each slot's copy covers its full region tile (all nblocks), so wait
-        # per slot along the leading (sequence) dim.
-        wait_ref = vmem_ref.at[pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
-
-    def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
-        assert self.sem_sends is not None
-        assert self.window_ref is not None
-        slot = self.current_wait_out_slot
-        sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        p_id = grid_indices[0]
-
-        dma_size = 0
-        for idx in range(self.cfg.seq_tile_size):
-            is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
-            dma_size += jnp.where(is_last_tile, 1, 0)
-
-        # Each slot's copy covers its full region tile (all nblocks), so wait
-        # per slot along the leading (sequence) dim.
-        wait_ref = vmem_ref.at[pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+    def _read_offset(self, s_idx):
+        # Checkpoint windows are not defined for an external source; the
+        # caller rejects window_size > 1 with a state plan.
+        return 0
 
 
 def create_allocs(

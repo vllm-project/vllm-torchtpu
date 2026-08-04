@@ -36,7 +36,7 @@ MAX_MODEL_LEN_BUFFER="${MAX_MODEL_LEN_BUFFER:-20}"
 
 case "$SHARDING" in
   DP8_EP)
-    # Data-parallel attention across all 8 chips + expert-parallel MoE.
+    # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
     # New prefills are admitted every this many steps. Larger value trades
     # TTFT for throughput. 256 was picked for maximizing 8k1k concurrency 256
@@ -59,19 +59,28 @@ case "$SHARDING" in
       --enable-expert-parallel
     ) ;;
   DP4TP2_EP)
-    # 4-way data-parallel x 2-way tensor-parallel attention + expert-parallel MoE.
+    # Data-parallel attention across all 4 chips with tensor-parallel across 2 cores
+    # on the same chip + expert-parallel MoE.
     DP_SIZE=4
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-256}"
     SHARDING_ARGS=(
       --tensor-parallel-size=2
       --data-parallel-size=4
       --enable-expert-parallel
-    ) ;;
+      --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
+    )
+    export DP_SCHED_ENABLED=1
+    ;;
   *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
 esac
 
 MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
-# Scale batched tokens based on input sequence length, but not too small.
-MAX_NUM_BATCHED_TOKENS=$(( ISL / DP_SIZE > 1024 ? ISL / DP_SIZE : 1024 ))
+
+# Global num of batched tokens == max(ISL, GLOBAL_BATCHED_TOKENS_MIN).
+GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
+GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
+
+MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
 
 MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
@@ -86,6 +95,9 @@ export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
 # Token padding sizes step by 16 up to 64 and double after.
 export TPU_TOKEN_BUCKET_LINEAR_UNTIL="${TPU_TOKEN_BUCKET_LINEAR_UNTIL:-64}"
 export TPU_TOKEN_BUCKET_LINEAR_INTERVAL="${TPU_TOKEN_BUCKET_LINEAR_INTERVAL:-16}"
+
+# Skip padded tokens in the fused MoE so they activate no experts.
+export TPU_MOE_SKIP_PADDED_TOKENS=1
 
 args=(
   "$MODEL"

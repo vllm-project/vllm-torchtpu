@@ -35,46 +35,6 @@ def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
     return jnp.swapaxes(fp4, -1, -2)  # [..., K, N]
 
 
-def unpack_mxfp4_to_kmajor(
-        w_packed: jax.Array,
-        scale_e8m0: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Prepare checkpoint MXFP4 weights and scales for ``gmm_v2``.
-
-    Inputs use the compressed-tensors / MXFP4 checkpoint layout:
-    ``w_packed[..., N, K/2]`` contains two E2M1 values per uint8 and
-    ``scale_e8m0[..., N, K/32]`` contains one E8M0 scale per 32 values.
-
-    Outputs are native E2M1 ``weight[..., K, N]`` and FP32
-    ``scale[..., K/32, 1, N]``, exactly matching ``gmm_v2``'s rhs contract.
-    This runs once while loading weights; no unpacking or scale conversion is
-    performed in the model forward.
-    """
-    if w_packed.dtype != jnp.uint8:
-        raise TypeError(f"MXFP4 weight must be uint8, got {w_packed.dtype}.")
-    if scale_e8m0.dtype != jnp.uint8:
-        raise TypeError(f"MXFP4 scale must be uint8, got {scale_e8m0.dtype}.")
-    if w_packed.shape[:-1] != scale_e8m0.shape[:-1]:
-        raise ValueError(
-            "MXFP4 weight and scale leading dimensions must match: "
-            f"{w_packed.shape} vs {scale_e8m0.shape}.")
-
-    size_k = w_packed.shape[-1] * 2
-    scale_size_k = scale_e8m0.shape[-1] * 32
-    if size_k != scale_size_k:
-        raise ValueError("MXFP4 requires one E8M0 scale per 32 E2M1 values: "
-                         f"weight K={size_k}, scale K={scale_size_k}.")
-
-    weight = jax.lax.bitcast_convert_type(w_packed, jnp.float4_e2m1fn)
-    weight = weight.reshape(*w_packed.shape[:-1], size_k)
-    weight = jnp.swapaxes(weight, -1, -2)
-
-    exponent = (scale_e8m0.astype(jnp.int32) +
-                jnp.finfo(jnp.float8_e8m0fnu).minexp)
-    scale = jnp.ldexp(jnp.ones_like(scale_e8m0, dtype=jnp.float32), exponent)
-    scale = jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2)
-    return weight, scale
-
-
 def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
                           block: int) -> tuple[jax.Array, jax.Array]:
     """W4A8 requantization in JAX: unpack the checkpoint block-16 fp4 weight,
@@ -143,6 +103,7 @@ def prepare_routed_gmm_inputs(
     use_ep: bool,
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
+    skip_padded_tokens: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -159,7 +120,13 @@ def prepare_routed_gmm_inputs(
     token_indices_flat = jnp.arange(num_tokens_local,
                                     dtype=jnp.int32).repeat(topk)
 
-    valid_mask = topk_indices_flat >= 0
+    if skip_padded_tokens:
+        # Padded tokens keep their selected expert ids, but carry zero
+        # expert routing weights. Treat them as invalid to remove them
+        # from GMM work.
+        valid_mask = (topk_indices_flat >= 0) & (topk_weights_flat != 0)
+    else:
+        valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
     argsort_revert_indices = jnp.argsort(sorted_indices)
@@ -216,6 +183,7 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -251,11 +219,19 @@ def moe_gmm(
                            zero_initialize=False,
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
-
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
+            if skip_padded_tokens:
+                # Zero out the GMM output rows of padded tokens that
+                # skipped the GMM computation, otherwise those
+                # uninitialized values can be NaN and the one-hot matmul
+                # would spread them to every token in the batch.
+                computed = jnp.arange(
+                    gmm2_res.shape[0],
+                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
@@ -290,6 +266,7 @@ def moe_gmm(
         "use_sparse_core",
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
+        "skip_padded_tokens",
     ),
 )
 def fused_moe_func(
@@ -309,6 +286,7 @@ def fused_moe_func(
     use_sparse_core: bool = True,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -369,6 +347,7 @@ def fused_moe_func(
          use_ep=use_ep,
          use_sparse_core=use_sparse_core,
          onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+         skip_padded_tokens=skip_padded_tokens,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
@@ -390,5 +369,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
     )
     return x[:num_tokens, :hidden_size]
