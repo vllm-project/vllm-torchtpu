@@ -82,6 +82,16 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
+  - id: pyrefly
+    name: Pyrefly type check
+    # Checks the whole project (see [tool.pyrefly] in pyproject.toml) rather
+    # than staged files, so results do not depend on which files a commit
+    # happens to touch. A full run is well under a second.
+    entry: pyrefly check
+    language: python
+    additional_dependencies: [pyrefly==1.2.0]
+    pass_filenames: false
+    always_run: true
   - id: suggestion
     name: Suggestion
     entry: bash -c 'echo "To bypass pre-commit hooks, add --no-verify to git commit."'

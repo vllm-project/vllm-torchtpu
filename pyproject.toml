@@ -94,6 +94,41 @@ markers = [
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
 ]
 
+[tool.pyrefly]
+project-includes = ["src"]
+
+# Start at `basic`, which covers unambiguous mistakes (undefined names, bad
+# unpacking, wrong keyword arguments). Raising this to `default` adds ~300 more
+# findings, mostly attribute and argument types on the JAX/torch boundary;
+# that is worth doing as follow-up work, not as part of enabling the checker.
+preset = "basic"
+
+# CI runs pre-commit without installing our dependencies, and `vllm` is
+# installed as an editable package behind a custom path hook that no static
+# checker can resolve. Listing these makes an unresolved import degrade to
+# `Any` instead of erroring, so local and CI runs agree. `ignore-missing-imports`
+# only applies when the module is genuinely unresolvable - when a package is
+# installed with type information, it is still checked normally.
+ignore-missing-imports = [
+    "compressed_tensors", "compressed_tensors.*",
+    "einops", "einops.*",
+    "jax", "jax.*",
+    "jaxlib", "jaxlib.*",
+    "numpy", "numpy.*",
+    "packaging", "packaging.*",
+    "pathwaysutils", "pathwaysutils.*",
+    "portpicker", "portpicker.*",
+    "ray", "ray.*",
+    "requests", "requests.*",
+    "sympy", "sympy.*",
+    "torch", "torch.*",
+    "torch_tpu", "torch_tpu.*",
+    "tpu_raiden", "tpu_raiden.*",
+    "transformers", "transformers.*",
+    "vllm", "vllm.*",
+    "zmq", "zmq.*",
+]
+
 [tool.setuptools]
 include-package-data = true
 py-modules = ["sitecustomize"]

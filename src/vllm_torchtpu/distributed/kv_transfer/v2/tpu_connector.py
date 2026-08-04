@@ -3081,8 +3081,12 @@ class TPUConnectorV2(KVConnectorBase_V1, SupportsHMA):
         from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import \
             TpuKVConnectorStats
 
-        return TpuKVConnectorStats(
-            data=data) if data is not None else (TpuKVConnectorStats())
+        # `data` is inherited from vLLM's KVConnectorStats dataclass, which a
+        # static checker cannot see through vllm's editable install.
+        if data is not None:
+            return TpuKVConnectorStats(
+                data=data)  # type: ignore[unexpected-keyword]
+        return TpuKVConnectorStats()
 
     @classmethod
     def build_prom_metrics(
