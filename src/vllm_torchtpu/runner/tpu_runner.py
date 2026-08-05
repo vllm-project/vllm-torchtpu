@@ -874,6 +874,16 @@ class TPUModelRunner(GPUModelRunner):
                             "Using irope in Pallas is not supported yet, it "
                             "will fall back to global attention for long context."
                         )
+                    # A narrowed KV dtype can be silently ineffective here: the
+                    # Pallas layout pads the packing dimension, so fp8 can cost
+                    # the same bytes as bf16 and the operator sees no capacity
+                    # change anywhere. Say so once, up front.
+                    PallasAttentionBackend.warn_if_kv_cache_dtype_is_ineffective(
+                        block_size,
+                        attn_module.num_kv_heads,
+                        attn_module.head_size,
+                        self.kv_cache_dtype,
+                    )
                     page_size_padded = (
                         self._hybrid_uniform_page_size_bytes if
                         self._hybrid_uniform_page_size_bytes is not None else
