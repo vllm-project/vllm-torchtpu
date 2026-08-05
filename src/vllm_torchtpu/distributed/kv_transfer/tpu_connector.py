@@ -332,10 +332,14 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                             "absent from request block tables: "
                             f"index={mamba_gid}, groups={len(block_ids)}")
                     mamba_block_ids.append(list(block_ids[mamba_gid]))
+            # The use_hma branch returned above, so use_raiden here means
+            # __init__ selected TPURaidenConnectorScheduler -- the only one
+            # of the three schedulers accepting mamba block ids. The checker
+            # cannot narrow the union to that subclass.
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
-                mamba_block_ids=mamba_block_ids)
+                mamba_block_ids=mamba_block_ids)  # type: ignore
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
             f"{len(block_ids)} groups")
@@ -357,8 +361,12 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     def build_kv_connector_stats(
             cls,
             data: dict[str, Any] | None = None) -> KVConnectorStats | None:
-        return (TpuKVConnectorStats(
-            data=data) if data is not None else TpuKVConnectorStats())
+        # `data` is inherited from vLLM's KVConnectorStats dataclass, which a
+        # static checker cannot see through vllm's editable install.
+        if data is not None:
+            return TpuKVConnectorStats(
+                data=data)  # type: ignore[unexpected-keyword]
+        return TpuKVConnectorStats()
 
     @classmethod
     def build_prom_metrics(
