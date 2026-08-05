@@ -116,7 +116,7 @@ class SmemWrapper:
 
     def _get_pos(self, indices):
         if not isinstance(indices, tuple):
-            indices = (indices, )
+            indices = (indices,)
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
 
@@ -191,7 +191,7 @@ class RpaSchedule:
         idx_wrapper = SmemWrapper.create_shape_dtype(
             (cfgs.max_steps_ub, cfgs.batch_size))
 
-        steps_wrapper = SmemWrapper.create_shape_dtype((cfgs.max_steps_ub, ))
+        steps_wrapper = SmemWrapper.create_shape_dtype((cfgs.max_steps_ub,))
 
         return cls(
             s_idx=idx_wrapper,
@@ -273,7 +273,6 @@ class RpaSchedule:
             self,
         )
 
-
 def _compute_waits(
     schedule: RpaSchedule,
     start_step: jax.typing.ArrayLike,
@@ -301,8 +300,9 @@ def _compute_waits(
                     kv_in_tokens += dma_valid * cfgs.serve.page_size
                 for i in range(cfgs.bkv_p_new):
                     dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_in_tokens += jnp.where(dma_entry.fetch_val > 0,
-                                              cfgs.serve.page_size, 0)
+                    kv_in_tokens += jnp.where(
+                        dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
+                    )
             else:
                 for i in range(cfgs.bkv_p_cache):
                     _, _, sz = schedule.get_dma_kv_cache(step, b, i)
@@ -314,7 +314,8 @@ def _compute_waits(
                 kv_in_tokens += total_new_sz
 
         schedule.total_wait_kv_in[step] = (
-            kv_in_tokens * kv_bytes_per_token) // dma_chunk_size
+            kv_in_tokens * kv_bytes_per_token
+        ) // dma_chunk_size
 
         # KV OUT
         kv_out_tokens = 0
@@ -324,24 +325,25 @@ def _compute_waits(
                 for i in range(cfgs.bkv_p_new):
                     dma_entry = schedule.dma_kv_new[step, b, i]
                     kv_out_tokens += jnp.where(
-                        do_writeback & (dma_entry.wb_val > 0),
-                        cfgs.serve.page_size, 0)
+                        do_writeback & (dma_entry.wb_val > 0), cfgs.serve.page_size, 0
+                    )
             else:
                 for i in range(cfgs.bkv_p_new):
                     dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val,
-                                               0)
+                    kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
 
         schedule.total_wait_kv_out[step] = (
-            kv_out_tokens * kv_bytes_per_token) // dma_chunk_size
+            kv_out_tokens * kv_bytes_per_token
+        ) // dma_chunk_size
 
         # Q IN
         q_in_tokens = 0
         for b in range(cfgs.batch_size):
             _, q_sz = schedule.get_dma_q(step, b)
             q_in_tokens += q_sz
-        schedule.total_wait_q_in[step] = (q_in_tokens *
-                                          q_bytes_per_token) // dma_chunk_size
+        schedule.total_wait_q_in[step] = (
+            q_in_tokens * q_bytes_per_token
+        ) // dma_chunk_size
 
         # O OUT
         o_out_tokens = 0
@@ -349,11 +351,11 @@ def _compute_waits(
             is_last_k = schedule.is_last_k[step, b] == 1
             _, q_sz = schedule.get_dma_q(step, b)
             o_out_tokens += jnp.where(is_last_k, q_sz, 0)
-        schedule.total_wait_o_out[step] = (o_out_tokens *
-                                           o_bytes_per_token) // dma_chunk_size
+        schedule.total_wait_o_out[step] = (
+            o_out_tokens * o_bytes_per_token
+        ) // dma_chunk_size
 
     jax.lax.fori_loop(start_step, end_step, body, None)
-
 
 def compute_metadata(
     cu_q_lens_ref: jax.Ref,
