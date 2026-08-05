@@ -9,6 +9,9 @@ These tests pin both halves of that behaviour: the configurations where fp8
 already works (which any layout fix must not regress) and the configurations
 where it silently does not (which the fix must make pass).
 """
+import contextlib
+import logging
+
 import pytest
 import torch
 
@@ -138,25 +141,80 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+class _RecordingLogHandler(logging.Handler):
+    """Same shape as the one in tests/distributed/tpu_connector_v2_test_utils.py."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def captured_warnings(logger_name: str = "vllm"):
+    """Collect warnings emitted under `logger_name`.
+
+    Deliberately not pytest's `caplog`. vLLM's dictConfig sets
+    `propagate=False` on the `vllm` logger, and `vllm_torchtpu.logger` prefixes
+    every name with `vllm.`, so these records stop at `vllm` and never reach
+    the root logger where `caplog` installs its handler. Whether `caplog` sees
+    anything then depends on pytest's handler placement racing vLLM's
+    dictConfig, which differs between a single-file local run and CI.
+    Attaching directly is deterministic in both.
+    """
+    logger = logging.getLogger(logger_name)
+    handler = _RecordingLogHandler()
+    old_level = logger.level
+    # Another test in this process may have raised the level or called
+    # logging.disable(); either drops the record before any handler runs.
+    old_disable = logging.root.manager.disable
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    logging.disable(logging.NOTSET)
+    try:
+        yield handler.messages
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logging.disable(old_disable)
+
+
+def warned_about_bug(messages):
+    return any("b/510425663" in message for message in messages)
+
+
 class TestWarningFiresExactlyWhenSavingIsLost:
 
-    def test_warns_on_underfilled_word(self, caplog):
-        with caplog.at_level("WARNING"):
+    def test_warns_on_underfilled_word(self):
+        with captured_warnings() as messages:
             PallasAttentionBackend.warn_if_kv_cache_dtype_is_ineffective(
                 BLOCK_SIZE, 1, 128, FP8)
-        assert "b/510425663" in caplog.text
+        assert warned_about_bug(messages)
 
-    def test_silent_when_fp8_actually_helps(self, caplog):
-        with caplog.at_level("WARNING"):
+    def test_silent_when_fp8_actually_helps(self):
+        with captured_warnings() as messages:
             PallasAttentionBackend.warn_if_kv_cache_dtype_is_ineffective(
                 BLOCK_SIZE, 8, 128, FP8)
-        assert "b/510425663" not in caplog.text
+        assert not warned_about_bug(messages)
 
-    def test_silent_for_bf16(self, caplog):
-        with caplog.at_level("WARNING"):
+    def test_silent_for_bf16(self):
+        with captured_warnings() as messages:
             PallasAttentionBackend.warn_if_kv_cache_dtype_is_ineffective(
                 BLOCK_SIZE, 1, 128, BF16)
-        assert "b/510425663" not in caplog.text
+        assert not warned_about_bug(messages)
+
+    def test_capture_helper_actually_captures(self):
+        """Guards the three tests above from passing vacuously.
+
+        Two of them assert an *absence*, which an always-empty record list
+        satisfies no matter what the code does. That is exactly how the
+        `caplog` version stayed green in CI while capturing nothing.
+        """
+        with captured_warnings() as messages:
+            logging.getLogger("vllm.test").warning("sentinel b/510425663")
+        assert warned_about_bug(messages)
 
 
 class TestMeasuredHardwareValues:
