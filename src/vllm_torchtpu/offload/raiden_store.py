@@ -46,32 +46,31 @@ the spec (the PCP-aware `build_offloading_config` patch must have scaled
 compatibility namespace. Data parallelism runs one independent V2 stack per
 engine (per-DP-rank controller port and job name).
 
-Phase-2 hardening: store jobs are batch-capped and retried once on transfer
-failure; keys that fail terminally are quarantined (reported MISS, never
-re-admitted). A drain that times out poisons the still-in-flight jobs, so
-their eventual completions finalize as failures instead of committing bytes
-possibly torn by the block reuse that motivated the drain.
+Failure hardening: a save whose transfer fails is retried once; keys that
+fail terminally are quarantined (reported MISS, never re-admitted). A drain
+that times out poisons the still-in-flight jobs, so their eventual
+completions finalize as failures instead of committing bytes possibly torn
+by the block reuse that motivated the drain.
 
-Phase 3 (newer store primitives, detected at runtime): store-job batches are
-classified by `insert_and_lock_detailed` (existing entries pinned in place,
-only newly inserted ones saved) with displacements surfaced as eviction
-events through `take_events`. On an older tpu_raiden, classification falls
-back to per-sub-hash peeks and no events are emitted.
+Store-job batches are classified by `insert_and_lock_detailed` (existing
+entries pinned in place, only newly inserted ones saved) with displacements
+surfaced as eviction events through `take_events`; the manager refuses to
+start on a tpu_raiden wheel that lacks it.
 
-Phase 4 (cross-instance KV sharing, enabled by `global_registry_address`):
-saved blocks are published to the global registry by raiden, so a prefix
-computed by any replica is a `REMOTE` hit everywhere. The receiver flow is
+Cross-instance KV sharing (enabled by `global_registry_address`): saved
+blocks are published to the global registry by raiden, so a prefix computed
+by any replica is a `REMOTE` hit everywhere. The receiver flow is
 `lookup(enable_global=True)` -> stash the peer `REMOTE` slices ->
-`insert_and_lock(remote_slices, on_host=True)` in prepare_load (installs the
-peer mapping locally, reserves host landing capacity, pins; on wheel #2 the
-detailed variant also reports what the landing reservation displaced) ->
+`insert_and_lock_detailed(remote_slices, on_host=True)` in prepare_load
+(installs the peer mapping locally, reserves host landing capacity, pins,
+and reports what the landing reservation displaced) ->
 `read_remote(hashes, device_block_ids)` straight into HBM at job-submit ->
 `poll_remote_read_status` in the finalizer. Success leaves the entries
 `HOST_AND_HBM` (the host landing blocks make a later local load cheap);
 failure `release_and_delete`s the batch, which frees the landing blocks and
 removes the local install while the registry keeps the peer mapping.
-Registry keys are namespaced by engine compatibility (§4 of the design), and
-raiden itself degrades a dead registry to local-only lookups.
+Registry keys carry the engine-compatibility namespace, and raiden itself
+degrades a dead registry to local-only lookups.
 
 See `raiden_connector.py` for the connector wiring (fence + echo channel).
 """
@@ -104,24 +103,11 @@ logger = init_logger(__name__)
 _DRAIN_TIMEOUT_S = float(
     os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
 
-# Store-job batch cap (offload keys per job). One raiden save() batch is one
-# joined failure unit, so modest batches keep one bad block from failing
-# unrelated work; keys beyond the cap are simply re-offered by the scheduler
-# on the next step.
-_MAX_STORE_KEYS_PER_JOB = int(
-    os.environ.get("VLLM_TPU_OFFLOAD_MAX_STORE_KEYS_PER_JOB", "64"))
-
-# A save whose transfer failed is retried this many times (§5.4: a failed
-# save leaves the entry HBM+pinned and a second save() works). Retries are
+# A save whose transfer failed is retried this many times (a failed save
+# leaves the entry HBM+pinned, so a second save() works). Retries are
 # suppressed for drained jobs: a drain means the source blocks are about to
 # be reused, so re-reading them would ship garbage.
 _SAVE_RETRIES = int(os.environ.get("VLLM_TPU_OFFLOAD_SAVE_RETRIES", "1"))
-
-# Diagnostic only: log the namespaced sub-hash of every store batch and of
-# every registry-eligible lookup miss, so two replicas' key spaces can be
-# diffed from their logs (j-c92b643e: cross-replica lookups missed 100%
-# despite both replicas provably publishing and querying the registry).
-_DEBUG_KEYS = os.environ.get("VLLM_TPU_OFFLOAD_DEBUG_KEYS", "") == "1"
 
 _DEFAULT_CONTROLLER_PORT = 51515
 
@@ -136,7 +122,7 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     manager interface has no failure return there); the load job then fails
     cleanly at submit time and vLLM recomputes the blocks.
 
-    `displaced_keys` (loads, wheel #2): keys whose entries prepare_load's
+    `displaced_keys` (loads): keys whose entries prepare_load's
     host-landing install displaced. Carried to submit_load_job so the
     displacement commits with the job's outcome, exactly like a store
     admission's.
@@ -185,8 +171,8 @@ class Admission:
     # through get_block_ids_with_load_errors on failure.
     req_id: str | None = None
     dst_gpu_block_ids: list[int] = field(default_factory=list)
-    # Loads only (phase 4): the sub-hashes fetched from a peer via
-    # read_remote rather than the local host pool. Drives the remote poll
+    # Loads only: the sub-hashes fetched from a peer via read_remote
+    # rather than the local host pool. Drives the remote poll
     # and the weaker remote-only quarantine on failure.
     remote_sub_hashes: set[bytes] = field(default_factory=set)
     # Stores only: the sub-hashes actually saved (newly admitted HBM entries;
@@ -201,7 +187,7 @@ class Admission:
     retries_left: int = 0
     # Keys whose entries this admission's insert displaced into the
     # eviction-candidate list (stores: the HBM admission; loads: the
-    # phase-4 host-landing install). Committed (as eviction events +
+    # host-landing install for a remote fetch). Committed (as eviction events +
     # advisory forget) only if the job SUCCEEDS — a failed job's rollback
     # restores the candidates.
     displaced_keys: list[OffloadKey] = field(default_factory=list)
@@ -264,6 +250,16 @@ class RaidenOffloadingManager(OffloadingManager):
                 "store_server_ip: peers could never dial this replica. "
                 "Set store_server_ip to the pod IP in "
                 "kv_connector_extra_config.")
+        if self._enable_global and not os.environ.get("PYTHONHASHSEED"):
+            # vLLM seeds its block-hash chain from os.urandom when
+            # PYTHONHASHSEED is unset, so unseeded replicas build disjoint
+            # hash chains and every cross-instance lookup misses — a silent
+            # zero-hit run with no error anywhere.
+            raise ValueError(
+                "[kv-offload-v2] global_registry_address requires "
+                "PYTHONHASHSEED to be set (to the same value on every "
+                "replica): unseeded engines derive disjoint block hashes "
+                "and cross-instance lookups can never hit.")
 
         if store is None:
             # Bind the native extension rather than
@@ -295,9 +291,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 # names 127.0.0.1 as the same-host value. Only registry runs
                 # have a real peers-dial-this address (the pod IP from the
                 # recipe); local-only stores never publish, so localhost is
-                # exact there. Keep the raw value in self.store_server_ip
-                # checks above: a registry run that FORGOT the pod IP must
-                # keep warning, not silently publish 127.0.0.1 to peers.
+                # exact there. The registry check in __init__ already raised
+                # for a registry run without the pod IP, so this fallback
+                # never publishes 127.0.0.1 to peers.
                 store_server_ip=store_server_ip or "127.0.0.1",
             )
             logger.info(
@@ -318,16 +314,14 @@ class RaidenOffloadingManager(OffloadingManager):
         self._block_id_cls = store_types.RaidenBlockID
         self._raiden_id = self._store.raiden_id
 
-        # Newer store primitives. hasattr is deliberate: the tpu_raiden wheel
-        # is pinned per recipe and older wheels genuinely lack this —
-        # store-job classification then falls back to per-sub-hash peeks (no
-        # eviction events).
-        self._has_detailed = hasattr(self._store, "insert_and_lock_detailed")
-        if not self._has_detailed:
-            logger.warning(
-                "[kv-offload-v2] tpu_raiden wheel lacks "
-                "insert_and_lock_detailed: store-job classification uses "
-                "per-sub-hash peeks and eviction events are unavailable.")
+        # Batch classification and displacement events both come from
+        # insert_and_lock_detailed. A wheel without it would silently stop
+        # surfacing evictions — evicted keys are then never re-offered for
+        # the life of the process — so refuse to start instead.
+        if not hasattr(self._store, "insert_and_lock_detailed"):
+            raise RuntimeError(
+                "[kv-offload-v2] the tpu_raiden wheel lacks "
+                "insert_and_lock_detailed; upgrade the pinned wheel.")
 
         # Registration gate: stores/loads stay disabled until every rank's
         # KVCacheManager has registered with the store's controller. A
@@ -349,7 +343,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # age out through normal LRU pressure.
         self._quarantined_keys: set[OffloadKey] = set()
 
-        # Remote-fetch quarantine (phase 4): keys whose read_remote failed
+        # Remote-fetch quarantine: keys whose read_remote failed
         # terminally. Weaker than the full quarantine — only the *global*
         # fallback is suppressed (a dead peer or stale registry entry must
         # not fail-loop), while local stores and loads of the same key stay
@@ -367,13 +361,13 @@ class RaidenOffloadingManager(OffloadingManager):
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
         # Eviction events for take_events(): populated when a successful
-        # store job's admission displaced entries (wheel #2 detailed result).
+        # store job's admission displaced entries (detailed insert result).
         self._pending_events: list[OffloadingEvent] = []
 
     # -- sub-hash / block-id expansion ----------------------------------
 
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
-        # The namespace prefix (phase 4) makes registry keys byte-distinct
+        # The namespace prefix makes registry keys byte-distinct
         # across incompatible engines; locally it is inert.
         return [self._ns + key + i.to_bytes(4, "big") for i in range(self._f)]
 
@@ -450,10 +444,6 @@ class RaidenOffloadingManager(OffloadingManager):
                         and key not in self._remote_quarantined_keys)
         matches = self._store.lookup(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
-            if _DEBUG_KEYS and allow_remote:
-                logger.info(
-                    "[kv-offload-v2] DEBUG_KEYS global-miss sub_hash=%s",
-                    sub_hashes[len(matches)].hex())
             self._stored_keys.discard(key)
             return LookupResult.MISS
         all_local = True
@@ -479,9 +469,9 @@ class RaidenOffloadingManager(OffloadingManager):
         if not all_local:
             self._remote_slices.update(remote_slices)
             return LookupResult.HIT
-        # Learn hits the advisory state has not seen: entries recovered from
-        # the shm-backed directory across a restart predate this process, and
-        # this keeps touch/prepare_store treating them like our own stores.
+        # Learn hits the advisory filter has not seen — e.g. an entry whose
+        # displacement was committed and then restored by a failed job's
+        # rollback — so touch/prepare_store treat them like our own stores.
         self._stored_keys.add(key)
         return LookupResult.HIT
 
@@ -532,19 +522,14 @@ class RaidenOffloadingManager(OffloadingManager):
         displaced_keys: list[OffloadKey] = []
         if remote_hashes:
             # The landing reservation can displace stored entries exactly
-            # like a store admission; on wheel #2 the detailed result
-            # surfaces them, and they commit with the load's outcome.
-            if self._has_detailed:
-                installed, _existing, _inserted, raw_displaced = (
-                    self._store.insert_and_lock_detailed(remote_hashes,
-                                                         remote_slices,
-                                                         on_host=True))
-                if installed:
-                    displaced_keys = self._displaced_keys_of(raw_displaced)
-            else:
-                installed = self._store.insert_and_lock(remote_hashes,
-                                                        remote_slices,
-                                                        on_host=True)
+            # like a store admission; the detailed result surfaces them, and
+            # they commit with the load's outcome.
+            installed, _existing, _inserted, raw_displaced = (
+                self._store.insert_and_lock_detailed(remote_hashes,
+                                                     remote_slices,
+                                                     on_host=True))
+            if installed:
+                displaced_keys = self._displaced_keys_of(raw_displaced)
             if not installed:
                 # Landing capacity is exhausted (capacity pressure with
                 # pinned entries) — rolled back inside raiden, nothing
@@ -578,11 +563,6 @@ class RaidenOffloadingManager(OffloadingManager):
             k for k in keys if k not in self._stored_keys and k not in
             self._inflight_store_keys and k not in self._quarantined_keys
         ]
-        # Batch cap: one store job is one raiden save() failure unit, so
-        # keep it modest. Dropped keys are not re-offered — the 0.26.0
-        # scheduler advances its per-group chunk index past every offered
-        # chunk, so keys beyond the cap are never stored.
-        keys_to_store = keys_to_store[:_MAX_STORE_KEYS_PER_JOB]
         if len(keys_to_store) > self._capacity_keys:
             return None
         # Atomic admission happens at job-submit time via insert_and_lock;
@@ -640,31 +620,19 @@ class RaidenOffloadingManager(OffloadingManager):
             ) for d in device_ids
         ]
         # Save only the newly admitted HBM entries. Pre-existing HOST /
-        # HOST_AND_HBM sub-hashes (recovered across a restart, or committed
-        # by a partially failed earlier save) were locked without touching
-        # their slices; their bytes are valid (content-addressed) and
-        # passing them to save() would fail the whole launch on its
-        # HBM-status precondition. Wheel #2's detailed result classifies the
-        # batch directly (and reports displacements); on wheel #1, classify
-        # with per-sub-hash peeks after a bare insert_and_lock.
+        # HOST_AND_HBM sub-hashes (committed by a partially failed earlier
+        # save) were locked without touching their slices; their bytes are
+        # valid (content-addressed) and passing them to save() would fail
+        # the whole launch on its HBM-status precondition. The detailed
+        # result classifies the batch directly and reports displacements.
         displaced_keys: list[OffloadKey] = []
-        if self._has_detailed:
-            admitted, _existing, inserted, raw_displaced = (
-                self._store.insert_and_lock_detailed(sub_hashes,
-                                                     slices,
-                                                     on_host=False))
-            if admitted:
-                to_save = list(inserted)
-                displaced_keys = self._displaced_keys_of(raw_displaced)
-        else:
-            admitted = self._store.insert_and_lock(sub_hashes,
-                                                   slices,
-                                                   on_host=False)
-            if admitted:
-                to_save = [
-                    h for h in sub_hashes
-                    if self._sub_hash_status(h) == self._block_status.HBM
-                ]
+        admitted, _existing, inserted, raw_displaced = (
+            self._store.insert_and_lock_detailed(sub_hashes,
+                                                 slices,
+                                                 on_host=False))
+        if admitted:
+            to_save = list(inserted)
+            displaced_keys = self._displaced_keys_of(raw_displaced)
         if not admitted:
             # Rolled back inside raiden; no save issued, no cleanup owed.
             logger.warning(
@@ -706,10 +674,6 @@ class RaidenOffloadingManager(OffloadingManager):
                     displaced_keys=displaced_keys,
                 ))
             return
-        if _DEBUG_KEYS and to_save:
-            logger.info(
-                "[kv-offload-v2] DEBUG_KEYS store-batch n=%d first=%s "
-                "last=%s", len(to_save), to_save[0].hex(), to_save[-1].hex())
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.STORE,
@@ -858,8 +822,9 @@ class RaidenOffloadingManager(OffloadingManager):
             # Every failed sub-hash was a peer fetch: suppress only the
             # global fallback for these keys (a dead peer or stale registry
             # entry must not fail-loop), keep local stores/loads allowed.
-            # (A poisoned admission has no failed sub-hashes and lands in
-            # the full quarantine below.)
+            # (A drain-poisoned load whose recorded failures were all peer
+            # fetches also lands here; that is fine — a failed load never
+            # touches the HOST copies, so local reuse stays safe.)
             self._remote_quarantined_keys.update(admission.keys)
             logger.error(
                 "[kv-offload-v2] remote-quarantining %d keys after a "
@@ -976,7 +941,7 @@ class RaidenOffloadingManager(OffloadingManager):
         """Re-issue the failed subset of a store job's save, at most
         `retries_left` times.
 
-        Safe by §5.4: a failed save leaves its entries HBM + pinned with the
+        Safe because a failed save leaves its entries HBM + pinned with the
         host slot freed, and the job stays non-terminal so the connector's
         pending-job gate keeps the source device blocks retained. Committed
         sub-hashes are not re-saved. drain_jobs zeroes retries_left first —
@@ -1070,7 +1035,7 @@ def derive_offload_namespace(
     num_kv_cache_groups: int,
     num_kv_cache_tensors: int,
     cp_geometry: tuple[int, ...] = ()) -> bytes:
-    """Compatibility namespace prefixed to every store/registry key (§4).
+    """Compatibility namespace prefixed to every store/registry key.
 
     A registry key must never match across incompatible engines: covers
     model+revision and quantization (weight identity), KV dtype and the
@@ -1269,7 +1234,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
     def ensure_registered(self) -> None:
         """Idempotently construct the KVCacheManager (registers the rank).
 
-        Raises if registration fails (wheel #1's ctor-raise): a rank that
+        Raises if registration fails (the KVCacheManager ctor throws): a rank that
         silently fails to register would be skipped by every save fanout
         while the store still reports success.
         """
@@ -1381,9 +1346,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                         f"pcp={parallel.pcp_size}; the PCP-aware "
                         "OffloadingConfig build patch did not run")
 
-        # Folded into the namespace / shm UID only when CP is active, so
-        # pre-existing pcp=1 namespaces (registry entries, recoverable shm
-        # segments) stay valid across this code change.
+        # Folded into the namespace only when CP is active, so pre-existing
+        # pcp=1 namespaces (registry entries) stay valid across this code
+        # change.
         cp_geometry: tuple[int, ...] = ()
         if parallel.pcp_size > 1:
             cp_geometry = (
@@ -1405,7 +1370,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.capacity_kernel_blocks = (self.num_offloaded_blocks *
                                        self.gpu_block_size_factor)
 
-        # Cross-instance KV sharing (phase 4): configured entirely from
+        # Cross-instance KV sharing: configured entirely from
         # kv_connector_extra_config. The registry address turns on global
         # lookups + read_remote; store_server_ip is the pod IP peers dial to
         # pull this replica's blocks (bind-and-advertise, so it must be an
@@ -1457,19 +1422,13 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.raiden_controller_port = dp_rank_local + int(
             self.extra_config.get("raiden_controller_port",
                                   _DEFAULT_CONTROLLER_PORT))
-        # With store_server_ip set, the store binds its controller on that
-        # IP (bind-and-advertise), so the workers must dial it there —
-        # 127.0.0.1 would no longer reach the controller.
-        self.raiden_controller_host = str(
-            self.extra_config.get("raiden_controller_host",
-                                  self.store_server_ip or "127.0.0.1"))
         self.raiden_job_name = str(
             self.extra_config.get("raiden_job_name",
                                   f"vllm-offload-{config.engine_id}"))
         # Suffix by the GLOBAL DP rank: with multi-node DP every node's
         # first engine has local rank 0, so a local-rank suffix would give
         # replicas sharing a recipe-set job name identical RaidenIds — and
-        # colliding global-registry entries (phase 4).
+        # colliding global-registry entries.
         if dp_rank:
             self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
 
@@ -1496,7 +1455,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         if self._worker is None:
             from vllm.distributed import parallel_state
             rank = parallel_state.get_world_group().rank_in_group
-            controller_address = (f"{self.raiden_controller_host}:"
+            # With store_server_ip set, the store binds its controller on
+            # that IP (bind-and-advertise), so the workers must dial it
+            # there — 127.0.0.1 would no longer reach the controller.
+            controller_address = (f"{self.store_server_ip or '127.0.0.1'}:"
                                   f"{self.raiden_controller_port}")
             self._worker = RaidenStoreOffloadingWorker(
                 kv_caches,

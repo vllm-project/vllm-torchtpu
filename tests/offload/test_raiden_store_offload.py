@@ -9,9 +9,9 @@ tpu_raiden wheel, or torch_tpu runtime is required:
 - Sub-hash-per-kernel-block mapping: one OffloadKey expands to
   gpu_block_size_factor store entries `key ‖ sub_idx`, device kernel-block
   IDs expand contiguously.
-- Atomic admission + exact-batch cleanup: insert_and_lock/save on submit,
-  release on success, release_and_delete on failure, immediate terminal
-  failure on rejected admission or failed launch (no cleanup owed).
+- Atomic admission + exact-batch cleanup: insert_and_lock_detailed/save on
+  submit, release on success, release_and_delete on failure, immediate
+  terminal failure on rejected admission or failed launch (no cleanup owed).
 - Load lifecycle: pin in prepare_load, release only from the finalizer
   (complete_load is a no-op), failed loads report their destination GPU
   blocks.
@@ -24,38 +24,40 @@ tpu_raiden wheel, or torch_tpu runtime is required:
   completed_jobs/finished_recving, failed-load block-ID reporting, and
   worker-metadata aggregation.
 
-Stage-2 hardening and hybrid coverage:
-- Store batch cap, save retry-once (suppressed during drains), and the
-  poison-key quarantine on terminal transfer failures.
+Failure hardening and hybrid coverage:
+- Save retry-once (suppressed during drains) and the poison-key quarantine
+  on terminal transfer failures.
 - Launch failures share the polled-failure quarantine policy, and a drain
   timeout poisons the still-in-flight jobs so their eventual completions
   finalize as failures instead of committing.
-- Submit-time sub-hash classification: mixed batches (recovered entries or
-  partial-failure leftovers) save only the newly admitted HBM sub-hashes —
-  raiden's save() rejects any batch containing non-HBM hashes.
+- Submit-time sub-hash classification: mixed batches (partial-failure
+  leftovers) save only the newly admitted HBM sub-hashes — raiden's save()
+  rejects any batch containing non-HBM hashes.
 - prepare_load pin races fail the job cleanly instead of raising.
-- Recovered-directory learning (lookup HIT teaches the advisory state) and
+- Advisory-state learning (a lookup HIT teaches the advisory state) and
   hybrid unified-pool geometry resolution (attention-spec filtering, page
   uniformity).
 
-Phase-4 cross-instance sharing:
+Cross-instance sharing:
 - Global lookup: REMOTE peer slices are a HIT only with the registry
   enabled, a dead registry degrades to local-only, an in-flight fetch
   reports HIT_PENDING.
 - Receiver flow: prepare_load installs peer mappings via
-  insert_and_lock(on_host=True), submit partitions load() vs read_remote()
-  by live status, the finalizer polls poll_remote_read_status.
+  insert_and_lock_detailed(on_host=True), submit partitions load() vs
+  read_remote() by live status, the finalizer polls
+  poll_remote_read_status.
 - Failure paths: landing-capacity rejection fails the job cleanly, a failed
   read (polled or at launch) deletes the local install (registry keeps the
   peer mapping) and remote-quarantines the keys without blocking local
   stores.
-- Host-landing displacements (wheel #2): prepare_load's detailed insert
+- Host-landing displacements: prepare_load's detailed insert
   carries them to the load job, committing only on success.
 - Compatibility namespace: sub-hashes carry the namespace prefix end to end
   (including displaced-key recovery), and derive_offload_namespace is
   deterministic and config-sensitive.
 """
 import enum
+import os
 import sys
 import unittest
 from dataclasses import dataclass
@@ -123,12 +125,16 @@ class FakeKVCacheStore:
         self.fail_load = False
         self.fail_read_remote = False
         self.raiden_id = object()
-        # Global-registry contents (phase 4): sub-hash -> peer REMOTE slice.
+        # Global-registry contents: sub-hash -> peer REMOTE slice.
         # Consulted by lookup(enable_global=True) for local misses, like
         # raiden's registry fallback; registry_down mirrors raiden's
         # swallow-registry-errors behavior (local results only).
         self.global_entries: dict[bytes, FakeRaidenBlockID] = {}
         self.registry_down = False
+        # Hashes the next insert_and_lock_detailed reports as displaced
+        # (their entries are dropped from the directory, mirroring a real
+        # displacement to the candidate list).
+        self.displace_next: list[bytes] = []
         # Terminal outcomes queued by the test, drained by the polls.
         self._save_done: list[bytes] = []
         self._save_failed: list[bytes] = []
@@ -195,6 +201,34 @@ class FakeKVCacheStore:
             else:
                 entry.pin_count += 1
         return True
+
+    def insert_and_lock_detailed(self, block_hashes, slices, on_host):
+        # Returns the raw (success, existing, inserted, displaced) tuple the
+        # native _tpu_raiden_torch binding returns, not the dataclass the
+        # unpackaged api/torch wrapper builds on top of it.
+        self.calls.append(
+            _Call("insert_and_lock_detailed",
+                  (list(block_hashes), list(slices), on_host)))
+        if self.fail_insert_and_lock:
+            return (False, [], [], [])
+        existing, inserted = [], []
+        for h, s in zip(block_hashes, slices):
+            entry = self.entries.get(h)
+            if entry is None:
+                self.entries[h] = _Entry(status=s.status,
+                                         device_block_id=s.device_block_id,
+                                         pin_count=1)
+                inserted.append(h)
+            else:
+                entry.pin_count += 1
+                existing.append(h)
+        displaced = []
+        for h in self.displace_next:
+            entry = self.entries.pop(h, None)
+            if entry is not None:
+                displaced.append((h, SimpleNamespace(status=entry.status)))
+        self.displace_next = []
+        return (True, existing, inserted, displaced)
 
     def release_and_delete(self, block_hashes) -> int:
         self.calls.append(_Call("release_and_delete", (list(block_hashes), )))
@@ -301,49 +335,6 @@ class FakeKVCacheStore:
         return [c for c in self.calls if c.name == name]
 
 
-class FakeKVCacheStoreV2(FakeKVCacheStore):
-    """Fake with insert_and_lock_detailed.
-
-    The base fake deliberately lacks it so the manager's per-sub-hash
-    classification fallback keeps its coverage.
-    """
-
-    def __init__(self, registered_workers: int = 0):
-        super().__init__(registered_workers)
-        # Hashes the next insert_and_lock_detailed reports as displaced
-        # (their entries are dropped from the directory, mirroring a real
-        # displacement to the candidate list).
-        self.displace_next: list[bytes] = []
-
-    def insert_and_lock_detailed(self, block_hashes, slices, on_host):
-        # Returns the raw (success, existing, inserted, displaced) tuple the
-        # native _tpu_raiden_torch binding returns, not the dataclass the
-        # unpackaged api/torch wrapper builds on top of it.
-        self.calls.append(
-            _Call("insert_and_lock_detailed",
-                  (list(block_hashes), list(slices), on_host)))
-        if self.fail_insert_and_lock:
-            return (False, [], [], [])
-        existing, inserted = [], []
-        for h, s in zip(block_hashes, slices):
-            entry = self.entries.get(h)
-            if entry is None:
-                self.entries[h] = _Entry(status=s.status,
-                                         device_block_id=s.device_block_id,
-                                         pin_count=1)
-                inserted.append(h)
-            else:
-                entry.pin_count += 1
-                existing.append(h)
-        displaced = []
-        for h in self.displace_next:
-            entry = self.entries.pop(h, None)
-            if entry is not None:
-                displaced.append((h, SimpleNamespace(status=entry.status)))
-        self.displace_next = []
-        return (True, existing, inserted, displaced)
-
-
 def make_manager(store, *, f=4, num_blocks=8, world_size=2, **kwargs):
     from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
     return RaidenOffloadingManager(
@@ -360,11 +351,14 @@ def make_manager(store, *, f=4, num_blocks=8, world_size=2, **kwargs):
 
 
 def make_global_manager(store, **kwargs):
-    """Manager with the phase-4 global registry enabled."""
-    return make_manager(store,
-                        global_registry_address="registry:50051",
-                        store_server_ip="10.0.0.1",
-                        **kwargs)
+    """Manager with the global registry enabled."""
+    # The manager rejects a registry configuration without PYTHONHASHSEED
+    # (unseeded replicas can never share hashes); satisfy it for the tests.
+    with patch.dict(os.environ, {"PYTHONHASHSEED": "0"}):
+        return make_manager(store,
+                            global_registry_address="registry:50051",
+                            store_server_ip="10.0.0.1",
+                            **kwargs)
 
 
 def sub_hashes(key: bytes, f: int = 4, ns: bytes = b"") -> list[bytes]:
@@ -417,6 +411,30 @@ class TestRegistrationGate(unittest.TestCase):
             manager.lookup(_key(0), _ctx())
 
 
+class TestConstructionGuards(unittest.TestCase):
+
+    def test_requires_insert_and_lock_detailed(self):
+        # A wheel without the detailed insert would silently never surface
+        # displacements; the manager must refuse to start on it.
+        saved = FakeKVCacheStore.insert_and_lock_detailed
+        del FakeKVCacheStore.insert_and_lock_detailed
+        try:
+            with self.assertRaises(RuntimeError):
+                make_manager(FakeKVCacheStore(registered_workers=2))
+        finally:
+            FakeKVCacheStore.insert_and_lock_detailed = saved
+
+    def test_registry_requires_pythonhashseed(self):
+        # Unseeded replicas derive disjoint block-hash chains, so every
+        # cross-instance lookup would miss with no error anywhere.
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONHASHSEED"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError):
+                make_manager(FakeKVCacheStore(registered_workers=2),
+                             global_registry_address="registry:50051",
+                             store_server_ip="10.0.0.1")
+
+
 class TestLookup(unittest.TestCase):
 
     def setUp(self):
@@ -438,7 +456,7 @@ class TestLookup(unittest.TestCase):
         self.assertEqual(self.manager.lookup(_key(0), _ctx()),
                          LookupResult.HIT_PENDING)
 
-    def test_remote_status_is_miss_in_phase1(self):
+    def test_remote_status_is_miss_without_registry(self):
         for h in sub_hashes(_key(0)):
             self.store.entries[h] = _Entry(status=FakeBlockStatus.REMOTE)
         self.assertEqual(self.manager.lookup(_key(0), _ctx()),
@@ -459,7 +477,7 @@ class TestStoreJobLifecycle(unittest.TestCase):
     def test_submit_expands_sub_hashes_and_device_blocks(self):
         self._admit([_key(0), _key(1)], [5, 9])
 
-        (call, ) = self.store.calls_named("insert_and_lock")
+        (call, ) = self.store.calls_named("insert_and_lock_detailed")
         hashes, slices, on_host = call.args
         self.assertEqual(hashes, sub_hashes(_key(0)) + sub_hashes(_key(1)))
         self.assertFalse(on_host)
@@ -767,14 +785,14 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertEqual(meta.load_jobs, {})
         self.assertEqual(meta.fence_job_ids, {7})
         self.assertEqual(meta.finished_store_job_ids, [])
-        self.assertEqual(store.calls_named("insert_and_lock"), [])
+        self.assertEqual(store.calls_named("insert_and_lock_detailed"), [])
 
         # First rank ack: still parked.
         self._ack(sched, [7])
-        self.assertEqual(store.calls_named("insert_and_lock"), [])
+        self.assertEqual(store.calls_named("insert_and_lock_detailed"), [])
         # Second rank ack: admitted and launched.
         self._ack(sched, [7])
-        self.assertEqual(len(store.calls_named("insert_and_lock")), 1)
+        self.assertEqual(len(store.calls_named("insert_and_lock_detailed")), 1)
         self.assertEqual(len(store.calls_named("save")), 1)
         self.assertNotIn(7, sched._fence_pending)
 
@@ -812,7 +830,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         meta = self._build_meta(sched, self._stock_meta(jobs_to_flush={7}))
         self.assertIn(7, meta.finished_store_job_ids)
         self.assertNotIn(7, sched._fence_pending)
-        self.assertEqual(store.calls_named("insert_and_lock"), [])
+        self.assertEqual(store.calls_named("insert_and_lock_detailed"), [])
         # The key is admittable again.
         out = manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(0)])
@@ -857,8 +875,8 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
     An aborted request's offload_keys cover every full token block (hashes
     exist as soon as tokens are known) while block_ids only cover what got
     allocated before the abort; the stock _build_store_jobs dies on its
-    slice-length assert (seen in job j-841170b1 when the eval pod killed
-    its background stressors, aborting their in-flight requests). The
+    slice-length assert (seen when an eval pod killed its background
+    stressors, aborting their in-flight requests). The
     TPURaidenOffloadingScheduler override trims the keys to the chunks
     whose blocks were allocated AND computed before delegating.
     """
@@ -1073,24 +1091,11 @@ class TestWorkerSideConnector(unittest.TestCase):
 
 
 class TestFailureHardening(unittest.TestCase):
-    """Stage-2 hardening: batch cap, drain-suppressed retries, and the
-    poison-key quarantine."""
+    """Drain-suppressed retries and the poison-key quarantine."""
 
     def setUp(self):
         self.store = FakeKVCacheStore(registered_workers=2)
         self.manager = make_manager(self.store)
-
-    def test_store_batch_cap_truncates_keys(self):
-        import vllm_torchtpu.offload.raiden_store as rs
-        keys = [_key(i) for i in range(5)]
-        with patch.object(rs, "_MAX_STORE_KEYS_PER_JOB", 2):
-            out = self.manager.prepare_store(keys, _ctx())
-        # Dropped keys are not accepted, so the scheduler re-offers them
-        # next step; only the accepted prefix is tracked in flight.
-        self.assertEqual(out.keys_to_store, keys[:2])
-        self.manager.on_store_job_cancelled(keys[:2])
-        out = self.manager.prepare_store(keys, _ctx())
-        self.assertEqual(out.keys_to_store, keys)
 
     def test_drain_suppresses_save_retry(self):
         out = self.manager.prepare_store([_key(0)], _ctx())
@@ -1228,7 +1233,7 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
         out = self.manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [])
 
-    def test_lookup_learns_recovered_keys_for_touch(self):
+    def test_lookup_learns_unknown_keys_for_touch(self):
         # The store directory can hold entries this process never
         # admitted (e.g. restored displacement candidates); a HIT must teach
         # the manager so touch reaches them.
@@ -1247,7 +1252,7 @@ class TestDetailedClassification(unittest.TestCase):
     displacement -> eviction events."""
 
     def setUp(self):
-        self.store = FakeKVCacheStoreV2(registered_workers=2)
+        self.store = FakeKVCacheStore(registered_workers=2)
         self.manager = make_manager(self.store)
 
     def _store_key(self, key, gpu_block, job_id):
@@ -1312,7 +1317,7 @@ class TestDetailedClassification(unittest.TestCase):
 
 
 class TestRemoteReadFlow(unittest.TestCase):
-    """Phase-4 receiver flow against the fake registry."""
+    """Cross-instance receiver flow against the fake registry."""
 
     def setUp(self):
         self.store = FakeKVCacheStore(registered_workers=2)
@@ -1344,7 +1349,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.assertTrue(spec.pinned)
         # The peer slices were installed locally: on_host=True, entries
         # REMOTE and pinned.
-        (ial, ) = self.store.calls_named("insert_and_lock")
+        (ial, ) = self.store.calls_named("insert_and_lock_detailed")
         self.assertEqual(ial.args[0], sub_hashes(key))
         self.assertTrue(ial.args[2])
         for h in sub_hashes(key):
@@ -1518,13 +1523,13 @@ class TestRemoteReadFlow(unittest.TestCase):
 
 
 class TestRemoteLandingDisplacement(unittest.TestCase):
-    """Phase 4 on a wheel-#2 store: prepare_load's host-landing install goes
-    through the detailed insert, so entries it displaces commit exactly like
-    a store admission's — eviction event + advisory forget on success,
-    rollback on failure."""
+    """prepare_load's host-landing install goes through the detailed
+    insert, so entries it displaces commit exactly like a store
+    admission's — eviction event + advisory forget on success, rollback on
+    failure."""
 
     def setUp(self):
-        self.store = FakeKVCacheStoreV2(registered_workers=2)
+        self.store = FakeKVCacheStore(registered_workers=2)
         self.manager = make_global_manager(self.store)
         # A locally stored key the landing reservation will displace.
         seed_host_entries(self.store, _key(1))
@@ -1583,7 +1588,7 @@ class TestNamespace(unittest.TestCase):
     NS = b"NS16bytes--------"[:16]
 
     def setUp(self):
-        self.store = FakeKVCacheStoreV2(registered_workers=2)
+        self.store = FakeKVCacheStore(registered_workers=2)
         self.manager = make_global_manager(self.store, key_namespace=self.NS)
 
     def test_namespace_prefixes_every_sub_hash(self):

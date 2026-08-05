@@ -195,14 +195,14 @@ def _register_tpu_kv_connectors() -> None:
     which is registry-only. Without this, the first stats batch naming a
     child (e.g. TPURaidenOffloadingConnector) kills the AsyncLLM output
     handler with "Connector ... is not registered" and every subsequent
-    request 500s (j-39fe6677).
+    request 500s.
 
     Called from check_and_update_config, which runs in every process that
     constructs a VllmConfig (the API server included) — NOT from the
     platform plugin entry point: that runs inside vllm.platforms' own
     module initialization, where importing the factory reaches back for
-    the still-unset current_platform and dies (j-7c3c871b). Lazy loaders:
-    nothing is imported until a name is actually looked up.
+    the still-unset current_platform and dies. Lazy loaders: nothing is
+    imported until a name is actually looked up.
     """
     from vllm.distributed.kv_transfer.kv_connector.factory import \
         KVConnectorFactory
@@ -215,8 +215,12 @@ def _register_tpu_kv_connectors() -> None:
         ("TPURaidenOffloadingConnector",
          "vllm_torchtpu.offload.raiden_connector"),
     ):
-        if name not in KVConnectorFactory._registry:
+        try:
             KVConnectorFactory.register_connector(name, module_path, name)
+        except ValueError:
+            # Already registered (check_and_update_config runs more than
+            # once per process).
+            pass
 
 
 def apply_tpu_patches() -> None:
