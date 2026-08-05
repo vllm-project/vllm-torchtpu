@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     FORCE_MOE_RANDOM_ROUTING: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -227,10 +228,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "RAGGED_GATHER_VERSION":
     env_with_choices("RAGGED_GATHER_VERSION", "v2", ["v1", "v2"]),
     # SparseCore MoE gather-reduce (combine) kernel version used by
-    # fused_moe_gmm. "v2" (default) = ragged_gather_reduce_v2; "v1" = legacy
-    # ragged_gather_reduce.
+    # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
+    # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION":
-    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
+    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
