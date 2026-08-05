@@ -921,8 +921,8 @@ class TestTPURaidenConnectorScheduler:
         for index in range(3):
             req = MagicMock()
             req.request_id = f"bounded-{index}"
-            req.num_prompt_tokens = 2
-            req.num_computed_tokens = 1
+            req.num_prompt_tokens = 32_769
+            req.num_computed_tokens = 32_768
             req.status = RequestStatus.FINISHED_LENGTH_CAPPED
             requests.append(req)
 
