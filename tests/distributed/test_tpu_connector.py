@@ -2623,6 +2623,17 @@ class TestTPURaidenConnectorWorker:
                                                    "dp8_decode.*requires"):
             worker._raiden_qwen35_admission_topology()
 
+    @pytest.mark.parametrize("dp_size", [4, 8])
+    def test_v1_admission_accepts_dp_prefill_topology(self, dp_size):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=True,
+                                     dp_size=dp_size,
+                                     pcp_size=1)
+
+        assert worker._raiden_qwen35_admission_topology() == (
+            f"dp{dp_size}_prefill")
+
     def test_producer_registers_sends_with_raiden(self):
         meta = TPUConnectorMetadata()
         meta.reqs_to_send["req"] = MagicMock(uuid=123, local_block_ids=[7, 8])
