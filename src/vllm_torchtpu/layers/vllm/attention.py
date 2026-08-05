@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import math
 from typing import Any, ClassVar
 
 import jax
@@ -15,7 +16,7 @@ from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, kv_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
     sparse_packed_width
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -23,6 +24,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
+from vllm_torchtpu.kv_cache_layout import KVCacheLayout, get_dtype_packing
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, mla_attention, ragged_paged_attention,
     ragged_paged_attention_batched)
@@ -36,9 +38,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 
 logger = init_logger(__name__)
-
-# TPU requires the head size to be a multiple of 128.
-TPU_HEAD_SIZE_ALIGNMENT = 128
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
 # from to fp32 directly. That's why it has a dtype mapping different from GPU
@@ -72,16 +71,6 @@ def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
     if dtype is None:
         raise ValueError(f"Unsupported KV cache dtype string: {cache_dtype}")
     return dtype
-
-
-def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
-    """Return number of dtype values packed into a packing_bits lane."""
-    bits = torch.empty((), dtype=dtype).element_size() * 8
-    if packing_bits % bits != 0:
-        raise ValueError(
-            f"The bit width must divide {packing_bits}, but got {bits} for "
-            f"dtype={dtype}.")
-    return packing_bits // bits
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
@@ -332,38 +321,40 @@ class PallasAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
+        *,
+        layout: KVCacheLayout | None = None,
     ) -> tuple[int, ...]:
-        padded_head_size = (cdiv(head_size, TPU_HEAD_SIZE_ALIGNMENT) *
-                            TPU_HEAD_SIZE_ALIGNMENT)
-        # Two different RPA kernels have different KV cache layouts:
-        # - hd64 (head_dim=64): K/V packed along head_dim
-        # - v3 (head_dim!=64): K/V packed along heads
-        # The Pallas kernels expect a 5D KV cache: [L, S, Kx2 / kv_packing, kv_packing, H]
-        # where Kx2 = num_kv_heads for hd64 and Kx2 = num_kv_heads * 2 for v3.
-        use_hd64 = (head_size == 64)
+        """Shape of one layer's KV cache. See `vllm_torchtpu.kv_cache_layout`.
+
+        `layout` is keyword-only with a default because vLLM itself calls this
+        method (e.g. `vllm/v1/attention/backend.py`, the offloading connector),
+        so the leading parameters are a fixed contract. Callers that do not
+        care get whatever `resolve_kv_cache_layout()` returns.
+        """
         # vLLM's OffloadingConnectorWorker.register_kv_caches probes this
         # method without a concrete dtype to discover the num_blocks logical
         # dimension (it only reads test_shape.index(num_blocks); see
         # vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py).
-        # num_blocks is at dim 0 in our layout regardless of dtype, so return
-        # a placeholder shape that satisfies the probe without resolving the
-        # dtype.
+        # num_blocks is at dim 0 in every layout, so return a placeholder shape
+        # that satisfies the probe without resolving the dtype.
         if (isinstance(cache_dtype_str, str)
                 and cache_dtype_str.lower().strip() == "auto"):
-            num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
-            return (num_blocks, block_size, num_kv_heads_x2, 1,
-                    padded_head_size)
-        kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        kv_packing = get_dtype_packing(kv_dtype)
-
-        num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
-        num_kv_heads_x2 = cdiv(num_kv_heads_x2, kv_packing) * kv_packing
-        return (
+            return (
+                num_blocks,
+                block_size,
+                kv_cache_layout.kv_vectors_per_token(num_kv_heads, head_size),
+                1,  # stand-in for the packing dim; the probe never reads it
+                kv_cache_layout.padded_head_size(head_size),
+            )
+        if layout is None:
+            layout = kv_cache_layout.resolve_kv_cache_layout()
+        return kv_cache_layout.kv_cache_shape(
+            layout,
             num_blocks,
             block_size,
-            num_kv_heads_x2 // kv_packing,
-            kv_packing,
-            padded_head_size,
+            num_kv_heads,
+            head_size,
+            _resolve_kv_cache_dtype(cache_dtype_str),
         )
 
     @staticmethod
@@ -372,18 +363,19 @@ class PallasAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
+        *,
+        layout: KVCacheLayout | None = None,
     ) -> int:
         """Return one Pallas KV-cache page size including layout padding."""
-        dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        shape = PallasAttentionBackend.get_kv_cache_shape(
-            1,
+        if layout is None:
+            layout = kv_cache_layout.resolve_kv_cache_layout()
+        return kv_cache_layout.kv_cache_page_size_bytes(
+            layout,
             block_size,
             num_kv_heads,
             head_size,
-            dtype,
+            _resolve_kv_cache_dtype(cache_dtype_str),
         )
-        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
-        return num_elements * torch.empty((), dtype=dtype).element_size()
 
     @staticmethod
     def swap_blocks(
@@ -959,6 +951,13 @@ class PallasMLAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
+        """MLA takes no layout argument: it is always token-packed.
+
+        `mla_v2_kernel.get_kv_cache_shape` derives the packing dimension from
+        `page_size` rather than the head count, which is what
+        `KVCacheLayout.TOKEN_PACKED` means for the other backends. A narrowed
+        dtype therefore shrinks the page here at any head count.
+        """
         if (isinstance(cache_dtype_str, str)
                 and cache_dtype_str.lower().strip() == "auto"):
             return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
@@ -1005,8 +1004,7 @@ class PallasMLAttentionBackend(AttentionBackend):
             head_size,
             dtype,
         )
-        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
-        return num_elements * torch.empty((), dtype=dtype).element_size()
+        return math.prod(shape) * dtype.itemsize
 
     @staticmethod
     def swap_blocks(
