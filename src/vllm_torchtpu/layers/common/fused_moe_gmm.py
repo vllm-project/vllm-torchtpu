@@ -17,6 +17,9 @@ import functools
 import jax
 from jax import numpy as jnp
 
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.cn_moe_kernels import TOP_K as CN_MOE_TOP_K
+from vllm_torchtpu.kernels.cn_moe_kernels import cn_moe_full
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
@@ -368,6 +371,30 @@ def fused_moe_func(
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
+    # Fast path for low-concurrency decode: a specialized C=N Pallas MoE kernel
+    # that skips the gather/scatter permutation of the general gmm path. Only
+    # engaged for small decode batches with topk == CN_MOE_TOP_K.
+    # In vllm-torchtpu, fused_moe_func is called per-device by the torch
+    # bridge, so weights are already local — no shard_map needed.
+    import logging as _logging
+    _lc_logger = _logging.getLogger(__name__)
+    low_conc_threshold = envs.MOE_LOW_CONC_THRESHOLD
+    if 1 <= num_tokens <= low_conc_threshold and topk == CN_MOE_TOP_K:
+        _lc_logger.info("Taking fast low-concurrency C=N Pallas MoE path for "
+                        f"BS={num_tokens} decode (use_ep={use_ep}, "
+                        f"threshold={low_conc_threshold}).")
+        # topk_ids are already local (experts_start remap happened above).
+        # For EP, zero-weight entries are already masked above.
+        out = cn_moe_full(hidden_states,
+                          w1,
+                          w1_scale,
+                          w2,
+                          w2_scale,
+                          topk_ids,
+                          topk_weights,
+                          use_ep=use_ep)
+        return out[:num_tokens, :hidden_size]
+
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,
      valid_mask) = prepare_routed_gmm_inputs(
          hidden_states,
@@ -381,6 +408,7 @@ def fused_moe_func(
          skip_padded_tokens=skip_padded_tokens,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+
     x = moe_gmm(
         x,
         w1,

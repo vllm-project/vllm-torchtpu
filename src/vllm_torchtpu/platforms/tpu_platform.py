@@ -687,7 +687,7 @@ class TpuPlatform(Platform):
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
             compilation_config.compile_sizes = _get_token_paddings(
-                min_token_size=16,
+                min_token_size=8,
                 max_token_size=scheduler_config.max_num_batched_tokens,
                 linear_until=envs.TPU_TOKEN_BUCKET_LINEAR_UNTIL,
                 linear_interval=envs.TPU_TOKEN_BUCKET_LINEAR_INTERVAL,

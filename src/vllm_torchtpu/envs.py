@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     USE_MOE_SPARSE_CORE: bool = True
     FORCE_MOE_RANDOM_ROUTING: bool = False
+    MOE_LOW_CONC_THRESHOLD: int = 64
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -217,6 +218,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output -- for profiling only, never serving. Disabled by default.
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
+    "MOE_LOW_CONC_THRESHOLD":
+    lambda: int(os.getenv("MOE_LOW_CONC_THRESHOLD", "64")),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.
