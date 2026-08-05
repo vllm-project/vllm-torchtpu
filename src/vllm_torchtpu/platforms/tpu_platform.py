@@ -620,6 +620,27 @@ class TpuPlatform(Platform):
         return
 
     @classmethod
+    def device_count(cls) -> int:
+        """Local physical chip count on this host, stable across contexts.
+
+        Without this override, `device_count()` resolves dynamically to
+        `torch.tpu.device_count()` (see torch_tpu's device module), which
+        returns the *local* chip count outside any torch.distributed group
+        but drops to 1 (chips bound to this rank) once a real multi-host
+        `tpu_dist` process group is active — vLLM workers are one-process-
+        per-chip, so every rank observes exactly 1 there. Callers like
+        MessageQueue.create_from_process_group_single_reader use this value
+        as "how many ranks share this host" (the CUDA convention, where
+        device_count() stays host-wide regardless of the process's own
+        device binding), so the dynamic proxy silently breaks cross-host
+        same-node detection for every rank but the reader itself. Scanning
+        /dev/vfio (or /dev/accel*) directly sidesteps the distributed
+        context entirely and always returns the true local chip count.
+        """
+        from vllm_torchtpu.tpu_info import get_num_chips
+        return get_num_chips()
+
+    @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
 
@@ -874,7 +895,26 @@ class TpuPlatform(Platform):
                         "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
-        if not multihost_backend:  # Single host
+        if multihost_backend != "ray" and parallel_config.nnodes > 1:
+            # Genuine multi-host run without Ray: each host runs its own
+            # `vllm serve --nnodes N --node-rank R [--headless]` process and
+            # spawns its local TP-slice workers via TpuMultiprocExecutor.
+            # Unlike the Ray path there's no actor system to discover peer
+            # hosts, so a short TCPStore rendezvous fills in the TORCH_TPU_*
+            # env vars (slicebuilder addresses spanning every host, full
+            # ICI topology, TPU_NUM_HOSTS/NODE_RANK) before workers are
+            # forked.
+            from vllm_torchtpu.distributed.tpu_mp_multihost import \
+                prepare_mp_multihost_env
+            prepare_mp_multihost_env(parallel_config)
+            logger.info(
+                "Force using TpuMultiprocExecutor for TPU multi-host "
+                "(nnodes=%d, node_rank=%d).", parallel_config.nnodes,
+                parallel_config.node_rank)
+            from vllm_torchtpu.executors.tpu_multiproc_executor import \
+                TpuMultiprocExecutor
+            parallel_config.distributed_executor_backend = TpuMultiprocExecutor
+        elif not multihost_backend:  # Single host
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
                 if pcp_size > 1:

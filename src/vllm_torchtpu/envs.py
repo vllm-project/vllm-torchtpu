@@ -173,9 +173,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID":
     lambda: os.getenv("TPU_WORKER_ID", None),
-    # Backend for multi-host communication on TPU
+    # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
+    # used whenever --nnodes > 1 and this isn't set to "ray"; set explicitly
+    # to "mp" to force it (e.g. to silence the auto-detection log line).
     "TPU_MULTIHOST_BACKEND":
-    env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray"]),
+    env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray", "mp"]),
     # Check for XLA recompilation during execution
     "VLLM_XLA_CHECK_RECOMPILATION":
     lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION") or "0")),

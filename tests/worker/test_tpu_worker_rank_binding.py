@@ -37,6 +37,9 @@ def _parallel_config(**kwargs):
     values = vars(ParallelConfig(tensor_parallel_size=8)).copy()
     values["prefill_context_parallel_size"] = 8
     values.update(kwargs)
+    # Single-host tests: local chip count equals the full TP world size
+    # unless a test explicitly overrides it (e.g. to simulate --nnodes > 1).
+    values.setdefault("local_world_size", values["world_size"])
     return SimpleNamespace(**values)
 
 

@@ -521,12 +521,18 @@ def get_tpu_worker_binding(
         )
     else:
         tpu_local_rank, remap, source = get_pcp_worker_local_rank_env(
-            local_rank, world_size, pcp_size)
+            native_local_rank, world_size, pcp_size)
+    # LOCAL_WORLD_SIZE must be the per-host chip count, not the global TP*PP
+    # world size: on a single host they're equal, but across --nnodes hosts
+    # each host only has world_size // nnodes chips, and PjRt bootstrap fails
+    # ("PjRtClient is not initialized") if told to expect more local devices
+    # than physically exist on this host.
+    local_chip_count = parallel_config.local_world_size
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,
         world_size=world_size,
-        local_world_size=local_rank_offset + world_size,
+        local_world_size=local_rank_offset + local_chip_count,
         init_rank=rank,
         init_world_size=world_size,
         init_local_rank=tpu_local_rank,

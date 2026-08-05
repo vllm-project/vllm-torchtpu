@@ -190,6 +190,8 @@ class TestTpuPlatform:
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
         vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.nnodes = 1
+        vllm_config.parallel_config.node_rank = 0
         vllm_config.parallel_config.world_size = 1
         vllm_config.parallel_config.world_size_across_dp = 1
         vllm_config.parallel_config.data_parallel_size = 1
