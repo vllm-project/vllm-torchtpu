@@ -602,6 +602,11 @@ def rpa_kernel(
 
         _run()
 
+    num_pre_leaves = 3  # cu_q_lens, kv_lens, page_indices
+    num_sched_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
+    q_hbm_idx = num_pre_leaves + num_sched_leaves
+    kv_cache_hbm_idx = q_hbm_idx + 2
+
     return pl.pallas_call(
         ragged_paged_attention_pipeline,
         out_shape=[q_hbm, kv_cache_hbm],
@@ -624,8 +629,8 @@ def rpa_kernel(
             disable_bounds_checks=True,
         ),
         input_output_aliases={
-            12: 0,
-            14: 1
+            q_hbm_idx: 0,
+            kv_cache_hbm_idx: 1
         },
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),

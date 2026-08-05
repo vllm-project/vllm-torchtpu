@@ -207,6 +207,9 @@ class RpaConfigs:
         bytes_per_step = (28 + 12 * self.bkv_p_cache +
                           4 * self.dma_kv_new_size * self.bkv_p_new)
         bytes_per_step *= self.block.batch_size
+        # Add 16 bytes for the 4 total_wait fields (total_wait_kv_in, total_wait_kv_out,
+        # total_wait_q_in, total_wait_o_out) which are 1D arrays (not multiplied by batch_size).
+        bytes_per_step += 16
 
         max_steps_ub = available_bytes // bytes_per_step
 
@@ -277,6 +280,26 @@ class RpaConfigs:
     @property
     def fuse_accum(self) -> bool:
         return self.mode == RpaCase.DECODE
+
+    @property
+    def kv_bytes_per_token(self) -> int:
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
+        else:
+            num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
+        return num_elements * self.serve.dtype_kv.itemsize
+
+    @property
+    def q_bytes_per_token(self) -> int:
+        return (self.model.num_kv_heads *
+                self.aligned_num_q_heads_per_kv_head *
+                self.aligned_q_head_dim * self.serve.dtype_q.itemsize)
+
+    @property
+    def o_bytes_per_token(self) -> int:
+        return (self.model.num_kv_heads *
+                self.aligned_num_q_heads_per_kv_head *
+                self.aligned_q_head_dim * self.serve.dtype_out.itemsize)
 
     @property
     def q_vmem_shape(self):
