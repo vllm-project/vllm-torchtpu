@@ -16,7 +16,7 @@ tpu_raiden wheel, or torch_tpu runtime is required:
   (complete_load is a no-op), failed loads report their destination GPU
   blocks.
 - touch via pin+release, lookup prefix semantics over sub-hashes,
-  reset_cache failing loudly, drain_jobs blocking until terminal.
+  drain_jobs blocking until terminal.
 - Scheduler subclass: store jobs are parked until every rank's fence ack,
   jobs_to_flush cancels fence-pending jobs and drains launched ones, and the
   shipped metadata carries empty job dicts plus fence/echo fields.
@@ -34,9 +34,9 @@ Stage-2 hardening and hybrid coverage:
   partial-failure leftovers) save only the newly admitted HBM sub-hashes —
   raiden's save() rejects any batch containing non-HBM hashes.
 - prepare_load pin races fail the job cleanly instead of raising.
-- Recovered-directory learning (lookup HIT teaches the advisory state),
-  RAIDEN_SHM_MODEL_UID derivation, and hybrid unified-pool geometry
-  resolution (attention-spec filtering, page uniformity).
+- Recovered-directory learning (lookup HIT teaches the advisory state) and
+  hybrid unified-pool geometry resolution (attention-spec filtering, page
+  uniformity).
 
 Phase-4 cross-instance sharing:
 - Global lookup: REMOTE peer slices are a HIT only with the registry
@@ -302,11 +302,10 @@ class FakeKVCacheStore:
 
 
 class FakeKVCacheStoreV2(FakeKVCacheStore):
-    """Fake with the wheel-#2 primitives (insert_and_lock_detailed, clear).
+    """Fake with insert_and_lock_detailed.
 
-    The base fake deliberately lacks them so the manager's wheel-#1
-    fallback paths (per-sub-hash classification, reset_cache raising) keep
-    their coverage.
+    The base fake deliberately lacks it so the manager's per-sub-hash
+    classification fallback keeps its coverage.
     """
 
     def __init__(self, registered_workers: int = 0):
@@ -343,17 +342,6 @@ class FakeKVCacheStoreV2(FakeKVCacheStore):
                 displaced.append((h, SimpleNamespace(status=entry.status)))
         self.displace_next = []
         return (True, existing, inserted, displaced)
-
-    def clear(self) -> int:
-        self.calls.append(_Call("clear", ()))
-        if self._saving or self._loading or self._remote_reading:
-            raise RuntimeError("KVCacheStore clear failed: transfers in "
-                               "flight")
-        if any(e.pin_count > 0 for e in self.entries.values()):
-            raise RuntimeError("KVCacheStore clear failed: pinned")
-        cleared = len(self.entries)
-        self.entries.clear()
-        return cleared
 
 
 def make_manager(store, *, f=4, num_blocks=8, world_size=2, **kwargs):
@@ -680,10 +668,6 @@ class TestTouchAndMisc(unittest.TestCase):
         self.assertEqual(pin.args[0], sub_hashes(_key(2)))
         (release, ) = self.store.calls_named("release")
         self.assertEqual(release.args[0], sub_hashes(_key(2)))
-
-    def test_reset_cache_fails_loudly(self):
-        with self.assertRaises(NotImplementedError):
-            self.manager.reset_cache()
 
     def test_drain_jobs_blocks_until_terminal(self):
         out = self.manager.prepare_store([_key(0)], _ctx())
@@ -1245,8 +1229,9 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
         self.assertEqual(out.keys_to_store, [])
 
     def test_lookup_learns_recovered_keys_for_touch(self):
-        # Entries recovered from shm predate this process's advisory state;
-        # a HIT must teach the manager so touch reaches them.
+        # The store directory can hold entries this process never
+        # admitted (e.g. restored displacement candidates); a HIT must teach
+        # the manager so touch reaches them.
         seed_host_entries(self.store, _key(0))
         self.manager.touch([_key(0)], _ctx())
         self.assertEqual(self.store.calls_named("pin"), [])
@@ -1257,10 +1242,9 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
         self.assertEqual(pin.args[0], sub_hashes(_key(0)))
 
 
-class TestWheel2DetailedAndReset(unittest.TestCase):
-    """Stage-3 paths on a wheel-#2 store: classification via the detailed
-    insert_and_lock result, displacement -> eviction events, and reset_cache
-    through the public clear()."""
+class TestDetailedClassification(unittest.TestCase):
+    """Classification via the detailed insert_and_lock result and
+    displacement -> eviction events."""
 
     def setUp(self):
         self.store = FakeKVCacheStoreV2(registered_workers=2)
@@ -1325,71 +1309,6 @@ class TestWheel2DetailedAndReset(unittest.TestCase):
         self.assertFalse(fj.success)
         # Rollback restored the candidates: no eviction events.
         self.assertEqual(list(self.manager.take_events()), [])
-
-    def test_reset_cache_drains_clears_and_resets_state(self):
-        # A stored key, an in-flight store, and a quarantined key all reset.
-        seed_host_entries(self.store, _key(0))
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
-        self._store_key(_key(1), 5, 7)
-        self.store.complete_save(sub_hashes(_key(1)))
-
-        self.manager.reset_cache()
-        (clear_call, ) = self.store.calls_named("clear")
-        self.assertEqual(clear_call.args, ())
-        self.assertEqual(self.store.entries, {})
-        self.assertFalse(self.manager.has_pending_work())
-        # Advisory state gone: everything is a MISS and re-admittable.
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.MISS)
-        out = self.manager.prepare_store([_key(0), _key(1)], _ctx())
-        self.assertEqual(out.keys_to_store, [_key(0), _key(1)])
-
-    def test_reset_cache_without_clear_raises(self):
-        legacy = FakeKVCacheStore(registered_workers=2)
-        manager = make_manager(legacy)
-        with self.assertRaises(NotImplementedError):
-            manager.reset_cache()
-
-
-class TestShmModelUid(unittest.TestCase):
-
-    def _cfg(self, model="m", revision="r"):
-        cfg = MagicMock()
-        cfg.model_config.model = model
-        cfg.model_config.revision = revision
-        return cfg
-
-    def test_uid_is_deterministic_and_config_sensitive(self):
-        from vllm_torchtpu.offload.raiden_store import derive_shm_model_uid
-        kwargs = dict(kernel_block_size=256,
-                      per_block_shape=(256, 8, 2, 128),
-                      kv_dtype="bfloat16",
-                      gpu_block_size=1280,
-                      world_size=4,
-                      capacity_kernel_blocks=1000)
-        uid = derive_shm_model_uid(self._cfg(), **kwargs)
-        self.assertEqual(uid, derive_shm_model_uid(self._cfg(), **kwargs))
-        self.assertNotEqual(
-            uid, derive_shm_model_uid(self._cfg(model="other"), **kwargs))
-        self.assertNotEqual(
-            uid,
-            derive_shm_model_uid(self._cfg(), **{
-                **kwargs, "capacity_kernel_blocks": 999
-            }))
-        # cp_geometry: empty (the pcp=1 case) must not change pre-existing
-        # UIDs — their recoverable shm segments stay valid — while an active
-        # CP layout must.
-        self.assertEqual(
-            uid, derive_shm_model_uid(self._cfg(), **kwargs, cp_geometry=()))
-        pcp_uid = derive_shm_model_uid(self._cfg(),
-                                       **kwargs,
-                                       cp_geometry=(8, 1, 1))
-        self.assertNotEqual(uid, pcp_uid)
-        self.assertNotEqual(
-            pcp_uid,
-            derive_shm_model_uid(self._cfg(), **kwargs,
-                                 cp_geometry=(8, 1, 16)))
 
 
 class TestRemoteReadFlow(unittest.TestCase):
@@ -1731,9 +1650,9 @@ class TestNamespace(unittest.TestCase):
                 **kwargs, "world_size": 8
             }))
         # cp_geometry: empty (the pcp=1 case) must not change pre-existing
-        # namespaces — registry entries and shm segments outlive code
-        # upgrades — while an active CP layout must (it changes how tokens
-        # map onto each rank's pages).
+        # namespaces — registry entries outlive code upgrades — while an
+        # active CP layout must (it changes how tokens map onto each rank's
+        # pages).
         self.assertEqual(
             ns, derive_offload_namespace(cfg(), **kwargs, cp_geometry=()))
         pcp_ns = derive_offload_namespace(cfg(),

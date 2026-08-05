@@ -50,18 +50,13 @@ Phase-2 hardening: store jobs are batch-capped and retried once on transfer
 failure; keys that fail terminally are quarantined (reported MISS, never
 re-admitted). A drain that times out poisons the still-in-flight jobs, so
 their eventual completions finalize as failures instead of committing bytes
-possibly torn by the block reuse that motivated the drain. With
-`RAIDEN_SHM_KEY` set, the host pools and the store
-directory live in shared memory and survive an engine-process crash; the
-directory is recovered inside the plain constructors on restart, gated by a
-config-derived `RAIDEN_SHM_MODEL_UID`.
+possibly torn by the block reuse that motivated the drain.
 
-Phase 3 (wheel #2 primitives, detected at runtime): store-job batches are
+Phase 3 (newer store primitives, detected at runtime): store-job batches are
 classified by `insert_and_lock_detailed` (existing entries pinned in place,
 only newly inserted ones saved) with displacements surfaced as eviction
-events through `take_events`; `reset_cache` empties the store via the public
-`clear()`. On a wheel-#1 tpu_raiden, classification falls back to
-per-sub-hash peeks, no events are emitted, and `reset_cache` raises.
+events through `take_events`. On an older tpu_raiden, classification falls
+back to per-sub-hash peeks and no events are emitted.
 
 Phase 4 (cross-instance KV sharing, enabled by `global_registry_address`):
 saved blocks are published to the global registry by raiden, so a prefix
@@ -323,19 +318,16 @@ class RaidenOffloadingManager(OffloadingManager):
         self._block_id_cls = store_types.RaidenBlockID
         self._raiden_id = self._store.raiden_id
 
-        # Wheel-#2 primitives. hasattr is deliberate: the tpu_raiden wheel is
-        # pinned per recipe and wheel #1 genuinely lacks both — store-job
-        # classification then falls back to per-sub-hash peeks (no eviction
-        # events) and reset_cache stays unsupported.
+        # Newer store primitives. hasattr is deliberate: the tpu_raiden wheel
+        # is pinned per recipe and older wheels genuinely lack this —
+        # store-job classification then falls back to per-sub-hash peeks (no
+        # eviction events).
         self._has_detailed = hasattr(self._store, "insert_and_lock_detailed")
-        self._has_clear = hasattr(self._store, "clear")
-        if not (self._has_detailed and self._has_clear):
+        if not self._has_detailed:
             logger.warning(
-                "[kv-offload-v2] tpu_raiden wheel predates wheel #2 "
-                "(insert_and_lock_detailed=%s, clear=%s): store-job "
-                "classification uses per-sub-hash peeks, eviction events are "
-                "unavailable, and reset_cache raises.", self._has_detailed,
-                self._has_clear)
+                "[kv-offload-v2] tpu_raiden wheel lacks "
+                "insert_and_lock_detailed: store-job classification uses "
+                "per-sub-hash peeks and eviction events are unavailable.")
 
         # Registration gate: stores/loads stay disabled until every rank's
         # KVCacheManager has registered with the store's controller. A
@@ -619,30 +611,6 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def has_pending_work(self) -> bool:
         return bool(self._admissions)
-
-    def reset_cache(self) -> None:
-        if not self._has_clear:
-            raise NotImplementedError(
-                "[kv-offload-v2] reset_cache requires the wheel-#2 "
-                "tpu_raiden clear() primitive: release_and_delete is a "
-                "rollback that preserves HOST entries, so a vLLM-side reset "
-                "would silently not clear the cache. Install a wheel built "
-                "from the raiden_controller branch with KVCacheStore.Clear.")
-        # The connector scheduler flushed every live job before calling us;
-        # drain whatever is still in flight so no pins survive (clear()
-        # rejects otherwise), with retries suppressed by the drain.
-        if self._admissions:
-            self.drain_jobs(set(self._admissions.keys()))
-        cleared = self._store.clear()
-        self._stored_keys.clear()
-        self._inflight_store_keys.clear()
-        self._quarantined_keys.clear()
-        self._remote_quarantined_keys.clear()
-        self._remote_slices.clear()
-        self._pending_events.clear()
-        logger.info(
-            "[kv-offload-v2] reset_cache: cleared %d store entries; advisory "
-            "state and quarantine reset.", cleared)
 
     def shutdown(self) -> None:
         if self._admissions:
@@ -1127,35 +1095,6 @@ def derive_offload_namespace(
     return hashlib.sha256(material.encode()).digest()[:16]
 
 
-def derive_shm_model_uid(
-    vllm_config: VllmConfig,
-    *,
-    kernel_block_size: int,
-    per_block_shape: tuple[int, ...],
-    kv_dtype: object,
-    gpu_block_size: int,
-    world_size: int,
-    capacity_kernel_blocks: int,
-    key_namespace: bytes = b"",
-    cp_geometry: tuple[int, ...] = ()) -> str:
-    """Deterministic RAIDEN_SHM_MODEL_UID for shm-backed restart recovery.
-
-    Covers everything that must match for recovered host bytes to be valid —
-    including the key namespace, since recovered directory hashes embed it;
-    an incompatible restart therefore fails raiden's segment validation and
-    cold-starts instead of serving garbage. `cp_geometry` follows the same
-    contract as in `derive_offload_namespace`: non-empty only under context
-    parallelism, so pcp=1 UIDs (and their recoverable segments) are
-    unaffected by its introduction.
-    """
-    material = repr((vllm_config.model_config.model,
-                     vllm_config.model_config.revision, str(kv_dtype),
-                     kernel_block_size, per_block_shape, gpu_block_size,
-                     world_size, capacity_kernel_blocks, key_namespace,
-                     "kv-offload-v2-subhash") + cp_geometry)
-    return hashlib.sha256(material.encode()).hexdigest()[:32]
-
-
 def resolve_kernel_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> tuple[int, tuple[int, ...], object, int]:
@@ -1494,33 +1433,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             cp_geometry=cp_geometry,
         )
 
-        # Restart recovery: RAIDEN_SHM_KEY (recipe-set) moves the workers'
-        # host KV pools and the store's metadata table into shared memory;
-        # re-attach and directory recovery then happen inside the plain
-        # raiden constructors on the next start. The model UID gates the
-        # re-attach, so derive it from everything that must match for the
-        # surviving bytes to be valid — an incompatible restart (different
-        # model, dtype, geometry, world size, or offload capacity) fails
-        # validation and cold-starts instead of serving garbage. Both the
-        # scheduler and worker processes construct this spec before creating
-        # any raiden object, so setting it here covers both sides.
+        # Shm-backed host pools are unsupported: the raiden shm allocator
+        # aliases every host mirror onto one segment, so serving from a
+        # RAIDEN_SHM_KEY store returns corrupt KV behind full-looking hits.
+        # Fail construction rather than let it through (see
+        # TODO/reset-and-shm-recovery.md).
         if os.environ.get("RAIDEN_SHM_KEY"):
-            os.environ.setdefault(
-                "RAIDEN_SHM_MODEL_UID",
-                derive_shm_model_uid(
-                    vllm_config,
-                    kernel_block_size=kernel_block_size,
-                    per_block_shape=per_block_shape,
-                    kv_dtype=kv_dtype,
-                    gpu_block_size=gpu_block_size,
-                    world_size=self.world_size,
-                    capacity_kernel_blocks=self.capacity_kernel_blocks,
-                    key_namespace=self.key_namespace,
-                    cp_geometry=cp_geometry))
-            logger.info(
-                "[kv-offload-v2] shm recovery enabled: RAIDEN_SHM_KEY=%s "
-                "RAIDEN_SHM_MODEL_UID=%s", os.environ["RAIDEN_SHM_KEY"],
-                os.environ["RAIDEN_SHM_MODEL_UID"])
+            raise ValueError(
+                "[kv-offload-v2] RAIDEN_SHM_KEY is not supported: shm-backed "
+                "host pools serve corrupt KV on the current tpu_raiden "
+                "wheel. See TODO/reset-and-shm-recovery.md.")
 
         # Each DP engine owns a full V2 stack (store + in-process
         # controller) and DP-local engines share one host, so offset the
@@ -1532,12 +1454,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
-        if (vllm_config.parallel_config.data_parallel_size > 1
-                and os.environ.get("RAIDEN_SHM_KEY")):
-            raise ValueError(
-                "[kv-offload-v2] shm restart recovery (RAIDEN_SHM_KEY) is "
-                "not supported with data parallelism: DP-local engines "
-                "would collide on the per-host shm segment names")
         self.raiden_controller_port = dp_rank_local + int(
             self.extra_config.get("raiden_controller_port",
                                   _DEFAULT_CONTROLLER_PORT))
