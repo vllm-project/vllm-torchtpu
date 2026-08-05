@@ -850,11 +850,6 @@ class TpuPlatform(Platform):
                     ensure_pcp_local_rank_remap(
                         parallel_config.world_size_across_dp,
                         get_topology=cls._get_tpu_topology)
-                # Single-host DP uses one torch_tpu slice across all DP*TP
-                # workers; the worker spawn shim exposes a DP-adjusted chip
-                # ordinal to TorchTPU for physical binding.
-                cls.device_control_env_var = \
-                    "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
@@ -867,7 +862,14 @@ class TpuPlatform(Platform):
                     parallel_config.data_parallel_master_ip or "localhost")
                 os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT",
                                       str(portpicker.pick_unused_port()))
-                # Full-slice slicebuilder list + topology (TP*PP*DP), once.
+                if parallel_config.enable_expert_parallel:
+                    # EP's expert-combine collective genuinely spans every
+                    # DP*TP worker, so torch_tpu needs one shared slice
+                    # across all of them; the worker spawn shim exposes a
+                    # DP-adjusted chip ordinal to TorchTPU for physical
+                    # binding.
+                    cls.device_control_env_var = \
+                        "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                 cls._prepare_singlehost_tpu_env(
                     parallel_config.world_size_across_dp)
             else:
