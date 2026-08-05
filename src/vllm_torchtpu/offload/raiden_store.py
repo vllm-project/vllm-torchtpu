@@ -589,6 +589,16 @@ class RaidenOffloadingManager(OffloadingManager):
         self._pending_events = []
         return events
 
+    def reset_cache(self) -> None:
+        # The inherited hook is a silent no-op, and the connector reports
+        # success to POST /reset_prefix_cache?reset_external=true while the
+        # raiden store would keep serving every entry. External reset is
+        # unsupported — fail the request instead of lying (see
+        # TODO/reset-and-shm-recovery.md).
+        raise NotImplementedError(
+            "[kv-offload-v2] external cache reset is not supported by the "
+            "raiden offload store; see TODO/reset-and-shm-recovery.md.")
+
     def has_pending_work(self) -> bool:
         return bool(self._admissions)
 

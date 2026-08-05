@@ -230,6 +230,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             if parked is not None:
                 manager.on_store_job_cancelled(parked.keys)
                 finished_store_ids.append(job_id)
+                # A job created and flushed in the same step must not ship
+                # as a fence request: the workers would run a full TPU sync
+                # for a job that no longer exists.
+                new_fence_ids.discard(job_id)
                 logger.debug(
                     "[kv-offload-v2] cancelled fence-pending store job %d "
                     "(source blocks reused)", job_id)

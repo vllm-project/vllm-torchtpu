@@ -668,6 +668,13 @@ class TestTouchAndMisc(unittest.TestCase):
         self.store = FakeKVCacheStore(registered_workers=2)
         self.manager = make_manager(self.store)
 
+    def test_reset_cache_raises(self):
+        # The inherited hook is a no-op and the connector would report
+        # reset success while the store kept everything; the override must
+        # fail the request loudly instead.
+        with self.assertRaises(NotImplementedError):
+            self.manager.reset_cache()
+
     def test_touch_pins_and_releases_stored_keys_only(self):
         seed_host_entries(self.store, _key(0))
         # Not tracked as stored: advisory filter skips the probe.
@@ -834,6 +841,23 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         # The key is admittable again.
         out = manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(0)])
+
+    def test_same_step_flush_ships_no_fence(self):
+        store = FakeKVCacheStore(registered_workers=2)
+        manager = make_manager(store)
+        manager.prepare_store([_key(0)], _ctx())
+        sched = self._make_scheduler(manager)
+
+        # Created and flushed in one step: cancelled before any rank saw
+        # it, and no fence request ships — a fence for a dead job would
+        # cost every worker a full TPU sync.
+        meta = self._build_meta(
+            sched,
+            self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])},
+                             jobs_to_flush={7}))
+        self.assertEqual(meta.fence_job_ids, set())
+        self.assertIn(7, meta.finished_store_job_ids)
+        self.assertNotIn(7, sched._fence_pending)
 
     def test_flush_drains_launched_store(self):
         store = FakeKVCacheStore(registered_workers=2)

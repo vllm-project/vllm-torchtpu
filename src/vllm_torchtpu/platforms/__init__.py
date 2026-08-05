@@ -33,8 +33,7 @@ def register_tpu_platform() -> str:
     may import vllm modules — the KV-connector registration that needs the
     factory lives in TpuPlatform.check_and_update_config instead (importing
     the factory from this window reaches back for the still-unset
-    vllm.platforms.current_platform and dies with an ImportError,
-    j-7c3c871b).
+    vllm.platforms.current_platform and dies with an ImportError).
     """
     _log_tpu_info()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
