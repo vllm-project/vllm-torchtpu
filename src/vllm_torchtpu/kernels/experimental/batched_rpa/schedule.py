@@ -115,8 +115,6 @@ class SmemWrapper:
                    shape=shape)
 
     def _get_pos(self, indices):
-        if not isinstance(indices, tuple):
-            indices = (indices,)
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
 
@@ -177,10 +175,6 @@ class RpaSchedule:
     dma_q: SmemWrapper  # [steps, batch, 2]
     dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
     dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
-    total_wait_kv_in: SmemWrapper  # [steps]
-    total_wait_kv_out: SmemWrapper  # [steps]
-    total_wait_q_in: SmemWrapper  # [steps]
-    total_wait_o_out: SmemWrapper  # [steps]
     actual_steps: Any  # [1]
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
@@ -190,8 +184,6 @@ class RpaSchedule:
 
         idx_wrapper = SmemWrapper.create_shape_dtype(
             (cfgs.max_steps_ub, cfgs.batch_size))
-
-        steps_wrapper = SmemWrapper.create_shape_dtype((cfgs.max_steps_ub,))
 
         return cls(
             s_idx=idx_wrapper,
@@ -214,10 +206,6 @@ class RpaSchedule:
                             HeadAlongSublaneDmaNew),
                 struct_size=cfgs.dma_kv_new_size,
             ),
-            total_wait_kv_in=steps_wrapper,
-            total_wait_kv_out=steps_wrapper,
-            total_wait_q_in=steps_wrapper,
-            total_wait_o_out=steps_wrapper,
             actual_steps=jax.ShapeDtypeStruct((1, ), jnp.int32),
             cfgs=cfgs,
         )
@@ -273,89 +261,6 @@ class RpaSchedule:
             self,
         )
 
-def _compute_waits(
-    schedule: RpaSchedule,
-    start_step: jax.typing.ArrayLike,
-    end_step: jax.typing.ArrayLike,
-    *,
-    cfgs: configs.RpaConfigs,
-):
-    """Computes total wait row/lane counts for a range of steps."""
-
-    kv_bytes_per_token = cfgs.kv_bytes_per_token
-    q_bytes_per_token = cfgs.q_bytes_per_token
-    o_bytes_per_token = cfgs.o_bytes_per_token
-
-    # Reshape buffers to (-1, 128) in u32 to perform contiguous 512-byte lane waits
-    # (1 row of 128 u32 words = 512 bytes).
-    dma_chunk_size = 512
-
-    def body(step, _):
-        # KV IN
-        kv_in_tokens = 0
-        for b in range(cfgs.batch_size):
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                for i in range(cfgs.bkv_p_cache):
-                    _, _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
-                    kv_in_tokens += dma_valid * cfgs.serve.page_size
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_in_tokens += jnp.where(
-                        dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
-                    )
-            else:
-                for i in range(cfgs.bkv_p_cache):
-                    _, _, sz = schedule.get_dma_kv_cache(step, b, i)
-                    kv_in_tokens += sz
-                total_new_sz = 0
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    total_new_sz += dma_entry.fetch_val
-                kv_in_tokens += total_new_sz
-
-        schedule.total_wait_kv_in[step] = (
-            kv_in_tokens * kv_bytes_per_token
-        ) // dma_chunk_size
-
-        # KV OUT
-        kv_out_tokens = 0
-        for b in range(cfgs.batch_size):
-            do_writeback = schedule.do_writeback[step, b] == 1
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_out_tokens += jnp.where(
-                        do_writeback & (dma_entry.wb_val > 0), cfgs.serve.page_size, 0
-                    )
-            else:
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
-
-        schedule.total_wait_kv_out[step] = (
-            kv_out_tokens * kv_bytes_per_token
-        ) // dma_chunk_size
-
-        # Q IN
-        q_in_tokens = 0
-        for b in range(cfgs.batch_size):
-            _, q_sz = schedule.get_dma_q(step, b)
-            q_in_tokens += q_sz
-        schedule.total_wait_q_in[step] = (
-            q_in_tokens * q_bytes_per_token
-        ) // dma_chunk_size
-
-        # O OUT
-        o_out_tokens = 0
-        for b in range(cfgs.batch_size):
-            is_last_k = schedule.is_last_k[step, b] == 1
-            _, q_sz = schedule.get_dma_q(step, b)
-            o_out_tokens += jnp.where(is_last_k, q_sz, 0)
-        schedule.total_wait_o_out[step] = (
-            o_out_tokens * o_bytes_per_token
-        ) // dma_chunk_size
-
-    jax.lax.fori_loop(start_step, end_step, body, None)
 
 def compute_metadata(
     cu_q_lens_ref: jax.Ref,
@@ -676,10 +581,6 @@ def rpa_metadata_schedule_kernel(
                 dma_entry.flags[...] = 0
             else:
                 dma_entry.set_flags(0, 0)
-        schedule_ref.total_wait_kv_in[step] = 0
-        schedule_ref.total_wait_kv_out[step] = 0
-        schedule_ref.total_wait_q_in[step] = 0
-        schedule_ref.total_wait_o_out[step] = 0
 
     for b_idx in range(cfgs.batch_size):
         start_step = lane_lengths_ref[b_idx]
@@ -687,7 +588,6 @@ def rpa_metadata_schedule_kernel(
         jax.lax.fori_loop(start_step, safe_max_steps, mask_step_fn, None)
 
     # Ste 4: Write back results to HBM.
-    _compute_waits(schedule_ref, 0, max_steps, cfgs=cfgs)
     flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
     flat_smem = jax.tree_util.tree_leaves(schedule_ref)
     dma_list = []
