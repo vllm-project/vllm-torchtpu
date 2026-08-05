@@ -285,7 +285,7 @@ class TPUWorker(WorkerBase):
                 "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
                 "self.rank=%d self.local_rank=%d -> tpu_rank=%d "
                 "tpu_local_rank=%d global_world=%d "
-                "init_local_rank=%d pcp_remap=%s source=%s "
+                "init_local_rank=%d "
                 "(vllm_init_rank=%d vllm_init_world=%d)",
                 dp_size,
                 dp_rank,
@@ -296,8 +296,6 @@ class TPUWorker(WorkerBase):
                 binding.local_rank,
                 binding.world_size,
                 binding.init_local_rank,
-                binding.pcp_local_rank_remap,
-                binding.pcp_remap_source,
                 init_rank,
                 init_world,
             )
@@ -313,15 +311,13 @@ class TPUWorker(WorkerBase):
                     "PCP native-rank TPU binding | rank=%d "
                     "native_local_rank=%d local_rank_env=%d "
                     "tpu_local_rank_env=%d local_world=%s "
-                    "tpu_local_world=%d remap=%s source=%s",
+                    "tpu_local_world=%d",
                     self.rank,
                     self.local_rank,
                     binding.init_local_rank,
                     binding.local_rank,
                     binding.world_size,
                     binding.local_world_size,
-                    binding.pcp_local_rank_remap,
-                    binding.pcp_remap_source,
                 )
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size

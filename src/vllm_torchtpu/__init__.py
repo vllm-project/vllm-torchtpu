@@ -554,20 +554,6 @@ def _patch_multiproc_worker_global_rank_env() -> None:
             binding.world_size, binding.local_world_size, rank, local_rank,
             binding.dp_rank, binding.dp_size, binding.local_rank_offset,
             binding.init_local_rank)
-        if binding.pcp_local_rank_remap is not None:
-            logger.info(
-                "Applied TPU patch: PCP native-rank worker spawn binding "
-                "native_local_rank=%d local_rank_env=%d "
-                "tpu_local_rank_env=%d local_world=%d tpu_local_world=%d "
-                "remap=%s source=%s",
-                binding.native_local_rank,
-                binding.init_local_rank,
-                binding.local_rank,
-                binding.world_size,
-                binding.local_world_size,
-                binding.pcp_local_rank_remap,
-                binding.pcp_remap_source,
-            )
         return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
