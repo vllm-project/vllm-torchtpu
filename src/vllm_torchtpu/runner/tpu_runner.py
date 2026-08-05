@@ -196,6 +196,27 @@ def _get_sequence_layout_planner_for_runner(runner: Any):
     return runner.sequence_layout_planner
 
 
+def _padded_block_copy_indices(
+    srcs: list[int],
+    dsts: list[int],
+    device: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device index pairs for a pool block copy.
+
+    The pair count is padded to a small bucket ladder so the copy op compiles
+    for a handful of shapes; (0, 0) pads are null-block self-copies.
+    """
+    padded = 8
+    while padded < len(srcs):
+        padded *= 4
+    srcs = srcs + [0] * (padded - len(srcs))
+    dsts = dsts + [0] * (padded - len(dsts))
+    return (torch.tensor(srcs, dtype=torch.int32).to(device,
+                                                     non_blocking=True),
+            torch.tensor(dsts, dtype=torch.int32).to(device,
+                                                     non_blocking=True))
+
+
 def _validate_libtpu_version() -> None:
     """Validate libtpu opportunistically if it is present."""
     libtpu_version = importlib_metadata.version("libtpu")
@@ -1477,7 +1498,16 @@ class TPUModelRunner(GPUModelRunner):
         other mode each request keeps one fixed state block for its whole
         lifetime, so the plan stays empty and the per-step collector is a
         no-op.
+
+        `_pool_block_split` is a property of the pool itself (born at kernel
+        block granularity), so it is derived in every mode: the scheduler's
+        copy-on-write block copies need it too.
         """
+        for raw in raw_tensors:
+            if raw.dim() > 1:
+                self._pool_block_split = (self.cache_config.block_size //
+                                          raw.shape[1])
+                break
         if self.cache_config.mamba_cache_mode != "align":
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
@@ -1504,11 +1534,44 @@ class TPUModelRunner(GPUModelRunner):
                 state_block_size = group.kv_cache_spec.block_size
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
-        for raw in raw_tensors:
-            if raw.dim() > 1:
-                self._pool_block_split = (self.cache_config.block_size //
-                                          raw.shape[1])
-                break
+
+    def _apply_kv_cache_block_copies(self, scheduler_output) -> None:
+        """Run the scheduler's copy-on-write pool block copies.
+
+        A prefix-cache hit that ends inside a block — possible once
+        `prefix_match_unit` makes the hash unit finer than the block — leaves
+        that tail block shared with the request that cached it. The scheduler
+        hands the resuming request a private block instead and asks the worker
+        to copy the shared one into it before the forward reads or extends it.
+
+        A manager block is one contiguous run of pool rows carrying every byte
+        the block owns — attention KV for an attention group's block, the
+        pooled GDN state for a mamba group's block — so one whole-block row
+        copy per pool buffer moves all of it, whichever group owns the block.
+
+        The sibling `SchedulerOutput.new_block_ids_to_zero` needs no TPU
+        counterpart: the RPA kernel zeroes out-of-range V and masks
+        out-of-range logits, and the GDN kernel selects a zero initial state
+        when the request has none, so no consumer can read a freshly allocated
+        block's stale bytes.
+        """
+        copies = scheduler_output.kv_cache_block_copies
+        if not copies:
+            return
+        assert self.kv_cache_raw_tensors, (
+            "copy-on-write block copies require the unified KV pool")
+        split = self._pool_block_split
+        srcs = [
+            block_copy.src_block_id * split + j for block_copy in copies
+            for j in range(split)
+        ]
+        dsts = [
+            block_copy.dst_block_id * split + j for block_copy in copies
+            for j in range(split)
+        ]
+        src_t, dst_t = _padded_block_copy_indices(srcs, dsts, self.device)
+        for raw in self.kv_cache_raw_tensors:
+            copy_mamba_state_blocks(raw, src_t, dst_t)
 
     def _collect_mamba_state_seed_copies(self, scheduler_output,
                                          start_index: int,
@@ -1603,18 +1666,7 @@ class TPUModelRunner(GPUModelRunner):
                 entry[2].extend(p[1] for p in pairs)
 
         for raw, srcs, dsts in per_raw.values():
-            # Pad the pair count to a small bucket ladder so the copy op
-            # compiles for a handful of shapes; (0, 0) pads are null-block
-            # self-copies.
-            padded = 8
-            while padded < len(srcs):
-                padded *= 4
-            srcs = srcs + [0] * (padded - len(srcs))
-            dsts = dsts + [0] * (padded - len(dsts))
-            src_t = torch.tensor(srcs, dtype=torch.int32).to(self.device,
-                                                             non_blocking=True)
-            dst_t = torch.tensor(dsts, dtype=torch.int32).to(self.device,
-                                                             non_blocking=True)
+            src_t, dst_t = _padded_block_copy_indices(srcs, dsts, self.device)
             self._pending_mamba_state_copies.append((raw, src_t, dst_t))
 
     def _flush_mamba_state_seed_copies(self) -> None:
@@ -1794,7 +1846,11 @@ class TPUModelRunner(GPUModelRunner):
         # so letting the base also correct would double-count.
         for req_state in self.requests.values():
             req_state.prev_num_draft_len = 0
-        return super()._update_states(scheduler_output)
+        result = super()._update_states(scheduler_output)
+        # Before anything reads the pool this step, and so before the mamba
+        # seed copies read a copy-on-write destination.
+        self._apply_kv_cache_block_copies(scheduler_output)
+        return result
 
     def _modify_prev_results(self):
         if self._pre_async_results is None:

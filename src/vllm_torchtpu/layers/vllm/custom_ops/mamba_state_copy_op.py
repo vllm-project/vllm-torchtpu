@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Donating slot-to-slot copy for Mamba recurrent state arrays."""
+"""Donating block-to-block copy inside the unified KV pool.
+
+A pool block is copied whole, so the op moves whatever the block carries:
+the mamba state-block seeding described below, and the scheduler's
+copy-on-write copies for prefix-cache hits that end mid-block
+(``TPUModelRunner._apply_kv_cache_block_copies``).
+"""
 
 import jax
 import torch
