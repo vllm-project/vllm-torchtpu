@@ -1021,7 +1021,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
-        interleave_size = getattr(self.vllm_config.model_config, "cp_kv_cache_interleave_size", 256)
+        interleave_size = getattr(self.vllm_config.model_config,
+                                  "cp_kv_cache_interleave_size", 256)
         min_transfer_tokens = pcp_size * interleave_size
         if (num_tokens < min_transfer_tokens):
             return False, {}
