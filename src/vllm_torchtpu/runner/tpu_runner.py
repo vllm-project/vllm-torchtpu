@@ -29,7 +29,8 @@ from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
-                                          has_kv_transfer_group)
+                                          has_kv_transfer_group,
+                                          kv_transfer_state)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import (Attention,
@@ -170,6 +171,17 @@ def _spec_warmup_all_token_ids(
         # sequence contains num_computed + 1 tokens at scheduler handoff.
         all_token_ids[req_id] = [0] * (num_computed + 1)
     return all_token_ids
+
+
+@contextmanager
+def _suspend_kv_transfer_group() -> Iterator[None]:
+    """Hide the process-global connector during worker-local warmup."""
+    connector = kv_transfer_state._KV_CONNECTOR_AGENT
+    kv_transfer_state._KV_CONNECTOR_AGENT = None
+    try:
+        yield
+    finally:
+        kv_transfer_state._KV_CONNECTOR_AGENT = connector
 
 
 _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
@@ -4287,7 +4299,11 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         n0 = self.num_xla_graphs
-        with self._precompile_timed("spec-decode real warmup"):
+        # These SchedulerOutputs are built locally and therefore have no
+        # scheduler-generated kv_connector_metadata. They must not start real
+        # PD transfers or bind synthetic requests into the connector.
+        with _suspend_kv_transfer_group(), self._precompile_timed(
+                "spec-decode real warmup"):
             # (1) First-pass / first-decode shapes depend on the prompt length:
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
