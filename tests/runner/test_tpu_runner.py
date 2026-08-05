@@ -40,6 +40,21 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
 
+def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
+    all_token_ids = tpu_runner._spec_warmup_all_token_ids(
+        ["request-0", "request-1"], [7, 12])
+
+    assert all_token_ids == {
+        "request-0": [0] * 8,
+        "request-1": [0] * 13,
+    }
+
+
+def test_spec_warmup_all_token_ids_rejects_misaligned_inputs():
+    with pytest.raises(ValueError):
+        tpu_runner._spec_warmup_all_token_ids(["request-0"], [7, 12])
+
+
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     """Run _prepare_async_token_substitution_indices with a minimal fake self.
     req_id_to_index_copy holds each request's *position*; with spec_k set the
