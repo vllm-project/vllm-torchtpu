@@ -15,6 +15,13 @@ TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-1}"
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"
+PREFILL_TP="${PREFILL_TP:-1}"
+PREFILL_PCP="${PREFILL_PCP:-4}"
+PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-256}"
+DECODE_TP="${DECODE_TP:-1}"
+DECODE_DP="${DECODE_DP:-4}"
+PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-4096}"
+DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-256}"
 
 cleanup() {
   local pid_file pid
@@ -22,8 +29,10 @@ cleanup() {
     for pid_file in "${RUN_DIR}/proxy.pid" "${RUN_DIR}/prefill.pid" "${RUN_DIR}/decode.pid"; do
       if [[ -f "${pid_file}" ]]; then
         pid="$(cat "${pid_file}" 2>/dev/null || true)"
-        if [[ -n "${pid}" ]]; then
-          kill -TERM "${pid}" 2>/dev/null || true
+        if [[ "${pid}" =~ ^[0-9]+$ ]]; then
+          kill -TERM -- "-${pid}" 2>/dev/null \
+            || kill -TERM "${pid}" 2>/dev/null \
+            || true
         fi
       fi
     done
@@ -31,8 +40,12 @@ cleanup() {
     for pid_file in "${RUN_DIR}/proxy.pid" "${RUN_DIR}/prefill.pid" "${RUN_DIR}/decode.pid"; do
       if [[ -f "${pid_file}" ]]; then
         pid="$(cat "${pid_file}" 2>/dev/null || true)"
-        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-          kill -KILL "${pid}" 2>/dev/null || true
+        if [[ "${pid}" =~ ^[0-9]+$ ]]; then
+          if kill -0 -- "-${pid}" 2>/dev/null; then
+            kill -KILL -- "-${pid}" 2>/dev/null || true
+          elif kill -0 "${pid}" 2>/dev/null; then
+            kill -KILL "${pid}" 2>/dev/null || true
+          fi
         fi
       fi
     done
@@ -60,6 +73,13 @@ export TORCHTPU_VLLM_SRC
 export USE_CURRENT_PY_ENV
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
 export ASYNC_SCHEDULING
+export PREFILL_TP
+export PREFILL_PCP
+export PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE
+export DECODE_TP
+export DECODE_DP
+export PREFILL_COMPILE_SIZES
+export DECODE_COMPILE_SIZES
 
 export P4D2_SHORT_REPEAT_LINES="${P4D2_SHORT_REPEAT_LINES:-32}"
 export P4D2_SHORT_REPEAT_COUNT="${P4D2_SHORT_REPEAT_COUNT:-3}"

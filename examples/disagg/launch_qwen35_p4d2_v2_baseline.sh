@@ -96,21 +96,28 @@ TPU_KV_TRANSFER_PORT="${TPU_KV_TRANSFER_PORT:-9100}"
 TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT:-9600}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
+PREFILL_PCP="${PREFILL_PCP:-1}"
+PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-1}"
 DECODE_TP="${DECODE_TP:-2}"
+DECODE_DP="${DECODE_DP:-1}"
 # Temporary same-host P4/D2 test hook. This is intentionally DEBUG-prefixed:
 # it offsets TorchTPU's physical LOCAL_RANK binding for the decode server and
 # is not a CUDA_VISIBLE_DEVICES-style remapping mechanism.
 PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET="${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET:-0}"
 DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET="${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET:-4}"
 
-BLOCK_SIZE="${BLOCK_SIZE:-}"
-block_size_label="${BLOCK_SIZE:-auto}"
+PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-}"
+DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-1536}"
+prefill_block_size_label="${PREFILL_BLOCK_SIZE:-auto}"
+decode_block_size_label="${DECODE_BLOCK_SIZE:-auto}"
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-128}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 COMPILE_SIZES="${COMPILE_SIZES:-16384}"
+PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-${COMPILE_SIZES}}"
+DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-${COMPILE_SIZES}}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
@@ -142,10 +149,13 @@ if [[ "${MODEL_PATH}" == /* || "${MODEL_PATH}" == ./* || "${MODEL_PATH}" == ../*
     exit 2
   fi
 fi
-if [[ ! "${COMPILE_SIZES}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
-  echo "COMPILE_SIZES must be a comma-separated integer list: ${COMPILE_SIZES}" >&2
-  exit 2
-fi
+for compile_sizes_name in COMPILE_SIZES PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZES; do
+  compile_sizes_value="${!compile_sizes_name}"
+  if [[ ! "${compile_sizes_value}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "${compile_sizes_name} must be a comma-separated integer list: ${compile_sizes_value}" >&2
+    exit 2
+  fi
+done
 
 managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}")
 for offset in 0 1 2 3; do
@@ -197,7 +207,8 @@ if vllm.__version__ != expected:
 PY
 } >"${version_log}" 2>&1
 
-compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":['"${COMPILE_SIZES}"'],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+prefill_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":['"${PREFILL_COMPILE_SIZES}"'],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+decode_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":['"${DECODE_COMPILE_SIZES}"'],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
 
 common_args=(
   --host "${SERVE_HOST}"
@@ -219,12 +230,7 @@ common_args=(
   --mamba-cache-mode "${MAMBA_CACHE_MODE}"
   --enable-prompt-tokens-details
   --no-enable-log-requests
-  --compilation-config "${compilation_config}"
 )
-
-if [[ -n "${BLOCK_SIZE}" ]]; then
-  common_args+=(--block-size "${BLOCK_SIZE}")
-fi
 
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
   common_args+=(--enable-prefix-caching)
@@ -258,8 +264,14 @@ EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}
 CONNECTOR=TPUConnectorV2
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector
 PREFILL_TP=${PREFILL_TP}
+PREFILL_PCP=${PREFILL_PCP}
+PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
 DECODE_TP=${DECODE_TP}
-BLOCK_SIZE=${block_size_label}
+DECODE_DP=${DECODE_DP}
+PREFILL_COMPILE_SIZES=${PREFILL_COMPILE_SIZES}
+DECODE_COMPILE_SIZES=${DECODE_COMPILE_SIZES}
+PREFILL_BLOCK_SIZE=${prefill_block_size_label}
+DECODE_BLOCK_SIZE=${decode_block_size_label}
 NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
 ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}
@@ -289,8 +301,7 @@ ${activation_cmd}
 cd $(shell_quote "${TORCHTPU_VLLM_SRC}");
 export PYTHONPATH=$(shell_quote "${TORCHTPU_VLLM_SRC}/src:${TORCHTPU_VLLM_SRC}:${VLLM_SRC}"):\${PYTHONPATH:-};
 export JAX_PLATFORMS=tpu,cpu PJRT_DEVICE=TPU TPU_BACKEND_TYPE=jax;
-export VLLM_TARGET_DEVICE=tpu;
-export SKIP_JAX_PRECOMPILE=1 VLLM_XLA_CHECK_RECOMPILATION=0;
+export VLLM_XLA_CHECK_RECOMPILATION=0;
 export USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}";
 export TPUMISC_HMA_CHECKSUM_TRACE="${TPUMISC_HMA_CHECKSUM_TRACE}";
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}";
@@ -310,11 +321,25 @@ export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0;
 EOF
 )
 
-prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --tensor-parallel-size "${PREFILL_TP}" --kv-transfer-config "${p_kv}")
-decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --tensor-parallel-size "${DECODE_TP}" --kv-transfer-config "${d_kv}")
+prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
+if [[ "${PREFILL_PCP}" -gt 1 ]]; then
+  prefill_args+=(--cp-kv-cache-interleave-size "${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}")
+fi
+decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "${decode_compilation_config}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --kv-transfer-config "${d_kv}")
+if [[ "${DECODE_DP}" -gt 1 ]]; then
+  decode_args+=(--data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}")
+fi
+if [[ -n "${PREFILL_BLOCK_SIZE}" ]]; then
+  prefill_args+=(--block-size "${PREFILL_BLOCK_SIZE}")
+fi
+if [[ -n "${DECODE_BLOCK_SIZE}" ]]; then
+  decode_args+=(--block-size "${DECODE_BLOCK_SIZE}")
+fi
+printf '%q ' "${prefill_args[@]}" >"${RUN_DIR}/prefill_vllm_args.quoted"
+printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"

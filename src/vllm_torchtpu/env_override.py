@@ -31,6 +31,31 @@ if os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden" or os.getenv(
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1":
     os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
 
+# TPU_GDN_CONV_QK_PAIR_LAYOUT resolves in two layers:
+#   1. An explicitly set value always wins (enable or disable), for both
+#      raiden and non-raiden runs — hence setdefault below.
+#   2. Otherwise, when the Raiden reshard stack is enabled, the layout
+#      follows the reshard's source fan-in: enabled iff
+#      TPU_RAIDEN_TRANSFER_PARALLELISM >= 8.  At such degrees a rank's
+#      conv Q and K segments are sub-token (512 B halves of the 1024-byte
+#      physical pool token under TP8), so only the pair-blocked layout
+#      gives whole-token — placement-exact — raw transfer spans; at lower
+#      source degrees the segment-major layout is already token-aligned.
+# The fan-in is parsed exactly like envs.TPU_RAIDEN_TRANSFER_PARALLELISM
+# (unset/empty means the default degree of 8 — keep the two in sync), so
+# the layout decision and the transfer stack always agree; today that
+# makes the pair layout the raiden default.  The launcher exports the
+# variable identically on both roles, so producer and consumer resolve the
+# same layout; a mismatched pair still fails closed through the layout
+# fingerprint.  An unparsable value raises here, at startup, rather than
+# letting the two readers diverge.
+if os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden" or os.getenv(
+        "TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1":
+    _raiden_transfer_degree = int(
+        os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8")
+    if _raiden_transfer_degree >= 8:
+        os.environ.setdefault("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
+
 # Per-tensor-core VMEM capacity by TPU family (used to set the SC-offload
 # threshold below). Values mirror JAX's pallas chip table at
 # jax/_src/pallas/mosaic/tpu_info.py. We resolve from the chip family string

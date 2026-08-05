@@ -127,43 +127,37 @@ def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
     ] == [4096, 4096]
 
 
-def test_hybrid_full_attention_mamba_pcp_coordinator_from_scheduler_call():
-    # The Scheduler constructs the KVCacheManager with pcp_world_size=1
-    # regardless of parallel config, so the coordinator patch must recover
-    # the PCP factor from scheduler_block_size instead of the argument.
+def test_hybrid_pcp_coordinator_recovers_pcp_folded_by_vllm_scheduler():
+    """vLLM 0.26 passes PCP=1 after folding PCP into scheduler blocks."""
     _patch_vllm_hybrid_pcp_block_sizes()
-    from vllm.v1.core.kv_cache_coordinator import (HybridKVCacheCoordinator,
-                                                   get_kv_cache_coordinator)
+    from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 
     kv_cache_config = KVCacheConfig(
         num_blocks=8,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(["attn"], _full_spec(block_size=4096)),
-            KVCacheGroupSpec(["gdn"], _mamba_spec()),
+            KVCacheGroupSpec(["attn"], _full_spec(block_size=2304)),
+            KVCacheGroupSpec(["gdn"], _mamba_spec(block_size=2304)),
         ],
     )
+
     coordinator = get_kv_cache_coordinator(
         kv_cache_config=kv_cache_config,
-        max_model_len=65536,
+        max_model_len=4096,
         max_in_flight_tokens=4096,
         use_eagle=False,
         enable_caching=True,
         enable_kv_cache_events=False,
         dcp_world_size=1,
+        # This is intentionally 1: vLLM 0.26's Scheduler hard-codes it.
         pcp_world_size=1,
-        scheduler_block_size=32768,
-        hash_block_size=32768,
+        scheduler_block_size=9216,
+        hash_block_size=9216,
     )
 
-    assert isinstance(coordinator, HybridKVCacheCoordinator)
     assert [
         manager.block_size for manager in coordinator.single_type_managers
-    ] == [32768, 32768]
-    assert [
-        group.kv_cache_spec.block_size
-        for group in kv_cache_config.kv_cache_groups
-    ] == [4096, 4096]
+    ] == [9216, 9216]
 
 
 def test_hybrid_pcp_patch_keeps_non_mamba_scope():

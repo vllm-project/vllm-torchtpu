@@ -88,7 +88,7 @@ SPANNER_EVAL_VARS=(
 )
 
 echo "--- Running command in Docker container"
-docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16g --device /dev/fuse \
+docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64g --device /dev/fuse \
   -w /root/torchtpu-vllm \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \

@@ -249,9 +249,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 failed_load_block_ids.extend(fj.failed_gpu_block_ids)
 
         # Ship empty job dicts: no per-rank transfer submission exists.
+        # The inherited-field kwargs are invisible to pyrefly because the
+        # vllm base dataclass resolves to Any (see [tool.pyrefly] notes).
         return RaidenOffloadingConnectorMetadata(
-            load_jobs={},
-            store_jobs={},
+            load_jobs={},  # pyrefly: ignore[unexpected-keyword]
+            store_jobs={},  # pyrefly: ignore[unexpected-keyword]
+            # pyrefly: ignore[unexpected-keyword]
             jobs_to_flush=meta.jobs_to_flush,
             fence_job_ids=new_fence_ids,
             finished_store_job_ids=finished_store_ids,
@@ -373,7 +376,10 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if not (self._fenced_jobs or self._completed_jobs):
             return None
+        # completed_jobs is an inherited field pyrefly cannot see: the vllm
+        # base dataclass resolves to Any (see [tool.pyrefly] notes).
         meta = RaidenOffloadingWorkerMetadata(
+            # pyrefly: ignore[unexpected-keyword]
             completed_jobs=self._completed_jobs,
             fenced_jobs=self._fenced_jobs,
         )

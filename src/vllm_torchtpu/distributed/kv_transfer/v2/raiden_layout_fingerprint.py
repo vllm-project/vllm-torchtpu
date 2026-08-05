@@ -15,6 +15,8 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from vllm_torchtpu import envs as tpu_envs
+
 from .raiden_pool_manifest import TAG_FA, PoolManifest
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
@@ -113,12 +115,26 @@ def measured_fa_layout_fingerprint(
 
     version = package_version or importlib.metadata.version
     payload = {
-        "schema": FA_LAYOUT_FINGERPRINT_SCHEMA,
-        "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
-        "minor_to_major": list(minor_to_major),
+        "schema":
+        FA_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu":
+        version("torch_tpu"),
+        "libtpu":
+        version("libtpu"),
+        "minor_to_major":
+        list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
-        "element_size_in_bits": element_bits,
+        "element_size_in_bits":
+        element_bits,
+        # GDN conv state layout version.  Both sides of a disagg pair must
+        # agree: the byte-span convention (pair-blocked whole-token QK
+        # spans vs the legacy split Q/K) is baked into the transfer plan,
+        # and the geometries are size-identical, so a mixed pair would not
+        # otherwise fail closed.  The controller compares fingerprints
+        # before emitting a plan.
+        "gdn_conv_layout":
+        ("qk-pair-v1"
+         if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"),
     }
     return canonical_layout_fingerprint(payload), payload
 

@@ -40,7 +40,6 @@ _TPU_COMPILE_ENV_IGNORED = {
     "DP_SCHED_ENABLED",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
-    "SKIP_JAX_PRECOMPILE",
     "TPU_NAME",
     "USE_PHASED_PROFILER",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time

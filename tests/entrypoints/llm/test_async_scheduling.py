@@ -6,7 +6,6 @@ synchronous scheduling.
 """
 
 import multiprocessing
-import os
 import traceback
 
 import pytest
@@ -44,9 +43,6 @@ def _run_generation_worker(
     Helper function to instantiate LLM and run generation within a child process.
     """
     try:
-        # Avoid JAX hanging during sequential tests
-        os.environ["SKIP_JAX_PRECOMPILE"] = "1"
-
         # We apply the monkeypatch dynamically
         if monkeypatch_tpu_runner_init is not None:
             TPUModelRunner.__init__ = monkeypatch_tpu_runner_init

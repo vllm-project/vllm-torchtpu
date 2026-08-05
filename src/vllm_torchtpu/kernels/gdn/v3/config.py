@@ -58,6 +58,13 @@ class StateRegion:
     view_dtype: jnp.dtype
     lane_split: int
     rows_used: int
+    # Optional static typed-row permutation between the pool's stored row
+    # order and the kernel's logical row order: logical_rows[i] is stored
+    # at typed row rows_perm[i].  None or the identity means the stored
+    # order IS the logical order.  Used by the QK pair-blocked conv layout,
+    # where full-width states interleave Q and K row-pairs per tap so that
+    # one whole pool token holds one head-pair's Q and K rows.
+    rows_perm: tuple[int, ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True)

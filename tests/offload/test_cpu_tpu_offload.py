@@ -974,9 +974,8 @@ class TestHybridSpecConsistencyAssert(unittest.TestCase):
         with patch.object(CPUOffloadingSpec, "__init__",
                           lambda self, *a, **k: None):
             offloading_config = MagicMock()
+            offloading_config.groups = ()
             offloading_config.cache.blocks_per_chunk = 1
-            vllm_config.parallel_config.prefill_context_parallel_size = 1
-            vllm_config.parallel_config.decode_context_parallel_size = 1
             return TPUCPUOffloadingSpec(offloading_config, vllm_config,
                                         kv_cache_config)
 

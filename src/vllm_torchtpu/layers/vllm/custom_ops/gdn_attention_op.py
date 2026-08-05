@@ -34,7 +34,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.layers.common.gdn_attention import (
     run_jax_gdn_attention, run_jax_gdn_attention_pcp_tp_prefill,
-    run_jax_gdn_attention_pooled, run_jax_gdn_attention_pooled_pcp_prefill)
+    run_jax_gdn_attention_pooled,
+    run_jax_gdn_attention_pooled_pcp_prefill_projection)
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
@@ -158,55 +159,6 @@ def gdn_attention_pooled_core_tpu(
     )
 
 
-def gdn_attention_pooled_core_tpu_pcp_prefill(
-    mixed_qkv: jax.Array,
-    b: jax.Array,
-    a: jax.Array,
-    recurrent_state: jax.Array,
-    conv_weight: jax.Array,
-    conv_bias: jax.Array | None,
-    A_log: jax.Array,
-    dt_bias: jax.Array,
-    state_indices: jax.Array,
-    query_start_loc: jax.Array,
-    distribution: jax.Array,
-    seq_lens: jax.Array,
-    *,
-    mesh: jax.sharding.Mesh,
-    n_kq: int,
-    n_v: int,
-    d_k: int,
-    d_v: int,
-    kernel_size: int,
-    pool_block_tokens: int,
-    pcp_size: int,
-    interleave_size: int,
-) -> tuple[jax.Array, jax.Array]:
-    return run_jax_gdn_attention_pooled_pcp_prefill(
-        mixed_qkv,
-        b,
-        a,
-        recurrent_state,
-        conv_weight,
-        conv_bias,
-        A_log,
-        dt_bias,
-        state_indices,
-        query_start_loc,
-        distribution,
-        seq_lens,
-        n_kq=n_kq,
-        n_v=n_v,
-        d_k=d_k,
-        d_v=d_v,
-        kernel_size=kernel_size,
-        pool_block_tokens=pool_block_tokens,
-        pcp_size=pcp_size,
-        interleave_size=interleave_size,
-        mesh=mesh,
-    )
-
-
 def gdn_attention_core_tpu_pcp_prefill(
     mixed_qkv: jax.Array,
     b: jax.Array,
@@ -311,10 +263,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.kv_cache = None
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op()
+        pcp_enabled = self._pcp_streaming_enabled()
+        self._pcp_streaming_configured = pcp_enabled
         self.gdn_pcp_op = (self._build_gdn_op(
-            pcp_streaming=True) if self._pcp_streaming_enabled() else None)
+            pcp_streaming=True) if pcp_enabled else None)
         self.gdn_pooled_pcp_op = (self._build_pooled_pcp_gdn_op()
-                                  if self._pcp_streaming_enabled() else None)
+                                  if pcp_enabled else None)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
@@ -608,7 +562,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         kernel_size = self.conv_kernel_size
 
         def wrapped_fn(
-            mixed_qkv: jax.Array,
+            hidden_states: jax.Array,
+            qkvz_weight: jax.Array,
+            qkvz_weight_scale: jax.Array,
             b: jax.Array,
             a: jax.Array,
             recurrent_state: jax.Array,
@@ -620,9 +576,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             query_start_loc: jax.Array,
             distribution: jax.Array,
             seq_lens: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
-            return gdn_attention_pooled_core_tpu_pcp_prefill(
-                mixed_qkv,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return run_jax_gdn_attention_pooled_pcp_prefill_projection(
+                hidden_states,
+                qkvz_weight,
+                qkvz_weight_scale,
                 b,
                 a,
                 recurrent_state,
@@ -645,10 +603,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 interleave_size=interleave_size,
             )
 
-        op_name = ("pallas::gdn_attention_pooled_pcp_"
+        op_name = ("pallas::gdn_attention_pooled_pcp_fused_"
                    f"{self.prefix.replace('.', '_')}")
         input_partition_specs = (
-            PartitionSpec("pcp"),  # mixed_qkv
+            PartitionSpec("pcp"),  # hidden states
+            PartitionSpec(),  # QKVZ weight
+            PartitionSpec(),  # QKVZ weight scale
             PartitionSpec("pcp"),  # b
             PartitionSpec("pcp"),  # a
             PartitionSpec("pcp"),  # recurrent_state pool (rank-local, axis 0)
@@ -663,49 +623,174 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         output_partition_specs = (
             PartitionSpec("pcp"),  # new pool
-            PartitionSpec(),  # output (packed rank-major, replicated)
+            PartitionSpec("pcp"),  # output
+            PartitionSpec("pcp"),  # z
         )
         gdn_jax_op = pcp_streaming_jax_op(
             op_name,
             wrapped_fn,
-            donate_argnums=(3, ),
+            donate_argnums=(5, ),
             mesh=pcp_mesh,
             input_partition_specs=input_partition_specs,
             output_partition_specs=output_partition_specs,
         )
 
-        def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
-            num_tokens = mixed_qkv.size(0)
-            out_shape = (num_tokens * pcp_size,
-                         local_num_v_heads * self.head_v_dim)
-            return torch.empty_like(recurrent_state), torch.empty(
-                out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+        def _fake_gdn(hidden_states, _weight, _scale, _b, _a, recurrent_state,
+                      *args, **kwargs):
+            num_tokens = hidden_states.size(0)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            output = torch.empty(out_shape,
+                                 dtype=hidden_states.dtype,
+                                 device=hidden_states.device)
+            return torch.empty_like(recurrent_state), output, torch.empty_like(
+                output)
 
         gdn_jax_op.register_fake(_fake_gdn)
 
-        def gdn_impl(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
-                     recurrent_state: torch.Tensor, conv_weight: torch.Tensor,
-                     conv_bias: torch.Tensor | None, A_log: torch.Tensor,
-                     dt_bias: torch.Tensor, state_indices: torch.Tensor,
-                     query_start_loc: torch.Tensor,
-                     request_distribution: torch.Tensor,
-                     seq_lens: torch.Tensor) -> torch.Tensor:
-            new_rec, outputs = gdn_jax_op(mixed_qkv, b, a, recurrent_state,
-                                          conv_weight, conv_bias, A_log,
-                                          dt_bias, state_indices,
-                                          query_start_loc,
-                                          request_distribution, seq_lens)
-            outputs = outputs.reshape(-1, local_num_v_heads * self.head_v_dim)
-            recurrent_state.copy_(new_rec)
-            return outputs
+        def gdn_impl(
+                hidden_states: torch.Tensor, qkvz_weight: torch.Tensor,
+                qkvz_weight_scale: torch.Tensor, b: torch.Tensor,
+                a: torch.Tensor, recurrent_state: torch.Tensor,
+                conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
+                A_log: torch.Tensor, dt_bias: torch.Tensor,
+                state_indices: torch.Tensor, query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor,
+                seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            new_rec, outputs, z = gdn_jax_op(hidden_states, qkvz_weight,
+                                             qkvz_weight_scale, b, a,
+                                             recurrent_state, conv_weight,
+                                             conv_bias, A_log, dt_bias,
+                                             state_indices, query_start_loc,
+                                             request_distribution, seq_lens)
+            # Rebind the donated pool instead of copying the full unified pool
+            # back into its old storage.  This function is exposed as a
+            # mutation-aware custom op below, so AOT functionalization threads
+            # the updated pool between layers and TorchTPU can preserve the
+            # Pallas input/output alias.
+            recurrent_state.set_(new_rec)
+            return outputs, z
 
-        return gdn_impl
+        stateful_op_name = ("vllm_torchtpu::gdn_attention_pooled_pcp_stateful_"
+                            f"{self.prefix.replace('.', '_')}")
+        stateful_gdn_op = torch.library.custom_op(
+            stateful_op_name,
+            gdn_impl,
+            mutates_args={"recurrent_state"},
+        )
+
+        def _fake_stateful_gdn(
+                hidden_states: torch.Tensor, qkvz_weight: torch.Tensor,
+                qkvz_weight_scale: torch.Tensor, b: torch.Tensor,
+                a: torch.Tensor, recurrent_state: torch.Tensor,
+                conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
+                A_log: torch.Tensor, dt_bias: torch.Tensor,
+                state_indices: torch.Tensor, query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor,
+                seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            del (qkvz_weight, qkvz_weight_scale, b, a, recurrent_state,
+                 conv_weight, conv_bias, A_log, dt_bias, state_indices,
+                 query_start_loc, request_distribution, seq_lens)
+            num_tokens = hidden_states.size(0)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            output = torch.empty(out_shape,
+                                 dtype=hidden_states.dtype,
+                                 device=hidden_states.device)
+            return output, torch.empty_like(output)
+
+        stateful_gdn_op.register_fake(_fake_stateful_gdn)
+        return stateful_gdn_op
+
+    def _require_pcp_projection_parameters(
+            self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the Qwen3.5 FP8 QKVZ parameters required by fusion."""
+        if (hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz")
+                or self.gqa_interleaved_layout):
+            raise RuntimeError("GDN pooled PCP prefill requires the Qwen3.5 "
+                               "non-interleaved QKVZ layout.")
+
+        projection = self.in_proj_qkvz
+        weight = getattr(projection, "weight", None)
+        weight_scale = getattr(projection, "weight_scale", None)
+        bias = getattr(projection, "bias", None)
+        if (weight is None or weight_scale is None
+                or weight.dtype != torch.float8_e4m3fn
+                or weight_scale.dtype != torch.float32
+                or weight_scale.ndim != 1 or bias is not None):
+            raise RuntimeError(
+                "GDN pooled PCP prefill requires bias-free float8_e4m3fn "
+                "QKVZ weights with a rank-1 FP32 scale.")
+        return weight, weight_scale
+
+    def _has_active_pooled_pcp_state(self, kv_cache) -> bool:
+        """Whether a PCP-configured worker owns an allocated unified pool."""
+        return (kv_cache is not None and len(kv_cache) == 1
+                and kv_cache[0].numel() > 0 and self._pcp_streaming_configured)
+
+    def _apply_output_projection(self, core_attn_out: torch.Tensor,
+                                 z: torch.Tensor,
+                                 num_tokens: int) -> torch.Tensor:
+        local_num_v_heads = self.num_v_heads // self.tp_size
+        core_attn_out = core_attn_out.view(num_tokens, local_num_v_heads,
+                                           self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
+    def _forward_fused_pooled_pcp(self, hidden_states: torch.Tensor,
+                                  state_pool: torch.Tensor,
+                                  attn_metadata) -> torch.Tensor:
+        """Run the mandatory fused path for an allocated pooled PCP call."""
+        if not is_pcp_streaming_attention_metadata(attn_metadata):
+            raise RuntimeError(
+                "PCP is configured with a unified pool, but attention "
+                "metadata does not use the PCP streaming sequence layout.")
+
+        gdn_pooled_pcp_op = self.gdn_pooled_pcp_op
+        assert gdn_pooled_pcp_op is not None
+        qkvz_weight, qkvz_weight_scale = (
+            self._require_pcp_projection_parameters())
+        ba, _ = self.in_proj_ba(hidden_states)
+        b, a = ba.chunk(2, dim=-1)
+        b = b.contiguous()
+        a = a.contiguous()
+
+        state_indices = attn_metadata.mamba_state_indices
+        assert state_indices is not None
+        core_attn_out, z = gdn_pooled_pcp_op(
+            hidden_states,
+            qkvz_weight,
+            qkvz_weight_scale,
+            b,
+            a,
+            state_pool,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            self.A_log,
+            self.dt_bias,
+            state_indices.to(torch.int32),
+            attn_metadata.query_start_loc,
+            attn_metadata.request_distribution,
+            attn_metadata.seq_lens,
+        )
+        num_tokens = hidden_states.size(0)
+        if core_attn_out.shape[0] != num_tokens:
+            raise RuntimeError("GDN op returned an incompatible output shape.")
+        return self._apply_output_projection(core_attn_out, z, num_tokens)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
+        kv_cache = self.kv_cache
+        if self._has_active_pooled_pcp_state(kv_cache):
+            attn_metadata = get_forward_context().attn_metadata[self.prefix]
+            return self._forward_fused_pooled_pcp(
+                hidden_states,
+                kv_cache[0],
+                attn_metadata,
+            )
 
         # ============================================================
         # Part 1: Input Projection
@@ -743,7 +828,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        kv_cache = self.kv_cache
         local_num_v_heads = self.num_v_heads // self.tp_size
 
         # During warmup or memory profiling, the kv_cache might not be allocated yet
@@ -755,8 +839,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             recurrent_state = None
         else:
-            fc = get_forward_context()
-            attn_metadata = fc.attn_metadata[self.prefix]
+            attn_metadata = get_forward_context().attn_metadata[self.prefix]
 
             if len(kv_cache) == 1:
                 # Unified block pool: the attention-shaped pool carries the
@@ -766,36 +849,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 assert attn_metadata.mamba_state_indices is not None
                 state_indices = attn_metadata.mamba_state_indices.to(
                     torch.int32)
-                if is_pcp_streaming_attention_metadata(attn_metadata):
-                    gdn_pooled_pcp_op = getattr(self, "gdn_pooled_pcp_op",
-                                                None)
-                    if gdn_pooled_pcp_op is None:
-                        raise RuntimeError(
-                            "GDN pooled PCP prefill op was not initialized "
-                            "during model loading.")
-                    core_attn_out = gdn_pooled_pcp_op(
-                        mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
-                        self.conv1d.bias, self.A_log, self.dt_bias,
-                        state_indices, attn_metadata.query_start_loc,
-                        attn_metadata.request_distribution,
-                        attn_metadata.seq_lens)
-                    if core_attn_out.shape[0] != num_tokens:
-                        start = get_pcp_rank() * num_tokens
-                        core_attn_out = core_attn_out[start:start + num_tokens]
-                    local_core_attn_out = torch.empty(
-                        tuple(core_attn_out.shape),
-                        dtype=core_attn_out.dtype,
-                        device=core_attn_out.device,
-                    )
-                    local_core_attn_out.copy_(core_attn_out)
-                    core_attn_out = local_core_attn_out
-                else:
-                    core_attn_out = self.gdn_pooled_op(
-                        mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
-                        self.conv1d.bias, self.A_log, self.dt_bias,
-                        state_indices, attn_metadata.query_start_loc,
-                        attn_metadata.request_distribution,
-                        attn_metadata.seq_lens)
+                core_attn_out = self.gdn_pooled_op(
+                    mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
+                    self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution, attn_metadata.seq_lens)
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError(
                         "GDN op returned an incompatible output shape.")
@@ -871,9 +929,4 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        core_attn_out = core_attn_out.view(num_tokens, local_num_v_heads,
-                                           self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        out, _ = self.out_proj(core_attn_out)
-        return out
+        return self._apply_output_projection(core_attn_out, z, num_tokens)

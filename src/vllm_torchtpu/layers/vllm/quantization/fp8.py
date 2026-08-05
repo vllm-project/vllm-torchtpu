@@ -61,10 +61,11 @@ from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
+from vllm_torchtpu.layers.common.quant_methods import (DEEPSEEK_V4_FP8, FP8,
+                                                       get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
-from vllm_torchtpu.layers.vllm import moe_routing
+from vllm_torchtpu.layers.vllm import moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
@@ -263,6 +264,70 @@ def _process_fp8_linear_weights(
     ), weight_scale, desired_quant_dtype, requant_block_size
 
 
+def _quantize_and_format_single_moe_weight(
+    w: torch.Tensor,
+    *,
+    name: str,
+    quant_dtype: torch.dtype,
+    block_size: int | None,
+    activation: str = "",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a float32 MoE weight tensor to FP8 and format for the GMM kernel.
+
+    Handles swigluoai deinterleaving (for w13), 128-alignment padding,
+    block alignment validation, quantization, transpose, and scale reshaping.
+    """
+    if activation == "swigluoai" and name == "w13":
+        w1 = w[:, ::2, :]
+        w3 = w[:, 1::2, :]
+        w = torch.cat([w1, w3], dim=1)
+
+    if name == "w13":
+        half = w.shape[1] // 2
+        aligned_half = (half + 127) // 128 * 128
+        if aligned_half != half:
+            pad_w = w.new_zeros(w.shape[0], aligned_half - half, w.shape[2])
+            w = torch.cat([w[:, :half, :], pad_w, w[:, half:, :], pad_w],
+                          dim=1).contiguous()
+    elif name == "w2":
+        inter = w.shape[2]
+        aligned_inter = (inter + 127) // 128 * 128
+        if aligned_inter != inter:
+            pad_w = w.new_zeros(w.shape[0], w.shape[1], aligned_inter - inter)
+            w = torch.cat([w, pad_w], dim=2).contiguous()
+
+    if block_size is not None and w.shape[-1] % block_size != 0:
+        raise ValueError(f"Unsupported MoE quantization: {name} contracting "
+                         f"dimension {w.shape[-1]} is not divisible by "
+                         f"block_size={block_size}.")
+
+    w, w_scale = quantize_tensor(w,
+                                 quant_dtype=quant_dtype,
+                                 axis=-1,
+                                 block_size=block_size)
+
+    w = w.transpose(1, 2).contiguous()
+
+    # Reshape scales for GMM kernel.
+    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
+    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
+    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
+    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
+    # contiguous device buffer with `torch.empty + .copy_` to break the
+    # view chain so the persistent storage is a plain 4D buffer that PJRT
+    # ships to the kernel with row-major layout.
+    if w_scale is not None:
+        s = w_scale.transpose(1, 2).contiguous().to(torch.float32)
+        w_scale = torch.empty(s.shape[0],
+                              s.shape[1],
+                              1,
+                              s.shape[2],
+                              dtype=s.dtype,
+                              device=s.device).copy_(s.unsqueeze(2))
+
+    return w, w_scale
+
+
 def _quantize_and_format_moe_weights(
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -276,66 +341,20 @@ def _quantize_and_format_moe_weights(
     Handles block alignment validation, quantization, swigluoai
     deinterleaving, transpose, and scale reshaping.
     """
-    if block_size is not None:
-        for name, w in (("w13", w13), ("w2", w2)):
-            if w.shape[-1] % block_size != 0:
-                raise ValueError(
-                    f"Unsupported MoE quantization: {name} contracting "
-                    f"dimension {w.shape[-1]} is not divisible by "
-                    f"block_size={block_size}.")
-
-    if activation == "swigluoai":
-        w1 = w13[:, ::2, :]
-        w3 = w13[:, 1::2, :]
-        w13 = torch.cat([w1, w3], dim=1)
-
-    half = w13.shape[1] // 2
-    aligned_half = (half + 127) // 128 * 128
-    if aligned_half != half:
-        pad_w13 = w13.new_zeros(w13.shape[0], aligned_half - half,
-                                w13.shape[2])
-        w13 = torch.cat([w13[:, :half, :], pad_w13, w13[:, half:, :], pad_w13],
-                        dim=1).contiguous()
-        pad_w2 = w2.new_zeros(w2.shape[0], w2.shape[1], aligned_half - half)
-        w2 = torch.cat([w2, pad_w2], dim=2).contiguous()
-
-    w13, w13_scale = quantize_tensor(w13,
-                                     quant_dtype=quant_dtype,
-                                     axis=-1,
-                                     block_size=block_size)
-    w2, w2_scale = quantize_tensor(w2,
-                                   quant_dtype=quant_dtype,
-                                   axis=-1,
-                                   block_size=block_size)
-
-    w13 = w13.transpose(1, 2).contiguous()
-    w2 = w2.transpose(1, 2).contiguous()
-
-    # Reshape scales for GMM kernel.
-    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
-    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
-    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
-    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
-    # contiguous device buffer with `torch.empty + .copy_` to break the
-    # view chain so the persistent storage is a plain 4D buffer that PJRT
-    # ships to the kernel with row-major layout.
-    if w13_scale is not None:
-        s = w13_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w13_scale = torch.empty(s.shape[0],
-                                s.shape[1],
-                                1,
-                                s.shape[2],
-                                dtype=s.dtype,
-                                device=s.device).copy_(s.unsqueeze(2))
-    if w2_scale is not None:
-        s = w2_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w2_scale = torch.empty(s.shape[0],
-                               s.shape[1],
-                               1,
-                               s.shape[2],
-                               dtype=s.dtype,
-                               device=s.device).copy_(s.unsqueeze(2))
-
+    w13, w13_scale = _quantize_and_format_single_moe_weight(
+        w13,
+        name="w13",
+        quant_dtype=quant_dtype,
+        block_size=block_size,
+        activation=activation,
+    )
+    w2, w2_scale = _quantize_and_format_single_moe_weight(
+        w2,
+        name="w2",
+        quant_dtype=quant_dtype,
+        block_size=block_size,
+        activation=activation,
+    )
     return w13, w13_scale, w2, w2_scale
 
 
@@ -365,6 +384,16 @@ def _process_fp8_moe_weights(
             "Missing MoE weight scale parameters (expected w13_weight_scale_inv or w13_weight_scale)"
         )
 
+    padded_intermediate = layer.moe_config.intermediate_size_per_partition
+    unpadded_intermediate = (
+        layer.moe_config.intermediate_size_per_partition_unpadded)
+    needs_padding = padded_intermediate != unpadded_intermediate
+    if needs_padding:
+        full_intermediate = unpadded_intermediate * layer.moe_config.tp_size
+        local_start = padded_intermediate * layer.moe_config.tp_rank
+        local_real = max(
+            0, min(padded_intermediate, full_intermediate - local_start))
+
     if weight_block_size is not None:
         # Validate block alignment
         block_h, block_w = weight_block_size
@@ -376,18 +405,43 @@ def _process_fp8_moe_weights(
                     "FP8 block quantized MoE weights must be divisible by the checkpoint "
                     f"block size, got {name}.shape={tuple(weight.shape)} and "
                     f"block_size={weight_block_size}.")
-        w13 = dequantize_tensor(
+        w13_fp32 = dequantize_tensor(
             layer.w13_weight.data,
             w13_scale_param.data,
             axis=(1, 2),
             out_dtype=torch.float32,
         )
-        w2 = dequantize_tensor(
+        if needs_padding and local_real < padded_intermediate:
+            w13_fp32[:, local_real:padded_intermediate, :] = 0
+            w13_fp32[:, padded_intermediate + local_real:2 *
+                     padded_intermediate, :] = 0
+
+        w13, w13_scale = _quantize_and_format_single_moe_weight(
+            w13_fp32,
+            name="w13",
+            quant_dtype=requant_dtype,
+            block_size=requant_block_size,
+            activation=activation,
+        )
+        del w13_fp32
+
+        w2_fp32 = dequantize_tensor(
             layer.w2_weight.data,
             w2_scale_param.data,
             axis=(1, 2),
             out_dtype=torch.float32,
         )
+        if needs_padding and local_real < padded_intermediate:
+            w2_fp32[:, :, local_real:padded_intermediate] = 0
+
+        w2, w2_scale = _quantize_and_format_single_moe_weight(
+            w2_fp32,
+            name="w2",
+            quant_dtype=requant_dtype,
+            block_size=requant_block_size,
+            activation=activation,
+        )
+        del w2_fp32
     else:
         w13_q = layer.w13_weight.data.to(torch.float32)
         s13 = w13_scale_param.data.to(torch.float32)
@@ -398,7 +452,20 @@ def _process_fp8_moe_weights(
             s13 = s13.unsqueeze(-1)
         elif s13.ndim == 1:
             s13 = s13.view(-1, 1, 1)
-        w13 = w13_q * s13
+        w13_fp32 = w13_q * s13
+        if needs_padding and local_real < padded_intermediate:
+            w13_fp32[:, local_real:padded_intermediate, :] = 0
+            w13_fp32[:, padded_intermediate + local_real:2 *
+                     padded_intermediate, :] = 0
+
+        w13, w13_scale = _quantize_and_format_single_moe_weight(
+            w13_fp32,
+            name="w13",
+            quant_dtype=requant_dtype,
+            block_size=requant_block_size,
+            activation=activation,
+        )
+        del w13_fp32
 
         w2_q = layer.w2_weight.data.to(torch.float32)
         s2 = w2_scale_param.data.to(torch.float32)
@@ -406,29 +473,18 @@ def _process_fp8_moe_weights(
             s2 = s2.unsqueeze(-1)
         elif s2.ndim == 1:
             s2 = s2.view(-1, 1, 1)
-        w2 = w2_q * s2
+        w2_fp32 = w2_q * s2
+        if needs_padding and local_real < padded_intermediate:
+            w2_fp32[:, :, local_real:padded_intermediate] = 0
 
-    padded_intermediate = layer.moe_config.intermediate_size_per_partition
-    unpadded_intermediate = (
-        layer.moe_config.intermediate_size_per_partition_unpadded)
-    if padded_intermediate != unpadded_intermediate:
-        full_intermediate = unpadded_intermediate * layer.moe_config.tp_size
-        local_start = padded_intermediate * layer.moe_config.tp_rank
-        local_real = max(
-            0, min(padded_intermediate, full_intermediate - local_start))
-        if local_real < padded_intermediate:
-            w13[:, local_real:padded_intermediate, :] = 0
-            w13[:, padded_intermediate + local_real:2 *
-                padded_intermediate, :] = 0
-            w2[:, :, local_real:padded_intermediate] = 0
-
-    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
-        w13,
-        w2,
-        quant_dtype=requant_dtype,
-        block_size=requant_block_size,
-        activation=activation,
-    )
+        w2, w2_scale = _quantize_and_format_single_moe_weight(
+            w2_fp32,
+            name="w2",
+            quant_dtype=requant_dtype,
+            block_size=requant_block_size,
+            activation=activation,
+        )
+        del w2_fp32
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
@@ -447,16 +503,25 @@ def _quantize_bf16_moe_weights(
     desired_quant_dtype, requant_dtype, requant_block_size = (
         _get_moe_quant_config("[MoE online FP8]: quantizing BF16 MoE weights"))
 
-    w13 = layer.w13_weight.data.to(torch.float32)
-    w2 = layer.w2_weight.data.to(torch.float32)
-
-    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
-        w13,
-        w2,
+    w13_fp32 = layer.w13_weight.data.to(torch.float32)
+    w13, w13_scale = _quantize_and_format_single_moe_weight(
+        w13_fp32,
+        name="w13",
         quant_dtype=requant_dtype,
         block_size=requant_block_size,
         activation=activation,
     )
+    del w13_fp32
+
+    w2_fp32 = layer.w2_weight.data.to(torch.float32)
+    w2, w2_scale = _quantize_and_format_single_moe_weight(
+        w2_fp32,
+        name="w2",
+        quant_dtype=requant_dtype,
+        block_size=requant_block_size,
+        activation=activation,
+    )
+    del w2_fp32
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
@@ -594,6 +659,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype,
                        **extra_weight_attrs):
+        self.moe = layer
+        if not hasattr(layer, "has_bias") and hasattr(layer, "moe_config"):
+            layer.has_bias = layer.moe_config.has_bias
         if self.quant_config.is_checkpoint_fp8_serialized:
             Fp8MoEMethod.create_weights(self, layer, num_experts, hidden_size,
                                         intermediate_size_per_partition,
@@ -619,8 +687,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                                                       requires_grad=False)
                 w2_weight_scale = torch.nn.Parameter(w2_scale_data,
                                                      requires_grad=False)
-                layer.register_parameter("w13_weight_scale", w13_weight_scale)
-                layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                layer.register_parameter(f"w13_{self.weight_scale_name}",
+                                         w13_weight_scale)
+                layer.register_parameter(f"w2_{self.weight_scale_name}",
+                                         w2_weight_scale)
                 from vllm.model_executor.layers.fused_moe import \
                     FusedMoeWeightScaleSupported
                 attrs = dict(extra_weight_attrs)
@@ -690,10 +760,15 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                  activation=activation_str,
              )
 
-        if hasattr(layer, "w13_weight_scale"):
-            del layer.w13_weight_scale
-        if hasattr(layer, "w2_weight_scale"):
-            del layer.w2_weight_scale
+        # Remove placeholder checkpoint scales before assigning runtime inverse scales
+        # to prevent nn.Module parameter re-assignment errors and free state dict memory.
+        # Note: RoutedExperts universally names its parameters w13 (gate+up) and w2 (down);
+        # hasattr is True for serialized FP8 checkpoints and False for unquantized BF16.
+        if hasattr(layer, f"w13_{self.weight_scale_name}"):
+            delattr(layer, f"w13_{self.weight_scale_name}")
+        if hasattr(layer, f"w2_{self.weight_scale_name}"):
+            delattr(layer, f"w2_{self.weight_scale_name}")
+
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale,
@@ -759,6 +834,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 layer=layer,
             )
 
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights)
+
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
         return fused_moe_gmm(
@@ -818,7 +897,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def __init__(self,
                  quant_config: Fp8Config,
-                 linear_config: VllmQuantLinearConfig | None = None):
+                 linear_config: VllmQuantLinearConfig | None = None,
+                 prefix: str = ""):
         # Skip Fp8LinearMethod.__init__ which has GPU-specific code
         # (CUDA capability, Marlin, cutlass, W8A8BlockFp8LinearOp).
         # Set only the attributes that create_weights() reads.
@@ -838,8 +918,23 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.out_dtype = torch.get_default_dtype()
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
-        self._linear_quant_config = _get_linear_quant_config(
-            self.linear_config)
+
+        # For DSV4, non-expert dense linears use per-channel FP8 rather than block-quantized FP8.
+        # Gated on config name so generic FP8 models/tests without 'experts' prefixes are unaffected.
+        is_dsv4 = getattr(quant_config, "get_name", lambda: None)() == \
+            DEEPSEEK_V4_FP8
+        is_routed_expert = bool(prefix and ("experts" in prefix)
+                                and ("shared_experts" not in prefix))
+        if is_dsv4 and not is_routed_expert:
+            # Non-expert dense linear layers (attention and shared experts) use per-channel FP8
+            self.weight_block_size = None
+            self.block_quant = False
+            self._linear_quant_config = ("fp8", torch.float8_e4m3fn, None,
+                                         False)
+            self.is_channel_quant = True
+        else:
+            self._linear_quant_config = _get_linear_quant_config(
+                self.linear_config)
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
@@ -850,7 +945,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                                            output_partition_sizes, input_size,
                                            output_size, params_dtype,
                                            **extra_weight_attrs)
-            if getattr(self.quant_config, "is_channel_quant", False):
+            if getattr(self.quant_config, "is_channel_quant",
+                       False) or getattr(self, "is_channel_quant", False):
                 weight_loader = extra_weight_attrs.get(
                     "weight_loader", getattr(layer, "weight_loader", None))
                 scale = ChannelQuantScaleParameterTPU(
@@ -904,8 +1000,10 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     linear_quant_config=self._linear_quant_config,
                 ))
         else:
-            desired_quant_dtype, requant_dtype, requant_block_size, blockwise_kernel = (
-                self._linear_quant_config)
+            requant_dtype = torch.float8_e4m3fn
+            requant_block_size = None
+            blockwise_kernel = False
+            desired_quant_dtype = "fp8"
             weight, weight_scale = quantize_tensor(
                 layer.weight.data.to(torch.float32),
                 quant_dtype=requant_dtype,

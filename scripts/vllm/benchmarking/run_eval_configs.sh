@@ -26,6 +26,11 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     echo "=== Running Perf/Eval ($(( i + 1 ))/${#configs[@]}): $config_name (Parallel Job: $job_index / $job_count) ==="
     echo "=========================================================="
 
+    # torch_tpu's tier-2 compilation cache accumulates in /dev/shm across
+    # configs and can exhaust the container's --shm-size, killing the server
+    # mid-run. Configs load different models, so there is no reuse to keep.
+    rm -rf /dev/shm/torch_tpu_cache
+
     eval_args=(
         --config "$config_name"
         --run-lm-eval
@@ -33,6 +38,9 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     )
     if [ "${RUN_CODE_EVAL:-0}" = "1" ]; then
         eval_args+=(--run-code-eval)
+    fi
+    if [[ "$config_name" == *multimodal* ]]; then
+        eval_args+=(--run-mm-eval)
     fi
 
     if ! bash ./scripts/vllm/benchmarking/run_eval_flow.sh "${eval_args[@]}"; then

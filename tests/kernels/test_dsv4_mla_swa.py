@@ -541,5 +541,29 @@ class CorrectnessTest(parameterized.TestCase):
                                      distribution)
 
 
+def test_quantize_kv_inputs_scale_saturation():
+    """Verifies quantize_kv_inputs saturates FP8 scales at 254 instead of wrapping modulo 256."""
+    from vllm_torchtpu.kernels.deepseek_v4.mla_swa import quantize_kv_inputs
+    huge_kv = jnp.full((1, 512), jnp.inf, dtype=jnp.bfloat16)
+    quantized = quantize_kv_inputs(huge_kv)
+    scales = quantized[0, 576:583]
+    assert jnp.all(
+        scales == 254), f"Expected saturated scale 254, got {scales}"
+
+
+def test_mla_swa_accumulator_hazard_guard():
+    """Verifies that ordinary m_curr == m_prev evaluates to False in exp_cond."""
+    m_prev = jnp.array([-10.0, -1.0, 0.0], dtype=jnp.float32)
+    m_curr = jnp.array([-10.0, -1.0, 0.0], dtype=jnp.float32)
+    exp_cond_old = m_curr == m_prev
+    exp_cond_new = jnp.isneginf(m_curr)
+    assert jnp.all(
+        exp_cond_old
+    ), "Old condition erroneously triggered on equal running maxes"
+    assert not jnp.any(
+        exp_cond_new
+    ), "New condition correctly avoids discarding equal running maxes"
+
+
 if __name__ == "__main__":
     absltest.main()

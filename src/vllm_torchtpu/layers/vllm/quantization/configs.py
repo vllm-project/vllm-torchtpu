@@ -118,3 +118,10 @@ class VllmQuantConfig:
         use_ep = self.vllm_config.parallel_config.enable_expert_parallel
         moe_config.moe_parallel_config.use_ep = use_ep
         return moe_config
+
+    @property
+    def mesh(self):
+        # Provides a default fallback for JAX/TPU layers that inspect .mesh on
+        # config objects so they do not raise an AttributeError when a device mesh
+        # is not explicitly bound on the quantization config.
+        return None

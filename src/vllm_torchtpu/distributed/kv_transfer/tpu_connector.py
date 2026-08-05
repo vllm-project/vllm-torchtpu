@@ -332,10 +332,14 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                             "absent from request block tables: "
                             f"index={mamba_gid}, groups={len(block_ids)}")
                     mamba_block_ids.append(list(block_ids[mamba_gid]))
+            # The use_hma branch returned above, so use_raiden here means
+            # __init__ selected TPURaidenConnectorScheduler -- the only one
+            # of the three schedulers accepting mamba block ids. The checker
+            # cannot narrow the union to that subclass.
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
-                mamba_block_ids=mamba_block_ids)
+                mamba_block_ids=mamba_block_ids)  # type: ignore
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
             f"{len(block_ids)} groups")
@@ -357,8 +361,12 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     def build_kv_connector_stats(
             cls,
             data: dict[str, Any] | None = None) -> KVConnectorStats | None:
-        return (TpuKVConnectorStats(
-            data=data) if data is not None else TpuKVConnectorStats())
+        # `data` is inherited from vLLM's KVConnectorStats dataclass, which a
+        # static checker cannot see through vllm's editable install.
+        if data is not None:
+            return TpuKVConnectorStats(
+                data=data)  # type: ignore[unexpected-keyword]
+        return TpuKVConnectorStats()
 
     @classmethod
     def build_prom_metrics(
@@ -2016,10 +2024,51 @@ class TPURaidenConnectorWorker:
                 f"groups={self._stage3_state_group_count}")
         from vllm_torchtpu.distributed.kv_transfer.v2.pool_byte_spans import \
             lower_gdn_state_shard_spans
+        from vllm_torchtpu.distributed.kv_transfer.v2.raiden_layout_fingerprint import (
+            EXPECTED_FA_MINOR_TO_MAJOR, EXPECTED_FA_TILES)
+        from vllm_torchtpu.distributed.kv_transfer.v2.raiden_pool_manifest import \
+            BINDING_ALIASED_RAW
+
+        aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
+        if aliased_raw:
+            # Raw transfers move physical bytes; admit only the fingerprinted
+            # tiled layout.  The whole-token QK pair-blocked conv layout is
+            # enforced downstream: the span lowering rejects any other conv
+            # region vocabulary, and the layout version rides the compared
+            # fingerprint payload.
+            payload = self._raiden_layout_fingerprint_payload
+            if not payload:
+                raise RuntimeError(
+                    "aliased raw GDN lowering requires an admitted physical "
+                    "layout fingerprint")
+            measured_minor_to_major = tuple(
+                int(value) for value in payload.get("minor_to_major", ()))
+            measured_tiles = tuple(
+                tuple(int(value) for value in tile)
+                for tile in payload.get("tiles", ()))
+            measured_element_bits = int(payload.get("element_size_in_bits", 0))
+            if (measured_minor_to_major != EXPECTED_FA_MINOR_TO_MAJOR
+                    or measured_tiles != EXPECTED_FA_TILES
+                    or measured_element_bits != 8):
+                raise RuntimeError(
+                    "aliased raw GDN lowering is unsupported for the "
+                    "admitted physical layout")
+
         registrations = []
         for tag in _STAGE3_STATE_CLASS_TAGS:
             for ordinal, block_id in enumerate(mamba_state_block_ids):
                 exact_tag = f"{tag}.g{ordinal}"
+                if aliased_raw:
+                    matching_pools = tuple(
+                        pool for pool in self._raiden_manifest.pools
+                        if str(getattr(pool, "tag", "")) == exact_tag)
+                    if any(
+                            int(pool.base_offset_bytes) %
+                            1024 or int(pool.block_stride_bytes) % 1024
+                            for pool in matching_pools):
+                        raise RuntimeError(
+                            "aliased raw GDN pool base and block stride must "
+                            f"be physical-token aligned ({exact_tag})")
                 registration = lower_gdn_state_shard_spans(
                     tag=exact_tag,
                     block_id=int(block_id),

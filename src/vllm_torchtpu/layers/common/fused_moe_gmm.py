@@ -18,8 +18,8 @@ import jax
 from jax import numpy as jnp
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
-    ragged_gather_reduce
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
+    ragged_gather_reduce_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
 
@@ -63,6 +63,37 @@ def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
                          -2), jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2))
 
 
+def quantize_to_native_fp4_kmajor(w: jax.Array,
+                                  block: int) -> tuple[jax.Array, jax.Array]:
+    """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and per-block FP32 scale.
+    Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2.
+
+    TODO: Make a more generic version of this function; possibly combine with quantize_tensor_to_fp4
+    """
+
+    size_k = w.shape[-2]
+    num_blocks = size_k // block
+    blocked = w.astype(jnp.float32).reshape(*w.shape[:-2], num_blocks, block,
+                                            w.shape[-1])
+    fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
+    abs_max = jnp.max(jnp.abs(blocked), axis=-2, keepdims=True)
+    scale = abs_max / fp4_max
+    scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
+    quantized = jnp.clip(blocked * scale_inv, -fp4_max,
+                         fp4_max).astype(jnp.float4_e2m1fn)
+    quantized = quantized.reshape(*w.shape[:-2], size_k,
+                                  w.shape[-1])  # [..., K, N]
+
+    # Real e2m1 bit-packing (2 values/byte along K), matching gmm_v2's own
+    # should_unpack/bitcast(quant_dtype) unpacking convention.
+    pairs = quantized.reshape(*w.shape[:-2], size_k // 2, 2, w.shape[-1])
+    pairs = jnp.swapaxes(pairs, -1, -2)  # [..., K/2, N, 2] -- pair axis last
+    packed = jax.lax.bitcast_convert_type(pairs, jnp.uint8)  # [..., K/2, N]
+
+    scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
+    return packed, scale
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -103,6 +134,7 @@ def prepare_routed_gmm_inputs(
     use_ep: bool,
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
+    skip_padded_tokens: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -119,7 +151,13 @@ def prepare_routed_gmm_inputs(
     token_indices_flat = jnp.arange(num_tokens_local,
                                     dtype=jnp.int32).repeat(topk)
 
-    valid_mask = topk_indices_flat >= 0
+    if skip_padded_tokens:
+        # Padded tokens keep their selected expert ids, but carry zero
+        # expert routing weights. Treat them as invalid to remove them
+        # from GMM work.
+        valid_mask = (topk_indices_flat >= 0) & (topk_weights_flat != 0)
+    else:
+        valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
     argsort_revert_indices = jnp.argsort(sorted_indices)
@@ -176,6 +214,7 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -211,11 +250,19 @@ def moe_gmm(
                            zero_initialize=False,
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
-
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
+            if skip_padded_tokens:
+                # Zero out the GMM output rows of padded tokens that
+                # skipped the GMM computation, otherwise those
+                # uninitialized values can be NaN and the one-hot matmul
+                # would spread them to every token in the batch.
+                computed = jnp.arange(
+                    gmm2_res.shape[0],
+                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
@@ -223,7 +270,7 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] *
                        valid_mask[..., None]).sum(axis=1)
             return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce(
+        return ragged_gather_reduce_v2(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
@@ -250,6 +297,7 @@ def moe_gmm(
         "use_sparse_core",
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
+        "skip_padded_tokens",
     ),
 )
 def fused_moe_func(
@@ -269,6 +317,7 @@ def fused_moe_func(
     use_sparse_core: bool = True,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -329,6 +378,7 @@ def fused_moe_func(
          use_ep=use_ep,
          use_sparse_core=use_sparse_core,
          onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+         skip_padded_tokens=skip_padded_tokens,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
@@ -350,5 +400,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
     )
     return x[:num_tokens, :hidden_size]

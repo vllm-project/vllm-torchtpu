@@ -1,0 +1,51 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+steps:
+  - label: ":k8s: :tpu: GKE P/D Disaggregated Benchmark & BigQuery Upload"
+    key: "gke_pd_disagg_benchmark"
+    timeout_in_minutes: 630
+    agents:
+      queue: "cpu"
+    env:
+      HF_TOKEN: "${HF_TOKEN:-}"
+      CLUSTER_NAME: "${CLUSTER_NAME:-tpu-v7x-cluster-c}"
+      ZONE: "${ZONE:-us-central1-c}"
+      PROJECT_NAME: "${PROJECT_NAME:-cloud-ullm-inference-ci-cd}"
+      K8S_NAMESPACE: "${K8S_NAMESPACE:-vllm-torchtpu-disagg}"
+      # Optional override for parse_gke_results.py's default table. Must be a
+      # backtick-quoted fully-qualified name: `project.dataset.table`.
+      BQ_TABLE: "${BQ_TABLE:-}"
+      REPOSITORY: "vllm-torchtpu"
+      RUN_TYPE: "GKE_DISAGG"
+      CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
+    commands:
+      # 1. Download and set executable permissions for kubectl
+      - "curl -LO \"https://dl.k8s.io/release/$$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\""
+      - "chmod +x kubectl"
+
+      # 2. Download the standalone user-space Google Cloud CLI archive
+      - "curl -LO \"https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz\""
+
+      # 3. Extract the archive into the current working directory
+      - "tar -xf google-cloud-cli-linux-x86_64.tar.gz"
+
+      # 4. Install the auth plugin directly into the localized gcloud environment
+      - "./google-cloud-sdk/bin/gcloud components install gke-gcloud-auth-plugin --quiet"
+
+      # 5. Prepend both current directory and localized gcloud binary path to system PATH and execute benchmark script
+      - |
+        export PATH="$$(pwd):$$(pwd)/google-cloud-sdk/bin:$$PATH"
+        export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+        bash .buildkite/scripts/daily_run_gke_disagg.sh

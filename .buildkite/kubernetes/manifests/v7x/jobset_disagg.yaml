@@ -1,0 +1,533 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-prefill
+  namespace: vllm-torchtpu-disagg
+spec:
+  selector:
+    app: vllm-prefill
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-decode
+  namespace: vllm-torchtpu-disagg
+spec:
+  selector:
+    app: vllm-decode
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: vllm-torchtpu-pd-disagg
+  namespace: vllm-torchtpu-disagg
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - benchmark
+  ttlSecondsAfterFinished: 300
+  replicatedJobs:
+    # ---------------------------------------------------------
+    # PREFILL SERVER
+    # ---------------------------------------------------------
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: vllm-prefill
+            spec:
+              restartPolicy: Never
+              serviceAccountName: default
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              initContainers:
+                - name: tpu-node-setup
+                  image: busybox
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      sysctl -w vm.max_map_count=8388608
+                      if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                        echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                      fi
+                  securityContext:
+                    privileged: true
+                # The XLA compile cache is keyed on image sources and engine
+                # config, so nightly image bumps orphan prior entries; prune
+                # anything untouched for 14 days to bound PVC growth.
+                - name: cache-prune
+                  image: busybox
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      find /usr/vllm/xla_cache -mindepth 1 -maxdepth 1 -atime +14 -exec rm -rf {} + 2>/dev/null || true
+                      df -h /usr/vllm || true
+                  volumeMounts:
+                  - name: pvc-vllm-vol
+                    mountPath: "/usr/vllm"
+              containers:
+              - name: vllm-tpu
+                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
+                imagePullPolicy: IfNotPresent
+                command: [ "/bin/bash", "-c", "--" ]
+                args: ["vllm serve --seed=42 --model=Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --max-model-len=10240 --max-num-batched-tokens=8192 --max-num-seqs=512 --no-enable-prefix-caching --tensor-parallel-size=8 --enable-expert-parallel --quantization=fp8 --kv-cache-dtype=fp8 --gpu-memory-utilization=0.70 --no-async-scheduling --disable-log-stats --language-model-only --attention-backend=FLASH_ATTN --mamba-cache-mode=align --no-disable-hybrid-kv-cache-manager --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"use_hma_connector\":true}}'"]
+                env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token-secret
+                      key: token
+                - name: HF_HOME
+                  value: /usr/vllm
+                - name: VLLM_LOGGING_LEVEL
+                  value: "INFO"
+                - name: JAX_PLATFORMS
+                  value: "tpu,cpu"
+                - name: TPU_BACKEND_TYPE
+                  value: jax
+                - name: PJRT_DEVICE
+                  value: TPU
+                - name: USE_MOE_EP_KERNEL
+                  value: "0"
+                - name: MODEL_IMPL_TYPE
+                  value: "vllm"
+                - name: USE_BATCHED_RPA_KERNEL
+                  value: "0"
+                - name: TPU_TOPOLOGY
+                  value: "2x2x1"
+                - name: TPU_HOST_BOUNDS
+                  value: "1,1,1"
+                - name: MEGASCALE_NUM_SLICES
+                  value: ""
+                - name: MEGASCALE_SLICE_ID
+                  value: ""
+                - name: TPU_PROCESS_ADDRESSES
+                  value: ""
+                - name: TPU_WORKER_HOSTNAMES
+                  value: ""
+                - name: TPU_PROCESS_PORT
+                  value: ""
+                - name: MEGASCALE_COORDINATOR_ADDRESS
+                  value: ""
+                - name: MEGASCALE_PORT
+                  value: ""
+                - name: RAY_LOG_TO_STDERR
+                  value: "1"
+                - name: TPU_KV_PIN_SHM
+                  value: "1"
+                - name: USE_MOE_SPARSE_CORE
+                  value: "1"
+                - name: ONEHOT_MOE_PERMUTE_THRESHOLD
+                  value: "32768"
+                - name: RAGGED_GATED_DELTA_RULE_IMPL
+                  value: "chunked_kernel_v3_pd"
+                - name: TPU_ACCELERATOR_TYPE
+                  value: "tpu7x"
+                # v1 HMA connector requires the typed per-layer KV layout;
+                # the unified pool exposes GDN layers as [pool] which it
+                # cannot register (only TPUConnectorV2 needs the unified pool).
+                - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                  value: "0"
+                - name: TPU_ENABLE_D2H_TRANSFER
+                  value: "1"
+                - name: TPU_HMA_D2H_COPY_IMPL
+                  value: "device_put"
+                - name: TPU_HMA_MIN_DONE_RECVING_BATCH
+                  value: "1"
+                - name: TPU_HMA_MAX_DONE_RECVING_BATCH
+                  value: "1"
+                - name: TPU_HMA_MAX_INFLIGHT_D2H_SENDS
+                  value: "1"
+                - name: TPU_HMA_MAX_INFLIGHT_PULLS
+                  value: "8"
+                - name: TPU_MAX_HOST_KV_BUFFER_SIZE
+                  value: "64"
+                - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                  value: "600"
+                - name: TPU_KV_SHM_POOL_GB
+                  value: "16"
+                - name: TPU_KV_TRANSFER_PORT
+                  value: "9100"
+                - name: TPU_SIDE_CHANNEL_PORT
+                  value: "9600"
+                - name: VLLM_ENGINE_READY_TIMEOUT_S
+                  value: "7200"
+                - name: VLLM_XLA_CACHE_PATH
+                  value: "/usr/vllm/xla_cache_v2"
+                - name: TPU_PREMAPPED_BUFFER_SIZE
+                  value: "8589934592"
+                - name: TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES
+                  value: "8589934592"
+                ports:
+                - containerPort: 8000
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "220"
+                    ephemeral-storage: "40Gi"
+                  requests:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "220"
+                    ephemeral-storage: "40Gi"
+                volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: pvc-vllm-vol
+                  mountPath: "/usr/vllm"
+                securityContext:
+                  privileged: true
+                  capabilities:
+                    add:
+                    - IPC_LOCK
+              volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+              - name: pvc-vllm-vol
+                persistentVolumeClaim:
+                  claimName: pvc-vllm-p
+
+    # ---------------------------------------------------------
+    # DECODE SERVER
+    # ---------------------------------------------------------
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: vllm-decode
+            spec:
+              restartPolicy: Never
+              serviceAccountName: default
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              initContainers:
+                - name: tpu-node-setup
+                  image: busybox
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      sysctl -w vm.max_map_count=8388608
+                      if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                        echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                      fi
+                  securityContext:
+                    privileged: true
+                # The XLA compile cache is keyed on image sources and engine
+                # config, so nightly image bumps orphan prior entries; prune
+                # anything untouched for 14 days to bound PVC growth.
+                - name: cache-prune
+                  image: busybox
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      find /usr/vllm/xla_cache -mindepth 1 -maxdepth 1 -atime +14 -exec rm -rf {} + 2>/dev/null || true
+                      df -h /usr/vllm || true
+                  volumeMounts:
+                  - name: pvc-vllm-vol
+                    mountPath: "/usr/vllm"
+              containers:
+              - name: vllm-tpu
+                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
+                imagePullPolicy: IfNotPresent
+                command: [ "/bin/bash", "-c", "--" ]
+                args: ["vllm serve --seed=42 --model=Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --max-model-len=10240 --max-num-batched-tokens=8192 --max-num-seqs=512 --no-enable-prefix-caching --tensor-parallel-size=8 --enable-expert-parallel --quantization=fp8 --kv-cache-dtype=fp8 --gpu-memory-utilization=0.70 --no-async-scheduling --disable-log-stats --language-model-only --attention-backend=FLASH_ATTN --mamba-cache-mode=align --no-disable-hybrid-kv-cache-manager --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"use_hma_connector\":true}}'"]
+                env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token-secret
+                      key: token
+                - name: HF_HOME
+                  value: /usr/vllm
+                - name: VLLM_LOGGING_LEVEL
+                  value: "INFO"
+                - name: JAX_PLATFORMS
+                  value: "tpu,cpu"
+                - name: TPU_BACKEND_TYPE
+                  value: jax
+                - name: PJRT_DEVICE
+                  value: TPU
+                - name: USE_MOE_EP_KERNEL
+                  value: "0"
+                - name: MODEL_IMPL_TYPE
+                  value: "vllm"
+                - name: USE_BATCHED_RPA_KERNEL
+                  value: "0"
+                - name: TPU_TOPOLOGY
+                  value: "2x2x1"
+                - name: TPU_HOST_BOUNDS
+                  value: "1,1,1"
+                - name: MEGASCALE_NUM_SLICES
+                  value: ""
+                - name: MEGASCALE_SLICE_ID
+                  value: ""
+                - name: TPU_PROCESS_ADDRESSES
+                  value: ""
+                - name: TPU_WORKER_HOSTNAMES
+                  value: ""
+                - name: TPU_PROCESS_PORT
+                  value: ""
+                - name: MEGASCALE_COORDINATOR_ADDRESS
+                  value: ""
+                - name: MEGASCALE_PORT
+                  value: ""
+                - name: RAY_LOG_TO_STDERR
+                  value: "1"
+                - name: TPU_KV_PIN_SHM
+                  value: "1"
+                - name: USE_MOE_SPARSE_CORE
+                  value: "1"
+                - name: ONEHOT_MOE_PERMUTE_THRESHOLD
+                  value: "32768"
+                - name: RAGGED_GATED_DELTA_RULE_IMPL
+                  value: "chunked_kernel_v3_pd"
+                - name: TPU_ACCELERATOR_TYPE
+                  value: "tpu7x"
+                # v1 HMA connector requires the typed per-layer KV layout;
+                # the unified pool exposes GDN layers as [pool] which it
+                # cannot register (only TPUConnectorV2 needs the unified pool).
+                - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                  value: "0"
+                - name: TPU_ENABLE_D2H_TRANSFER
+                  value: "1"
+                - name: TPU_HMA_D2H_COPY_IMPL
+                  value: "device_put"
+                - name: TPU_HMA_MIN_DONE_RECVING_BATCH
+                  value: "1"
+                - name: TPU_HMA_MAX_DONE_RECVING_BATCH
+                  value: "1"
+                - name: TPU_HMA_MAX_INFLIGHT_D2H_SENDS
+                  value: "1"
+                - name: TPU_HMA_MAX_INFLIGHT_PULLS
+                  value: "8"
+                - name: TPU_MAX_HOST_KV_BUFFER_SIZE
+                  value: "64"
+                - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                  value: "600"
+                - name: TPU_KV_SHM_POOL_GB
+                  value: "16"
+                - name: TPU_KV_TRANSFER_PORT
+                  value: "9100"
+                - name: TPU_SIDE_CHANNEL_PORT
+                  value: "9600"
+                - name: VLLM_ENGINE_READY_TIMEOUT_S
+                  value: "7200"
+                - name: VLLM_XLA_CACHE_PATH
+                  value: "/usr/vllm/xla_cache_v2"
+                - name: TPU_PREMAPPED_BUFFER_SIZE
+                  value: "8589934592"
+                - name: TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES
+                  value: "8589934592"
+                ports:
+                - containerPort: 8000
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "220"
+                    ephemeral-storage: "40Gi"
+                  requests:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "220"
+                    ephemeral-storage: "40Gi"
+                volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: pvc-vllm-vol
+                  mountPath: "/usr/vllm"
+                securityContext:
+                  privileged: true
+                  capabilities:
+                    add:
+                    - IPC_LOCK
+              volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+              - name: pvc-vllm-vol
+                persistentVolumeClaim:
+                  claimName: pvc-vllm-d
+
+    # ---------------------------------------------------------
+    # BENCHMARK CLIENT & PROXY
+    # ---------------------------------------------------------
+    - name: benchmark
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: vllm-benchmark
+            spec:
+              restartPolicy: Never
+              containers:
+              - name: benchmark-runner
+                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
+                imagePullPolicy: IfNotPresent
+                env:
+                # vllm bench serve is a pure HTTP client on a CPU node; loading
+                # the torchtpu platform plugin there makes vLLM's CLI call
+                # torch.device("tpu"), which fails without import torch_tpu.
+                - name: VLLM_PLUGINS
+                  value: ""
+                # PyTorch auto-imports torch_tpu at `import torch` via the
+                # torch.backends entry point; without libtpu its native init
+                # fatally aborts. Disable backend autoload on this CPU client.
+                - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+                  value: "0"
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token-secret
+                      key: token
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    set -e
+                    # This pod is a CPU-only HTTP client. The image ships
+                    # libtpu, which makes vLLM's built-in platform detection
+                    # pick TPU and fail (tpu_inference is not installed).
+                    # Remove it so vLLM falls back to the CPU platform.
+                    pip uninstall -y libtpu libtpu-nightly >/dev/null 2>&1 || true
+                    echo "Starting proxy server..."
+                    python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+                      --host 0.0.0.0 \
+                      --port 10000 \
+                      --prefiller-host vllm-service-prefill \
+                      --prefiller-port 8000 \
+                      --decoder-host vllm-service-decode \
+                      --decoder-port 8000 &
+
+                    echo "Waiting for prefill (vllm-service-prefill:8000) and decode (vllm-service-decode:8000) servers..."
+                    until curl -s http://vllm-service-prefill:8000/health && curl -s http://vllm-service-decode:8000/health; do
+                      echo "Waiting for prefill and decode health checks..."
+                      sleep 10
+                    done
+
+                    echo "Both prefill and decode servers are HEALTHY!"
+
+                    mkdir -p /tmp/benchmark_results
+                    model="Qwen/Qwen3.5-397B-A17B-FP8"
+
+                    # Tiers above c=8 and the c>=8/2048 cell hit a known
+                    # worker hang in the HMA concurrent-load path (see builds
+                    # 38-40); re-enable as the stack fixes land.
+                    CONCURRENCIES=(1 8 16 32)
+                    # Aligned with the Ali daily-benchmark workloads: 8192/1
+                    # is their canonical prefill shape (pure prefill + KV
+                    # handoff in disagg), 1024/1024 approximates the decode
+                    # tier, 512/512 is a fast smoke cell.
+                    ISL_OSL_COMBOS=(
+                      "512 512"
+                      "1024 1024"
+                      "8192 1"
+                    )
+
+                    for CONCURRENCY in "${CONCURRENCIES[@]}"; do
+                      for combo in "${ISL_OSL_COMBOS[@]}"; do
+                        read -r input_len output_len <<< "$combo"
+                        if [ "$CONCURRENCY" -ge 8 ] && { [ "$input_len" -ge 2048 ] || [ "$output_len" -ge 4096 ]; }; then
+                          echo "Skipping Concurrency=$CONCURRENCY Input=$input_len Output=$output_len (known concurrent-load hang)"
+                          continue
+                        fi
+                        num_prompts=$((CONCURRENCY * 10))
+                        effective_num_prompts=$((num_prompts > 32 ? num_prompts : 32))
+                        # Ali's rig uses a fixed 512 prompts per level; cap so
+                        # high-concurrency combos stay comparable and bounded.
+                        effective_num_prompts=$((effective_num_prompts > 512 ? 512 : effective_num_prompts))
+                        filename="/tmp/benchmark_results/pd_disagg_c${CONCURRENCY}_i${input_len}_o${output_len}.json"
+
+                        echo "Starting Benchmark: Concurrency=$CONCURRENCY, Input=$input_len, Output=$output_len"
+                        vllm bench serve \
+                          --model="$model" \
+                          --dataset-name=random \
+                          --num-warmups 10 \
+                          --random-input-len="$input_len" \
+                          --random-output-len="$output_len" \
+                          --num-prompts="$effective_num_prompts" \
+                          --ignore-eos \
+                          --host=localhost \
+                          --port=10000 \
+                          --max-concurrency=$CONCURRENCY \
+                          --request-rate=inf \
+                          --metric-percentiles 90,99 \
+                          --append-result \
+                          --result-file="$filename"
+
+                        # Emit each combo's result immediately so a timeout
+                        # mid-sweep still yields the completed combos.
+                        if [ -f "$filename" ]; then
+                          echo "===BEGIN_RESULT_FILE $(basename "$filename")==="
+                          cat "$filename"
+                          echo ""
+                          echo "===END_RESULT_FILE==="
+                        fi
+
+                        sleep 10
+                      done
+                    done
+
+                    echo "Benchmark complete! Results saved in /tmp/benchmark_results."
+
+                    # The pod terminates when this script exits, so kubectl cp
+                    # can't fetch results afterwards. Emit them to stdout with
+                    # markers; the runner extracts them from the streamed log.
+                    for f in /tmp/benchmark_results/pd_disagg_*.json; do
+                      [ -f "$f" ] || continue
+                      echo "===BEGIN_RESULT_FILE $(basename "$f")==="
+                      cat "$f"
+                      echo ""
+                      echo "===END_RESULT_FILE==="
+                    done
+                resources:
+                  requests:
+                    cpu: "8"
+                    memory: "16Gi"
+                    ephemeral-storage: "20Gi"
+                  limits:
+                    cpu: "16"
+                    memory: "32Gi"

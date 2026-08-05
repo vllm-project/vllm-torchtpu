@@ -20,15 +20,16 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.common.fused_moe_gmm import (fused_moe_func,
-                                                       requant_unpack_kmajor,
-                                                       unpack_fp4_to_e2m1)
+from vllm_torchtpu.layers.common.fused_moe_gmm import (
+    fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
+    unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, Optional[int], Any],
                               Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
+_quantize_native_fp4_kmajor_ops: dict[int, Callable] = {}
 
 
 def get_fused_moe_activation(activation, moe_config) -> str:
@@ -80,6 +81,18 @@ def requant_load_kmajor_fp4(w_u8: torch.Tensor, scale_f: torch.Tensor,
     return op(w_u8, scale_f)
 
 
+def quantize_native_fp4_kmajor(
+        w: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an already-dequantized, K-major float weight to native FP4."""
+    op = _quantize_native_fp4_kmajor_ops.get(block)
+    if op is None:
+        op = pallas.jax_op(
+            f"pallas::nvfp4_quantize_native_kmajor_b{block}",
+            functools.partial(quantize_to_native_fp4_kmajor, block=block))
+        _quantize_native_fp4_kmajor_ops[block] = op
+    return op(w)
+
+
 def _allocate_kernel_instance_id() -> int:
     global _kernel_instance_counter
     kernel_instance_id = _kernel_instance_counter
@@ -105,20 +118,8 @@ def _build_fused_moe_custom_op(
     # yet, so that also needs an upstream OOT-backend hook.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
 
-    # `experts_start` is deliberately NOT bound here via functools.partial.
-    # Under expert parallelism it differs per EP rank (each shard owns a
-    # different slice of the global expert table), and every rank builds
-    # this op under the identical `op_name` (the cache below is keyed on
-    # `use_ep`, not on the rank-specific value). Binding a per-rank Python
-    # int into the closure would make every rank JIT-compile a structurally
-    # different program under the same op name -- confirmed to desync the
-    # in-graph EP all-to-all/gather collectives and halt the TPU core
-    # during warmup (2026-07-30; same class of bug as the GDN/PCP fix in
-    # fa8faaf5, "Make GDN PCP weight sharding rank-uniform in the compiled
-    # graph"). `experts_start` is instead passed as a genuine call-time
-    # tensor argument (see `fused_moe_gmm` below), so it flows through
-    # `jax.jit` as traced data -- identical compiled program on every rank,
-    # only the runtime value differs.
+    # Pass experts_start as a runtime tensor rather than static closure arg so every EP rank compiles an identical program.
+    # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
         fused_moe_func,
         topk=topk,
@@ -126,7 +127,8 @@ def _build_fused_moe_custom_op(
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
-        rhs_quant_dtype=rhs_quant_dtype)
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 

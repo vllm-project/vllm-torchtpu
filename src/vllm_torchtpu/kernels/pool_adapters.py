@@ -396,10 +396,57 @@ def copy_blocks(pool, src_indices, dst_indices):
     )(src_indices, dst_indices, pool)
 
 
-def v3_state_source(pool, *, split: int, ssm_ntok: int, conv_tok0: int,
-                    conv_ntok: int, conv_dim: int, n_v: int, d_k: int,
-                    d_v: int,
-                    kernel_size: int) -> gdn_v3_config.StateSourcePlan:
+def _conv_qk_pair_rows_perm(taps: int, conv_dim: int, n_v: int, d_v: int,
+                            lanes: int) -> tuple[int, ...] | None:
+    """Typed-row permutation for the QK pair-blocked pooled conv layout.
+
+    Stored order per tap interleaves Q and K row-pairs —
+    ``[Q0, K0, Q1, K1, ..., V...]`` — so that one whole pool token holds
+    one head-pair's Q and K rows and a full-width state can receive a
+    TP-rank shard's first conv token as a single contiguous token copy.
+    Returns the load-order permutation (``logical[i] = stored[perm[i]]``),
+    or ``None`` when the stored order equals the logical order (head-shard
+    states whose Q segment is a single typed row).
+    """
+    v_elems = n_v * d_v
+    qk_elems = conv_dim - v_elems
+    q_elems = qk_elems // 2
+    if 2 * q_elems != qk_elems or q_elems % lanes:
+        raise NotImplementedError(
+            "QK pair-blocked conv layout requires lane-aligned equal Q/K "
+            f"segments: conv_dim={conv_dim}, n_v*d_v={v_elems}, "
+            f"lanes={lanes}")
+    if v_elems % lanes:
+        raise NotImplementedError(
+            f"QK pair-blocked conv layout requires lane-aligned V: "
+            f"{v_elems} % {lanes}")
+    q_rows = q_elems // lanes
+    v_rows = v_elems // lanes
+    rows_per_tap = conv_dim // lanes
+    if q_rows <= 1:
+        return None
+    perm: list[int] = []
+    for tap in range(taps):
+        base = tap * rows_per_tap
+        perm.extend(base + 2 * i for i in range(q_rows))
+        perm.extend(base + 2 * i + 1 for i in range(q_rows))
+        perm.extend(base + 2 * q_rows + j for j in range(v_rows))
+    return tuple(perm)
+
+
+def v3_state_source(
+        pool,
+        *,
+        split: int,
+        ssm_ntok: int,
+        conv_tok0: int,
+        conv_ntok: int,
+        conv_dim: int,
+        n_v: int,
+        d_k: int,
+        d_v: int,
+        kernel_size: int,
+        qk_pair_layout: bool = False) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
@@ -452,6 +499,10 @@ def v3_state_source(pool, *, split: int, ssm_ntok: int, conv_tok0: int,
     assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (conv_rows,
                                                             conv_ntok,
                                                             tok_bytes)
+    conv_rows_perm = None
+    if qk_pair_layout:
+        conv_rows_perm = _conv_qk_pair_rows_perm(kernel_size - 1, conv_dim,
+                                                 n_v, d_v, lanes)
     conv = gdn_v3_config.StateRegion(
         kb0=kb0,
         nblocks=1,
@@ -460,6 +511,7 @@ def v3_state_source(pool, *, split: int, ssm_ntok: int, conv_tok0: int,
         view_dtype=jnp.dtype(jnp.bfloat16),
         lane_split=1,
         rows_used=conv_rows,
+        rows_perm=conv_rows_perm,
     )
 
     return gdn_v3_config.StateSourcePlan(stride=split,

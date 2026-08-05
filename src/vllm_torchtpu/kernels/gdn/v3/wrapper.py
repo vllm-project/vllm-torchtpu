@@ -39,6 +39,7 @@ def inner_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
+    p_id: jax.Array | None = None,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -63,9 +64,13 @@ def inner_kernel(
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
         cfg: GDN configuration object.
+        p_id: Optional explicit tile index. Communication-fused outer kernels
+            pass their global compute-tile index because their surrounding
+            pipeline owns the Pallas program id.
     """
 
-    p_id = pl.program_id(0)
+    if p_id is None:
+        p_id = pl.program_id(0)
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -107,9 +112,15 @@ def inner_kernel(
         # External source tiles: encode the state through the region's
         # typed view; copy_out pushes the raw bytes back to the source.
         for idx in range(cfg.seq_tile_size):
-            vmem_ldst.store_state_region(conv_state_slot_ref.at[idx],
-                                         cfg.state_plan.conv,
-                                         new_conv_state[idx])
+
+            args = (conv_state_slot_ref.at[idx], cfg.state_plan.conv,
+                    new_conv_state[idx])
+            if carry_conv_scratch_ref is None:
+                vmem_ldst.store_state_region(*args)
+            else:
+                # copy_out only DMAs the tile that ends a sequence.
+                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                    functools.partial(vmem_ldst.store_state_region, *args))
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -181,9 +192,14 @@ def inner_kernel(
             recurrent_slot_ref.dtype)
     else:
         for idx in range(cfg.seq_tile_size):
-            vmem_ldst.store_state_region(recurrent_slot_ref.at[idx],
-                                         cfg.state_plan.recurrent,
-                                         new_recurrent_state[idx])
+
+            args = (recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
+                    new_recurrent_state[idx])
+            if carry_recurrent_scratch_ref is None:
+                vmem_ldst.store_state_region(*args)
+            else:
+                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                    functools.partial(vmem_ldst.store_state_region, *args))
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -390,6 +406,11 @@ def fused_conv1d_gdn(
     if pooled:
         assert conv_state is None and recurrent_state is None
         assert state_source is not None
+        # An external source stores one state per slot, not a checkpoint
+        # window, so the rollback reads/writes have nowhere to land.
+        assert num_spec_tokens == 0, (
+            "speculative decoding is not supported with an external state "
+            f"source (num_spec_tokens={num_spec_tokens})")
     else:
         assert state_source is None
         conv_out_dtype = conv_state.dtype

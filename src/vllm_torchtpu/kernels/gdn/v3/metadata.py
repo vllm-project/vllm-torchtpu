@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from vllm_torchtpu.kernels import varlen_tiles
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
@@ -69,78 +70,34 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
 ) -> memory_ref.MetadataRef:
-    """Metadata for computing single sequence per tile."""
+    """Metadata for computing single sequence per tile.
 
-    max_seqs = seq_lens.size
-    max_tokens = cfg.batch_size
-    all_seqs = jnp.arange(max_seqs)
-    all_tokens = jnp.arange(max_tokens)
-
-    # Shift to ensure first element is for start_seq.
-    query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
-    seq_lens = jnp.roll(seq_lens, shift=-start_seq)
-    state_indices = jnp.roll(state_indices, shift=-start_seq)
-
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    # NOTE: query_lens is used for calculating num_tiles. Defensive programming
-    # that masks out all the other values (seq_lens, state_indices) are not needed
-    # since they will not be visited as long as num_tiles is correct.
-    num_seqs = end_seq - start_seq
-    query_lens = jnp.where(all_seqs < num_seqs, query_lens, 0)
-
-    # Calculate number of tiles needed for each sequence.
-    s_idx_to_num_tiles = pl.cdiv(query_lens, cfg.chunk_size)
-    # Calculate starting p_id of each sequence.
-    s_idx_to_start_p_id = jnp.cumulative_sum(s_idx_to_num_tiles,
-                                             include_initial=True)
-    # Map tile index to seq index.
-    # Consider following case:
-    # all_seqs = [0 1 2 3 4]
-    # s_idx_to_num_tiles = [1 2 3 0 1]
-    # jnp.repeat will return following results:
-    # p_id_to_s_idx = [0 1 1 2 2 2 4]
-    # This means p_id_to_s_idx[i] will point to its corresponding seq index.
-
-    # NOTE: To make jnp.repeat jit compilable, we add total_repeat_length. This
-    # introduces padding to p_id_to_s_idx[i] where i >= num_tiles. Since the
-    # kernel only checks value up-to p_id_to_s_idx[num_tiles-1], padded value
-    # will not impact kernel execution.
-    p_id_to_s_idx = jnp.repeat(all_seqs,
-                               s_idx_to_num_tiles,
-                               total_repeat_length=max_tokens)
-    # Map program id (p_id) to tile id of a sequence.
-    p_id_to_t_id = all_tokens - s_idx_to_start_p_id[p_id_to_s_idx]
-    # Map tile index to starting row of its activation.
-    p_id_to_r_base = (query_start_loc[p_id_to_s_idx] +
-                      p_id_to_t_id * cfg.chunk_size)
-    # Calculate number of rows to calculate / fetch for each tile.
-    p_id_to_r_size = jnp.minimum(
-        query_start_loc[p_id_to_s_idx + 1] - p_id_to_r_base,
-        cfg.tile_size,
+    The tiling itself lives in `kernels/varlen_tiles.py` so the Kimi KDA kernels
+    can share it; this wraps it in GDN's SMEM-resident MetadataRef and adds the
+    per-sequence state addressing, which is GDN's own.
+    """
+    plan = varlen_tiles.plan_per_seq_tiles(
+        seq_lens,
+        query_start_loc,
+        max_tiles=cfg.batch_size,
+        chunk_size=cfg.chunk_size,
+        tile_size=cfg.tile_size,
+        start_seq=start_seq,
+        end_seq=end_seq,
     )
-
-    # Calculate predicate used for state DMA. State is read if program id (p_id)
-    # is the first tile of a sequence and the sequence had been computed before
-    # (chunked prefill, decode, etc). State is written if the program id is the
-    # last tile of a sequence.
-    has_initial_state = (seq_lens - query_lens) > 0
-    p_id_is_first_tile = p_id_to_t_id == 0
-    p_id_is_last_tile = p_id_to_t_id == (s_idx_to_num_tiles[p_id_to_s_idx] - 1)
-
-    # NOTE: Since query_lens[i] = 0 where i >= num_seqs, s_idx_to_num_tiles[i]
-    # where i >= num_seqs will also be 0. Therefore, s_idx_to_num_tiles.sum()
-    # will contain number of tiles for valid sequence.
-    num_tiles = s_idx_to_num_tiles.sum()
+    # Rotated the same way the plan rotates what it reads, so the per-sequence
+    # payloads stay aligned with `p_id_to_s_idx`.
+    state_indices = varlen_tiles.roll_to_start_seq(state_indices, start_seq)
 
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
-        num_tiles=num_tiles,
-        p_id_to_s_idx=p_id_to_s_idx,
-        p_id_to_r_base=p_id_to_r_base,
-        p_id_to_r_size=p_id_to_r_size,
-        p_id_is_first_tile=p_id_is_first_tile,
-        p_id_is_last_tile=p_id_is_last_tile,
-        s_idx_has_initial_state=has_initial_state,
+        num_tiles=plan.num_tiles,
+        p_id_to_s_idx=plan.p_id_to_s_idx,
+        p_id_to_r_base=plan.p_id_to_r_base,
+        p_id_to_r_size=plan.p_id_to_r_size,
+        p_id_is_first_tile=plan.p_id_is_first_tile,
+        p_id_is_last_tile=plan.p_id_is_last_tile,
+        s_idx_has_initial_state=plan.s_idx_has_initial_state,
         s_idx_to_state_indices=state_indices,
         # Prefill/mixed sequences always resume from the group's base slot.
         s_idx_to_read_offset=jnp.zeros_like(state_indices),

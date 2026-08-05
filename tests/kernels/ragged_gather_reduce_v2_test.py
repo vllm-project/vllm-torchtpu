@@ -24,8 +24,8 @@ from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
-    ragged_gather_reduce as ragged_gather_reduce_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
+    ragged_gather_reduce_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
 
 jax.config.parse_flags_with_absl()

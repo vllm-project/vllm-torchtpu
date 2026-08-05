@@ -82,7 +82,8 @@ class ServingConfigs:
     def int_ty(self) -> jnp.dtype:
         if utils.get_dtype_packing(self.dtype_q) == 1:
             return jnp.int32
-
+        if self.pages_per_seq * self.page_size > jnp.iinfo(jnp.int16).max:
+            return jnp.int32
         match pltpu.get_tpu_info().generation:
             case 6 | 7:
                 return jnp.int16

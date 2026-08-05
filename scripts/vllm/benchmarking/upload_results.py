@@ -161,6 +161,7 @@ def main():
 
         input_len = int(m.group(1))
         output_len = int(m.group(2))
+        concurrency = int(m.group(3))
 
         try:
             with open(rf, "r") as f:
@@ -239,10 +240,14 @@ def main():
 
         # ExtraArgs construction
         extra_args_parts = []
+        extra_args_parts.append(f"tp={tensor_parallelism}")
+        dp = config.get("data_parallelism", 1)
+        extra_args_parts.append(f"dp={dp}")
         if config.get("enable_ep"):
             extra_args_parts.append("enable_ep")
         if config.get("quantization"):
             extra_args_parts.append(f"quantization={config['quantization']}")
+        extra_args_parts.append(f"concurrency={concurrency}")
         extra_args = " ".join(extra_args_parts)
         columns["ExtraArgs"] = f"'{sql_escape(extra_args)}'"
 

@@ -67,6 +67,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
+from vllm_torchtpu.layers.vllm import token_padding
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend,
                                                  PallasMLAttentionBackend)
@@ -340,7 +341,7 @@ class TPUModelRunner(GPUModelRunner):
         self.original_parallel_config = vllm_config.parallel_config
         self.device_config = vllm_config.device_config
 
-        # Set by `_update_mamba_page_size_padded` for hybrid attention+mamba
+        # Set by `_update_*_page_size_padded` for hybrid attention
         # models so vLLM sees a uniform page size across groups.
         self._hybrid_uniform_page_size_bytes: int | None = None
 
@@ -555,6 +556,10 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+
+        # Tracks token padding in each step.
+        self._token_padding_state: token_padding.TokenPaddingState | None = None
+
         self._init_phased_profiling()
 
     def _init_phased_profiling(self) -> None:
@@ -817,8 +822,10 @@ class TPUModelRunner(GPUModelRunner):
         has_attention = any(
             isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
-        if has_attention and has_mamba and not self._unified_kv_layout:
-            self._update_mamba_page_size_padded(layers)
+        if has_attention and not self._unified_kv_layout:
+            self._update_attention_page_size_padded(layers)
+            if has_mamba:
+                self._update_mamba_page_size_padded(layers)
 
         hma_enabled = (
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
@@ -1053,6 +1060,75 @@ class TPUModelRunner(GPUModelRunner):
                     f"{target_layer_name}, but the target cache was not "
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+    def _update_attention_page_size_padded(
+            self, layers: dict[str, AttentionLayerBase]) -> None:
+        """Pad attention page sizes so vLLM's num_blocks matches what
+        the TPU allocates per layer.
+
+        If every attention layer already has the same natural TPU page
+        size, there's nothing to compensate for: leave
+        `mamba_page_size_padded` as a no-op default.
+
+        If they differ, vLLM's own `unify_kv_cache_spec_page_size` will
+        rescale the smaller layer's `block_size` to match but leaves
+        its `page_size_padded` at the old, now-too-small
+        value, which trips `AttentionSpec.page_size_bytes`'s own
+        `page_size_padded >= real_page_size_bytes` assertion. Instead,
+        pin every layer's `page_size_padded` to the max natural size
+        up front (mirroring the Mamba-hybrid case below), so all
+        layers already report equal `page_size_bytes` and
+        `unify_kv_cache_spec_page_size` is a no-op.
+
+        NOTE: Cannot leave `page_size_padded=None` on every layer, because
+        vLLM core uses `page_size_padded` to size `num_blocks` against the HBM
+        budget. With `page_size_padded=None`, that sizing falls back to
+        generic page-size formula (https://github.com/vllm-project/vllm/blob/48aa8d8d7529d2314858d8487cc0a21789fc7ec1/vllm/v1/kv_cache_interface.py#L204-L218)
+        which has no notion of TPU's packing/alignment rules (e.g.
+        fp8 packs 4 elements per 32-bit lane, so `num_kv_heads * 2` gets
+        rounded up to a multiple of 4 in the actual TPU tensor -- see
+        `get_kv_cache_shape`). Where that rounding changes the byte count --
+        e.g. a GQA layer TP-sharded down to a single KV head -- the real TPU
+        allocation ends up larger than vLLM's generic formula accounted for,
+        so `num_blocks` is silently oversized and HBM usage silently exceeds
+        `gpu_memory_utilization`'s target, instead of failing loudly the way
+        this assertion does. `page_size_padded` has to stay pinned to the
+        true, packing-aware size on every layer; this function's job is only
+        to make sure every layer is pinned to the *same* one.
+        """
+        attn_page_sizes = set()
+        for m in layers.values():
+            if isinstance(m, Attention):
+                attn_page_sizes.add(
+                    PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        self.block_size,
+                        m.num_kv_heads,
+                        m.head_size,
+                        self.kv_cache_dtype,
+                    ))
+            elif isinstance(m, MLAAttention):
+                attn_page_sizes.add(
+                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                        self.block_size,
+                        1,
+                        m.head_size,
+                        self.kv_cache_dtype,
+                    ))
+
+        if not attn_page_sizes:
+            return
+        elif len(attn_page_sizes) > 1:
+            uniform_page_size_bytes = max(attn_page_sizes)
+            self._hybrid_uniform_page_size_bytes = uniform_page_size_bytes
+            self.cache_config.mamba_page_size_padded = uniform_page_size_bytes
+            logger.info(
+                "Pure-attention hybrid KV cache: padding every layer "
+                "spec to %d bytes (max of native sizes %s). Avoids "
+                "vLLM's unify_kv_cache_spec_page_size leaving a stale "
+                "page_size_padded behind when layer head_dims differ.",
+                uniform_page_size_bytes, sorted(attn_page_sizes))
+        else:
+            self.cache_config.mamba_page_size_padded = attn_page_sizes.pop()
 
     def _update_mamba_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
@@ -2569,6 +2645,8 @@ class TPUModelRunner(GPUModelRunner):
             # and packs the tokens into inputs_embeds; use whichever exists.
             num_tokens_padded = (input_ids if input_ids is not None else
                                  inputs_embeds).shape[0]
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                self._token_padding_update(num_tokens_padded)
             with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -3204,6 +3282,11 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            self._token_padding_state = token_padding.TokenPaddingState.create(
+                self.max_num_tokens, self.device)
+            token_padding.set_padding_state(self._token_padding_state)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
@@ -3361,6 +3444,10 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in self._attn_layer_names
             }
 
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            assert self._token_padding_state is not None
+            # Every row of a dummy step is padding.
+            self._token_padding_state.update(0, num_tokens)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -4494,6 +4581,18 @@ class TPUModelRunner(GPUModelRunner):
         # the same HBM pressure as runtime.
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
+
+    def _token_padding_update(self, num_tokens_padded: int) -> None:
+        """Record which of this step's token rows are padding."""
+        if self._token_padding_state is None:
+            return
+        plan = self._last_sequence_layout_plan
+        if plan is not None and plan.kind is SequenceLayoutKind.ALL:
+            num_valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
+        else:
+            # Padding-mask support is currently limited to the ALL layout.
+            num_valid_tokens = num_tokens_padded
+        self._token_padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         # @support_torch_compile annotations will be put on the vLLM model if it

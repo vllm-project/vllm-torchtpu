@@ -22,9 +22,6 @@ wait_for_server() {
 print_logs_on_exit() {
   echo "--- Script exiting, displaying logs ---"
 
-  # The logs are written inside containers to /root/logs, which is mapped from $LOG_DIR on the host.
-  LOG_DIR=$HOME/logs
-
   if [ -d "$LOG_DIR" ]; then
     echo "--- Contents of $LOG_DIR/prefill_0.txt ---"
     if [ -f "$LOG_DIR/prefill_0.txt" ]; then
@@ -106,7 +103,7 @@ DECODE_PORTS=()
 # Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
 TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | grep -o '/dev/vfio/[0-9]\+'))
 
-LOG_DIR=$HOME/logs
+LOG_DIR=${LOG_DIR:-$HOME/logs}
 
 if [ ! -d $LOG_DIR ]; then
   mkdir -p $LOG_DIR
@@ -132,7 +129,6 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
-    SKIP_JAX_PRECOMPILE=1 \
     \
     vllm serve $MODEL \
     --port $PORT \
@@ -164,7 +160,6 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
-    SKIP_JAX_PRECOMPILE=1 \
     \
     vllm serve $MODEL \
     --port $PORT \

@@ -136,6 +136,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_build_pooled.assert_called_once_with()
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
+        assert not attn._pcp_streaming_configured
         assert attn.gdn_pcp_op is None
         assert attn.gdn_pooled_pcp_op is None
 
@@ -170,6 +171,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_build_pooled_pcp.assert_called_once_with()
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
+        assert attn._pcp_streaming_configured
         assert attn.gdn_pcp_op is pcp_op
         assert attn.gdn_pooled_pcp_op is pooled_pcp_op
 
@@ -632,6 +634,91 @@ class TestVllmGatedDeltaNetAttention:
             [torch.full((4, 16), 12.0),
              torch.full((4, 16), 13.0)])
         assert torch.equal(attn.norm.call_args[0][0], expected_local)
+        assert torch.all(output == 5)
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+    )
+    def test_forward_uses_fused_projection_for_pooled_pcp_prefill(
+            self, mock_get_forward_context):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
+        attn.head_v_dim = 16
+        attn.num_v_heads = 4
+        attn.tp_size = 1
+        attn.prefix = "test_layer"
+        attn.gqa_interleaved_layout = False
+        attn._pcp_streaming_configured = True
+
+        attn.conv1d = MagicMock()
+        attn.conv1d.weight = torch.randn(1)
+        attn.conv1d.bias = torch.randn(1)
+        attn.A_log = torch.randn(1)
+        attn.dt_bias = torch.randn(1)
+        attn.kv_cache = (torch.ones(1), )
+        attn.gdn_op = MagicMock()
+        attn.gdn_pooled_op = MagicMock()
+        attn.gdn_pooled_pcp_op = MagicMock()
+
+        qkvz_weight = torch.ones((192, 64), dtype=torch.float8_e4m3fn)
+        qkvz_weight_scale = torch.ones(192, dtype=torch.float32)
+        attn.in_proj_qkvz = SimpleNamespace(
+            weight=qkvz_weight,
+            weight_scale=qkvz_weight_scale,
+            bias=None,
+        )
+        attn.in_proj_ba = MagicMock()
+        attn.norm = MagicMock()
+        attn.out_proj = MagicMock()
+
+        num_tokens = 2
+        hidden_states = torch.randn(num_tokens, 64)
+        b_local = torch.full((num_tokens, 16), -2.0)
+        a_local = torch.full((num_tokens, 16), -3.0)
+        attn.in_proj_ba.return_value = (torch.cat((b_local, a_local),
+                                                  dim=-1), None)
+
+        fused_output = torch.arange(
+            num_tokens * 4 * 16,
+            dtype=torch.float32,
+        ).reshape(num_tokens, 4, 16)
+        fused_z = fused_output + 1000
+        attn.gdn_pooled_pcp_op.return_value = fused_output, fused_z
+        attn.norm.side_effect = lambda core, _z: core
+        attn.out_proj.return_value = (torch.full((num_tokens, 64), 5.0), None)
+
+        metadata = MagicMock()
+        metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
+        metadata.mamba_state_indices = torch.tensor([3, 1], dtype=torch.int32)
+        metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
+        metadata.sequence_layout_protocol = "pcp_streaming"
+        metadata.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
+        metadata.request_distribution = torch.zeros(3, dtype=torch.int32)
+        mock_get_forward_context.return_value = SimpleNamespace(
+            attn_metadata={"test_layer": metadata})
+
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(),
+                vllm_config=_vllm_config(pcp_size=2, interleave_size=1)):
+            output = attn.forward(hidden_states)
+
+        attn.gdn_op.assert_not_called()
+        attn.gdn_pooled_op.assert_not_called()
+        attn.gdn_pooled_pcp_op.assert_called_once()
+        core_args = attn.gdn_pooled_pcp_op.call_args.args
+        assert core_args[0] is hidden_states
+        assert core_args[1] is qkvz_weight
+        assert core_args[2] is qkvz_weight_scale
+        assert torch.equal(core_args[3], b_local)
+        assert torch.equal(core_args[4], a_local)
+        assert core_args[5] is attn.kv_cache[0]
+        assert core_args[10] is metadata.mamba_state_indices
+        assert core_args[11] is metadata.query_start_loc
+        assert core_args[12] is metadata.request_distribution
+        assert core_args[13] is metadata.seq_lens
+        assert len(core_args) == 14
+        assert torch.equal(attn.norm.call_args.args[0], fused_output)
+        assert attn.norm.call_args.args[1] is fused_z
         assert torch.all(output == 5)
 
     @patch(

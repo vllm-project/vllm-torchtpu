@@ -21,9 +21,9 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.vllm.custom_ops import \
     kda_attention_op as kimi_custom_ops
-from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiLinearForCausalLM,
                                                KimiModel,
@@ -41,7 +41,7 @@ def test_kimi_architectures_are_registered() -> None:
         for architecture in architectures
     }
     try:
-        register_models()
+        register_layers()
         for architecture in architectures:
             registered = ModelRegistry.models[architecture]
             assert registered.load_model_cls() is KimiLinearForCausalLM
@@ -168,8 +168,13 @@ def test_mxfp4_expert_weight_loader_rebinds_packed_checkpoint_name() -> None:
     )]
 
 
+@pytest.mark.parametrize(
+    ("min_per_partition", "expected_intermediate", "expected_unpadded"),
+    [(None, 1024, None), (256, 2048, 128)],
+)
 def test_small_experts_use_current_padded_weight_location(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, min_per_partition: int | None,
+        expected_intermediate: int, expected_unpadded: int | None) -> None:
 
     class FakeGate(nn.Module):
 
@@ -210,16 +215,62 @@ def test_small_experts_use_current_padded_weight_location(
         num_shared_experts=1,
         moe_intermediate_size=1024,
     )
+    if min_per_partition is not None:
+        config.min_moe_intermediate_per_partition = min_per_partition
     layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
 
-    assert fused_moe_args["intermediate_size"] == 2048
+    assert fused_moe_args["intermediate_size"] == expected_intermediate
     assert "activation_situ_beta" not in fused_moe_args
     assert "activation_situ_linear_beta" not in fused_moe_args
     assert layer.experts.moe_config.activation_situ_beta is None
     assert layer.experts.moe_config.activation_situ_linear_beta is None
-    assert layer.experts.moe_config.intermediate_size_per_partition_unpadded == 128
-    assert not layer.experts.routed_experts.w13_weight.any()
-    assert not layer.experts.routed_experts.w2_weight.any()
+    assert (layer.experts.moe_config.intermediate_size_per_partition_unpadded
+            == expected_unpadded)
+    expect_zero = expected_unpadded is not None
+    assert bool(layer.experts.routed_experts.w13_weight.any()) != expect_zero
+    assert bool(layer.experts.routed_experts.w2_weight.any()) != expect_zero
+
+
+def test_expert_parallelism_keeps_native_intermediate_size(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class FakeGate(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    class FakeRunner(nn.Module):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.routed_experts = nn.Module()
+            self.moe_config = SimpleNamespace()
+
+    fused_moe_args = {}
+
+    def fake_fused_moe(**kwargs):
+        fused_moe_args.update(kwargs)
+        return FakeRunner()
+
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(
+        enable_expert_parallel=True))
+    monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none",
+                        lambda: vllm_config)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: 8)
+    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        hidden_act="silu",
+        num_experts=8,
+        num_experts_per_token=2,
+        num_shared_experts=0,
+        moe_intermediate_size=1024,
+    )
+    kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+
+    assert fused_moe_args["intermediate_size"] == 1024
 
 
 def test_situ_moe_uses_tpu_activation_descriptor(
@@ -418,6 +469,7 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -436,16 +488,25 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         assert args[0] is sconv_cache
         return mixed_qkv
 
-    def kda_op(mixed_qkv, *args):
-        calls.append("kda")
+    def chunk_kda_op(mixed_qkv, *args):
+        calls.append("chunk")
         assert args[3] is recurrent_cache
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
+    def unexpected(name):
+
+        def op(*args, **kwargs):
+            raise AssertionError(f"{name} must not run for this batch")
+
+        return op
+
     layer.sconv_op = sconv_op
-    layer.kda_op = kda_op
+    layer.chunk_kda_op = chunk_kda_op
+    # The reference scan is only reachable via VLLM_TPU_USE_NAIVE_KDA.
+    layer.kda_op = unexpected("kda_op")
 
     output = layer(torch.arange(2), torch.ones(2, 4))
-    assert calls == ["sconv", "kda"]
+    assert calls == ["sconv", "chunk"]
     torch.testing.assert_close(output, torch.arange(8).view(2, 4).float())
 
 
@@ -513,12 +574,18 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
     layer.sconv_op = kimi_custom_ops.build_kimi_sconv_op(
         "test_compile",
         kernel_size=3,
         state_dim_first=True,
     )
     layer.kda_op = kimi_custom_ops.build_kimi_kda_op(
+        "test_compile",
+        lower_bound=None,
+        eps=1e-5,
+    )
+    layer.chunk_kda_op = kimi_custom_ops.build_kimi_chunk_kda_op(
         "test_compile",
         lower_bound=None,
         eps=1e-5,

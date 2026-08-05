@@ -304,9 +304,11 @@ class TestFp8PoolSsmPattern:
 
 
 class TestLaneSplitGather:
-    """out_lanes narrower than pool lanes: each 128-wide lane slice of the
-    wide view carries a contiguous range of the narrow view's rows, so the
-    narrow view is the wide view's lane slices concatenated along rows."""
+    """out_lanes narrower than pool lanes: the narrowing happens on the ref
+    before the load, so the narrow view is the wide view's own row-major
+    reshape — wide row ``r`` supplies narrow rows ``[r * k, (r + 1) * k)``
+    for ``k = lanes // out_lanes``. Splitting lanes after the load instead
+    would cost a lane-crossing relayout."""
 
     NB, BS, H2P, PACK, LANES = 3, 64, 2, 2, 256
     OUT_LANES = 128
@@ -334,8 +336,7 @@ class TestLaneSplitGather:
                                              ntok=self.BS,
                                              out_dtype=jnp.float32,
                                              out_lanes=self.OUT_LANES)
-        ref = jnp.concatenate(
-            [wide[:, :, :self.OUT_LANES], wide[:, :, self.OUT_LANES:]], axis=1)
+        ref = wide.reshape(wide.shape[0], -1, self.OUT_LANES)
         assert narrow.shape == ref.shape, (narrow.shape, ref.shape)
         assert (narrow.view(jnp.int32) == ref.view(jnp.int32)).all()
 
