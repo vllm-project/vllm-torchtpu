@@ -393,6 +393,70 @@ class PallasAttentionBackend(AttentionBackend):
     ) -> None:
         raise RuntimeError("swap_blocks is not used for the TPU backend.")
 
+    @staticmethod
+    def kv_cache_dtype_saving_ratio(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype: str | torch.dtype,
+        *,
+        reference_dtype: torch.dtype = torch.bfloat16,
+    ) -> float:
+        """How much smaller a page gets by moving to `cache_dtype`.
+
+        1.0 means the narrower dtype buys nothing. That happens because
+        `get_kv_cache_shape` puts KV heads on the 32-bit packing dimension and
+        rounds their count up to a whole number of words: fp8 fits 4 values per
+        word against bf16's 2, so a page costs `ceil(num_kv_heads_x2 / packing)`
+        words either way once `num_kv_heads_x2 <= 2`.
+        """
+        wide = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size, num_kv_heads, head_size, reference_dtype)
+        narrow = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size, num_kv_heads, head_size, cache_dtype)
+        return wide / narrow
+
+    @staticmethod
+    def warn_if_kv_cache_dtype_is_ineffective(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype: str | torch.dtype,
+    ) -> None:
+        """Warn when a narrowed KV cache dtype will not free any memory.
+
+        Without this the request is silently a no-op for capacity: vLLM sizes
+        the cache to whatever memory is left over, so an unchanged page size
+        surfaces only as an unchanged `GPU KV cache size` line and a server
+        that quietly serves half the requests the operator budgeted for.
+        """
+        dtype = _resolve_kv_cache_dtype(cache_dtype)
+        if dtype.itemsize >= torch.bfloat16.itemsize:
+            return
+        try:
+            ratio = PallasAttentionBackend.kv_cache_dtype_saving_ratio(
+                block_size, num_kv_heads, head_size, dtype)
+            # Derived from the real shape rather than restating the hd64-vs-v3
+            # rule, so this cannot drift away from get_kv_cache_shape.
+            _, _, boxes, per_box, _ = PallasAttentionBackend.get_kv_cache_shape(
+                1, block_size, num_kv_heads, head_size, dtype)
+        except (NotImplementedError, ValueError):
+            # Diagnostics must never be the thing that fails startup; the real
+            # allocation path raises its own error for unsupported dtypes.
+            return
+        if ratio >= 1.99:
+            return
+        logger.warning_once(
+            "KV cache dtype %s yields only a %.2fx memory saving over bfloat16 "
+            "for this configuration (2.00x expected). This rank holds "
+            "num_kv_heads=%d at head_size=%d, which the Pallas KV layout pads "
+            "out to %d slot(s) per 32-bit word to fill the packing dimension. "
+            "That padding cancels the narrower dtype, so KV cache capacity "
+            "will not improve. Lowering tensor parallelism (more KV heads per "
+            "rank) or enabling attention data parallelism avoids the padding. "
+            "See b/510425663.", dtype, ratio, num_kv_heads, head_size,
+            boxes * per_box)
+
     # In recent TPU generations, up to v6e, the SMEM size is 1MB. The
     # block_tables within the PallasMetadata constitute almost the entire SMEM
     # requirement. Its size is max_num_seqs * num_page_per_seq * 4 (Int). Here
