@@ -180,10 +180,11 @@ class RpaSchedule:
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
-    def create_shape_dtype(cls, cfgs: configs.RpaConfigs):
+    def create_shape_dtype(cls, cfgs: configs.RpaConfigs, multiplier: int = 1):
+        effective_max_steps = cfgs.max_steps_ub * multiplier
 
         idx_wrapper = SmemWrapper.create_shape_dtype(
-            (cfgs.max_steps_ub, cfgs.batch_size))
+            (effective_max_steps, cfgs.batch_size))
 
         return cls(
             s_idx=idx_wrapper,
@@ -192,12 +193,12 @@ class RpaSchedule:
             is_last_k=idx_wrapper,
             do_writeback=idx_wrapper,
             dma_q=SmemWrapper.create_shape_dtype(
-                (cfgs.max_steps_ub, cfgs.batch_size, 2)),
+                (effective_max_steps, cfgs.batch_size, 2)),
             dma_kv_cache=SmemWrapper.create_shape_dtype(
-                (cfgs.max_steps_ub, cfgs.batch_size, cfgs.bkv_p_cache, 3)),
+                (effective_max_steps, cfgs.batch_size, cfgs.bkv_p_cache, 3)),
             dma_kv_new=SmemArrayOfStructs.create_shape_dtype(
                 (
-                    cfgs.max_steps_ub,
+                    effective_max_steps,
                     cfgs.batch_size,
                     cfgs.bkv_p_new,
                 ),
@@ -229,6 +230,34 @@ class RpaSchedule:
         src_hbm = self.dma_q[step, batch_idx, 0]
         sz = self.dma_q[step, batch_idx, 1]
         return src_hbm, sz
+
+    @jax.named_scope("mask_out_steps")
+    def mask_out_steps(self, step, _, *, b_idx):
+        """Mask out unvisited metadata schedule entries at (step, b_idx)."""
+        self.s_idx[step, b_idx] = -1
+        self.q_idx[step, b_idx] = 0
+        self.k_idx[step, b_idx] = 0
+        self.is_last_k[step, b_idx] = 0
+        self.do_writeback[step, b_idx] = 0
+
+        self.dma_q[step, b_idx, 0] = 0
+        self.dma_q[step, b_idx, 1] = 0
+
+        for i in range(self.cfgs.bkv_p_cache):
+            self.dma_kv_cache[step, b_idx, i, 0] = 0
+            self.dma_kv_cache[step, b_idx, i, 1] = 0
+            self.dma_kv_cache[step, b_idx, i, 2] = 0
+
+        for i in range(self.cfgs.bkv_p_new):
+            dma_entry = self.dma_kv_new[step, b_idx, i]
+            dma_entry.fetch_hbm[...] = 0
+            dma_entry.fetch_vmem[...] = 0
+            dma_entry.wb_hbm[...] = 0
+            if self.cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+                dma_entry.wb_vmem[...] = 0
+                dma_entry.flags[...] = 0
+            else:
+                dma_entry.set_flags(0, 0)
 
     def scratch_shapes(self):
         """Returns a Pytree of SMEM scratch memory."""
@@ -262,16 +291,53 @@ class RpaSchedule:
         )
 
 
+def _write_schedule_to_hbm(
+    schedule_smem: RpaSchedule,
+    schedule_hbm: RpaSchedule,
+    hbm_offset: jax.typing.ArrayLike,
+    num_steps: jax.typing.ArrayLike,
+    dma_sem: jax.Ref,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Writes `num_steps` of metadata from `schedule_smem` to `schedule_hbm` at `hbm_offset`."""
+    hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)
+    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
+    flat_smem = jax.tree_util.tree_leaves(schedule_smem)
+    dma_list = []
+    for h, s in zip(flat_hbm, flat_smem):
+        element_size = s.shape[0] // cfgs.max_steps_ub
+        if h.shape[0] > 1:
+            write_size = num_steps * element_size
+            write_size = utils.align_to(write_size, 128)
+            output_offset = hbm_offset_aligned * element_size
+        else:
+            write_size = h.shape[0]
+            output_offset = 0
+
+        copy = pltpu.make_async_copy(
+            s.at[pl.ds(0, write_size)],
+            h.at[pl.ds(output_offset, write_size)],
+            dma_sem.at[0],
+        )
+        dma_list.append(copy)
+
+    jax.tree.map(lambda x: x.start(), dma_list)
+    jax.tree.map(lambda x: x.wait(), dma_list)
+
+
 def compute_metadata(
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
     schedule: RpaSchedule,
     lane_lengths_ref: jax.Ref,
+    schedule_hbm_ref: RpaSchedule,
+    dma_sem: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
     skip_kv_update: bool = False,
-):
+) -> jax.Array:
     """Fill metadata using triple nested loop of seq->q->k loop.
 
     When `skip_kv_update=True` (cross-layer KV-share path): the current step's
@@ -419,15 +485,8 @@ def compute_metadata(
         return step + 1
 
     @jax.named_scope("q_loop")
-    def q_loop(q_idx, _, *, s_idx, q_start, q_end, k_len, q_len, num_k):
-        target_lane = 0
-        min_len = lane_lengths_ref[0]
-        for b in range(1, cfgs.batch_size):
-            is_better = lane_lengths_ref[b] < min_len
-            target_lane = jnp.where(is_better, b, target_lane)
-            min_len = jnp.where(is_better, lane_lengths_ref[b], min_len)
-
-        curr_ptr = lane_lengths_ref[target_lane]
+    def q_loop(q_idx, hbm_offset, *, s_idx, q_start, q_end, k_len, q_len,
+               num_k):
         q_src = q_start + q_idx * cfgs.bq_sz
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
@@ -439,6 +498,49 @@ def compute_metadata(
         end_k_idx_causal = (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task -
                             1) // cfgs.bkv_sz + 1
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
+
+        steps = end_k_idx - start_k_idx
+
+        target_lane = 0
+        min_len = lane_lengths_ref[0]
+        for b in range(1, cfgs.batch_size):
+            is_better = lane_lengths_ref[b] < min_len
+            target_lane = jnp.where(is_better, b, target_lane)
+            min_len = jnp.where(is_better, lane_lengths_ref[b], min_len)
+
+        curr_ptr = lane_lengths_ref[target_lane]
+
+        will_exceed = curr_ptr + steps > cfgs.max_steps_ub
+
+        def do_flush():
+            # Mask out unvisited steps.
+            for b_idx in range(cfgs.batch_size):
+                start_step = lane_lengths_ref[b_idx]
+                mask_step_fn = functools.partial(schedule.mask_out_steps,
+                                                 b_idx=b_idx)
+                jax.lax.fori_loop(start_step, cfgs.max_steps_ub, mask_step_fn,
+                                  None)
+
+            # Write back to HBM.
+            _write_schedule_to_hbm(
+                schedule,
+                schedule_hbm_ref,
+                hbm_offset,
+                cfgs.max_steps_ub,
+                dma_sem,
+                cfgs=cfgs,
+            )
+            hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)
+
+            for b_idx in range(cfgs.batch_size):
+                lane_lengths_ref[b_idx] = 0
+            return hbm_offset_aligned + cfgs.max_steps_ub, 0
+
+        def no_flush():
+            return hbm_offset, curr_ptr
+
+        new_hbm_offset, curr_ptr = jax.lax.cond(will_exceed, do_flush,
+                                                no_flush)
 
         k_loop_fn = functools.partial(
             k_loop,
@@ -455,8 +557,10 @@ def compute_metadata(
         lane_lengths_ref[target_lane] = jax.lax.fori_loop(
             start_k_idx, end_k_idx, k_loop_fn, curr_ptr)
 
+        return new_hbm_offset
+
     @jax.named_scope("seq_loop")
-    def seq_loop(s_idx, _):
+    def seq_loop(s_idx, hbm_offset):
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
         k_len = kv_lens_ref[s_idx]
@@ -475,10 +579,10 @@ def compute_metadata(
             num_k=num_k,
         )
 
-        jax.lax.fori_loop(0, num_q, q_loop_fn, None)
+        return jax.lax.fori_loop(0, num_q, q_loop_fn, hbm_offset)
 
     start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
-    jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, None)
+    return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, 0)
 
 
 def rpa_metadata_schedule_kernel(
@@ -529,12 +633,14 @@ def rpa_metadata_schedule_kernel(
         lane_lengths_ref[b_idx] = 0
 
     # Step 1: Compute and fill scheduler metadata.
-    compute_metadata(
+    hbm_offset = compute_metadata(
         cu_q_lens_ref,
         kv_lens_ref,
         distribution_ref,
         schedule_ref,
         lane_lengths_ref,
+        schedule_hbm_ref,
+        dma_sem,
         cfgs=cfgs,
         skip_kv_update=skip_kv_update,
     )
@@ -549,63 +655,25 @@ def rpa_metadata_schedule_kernel(
         f"Max steps exceeded SMEM capacity limit! {max_steps} vs"
         f" {cfgs.max_steps_ub}",
     )
-    schedule_ref.actual_steps[0] = max_steps
-
-    safe_max_steps = jnp.minimum(max_steps + cfgs.n_buffer + 1,
-                                 cfgs.max_steps_ub)
+    schedule_ref.actual_steps[0] = jnp.where(max_steps > 1,
+                                             hbm_offset + max_steps, max_steps)
 
     # Step 3: Mask out unvisited steps.
-    @jax.named_scope("mask_out_steps")
-    def mask_out_steps(step, _, *, b_idx):
-        schedule_ref.s_idx[step, b_idx] = -1
-        schedule_ref.q_idx[step, b_idx] = 0
-        schedule_ref.k_idx[step, b_idx] = 0
-        schedule_ref.is_last_k[step, b_idx] = 0
-        schedule_ref.do_writeback[step, b_idx] = 0
-
-        schedule_ref.dma_q[step, b_idx, 0] = 0
-        schedule_ref.dma_q[step, b_idx, 1] = 0
-
-        for i in range(cfgs.bkv_p_cache):
-            schedule_ref.dma_kv_cache[step, b_idx, i, 0] = 0
-            schedule_ref.dma_kv_cache[step, b_idx, i, 1] = 0
-            schedule_ref.dma_kv_cache[step, b_idx, i, 2] = 0
-
-        for i in range(cfgs.bkv_p_new):
-            dma_entry = schedule_ref.dma_kv_new[step, b_idx, i]
-            dma_entry.fetch_hbm[...] = 0
-            dma_entry.fetch_vmem[...] = 0
-            dma_entry.wb_hbm[...] = 0
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                dma_entry.wb_vmem[...] = 0
-                dma_entry.flags[...] = 0
-            else:
-                dma_entry.set_flags(0, 0)
-
     for b_idx in range(cfgs.batch_size):
         start_step = lane_lengths_ref[b_idx]
-        mask_step_fn = functools.partial(mask_out_steps, b_idx=b_idx)
-        jax.lax.fori_loop(start_step, safe_max_steps, mask_step_fn, None)
+        mask_step_fn = functools.partial(schedule_ref.mask_out_steps,
+                                         b_idx=b_idx)
+        jax.lax.fori_loop(start_step, max_steps, mask_step_fn, None)
 
-    # Ste 4: Write back results to HBM.
-    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-    flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-    dma_list = []
-    for h, s in zip(flat_hbm, flat_smem):
-        write_size = h.shape[0]
-        if write_size > 1:
-            write_size = (write_size // cfgs.max_steps_ub) * safe_max_steps
-            write_size = utils.align_to(write_size, 1024)
-
-        copy = pltpu.make_async_copy(
-            s.at[pl.ds(0, write_size)],
-            h.at[pl.ds(0, write_size)],
-            dma_sem.at[0],
-        )
-        dma_list.append(copy)
-
-    jax.tree.map(lambda x: x.start(), dma_list)
-    jax.tree.map(lambda x: x.wait(), dma_list)
+    # Step 4: Write back results to HBM.
+    _write_schedule_to_hbm(
+        schedule_ref,
+        schedule_hbm_ref,
+        hbm_offset,
+        max_steps,
+        dma_sem,
+        cfgs=cfgs,
+    )
 
 
 def generate_rpa_metadata(
@@ -618,16 +686,18 @@ def generate_rpa_metadata(
     skip_kv_update: bool = False,
 ) -> RpaSchedule:
     schedule_shaped_dtype = RpaSchedule.create_shape_dtype(cfgs)
+    schedule_hbm = RpaSchedule.create_shape_dtype(
+        cfgs, multiplier=cfgs.max_schedule_size_multiplier)
 
     return pl.pallas_call(
         functools.partial(rpa_metadata_schedule_kernel,
                           cfgs=cfgs,
                           skip_kv_update=skip_kv_update),
-        out_shape=schedule_shaped_dtype,
+        out_shape=schedule_hbm,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             in_specs=[],
-            out_specs=schedule_shaped_dtype.out_specs(),
+            out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
                 schedule_shaped_dtype.scratch_shapes(),
                 pltpu.SMEM((cfgs.batch_size, ), jnp.int32),

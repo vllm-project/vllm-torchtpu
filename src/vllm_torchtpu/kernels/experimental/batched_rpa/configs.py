@@ -77,6 +77,8 @@ class ServingConfigs:
     scale_k: int | None = None
     scale_v: int | None = None
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
+    smem_fraction_limit_for_schedule_generation: float = 0.33
+    max_schedule_size_multiplier: int = 16
 
     @property
     def pages_per_seq(self) -> int:
@@ -192,7 +194,9 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
-        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+        smem_limit_bytes = (
+            pltpu.get_tpu_info().smem_capacity_bytes -
+            32 * 1024) * self.serve.smem_fraction_limit_for_schedule_generation
         available_bytes = smem_limit_bytes - fixed_bytes
 
         # Per step per batch item:
@@ -208,7 +212,7 @@ class RpaConfigs:
 
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
-        return max_steps_ub
+        return int(max_steps_ub)
 
     @property
     def bkv_p(self) -> int:
@@ -329,6 +333,11 @@ class RpaConfigs:
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
             self.aligned_kv_head_dim,
         )
+
+    @property
+    def max_schedule_size_multiplier(self) -> int:
+        # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
+        return self.serve.max_schedule_size_multiplier
 
     def validate_inputs(
         self,
