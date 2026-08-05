@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
+    ragged_gather_reduce as ragged_gather_reduce_v3
 from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
 
 jax.config.parse_flags_with_absl()
@@ -146,6 +148,7 @@ class ScatterTest(jtu.JaxTestCase):
         for rgr, name in (
             (ragged_gather_reduce_v1, "ragged_gather_reduce_v1"),
             (ragged_gather_reduce_v2, "ragged_gather_reduce_v2"),
+            (ragged_gather_reduce_v3, "ragged_gather_reduce_v3"),
         ):
             try:
                 actual = rgr(x, indices, topk_weights, valid_rows_mask,
@@ -259,6 +262,16 @@ class ScatterTest(jtu.JaxTestCase):
         run_and_time(
             "ragged_gather_reduce_v2",
             ragged_gather_reduce_v2,
+            x,
+            indices,
+            topk_weights,
+            valid_rows_mask,
+            reduce_group_size,
+        )
+
+        run_and_time(
+            "ragged_gather_reduce_v3",
+            ragged_gather_reduce_v3,
             x,
             indices,
             topk_weights,

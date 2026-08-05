@@ -18,8 +18,8 @@ import jax
 from jax import numpy as jnp
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
-    ragged_gather_reduce_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
+    ragged_gather_reduce
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
 
