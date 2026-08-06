@@ -137,11 +137,6 @@ def test_tpu_precompute_context_kv(device):
     proposer.draft_model = draft_model
 
     # Initialize mock forward implementations on the layers to record outputs
-    kv_caches = [
-        torch.zeros((1, num_ctx, nkv, 2, hd),
-                    dtype=torch.float32,
-                    device=device) for _ in range(L)
-    ]
     for layer in layers:
         layer.self_attn.attn.impl = mock.MagicMock()
         layer.self_attn.attn.impl.forward = mock.MagicMock(
@@ -150,8 +145,8 @@ def test_tpu_precompute_context_kv(device):
     # 1. Run compiled/batched math eagerly inside test suite
     fn_eager = torch._dynamo.disable(
         DFlashProposer._tpu_precompute_and_update_kv_cache)
-    _, dummy_outputs = fn_eager(proposer, hidden_states, positions, None,
-                                kv_caches)
+    dummy_md = mock.MagicMock()
+    fn_eager(proposer, hidden_states, positions, (dummy_md, dummy_md))
 
     # Extract roped keys and values from the mocked layer forward calls
     roped_k_list = []
@@ -206,7 +201,8 @@ def _make_chunk(num_reqs,
         query_start_loc_np=query_start_loc_np,
         attn_ctx=SimpleNamespace(seq_lens=seq_lens,
                                  query_start_loc=query_start_loc,
-                                 use_max_model_len=True),
+                                 use_max_model_len=True,
+                                 position_ids_override=None),
         start_index=start_index,
         num_reqs=num_reqs,
         aux_hidden_states=aux_hidden_states,

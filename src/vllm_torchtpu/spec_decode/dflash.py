@@ -208,10 +208,8 @@ class DFlashProposer:
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             padded_num_reqs, block_size)
 
-        mamba_state_indices = (runner._build_mamba_state_indices(
-            chunk.start_index, chunk.num_reqs, padded_num_reqs)
-                               if getattr(runner, "_has_mamba_state", False)
-                               else None)
+        assert self._draft_attn_layer_names is not None, (
+            "load_model() must run before draft attention metadata is built")
 
         saved_ctx = runner._attn_metadata_builder_ctx
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
@@ -221,28 +219,21 @@ class DFlashProposer:
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
-            mamba_state_indices=mamba_state_indices,
             position_ids_override=chunk_ctx.position_ids_override,
         )
-        slot_mappings_dict = runner.empty_slot_mappings
-
+        # No mamba fields: DFlash drafters are attention-only, so the build
+        # below visits no mamba group and nothing would read them. A drafter
+        # with recurrent layers needs more than a slot tensor here anyway —
+        # `unified_mamba_state_indices`, the read-offset scatter, and the
+        # state seed copies are all target-path only.
         try:
-            per_layer_attn_metadata, _ = runner._build_attention_metadata(
-                num_tokens=num_tokens_padded,
-                num_reqs=padded_num_reqs,
-                max_query_len=num_tokens_padded // padded_num_reqs,
-                num_tokens_padded=num_tokens_padded,
-                num_reqs_padded=padded_num_reqs,
-                slot_mappings=slot_mappings_dict,
-            )
+            # Only the draft layers' KV cache groups. The full build walks
+            # every group in the deployment and we would discard all but
+            # these — see `build_attention_metadata_for_layers`.
+            return runner.build_attention_metadata_for_layers(
+                self._draft_attn_layer_names, padded_num_reqs)
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
-
-        return {
-            name: md
-            for name, md in per_layer_attn_metadata.items()
-            if name in self._draft_attn_layer_names
-        }
 
     def _prepare_dflash_inputs(
         self,
@@ -262,7 +253,6 @@ class DFlashProposer:
 
         The base token is the last verified token from the target model.
         """
-        logger.debug("DFlash: Starting _prepare_dflash_inputs. num_reqs=%s", chunk.num_reqs)
         # 1. Calculate static padded shapes
         num_reqs = chunk.num_reqs
         K = self.speculative_config.num_speculative_tokens
@@ -319,8 +309,10 @@ class DFlashProposer:
         for layer in self.draft_model.model.layers:
             layer_name = getattr(layer.self_attn.attn, "layer_name", "")
             md = attn_metadata.get(layer_name, default_md)
-            if getattr(md, "block_tables", None) is not None and md.block_tables.dim() > 1:
-                md = dataclasses.replace(md, block_tables=md.block_tables.reshape(-1))
+            if getattr(md, "block_tables",
+                       None) is not None and md.block_tables.dim() > 1:
+                md = dataclasses.replace(
+                    md, block_tables=md.block_tables.reshape(-1))
             draft_md_list.append(md)
         return tuple(draft_md_list)
 
@@ -352,8 +344,8 @@ class DFlashProposer:
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
 
         with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
-            self._tpu_precompute_and_update_kv_cache(
-                target_hidden, positions, draft_md_tuple)
+            self._tpu_precompute_and_update_kv_cache(target_hidden, positions,
+                                                     draft_md_tuple)
 
     @torch.no_grad()
     def propose(
@@ -526,7 +518,8 @@ class DFlashProposer:
         with set_vllm_model_wrapper_context(mesh=runner.mesh):
             out = self._tpu_precompute_and_update_kv_cache(
                 dummy_hidden, dummy_positions,
-                tuple([dummy_attn_metadata] * len(self.draft_model.model.layers)))
+                tuple([dummy_attn_metadata] *
+                      len(self.draft_model.model.layers)))
             sync.synchronize(out, wait=True)
 
     def _dummy_draft_forward(
@@ -592,15 +585,17 @@ class DFlashProposer:
                     for layer_name in runner._attn_layer_names
                 }
             else:
-                slot_mappings = runner.empty_slot_mappings
-                per_layer_attn_metadata, _ = runner._build_attention_metadata(
-                    num_tokens=num_tokens,
-                    num_reqs=actual_num_reqs,
-                    max_query_len=num_tokens_per_req,
-                    num_tokens_padded=num_tokens,
-                    num_reqs_padded=actual_num_reqs,
-                    slot_mappings=slot_mappings,
-                )
+                # Must match `_build_draft_attn_metadata` exactly. torch-tpu's
+                # DEFER_AND_FUSE keys its fused programs on the live dispatch
+                # sequence, so precompiling a different sequence than propose
+                # actually runs emits programs serving never hits and leaves
+                # the real ones to compile on first use — which is what the
+                # spec-decode real warmup then has to pay for.
+                assert self._draft_attn_layer_names is not None, (
+                    "load_model() must run before precompile()")
+                per_layer_attn_metadata = (
+                    runner.build_attention_metadata_for_layers(
+                        self._draft_attn_layer_names, actual_num_reqs))
             with (
                     set_forward_context(per_layer_attn_metadata,
                                         self.vllm_config, 0),
@@ -693,7 +688,8 @@ class DFlashProposer:
                 key=roped_k_all[i],
                 value=all_v[i],
                 kv_cache=kv_cache,
-                attn_metadata=(draft_md_tuple[i] if isinstance(draft_md_tuple, (tuple, list)) else draft_md_tuple),
+                attn_metadata=(draft_md_tuple[i] if isinstance(
+                    draft_md_tuple, (tuple, list)) else draft_md_tuple),
             )
 
         return hidden_states

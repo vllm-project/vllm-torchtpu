@@ -10,9 +10,11 @@ import copy
 import dataclasses
 import os
 import time
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
@@ -1021,6 +1023,41 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
         )
+
+    def build_attention_metadata_for_layers(
+        self,
+        layer_names: Collection[str],
+        num_reqs_padded: int,
+    ) -> dict[str, AttentionMetadata]:
+        """Build attention metadata for only the groups owning `layer_names`.
+
+        `_build_attention_metadata` walks every KV cache group. A drafter
+        needs only its own layers, and the group count tracks the layer count
+        whenever vLLM's spec bucketing collapses — which a drafter mixing
+        window and full attention causes on its own. Building every group and
+        discarding all but the draft's costs a block-table H2D plus a handful
+        of gathers per discarded group, per chunk, per step.
+
+        Reads the same `_attn_metadata_builder_ctx` the full build does, so
+        callers stage it identically.
+        """
+        # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
+        # common metadata; everything else it needs comes from
+        # `_attn_metadata_builder_ctx`.
+        common = SimpleNamespace(num_reqs=num_reqs_padded)
+        metadata: dict[str, AttentionMetadata] = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                selected = [n for n in group.layer_names if n in layer_names]
+                if not selected:
+                    continue
+                built = group.metadata_builders[0].build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                )
+                for name in selected:
+                    metadata[name] = built
+        return metadata
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -2068,8 +2105,6 @@ class TPUModelRunner(GPUModelRunner):
                 seq.tolist()
                 for seq in pre_next_tokens_cpu[valid_mask].split(gen_lens)
             ]
-            logger.info("SPEC_VERIFY_HOST: req_ids=%s, num_drafts=%s, accepted_tokens=%s",
-                        pre_req_ids, pre_num_draft_per_req, valid_sampled_token_ids)
 
         for i in pre_discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
@@ -3094,9 +3129,14 @@ class TPUModelRunner(GPUModelRunner):
             num_valid = (next_tokens[:num_reqs]
                          != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
             offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
-        for group_indices in indices_per_group:
-            self.mamba_slot_read_offsets.index_put_((group_indices.long(), ),
-                                                    offsets)
+        if len(indices_per_group) == 1:
+            self.mamba_slot_read_offsets.index_put_(
+                (indices_per_group[0].long(), ), offsets)
+        else:
+            all_indices = torch.cat(indices_per_group, dim=0).long()
+            all_offsets = offsets.repeat(len(indices_per_group))
+            self.mamba_slot_read_offsets.index_put_((all_indices, ),
+                                                    all_offsets)
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -3170,11 +3210,18 @@ class TPUModelRunner(GPUModelRunner):
         # No `if nothing_new: return` here — see the docstring. The device
         # work below must be issued on every rank on every step.
         keep_dev.copy_(keep, non_blocking=True)
-        for group_indices in groups:
-            # Non-new rows collapse onto the null slot; writing 0 there is a
-            # no-op, which keeps this scatter one fixed shape.
-            targets = torch.where(keep_dev, group_indices, null)
+        # Non-new rows collapse onto the null slot; writing 0 there is a
+        # no-op, which keeps this scatter one fixed shape.
+        if len(groups) == 1:
+            targets = torch.where(keep_dev, groups[0], null)
             self.mamba_slot_read_offsets.index_put_((targets.long(), ), zeros)
+        else:
+            all_groups = torch.cat(groups, dim=0)
+            keep_all = keep_dev.repeat(len(groups))
+            targets = torch.where(keep_all, all_groups, null)
+            zeros_all = zeros.repeat(len(groups))
+            self.mamba_slot_read_offsets.index_put_((targets.long(), ),
+                                                    zeros_all)
 
     def _read_offset_reset_scratch(
         self, width: int, device: torch.device
