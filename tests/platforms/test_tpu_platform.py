@@ -453,14 +453,15 @@ class TestPhasedProfilingConfigValidation:
 
 
 def test_config_hook_registers_tpu_kv_connectors_by_name():
-    # The API server's multi-connector stats path resolves child connectors
-    # via get_connector_class_by_name (registry-only), but recipes load the
-    # TPU connectors through kv_connector_module_path, which never
-    # registers them. Registration must run in every process that builds a
-    # VllmConfig so a stats batch naming a child cannot kill the AsyncLLM
-    # output handler — and it must NOT live in the platform plugin entry
-    # point, which runs inside vllm.platforms' module initialization where
-    # importing the factory dies on the half-initialized module.
+    """Verify TPU KV connectors are registered in the factory by name idempotently.
+
+    When loaded dynamically via module paths, connectors are not registered by name
+    in KVConnectorFactory. However, the API server's multi-connector metrics path resolves
+    child connectors via get_connector_class_by_name().
+
+    This test verifies that _register_tpu_kv_connectors() populates the name registry
+    safely across repeated invocations without raising duplicate-registration errors.
+    """
     from vllm.distributed.kv_transfer.kv_connector.factory import \
         KVConnectorFactory
 
@@ -468,7 +469,8 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
         _register_tpu_kv_connectors
 
     _register_tpu_kv_connectors()
-    _register_tpu_kv_connectors()  # idempotent: must not raise on re-entry
+    _register_tpu_kv_connectors(
+    )  # Idempotent: repeated registrations must succeed.
 
     for name in ("TPURaidenConnector", "TPUMultiConnector",
                  "TPURaidenOffloadingConnector"):

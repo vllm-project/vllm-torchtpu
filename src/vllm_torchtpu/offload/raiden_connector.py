@@ -166,6 +166,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                         max_chunks, req.num_computed_tokens //
                         group_config.tokens_per_chunk)
                 del group_state.offload_keys[max_chunks:]
+                del group_state.block_ids[max_chunks *
+                                          self.config.blocks_per_chunk:]
         return super()._build_store_jobs(scheduler_output)
 
     def build_connector_meta(

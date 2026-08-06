@@ -186,23 +186,18 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
 
 
 def _register_tpu_kv_connectors() -> None:
-    """Register the TPU KV connectors in the factory's name registry.
+    """Register TPU-specific KV connectors in vLLM's factory name registry.
 
-    Recipes load these via kv_connector_module_path, which resolves the
-    class without registering it, and the API server process never
-    instantiates connectors at all — but its metrics path rebuilds
-    TPUMultiConnector child stats through get_connector_class_by_name,
-    which is registry-only. Without this, the first stats batch naming a
-    child (e.g. TPURaidenOffloadingConnector) kills the AsyncLLM output
-    handler with "Connector ... is not registered" and every subsequent
-    request 500s.
+    Ensures connectors loaded dynamically via module paths (e.g., TPURaidenConnector,
+    TPUMultiConnector, TPURaidenOffloadingConnector) are discoverable by name.
 
-    Called from check_and_update_config, which runs in every process that
-    constructs a VllmConfig (the API server included) — NOT from the
-    platform plugin entry point: that runs inside vllm.platforms' own
-    module initialization, where importing the factory reaches back for
-    the still-unset current_platform and dies. Lazy loaders: nothing is
-    imported until a name is actually looked up.
+    Required for the API server metrics pipeline: TPUMultiConnector aggregates child
+    connector statistics by looking up classes via get_connector_class_by_name().
+    Without registry registration, the first metrics collection triggers an unhandled
+    exception in the AsyncLLM output handler, causing HTTP 500 errors on subsequent requests.
+
+    Invoked from check_and_update_config() in every process that builds a VllmConfig
+    (including the API server). Defers imports lazily until connector names are accessed.
     """
     from vllm.distributed.kv_transfer.kv_connector.factory import \
         KVConnectorFactory
@@ -218,8 +213,7 @@ def _register_tpu_kv_connectors() -> None:
         try:
             KVConnectorFactory.register_connector(name, module_path, name)
         except ValueError:
-            # Already registered (check_and_update_config runs more than
-            # once per process).
+            # Idempotent: ignore if already registered on repeated config updates.
             pass
 
 
@@ -912,8 +906,8 @@ class TpuPlatform(Platform):
                                     and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):
-                # Hybrid CPU offloading transfers whole pool rows; the
-                # typed-view layout has no uniform per-block row to copy.
+                # Hybrid model offloading transfers uniform pool rows; the non-unified
+                # typed-view layout lacks a common per-block stride for DMA copies.
                 raise ValueError(
                     f"CPU offloading ({kv_transfer_config.kv_connector}) "
                     "on hybrid attention+Mamba models requires the unified "
