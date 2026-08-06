@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Connector wiring for the store-backed (V2) raiden KV offload path.
+"""Connector wiring for the store-backed (V2) Raiden KV offload path.
 
-`TPURaidenOffloadingConnector` subclasses vLLM's `OffloadingConnector`;
-select it with:
+`TPURaidenOffloadingConnector` subclasses vLLM's `OffloadingConnector`.
+Enable it via:
 
     --kv-transfer-config '{
         "kv_connector": "TPURaidenOffloadingConnector",
@@ -23,35 +23,29 @@ select it with:
         "kv_connector_extra_config": {"cpu_bytes_to_use": ...}
     }'
 
-Control flow vs the stock connector: transfers originate at the scheduler
-(the manager's `KVCacheStore`), so workers receive **no** load/store jobs.
-Two things still ride the scheduler<->worker metadata channel:
+Architecture overview vs. stock vLLM offloading:
+Transfers are centralized at the scheduler via Raiden's C++ `KVCacheStore`,
+leaving worker job dicts empty. Two essential signals flow between scheduler
+and workers:
 
-- **Save fence.** A store job's `save()` may only read HBM after the forward
-  that wrote the blocks. Newly created store jobs ship as `fence_job_ids`;
-  each rank runs a post-forward `_tpu_sync(wait=True)` and acks via
-  `fenced_jobs` on the worker metadata. Only after every rank acked does the
-  scheduler admit (`insert_and_lock`) and launch (`save`) the job.
+- Save fence: A store job can only read HBM after the forward pass writing
+  those blocks has fully landed. Store jobs ship as `fence_job_ids`. Each rank
+  executes a post-forward `_tpu_sync(wait=True)` and acks via `fenced_jobs`.
+  The scheduler admits and launches `save()` only after all ranks have acked.
 
-- **Completion echoes.** The stock completion machinery (per-job pending
-  counts, block-free fencing, WAITING_FOR_REMOTE_KVS release) is count/ID
-  driven from worker reports. Terminal jobs discovered by the manager's
-  finalizer ship to the workers, which echo them back as `completed_jobs` /
-  `finished_recving` — so that machinery runs unchanged, at the cost of one
-  extra step of latency on completion signals. Failed loads additionally
-  report their destination GPU blocks through
-  `get_block_ids_with_load_errors`, which the scheduler core already handles
-  by invalidating and recomputing those blocks.
+- Completion echoes: Upstream vLLM completion machinery (reference counting,
+  block release, `WAITING_FOR_REMOTE_KVS` unblocking) expects worker reports.
+  Terminal jobs discovered by the scheduler manager ship down to workers,
+  which echo them back as `completed_jobs` / `finished_recving`. Failed loads
+  report their destination blocks via `get_block_ids_with_load_errors` for
+  automatic recomputation.
 
-`jobs_to_flush` (blocks about to be reused) is handled scheduler-side:
-fence-pending stores are cancelled, launched jobs are drained by blocking on
-the store polls before this step's metadata ships.
+- Memory reuse (jobs_to_flush): Handled entirely scheduler-side. Fence-pending
+  stores are cancelled before launching, while active transfers are drained
+  synchronously before shipping metadata, preventing torn reads upon block reuse.
 
-`_build_store_jobs` is additionally overridden to survive aborted requests:
-the stock finished-request store path asserts offload_keys and block_ids
-line up, which an abort violates (hashes cover all known tokens, blocks only
-what was allocated); the override trims the keys to the allocated+computed
-chunks first.
+- Aborted request resilience: `_build_store_jobs` trims keys to allocated blocks
+  and computed tokens, preventing crashes and cache pollution from aborted requests.
 """
 from __future__ import annotations
 
@@ -90,26 +84,24 @@ logger = init_logger(__name__)
 
 @dataclass
 class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
-    """Scheduler -> worker metadata. load_jobs/store_jobs are always empty
-    (transfers are controller-driven); the extra fields carry the fence
-    requests and the completion echoes."""
-    # Store jobs newly parked this step: every rank must fence (post-forward
-    # _tpu_sync) and ack before the scheduler launches the save.
+    """Scheduler -> worker metadata.
+
+    Transfers are controller-driven (load_jobs and store_jobs are empty);
+    extra fields carry fence requests and completion echoes.
+    """
+    # Store jobs awaiting device fence from all ranks before launching save.
     fence_job_ids: set[int] = field(default_factory=set)
-    # Terminal store jobs to echo back as completed_jobs.
+    # Completed store jobs to echo back to the scheduler state machine.
     finished_store_job_ids: list[int] = field(default_factory=list)
-    # Terminal load jobs to echo back: job_id -> req_id (reported both as
-    # completed_jobs and finished_recving, on success AND failure).
+    # Completed load jobs (job_id -> req_id) to echo back and unblock requests.
     finished_load_jobs: dict[int, str] = field(default_factory=dict)
-    # Destination GPU block IDs of failed loads, reported through
-    # get_block_ids_with_load_errors.
+    # Destination GPU blocks of failed loads, reported for scheduler recompute.
     failed_load_gpu_block_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
 class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
-    """Worker -> scheduler metadata: stock completed-job echoes plus the
-    per-rank fence acks ({job_id: 1}, summed across ranks)."""
+    """Worker -> scheduler metadata: contains completed-job echoes and per-rank fence acks."""
     fenced_jobs: dict[int, int] = field(default_factory=dict)
 
     def aggregate(self, other):
@@ -129,15 +121,18 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
 
 @dataclass
 class _ParkedStore:
-    """A store job awaiting fence acks from every rank."""
+    """A store job parked until every worker rank acknowledges the device fence."""
     keys: list[OffloadKey]
     gpu_block_ids: list[int]
     acks: int = 0
 
 
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
-    """Scheduler that strips jobs from the worker metadata and drives the
-    store through the manager's submission bridge instead."""
+    """Scheduler for the store-backed offload path.
+
+    Strips per-rank transfer jobs and orchestrates the store engine directly
+    via RaidenOffloadingManager.
+    """
 
     def __init__(self, spec: TPURaidenStoreOffloadingSpec,
                  vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
@@ -148,17 +143,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def _build_store_jobs(
             self, scheduler_output: SchedulerOutput) -> dict[int, TransferJob]:
-        # A request aborted mid-flight reaches the stock finished-request
-        # store path with offload_keys covering every full token block
-        # (block hashes exist as soon as the tokens are known) while
-        # group_state.block_ids only covers the blocks actually allocated
-        # before the abort — the stock slice-length assert then kills the
-        # engine. Drop the keys of chunks with no allocated blocks, and for
-        # aborted requests also of chunks past the computed tokens: their
-        # blocks may exist (allocated ahead of compute) but their KV was
-        # never written, so storing them would serve garbage on a later
-        # prefix hit. Normally finished requests are untouched — their
-        # block_ids always cover the storable chunks.
+        # TODO: Drop this override once vLLM is updated past commit 4a3447d200:
+        # upstream OffloadingConnectorScheduler handles FINISHED_ABORTED by
+        # bounding tokens to req.num_computed_tokens.
+        #
+        # Protect against mid-flight aborted requests:
+        # - Prevent crash: Prompt token hashes (offload_keys) exist upfront, but
+        #   an aborted request only has partially allocated block_ids. Trim keys
+        #   to allocated blocks so upstream slice-length assertions won't fail.
+        # - Prevent cache pollution: Blocks allocated ahead of computation have
+        #   not been written yet. Trim keys to actually computed tokens so we
+        #   never store uninitialized garbage into the offload cache.
         for req_id in scheduler_output.finished_req_ids or ():
             req_status = self._req_status.get(req_id)
             if req_status is None:
@@ -183,9 +178,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
         manager = self._raiden_manager
 
-        # Park new store jobs until every rank fences. keys (dst_spec, from
-        # prepare_store) and GPU block IDs (src_spec) align 1:1 with
-        # blocks_per_chunk == 1.
+        # Park new store jobs: wait for all ranks to complete device fence.
         new_fence_ids: set[int] = set()
         for job_id, job in meta.store_jobs.items():
             src_spec, dst_spec = job.src_spec, job.dst_spec
@@ -198,9 +191,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 keys=dst_spec.keys, gpu_block_ids=gpu_block_ids)
             new_fence_ids.add(job_id)
 
-        # Loads are safe by construction (freshly allocated destination
-        # blocks; request scheduled only after the poll reports done), so
-        # submit them to the store immediately.
+        # Submit load jobs immediately: destination HBM blocks are freshly
+        # allocated and safe to write into.
         for job_id, job in meta.load_jobs.items():
             src_spec, dst_spec = job.src_spec, job.dst_spec
             assert isinstance(src_spec, RaidenLoadStoreSpec)
@@ -215,11 +207,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                                     pinned=src_spec.pinned,
                                     displaced_keys=src_spec.displaced_keys)
 
-        # jobs_to_flush: the jobs' source blocks are about to be reused.
-        # Fence-pending stores are cancelled (nothing was admitted yet);
-        # launched jobs are drained by blocking on the polls, so the DMA
-        # finishes before the forward that overwrites the blocks (workers
-        # only start it after receiving this step's metadata).
+        # Handle jobs_to_flush (source blocks are about to be recycled):
+        # - Cancel fence-pending stores before they start.
+        # - Synchronously drain launched stores so DMA finishes before blocks are overwritten.
         finished_store_ids: list[int] = []
         finished_loads: dict[int, str] = {}
         failed_load_block_ids: list[int] = []
@@ -230,9 +220,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             if parked is not None:
                 manager.on_store_job_cancelled(parked.keys)
                 finished_store_ids.append(job_id)
-                # A job created and flushed in the same step must not ship
-                # as a fence request: the workers would run a full TPU sync
-                # for a job that no longer exists.
+                # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
                 logger.debug(
                     "[kv-offload-v2] cancelled fence-pending store job %d "
@@ -242,19 +230,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         drained = (manager.drain_jobs(launched_flush_ids)
                    if launched_flush_ids else [])
 
-        # Collect newly terminal jobs (regular completions + the drain) for
-        # the echo channel.
-        for fj in list(drained) + manager.poll_finished_jobs():
-            if fj.op == AdmissionOp.STORE:
-                finished_store_ids.append(fj.job_id)
+        # Collect completed/drained jobs for the worker echo channel.
+        for finished_job in list(drained) + manager.poll_finished_jobs():
+            if finished_job.op == AdmissionOp.STORE:
+                finished_store_ids.append(finished_job.job_id)
             else:
-                assert fj.req_id is not None
-                finished_loads[fj.job_id] = fj.req_id
-                failed_load_block_ids.extend(fj.failed_gpu_block_ids)
+                assert finished_job.req_id is not None
+                finished_loads[finished_job.job_id] = finished_job.req_id
+                failed_load_block_ids.extend(finished_job.failed_gpu_block_ids)
 
-        # Ship empty job dicts: no per-rank transfer submission exists.
-        # The inherited-field kwargs are invisible to pyrefly because the
-        # vllm base dataclass resolves to Any (see [tool.pyrefly] notes).
+        # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
             load_jobs={},  # pyrefly: ignore[unexpected-keyword]
             store_jobs={},  # pyrefly: ignore[unexpected-keyword]
@@ -285,27 +270,21 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
-    """OffloadingConnector variant for the raiden KVCacheStore path."""
+    """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
                  kv_cache_config: KVCacheConfig):
-        # Deliberately skip OffloadingConnector.__init__: it resolves the
-        # spec through the OffloadingSpecFactory, which cannot carry
-        # vllm_config / kv_cache_config into the spec.
+        # Skip OffloadingConnector.__init__: default factory cannot carry
+        # vllm_config / kv_cache_config directly into the spec.
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
 
-        # Without this, ControllerServer / WorkerServiceServer are
-        # process-wide singletons that silently reuse the first bound port —
-        # fatal when the disagg stack runs its own raiden control plane in
-        # the same process.
+        # Disable singleton worker to avoid port collisions when disagg stack
+        # runs its own control plane in the same process.
         if os.environ.get("RAIDEN_DISABLE_SINGLETON_WORKER") not in ("1",
                                                                      "true"):
             os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
 
-        # Called through the module: the PCP-aware TPU patch rebinds the
-        # module attribute, and a from-import taken before the patch ran
-        # would pin the unpatched build (rank-local tokens_per_block under
-        # PCP).
+        # Call through module to preserve PCP-aware patch on build_offloading_config.
         offloading_config = offloading_config_module.build_offloading_config(
             vllm_config, kv_cache_config)
         spec = TPURaidenStoreOffloadingSpec(offloading_config, vllm_config,
@@ -317,13 +296,10 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self.connector_scheduler = TPURaidenOffloadingScheduler(
                 spec, vllm_config, kv_cache_config)
         elif role == KVConnectorRole.WORKER:
-            # The stock worker wrapper is reused only for its KV cache
-            # registration (canonicalized views -> spec.get_worker); the job
-            # dicts it iterates are always empty.
+            # Worker wrapper is only used for KV buffer registration; job dicts remain empty.
             self.connector_worker = OffloadingConnectorWorker(
                 spec, kv_cache_config)
-            # Per-step fence acks and completion echoes for the next
-            # build_connector_worker_meta.
+            # Track per-step fence acks and completion echoes for worker metadata.
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}
             self._load_error_block_ids: set[int] = set()
@@ -337,14 +313,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         return worker
 
     def start_load_kv(self, forward_context, **kwargs) -> None:
-        # Registration is deferred to here (the first per-step hook): the
-        # scheduler-side controller is deterministically up by the first
-        # step, while register_kv_caches runs strictly before it exists.
+        # Defer registration to the first step when the controller server is ready.
         self._raiden_worker().ensure_registered()
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
-        # Flushes are handled scheduler-side (cancel or drain); there is no
-        # per-rank transfer state to flush.
+        # Flushes are handled scheduler-side; no per-rank transfer state to flush.
         return
 
     def get_finished(self,
@@ -354,9 +327,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
         if meta.fence_job_ids:
-            # Post-forward device fence: after this, every KV write of the
-            # forward that filled the fenced jobs' blocks is complete, so
-            # the controller's save may read them.
+            # Run device fence: ensure previous forward writes to HBM are complete
+            # before the controller's background save reads them.
             from torch_tpu._internal.sync import synchronize as _tpu_sync
             _tpu_sync(wait=True)
             for job_id in meta.fence_job_ids:
@@ -380,8 +352,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if not (self._fenced_jobs or self._completed_jobs):
             return None
-        # completed_jobs is an inherited field pyrefly cannot see: the vllm
-        # base dataclass resolves to Any (see [tool.pyrefly] notes).
+        # completed_jobs is inherited from vLLM base dataclass.
         meta = RaidenOffloadingWorkerMetadata(
             # pyrefly: ignore[unexpected-keyword]
             completed_jobs=self._completed_jobs,
