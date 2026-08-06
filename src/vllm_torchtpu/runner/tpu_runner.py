@@ -80,9 +80,9 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm import token_padding
-from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.layers.vllm.attention import (
+    TPU_STR_DTYPE_TO_TORCH_DTYPE, PallasAttentionBackend,
+    PallasBatchedRPAAttentionBackend, PallasMLAttentionBackend)
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
@@ -1191,10 +1191,13 @@ class TPUModelRunner(GPUModelRunner):
                         attn_module.head_size,
                         self.kv_cache_dtype,
                     )
+                    _page_size_backend = (PallasAttentionBackend
+                                          if attn_module.head_size == 64 else
+                                          PallasBatchedRPAAttentionBackend)
                     page_size_padded = (
-                        self._hybrid_uniform_page_size_bytes if
-                        self._hybrid_uniform_page_size_bytes is not None else
-                        PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        self._hybrid_uniform_page_size_bytes
+                        if self._hybrid_uniform_page_size_bytes is not None
+                        else _page_size_backend.get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
@@ -1561,9 +1564,11 @@ class TPUModelRunner(GPUModelRunner):
         attn_page_sizes = set()
         for m in layers.values():
             if isinstance(m, Attention):
+                backend_cls = (PallasAttentionBackend if m.head_size == 64 else
+                               PallasBatchedRPAAttentionBackend)
                 attn_page_sizes.add(
-                    PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                        block_size,
+                    backend_cls.get_kv_cache_page_size_bytes(
+                        self.block_size,
                         m.num_kv_heads,
                         m.head_size,
                         self.kv_cache_dtype,
@@ -1642,8 +1647,12 @@ class TPUModelRunner(GPUModelRunner):
         first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        attention_backend = (PallasMLAttentionBackend if isinstance(
-            first_attn_module, MLAAttention) else PallasAttentionBackend)
+        if isinstance(first_attn_module, MLAAttention):
+            attention_backend = PallasMLAttentionBackend
+        elif first_attn_module.head_size == 64:
+            attention_backend = PallasAttentionBackend
+        else:
+            attention_backend = PallasBatchedRPAAttentionBackend
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.block_size, num_kv_heads, first_attn_module.head_size,
             self.kv_cache_dtype)
@@ -5888,7 +5897,10 @@ class TPUModelRunner(GPUModelRunner):
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
                             f"tp_size {tp_size} under SPMD mode")
-                    kv_cache_shape = PallasAttentionBackend.get_kv_cache_shape(
+                    backend_cls = (PallasAttentionBackend
+                                   if kv_cache_spec.head_size == 64 else
+                                   PallasBatchedRPAAttentionBackend)
+                    kv_cache_shape = backend_cls.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,
@@ -5898,6 +5910,9 @@ class TPUModelRunner(GPUModelRunner):
                     dtype = kv_cache_spec.dtype
                     tpu_kv_cache = torch.zeros(kv_cache_shape,
                                                dtype=dtype).to(self.device)
+                    logger.info(
+                        f"{layer_name}: shape={tuple(tpu_kv_cache.shape)}, "
+                        f"dtype={tpu_kv_cache.dtype}, mesh={self.mesh}")
 
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
