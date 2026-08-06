@@ -1200,6 +1200,7 @@ class TPURaidenConnectorWorker:
         self._stage3_reported_sends: set[str] = set()
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
+        self._stage3_load_start_times: dict[str, float] = {}
         # Consumer-side facades for the producers' controllers, keyed by
         # controller address: the consumer coordinates each load with the
         # SOURCE controller directly (it plans, arms this worker, and
@@ -2224,10 +2225,13 @@ class TPURaidenConnectorWorker:
                 continue
             self._stage3_submitted_loads[destination_req_id] = uuid
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
+            self._stage3_load_start_times[
+                destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
             controller_contacted = False
             fa_accepted = False
+            submit_ms = None
             try:
                 src_units = self._stage3_source_work_units(req_meta)
                 src_controller_address = str(
@@ -2269,6 +2273,7 @@ class TPURaidenConnectorWorker:
                             transfer_tags.append(f"{tag}.g{ordinal}")
                             dst_blocks.append(int(slot))
                             dst_counts.append(1)
+                start_submit = time.perf_counter()
                 accepted = self._start_stage3_transfer_with_d5_retry(
                     source_facade,
                     src_units=src_units,
@@ -2288,6 +2293,7 @@ class TPURaidenConnectorWorker:
                     transfer_pool_tags=transfer_tags,
                     dst_block_counts=dst_counts,
                 )
+                submit_ms = (time.perf_counter() - start_submit) * 1000
                 if accepted is not True:
                     raise RuntimeError(
                         "source controller rejected Stage-3 transfer")
@@ -2333,6 +2339,7 @@ class TPURaidenConnectorWorker:
                         "recv_armed_before_push": True,
                         "state_group_count": self._stage3_state_group_count,
                         "destination_pages": len(local_blocks),
+                        "controller_submit_ms": submit_ms,
                     },
                     sort_keys=True,
                 ),
@@ -2564,6 +2571,10 @@ class TPURaidenConnectorWorker:
                 source_req_id = self._stage3_source_request_id(req_id)
                 if (req_id not in self._reported_recving and uuid is not None
                         and num_tokens is not None):
+                    start_time = self._stage3_load_start_times.get(req_id)
+                    latency_ms = None
+                    if start_time is not None:
+                        latency_ms = (time.perf_counter() - start_time) * 1000
                     logger.info(
                         "%s",
                         json.dumps(
@@ -2573,6 +2584,7 @@ class TPURaidenConnectorWorker:
                                 "destination_req_id": req_id,
                                 "uuid": uuid,
                                 "num_tokens": num_tokens,
+                                "reshard_e2e_latency_ms": latency_ms,
                             },
                             sort_keys=True,
                         ),
