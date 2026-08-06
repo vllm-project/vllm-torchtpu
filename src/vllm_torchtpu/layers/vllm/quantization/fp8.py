@@ -631,6 +631,13 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         self.weight_scale_name = ("weight_scale_inv"
                                   if self.block_quant else "weight_scale")
         self.fp8_backend = None
+        threshold = envs.TPU_MOE_INTERNAL_TWO_WAVE_MIN_LOCAL_TOKENS
+        parallel = moe_config.moe_parallel_config
+        self._use_internal_two_wave = (threshold > 0 and parallel.use_ep
+                                       and (parallel.dp_size > 1
+                                            or parallel.pcp_size > 1))
+        setattr(parallel, "_tpu_internal_pcp_collectives",
+                self._use_internal_two_wave and parallel.pcp_size > 1)
 
     def maybe_roundup_sizes(
         self,
@@ -723,6 +730,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
+    @property
+    def supports_internal_mk(self) -> bool:
+        return self.moe_kernel is not None or self._use_internal_two_wave
+
     def get_fused_moe_quant_config(self, layer):
         return None
 
@@ -811,6 +822,58 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
+        if not self._use_internal_two_wave:
+            return self._apply_monolithic_wave(layer, x, router_logits)
+
+        threshold = envs.TPU_MOE_INTERNAL_TWO_WAVE_MIN_LOCAL_TOKENS
+        if input_ids is not None:
+            raise NotImplementedError(
+                "internal DP/PCP MoE waves do not support input_ids")
+        from vllm.distributed import get_dp_group, get_pcp_group
+
+        dp_group = get_dp_group()
+        pcp_group = get_pcp_group()
+        tensors = ((x, router_logits, 0), )
+        if x.shape[0] >= max(threshold, 2):
+            x_waves = torch.tensor_split(x, 2, dim=0)
+            router_waves = torch.tensor_split(router_logits, 2, dim=0)
+            tensors = zip(
+                x_waves,
+                router_waves,
+                (0, x_waves[0].shape[0]),
+            )
+
+        outputs = []
+        for wave_x, wave_router_logits, local_token_offset in tensors:
+            if dp_group.world_size > 1:
+                wave_x = dp_group.all_gather(wave_x, dim=0)
+                wave_router_logits = dp_group.all_gather(wave_router_logits,
+                                                         dim=0)
+            if pcp_group.world_size > 1:
+                wave_x = pcp_group.all_gather(wave_x, dim=0)
+                wave_router_logits = pcp_group.all_gather(wave_router_logits,
+                                                          dim=0)
+            wave_output = self._apply_monolithic_wave(
+                layer,
+                wave_x,
+                wave_router_logits,
+                local_token_offset=local_token_offset,
+            )
+            if pcp_group.world_size > 1:
+                wave_output = pcp_group.reduce_scatter(wave_output, dim=0)
+            if dp_group.world_size > 1:
+                wave_output = dp_group.reduce_scatter(wave_output, dim=0)
+            outputs.append(wave_output)
+        return torch.cat(outputs, dim=0)
+
+    def _apply_monolithic_wave(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        local_token_offset: int = 0,
+    ) -> torch.Tensor:
+
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
         custom_routing_fn = layer.custom_routing_function
@@ -836,7 +899,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                topk_ids, topk_weights)
+                topk_ids, topk_weights, local_token_offset=local_token_offset)
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).

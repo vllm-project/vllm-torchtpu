@@ -168,9 +168,6 @@ def prepare_routed_gmm_inputs(
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
-    token_indices_flat = jnp.arange(num_tokens_local,
-                                    dtype=jnp.int32).repeat(topk)
-
     if skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them
@@ -182,7 +179,7 @@ def prepare_routed_gmm_inputs(
     sorted_indices = jnp.argsort(sort_keys)
     argsort_revert_indices = jnp.argsort(sorted_indices)
 
-    token_indices_sorted = token_indices_flat[sorted_indices]
+    token_indices_sorted = sorted_indices // topk
     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
     group_sizes_local = (jax.nn.one_hot(
         topk_indices_for_count, local_num_experts, dtype=jnp.int32) *

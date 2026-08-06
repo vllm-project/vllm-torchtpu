@@ -190,9 +190,9 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
     vLLM treats PCP+EP as an all-to-all-kernel configuration and therefore
     skips the explicit PCP all-gather/reduce-scatter in ``MoERunner``.  The
-    TorchTPU monolithic MoE kernels only compute local expert contributions;
-    they do not implement internal PCP dispatch/combine.  Do not let PCP by
-    itself select that internal-kernel contract until the backend supports it.
+    TorchTPU monolithic MoE kernels normally only compute local expert
+    contributions. Keep PCP collectives explicit unless the selected method
+    marks the parallel config as handling them internally.
     """
     from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
 
@@ -206,7 +206,8 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
     def use_all2all_kernels(self):
         if (self.use_ep and self.pcp_size > 1 and self.dp_size == 1
-                and not self.is_sequence_parallel):
+                and not self.is_sequence_parallel
+                and not getattr(self, "_tpu_internal_pcp_collectives", False)):
             return False
         return upstream_getter(self)
 

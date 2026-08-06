@@ -11,6 +11,7 @@ def test_local_suffix_update():
     assert mask.get_local_padding_mask(6).tolist() == [
         False, False, False, True, True, True
     ]
+    assert mask.get_local_padding_mask(2, offset=3).tolist() == [True, True]
     mask.update(2, 2)
     assert mask.get_local_padding_mask(8).sum().item() == 0
 
@@ -32,6 +33,8 @@ def test_zero_routing_weights_for_padding_zeroes_weights_keeps_ids(
         world_size = 1
 
     monkeypatch.setattr("vllm.distributed.parallel_state.get_dp_group",
+                        lambda: _FakeGroup())
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pcp_group",
                         lambda: _FakeGroup())
     try:
         provider.update(1, 4)
@@ -65,6 +68,8 @@ def test_zero_routing_weights_for_padding_dp_gather_rank_order(monkeypatch):
 
     monkeypatch.setattr("vllm.distributed.parallel_state.get_dp_group",
                         lambda: _FakeGroup())
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pcp_group",
+                        lambda: type("_FakePcpGroup", (), {"world_size": 1})())
     try:
         ids = torch.arange(8, dtype=torch.int32).reshape(4, 2)
         weights = torch.full((4, 2), 0.5)
@@ -75,5 +80,47 @@ def test_zero_routing_weights_for_padding_dp_gather_rank_order(monkeypatch):
         assert float(w2[1].abs().sum()) == 0.0
         assert float(w2[2].abs().sum()) == 0.0
         assert w2[3].tolist() == [0.5, 0.5]
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_zero_routing_weights_for_padding_dp_pcp_offset(monkeypatch):
+    provider = TokenPaddingState(
+        local_padding_mask=torch.tensor([False, False, False, True, True]))
+    token_padding.set_padding_state(provider)
+
+    class _FakeDpGroup:
+        world_size = 2
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            peer = torch.tensor([0, 1], dtype=t.dtype)
+            return torch.cat([t, peer], dim=dim)
+
+    class _FakePcpGroup:
+        world_size = 2
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            peer = torch.tensor([0, 0, 1, 0], dtype=t.dtype)
+            return torch.cat([t, peer], dim=dim)
+
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_dp_group",
+                        lambda: _FakeDpGroup())
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pcp_group",
+                        lambda: _FakePcpGroup())
+    try:
+        ids = torch.arange(16, dtype=torch.int32).reshape(8, 2)
+        weights = torch.full((8, 2), 0.5)
+        ids2, w2 = token_padding.zero_routing_weights_for_padding(
+            ids, weights, local_token_offset=3)
+
+        assert torch.equal(ids2, ids)
+        zero_rows = {0, 1, 3, 6}
+        for row in range(8):
+            if row in zero_rows:
+                assert float(w2[row].abs().sum()) == 0.0
+            else:
+                assert w2[row].tolist() == [0.5, 0.5]
     finally:
         token_padding.set_padding_state(None)

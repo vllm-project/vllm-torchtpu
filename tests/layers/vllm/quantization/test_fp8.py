@@ -534,6 +534,9 @@ class TestOnlineFp8Quantization:
         layer.custom_routing_function = mock_routing
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
+        method._use_internal_two_wave = False
+        method._apply_monolithic_wave = (
+            VllmFp8MoEMethodTPU._apply_monolithic_wave.__get__(method))
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
 
@@ -546,6 +549,123 @@ class TestOnlineFp8Quantization:
                                                  router_logits)
 
         mock_routing.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("threshold", "dp_size", "pcp_size", "use_ep", "expected"),
+    [
+        (4, 2, 1, True, True),
+        (4, 1, 2, True, True),
+        (4, 2, 2, True, True),
+        (4, 1, 1, True, False),
+        (4, 2, 1, False, False),
+        (0, 2, 2, True, False),
+    ],
+)
+def test_internal_two_wave_selection(monkeypatch, threshold, dp_size, pcp_size,
+                                     use_ep, expected):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.vllm.quantization.fp8 import \
+        VllmFp8MoEMethodTPU
+
+    monkeypatch.setattr(envs, "TPU_MOE_INTERNAL_TWO_WAVE_MIN_LOCAL_TOKENS",
+                        threshold)
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    parallel = SimpleNamespace(dp_size=dp_size,
+                               pcp_size=pcp_size,
+                               use_ep=use_ep)
+    moe_config = SimpleNamespace(moe_parallel_config=parallel)
+
+    method = VllmFp8MoEMethodTPU(FakeQuant(), moe_config)
+
+    assert method._use_internal_two_wave is expected
+    assert method.supports_internal_mk is expected
+    assert parallel._tpu_internal_pcp_collectives is (expected
+                                                      and pcp_size > 1)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_local_waves", "expected_offsets"),
+    [
+        (3, [[0, 1, 2]], [0]),
+        (5, [[0, 1, 2], [3, 4]], [0, 3]),
+    ],
+)
+@pytest.mark.parametrize(("dp_size", "pcp_size"), [(2, 1), (1, 2), (2, 2)])
+def test_internal_two_wave_dispatches_rank_balanced(monkeypatch, num_tokens,
+                                                    expected_local_waves,
+                                                    expected_offsets, dp_size,
+                                                    pcp_size):
+    from types import SimpleNamespace
+
+    import vllm.distributed as vllm_dist
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.vllm.quantization.fp8 import \
+        VllmFp8MoEMethodTPU
+
+    monkeypatch.setattr(envs, "TPU_MOE_INTERNAL_TWO_WAVE_MIN_LOCAL_TOKENS", 4)
+
+    class FakeDpGroup:
+
+        def __init__(self):
+            self.world_size = dp_size
+
+        def all_gather(self, tensor, dim=0):
+            if self.world_size == 1:
+                return tensor
+            return torch.cat((tensor, tensor + 10), dim=dim)
+
+        def reduce_scatter(self, tensor, dim=0):
+            if self.world_size == 1:
+                return tensor
+            return tensor[:tensor.shape[dim] // 2]
+
+    class FakePcpGroup:
+
+        def __init__(self):
+            self.world_size = pcp_size
+
+        def all_gather(self, tensor, dim=0):
+            if self.world_size == 1:
+                return tensor
+            return torch.cat((tensor, tensor + 100), dim=dim)
+
+        def reduce_scatter(self, tensor, dim=0):
+            if self.world_size == 1:
+                return tensor
+            return tensor[:tensor.shape[dim] // 2]
+
+    monkeypatch.setattr(vllm_dist, "get_dp_group", lambda: FakeDpGroup())
+    monkeypatch.setattr(vllm_dist, "get_pcp_group", lambda: FakePcpGroup())
+
+    method = SimpleNamespace(_use_internal_two_wave=True)
+    dispatched_waves = []
+    offsets = []
+
+    def apply_wave(_layer, x, *_args, **kwargs):
+        dispatched_waves.append(x[:, 0].tolist())
+        offsets.append(kwargs["local_token_offset"])
+        return x + 1000
+
+    method._apply_monolithic_wave = apply_wave
+    x = torch.arange(num_tokens, dtype=torch.float32).reshape(-1, 1)
+    output = VllmFp8MoEMethodTPU.apply_monolithic(method, object(), x, x)
+
+    expected_dispatches = []
+    for local_wave in expected_local_waves:
+        dp_wave = local_wave
+        if dp_size > 1:
+            dp_wave = dp_wave + [token + 10 for token in dp_wave]
+        if pcp_size > 1:
+            dp_wave = dp_wave + [token + 100 for token in dp_wave]
+        expected_dispatches.append(dp_wave)
+
+    assert dispatched_waves == expected_dispatches
+    assert offsets == expected_offsets
+    torch.testing.assert_close(output, x + 1000)
 
 
 if __name__ == "__main__":

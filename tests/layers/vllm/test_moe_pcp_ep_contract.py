@@ -154,7 +154,10 @@ def test_tpu_pcp_patch_preserves_non_pcp_all2all_triggers():
 
     _patch_moe_explicit_pcp_collectives()
 
-    assert not _make_parallel_config().use_all2all_kernels
+    pcp_config = _make_parallel_config()
+    assert not pcp_config.use_all2all_kernels
+    setattr(pcp_config, "_tpu_internal_pcp_collectives", True)
+    assert pcp_config.use_all2all_kernels
     assert _make_parallel_config(pcp_size=1, dp_size=2).use_all2all_kernels
     assert _make_parallel_config(pcp_size=1, sp_size=2).use_all2all_kernels
 

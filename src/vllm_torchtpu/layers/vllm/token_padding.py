@@ -39,8 +39,10 @@ class TokenPaddingState:
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
 
-    def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
-        return self.local_padding_mask[:num_tokens]
+    def get_local_padding_mask(self,
+                               num_tokens: int,
+                               offset: int = 0) -> torch.Tensor:
+        return self.local_padding_mask[offset:offset + num_tokens]
 
 
 def set_padding_state(state: "TokenPaddingState | None") -> None:
@@ -50,7 +52,8 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
 
 def zero_routing_weights_for_padding(
         topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_weights: torch.Tensor,
+        local_token_offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     """Set routing weights to 0 for padded tokens.
 
     A padded token keeps its selected expert ids but gets zero gate
@@ -59,18 +62,18 @@ def zero_routing_weights_for_padding(
     if _padding_state is None:
         return topk_ids, topk_weights
     num_tokens = topk_ids.shape[0]
-    from vllm.distributed.parallel_state import get_dp_group
+    from vllm.distributed.parallel_state import get_dp_group, get_pcp_group
     dp_group = get_dp_group()
-    dp_size = dp_group.world_size
-    if dp_size > 1:
-        local_padding = _padding_state.get_local_padding_mask(num_tokens //
-                                                              dp_size)
-        # TPU collectives may not support bool, so encode the mask as int8.
-        gathered_padding = dp_group.all_gather(local_padding.to(torch.int8),
-                                               dim=0)
-        is_padding = gathered_padding.ne(0)
-    else:
-        is_padding = _padding_state.get_local_padding_mask(num_tokens)
+    pcp_group = get_pcp_group()
+    local_tokens = num_tokens // (dp_group.world_size * pcp_group.world_size)
+    is_padding = _padding_state.get_local_padding_mask(
+        local_tokens, local_token_offset).to(torch.int8)
+    # Match hidden-state dispatch order. TPU collectives may not support bool.
+    if dp_group.world_size > 1:
+        is_padding = dp_group.all_gather(is_padding, dim=0)
+    if pcp_group.world_size > 1:
+        is_padding = pcp_group.all_gather(is_padding, dim=0)
+    is_padding = is_padding.ne(0)
     topk_weights = torch.where(is_padding[:, None],
                                torch.zeros_like(topk_weights), topk_weights)
     return topk_ids, topk_weights
