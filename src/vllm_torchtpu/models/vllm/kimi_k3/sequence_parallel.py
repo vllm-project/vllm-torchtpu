@@ -17,13 +17,12 @@ def is_kimi_sequence_parallel(parallel_config: ParallelConfig) -> bool:
     """Whether Kimi should shard tokens between attention and its FFN.
 
     Pipeline parallelism is deliberately excluded because vLLM's pipeline
-    boundary tensors are not sequence sharded. TPU currently has no MegaMoE
-    path, so DP>1 is the configuration in which EP needs this optimization.
+    boundary tensors are not sequence sharded. Under TEP, TP and EP share the
+    same ranks, so this also applies to the TP8 x EP8 x DP1 decode topology.
     """
     return (parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and parallel_config.data_parallel_size > 1)
+            and parallel_config.tensor_parallel_size > 1)
 
 
 def shard(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -38,6 +37,25 @@ def shard(hidden_states: torch.Tensor) -> torch.Tensor:
     # it; this also retains the op's compile-safe symbolic output shape.
     assert hidden_states.ndim == 3 and hidden_states.shape[1] == 1
     return sequence_parallel_chunk(hidden_states.squeeze(1)).unsqueeze(1)
+
+
+def padding_mask(
+    is_padding: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Return the global mask consumed after MoE gathers the SP shards."""
+    num_tokens = hidden_states.shape[0]
+    if is_padding is None:
+        # Keep the symbolic token dimension tensor-derived. TorchTPU's FX
+        # exporter cannot materialize ``new_zeros(SymInt)`` during AOT export.
+        is_padding = torch.zeros_like(hidden_states[:, 0], dtype=torch.bool)
+    assert is_padding.shape[0] == num_tokens
+
+    tp_size = get_tensor_model_parallel_world_size()
+    sp_pad = (-num_tokens) % tp_size
+    if sp_pad > 0:
+        is_padding = F.pad(is_padding, (0, sp_pad), value=True)
+    return is_padding
 
 
 def all_gather(hidden_states: torch.Tensor) -> torch.Tensor:

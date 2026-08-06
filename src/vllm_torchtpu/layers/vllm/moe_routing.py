@@ -14,6 +14,9 @@
 """Routing helpers for TPU local MoE kernels."""
 
 import torch
+from vllm import envs as vllm_envs
+from vllm.forward_context import (get_forward_context,
+                                  is_forward_context_available)
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
@@ -65,6 +68,18 @@ def _apply_scoring_fn(scoring_fn: str,
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
 
 
+def _skip_padding_routes(topk_ids: torch.Tensor) -> torch.Tensor:
+    """Mark padded token routes with vLLM's ``-1`` skip sentinel."""
+    if (not vllm_envs.VLLM_MOE_SKIP_PADDING
+            or not is_forward_context_available()):
+        return topk_ids
+    is_padding = get_forward_context().is_padding
+    if is_padding is None:
+        return topk_ids
+    num_tokens = topk_ids.shape[0]
+    return torch.where(is_padding[:num_tokens].unsqueeze(1), -1, topk_ids)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -91,7 +106,8 @@ def select_experts(
             routed_scaling_factor=layer.routed_scaling_factor,
             e_score_correction_bias=layer.e_score_correction_bias,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        topk_ids = _skip_padding_routes(topk_ids.to(torch.int32))
+        return topk_weights.to(hidden_states.dtype), topk_ids
 
     topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
         scoring_fn, router_logits),
@@ -99,7 +115,8 @@ def select_experts(
                                         dim=-1)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    topk_ids = _skip_padding_routes(topk_ids.to(torch.int32))
+    return topk_weights.to(hidden_states.dtype), topk_ids
 
 
 def get_experts_start(layer) -> int | None:

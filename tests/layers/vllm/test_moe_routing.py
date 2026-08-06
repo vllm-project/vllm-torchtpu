@@ -16,8 +16,28 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_torchtpu.layers.vllm import moe_routing
+
+
+def test_skip_padding_routes_marks_ids_with_minus_one(monkeypatch):
+    context = SimpleNamespace(
+        is_padding=torch.tensor([False, True, False, True]))
+    monkeypatch.setattr(moe_routing.vllm_envs, "VLLM_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(moe_routing, "is_forward_context_available",
+                        lambda: True)
+    monkeypatch.setattr(moe_routing, "get_forward_context", lambda: context)
+    topk_ids = torch.arange(12, dtype=torch.int32).reshape(4, 3)
+
+    result = moe_routing._skip_padding_routes(topk_ids)
+
+    torch.testing.assert_close(result[0], topk_ids[0])
+    torch.testing.assert_close(result[1], torch.full((3, ), -1,
+                                                     dtype=torch.int32))
+    torch.testing.assert_close(result[2], topk_ids[2])
+    torch.testing.assert_close(result[3], torch.full((3, ), -1,
+                                                     dtype=torch.int32))
 
 
 def _make_layer(*, use_ep, ep_size=1, ep_rank=0, global_num_experts=0):

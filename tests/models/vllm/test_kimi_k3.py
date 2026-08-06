@@ -486,7 +486,7 @@ def test_latent_moe_enables_fused_moe_sequence_parallel(
         }, False),
         ({
             "data_parallel_size": 1
-        }, False),
+        }, True),
     ],
 )
 def test_kimi_sequence_parallel_activation(overrides, expected) -> None:
@@ -530,6 +530,45 @@ def test_sequence_parallel_helpers_pad_shard_and_gather(
     assert scattered.shape == (3, 2)
     assert calls == [("gather", torch.Size([2, 2]), 0),
                      ("scatter", torch.Size([6, 2]), 0)]
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "is_padding", "expected"),
+    [
+        (1, None, [False, True, True, True]),
+        (5, None, [False, False, False, False, False, True, True, True]),
+        (5, [False, True, False, False, False],
+         [False, True, False, False, False, True, True, True]),
+    ],
+)
+def test_sequence_parallel_padding_mask_marks_added_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    is_padding: list[bool] | None,
+    expected: list[bool],
+) -> None:
+    monkeypatch.setattr(kimi_sp, "get_tensor_model_parallel_world_size",
+                        lambda: 4)
+    hidden_states = torch.randn(num_tokens, 8)
+    existing = None if is_padding is None else torch.tensor(is_padding)
+
+    result = kimi_sp.padding_mask(existing, hidden_states)
+
+    torch.testing.assert_close(result, torch.tensor(expected))
+
+
+def test_tep8_padding_mask_reduces_decode_routes_from_128_to_16(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kimi_sp, "get_tensor_model_parallel_world_size",
+                        lambda: 8)
+    hidden_states = torch.randn(1, 8)
+    is_padding = kimi_sp.padding_mask(None, hidden_states)
+    topk_ids = torch.zeros((8, 16), dtype=torch.int32)
+    routed_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+    active_routes = int((routed_ids >= 0).sum())
+
+    assert 8 * 16 == 128
+    assert active_routes == 16
 
 
 def test_sequence_parallel_shard_pads_kimi_k3_token_axis(
@@ -602,6 +641,45 @@ def test_kimi_attention_residual_buffer_uses_sharded_token_count(
                                inputs_embeds=values)
 
     assert result.shape == (2, 8)
+
+
+def test_kimi_sequence_parallel_propagates_padding_mask_to_fused_moe(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class IdentityLayer(nn.Module):
+
+        def forward(self, positions, hidden_states, block_residuals):
+            return hidden_states, block_residuals
+
+    model = KimiModel.__new__(KimiModel)
+    nn.Module.__init__(model)
+    model.attn_res_block_size = None
+    model.use_sequence_parallel = True
+    model.layers = nn.ModuleList([IdentityLayer()])
+    model.norm = nn.Identity()
+    existing_mask = torch.tensor([False, True, False])
+    context = SimpleNamespace(is_padding=existing_mask)
+    global_mask = torch.tensor([False, True, True, True])
+    calls = []
+    monkeypatch.setattr(kimi_model.envs, "VLLM_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(kimi_model, "is_forward_context_available",
+                        lambda: True)
+    monkeypatch.setattr(kimi_model, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        kimi_model,
+        "sp_padding_mask",
+        lambda mask, values: calls.append((mask, values.shape)) or global_mask,
+    )
+    monkeypatch.setattr(kimi_model, "sp_shard", lambda values: values[:2])
+    monkeypatch.setattr(kimi_model, "sp_all_gather", lambda values: values)
+    values = torch.randn(3, 8)
+
+    KimiModel.forward(model, None, torch.arange(3), inputs_embeds=values)
+
+    assert len(calls) == 1
+    assert calls[0][0] is existing_mask
+    assert calls[0][1] == torch.Size([3, 8])
+    assert context.is_padding is global_mask
 
 
 def test_decoder_sequence_parallel_collective_order(

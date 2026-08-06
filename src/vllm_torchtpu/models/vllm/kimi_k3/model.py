@@ -8,8 +8,11 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.forward_context import (get_forward_context,
+                                  is_forward_context_available)
 from vllm.model_executor.layers.fused_moe import \
     fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -29,6 +32,7 @@ from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
 from .sequence_parallel import all_gather as sp_all_gather
 from .sequence_parallel import is_kimi_sequence_parallel
+from .sequence_parallel import padding_mask as sp_padding_mask
 from .sequence_parallel import reduce_scatter as sp_reduce_scatter
 from .sequence_parallel import shard as sp_shard
 
@@ -203,6 +207,10 @@ class KimiModel(nn.Module):
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding, hidden_states)
             hidden_states = sp_shard(hidden_states)
         # Build the empty residual stack as a view. TorchTPU cannot export a
         # new_empty whose token dimension is the symbolic result of the SP
