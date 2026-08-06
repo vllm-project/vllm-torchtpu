@@ -450,3 +450,29 @@ class TestPhasedProfilingConfigValidation:
         monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
 
         _validate_phased_profiling_config(self._config())
+
+
+def test_config_hook_registers_tpu_kv_connectors_by_name():
+    """Verify TPU KV connectors are registered in the factory by name idempotently.
+
+    When loaded dynamically via module paths, connectors are not registered by name
+    in KVConnectorFactory. However, the API server's multi-connector metrics path resolves
+    child connectors via get_connector_class_by_name().
+
+    This test verifies that _register_tpu_kv_connectors() populates the name registry
+    safely across repeated invocations without raising duplicate-registration errors.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    from vllm_torchtpu.platforms.tpu_platform import \
+        _register_tpu_kv_connectors
+
+    _register_tpu_kv_connectors()
+    _register_tpu_kv_connectors(
+    )  # Idempotent: repeated registrations must succeed.
+
+    for name in ("TPURaidenConnector", "TPUMultiConnector",
+                 "TPURaidenOffloadingConnector"):
+        cls = KVConnectorFactory.get_connector_class_by_name(name)
+        assert cls.__name__ == name

@@ -185,6 +185,38 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
             "--profiler-config.torch_profiler_dir=<dir>.")
 
 
+def _register_tpu_kv_connectors() -> None:
+    """Register TPU-specific KV connectors in vLLM's factory name registry.
+
+    Ensures connectors loaded dynamically via module paths (e.g., TPURaidenConnector,
+    TPUMultiConnector, TPURaidenOffloadingConnector) are discoverable by name.
+
+    Required for the API server metrics pipeline: TPUMultiConnector aggregates child
+    connector statistics by looking up classes via get_connector_class_by_name().
+    Without registry registration, the first metrics collection triggers an unhandled
+    exception in the AsyncLLM output handler, causing HTTP 500 errors on subsequent requests.
+
+    Invoked from check_and_update_config() in every process that builds a VllmConfig
+    (including the API server). Defers imports lazily until connector names are accessed.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    for name, module_path in (
+        ("TPURaidenConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
+        ("TPUMultiConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"),
+        ("TPURaidenOffloadingConnector",
+         "vllm_torchtpu.offload.raiden_connector"),
+    ):
+        try:
+            KVConnectorFactory.register_connector(name, module_path, name)
+        except ValueError:
+            # Idempotent: ignore if already registered on repeated config updates.
+            pass
+
+
 def apply_tpu_patches() -> None:
     """Apply all module-level patches required for TorchTPU.
 
@@ -634,6 +666,7 @@ class TpuPlatform(Platform):
         _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
+        _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -855,6 +888,7 @@ class TpuPlatform(Platform):
                 "TPUMultiConnector",
                 "TPUConnectorHMA",
                 "OffloadingConnector",
+                "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
                 _TPU_SUPPORTED_KV_CONNECTORS, (
@@ -867,15 +901,17 @@ class TpuPlatform(Platform):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    == "OffloadingConnector" and is_hybrid)
+                                    in ("OffloadingConnector",
+                                        "TPURaidenOffloadingConnector")
+                                    and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):
-                # Hybrid CPU offloading transfers whole pool rows; the
-                # typed-view layout has no uniform per-block row to copy.
+                # Hybrid model offloading transfers uniform pool rows; the non-unified
+                # typed-view layout lacks a common per-block stride for DMA copies.
                 raise ValueError(
-                    "CPU offloading (OffloadingConnector) on hybrid "
-                    "attention+Mamba models requires the unified block "
-                    "pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+                    f"CPU offloading ({kv_transfer_config.kv_connector}) "
+                    "on hybrid attention+Mamba models requires the unified "
+                    "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
