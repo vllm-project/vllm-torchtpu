@@ -27,6 +27,7 @@ def compute_batched_seq_metadata(
     state_indices: jax.Array,
     read_offsets: jax.Array,
     end_seq: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -59,6 +60,7 @@ def compute_batched_seq_metadata(
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
+        s_idx_to_ckpt_indices=ckpt_indices,
     )
 
 
@@ -67,14 +69,23 @@ def compute_per_seq_metadata(
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
     state_indices: jax.Array,
+    read_offsets: jax.Array,
     start_seq: jax.Array,
     end_seq: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
     The tiling itself lives in `kernels/varlen_tiles.py` so the Kimi KDA kernels
     can share it; this wraps it in GDN's SMEM-resident MetadataRef and adds the
     per-sequence state addressing, which is GDN's own.
+
+    `read_offsets` selects the checkpoint a resuming sequence's initial state
+    is read from. It is 0 in the common cases (a fresh or chunked prefill
+    resumes from the single state its previous chunk wrote), but a
+    prefix-cache resume on the unified pool may land on a boundary state
+    block whose committed state is a non-zero checkpoint from a verify step.
+    The final state is always written to checkpoint 0.
     """
     plan = varlen_tiles.plan_per_seq_tiles(
         seq_lens,
@@ -88,6 +99,11 @@ def compute_per_seq_metadata(
     # Rotated the same way the plan rotates what it reads, so the per-sequence
     # payloads stay aligned with `p_id_to_s_idx`.
     state_indices = varlen_tiles.roll_to_start_seq(state_indices, start_seq)
+    read_offsets = varlen_tiles.roll_to_start_seq(read_offsets, start_seq)
+    if ckpt_indices is not None:
+        # Sequence-major axis only: the checkpoint axis must stay put or the
+        # read offset would select another slot's block.
+        ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
 
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
@@ -99,6 +115,6 @@ def compute_per_seq_metadata(
         p_id_is_last_tile=plan.p_id_is_last_tile,
         s_idx_has_initial_state=plan.s_idx_has_initial_state,
         s_idx_to_state_indices=state_indices,
-        # Prefill/mixed sequences always resume from the group's base slot.
-        s_idx_to_read_offset=jnp.zeros_like(state_indices),
+        s_idx_to_read_offset=read_offsets,
+        s_idx_to_ckpt_indices=ckpt_indices,
     )

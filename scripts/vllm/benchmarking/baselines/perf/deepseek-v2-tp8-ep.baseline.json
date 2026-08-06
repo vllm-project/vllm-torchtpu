@@ -1,0 +1,10 @@
+{
+  "isl1024_osl1024_c64": {
+    "completed": 320,
+    "median_tpot_ms": 35.30563842836909,
+    "median_ttft_ms": 213.32872653147206,
+    "num_prompts": 320,
+    "output_token_throughput": 1618.7356346309052,
+    "total_token_throughput": 3231.2983087408493
+  }
+}

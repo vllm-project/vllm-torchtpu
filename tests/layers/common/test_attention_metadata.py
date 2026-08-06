@@ -138,7 +138,6 @@ class TestAttentionMetadataBuilderPlumbing:
     def test_build_mamba_state_indices_from_current_block_table_entry(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_kv_layout = True
-        runner._mamba_align_mode = True
         builder = self._make_mamba_builder(runner)
 
         seq_lens = torch.tensor([1, 16, 17, 64], dtype=torch.int32)
@@ -165,10 +164,173 @@ class TestAttentionMetadataBuilderPlumbing:
                                 dtype=torch.int32)
         assert torch.equal(meta.mamba_state_indices, expected)
 
+    def test_ckpt_window_names_the_blocks_after_the_state_block(self):
+        """Checkpoint t is the row entry `state_block_offset + t`.
+
+        The manager allocates the `window - 1` speculative blocks by
+        inflating the request's token count, so they sit immediately after
+        the positional state block; checkpoint 0 must stay the state block
+        itself, keeping `mamba_state_indices` its column 0.
+        """
+        window = 3
+        runner = self._make_runner_mock(max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        builder = self._make_mamba_builder(runner)
+
+        seq_lens = torch.tensor([1, 17, 33, 33], dtype=torch.int32)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            mamba_ckpt_window=window,
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        block_tables = (
+            runner.input_batch.block_table[0].get_cpu_tensor.return_value)
+        # (seq_len - 1) // 16 for a 16-token block: 0, 1, 2, 2.
+        base_cols = [0, 1, 2, 2]
+        assert meta.mamba_ckpt_indices is not None
+        assert meta.mamba_ckpt_indices.shape == (4, window)
+        for row, col0 in enumerate(base_cols):
+            for t in range(window):
+                assert (meta.mamba_ckpt_indices[row,
+                                                t] == block_tables[row, col0 +
+                                                                   t]), (row,
+                                                                         t)
+        # Checkpoint 0 is the state block the affine path also uses.
+        assert torch.equal(meta.mamba_ckpt_indices[:, 0],
+                           meta.mamba_state_indices)
+
+    def test_no_ckpt_indices_without_a_window(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        builder = self._make_mamba_builder(runner)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 16], dtype=torch.int32),
+            query_start_loc=torch.arange(3, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(2))
+        assert meta.mamba_ckpt_indices is None
+
+    def test_most_model_len_row_covers_the_checkpoint_blocks(self):
+        """The `most_model_len` row must include the speculative blocks.
+
+        `MambaSpec.max_num_blocks_per_req` is
+        `cdiv(max_model_len, B) + num_speculative_blocks`, which the
+        `use_max_model_len` branch picks up for free. Deriving the shorter
+        row from `most_model_len` alone stops before the checkpoint group,
+        and the in-row mask then silently redirects checkpoints to the null
+        block -- rollback accuracy lost with no error.
+        """
+        window = 3
+        runner = self._make_runner_mock(most_model_len=32,
+                                        max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        builder = self._make_mamba_builder(runner)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=False,
+            seq_lens=torch.full((4, ), 17, dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            mamba_ckpt_window=window,
+        )
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        # cdiv(32, 16) = 2 positional columns + (window - 1) checkpoints.
+        assert meta.block_tables.numel() == 4 * 4
+        block_tables = (
+            runner.input_batch.block_table[0].get_cpu_tensor.return_value)
+        # (17 - 1) // 16 = column 1, so checkpoints are columns 1, 2, 3.
+        for row in range(4):
+            for t in range(window):
+                assert (meta.mamba_ckpt_indices[row, t] == block_tables[row,
+                                                                        1 + t])
+        # Nothing was masked onto the null block.
+        assert int(meta.mamba_ckpt_indices.min()) > 0
+
+    def test_most_model_len_row_unchanged_without_a_window(self):
+        # No speculative blocks are allocated without spec decode, so the
+        # row stays exactly cdiv(most_model_len, block_size) wide.
+        runner = self._make_runner_mock(most_model_len=32,
+                                        max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        builder = self._make_mamba_builder(runner)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=False,
+            seq_lens=torch.full((4, ), 17, dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+        )
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+        assert meta.block_tables.numel() == 4 * 2
+
+    def test_unified_spec_stashes_state_indices_for_offset_scatter(self):
+        # With spec decoding the runner seeds unified_mamba_state_indices
+        # with an empty list; each mamba group's builder appends the state
+        # blocks it derived so the post-sampling read-offset scatter can
+        # address them.
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        builder = self._make_mamba_builder(runner)
+
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 16, 17, 64], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            unified_mamba_state_indices=[],
+        )
+        runner._attn_metadata_builder_ctx = ctx
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert len(ctx.unified_mamba_state_indices) == 1
+        assert ctx.unified_mamba_state_indices[0] is meta.mamba_state_indices
+
+    def test_unified_without_spec_does_not_stash_state_indices(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        builder = self._make_mamba_builder(runner)
+
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 16, 17, 64], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+
+        builder.build(common_prefix_len=0,
+                      common_attn_metadata=self._make_cm(4))
+
+        assert ctx.unified_mamba_state_indices is None
+
     def test_unified_none_mode_derives_state_indices_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_kv_layout = True
-        runner._mamba_align_mode = False
         builder = self._make_mamba_builder(runner)
 
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(

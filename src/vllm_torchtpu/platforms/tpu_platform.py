@@ -762,8 +762,7 @@ class TpuPlatform(Platform):
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # align-mode mamba state seeding (MambaApcStateCopier on the
-        # typed-view layout, or the pool's seed copies); other cache modes
+        # the pool's align-mode mamba state seed copies; other cache modes
         # and speculative decoding must be rejected up front instead of
         # failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
@@ -776,6 +775,14 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
+            if not unified_kv_layout_enabled(vllm_config):
+                # Seed copies live on the pooled path only, so the per-layer
+                # layout restores no Mamba state on a prefix-cache hit and
+                # would silently generate from an unrelated slot.
+                raise NotImplementedError(
+                    "Prefix caching on hybrid Mamba models requires the "
+                    "unified KV pool; remove "
+                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.")
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = \
@@ -896,7 +903,7 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             if (kv_transfer_config.kv_connector == "TPUConnectorV2"
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                    and not unified_kv_layout_enabled(vllm_config)):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
@@ -904,7 +911,7 @@ class TpuPlatform(Platform):
                                         "TPURaidenOffloadingConnector")
                                     and is_hybrid)
             if (is_hybrid_offloading
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                    and not unified_kv_layout_enabled(vllm_config)):
                 # Hybrid CPU offloading transfers whole pool rows; the
                 # typed-view layout has no uniform per-block row to copy.
                 raise ValueError(

@@ -24,8 +24,8 @@ steps:
       ZONE: "${ZONE:-us-central1-c}"
       PROJECT_NAME: "${PROJECT_NAME:-cloud-ullm-inference-ci-cd}"
       K8S_NAMESPACE: "${K8S_NAMESPACE:-vllm-torchtpu-disagg}"
-      # Optional override for parse_gke_results.py's default table. Must be a
-      # backtick-quoted fully-qualified name: `project.dataset.table`.
+      # Optional override for the default BigQuery table, as a
+      # fully-qualified name: project.dataset.table (backticks optional).
       BQ_TABLE: "${BQ_TABLE:-}"
       REPOSITORY: "vllm-torchtpu"
       RUN_TYPE: "GKE_DISAGG"

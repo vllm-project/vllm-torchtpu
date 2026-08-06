@@ -115,8 +115,8 @@ def run_jax_gdn_attention(
         P(None),  # seq_lens
     )
     if slot_read_offsets is not None:
-        # Per-slot buffer, replicated like the other per-sequence inputs
-        # (query_start_loc / state_indices / seq_lens).
+        # Per-sequence read offsets (see below), replicated like the other
+        # per-sequence inputs (query_start_loc / state_indices / seq_lens).
         in_specs = in_specs + (P(None), )
 
     out_specs = (
@@ -147,7 +147,20 @@ def run_jax_gdn_attention(
         check_vma=False,
     )
 
-    extra_args = (() if slot_read_offsets is None else (slot_read_offsets, ))
+    # `slot_read_offsets` is the per-slot offset buffer (shape (num_blocks,)):
+    # `slot_read_offsets[base_slot]` holds `num_accepted - 1` for the request
+    # whose checkpoint group starts at `base_slot`. Index it by `state_indices`
+    # (each sequence's base slot) to get the per-sequence read offsets the
+    # kernel expects (shape (num_seqs,)); it then reads each request's initial
+    # state from `state_indices[s] + read_offsets[s]`. Both operands are
+    # replicated, so gather here, outside the shard_map. (This indexing was
+    # dropped when #115 inlined run_jax_gdn_attention_local into the shard_map
+    # body, leaving the full buffer to reach the kernel and trip its
+    # `read_offsets.shape == (num_seqs,)` assertion.)
+    if slot_read_offsets is not None:
+        extra_args = (slot_read_offsets[state_indices], )
+    else:
+        extra_args = ()
     (new_conv_state, new_recurrent_state), output = mapped_fn(
         j_mixed_qkv,
         j_b,
@@ -746,12 +759,16 @@ def run_jax_gdn_attention_pooled_local(
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
+    read_offsets: Optional[jnp.ndarray] = None,
+    ckpt_indices: Optional[jnp.ndarray] = None,
+    *,
     n_kq: int,
     n_v: int,
     d_k: int,
     d_v: int,
     kernel_size: int,
     pool_block_tokens: int,
+    num_spec_tokens: int = 0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -796,6 +813,8 @@ def run_jax_gdn_attention_pooled_local(
         state_indices,
         distribution,
         seq_lens,
+        read_offsets,
+        ckpt_indices,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -803,6 +822,7 @@ def run_jax_gdn_attention_pooled_local(
         kernel_size=kernel_size,
         state_source=recurrent_state,
         state_plan=plan,
+        num_spec_tokens=num_spec_tokens,
     )
     return recurrent_state, output
 
@@ -820,6 +840,9 @@ def run_jax_gdn_attention_pooled(
     query_start_loc: jnp.ndarray,
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
+    slot_read_offsets: Optional[jnp.ndarray] = None,
+    ckpt_indices: Optional[jnp.ndarray] = None,
+    *,
     n_kq: int,
     n_v: int,
     d_k: int,
@@ -827,6 +850,7 @@ def run_jax_gdn_attention_pooled(
     kernel_size: int,
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
+    num_spec_tokens: int = 0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -880,6 +904,17 @@ def run_jax_gdn_attention_pooled(
         P(None),  # distribution
         P(None),  # seq_lens
     )
+    if slot_read_offsets is not None:
+        # Per-sequence read offsets (see below), replicated like the other
+        # per-sequence inputs.
+        in_specs = in_specs + (P(None), )
+    if ckpt_indices is not None:
+        # `(num_seqs, num_spec_tokens + 1)` block id per checkpoint,
+        # replicated like the other per-sequence inputs.
+        assert slot_read_offsets is not None, (
+            "ckpt_indices selects a checkpoint per sequence, which needs "
+            "slot_read_offsets to say which one")
+        in_specs = in_specs + (P(None, None), )
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
@@ -896,6 +931,7 @@ def run_jax_gdn_attention_pooled(
         d_v=d_v,
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
+        num_spec_tokens=num_spec_tokens,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
@@ -905,6 +941,22 @@ def run_jax_gdn_attention_pooled(
         check_vma=False,
     )
 
+    # `slot_read_offsets` is the per-slot offset buffer indexed by manager
+    # block id: `slot_read_offsets[block]` holds `num_accepted - 1` for the
+    # request whose state block is `block`. Index it by `state_indices`
+    # (each sequence's state block) to get the per-sequence read offsets
+    # the kernel expects (shape (num_seqs,)); it then reads each request's
+    # initial state from checkpoint `read_offsets[s]` of block
+    # `state_indices[s]`. Both operands are replicated, so gather here,
+    # outside the shard_map (mirrors run_jax_gdn_attention).
+    if slot_read_offsets is not None:
+        extra_args = (slot_read_offsets[state_indices], )
+    else:
+        extra_args = ()
+    if ckpt_indices is not None:
+        # Already per-sequence (row s names sequence s's checkpoint blocks),
+        # so it needs no gather by state_indices.
+        extra_args = extra_args + (ckpt_indices, )
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,
@@ -918,6 +970,7 @@ def run_jax_gdn_attention_pooled(
         state_indices,
         distribution,
         seq_lens,
+        *extra_args,
     )
 
     return outputs

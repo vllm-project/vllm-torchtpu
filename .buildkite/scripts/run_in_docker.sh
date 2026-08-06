@@ -78,8 +78,10 @@ if [ -n "${BUILDKITE_OIDC_TOKEN_PATH:-}" ]; then
   TEST_SUITE_VARS+=(-v "$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}"):$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}")")
 fi
 
-# Spanner eval upload tracking & metadata variables (from PR #14)
+# Spanner/BigQuery eval upload tracking & metadata variables (from PR #14)
 SPANNER_EVAL_VARS=(
+  -e BQ_PROJECT_ID="${BQ_PROJECT_ID:-}"
+  -e BQ_TABLE="${BQ_TABLE:-}"
   -e CREATED_BY="${CREATED_BY:-}"
   -e GCP_INSTANCE_NAME="${GCP_INSTANCE_NAME:-}"
   -e NIGHTLY="${NIGHTLY:-}"

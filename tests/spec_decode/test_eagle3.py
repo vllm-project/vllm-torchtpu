@@ -97,6 +97,76 @@ def test_draft_tp_invalid_raises(draft_tp):
         _make_proposer(draft_tp=draft_tp, target_tp=8)
 
 
+class TestDpLockstepSharded:
+    """Which drafts must have their collective trace replayed by idle DP ranks.
+
+    A draft emits cross-DP collectives either because it is TP-sharded, or
+    because it carries MoE whose experts are expert-parallel across the DP
+    group — the latter holds even at draft_tp=1, since forcing the draft to
+    tp=1 does not make its MoE rank-local.
+    """
+
+    def _proposer(self, *, target_tp, lockstep, has_moe, loaded=True):
+        proposer = _make_proposer(draft_tp=None, target_tp=target_tp)
+        proposer.runner._dp_lockstep_enabled = lambda: lockstep
+        proposer.draft_model = object() if loaded else None
+        return proposer, mock.patch(
+            "vllm.model_executor.models.interfaces.is_mixture_of_experts",
+            return_value=has_moe)
+
+    def test_replicated_moe_draft_under_ep_dp_pairs(self):
+        # TP=1 + DP>1 + EP: the MoE draft still needs idle-rank pairing.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=True)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is True
+
+    def test_replicated_dense_draft_does_not_pair(self):
+        # A tp=1 dense draft is entirely rank-local: nothing to pair with.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=False)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is False
+
+    def test_sharded_draft_pairs_regardless_of_moe(self):
+        proposer, moe_patch = self._proposer(target_tp=8,
+                                             lockstep=True,
+                                             has_moe=False)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is True
+
+    def test_no_lockstep_never_pairs(self):
+        # DP=1 or EP off: no cross-DP collective program to match.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=False,
+                                             has_moe=True)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is False
+
+    def test_moe_detection_is_cached(self):
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=True)
+        with moe_patch as m:
+            assert proposer._dp_lockstep_sharded() is True
+            assert proposer._dp_lockstep_sharded() is True
+            assert m.call_count == 1
+
+    def test_unloaded_draft_reports_no_moe(self):
+        # Queried before load_model: must not raise, and must not cache a
+        # False that would outlive the load.
+        proposer, moe_patch = self._proposer(target_tp=1,
+                                             lockstep=True,
+                                             has_moe=True,
+                                             loaded=False)
+        with moe_patch:
+            assert proposer._dp_lockstep_sharded() is False
+            proposer.draft_model = object()
+            assert proposer._dp_lockstep_sharded() is True
+
+
 def _make_chunk(*,
                 input_ids,
                 position_ids,
@@ -140,6 +210,7 @@ def test_prepare_draft_inputs(device):
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -188,6 +259,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -235,6 +307,7 @@ def test_prepare_draft_inputs_async_device(device):
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -612,7 +685,8 @@ def test_loop_bucket_constant_under_sharded_lockstep():
     assert proposer._loop_bucket(33) == 64
 
     rep = _make_proposer(draft_tp=1, target_tp=2)
-    rep.runner = SimpleNamespace(num_tokens_paddings=[16, 32, 64, 128])
+    rep.runner = SimpleNamespace(num_tokens_paddings=[16, 32, 64, 128],
+                                 _dp_lockstep_enabled=lambda: False)
     assert rep._loop_bucket(1) == 16
     assert rep._loop_bucket(33) == 64
 
@@ -634,6 +708,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
         num_tokens_paddings=[16, 32, 64],
         device=torch.device("cpu"),
         _hidden_states_dtype=torch.float32,
+        uses_mrope=False,
         _dp_lockstep_enabled=lambda: True,
     )
     proposer.draft_model = SimpleNamespace(
@@ -672,6 +747,116 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
         if f["step_idx"] > 0)
     # K lm-head gathers per chunk, all at the constant loop bucket.
     assert tok_shapes == [(16, 8)] * 6
+
+
+def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
+    """An MTP draft has no combine_hidden_states, so the replay must not
+    emit one.
+
+    propose() runs combine only for eagle3; MTP feeds the target hidden
+    state straight to the forward. Replaying a combine here would both
+    raise AttributeError on the draft and add a step the real trace does
+    not have.
+    """
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    monkeypatch.setattr(e3.sync, "synchronize", lambda *a, **k: None)
+
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        _dp_target_bucket=64,
+        num_reqs_max_model_len=16,
+        max_num_reqs=16,
+        num_tokens_paddings=[16, 32, 64],
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: True,
+    )
+    # A real Qwen3_5MoeMTP has no combine_hidden_states attribute at all;
+    # SimpleNamespace reproduces that, so a stray call raises here too.
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(use_aux_hidden_state=False),
+    )
+    proposer._draft_has_moe_cache = True
+
+    fwd, tok_shapes = [], []
+
+    def fake_forward(**kw):
+        fwd.append(kw)
+        return (torch.zeros((kw["num_tokens_padded"], 8)), None)
+
+    proposer._forward_draft = fake_forward
+
+    def fake_propose_token(h):
+        tok_shapes.append(tuple(h.shape))
+        return torch.zeros(h.shape[0], dtype=torch.int32)
+
+    proposer._draft_propose_token = fake_propose_token
+
+    proposer.run_dp_dummy_draft(2)
+
+    # Same forward/lm-head trace as eagle3, only without the combine step.
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 16, 16] * 2
+    assert [f["step_idx"] for f in fwd] == [0, 1, 2] * 2
+    assert tok_shapes == [(16, 8)] * 6
+
+
+@pytest.mark.parametrize("uses_mrope", [False, True])
+def test_run_dp_dummy_draft_positions_match_draft_graph_rank(
+        monkeypatch, uses_mrope):
+    """Dummy positions must carry the rank the draft graph was compiled for.
+
+    The draft's compiled graph marks `positions` dim -1 dynamic, so on an
+    mrope model it is specialized on the [3, N] rank the real propose
+    passes. A 1-D dummy trips the guard with `IndexError: Dimension out of
+    range`. The attn-metadata build is the opposite: it always wants the
+    1-D token positions, like runner.position_ids.
+    """
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    monkeypatch.setattr(e3.sync, "synchronize", lambda *a, **k: None)
+
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        _dp_target_bucket=64,
+        num_reqs_max_model_len=16,
+        max_num_reqs=16,
+        num_tokens_paddings=[16, 32, 64],
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        uses_mrope=uses_mrope,
+        _dp_lockstep_enabled=lambda: True,
+    )
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(use_aux_hidden_state=False),
+    )
+    proposer._draft_has_moe_cache = True
+
+    fwd = []
+
+    def fake_forward(**kw):
+        fwd.append(kw)
+        return (torch.zeros((kw["num_tokens_padded"], 8)), None)
+
+    proposer._forward_draft = fake_forward
+    proposer._draft_propose_token = lambda h: torch.zeros(h.shape[0],
+                                                          dtype=torch.int32)
+
+    proposer.run_dp_dummy_draft(1)
+
+    first, loop = fwd[0], fwd[1]
+    if uses_mrope:
+        # [3, N] for both the first pass (bucket) and the loop carry (p).
+        assert first["positions"].shape == (3, 64)
+        assert loop["positions"].shape == (3, 16)
+    else:
+        assert first["positions"].shape == (64, )
+        assert loop["positions"].shape == (16, )
+    # The attn-metadata override stays 1-D either way.
+    assert first["chunk"].attn_ctx.position_ids_override.shape == (64, )
 
 
 def test_build_draft_attn_metadata_loop_cache(device):

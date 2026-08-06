@@ -23,6 +23,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import bq_utils
+from bq_utils import sql_escape
+
 # GCP Spanner default coordinates
 DEFAULT_PROJECT_ID = "cloud-tpu-inference-test"
 DEFAULT_INSTANCE_ID = "vllm-bm-inst"
@@ -40,10 +43,6 @@ ACC_KEYS = (
     "pass_at_1,create_test",
     "pass_at_1,none",
 )
-
-
-def sql_escape(val: str) -> str:
-    return val.replace("'", "''")
 
 
 def load_config_json(results_dir: Path) -> dict:
@@ -87,7 +86,8 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Upload performance benchmark results to Spanner.")
+        description="Upload performance benchmark results to Spanner and "
+        "BigQuery (dual write during the migration to BigQuery).")
     parser.add_argument("--results-dir",
                         type=Path,
                         required=True,
@@ -108,6 +108,16 @@ def main():
                         default=os.getenv("GCP_DATABASE_ID",
                                           DEFAULT_DATABASE_ID),
                         help="Spanner database ID.")
+    parser.add_argument("--bq-project",
+                        default=None,
+                        help="GCP project ID used to run BigQuery jobs "
+                        "(default: BQ_PROJECT_ID env or "
+                        f"{bq_utils.DEFAULT_BQ_PROJECT_ID}).")
+    parser.add_argument("--bq-table",
+                        default=None,
+                        help="Fully-qualified BigQuery table "
+                        "(default: BQ_TABLE env or "
+                        f"{bq_utils.DEFAULT_BQ_TABLE}).")
     args = parser.parse_args()
 
     if not args.results_dir.exists():
@@ -197,14 +207,17 @@ def main():
         # Populate column dictionary with required fields
         columns = {
             "RecordId": f"'{record_id}'",
-            "RunType": f"'{sql_escape(os.getenv('RUN_TYPE', 'DAILY'))}'",
+            # run_in_docker.sh exports these as empty strings when unset
+            # upstream; `or` falls back on empty too, unlike os.getenv's
+            # unset-only default.
+            "RunType": f"'{sql_escape(os.getenv('RUN_TYPE') or 'DAILY')}'",
             "MaxNumSeqs": str(max_num_seqs),
             "MaxNumBatchedTokens": str(max_num_batched_tokens),
             "TensorParallelSize": str(tensor_parallelism),
             "MaxModelLen": str(max_model_len),
             "Dataset": f"'{sql_escape(dataset)}'",
             "CreatedBy":
-            f"'{sql_escape(os.getenv('CREATED_BY', 'buildkite-agent'))}'",
+            f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'",
             "InputLen": str(input_len),
             "OutputLen": str(output_len),
             "Device": f"'{sql_escape(device)}'",
@@ -267,29 +280,76 @@ def main():
             print(
                 f"=== Skipping Spanner DB Upload (--skip-db-upload specified) ===. RecordId: {record_id}"
             )
-            continue
-
-        cmd = [
-            "gcloud", "spanner", "databases", "execute-sql", args.database,
-            f"--project={args.project}", f"--instance={args.instance}",
-            f"--sql={sql}"
-        ]
-
-        print(f"Executing: {' '.join(cmd)}")
-        res_proc = subprocess.run(cmd,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  text=True)
-        if res_proc.returncode != 0:
-            print(f"Failed to update Spanner record for {rf.name}!",
-                  file=sys.stderr)
-            print(f"Stdout:\n{res_proc.stdout}", file=sys.stderr)
-            print(f"Stderr:\n{res_proc.stderr}", file=sys.stderr)
-            success = False
         else:
-            print(
-                f"Successfully updated Spanner record for {rf.name}. RecordId: {record_id}"
-            )
+            cmd = [
+                "gcloud", "spanner", "databases", "execute-sql", args.database,
+                f"--project={args.project}", f"--instance={args.instance}",
+                f"--sql={sql}"
+            ]
+
+            print(f"Executing: {' '.join(cmd)}")
+            res_proc = subprocess.run(cmd,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE,
+                                      text=True)
+            if res_proc.returncode != 0:
+                print(f"Failed to update Spanner record for {rf.name}!",
+                      file=sys.stderr)
+                print(f"Stdout:\n{res_proc.stdout}", file=sys.stderr)
+                print(f"Stderr:\n{res_proc.stderr}", file=sys.stderr)
+                success = False
+            else:
+                print(
+                    f"Successfully updated Spanner record for {rf.name}. RecordId: {record_id}"
+                )
+
+        # Dual write to BigQuery while dashboards migrate off Spanner. The
+        # row shares the Spanner RecordId so the two writes can be
+        # cross-referenced. Accuracy metrics are per-run but stamped onto
+        # every cell row (like Spanner's AccuracyMetrics) — dedupe when
+        # aggregating them across rows.
+        bq_metrics = [("vllm_bench", bq_utils.extract_bench_metrics(res))]
+        if accuracy_metrics:
+            bq_metrics.append(("lm_eval", accuracy_metrics))
+        bq_config = {
+            "code_hash": code_hash,
+            "created_by": os.getenv("CREATED_BY") or "buildkite-agent",
+            "device_type": device,
+            "run_by": run_by,
+            "job_reference": str(job_ref),
+            "backend": dataset,
+            "engine_flags": {
+                "max_num_seqs": max_num_seqs,
+                "max_num_batched_tokens": max_num_batched_tokens,
+                "tensor_parallel_size": tensor_parallelism,
+                "data_parallel_size": config.get("data_parallelism", 1),
+                "max_model_len": max_model_len,
+                "enable_ep": bool(config.get("enable_ep")),
+                "quantization": config.get("quantization"),
+            },
+            "workload": {
+                "input_len": input_len,
+                "output_len": output_len,
+                "num_prompts": res.get("num_prompts"),
+                "request_rate": res.get("request_rate"),
+                "burstiness": res.get("burstiness"),
+                "max_concurrency": res.get("max_concurrency", concurrency),
+            },
+        }
+        bq_sql = bq_utils.build_insert_sql(
+            record_id=record_id,
+            created_time=bq_utils.created_time_sql(res.get("date")),
+            run_type=os.getenv("RUN_TYPE") or "DAILY",
+            model_id=model,
+            metrics=bq_metrics,
+            config=bq_config,
+            bq_table=args.bq_table)
+        if not bq_utils.run_insert(bq_sql,
+                                   project=args.bq_project,
+                                   label=rf.name,
+                                   record_id=record_id,
+                                   skip=args.skip_db_upload):
+            success = False
 
     return 0 if success else 1
 

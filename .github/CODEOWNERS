@@ -7,4 +7,31 @@
 # Analysis includes full history from tpu_commons, tpu_inference, and torchtpu-vllm paths.
 
 # Default owners for everything in the repo (fallback)
-* @qizzzh @Geyuhao @angelayi @colin2328
+* @qizzzh @Geyuhao @angelayi @colin2328 @QiliangCui
+
+# CI/CD and Build Configuration
+/.buildkite/ @QiliangCui @theminghuang
+/.github/ @QiliangCui @theminghuang
+
+# Documentation
+/docs/ @bvrockwell @RobMulla @QiliangCui @qizzzh
+/README.md @bvrockwell @QiliangCui @qizzzh
+/CONTRIBUTING.md @bvrockwell @RobMulla @QiliangCui @qizzzh
+
+# Kernel Implementations
+/src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh
+
+# Model layers
+/src/vllm_torchtpu/layers/ @kyuyeunk @Geyuhao @qizzzh
+
+# Model Implementations and wrappers
+/src/vllm_torchtpu/models/ @kyuyeunk @Geyuhao @qizzzh
+
+# Speculative Decoding
+/src/vllm_torchtpu/spec_decode/ @Lumosis
+
+# Platform Support
+/src/vllm_torchtpu/platforms/ @Geyuhao @sixiang-google
+
+# Docker Configuration
+/docker/ @QiliangCui @theminghuango

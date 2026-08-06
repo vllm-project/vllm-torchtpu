@@ -66,9 +66,9 @@ if [ -z "$CONFIG_NAME" ]; then
     exit 1
 fi
 
-# If running in Buildkite CI, only upload to Spanner if on main branch and not a PR.
+# If running in Buildkite CI, only upload to Spanner/BigQuery if on main branch and not a PR.
 if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
-    echo "Running on PR or non-main branch in Buildkite. Skipping Spanner upload."
+    echo "Running on PR or non-main branch in Buildkite. Skipping database upload."
     SKIP_DB_UPLOAD_FLAG=1
 fi
 
@@ -278,15 +278,15 @@ if [ "$RUN_MM_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 7. Upload results to Spanner
+# 7. Upload results to Spanner and BigQuery (dual write during migration)
 # ========================================================
-echo "=== Uploading results to Spanner ==="
+echo "=== Uploading results to Spanner and BigQuery ==="
 UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")
 if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "$SKIP_DB_UPLOAD_FLAG" = "1" ]; then
     UPLOAD_ARGS+=("--skip-db-upload")
 fi
 
 
-python3 scripts/vllm/benchmarking/upload_results.py "${UPLOAD_ARGS[@]}" || echo "Warning: Spanner upload failed"
+python3 scripts/vllm/benchmarking/upload_results.py "${UPLOAD_ARGS[@]}" || echo "Warning: results upload failed"
 
 exit "$fail"

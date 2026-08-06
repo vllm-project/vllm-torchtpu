@@ -458,6 +458,13 @@ def v3_state_source(
     single kernel block, viewed bf16 with the tail rows zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
     caller; ``pool`` contributes only its shape and dtype.
+
+    The plan describes one checkpoint. With speculative decoding the
+    caller names one source block per checkpoint
+    (``MetadataRef.s_idx_to_ckpt_indices``), matching how vLLM's reference
+    GDN kernel indexes ``ssm_state_indices[seq, ckpt]``; every checkpoint
+    reuses this same intra-block geometry, so the block size stays
+    independent of ``num_speculative_tokens``.
     """
     block_size, payload, lanes = _pool_geometry(pool)
     tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize

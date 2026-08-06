@@ -71,7 +71,12 @@ class StateRegion:
 class StateSourcePlan:
     """States live in an indexed external source instead of dense per-slot
     tensors: each state index owns a window of ``stride`` consecutive
-    source blocks holding both state regions."""
+    source blocks holding both state regions.
+
+    The plan describes one checkpoint's geometry. With speculative
+    decoding every checkpoint is an independent source block named by
+    ``MetadataRef.s_idx_to_ckpt_indices`` and reuses this same geometry,
+    so nothing here varies with the verify window."""
     stride: int
     conv: StateRegion
     recurrent: StateRegion

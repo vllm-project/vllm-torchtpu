@@ -61,8 +61,38 @@ def _apply_scoring_fn(scoring_fn: str,
         return scores.softmax(dim=-1)
     if scoring_fn == "sigmoid":
         return scores.sigmoid()
+    if scoring_fn == "sqrtsoftplus":
+        import torch.nn.functional as F
+        return torch.sqrt(F.softplus(scores))
     raise NotImplementedError(
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
+
+
+def _hash_moe_select(
+    scores: torch.Tensor,
+    hash_indices_table: torch.Tensor,
+    input_ids: torch.Tensor,
+    renormalize: bool,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Static token-id based MoE routing for DeepSeek-V4.
+
+    Routes tokens to experts based on precomputed hash_indices_table lookup indexed by
+    flat input_ids rather than dynamic gating logits.
+    """
+    flat_input_ids = input_ids.long().flatten()
+    topk_ids = hash_indices_table[flat_input_ids].long()
+    target_shape = list(scores.shape)
+    target_shape[-1] = topk_ids.shape[-1]
+    topk_ids = topk_ids.reshape(target_shape)
+    topk_weights = scores.gather(-1, topk_ids)
+
+    if renormalize:
+        topk_weights = topk_weights / torch.clamp(
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights, topk_ids
 
 
 def select_experts(
@@ -73,10 +103,32 @@ def select_experts(
     renormalize: bool,
     scoring_fn: str,
     layer=None,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute local routed ids/weights for the non-EP path."""
-    # Profiling-only override; a no-op unless FORCE_MOE_RANDOM_ROUTING is set.
+    """Compute local routed expert IDs and weights for non-EP execution.
+
+    Dispatch order:
+    1. DeepSeek-V4 hash routing (if `layer.hash_indices_table` is present).
+    2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled, e.g. DeepSeek-V2/V3).
+    3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for DeepSeek-V4)
+       and optional `e_score_correction_bias`.
+    """
     router_logits = maybe_force_random_routing(router_logits)
+
+    hash_indices_table = getattr(layer, "hash_indices_table",
+                                 None) if layer is not None else None
+    if hash_indices_table is not None and input_ids is not None:
+        scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+        routed_scaling_factor = getattr(layer, "routed_scaling_factor", 1.0)
+        topk_weights, topk_ids = _hash_moe_select(
+            scores,
+            hash_indices_table,
+            input_ids,
+            renormalize,
+            routed_scaling_factor,
+        )
+        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
     if layer is not None and layer.use_grouped_topk:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk
@@ -93,12 +145,27 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
-        scoring_fn, router_logits),
-                                        k=topk,
-                                        dim=-1)
+    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+    e_score_correction_bias = getattr(layer, "e_score_correction_bias",
+                                      None) if layer is not None else None
+
+    if e_score_correction_bias is not None:
+        bias_shape = [1] * (scores.dim() - 1) + [-1]
+        bias = e_score_correction_bias.float().view(bias_shape)
+        scores_for_choice = scores + bias
+        _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
+        topk_weights = scores.gather(-1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / torch.clamp(
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
+    routed_scaling_factor = getattr(layer, "routed_scaling_factor",
+                                    1.0) if layer is not None else 1.0
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 

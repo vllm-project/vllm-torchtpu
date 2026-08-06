@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_torchtpu.gdn_pool_layout import (PooledGDNStateLayout,
+from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_ARCHITECTURES,
+                                           PooledGDNStateLayout,
                                            derive_pooled_gdn_state_layout)
 from vllm_torchtpu.logger import init_logger
 
@@ -19,10 +20,19 @@ logger = init_logger(__name__)
 
 
 def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
-    """Whether the deployment uses the attention-shaped unified KV pool."""
-    del vllm_config
+    """Whether the deployment uses the attention-shaped unified KV pool.
+
+    An explicit TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL wins in either direction.
+    Unset selects the pool for the GDN architectures that read their recurrent
+    state out of the attention pages; everything else keeps the per-layer KV
+    caches, which is the only layout an attention-only model has and the only
+    one the other hybrid families implement.
+    """
     from vllm_torchtpu import envs as tpu_envs
-    return tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+    override = tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+    if override is not None:
+        return override
+    return vllm_config.model_config.architecture in POOLED_GDN_ARCHITECTURES
 
 
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {

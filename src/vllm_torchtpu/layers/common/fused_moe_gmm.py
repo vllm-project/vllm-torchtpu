@@ -17,10 +17,30 @@ import functools
 import jax
 from jax import numpy as jnp
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
+    ragged_gather_reduce as ragged_gather_reduce_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
+    ragged_gather_reduce as ragged_gather_reduce_v3
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+
+
+def _select_ragged_gather_reduce(version: str):
+    return {
+        "v1": ragged_gather_reduce_v1,
+        "v2": ragged_gather_reduce_v2,
+        "v3": ragged_gather_reduce_v3,
+    }[version]
+
+
+# The server sets its environment before importing model code, so the selected
+# implementation remains fixed for the process lifetime. The default is v2;
+# set RAGGED_GATHER_REDUCE_VERSION=v3 to enable the destination-major kernel.
+ragged_gather_reduce = _select_ragged_gather_reduce(
+    envs.RAGGED_GATHER_REDUCE_VERSION)
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -270,7 +290,7 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] *
                        valid_mask[..., None]).sum(axis=1)
             return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce_v2(
+        return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,

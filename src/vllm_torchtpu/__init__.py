@@ -752,8 +752,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         connector_enabled = vllm_config.kv_transfer_config is not None
         if not (cache_config.enable_prefix_caching or connector_enabled):
             hash_block_size = scheduler_block_size
-        elif (not hasattr(cache_config, "prefix_match_unit")
-              or cache_config.prefix_match_unit is None):
+        elif cache_config.prefix_match_unit is None:
             hash_block_size = math.gcd(*group_block_sizes)
         else:
             hash_block_size = cache_config.prefix_match_unit

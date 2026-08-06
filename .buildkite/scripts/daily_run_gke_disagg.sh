@@ -173,16 +173,8 @@ stop_log_streams_and_upload() {
     fi
 }
 
-tail_pod_log() {
-    local label=$1 name=$2 container=$3 lines=$4
-    local pod
-    pod=$(kubectl get pods -n "$K8S_NAMESPACE" -l "$label" -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || true)
-    if [ -n "$pod" ]; then
-        echo "--- $name pod ($pod) recent log ---"
-        kubectl logs -n "$K8S_NAMESPACE" "$pod" -c "$container" --tail "$lines" 2>/dev/null || true
-    fi
-}
-
+# Full pod logs are streamed to files and uploaded as artifacts (see above),
+# so the failure dump only summarizes cluster state and recent log tails.
 dump_diagnostics() {
     echo "+++ ===== FAILURE DIAGNOSTICS ====="
     local f
@@ -198,16 +190,6 @@ dump_diagnostics() {
     kubectl get events -n "$K8S_NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -40 || true
     echo "===== Pods ====="
     kubectl get pods -n "$K8S_NAMESPACE" -o wide 2>/dev/null || true
-    local pod
-    for pod in $(kubectl get pods -n "$K8S_NAMESPACE" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-        echo "===== describe pod/$pod (status section) ====="
-        kubectl describe pod "$pod" -n "$K8S_NAMESPACE" 2>/dev/null | sed -n '/^Status:/,/^Volumes:/p' || true
-        kubectl describe pod "$pod" -n "$K8S_NAMESPACE" 2>/dev/null | sed -n '/^Events:/,$p' || true
-        echo "===== logs pod/$pod (last 300 lines) ====="
-        kubectl logs "$pod" -n "$K8S_NAMESPACE" --all-containers --tail 300 2>/dev/null || true
-        echo "===== previous logs pod/$pod (last 150 lines, if restarted) ====="
-        kubectl logs "$pod" -n "$K8S_NAMESPACE" --all-containers --previous --tail 150 2>/dev/null || true
-    done
     echo "===== END FAILURE DIAGNOSTICS ====="
 }
 
@@ -310,13 +292,10 @@ while true; do
         exit 1
     fi
 
-    # Every minute (4 iterations * 15s), print pod status and progress log snippets
-    if [ "$((COUNTER % 4))" -eq 0 ]; then
+    # Every 5 minutes (20 iterations * 15s), print pod status
+    if [ "$((COUNTER % 20))" -eq 0 ]; then
         echo "[Elapsed: $(( (SECONDS - START_TIME) / 60 ))m] Pod status in namespace $K8S_NAMESPACE:"
         kubectl get pods -n "$K8S_NAMESPACE" || true
-        tail_pod_log "app=vllm-prefill" "Prefill" "vllm-tpu" 5
-        tail_pod_log "app=vllm-decode" "Decode" "vllm-tpu" 5
-        tail_pod_log "app=vllm-benchmark" "Benchmark" "benchmark-runner" 5
     fi
 
     COUNTER=$((COUNTER + 1))
@@ -357,14 +336,6 @@ for RESULT_FILE in "${RESULT_FILES[@]}"; do
     # Upload results to BigQuery
     if [ -n "${PROJECT_NAME:-}" ]; then
         echo "Parsing results and inserting into BigQuery..."
-        python3 ./.buildkite/scripts/parse_gke_results.py "$RESULT_FILE" "$RECORD_ID" | while read -r SQL; do
-            if [[ -n "$SQL" ]]; then
-                echo "Executing BigQuery INSERT statement..."
-                bq query \
-                    --use_legacy_sql=false \
-                    --project_id="${PROJECT_NAME}" \
-                    "$SQL"
-            fi
-        done
+        BQ_PROJECT_ID="${PROJECT_NAME}" python3 ./.buildkite/scripts/parse_gke_results.py "$RESULT_FILE" "$RECORD_ID"
     fi
 done

@@ -210,8 +210,9 @@ def run_repeat_consistency(
         result = chat(url, model, prompt, max_tokens, timeout)
         text = result.get("text", "")
         cached = int(result.get("cached_tokens") or 0)
+        # The first request populates the cache; only repeats can hit it.
         ok = (result.get("status") == 200 and result.get("finish") == "stop"
-              and text == expected and cached > 0
+              and text == expected and (cached > 0 or index == 1)
               and all(marker not in text for marker in BAD_MARKERS))
         outputs.append(text)
         cached_values.append(cached)
@@ -308,10 +309,12 @@ def run_long_shared_prefix_cross_query(
             result = chat(url, model, prompt, max_tokens, timeout)
             text = result.get("text", "")
             cached = int(result.get("cached_tokens") or 0)
+            # Round 1 writes the shared prefix into the cache; from round 2
+            # every query should resume from it.
             ok = (result.get("status") == 200
                   and result.get("finish") == "stop" and text == expected
-                  and cached > 0 and all(marker not in text
-                                         for marker in BAD_MARKERS))
+                  and (cached > 0 or round_index == 1)
+                  and all(marker not in text for marker in BAD_MARKERS))
             requests += 1
             failures += int(not ok)
             outputs_by_key[key].append(text)
@@ -431,9 +434,12 @@ def run_mixed_query_correctness(
             result = chat(url, model, prompt, max_tokens, timeout)
             text = result.get("text", "")
             cached = int(result.get("cached_tokens") or 0)
+            # Long prompts share a prefix, so from round 2 they must hit;
+            # the short ones interleaved between them never can.
             ok = (result.get("status") == 200
                   and result.get("finish") == "stop"
                   and normalize(text) == normalize(expected)
+                  and (cached > 0 or kind != "long" or round_index == 1)
                   and all(marker not in text for marker in BAD_MARKERS))
             requests += 1
             failures += int(not ok)

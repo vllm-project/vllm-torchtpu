@@ -105,7 +105,9 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
             # scale shape: [E, N, num_blocks]
             # gmm_v2 scale layout: [E, num_blocks, 1, N]
-            return scale.movedim(-1, 1).unsqueeze(-2)
+            view = scale.movedim(-1, 1).unsqueeze(-2)
+            out = torch.empty(view.shape, dtype=view.dtype, device=view.device)
+            return out.copy_(view)
 
         w13_scale_4d = _to_kernel_scale(w13_scale)
         w2_scale_4d = _to_kernel_scale(w2_scale)

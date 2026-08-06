@@ -1,0 +1,6 @@
+{
+  "mmlu_llama": {
+    "exact_match,strict_match": 0.7898,
+    "exact_match_stderr,strict_match": 0.00516
+  }
+}

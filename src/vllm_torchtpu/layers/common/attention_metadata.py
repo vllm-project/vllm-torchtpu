@@ -25,6 +25,7 @@ from vllm_torchtpu.layers.common.sequence_layout import (
         "request_distribution",
         "mamba_state_indices",
         "mamba_slot_read_offsets",
+        "mamba_ckpt_indices",
         "mamba_request_distribution",
     ],
     meta_fields=[
@@ -63,6 +64,10 @@ class AttentionMetadata(object):
     # condensed. Updated on device after each sampling step; None unless the
     # model has mamba layers *and* speculative decoding is enabled.
     mamba_slot_read_offsets: jax.Array | None = None
+    # `(num_reqs, num_spec + 1)` source block per checkpoint. Unified pool
+    # with speculative decoding only; None elsewhere, where the sole
+    # checkpoint is the request's own state block.
+    mamba_ckpt_indices: jax.Array | None = None
     # (3,) int32 — GDN-specific request distribution, same format as
     # `request_distribution` but with the first segment covering all
     # *windowed* sequences (plain decodes and speculative verify windows of
@@ -106,7 +111,17 @@ class AttentionMetadataBuilderContext:
     # Spec decode with mamba layers only; see the AttentionMetadata fields of
     # the same names. Only the mamba group's builder reads them.
     mamba_slot_read_offsets: torch.Tensor | None = None
+    # State checkpoints per request on the unified pool (num_spec + 1, each
+    # its own block). 1 means a single state per request, so the builder
+    # emits no `mamba_ckpt_indices`.
+    mamba_ckpt_window: int = 1
     mamba_request_distribution: torch.Tensor | None = None
+    # Unified pool + spec decode only: the runner seeds this with an empty
+    # list and each mamba group's builder appends the per-request state
+    # block ids it derived from its block table, so the post-sampling
+    # read-offset scatter can address every group's state block (groups
+    # allocate distinct blocks, unlike the compact pool's shared slots).
+    unified_mamba_state_indices: list[torch.Tensor] | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
 
@@ -151,6 +166,19 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             assert runner.most_model_len is not None
             target_num_blocks = cdiv(runner.most_model_len,
                                      self.target_block_size)
+            if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
+                # Speculative decoding: the manager appends
+                # `num_speculative_blocks` (= window - 1) checkpoint blocks
+                # after the request's positional state block, so a mamba row
+                # is that much wider than the positional part alone. This
+                # mirrors `MambaSpec.max_num_blocks_per_req`, which the
+                # use_max_model_len branch above already gets for free.
+                # Without it the row stops short of the checkpoint group and
+                # `in_row` below silently redirects checkpoints to the null
+                # block, costing rollback accuracy with no error.
+                target_num_blocks = min(
+                    target_num_blocks + ctx.mamba_ckpt_window - 1,
+                    block_table_obj.max_num_blocks_per_req)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
@@ -174,6 +202,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                                                            non_blocking=True)
             input_positions = runner.position_ids
 
+        mamba_ckpt_indices = None
         if not self.is_mamba_group:
             mamba_state_indices = None
         elif ctx.mamba_state_indices is not None:
@@ -200,6 +229,34 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 dim=1,
                 index=state_block_offsets.unsqueeze(1),
             ).squeeze(1)
+            if ctx.mamba_ckpt_window > 1:
+                # Speculative decoding, one block per checkpoint (vLLM's
+                # MambaSpec.num_speculative_blocks scheme): the manager
+                # allocates `window - 1` extra blocks per request by
+                # inflating the token count, so they land immediately after
+                # the positional state block. Checkpoint t is therefore the
+                # row entry `state_block_offsets + t`.
+                ckpt_offsets = (
+                    state_block_offsets.unsqueeze(1) +
+                    torch.arange(ctx.mamba_ckpt_window,
+                                 device=state_block_offsets.device,
+                                 dtype=state_block_offsets.dtype).unsqueeze(0))
+                # Defensive: a row too short to hold the group would alias
+                # two checkpoints onto one block and silently corrupt state,
+                # so clamp to the null block instead of a live one.
+                in_row = ckpt_offsets < target_num_blocks
+                mamba_ckpt_indices = torch.gather(
+                    block_tables_2d,
+                    dim=1,
+                    index=torch.where(in_row, ckpt_offsets,
+                                      torch.zeros_like(ckpt_offsets)),
+                ) * in_row
+            else:
+                mamba_ckpt_indices = None
+            if ctx.unified_mamba_state_indices is not None:
+                # Spec decode: expose this group's state blocks for the
+                # post-sampling read-offset scatter.
+                ctx.unified_mamba_state_indices.append(mamba_state_indices)
         else:
             mamba_state_indices = None
 
@@ -218,6 +275,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             request_distribution=ctx.request_distribution,
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=mamba_slot_read_offsets,
+            mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),

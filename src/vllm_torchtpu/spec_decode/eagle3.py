@@ -105,6 +105,8 @@ class Eagle3Proposer:
                 f"on TPU: it must be 1 (replicated draft) or {target_tp} "
                 f"(== target tensor_parallel_size, sharded draft).")
         self._draft_replicated = (draft_tp == 1)
+        # Lazily resolved by _draft_has_moe once the draft model exists.
+        self._draft_has_moe_cache: bool | None = None
         logger.info(
             "%s draft parallelism: %s (draft_tp=%s).",
             self.speculative_config.method,
@@ -968,15 +970,39 @@ class Eagle3Proposer:
             return self.draft_model.model.fc_input_size
         return self._draft_hidden_size()
 
-    def _dp_lockstep_sharded(self) -> bool:
-        """True when the draft is TP-SHARDED under EP-DP lockstep.
+    def _draft_has_moe(self) -> bool:
+        """Whether the draft model carries MoE layers.
 
-        In that one topology the draft's internal collectives are part of the
-        cross-rank collective program, so every rank must execute the same collective trace.
-        The replicated (draft_tp=1) draft has no collectives and needs none of this.
+        A TP-replicated draft is not rank-local when it carries MoE: under
+        `--enable-expert-parallel` the experts are distributed across the DP
+        group, so the draft forward emits cross-DP collectives just like a
+        TP-sharded draft does. `_force_draft_tp1` only collapses the TP group;
+        it does not make the MoE local. (The MTP draft of an MoE target is
+        itself a full decoder layer, MoE block included.) Cached after the
+        first query; False until the draft model is loaded.
         """
-        return (not self._draft_replicated
-                and self.runner._dp_lockstep_enabled())
+        if self._draft_has_moe_cache is None:
+            if self.draft_model is None:
+                return False
+            from vllm.model_executor.models.interfaces import \
+                is_mixture_of_experts
+            self._draft_has_moe_cache = bool(
+                is_mixture_of_experts(self.draft_model))
+        return self._draft_has_moe_cache
+
+    def _dp_lockstep_sharded(self) -> bool:
+        """True when the draft emits cross-DP collectives under EP-DP lockstep.
+
+        Those collectives are part of the cross-rank collective program, so
+        every rank must execute the same collective trace. Two ways the draft
+        can emit them: it is TP-SHARDED (its TP collectives ride the same
+        program), or it carries expert-parallel MoE layers, whose experts span
+        the DP group even when the draft is TP-replicated (draft_tp=1). A
+        replicated, MoE-free draft is entirely local and needs none of this.
+        """
+        if not self.runner._dp_lockstep_enabled():
+            return False
+        return not self._draft_replicated or self._draft_has_moe()
 
     def _loop_bucket(self, num_reqs: int) -> int:
         """Loop-phase token bucket p (carries, lm-head gathers, loop forwards).
@@ -1095,9 +1121,19 @@ class Eagle3Proposer:
         input_ids = torch.zeros(bucket,
                                 dtype=torch.int32,
                                 device=runner.device)
-        positions = torch.zeros(bucket,
-                                dtype=torch.int32,
-                                device=runner.device)
+        # Two consumers, two ranks. The draft forward takes mrope-shaped
+        # positions [3, N] on models that use them, and its compiled graph
+        # is specialized on that rank (dynamic_arg_dims marks positions
+        # dim -1), so a 1-D dummy trips the guard with
+        # `IndexError: Dimension out of range`. The attn-metadata build
+        # always wants the 1-D token positions, matching
+        # runner.position_ids.
+        token_positions = torch.zeros(bucket,
+                                      dtype=torch.int32,
+                                      device=runner.device)
+        positions = (torch.zeros(
+            (3, bucket), dtype=torch.int32, device=runner.device)
+                     if runner.uses_mrope else token_positions)
         target_hidden_states = torch.zeros((bucket, self._draft_hidden_size()),
                                            dtype=runner._hidden_states_dtype,
                                            device=runner.device)
@@ -1120,7 +1156,7 @@ class Eagle3Proposer:
             # zeroed-block-table branch (attention_metadata.py) instead of
             # slicing the real block table, which on an idle rank is shorter
             # than num_reqs and would fail to broadcast.
-            position_ids_override=positions,
+            position_ids_override=token_positions,
         )
         chunk = DraftChunkInputs(
             input_ids=input_ids,
@@ -1142,7 +1178,9 @@ class Eagle3Proposer:
         loop_input_ids = torch.zeros(p,
                                      dtype=torch.int32,
                                      device=runner.device)
-        loop_positions = torch.zeros(p,
+        # Mirrors the real loop carry, which stays mrope-shaped across steps
+        # (propose() pads it with _maybe_pad_dim1 when pos.ndim == 2).
+        loop_positions = torch.zeros((3, p) if runner.uses_mrope else (p, ),
                                      dtype=torch.int32,
                                      device=runner.device)
         loop_hidden = torch.zeros((p, draft_hidden),
@@ -1156,6 +1194,13 @@ class Eagle3Proposer:
                                     dtype=torch.int32,
                                     device=runner.device)
         uses_aux = self._draft_uses_aux_hidden_state()
+        # Mirror propose()'s branch exactly: only eagle3 runs the plain
+        # hidden state through combine_hidden_states. An MTP draft feeds the
+        # target hidden state straight to the forward and has no
+        # combine_hidden_states at all, so replaying one here would both
+        # crash and add a step the real trace does not have.
+        combines_plain = not uses_aux and (self.speculative_config.method
+                                           == "eagle3")
         if uses_aux:
             aux_width = self._draft_combine_input_size() // 3
             combine_aux = [
@@ -1163,18 +1208,19 @@ class Eagle3Proposer:
                             dtype=dtype,
                             device=runner.device) for _ in range(3)
             ]
-        else:
+        elif combines_plain:
             combine_plain = torch.zeros(
                 (bucket, self._draft_combine_input_size()),
                 dtype=dtype,
                 device=runner.device)
         for _ in range(num_chunks):
             # Mirror the real first pass: combine -> forward @bucket -> lm head.
-            with set_model_tag("eagle_head"):
-                if uses_aux:
-                    self._draft_combine_hidden_states(*combine_aux)
-                else:
-                    self.draft_model.combine_hidden_states(combine_plain)
+            if uses_aux or combines_plain:
+                with set_model_tag("eagle_head"):
+                    if uses_aux:
+                        self._draft_combine_hidden_states(*combine_aux)
+                    else:
+                        self.draft_model.combine_hidden_states(combine_plain)
             last_hidden, _ = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,

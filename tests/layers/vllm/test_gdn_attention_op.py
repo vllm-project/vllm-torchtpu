@@ -217,6 +217,59 @@ class TestVllmGatedDeltaNetAttention:
 
         assert mock_core.call_args.kwargs["pool_block_tokens"] == 256
 
+    def test_pooled_impl_forwards_every_operand_the_forward_passes(self):
+        """`gdn_impl` must accept exactly what `forward` calls it with.
+
+        The pooled operand list is threaded through four layers (forward ->
+        gdn_impl -> jax_op/wrapped_fn -> the pooled runner), and an arity
+        mismatch between them is invisible until torch.compile traces
+        `gdn_impl` on device — a very expensive way to learn about a missing
+        parameter. Calling it with the full positional list here catches it
+        on CPU instead.
+        """
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        pool = torch.zeros((4, 8), dtype=torch.float32)
+        captured = {}
+
+        def fake_op(*args, **kwargs):
+            captured["args"] = args
+            return torch.zeros_like(pool), torch.zeros((2, 64, 128))
+
+        fake_jax_op = MagicMock(side_effect=fake_op)
+        with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                            vllm_config=_vllm_config()), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "pallas.jax_op",
+                 return_value=fake_jax_op,
+             ):
+            gdn_impl = attn._build_pooled_gdn_op()
+
+        # Mirrors the operand order at the forward's call site, ending with
+        # slot_read_offsets and the per-checkpoint block indices.
+        operands = (
+            torch.zeros((2, 64)),  # mixed_qkv
+            torch.zeros((2, 64)),  # b
+            torch.zeros((2, 64)),  # a
+            pool,  # recurrent_state
+            torch.zeros((64, 1, 4)),  # conv_weight
+            None,  # conv_bias
+            torch.zeros(64),  # A_log
+            torch.zeros(64),  # dt_bias
+            torch.zeros(2, dtype=torch.int32),  # state_indices
+            torch.zeros(3, dtype=torch.int32),  # query_start_loc
+            torch.zeros(3, dtype=torch.int32),  # request_distribution
+            torch.zeros(2, dtype=torch.int32),  # seq_lens
+            torch.zeros(2, dtype=torch.int32),  # slot_read_offsets
+            torch.zeros((2, 5), dtype=torch.int32),  # ckpt_indices
+        )
+        gdn_impl(*operands)
+
+        # Nothing silently dropped on the way to the kernel.
+        assert len(captured["args"]) == len(operands)
+        assert captured["args"][-1] is operands[-1]
+
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
         attn0 = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")

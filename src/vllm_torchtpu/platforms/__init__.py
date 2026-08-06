@@ -27,13 +27,6 @@ def _log_tpu_info() -> None:
 
 
 def register_tpu_platform() -> str:
-    """vLLM out-of-tree platform plugin entry point.
-
-    Runs inside vllm.platforms' own module initialization, so nothing here
-    may import vllm modules — the KV-connector registration that needs the
-    factory lives in TpuPlatform.check_and_update_config instead (importing
-    the factory from this window reaches back for the still-unset
-    vllm.platforms.current_platform and dies with an ImportError).
-    """
+    """vLLM out-of-tree platform plugin entry point."""
     _log_tpu_info()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"

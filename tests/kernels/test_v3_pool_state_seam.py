@@ -111,9 +111,10 @@ def test_v3_kernel_package_stays_pool_agnostic():
 # --------------------------------------------------------------------
 
 
-def _garbage_pool(seed):
+def _garbage_pool(seed, num_mgr: int = NUM_MGR):
     rng = np.random.default_rng(seed)
-    return jnp.asarray(rng.standard_normal(POOL_SHAPE), dtype=jnp.bfloat16)
+    shape = (num_mgr * SPLIT, KBS) + PAYLOAD + (LANES, )
+    return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
 
 
 def _write_states(pool, ssm, conv, idx):
@@ -243,6 +244,109 @@ class TestSeamMatchesRoundTrip:
         )
         self._compare(pool, idx, kwargs)
 
+    def test_per_ckpt_read_selects_the_named_block(self):
+        """Rollback must resume from `ckpt_indices[s, read_offsets[s]]`.
+
+        With per-checkpoint indices the group is scattered across ordinary
+        pool blocks, so selecting checkpoint `r` means indexing the block
+        named at column `r` — not adding an affine pitch to a base block.
+        Checked as an equivalence through the *same* kernel path: reading
+        column `r` of a pool whose columns hold unrelated states must equal
+        reading column 0 of a pool that has state `r` there. Comparing one
+        path against itself keeps float reassociation out of the result.
+        """
+        n, num_spec = 2, 3
+        window = num_spec + 1
+        # Deliberately non-contiguous columns, so no affine base + pitch
+        # map could reproduce this addressing.
+        # Distinct, non-contiguous block per (seq, checkpoint): reusing a
+        # block across slots would let one sequence's write clobber
+        # another's, which is a property of the addressing, not the kernel.
+        ckpt_blocks = jnp.asarray(
+            np.array([[1, 3, 5, 7], [8, 6, 4, 2]], dtype=np.int32))
+        num_mgr = 9
+        keys = iter(jax.random.split(jax.random.key(77), 2 * window))
+        states = []
+        pool = _garbage_pool(11, num_mgr)
+        for t in range(window):
+            ssm_t = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
+            conv_t = jax.random.normal(
+                next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
+            states.append((ssm_t, conv_t))
+            pool = _write_states(pool, ssm_t, conv_t, ckpt_blocks[:, t])
+
+        kwargs = _rand_inputs(12, n) | dict(
+            query_start_loc=jnp.arange(n + 1),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+        )
+
+        def _run(src, read_ckpt):
+            return wrapper.fused_conv1d_gdn(conv_state=None,
+                                            recurrent_state=None,
+                                            state_indices=jnp.zeros(
+                                                (n, ), dtype=jnp.int32),
+                                            state_source=jnp.copy(src),
+                                            state_plan=_plan(src),
+                                            read_offsets=jnp.full(
+                                                (n, ),
+                                                read_ckpt,
+                                                dtype=jnp.int32),
+                                            ckpt_indices=ckpt_blocks,
+                                            num_spec_tokens=num_spec,
+                                            **kwargs)[1]
+
+        for r in range(window):
+            ssm_r, conv_r = states[r]
+            # Same states, but the one the offset names now sits at column 0.
+            at_col0 = _write_states(_garbage_pool(11, num_mgr), ssm_r, conv_r,
+                                    ckpt_blocks[:, 0])
+            np.testing.assert_allclose(np.asarray(_run(pool, r)),
+                                       np.asarray(_run(at_col0, 0)),
+                                       rtol=1e-6,
+                                       atol=1e-6,
+                                       err_msg=f"checkpoint {r}")
+
+    def test_per_ckpt_writes_only_touch_named_blocks(self):
+        """Checkpoint `t` is written to `ckpt_indices[:, t]`; nothing else
+        in the pool may change."""
+        n, num_spec = 2, 3
+        window = num_spec + 1
+        ckpt_blocks = np.array([[1, 3, 5, 7], [8, 6, 4, 2]], dtype=np.int32)
+        num_mgr = 9
+        pool = _garbage_pool(13, num_mgr)
+        kwargs = _rand_inputs(14, n * window) | dict(
+            query_start_loc=jnp.arange(0, n * window + 1, window),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+        )
+        before = np.asarray(pool.view(jnp.int16))
+        out_pool, _ = wrapper.fused_conv1d_gdn(
+            conv_state=None,
+            recurrent_state=None,
+            state_indices=jnp.zeros((n, ), dtype=jnp.int32),
+            state_source=jnp.copy(pool),
+            state_plan=_plan(pool),
+            read_offsets=jnp.zeros((n, ), dtype=jnp.int32),
+            ckpt_indices=jnp.asarray(ckpt_blocks),
+            num_spec_tokens=num_spec,
+            **kwargs)
+
+        named = set(int(m) for m in ckpt_blocks.reshape(-1))
+        touched_kb = {
+            kb
+            for m in named
+            for kb in range(m * SPLIT, m * SPLIT + SPLIT)
+        }
+        after = np.asarray(out_pool.view(jnp.int16))
+        changed = {
+            kb
+            for kb in range(after.shape[0])
+            if not np.array_equal(after[kb], before[kb])
+        }
+        assert changed, "the run wrote no state at all"
+        assert changed <= touched_kb, sorted(changed - touched_kb)
+
     def test_fresh_prefill_on_garbage_pool(self):
         idx = jnp.array([2, 4], dtype=jnp.int32)
         kwargs = _rand_inputs(2, 128) | dict(
@@ -321,6 +425,139 @@ class TestSeamSkipsInvalidSlots:
             conv_kb = mgr * SPLIT + 2
             assert jnp.array_equal(b16(after[conv_kb, CONV_NTOK:]),
                                    b16(before[conv_kb, CONV_NTOK:])), mgr
+
+
+def _write_states_split(pool, ssm, conv, idx, split):
+    """`_write_states` on an arbitrary-split pool (checkpoint 0's layout)."""
+    n = idx.shape[0]
+    pool = pool_adapters.scatter_region(pool,
+                                        ssm.astype(jnp.float32).reshape(
+                                            n, N_V * D_K, D_V),
+                                        idx,
+                                        tok0=0,
+                                        ntok=SSM_NTOK,
+                                        split=split)
+    rows = conv.astype(jnp.bfloat16).reshape(n, CONV_ROWS, LANES)
+    rows = jnp.pad(rows, ((0, 0), (0, CONV_SLOT_ROWS - CONV_ROWS), (0, 0)))
+    return pool_adapters.scatter_region(pool,
+                                        rows,
+                                        idx,
+                                        tok0=CONV_TOK0,
+                                        ntok=CONV_NTOK,
+                                        split=split)
+
+
+class TestPooledSpecWindows:
+    """Speculative verify windows on the pooled path.
+
+    Each checkpoint is its own pool block, named by `ckpt_indices`, and the
+    read offset picks which one a sequence resumes from. Reference is the
+    dense SPEC kernel (validated token-by-token in test_gdn_attention_v3)
+    on compact slot groups, fed byte-equal initial states: matching outputs
+    across multi-step schedules prove the pooled DMA wrote each window
+    position's checkpoint to the block the next step's read offset names.
+    """
+
+    NUM_SPEC = 1
+    WINDOW = NUM_SPEC + 1
+    N = 3
+
+    def _pool(self, split):
+        shape = ((NUM_MGR * self.WINDOW * split, KBS) + PAYLOAD +
+                 (LANES, ) if split > 1 else
+                 (NUM_MGR * self.WINDOW, 1280) + PAYLOAD + (LANES, ))
+        rng = np.random.default_rng(20)
+        return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
+
+    def _steps(self):
+        """Three-step schedule; every step's per-seq read offsets pick a
+        checkpoint the previous step wrote."""
+        n = self.N
+        return [
+            # Verify windows (2, 1, 2 tokens), resuming from checkpoint 0.
+            dict(num_tokens=5,
+                 query_start_loc=jnp.array([0, 2, 3, 5]),
+                 distribution=jnp.array([n, n, n], dtype=jnp.int32),
+                 seq_lens=jnp.array([10, 7, 9], dtype=jnp.int32),
+                 read_offsets=jnp.zeros((n, ), dtype=jnp.int32)),
+            # Mixed acceptance: seqs 0/2 roll back to checkpoint 1, seq 1
+            # to checkpoint 0.
+            dict(num_tokens=5,
+                 query_start_loc=jnp.array([0, 2, 4, 5]),
+                 distribution=jnp.array([n, n, n], dtype=jnp.int32),
+                 seq_lens=jnp.array([12, 9, 10], dtype=jnp.int32),
+                 read_offsets=jnp.array([1, 0, 1], dtype=jnp.int32)),
+            # PER_SEQ resume with a non-zero read offset: seq 0 stays a
+            # 1-token window, seq 1 becomes a 5-token prefill continuation
+            # resuming from checkpoint 1 (the prefix-cache-resume shape);
+            # seq 2 idles.
+            dict(num_tokens=6,
+                 query_start_loc=jnp.array([0, 1, 6, 6]),
+                 distribution=jnp.array([1, 1, n], dtype=jnp.int32),
+                 seq_lens=jnp.array([14, 14, 0], dtype=jnp.int32),
+                 read_offsets=jnp.array([0, 1, 0], dtype=jnp.int32)),
+        ]
+
+    @pytest.mark.parametrize("split", [6, 1],
+                             ids=["kernel_grained", "manager"])
+    def test_pooled_spec_matches_dense(self, split):
+        n, window = self.N, self.WINDOW
+        pool = self._pool(split)
+        # Checkpoint 0 is the request's state block; the rest are ordinary
+        # pool blocks elsewhere, deliberately *not* adjacent, so a stray
+        # affine base + offset would land on the wrong state.
+        pool_idx = jnp.array([4, 1, 3], dtype=jnp.int32)
+        ckpt_indices = jnp.array([[4, 7], [1, 9], [3, 5]], dtype=jnp.int32)
+
+        keys = iter(jax.random.split(jax.random.key(21), 2))
+        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
+        conv0 = jax.random.normal(
+            next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
+        pool = _write_states_split(pool, ssm0, conv0, pool_idx, split)
+        plan = _plan(pool, split=split)
+
+        # Dense reference: compact slot groups of `window` consecutive
+        # slots, byte-equal initial states at each group's base. Garbage in
+        # the other slots must never be read.
+        rng = np.random.default_rng(22)
+        num_slots = 1 + n * window
+        dense_base = jnp.array([1 + i * window for i in range(n)],
+                               dtype=jnp.int32)
+        dense_conv = jnp.asarray(rng.standard_normal(
+            (num_slots, KERNEL_SIZE - 1, DIM)),
+                                 dtype=jnp.bfloat16)
+        dense_rec = jnp.asarray(rng.standard_normal(
+            (num_slots, N_V, D_K, D_V)),
+                                dtype=jnp.float32)
+        dense_conv = dense_conv.at[dense_base].set(conv0)
+        dense_rec = dense_rec.at[dense_base].set(ssm0.astype(jnp.float32))
+
+        for step_num, step in enumerate(self._steps()):
+            kwargs = _rand_inputs(30 + step_num, step["num_tokens"]) | dict(
+                query_start_loc=step["query_start_loc"],
+                distribution=step["distribution"],
+                seq_lens=step["seq_lens"],
+                num_spec_tokens=self.NUM_SPEC,
+                read_offsets=step["read_offsets"],
+            )
+            (dense_conv, dense_rec), out_dense = wrapper.fused_conv1d_gdn(
+                conv_state=dense_conv,
+                recurrent_state=dense_rec,
+                state_indices=dense_base,
+                **kwargs)
+            pool, out_pooled = wrapper.fused_conv1d_gdn(
+                conv_state=None,
+                recurrent_state=None,
+                state_indices=pool_idx,
+                ckpt_indices=ckpt_indices,
+                state_source=pool,
+                state_plan=plan,
+                **kwargs)
+            np.testing.assert_allclose(np.asarray(out_pooled),
+                                       np.asarray(out_dense),
+                                       rtol=2e-2,
+                                       atol=2e-2,
+                                       err_msg=f"step {step_num}")
 
 
 class TestPooledCallerV3:

@@ -109,18 +109,20 @@ def inner_kernel(
     if cfg.state_plan is None:
         conv_state_slot_ref[...] = new_conv_state
     else:
-        # External source tiles: encode the state through the region's
-        # typed view; copy_out pushes the raw bytes back to the source.
+        # External source tiles: encode each window position's checkpoint
+        # through the region's typed view; copy_out pushes the raw bytes
+        # of the valid checkpoints back to the source.
         for idx in range(cfg.seq_tile_size):
 
-            args = (conv_state_slot_ref.at[idx], cfg.state_plan.conv,
-                    new_conv_state[idx])
-            if carry_conv_scratch_ref is None:
-                vmem_ldst.store_state_region(*args)
-            else:
-                # copy_out only DMAs the tile that ends a sequence.
-                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                    functools.partial(vmem_ldst.store_state_region, *args))
+            for t in range(cfg.window_size):
+                args = (conv_state_slot_ref.at[idx, t], cfg.state_plan.conv,
+                        new_conv_state[idx, t])
+                if carry_conv_scratch_ref is None:
+                    vmem_ldst.store_state_region(*args)
+                else:
+                    # copy_out only DMAs the tile that ends a sequence.
+                    pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                        functools.partial(vmem_ldst.store_state_region, *args))
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -193,13 +195,14 @@ def inner_kernel(
     else:
         for idx in range(cfg.seq_tile_size):
 
-            args = (recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
-                    new_recurrent_state[idx])
-            if carry_recurrent_scratch_ref is None:
-                vmem_ldst.store_state_region(*args)
-            else:
-                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                    functools.partial(vmem_ldst.store_state_region, *args))
+            for t in range(cfg.window_size):
+                args = (recurrent_slot_ref.at[idx, t],
+                        cfg.state_plan.recurrent, new_recurrent_state[idx, t])
+                if carry_recurrent_scratch_ref is None:
+                    vmem_ldst.store_state_region(*args)
+                else:
+                    pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                        functools.partial(vmem_ldst.store_state_region, *args))
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -322,6 +325,7 @@ def fused_conv1d_gdn(
     distribution: jax.Array,  # [3]
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
+    ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
     *,
     n_kq: int,
     n_v: int,
@@ -406,11 +410,10 @@ def fused_conv1d_gdn(
     if pooled:
         assert conv_state is None and recurrent_state is None
         assert state_source is not None
-        # An external source stores one state per slot, not a checkpoint
-        # window, so the rollback reads/writes have nowhere to land.
-        assert num_spec_tokens == 0, (
-            "speculative decoding is not supported with an external state "
-            f"source (num_spec_tokens={num_spec_tokens})")
+        # Checkpoints are individually addressable source blocks; without
+        # the index array they would all alias onto the slot's own block.
+        assert num_spec_tokens == 0 or ckpt_indices is not None, (
+            "num_spec_tokens > 0 requires ckpt_indices")
     else:
         assert state_source is None
         conv_out_dtype = conv_state.dtype
@@ -437,6 +440,14 @@ def fused_conv1d_gdn(
         read_offsets = jnp.zeros((num_seqs, ), dtype=jnp.int32)
     assert read_offsets.shape == (num_seqs, )
     read_offsets = read_offsets.astype(jnp.int32)
+    if ckpt_indices is not None:
+        # One source block per checkpoint (vLLM's ssm_state_indices scheme):
+        # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
+        # the pool block only ever has to hold a single state.
+        assert ckpt_indices.shape == (num_seqs, num_spec_tokens +
+                                      1), (ckpt_indices.shape, num_seqs,
+                                           num_spec_tokens)
+        ckpt_indices = ckpt_indices.astype(jnp.int32)
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
@@ -550,6 +561,7 @@ def fused_conv1d_gdn(
                 state_indices=state_indices,
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
+                ckpt_indices=ckpt_indices,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
@@ -557,8 +569,10 @@ def fused_conv1d_gdn(
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 state_indices=state_indices,
+                read_offsets=read_offsets,
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
+                ckpt_indices=ckpt_indices,
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)

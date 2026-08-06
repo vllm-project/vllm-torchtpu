@@ -18,8 +18,79 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
+from vllm_torchtpu.layers.common import fused_moe_gmm
 from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
+
+
+@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
+def test_select_ragged_gather_reduce(version):
+    selected = fused_moe_gmm._select_ragged_gather_reduce(version)
+    expected = getattr(fused_moe_gmm, f"ragged_gather_reduce_{version}")
+    assert selected is expected
+
+
+def test_ragged_gather_reduce_version_defaults_to_v2(monkeypatch):
+    monkeypatch.delenv("RAGGED_GATHER_REDUCE_VERSION", raising=False)
+    getter = envs.environment_variables["RAGGED_GATHER_REDUCE_VERSION"]
+    assert getter() == "v2"
+
+
+def test_ragged_gather_reduce_version_accepts_v3(monkeypatch):
+    monkeypatch.setenv("RAGGED_GATHER_REDUCE_VERSION", "v3")
+    getter = envs.environment_variables["RAGGED_GATHER_REDUCE_VERSION"]
+    assert getter() == "v3"
+
+
+def test_ragged_gather_reduce_uses_configured_version():
+    expected = fused_moe_gmm._select_ragged_gather_reduce(
+        envs.RAGGED_GATHER_REDUCE_VERSION)
+    assert fused_moe_gmm.ragged_gather_reduce is expected
+
+
+def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
+    gmm_outputs = iter([
+        jnp.ones((2, 4), dtype=jnp.bfloat16),
+        jnp.ones((2, 4), dtype=jnp.bfloat16),
+    ])
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda *args, **kwargs: next(gmm_outputs))
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+
+    expected = jnp.full((1, 4), 7, dtype=jnp.bfloat16)
+    calls = []
+
+    def fake_ragged_gather_reduce(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce",
+                        fake_ragged_gather_reduce)
+
+    actual = fused_moe_gmm.moe_gmm(
+        x=jnp.ones((2, 4), dtype=jnp.bfloat16),
+        w1=jnp.ones((1, 4, 4), dtype=jnp.bfloat16),
+        w1_scale=None,
+        w1_bias=None,
+        w2=jnp.ones((1, 4, 4), dtype=jnp.bfloat16),
+        w2_scale=None,
+        w2_bias=None,
+        group_sizes=jnp.array([2], dtype=jnp.int32),
+        argsort_revert_indices=jnp.array([0, 1], dtype=jnp.int32),
+        topk_weights_flat=jnp.array([0.25, 0.75], dtype=jnp.float32),
+        valid_mask_flat=jnp.array([True, True]),
+        activation="silu",
+        num_tokens=1,
+        topk=2,
+        use_ep=True,
+        use_sparse_core=True,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    assert len(calls) == 1
+    assert calls[0][1]["reduce_group_size"] == 2
 
 
 def _require_tpu() -> None:

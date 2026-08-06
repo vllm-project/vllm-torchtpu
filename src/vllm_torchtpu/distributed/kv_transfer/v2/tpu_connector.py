@@ -3018,7 +3018,7 @@ class TPUConnectorV2(KVConnectorBase_V1, SupportsHMA):
         del kwargs
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
-        if not tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:
+        if tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL is False:
             raise ValueError("TPUConnectorV2 requires "
                              "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
         self._connector_metadata = None

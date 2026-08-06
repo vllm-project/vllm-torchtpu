@@ -211,7 +211,7 @@ def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
     if cfg.state_plan is None:
         return slot_ref[idx, 0].astype(jnp.float32)
-    return load_state_region(slot_ref.at[idx], cfg.state_plan.conv,
+    return load_state_region(slot_ref.at[idx, 0], cfg.state_plan.conv,
                              (cfg.prev_kernel_size, 1, cfg.dim_size)).astype(
                                  jnp.float32)
 
@@ -222,7 +222,7 @@ def _load_recurrent_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
     if cfg.state_plan is None:
         return slot_ref[idx, 0]
     return load_state_region(
-        slot_ref.at[idx], cfg.state_plan.recurrent,
+        slot_ref.at[idx, 0], cfg.state_plan.recurrent,
         (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
 
 

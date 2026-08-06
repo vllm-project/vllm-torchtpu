@@ -37,6 +37,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
@@ -455,6 +456,8 @@ class TestTPURunner:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        # Slots per request in the mamba pool (1 without spec decode).
+        self.runner._mamba_slot_stride = 1
 
         # Bind the actual methods to our mock
         self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
@@ -1495,7 +1498,6 @@ class TestAttentionMetadataBuilder:
     def test_unified_mamba_state_indices_derive_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_kv_layout = True
-        runner._mamba_align_mode = True
         mamba_spec = MambaSpec(
             block_size=16,
             shapes=[(2, 8)],
@@ -1559,10 +1561,12 @@ class TestCompactMambaSlotPool:
     (_init_mamba_slot_pool + _build_mamba_state_indices). The slot index is
     correctness-critical: a wrong slot = silent recurrent-state corruption."""
 
-    def _make_runner(self, max_num_reqs=4, mamba_num_blocks=5):
+    def _make_runner(self, max_num_reqs=4, mamba_num_blocks=5, slot_stride=1):
         runner = MagicMock(spec=TPUModelRunner)
         runner.device = torch.device("cpu")
         runner.max_num_reqs = max_num_reqs
+        # Slots per request: 1 without spec decode, num_spec + 1 with it.
+        runner._mamba_slot_stride = slot_stride
         runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs,
                                                      dtype=torch.int32)
         runner.input_batch = MagicMock()
@@ -1594,6 +1598,40 @@ class TestCompactMambaSlotPool:
         assert idx[0] != idx[1]
         # Padded tail points at the null slot (0).
         assert idx[2] == 0 and idx[3] == 0
+
+    def test_idle_dp_rank_gets_all_null_slots(self):
+        """An idle DP rank asks for the coordinated shape with an empty batch.
+
+        `run_dp_dummy_draft` replays a busy peer's collective trace using
+        `num_reqs_max_model_len`, but the idle rank has no scheduled
+        requests. Walking the real `req_ids` for that many positions used to
+        raise `IndexError: list index out of range` inside the dummy draft
+        and kill the engine (compact layout only -- the unified pool builds
+        its indices from the block table and never reaches this code).
+        """
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, [])  # idle rank: nothing scheduled
+
+        idx = runner._build_mamba_state_indices(start_index=0,
+                                                num_reqs=4,
+                                                target_num_reqs=4).cpu()
+        # Every position is the null slot: no real request to address, and
+        # the dummy forward must not touch a live request's state.
+        assert [int(v) for v in idx] == [0, 0, 0, 0]
+        # No slots were consumed, so a later real request still gets one.
+        assert len(runner._free_mamba_slots) == 4
+
+    def test_partially_filled_batch_assigns_only_live_prefix(self):
+        """Coordinated `num_reqs` above the live count keeps the tail null."""
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a"])
+
+        # Peer coordinated 4; this rank only has 1 request.
+        idx = runner._build_mamba_state_indices(0, 4, 4).cpu()
+        assert int(idx[0]) != 0
+        assert [int(v) for v in idx[1:]] == [0, 0, 0]
 
     def test_slot_follows_req_id_through_condense(self):
         """A request keeps its slot even when its persistent-batch position
@@ -1640,3 +1678,389 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1])
         }
         assert slots == {1, 2, 3, 4}
+
+    def test_spec_decode_stride_allocates_group_bases(self):
+        """With speculative decoding each request owns a group of `stride`
+        consecutive slots; the pool hands out only the group *bases*."""
+        # num_spec = 2 -> stride 3; max_num_reqs = 3 -> 3*3 + 1 = 10 blocks.
+        runner = self._make_runner(max_num_reqs=3,
+                                   mamba_num_blocks=10,
+                                   slot_stride=3)
+        runner._init_mamba_slot_pool(10)
+        # Group bases are 1, 4, 7 (slot 0 is the null block); the interior
+        # checkpoint slots (2,3,5,6,8,9) are never handed out directly.
+        assert sorted(runner._free_mamba_slots) == [1, 4, 7]
+
+        self._set_batch(runner, ["a", "b", "c"])
+        idx = runner._build_mamba_state_indices(0, 3, 3).cpu()
+        assert sorted(int(x) for x in idx) == [1, 4, 7]
+
+    def test_spec_decode_stride_one_matches_plain_layout(self):
+        """stride 1 (spec decode disabled) reproduces the dense layout."""
+        runner = self._make_runner(max_num_reqs=4,
+                                   mamba_num_blocks=5,
+                                   slot_stride=1)
+        runner._init_mamba_slot_pool(5)
+        assert sorted(runner._free_mamba_slots) == [1, 2, 3, 4]
+
+
+class TestReorderBatchForRpa:
+    """Unit tests for the RPA batch reordering. With spec decode the batch is
+    partitioned into three contiguous segments [decode][verify][prefill]; the
+    returned (num_decode, num_windowed) split is fed to both RPA (decode-only
+    front) and the GDN windowed kernel (decode + verify)."""
+
+    def _make_runner(self):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.input_batch = MagicMock()
+        runner._reorder_batch_for_rpa = (
+            TPUModelRunner._reorder_batch_for_rpa.__get__(runner))
+        return runner
+
+    def _batch(self, runner, req_ids):
+        ib = runner.input_batch
+        ib.req_ids = list(req_ids)
+        ib.num_reqs = len(req_ids)
+
+        def swap_states(i, j):
+            ib.req_ids[i], ib.req_ids[j] = ib.req_ids[j], ib.req_ids[i]
+
+        ib.swap_states.side_effect = swap_states
+
+    def _sched(self, num_scheduled, spec_reqs=()):
+        return SimpleNamespace(
+            num_scheduled_tokens=num_scheduled,
+            scheduled_spec_decode_tokens={r: object()
+                                          for r in spec_reqs})
+
+    def test_empty_batch(self):
+        runner = self._make_runner()
+        self._batch(runner, [])
+        assert runner._reorder_batch_for_rpa(self._sched({})) == (0, 0)
+
+    def test_no_spec_decode_first_and_windowed_equal(self):
+        """Without spec decode, num_decode == num_windowed and only the
+        1-token decodes move to the front."""
+        runner = self._make_runner()
+        self._batch(runner, ["p", "d1", "p2", "d2"])
+        sched = self._sched({"p": 8, "d1": 1, "p2": 5, "d2": 1})
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert num_decode == 2
+        assert num_windowed == 2
+        # Both decode requests are in the front two positions.
+        assert set(runner.input_batch.req_ids[:2]) == {"d1", "d2"}
+
+    def test_three_segments_decode_verify_prefill(self):
+        """Spec decode yields [decode][verify][prefill] with the split at
+        num_decode and num_windowed."""
+        runner = self._make_runner()
+        self._batch(runner, ["pf", "vr", "dc", "vr2", "dc2"])
+        # dc, dc2: 1-token decode; vr, vr2: multi-token spec verify; pf: prefill
+        sched = self._sched({
+            "pf": 16,
+            "vr": 3,
+            "dc": 1,
+            "vr2": 3,
+            "dc2": 1
+        },
+                            spec_reqs=("vr", "vr2"))
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert num_decode == 2
+        assert num_windowed == 4
+        ids = runner.input_batch.req_ids
+        assert set(ids[:2]) == {"dc", "dc2"}  # decode segment
+        assert set(ids[2:4]) == {"vr", "vr2"}  # verify segment
+        assert ids[4] == "pf"  # prefill/mixed tail
+
+    def test_all_verify_no_plain_decode(self):
+        """Verify windows with no 1-token decodes: decode segment empty,
+        windowed segment covers all verify requests."""
+        runner = self._make_runner()
+        self._batch(runner, ["pf", "vr", "vr2"])
+        sched = self._sched({
+            "pf": 10,
+            "vr": 3,
+            "vr2": 3
+        },
+                            spec_reqs=("vr", "vr2"))
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert num_decode == 0
+        assert num_windowed == 2
+        assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
+        assert runner.input_batch.req_ids[2] == "pf"
+
+
+class TestMambaSlotReadOffsets:
+    """Unit tests for the per-slot mamba read-offset scatter used to roll back
+    rejected speculative tokens by *selection* (base_slot + offset)."""
+
+    def _make_runner(self, num_blocks=8):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
+                                                     dtype=torch.int32)
+        runner._update_mamba_slot_read_offsets = (
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+        return runner
+
+    def test_noop_when_offsets_disabled(self):
+        """No slot buffer (spec decode disabled) -> nothing to scatter."""
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.mamba_slot_read_offsets = None
+        runner._update_mamba_slot_read_offsets = (
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+        # Must not raise even with real-looking args.
+        runner._update_mamba_slot_read_offsets([torch.tensor([1, 4])],
+                                               torch.tensor([[10, -1]]), 2)
+
+    def test_verify_offsets_are_num_accepted_minus_one(self):
+        """offset = (#valid tokens) - 1: full accept -> k, all-rejected -> 0."""
+        runner = self._make_runner(num_blocks=8)
+        state_indices = torch.tensor([1, 4], dtype=torch.int32)
+        # req at slot 1 accepted 3 tokens (2 drafts + bonus); req at slot 4
+        # accepted only the bonus (both drafts rejected).
+        next_tokens = torch.tensor([[10, 11, 12],
+                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
+        assert int(runner.mamba_slot_read_offsets[1]) == 2  # 3 valid - 1
+        assert int(runner.mamba_slot_read_offsets[4]) == 0  # 1 valid - 1
+
+    def test_non_verify_chunk_resets_offsets(self):
+        """A None next_tokens (prefill / plain decode) resets to 0, so the
+        next step resumes from the group base checkpoint."""
+        runner = self._make_runner(num_blocks=8)
+        runner.mamba_slot_read_offsets[1] = 2
+        runner.mamba_slot_read_offsets[4] = 1
+        runner._update_mamba_slot_read_offsets(
+            [torch.tensor([1, 4], dtype=torch.int32)], None, 2)
+        assert int(runner.mamba_slot_read_offsets[1]) == 0
+        assert int(runner.mamba_slot_read_offsets[4]) == 0
+
+    def test_padded_tail_writes_to_null_slot(self):
+        """Padded positions carry slot 0 (the null block); their reset writes
+        land there harmlessly and never touch an active group base."""
+        runner = self._make_runner(num_blocks=8)
+        runner.mamba_slot_read_offsets[1] = 2
+        # num_reqs = 1 active (slot 1); position 1 is padding -> slot 0.
+        state_indices = torch.tensor([1, 0], dtype=torch.int32)
+        next_tokens = torch.tensor([[10, 11],
+                                    [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 1)
+        assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
+        # Null slot only ever gets 0; active groups untouched by the tail.
+        assert int(runner.mamba_slot_read_offsets[0]) == 0
+
+    def test_unified_per_group_indices_all_scattered(self):
+        """Unified pool: each mamba group has its own state block per
+        request; the same offsets land at every group's blocks."""
+        runner = self._make_runner(num_blocks=16)
+        group0 = torch.tensor([3, 7], dtype=torch.int32)
+        group1 = torch.tensor([11, 5], dtype=torch.int32)
+        next_tokens = torch.tensor([[10, 11, 12],
+                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens,
+                                               2)
+        for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
+            assert int(runner.mamba_slot_read_offsets[block]) == expected
+
+    def test_unified_empty_group_list_is_noop(self):
+        runner = self._make_runner(num_blocks=8)
+        runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
+        assert int(runner.mamba_slot_read_offsets.sum()) == 0
+
+
+class TestReadOffsetsClearedOnReallocation:
+    """A recycled slot/block must not carry a read offset into its next owner.
+
+    `mamba_slot_read_offsets` is indexed by slot/block id, not by request.
+    When a request leaves mid-verify-window its `num_accepted - 1` stays in
+    the buffer, and both layouts hand that storage to the next request --
+    compact via `_free_mamba_slots`, unified via the block manager. The new
+    owner's first forward would then resume from a checkpoint belonging to
+    the previous conversation: silent GDN state corruption, no crash.
+    """
+
+    def _make_runner(self, num_blocks=8, width=2):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
+                                                     dtype=torch.int32)
+        runner._mamba_offset_seeded = set()
+        runner._read_offset_scratch = {}
+        runner.input_batch = MagicMock()
+        runner._mamba_state_index_groups = (
+            TPUModelRunner._mamba_state_index_groups.__get__(runner))
+        runner._read_offset_reset_scratch = (
+            TPUModelRunner._read_offset_reset_scratch.__get__(runner))
+        runner._reset_read_offsets_for_new_requests = (
+            TPUModelRunner._reset_read_offsets_for_new_requests.__get__(runner)
+        )
+        return runner
+
+    def _set_batch(self, runner, req_ids, state_indices):
+        runner.input_batch.req_ids = list(req_ids)
+        runner.input_batch.req_id_to_index = {
+            r: i
+            for i, r in enumerate(req_ids)
+        }
+        ctx = MagicMock()
+        ctx.mamba_state_indices = torch.tensor(state_indices,
+                                               dtype=torch.int32)
+        ctx.unified_mamba_state_indices = None
+        runner._attn_metadata_builder_ctx = ctx
+
+    def test_recycled_slot_does_not_inherit_stale_offset(self):
+        runner = self._make_runner()
+        # Request "a" owns slot 5 and ended a verify step having accepted 3
+        # tokens, so slot 5 carries offset 2.
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner.mamba_slot_read_offsets[5] = 2
+
+        # "a" leaves; a new conversation "b" is handed the same slot.
+        self._set_batch(runner, ["b"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+
+        assert int(runner.mamba_slot_read_offsets[5]) == 0, (
+            "new request inherited the previous request's checkpoint")
+
+    def test_continuing_request_keeps_its_offset(self):
+        """The reset must not clobber a request still mid-window."""
+        runner = self._make_runner()
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner.mamba_slot_read_offsets[5] = 2
+
+        # Same request, next step: its offset is still live.
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert int(runner.mamba_slot_read_offsets[5]) == 2
+
+    def test_null_slot_absorbs_padded_and_seen_rows(self):
+        runner = self._make_runner()
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        runner.mamba_slot_read_offsets[5] = 2
+        runner.mamba_slot_read_offsets[6] = 1
+
+        # "a" stays, "c" replaces "b" on slot 6.
+        self._set_batch(runner, ["a", "c"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert int(runner.mamba_slot_read_offsets[5]) == 2  # untouched
+        assert int(runner.mamba_slot_read_offsets[6]) == 0  # cleared
+        assert int(runner.mamba_slot_read_offsets[0]) == 0  # null stays 0
+
+
+class TestUnifiedReadOffsetMigration:
+    """The align-mode seed-copy collector must migrate the per-block read
+    offsets together with the state when a request's state block moves.
+
+    These pin the no-checkpoint-group gate (`_mamba_ckpt_window == 1`),
+    where the offset simply follows the state block. With a checkpoint
+    group the group slides with the state column and the contract is
+    different -- the resumed checkpoint moves and the offset resets to 0;
+    that is covered in tests/runner/test_mamba_state_seed_copies.py.
+    """
+
+    def _make_runner(self,
+                     *,
+                     block_table,
+                     computed,
+                     scheduled,
+                     block_size=4,
+                     ckpt_window=1):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.cache_config = MagicMock()
+        runner.cache_config.block_size = block_size
+        runner._mamba_ckpt_window = ckpt_window
+        runner._bucket_len = TPUModelRunner._bucket_len
+        runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
+        for name in ("_pad_dev_to_bucket", "_expand_pool_split",
+                     "_spec_seed_sources"):
+            setattr(runner, name,
+                    getattr(TPUModelRunner, name).__get__(runner))
+        # The collector strides the mamba block tables by the mamba groups'
+        # spec block size (times the cp world), not by the attention block
+        # size; with cp=1 the two coincide here.
+        runner._mamba_state_block_size = block_size
+        runner.device = torch.device("cpu")
+        runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
+        runner._mamba_state_pos = {}
+        runner._pool_block_split = 1
+        runner._pending_mamba_state_copies = []
+        raw = torch.zeros(16, 2)
+        runner._mamba_copy_plan = [(0, [raw])]
+        runner.input_batch = MagicMock()
+        req_ids = [f"r{i}" for i in range(len(computed))]
+        runner.input_batch.req_ids = req_ids
+        runner.input_batch.req_id_to_index = {
+            rid: i
+            for i, rid in enumerate(req_ids)
+        }
+        runner.input_batch.num_computed_tokens_cpu = np.array(computed)
+        bt_obj = MagicMock()
+        bt_obj.get_cpu_tensor.return_value = torch.tensor(block_table,
+                                                          dtype=torch.int32)
+        runner.input_batch.block_table = {0: bt_obj}
+        runner._collect_mamba_state_seed_copies = (
+            TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner))
+        scheduler_output = MagicMock()
+        scheduler_output.num_scheduled_tokens = {
+            rid: s
+            for rid, s in zip(req_ids, scheduled)
+        }
+        return runner, scheduler_output
+
+    def test_offsets_follow_state_block_on_crossing(self):
+        # block_size=4: req r0 computed=7 scheduled=2 -> state block moves
+        # from position 1 (block id 5) to position 2 (block id 9).
+        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
+                                                                   0]],
+                                                     computed=[7],
+                                                     scheduled=[2])
+        runner.mamba_slot_read_offsets[5] = 3
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        assert int(runner.mamba_slot_read_offsets[9]) == 3
+        # The state seed copy itself was staged for the same pair.
+        assert len(runner._pending_mamba_state_copies) == 1
+        _, src_t, dst_t = runner._pending_mamba_state_copies[0]
+        assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
+
+    def test_no_crossing_leaves_offsets_alone(self):
+        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
+                                                                   0]],
+                                                     computed=[5],
+                                                     scheduled=[2])
+        runner.mamba_slot_read_offsets[5] = 3
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        assert int(runner.mamba_slot_read_offsets[5]) == 3
+        assert int(runner.mamba_slot_read_offsets[9]) == 0
+        assert not runner._pending_mamba_state_copies
+
+    def test_checkpoint_group_crossing_seeds_the_resumed_checkpoint(self):
+        # With a checkpoint group the whole group slides with the state
+        # column, so the block to carry over is the checkpoint the request
+        # resumes from -- not the old state block, which would leave it
+        # resuming one checkpoint late. It lands as checkpoint 0, so the
+        # offset resets.
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 11]],
+            computed=[7],
+            scheduled=[2],
+            ckpt_window=3)
+        # Pre-crossing group is columns 1..3 = blocks (5, 9, 11).
+        runner.mamba_slot_read_offsets[5] = 2
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        _, src_t, dst_t = runner._pending_mamba_state_copies[0]
+        assert int(src_t[0]) == 11 and int(dst_t[0]) == 9
+        assert int(runner.mamba_slot_read_offsets[9]) == 0
+
+    def test_rollback_crossing_migrates_offsets_backward(self):
+        # A rejected verify window can pull the state position back into the
+        # previous block: prev tracked position 2 (block 9), current step
+        # lands in position 1 (block 5) -> offsets follow backward.
+        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
+                                                                   0]],
+                                                     computed=[6],
+                                                     scheduled=[1])
+        runner._mamba_state_pos["r0"] = 2
+        runner.mamba_slot_read_offsets[9] = 1
+        runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
+        assert int(runner.mamba_slot_read_offsets[5]) == 1

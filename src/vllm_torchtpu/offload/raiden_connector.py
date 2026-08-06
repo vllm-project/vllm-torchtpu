@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Connector wiring for the store-backed (V2) Raiden KV offload path.
+"""Connector wiring for the store-backed Raiden KV offload path.
 
-`TPURaidenOffloadingConnector` subclasses vLLM's `OffloadingConnector`.
+`TPURaidenOffloadingConnector` subclasses vLLM's `OffloadingConnector` and
+orchestrates controller-driven KV offloading via Raiden's C++ `KVCacheStore`.
 Enable it via:
 
     --kv-transfer-config '{
@@ -23,29 +24,25 @@ Enable it via:
         "kv_connector_extra_config": {"cpu_bytes_to_use": ...}
     }'
 
-Architecture overview vs. stock vLLM offloading:
-Transfers are centralized at the scheduler via Raiden's C++ `KVCacheStore`,
-leaving worker job dicts empty. Two essential signals flow between scheduler
-and workers:
+Core mechanisms:
 
-- Save fence: A store job can only read HBM after the forward pass writing
-  those blocks has fully landed. Store jobs ship as `fence_job_ids`. Each rank
-  executes a post-forward `_tpu_sync(wait=True)` and acks via `fenced_jobs`.
-  The scheduler admits and launches `save()` only after all ranks have acked.
+- Save fence: Store jobs only read HBM after the forward pass writing those
+  blocks has fully completed. Store jobs ship as `fence_job_ids`. Each rank
+  executes a post-forward `_tpu_sync(wait=True)` and acknowledges via
+  `fenced_jobs`. The scheduler launches `save()` only after all ranks have acked.
 
-- Completion echoes: Upstream vLLM completion machinery (reference counting,
-  block release, `WAITING_FOR_REMOTE_KVS` unblocking) expects worker reports.
-  Terminal jobs discovered by the scheduler manager ship down to workers,
-  which echo them back as `completed_jobs` / `finished_recving`. Failed loads
-  report their destination blocks via `get_block_ids_with_load_errors` for
-  automatic recomputation.
+- Completion echoes: Terminal jobs discovered by the scheduler manager ship
+  down to workers, which echo them back as `completed_jobs` / `finished_recving`
+  to unblock waiting requests and maintain reference counting. Failed loads
+  report their destination blocks for automatic recomputation.
 
 - Memory reuse (jobs_to_flush): Handled entirely scheduler-side. Fence-pending
   stores are cancelled before launching, while active transfers are drained
   synchronously before shipping metadata, preventing torn reads upon block reuse.
 
-- Aborted request resilience: `_build_store_jobs` trims keys to allocated blocks
-  and computed tokens, preventing crashes and cache pollution from aborted requests.
+- Aborted request resilience: Trims keys to allocated blocks and computed
+  tokens in `_build_store_jobs`, preventing crashes and cache pollution from
+  mid-flight aborted requests.
 """
 from __future__ import annotations
 
@@ -223,7 +220,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
                 logger.debug(
-                    "[kv-offload-v2] cancelled fence-pending store job %d "
+                    "TPURaidenOffloadingConnector: cancelled fence-pending store job %d "
                     "(source blocks reused)", job_id)
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)

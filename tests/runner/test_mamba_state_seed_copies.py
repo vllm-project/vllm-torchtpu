@@ -46,7 +46,9 @@ def _make_self(req_ids,
                state_pos=None,
                split=1,
                num_cols=8,
-               state_block_size=BLOCK_SIZE):
+               state_block_size=BLOCK_SIZE,
+               ckpt_window=1,
+               read_offsets=None):
     """Build a minimal fake runner ``self`` for the collector.
 
     ``group_block_rows`` is a list (one entry per mamba group) of block-table
@@ -74,16 +76,33 @@ def _make_self(req_ids,
         for _ in group_block_rows
     ]
     plan = [(gid + 1, [raws[gid]]) for gid in range(len(group_block_rows))]
-    return SimpleNamespace(
+    ns = SimpleNamespace(
         _mamba_copy_plan=plan,
         _mamba_state_pos=dict(state_pos or {}),
         _mamba_state_block_size=state_block_size,
         _pool_block_split=split,
+        # 1 = no speculative checkpoint group; > 1 takes the sliding-group
+        # path exercised at the bottom of this file.
+        _mamba_ckpt_window=ckpt_window,
+        # The collector reads the manager block size from cache_config, not
+        # the runner's init-time snapshot (the executor finalizes it after
+        # the runner is constructed).
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
         block_size=BLOCK_SIZE,
         device="cpu",
+        mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
         input_batch=input_batch,
-    ), raws
+    )
+    # Padding/expansion/source-selection helpers the collector calls on
+    # self; bind the real implementations onto the stand-in. The static and
+    # class methods are already callable as-is.
+    ns._bucket_len = TPUModelRunner._bucket_len
+    ns._pad_to_bucket = TPUModelRunner._pad_to_bucket
+    for name in ("_pad_dev_to_bucket", "_expand_pool_split",
+                 "_spec_seed_sources"):
+        setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
+    return ns, raws
 
 
 def _sched(num_scheduled):
@@ -377,3 +396,90 @@ def test_split_expansion_fans_out_pairs():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(18, 21),
                                                                 (19, 22),
                                                                 (20, 23)]
+
+
+# --- speculative decoding: the checkpoint group slides with the state ----
+#
+# With `num_speculative_blocks = window - 1`, vLLM's MambaManager appends a
+# block and never shifts, so when the state column advances the whole
+# checkpoint group slides one column right: what was checkpoint 1 becomes the
+# state block, checkpoint 2 becomes checkpoint 1, and a fresh (stateless)
+# block appears at the end. Seeding the new state block from the OLD state
+# block would leave the request resuming one checkpoint late. What has to
+# move is the checkpoint it is about to resume from, which lands as
+# checkpoint 0 of the new group -- so the read offset resets to 0.
+
+
+def _spec_self(offset, *, window=3, row=(10, 11, 12, 13), split=1):
+    """One request about to cross from state column 0 to column 1.
+
+    Pre-crossing the group is blocks (10, 11, 12) with the state at 10;
+    post-crossing the manager has appended 13 and the group is (11, 12, 13).
+    ``offset`` is the read offset parked on the old state block, i.e. the
+    checkpoint of the request's last accepted token.
+    """
+    read_offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    read_offsets[row[0]] = offset
+    return _make_self(["a"], [BLOCK_SIZE], [[list(row)]],
+                      state_pos={"a": 0},
+                      ckpt_window=window,
+                      read_offsets=read_offsets,
+                      split=split)
+
+
+@pytest.mark.parametrize("offset,expected_src", [(0, 10), (1, 11), (2, 12)])
+def test_spec_crossing_seeds_from_the_resumed_checkpoint(offset, expected_src):
+    fake, _ = _spec_self(offset)
+    _collect(fake, _sched({"a": 1}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(expected_src,
+                                                                 11)]
+
+
+def test_spec_crossing_does_not_carry_the_stale_state_block():
+    # Regression: seeding from the old state block (10) regardless of the
+    # offset left the request one checkpoint late, and at the top of the
+    # window pointed it at the freshly appended block, which holds no state.
+    fake, _ = _spec_self(2)
+    _collect(fake, _sched({"a": 1}))
+    srcs = [s for s, _ in _real_pairs(fake._pending_mamba_state_copies[0])]
+    assert srcs == [12] and 10 not in srcs
+
+
+@pytest.mark.parametrize("offset", [0, 1, 2])
+def test_spec_crossing_resets_the_read_offset(offset):
+    # The seeded checkpoint IS checkpoint 0 of the post-crossing group.
+    fake, _ = _spec_self(offset)
+    _collect(fake, _sched({"a": 1}))
+    assert int(fake.mamba_slot_read_offsets[11]) == 0
+
+
+def test_spec_crossing_offset_past_the_row_falls_back_to_the_state_block():
+    # A row too short to hold the whole group must not gather out of range.
+    fake, _ = _spec_self(2, window=3, row=(10, 11))
+    _collect(fake, _sched({"a": 1}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
+
+
+@pytest.mark.skipif(not _HAS_SPLIT,
+                    reason="split expansion only exists on the batched-RPA PR")
+def test_spec_crossing_fans_out_pool_split():
+    # The device-side source selection still expands to kernel blocks.
+    fake, _ = _spec_self(2, split=3)
+    _collect(fake, _sched({"a": 1}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(36, 33),
+                                                                (37, 34),
+                                                                (38, 35)]
+
+
+def test_non_spec_crossing_keeps_the_state_block_source():
+    # window == 1: no checkpoint group, so the old state block is the source
+    # and its offset migrates to the new state block unchanged.
+    read_offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    read_offsets[7] = 3
+    fake, _ = _make_self(["a"], [3 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
+                         state_pos={"a": 2},
+                         ckpt_window=1,
+                         read_offsets=read_offsets)
+    _collect(fake, _sched({"a": 1}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(7, 8)]
+    assert int(fake.mamba_slot_read_offsets[8]) == 3
