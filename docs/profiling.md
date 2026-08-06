@@ -208,6 +208,11 @@ curl -X POST http://localhost:8000/stop_profile
 read by the TPU workers, so setting it only in the shell that runs `curl` has no
 effect.
 
+The traffic you send between those two calls decides which phases you get. A
+single request in flight yields `prefill_only` and nothing else — see
+[a phase is missing](#the-run-produces-no-or-unexpected-traces) before running
+this against an expensive model.
+
 Two flags in that command are easy to miss. `--attention-backend CUSTOM` selects
 the batched-RPA Pallas kernel; without it vLLM falls back to `FLASH_ATTN` with
 `block_size=16`, so you would be profiling a backend you do not serve with.
@@ -444,10 +449,23 @@ harness that means `CAPTURE_PROFILE` must resolve to `1`.
 composition. `prefill_only` and `decode_only` need batches that are entirely one
 or the other, which a heavily overlapped serving run may never schedule. Check
 the `batch_composition_stats_*.json` files to see which phases the scheduler
-actually produced. `decode_only` additionally needs at least two concurrent
-requests: the profiler skips one-token steps (a guard against capturing the
-initial request), and a single decoding request schedules exactly one token per
-step.
+actually produced. For `decode_only`, see the batch-size note below.
+
+> [!IMPORTANT]
+> **`decode_only` cannot be captured at batch size 1.** The profiler ignores any
+> step whose whole batch schedules a single token, and one decoding request
+> schedules exactly one token per step. Capturing `decode_only` therefore needs
+> **both** `--max-num-seqs 2` or higher **and** at least two requests in flight
+> at once — raising only the client's concurrency does nothing if the server
+> admits one sequence at a time.
+>
+> The same guard also blocks the counter that closes a capture, so a run that
+> never clears it leaves the phase in progress open until `/stop_profile`,
+> ignoring `--profiler-config.max_iterations`. A capture that ends this way
+> holds every step after it started, whatever their phase, under the label of
+> the phase that opened it. The symptom is a single
+> `batch_composition_stats_*.json` in that phase's `rank_<N>/` directory: the
+> capture opened and never stepped again.
 
 **Traces are split across two timestamped directories** — ranks disagreed on the
 canonical timestamp; see the multi-host warning above.
