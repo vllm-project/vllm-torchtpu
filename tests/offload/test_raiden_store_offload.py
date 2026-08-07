@@ -86,8 +86,7 @@ class _Call:
 class FakeKVCacheStore:
     """In-memory stand-in for tpu_raiden's KVCacheStore python wrapper."""
 
-    def __init__(self, registered_workers: int = 0):
-        self.registered_workers = registered_workers
+    def __init__(self):
         self.entries: dict[bytes, _Entry] = {}
         self.calls: list[_Call] = []
         self.fail_insert_and_lock = False
@@ -115,9 +114,6 @@ class FakeKVCacheStore:
         self._remote_device_ids: dict[bytes, int] = {}
 
     # -- store surface used by the manager -----------------------------
-
-    def num_registered_workers(self) -> int:
-        return self.registered_workers
 
     def lookup(self, block_hashes, enable_global=False):
         out = []
@@ -358,35 +354,6 @@ def seed_global_entries(store,
             status=FakeBlockStatus.REMOTE)
 
 
-class TestRegistrationGate(unittest.TestCase):
-
-    def test_gate_disables_lookup_and_store_until_all_ranks(self):
-        store = FakeKVCacheStore(registered_workers=1)
-        manager = make_manager(store, world_size=2)
-        seed_host_entries(store, _key(0))
-
-        # When registered_workers < world_size, operations return MISS or None.
-        self.assertEqual(manager.lookup(_key(0), _ctx()), LookupResult.MISS)
-        self.assertIsNone(manager.prepare_store([_key(1)], _ctx()))
-
-        # Registration gate opens when registered_workers equals world_size.
-        store.registered_workers = 2
-        self.assertEqual(manager.lookup(_key(0), _ctx()), LookupResult.HIT)
-        out = manager.prepare_store([_key(1)], _ctx())
-        self.assertIsNotNone(out)
-        self.assertEqual(out.keys_to_store, [_key(1)])
-
-        # Once open, the gate remains open without re-querying.
-        store.registered_workers = 0
-        self.assertEqual(manager.lookup(_key(0), _ctx()), LookupResult.HIT)
-
-    def test_more_workers_than_world_size_raises(self):
-        store = FakeKVCacheStore(registered_workers=3)
-        manager = make_manager(store, world_size=2)
-        with self.assertRaises(RuntimeError):
-            manager.lookup(_key(0), _ctx())
-
-
 class TestConstructionGuards(unittest.TestCase):
 
     def test_requires_insert_and_lock_detailed(self):
@@ -395,7 +362,7 @@ class TestConstructionGuards(unittest.TestCase):
         del FakeKVCacheStore.insert_and_lock_detailed
         try:
             with self.assertRaises(RuntimeError):
-                make_manager(FakeKVCacheStore(registered_workers=2))
+                make_manager(FakeKVCacheStore())
         finally:
             FakeKVCacheStore.insert_and_lock_detailed = saved
 
@@ -404,7 +371,7 @@ class TestConstructionGuards(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "PYTHONHASHSEED"}
         with patch.dict(os.environ, env, clear=True):
             with self.assertRaises(ValueError):
-                make_manager(FakeKVCacheStore(registered_workers=2),
+                make_manager(FakeKVCacheStore(),
                              global_registry_address="registry:50051",
                              store_server_ip="10.0.0.1")
 
@@ -412,7 +379,7 @@ class TestConstructionGuards(unittest.TestCase):
 class TestLookup(unittest.TestCase):
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
     def test_hit_requires_every_sub_hash(self):
@@ -440,7 +407,7 @@ class TestLookup(unittest.TestCase):
 class TestStoreJobLifecycle(unittest.TestCase):
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
     def _admit(self, keys, gpu_blocks):
@@ -563,7 +530,7 @@ class TestStoreJobLifecycle(unittest.TestCase):
 class TestLoadJobLifecycle(unittest.TestCase):
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
         seed_host_entries(self.store, _key(0))
         seed_host_entries(self.store, _key(1))
@@ -632,7 +599,7 @@ class TestLoadJobLifecycle(unittest.TestCase):
 class TestTouchAndMisc(unittest.TestCase):
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
     def test_reset_cache_raises(self):
@@ -743,7 +710,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
             sched.update_connector_output(output)
 
     def test_store_jobs_parked_until_all_ranks_fence(self):
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         manager = make_manager(store)
         manager.prepare_store([_key(0)], _ctx())
         sched = self._make_scheduler(manager)
@@ -769,7 +736,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertNotIn(7, sched._fence_pending)
 
     def test_load_jobs_submit_immediately(self):
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         manager = make_manager(store)
         seed_host_entries(store, _key(0))
         manager.prepare_load([_key(0)], _ctx("r1"))
@@ -789,7 +756,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertEqual(meta2.failed_load_gpu_block_ids, [])
 
     def test_flush_cancels_fence_pending_store(self):
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         manager = make_manager(store)
         manager.prepare_store([_key(0)], _ctx())
         sched = self._make_scheduler(manager)
@@ -807,7 +774,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertEqual(out.keys_to_store, [_key(0)])
 
     def test_same_step_flush_ships_no_fence(self):
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         manager = make_manager(store)
         manager.prepare_store([_key(0)], _ctx())
         sched = self._make_scheduler(manager)
@@ -822,7 +789,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertNotIn(7, sched._fence_pending)
 
     def test_flush_drains_launched_store(self):
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         manager = make_manager(store)
         manager.prepare_store([_key(0)], _ctx())
         sched = self._make_scheduler(manager)
@@ -933,7 +900,7 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
                        num_computed_tokens=12,
                        num_blocks=3):
         from vllm.v1.request import RequestStatus
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         sched = self._make_sched(make_manager(store))
         req = _FakeFinishedRequest("r1", num_tokens, num_computed_tokens,
                                    RequestStatus.FINISHED_ABORTED)
@@ -971,7 +938,7 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
     def test_waiting_abort_with_no_blocks_builds_no_job(self):
         # Request aborted from waiting queue before block allocation: no store issued.
         from vllm.v1.request import RequestStatus
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         sched = self._make_sched(make_manager(store))
         req = _FakeFinishedRequest("r1", 32, 0, RequestStatus.FINISHED_ABORTED)
         self._track(sched, req, [_key(i) for i in range(8)], [])
@@ -982,7 +949,7 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
     def test_normally_finished_request_keys_untouched(self):
         # Normal completion: computed = num_tokens - 1, both chunks backed by blocks.
         from vllm.v1.request import RequestStatus
-        store = FakeKVCacheStore(registered_workers=2)
+        store = FakeKVCacheStore()
         sched = self._make_sched(make_manager(store))
         req = _FakeFinishedRequest("r1", 8, 7, RequestStatus.FINISHED_STOPPED)
         keys = [_key(0), _key(1)]
@@ -1074,7 +1041,7 @@ class TestFailureHardening(unittest.TestCase):
     """Drain-suppressed retries and failure handling."""
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
     def test_drain_suppresses_save_retry(self):
@@ -1149,7 +1116,7 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
     launch if any hash is not HBM status."""
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
     def test_mixed_batch_saves_only_new_sub_hashes(self):
@@ -1204,7 +1171,7 @@ class TestDetailedClassification(unittest.TestCase):
     displacement -> eviction events."""
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
     def _store_key(self, key, gpu_block, job_id):
@@ -1272,7 +1239,7 @@ class TestRemoteReadFlow(unittest.TestCase):
     """Cross-instance receiver flow against the fake registry."""
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_global_manager(self.store)
 
     def test_remote_hit_requires_global_enabled(self):
@@ -1457,7 +1424,7 @@ class TestRemoteLandingDisplacement(unittest.TestCase):
     failure."""
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_global_manager(self.store)
         # Locally stored entry displaced by incoming remote landing allocation.
         seed_host_entries(self.store, _key(1))
@@ -1513,7 +1480,7 @@ class TestNamespace(unittest.TestCase):
     NS = b"NS16bytes--------"[:16]
 
     def setUp(self):
-        self.store = FakeKVCacheStore(registered_workers=2)
+        self.store = FakeKVCacheStore()
         self.manager = make_global_manager(self.store, key_namespace=self.NS)
 
     def test_namespace_prefixes_every_sub_hash(self):

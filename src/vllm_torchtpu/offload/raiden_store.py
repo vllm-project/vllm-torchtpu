@@ -53,6 +53,8 @@ from __future__ import annotations
 import enum
 import hashlib
 import os
+import socket
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -176,10 +178,7 @@ class RaidenOffloadingManager(OffloadingManager):
 
     The store owns the directory, LRU, pins, and transfers; this class maps
     vLLM's manager contract onto it and owns the failure-aware job finalizer
-    (`poll_finished_jobs`). The stock `complete_store` / `complete_load`
-    callbacks are deliberately no-ops: all raiden-side state transitions
-    (release on success, release_and_delete on failure) happen in the
-    finalizer, keyed by the exact admitted batch.
+    (`poll_finished_jobs`).
     """
 
     def __init__(
@@ -203,7 +202,6 @@ class RaidenOffloadingManager(OffloadingManager):
             offload_logical_blocks_capacity * gpu_block_size_factor)
         self._capacity_keys = offload_logical_blocks_capacity
         self._gpu_block_size_factor = gpu_block_size_factor
-        self._world_size = world_size
         self._key_namespace = key_namespace
         # Cross-instance sharing: publishing blocks to the global registry
         # requires a peer-reachable store_server_ip.
@@ -235,6 +233,9 @@ class RaidenOffloadingManager(OffloadingManager):
             torch_tpu_common_loader.load_torch_tpu_common()
             from tpu_raiden.frameworks.torch import \
                 _tpu_raiden_torch as store_types
+            logger.info(
+                "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
+                "until %d worker(s) register", world_size)
             store = store_types.KVCacheStore(
                 capacity=kernel_physical_blocks_capacity,
                 raiden_id=store_types.RaidenId(raiden_job_name, "0",
@@ -247,13 +248,19 @@ class RaidenOffloadingManager(OffloadingManager):
                 raiden_orchestrator_address=raiden_orchestrator_address,
                 # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
                 store_server_ip=store_server_ip or "127.0.0.1",
+                # Construction blocks in RaidenController::Init() until every
+                # rank registers, and raises on timeout
+                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
+                expected_worker_count=world_size,
             )
             logger.info(
                 "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d kernel blocks "
                 "(%d offloaded blocks x %d), namespace=%s, controller at "
-                "%s%s", kernel_physical_blocks_capacity,
+                "%s, all %d workers registered%s",
+                kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity, gpu_block_size_factor,
                 key_namespace.hex(), store.raiden_controller_address,
+                world_size,
                 (f", published at {store.store_server_address or '<nothing>'}"
                  f" in registry {global_registry_address}"
                  if self._enable_global else ""))
@@ -273,11 +280,6 @@ class RaidenOffloadingManager(OffloadingManager):
             raise RuntimeError(
                 "TPURaidenOffloadingConnector: the tpu_raiden wheel lacks "
                 "insert_and_lock_detailed; upgrade the pinned wheel.")
-
-        # Registration gate: offloading operations remain disabled until all
-        # worker ranks have registered device buffers with the controller,
-        # preventing partial or corrupted transfers.
-        self._gate_open = False
 
         # Advisory admission state: filters `prepare_store` to prevent redundant
         # admissions for keys already stored or in-flight.
@@ -335,25 +337,6 @@ class RaidenOffloadingManager(OffloadingManager):
                 displaced.append(key)
         return displaced
 
-    # -- registration gate ----------------------------------------------
-
-    def is_gate_open(self) -> bool:
-        if self._gate_open:
-            return True
-        num = self._store.num_registered_workers()
-        if num > self._world_size:
-            raise RuntimeError(
-                f"TPURaidenOffloadingConnector: {num} workers registered with the offload "
-                f"controller, expected at most world_size={self._world_size}."
-                " A stale or foreign worker registration would corrupt the "
-                "save fanout.")
-        if num == self._world_size:
-            self._gate_open = True
-            logger.info(
-                "TPURaidenOffloadingConnector: registration gate open: %d/%d workers "
-                "registered; stores and loads enabled.", num, self._world_size)
-        return self._gate_open
-
     # -- OffloadingManager contract --------------------------------------
 
     def on_new_request(self,
@@ -361,8 +344,6 @@ class RaidenOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        if not self.is_gate_open():
-            return LookupResult.MISS
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
@@ -405,8 +386,6 @@ class RaidenOffloadingManager(OffloadingManager):
         return LookupResult.HIT
 
     def touch(self, keys, req_context: ReqContext) -> None:
-        if not self._gate_open:
-            return
         # Pin and immediate release moves entries to the Most Recently Used
         # (MRU) position, refreshing their LRU order. The advisory filter
         # prevents unnecessary probes for keys not stored locally.
@@ -468,16 +447,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
         return RaidenLoadStoreSpec(keys, displaced_keys=displaced_keys)
 
-    def complete_load(self, keys, req_context: ReqContext) -> None:
-        # Intentionally a no-op: _finalize() releases pinned entries upon
-        # polled DMA completion. Releasing here would cause double-unpinning
-        # and risk dropping concurrent locks on shared entries.
-        return
-
     def prepare_store(self, keys,
                       req_context: ReqContext) -> PrepareStoreOutput | None:
-        if not self.is_gate_open():
-            return None
         keys_to_store = [
             key for key in keys if key not in self._stored_keys
             and key not in self._inflight_store_keys
@@ -493,14 +464,6 @@ class RaidenOffloadingManager(OffloadingManager):
             store_spec=RaidenLoadStoreSpec(keys_to_store),
             evicted_keys=[],
         )
-
-    def complete_store(self,
-                       keys,
-                       req_context: ReqContext,
-                       success: bool = True) -> None:
-        # Intentionally a no-op: _finalize() drives store state transitions
-        # and unpinning upon polled hardware completion.
-        return
 
     def take_events(self):
         events = self._pending_events
@@ -1041,9 +1004,16 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
     managed centrally by the controller and never dispatched to workers directly;
     the worker submit hooks assert fail loudly if invoked.
 
-    Registration is deferred: worker initialization occurs before the scheduler
-    creates the controller server. Worker ranks register lazily on the first
-    inference step via ensure_registered() once the controller is running.
+    Registration is eager but asynchronous: worker initialization occurs
+    before the scheduler creates the controller server, so a background
+    thread probes the controller endpoint and registers as soon as it is
+    reachable — normally while engine init is still loading/compiling, which
+    keeps the host-pool allocation and registration RPCs off the first
+    request's critical path. The scheduler side blocks KVCacheStore
+    construction on all ranks registering, so a rank that cannot register
+    fails engine startup when that barrier times out — and conversely, no
+    inference step can ever run unregistered, so there is no per-step
+    registration hook.
     """
 
     def __init__(
@@ -1108,29 +1078,76 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._controller_address = controller_address
         self._rank = rank
         self._mgr = None
+        self._stop_registration = threading.Event()
+        self._register_thread = threading.Thread(
+            target=self._register_loop,
+            name=f"raiden-offload-register-rank{rank}",
+            daemon=True)
+        self._register_thread.start()
 
-    def ensure_registered(self) -> None:
-        """Idempotently register this worker rank's HBM buffers with the Raiden controller.
+    def _controller_reachable(self) -> bool:
+        """TCP-probe the controller endpoint (a listening server is a
+        precondition for registering, not proof of registration)."""
+        host, _, port = self._controller_address.rpartition(":")
+        host = host.strip("[]")
+        try:
+            with socket.create_connection((host, int(port)), timeout=1.0):
+                return True
+        except OSError:
+            return False
 
-        Fails fast if registration fails to prevent partial transfer fanouts where
-        unregistered ranks are skipped while stores falsely report success.
+    def _register_loop(self) -> None:
+        """Background registration: wait for the controller server to come up
+        (it is created scheduler-side after this worker), then register.
+
+        Retries with backoff until it succeeds or shutdown() stops it. The
+        verdict lives scheduler-side: KVCacheStore construction blocks until
+        every rank has registered and fails engine startup on timeout, so
+        this loop only has to keep trying, never to give up or escalate.
         """
-        if self._mgr is not None:
-            return
-        from tpu_raiden.api.torch import kv_cache_manager as _kcm
-        self._mgr = _kcm.KVCacheManager(
-            kv_caches=self._device_tensors,
-            local_control_port=0,
-            host_blocks_to_allocate=self._host_blocks_to_allocate,
-            raiden_worker_port=0,
-            raiden_controller_address=self._controller_address,
-            worker_id=f"shard_{self._rank}",
-            node_id=self._rank,
-        )
-        logger.info(
-            "TPURaidenOffloadingConnector: rank %d registered with offload controller at "
-            "%s (%d host kernel blocks)", self._rank, self._controller_address,
-            self._host_blocks_to_allocate)
+        delay = 0.5
+        next_note = time.monotonic() + 30.0
+        while not self._stop_registration.is_set():
+            if self._controller_reachable():
+                try:
+                    from tpu_raiden.api.torch import kv_cache_manager as _kcm
+                    self._mgr = _kcm.KVCacheManager(
+                        kv_caches=self._device_tensors,
+                        local_control_port=0,
+                        host_blocks_to_allocate=self._host_blocks_to_allocate,
+                        raiden_worker_port=0,
+                        raiden_controller_address=self._controller_address,
+                        worker_id=f"shard_{self._rank}",
+                        node_id=self._rank,
+                    )
+                    logger.info(
+                        "TPURaidenOffloadingConnector: rank %d registered with offload "
+                        "controller at %s (%d host kernel blocks)", self._rank,
+                        self._controller_address,
+                        self._host_blocks_to_allocate)
+                    return
+                except Exception:
+                    # A persistent failure escalates via the
+                    # scheduler's construction barrier timeout.
+                    logger.warning(
+                        "TPURaidenOffloadingConnector: rank %d: background "
+                        "registration attempt failed; retrying in %.1fs",
+                        self._rank,
+                        delay,
+                        exc_info=True)
+            elif time.monotonic() >= next_note:
+                # The unreachable case produces no exception to log, so this
+                # throttled note is its only signal (and names the probed
+                # address, the thing a misconfigured recipe gets wrong).
+                logger.warning(
+                    "TPURaidenOffloadingConnector: rank %d: offload controller at %s "
+                    "not reachable yet; still probing (the scheduler's "
+                    "registration barrier will fail engine startup if "
+                    "registration does not succeed in time)", self._rank,
+                    self._controller_address)
+                next_note = time.monotonic() + 30.0
+            self._stop_registration.wait(delay)
+            delay = min(delay * 2, 5.0)
 
     def submit_store(self, job_id, src_spec, dst_spec) -> bool:
         raise AssertionError(
@@ -1150,6 +1167,8 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         return
 
     def shutdown(self) -> None:
+        self._stop_registration.set()
+        self._register_thread.join(timeout=5.0)
         self._mgr = None
 
 

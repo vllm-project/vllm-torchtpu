@@ -73,7 +73,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (AdmissionOp,
                                                 RaidenLoadStoreSpec,
                                                 RaidenOffloadingManager,
-                                                RaidenStoreOffloadingWorker,
                                                 TPURaidenStoreOffloadingSpec)
 
 logger = init_logger(__name__)
@@ -304,21 +303,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._load_error_block_ids: set[int] = set()
 
     # -- worker-side hooks -------------------------------------------------
-
-    def _raiden_worker(self) -> RaidenStoreOffloadingWorker:
-        assert self.connector_worker is not None
-        worker = self.connector_worker.worker
-        assert isinstance(worker, RaidenStoreOffloadingWorker)
-        return worker
-
-    def start_load_kv(self, forward_context, **kwargs) -> None:
-        # Defer registration to the first step when the controller server is ready.
-        self._raiden_worker().ensure_registered()
-
-    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
-        # Flushes are handled scheduler-side; no per-rank transfer state to flush.
-        return
-
     def get_finished(self,
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
