@@ -3420,9 +3420,14 @@ class TPUModelRunner(GPUModelRunner):
             num_valid = (next_tokens[:num_reqs]
                          != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
             offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
-        for group_indices in indices_per_group:
-            self.mamba_slot_read_offsets.index_put_((group_indices.long(), ),
-                                                    offsets)
+        if len(indices_per_group) == 1:
+            self.mamba_slot_read_offsets.index_put_(
+                (indices_per_group[0].long(), ), offsets)
+        else:
+            all_indices = torch.cat(indices_per_group, dim=0).long()
+            all_offsets = offsets.repeat(len(indices_per_group))
+            self.mamba_slot_read_offsets.index_put_((all_indices, ),
+                                                    all_offsets)
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -3496,11 +3501,18 @@ class TPUModelRunner(GPUModelRunner):
         # No `if nothing_new: return` here — see the docstring. The device
         # work below must be issued on every rank on every step.
         keep_dev.copy_(keep, non_blocking=True)
-        for group_indices in groups:
-            # Non-new rows collapse onto the null slot; writing 0 there is a
-            # no-op, which keeps this scatter one fixed shape.
-            targets = torch.where(keep_dev, group_indices, null)
+        # Non-new rows collapse onto the null slot; writing 0 there is a
+        # no-op, which keeps this scatter one fixed shape.
+        if len(groups) == 1:
+            targets = torch.where(keep_dev, groups[0], null)
             self.mamba_slot_read_offsets.index_put_((targets.long(), ), zeros)
+        else:
+            all_groups = torch.cat(groups, dim=0)
+            keep_all = keep_dev.repeat(len(groups))
+            targets = torch.where(keep_all, all_groups, null)
+            zeros_all = zeros.repeat(len(groups))
+            self.mamba_slot_read_offsets.index_put_((targets.long(), ),
+                                                    zeros_all)
 
     def _read_offset_reset_scratch(
         self, width: int, device: torch.device
