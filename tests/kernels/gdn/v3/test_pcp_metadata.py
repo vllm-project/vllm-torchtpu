@@ -69,7 +69,7 @@ def _assert_pytree_array_equal(actual, expected):
                                       np.asarray(expected_leaf))
 
 
-def test_schedule_splits_unaligned_requests_at_absolute_pcp_rounds():
+def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
     cfg = _cfg(batch_size=128, tile_size=4)
     seq_lens, query_start, state_indices, distribution = _metadata_inputs(
         lengths=[13, 11],
@@ -91,54 +91,51 @@ def test_schedule_splits_unaligned_requests_at_absolute_pcp_rounds():
         num_projection_out_blocks=8,
     )
 
-    assert int(schedule.num_stages) == 4
-    np.testing.assert_array_equal(np.asarray(schedule.num_tokens[:4]),
-                                  [9, 4, 10, 1])
+    assert int(schedule.num_stages) == 3
+    np.testing.assert_array_equal(np.asarray(schedule.num_tokens[:3]),
+                                  [13, 3, 8])
     np.testing.assert_array_equal(
-        np.asarray(schedule.rank_valid_rows[:4]),
+        np.asarray(schedule.rank_valid_rows[:3]),
         [
-            [0, 1, 4, 4],
-            [4, 0, 0, 0],
-            [0, 2, 4, 4],
-            [1, 0, 0, 0],
+            [4, 4, 4, 1],
+            [0, 0, 0, 3],
+            [4, 4, 0, 0],
         ],
     )
     np.testing.assert_array_equal(
-        np.asarray(schedule.rank_recv_start[:4]),
+        np.asarray(schedule.rank_recv_start[:3]),
         [
-            [0, 4, 8, 12],
             [0, 4, 8, 12],
             [0, 4, 8, 12],
             [0, 4, 8, 12],
         ],
     )
     # Rank-local request segments stay compact across stage boundaries and
-    # across requests even though the requests start at different offsets.
+    # across requests even though their absolute positions are unrelated.
     np.testing.assert_array_equal(
-        np.asarray(schedule.rank_row_start[:4]),
+        np.asarray(schedule.rank_row_start[:3]),
         [
             [0, 0, 0, 0],
-            [0, 1, 4, 4],
-            [4, 1, 4, 4],
-            [4, 3, 8, 8],
+            [4, 4, 4, 1],
+            [4, 4, 4, 4],
         ],
     )
-    assert int(metadata.num_tiles) == 8
+    assert int(metadata.num_tiles) == 7
     np.testing.assert_array_equal(
-        np.asarray(metadata.p_id_to_r_base.data[:8]),
-        [0, 1, 5, 9, 13, 15, 19, 23],
+        np.asarray(metadata.p_id_to_r_base.data[:7]),
+        [0, 4, 8, 12, 13, 16, 20],
     )
     np.testing.assert_array_equal(
-        np.asarray(metadata.p_id_to_r_size.data[:8]),
-        [1, 4, 4, 4, 2, 4, 4, 1],
+        np.asarray(metadata.p_id_to_r_size.data[:7]),
+        [4, 4, 4, 1, 3, 4, 4],
     )
     np.testing.assert_array_equal(
-        np.asarray(metadata.p_id_is_first_tile.data[:8]),
-        [True, False, False, False, True, False, False, False],
+        np.asarray(metadata.p_id_is_first_tile.data[:7]),
+        [True, False, False, False, True, False, False],
     )
     np.testing.assert_array_equal(
-        np.asarray(metadata.p_id_is_last_tile.data[:8]),
-        [False, False, False, True, False, False, False, True],
+        np.asarray(metadata.p_id_is_last_tile.data[:7]),
+        [False, False, False, True, False, False, True],
     )
 
 
@@ -180,7 +177,7 @@ def test_dual_coordinates_separate_token_ownership_from_absolute_state():
         num_qkv_out_blocks=6,
         num_projection_out_blocks=8,
     )
-    current_metadata, current_schedule = (
+    _, request_absolute_schedule = (
         pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
             token_owner_starts=request_absolute_starts,
             request_absolute_starts=request_absolute_starts,
@@ -199,10 +196,10 @@ def test_dual_coordinates_separate_token_ownership_from_absolute_state():
             **common_kwargs,
         ))
 
-    # The current public path remains bit-for-bit identical: it supplies the
-    # request-absolute coordinate as the token-owner coordinate too.
-    _assert_pytree_array_equal(public_metadata, current_metadata)
-    _assert_pytree_array_equal(public_schedule, current_schedule)
+    # The public path now supplies batch-flat owner starts while retaining the
+    # independently reconstructed request-absolute starts for state semantics.
+    _assert_pytree_array_equal(public_metadata, owner_metadata)
+    _assert_pytree_array_equal(public_schedule, owner_schedule)
 
     assert int(owner_schedule.num_stages) == 3
     np.testing.assert_array_equal(np.asarray(owner_schedule.request_id[:3]),
@@ -217,7 +214,7 @@ def test_dual_coordinates_separate_token_ownership_from_absolute_state():
     )
     assert not np.array_equal(
         np.asarray(owner_schedule.num_tokens[:3]),
-        np.asarray(current_schedule.num_tokens[:3]),
+        np.asarray(request_absolute_schedule.num_tokens[:3]),
     )
 
     # Changing only absolute starts cannot change ownership, rank rows, or
@@ -295,30 +292,33 @@ def test_live_stage_and_tile_counts_do_not_expand_to_compile_bucket():
     )
 
 
-def test_projection_schedule_catches_up_only_the_imbalanced_live_rank():
+def test_projection_schedule_catches_up_only_the_imbalanced_owner_rank():
     cfg = _cfg(batch_size=8 * 4096)
     seq_lens, query_start, state_indices, distribution = _metadata_inputs(
-        # Each independent request starts at absolute position zero, so all
-        # live rows belong to PCP rank zero.  This deliberately exposes fewer
-        # GDN tiles than the next 1024-row projection block needs.
+        # The private coordinate helper below explicitly resets ownership for
+        # each request, so all live rows belong to PCP rank zero. This retains
+        # coverage of the projection catch-up path independently of the public
+        # batch-flat ownership policy.
         lengths=[256] * 5,
         offsets=[0] * 5,
         max_num_seqs=16,
     )
 
-    metadata, schedule = pcp_metadata.compute_pcp_stage_metadata(
-        cfg,
-        seq_lens,
-        query_start,
-        state_indices,
-        distribution[0],
-        distribution[-1],
-        pcp_size=8,
-        comm_chunk_size=256,
-        projection_token_block_size=_PROJECTION_TOKEN_BLOCK_SIZE,
-        num_qkv_out_blocks=_NUM_QKV_OUT_BLOCKS,
-        num_projection_out_blocks=_NUM_PROJECTION_OUT_BLOCKS,
-    )
+    metadata, schedule = (
+        pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
+            cfg,
+            query_start,
+            state_indices,
+            distribution[0],
+            distribution[-1],
+            token_owner_starts=jnp.zeros_like(seq_lens),
+            request_absolute_starts=jnp.zeros_like(seq_lens),
+            pcp_size=8,
+            comm_chunk_size=256,
+            projection_token_block_size=_PROJECTION_TOKEN_BLOCK_SIZE,
+            num_qkv_out_blocks=_NUM_QKV_OUT_BLOCKS,
+            num_projection_out_blocks=_NUM_PROJECTION_OUT_BLOCKS,
+        ))
 
     assert int(schedule.num_stages) == 5
     assert int(metadata.num_tiles) == 20

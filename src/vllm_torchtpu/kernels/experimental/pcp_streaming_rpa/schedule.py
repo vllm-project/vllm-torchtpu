@@ -17,8 +17,8 @@ import dataclasses
 
 import numpy as np
 
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    pcp_token_owner_chunk_ranges
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    pcp_token_owner_chunk_ranges, )
 
 
 class ScheduleField:
@@ -358,9 +358,11 @@ def generate_pcp_streaming_schedule_from_metadata_host(
 
     This runtime helper is intentionally narrow for the metadata-driven path:
     active query spans packed from index 0, one lane, one KV page per ring step
-    for multi-request chunks, and page_size divisible by interleave_size. The static
-    schedule shape is padded from the compile bucket size, not the live query
-    length. It converts inputs to NumPy and is not safe for JAX tracers.
+    for multi-request chunks, and page_size divisible by interleave_size. Query
+    ownership follows the batch-flat ``cu_q_lens`` coordinate, while causal and
+    cache coordinates remain request-absolute. The static schedule shape is
+    padded from the compile bucket size, not the live query length. It converts
+    inputs to NumPy and is not safe for JAX tracers.
     """
     kv_lens = np.asarray(kv_lens, dtype=np.int64)
     page_indices = np.asarray(page_indices, dtype=np.int32)
@@ -394,6 +396,7 @@ def generate_pcp_streaming_schedule_from_metadata_host(
     kv_lens_active = kv_lens[:num_reqs]
     cu_q_lens_active = cu_q_lens[:num_reqs + 1]
     q_lens = cu_q_lens_active[1:] - cu_q_lens_active[:-1]
+    token_owner_start_offsets = cu_q_lens_active[:-1]
     request_absolute_query_start_offsets = kv_lens_active - q_lens
     if np.any(q_lens <= 0):
         raise NotImplementedError(
@@ -430,7 +433,7 @@ def generate_pcp_streaming_schedule_from_metadata_host(
     return _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=kv_lens_active,
         cu_q_lens=cu_q_lens_active,
-        token_owner_start_offsets=request_absolute_query_start_offsets,
+        token_owner_start_offsets=token_owner_start_offsets,
         request_absolute_query_start_offsets=(
             request_absolute_query_start_offsets),
         block_tables=local_block_tables,
@@ -522,9 +525,10 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     per-rank Q tiles with arbitrary live q_len/q_start values while the schedule
     shapes remain static from the compile bucket. The current schedule covers
     KV pages that overlap the active query cycle; the history schedule covers
-    earlier KV pages. Callers must keep the narrow metadata path constraints:
-    num_lanes=1, kv_pages_per_block=1, and page_size divisible by
-    interleave_size.
+    earlier KV pages. Query ownership follows the batch-flat ``cu_q_lens``
+    coordinate, while causal and cache coordinates remain request-absolute.
+    Callers must keep the narrow metadata path constraints: num_lanes=1,
+    kv_pages_per_block=1, and page_size divisible by interleave_size.
     """
     import jax.numpy as jnp
 
@@ -796,10 +800,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         q_len = jnp.where(req_active, q_len_raw, 0)
         kv_len = jnp.where(req_active, kv_lens[req_idx], 0)
         request_absolute_query_start = kv_len - q_len
-        # The public metadata path keeps the current ownership policy.
-        # Keeping these as distinct values makes the later owner-policy switch
-        # independent from causal/history/cache coordinates.
-        token_owner_start = request_absolute_query_start
+        token_owner_start = cu_q_lens[req_idx]
         num_kv_pages = _kv_steps_for_token_count(kv_len)
 
         for tile_idx in range(max_q_tiles):

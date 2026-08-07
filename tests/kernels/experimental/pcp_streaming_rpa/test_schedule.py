@@ -21,18 +21,24 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from schedule_reference import \
-    generate_pcp_streaming_schedule_reference  # noqa: E402
+from schedule_reference import generate_pcp_streaming_schedule_reference
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
-    PcpStreamingSchedule, ScheduleField, TilePlanField,
-    _build_pcp_rank_query_tiles, build_pcp_streaming_active_page_groups,
+    PcpStreamingSchedule,
+    ScheduleField,
+    TilePlanField,
+    _build_pcp_rank_query_tiles,
+    _generate_pcp_streaming_schedule_lockstep_compact,
+    build_pcp_streaming_active_page_groups,
     build_pcp_streaming_schedule_inputs_from_metadata_host,
     build_pcp_streaming_schedule_inputs_from_metadata_jax,
     estimate_pcp_streaming_metadata_schedule_steps_ub,
-    estimate_pcp_streaming_schedule_steps_ub, generate_pcp_streaming_schedule,
+    estimate_pcp_streaming_schedule_steps_ub,
+    generate_pcp_streaming_schedule,
     generate_pcp_streaming_schedule_from_metadata_host,
-    unpack_pcp_streaming_schedule_field, validate_pcp_streaming_schedule)
+    unpack_pcp_streaming_schedule_field,
+    validate_pcp_streaming_schedule,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -514,10 +520,11 @@ def test_metadata_schedule_matches_host_oracle_for_aligned_single_request(
         interleave_size=interleave_size,
         q_block_size=q_block_size,
     )
-    expected = generate_pcp_streaming_schedule(
+    expected = _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=[kv_len],
         cu_q_lens=[0, q_len],
-        q_start_offsets=[q_start],
+        token_owner_start_offsets=[0],
+        request_absolute_query_start_offsets=[q_start],
         block_tables=block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -571,10 +578,11 @@ def test_metadata_schedule_matches_host_oracle_for_aligned_multi_request():
         interleave_size=interleave_size,
         q_block_size=q_block_size,
     )
-    expected = generate_pcp_streaming_schedule(
+    expected = _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=kv_lens_active,
         cu_q_lens=np.array([0, q_lens[0], q_lens.sum()], dtype=np.int32),
-        q_start_offsets=q_starts,
+        token_owner_start_offsets=np.array([0, q_lens[0]], dtype=np.int32),
+        request_absolute_query_start_offsets=q_starts,
         block_tables=localized_block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -594,6 +602,64 @@ def test_metadata_schedule_matches_host_oracle_for_aligned_multi_request():
 
     _assert_schedule_equal(actual, expected)
     validate_pcp_streaming_schedule(actual, require_ring_source_invariant=True)
+
+
+def test_metadata_schedule_balances_32_short_zero_history_requests():
+    num_reqs = 32
+    q_len = 256
+    pcp_size = 8
+    page_size = interleave_size = q_block_size = 256
+    global_bucket_tokens = num_reqs * q_len
+    local_kv_cache_num_blocks = num_reqs
+    q_lens = np.full(num_reqs, q_len, dtype=np.int32)
+    cu_q_lens = np.concatenate(
+        (np.zeros(1, dtype=np.int32), np.cumsum(q_lens, dtype=np.int32)))
+    schedule = generate_pcp_streaming_schedule_from_metadata_host(
+        kv_lens=q_lens,
+        page_indices=np.arange(num_reqs, dtype=np.int32)[:, None],
+        cu_q_lens=cu_q_lens,
+        distribution=np.array([0, 0, num_reqs], dtype=np.int32),
+        global_bucket_tokens=global_bucket_tokens,
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        q_block_size=q_block_size,
+        max_context_tokens=q_len,
+    )
+
+    loaded_rows = np.zeros(pcp_size, dtype=np.int32)
+    for rank in range(pcp_size):
+        load_steps = np.flatnonzero(schedule.load_q[rank, :, 0])
+        assert load_steps.size == num_reqs // pcp_size
+        loaded_rows[rank] = max(
+            int(schedule.q_hbm_offset[rank, step, 0] +
+                schedule.q_tile_size[rank, step, 0]) for step in load_steps)
+    np.testing.assert_array_equal(
+        loaded_rows,
+        np.full(pcp_size, global_bucket_tokens // pcp_size, dtype=np.int32),
+    )
+
+    schedule_bound = estimate_pcp_streaming_metadata_schedule_steps_ub(
+        global_bucket_tokens=global_bucket_tokens,
+        capacity_tokens=q_len,
+        block_size=page_size,
+        pcp_size=pcp_size,
+        q_block_size=q_block_size,
+        max_num_reqs=num_reqs,
+    )
+    assert schedule.packed_schedule.shape[0] == schedule_bound
+    assert int(schedule.global_actual_steps[0]) <= schedule_bound
+    full_context_bound = estimate_pcp_streaming_metadata_schedule_steps_ub(
+        global_bucket_tokens=global_bucket_tokens,
+        capacity_tokens=128 * 1024,
+        block_size=page_size,
+        pcp_size=pcp_size,
+        q_block_size=q_block_size,
+        max_num_reqs=num_reqs,
+    )
+    assert full_context_bound == 51_200
+    assert int(schedule.global_actual_steps[0]) <= full_context_bound
 
 
 def test_metadata_schedule_accepts_decode_only_distribution():
@@ -626,10 +692,11 @@ def test_metadata_schedule_accepts_decode_only_distribution():
         interleave_size=interleave_size,
         q_block_size=q_block_size,
     )
-    expected = generate_pcp_streaming_schedule(
+    expected = _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=kv_lens_active,
         cu_q_lens=np.array([0, 1, 2], dtype=np.int32),
-        q_start_offsets=q_starts,
+        token_owner_start_offsets=np.array([0, 1], dtype=np.int32),
+        request_absolute_query_start_offsets=q_starts,
         block_tables=localized_block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -683,10 +750,11 @@ def test_metadata_schedule_accepts_mixed_distribution():
         interleave_size=interleave_size,
         q_block_size=q_block_size,
     )
-    expected = generate_pcp_streaming_schedule(
+    expected = _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=kv_lens_active,
         cu_q_lens=np.array([0, 1, 10, 27], dtype=np.int32),
-        q_start_offsets=q_starts,
+        token_owner_start_offsets=np.array([0, 1, 10], dtype=np.int32),
+        request_absolute_query_start_offsets=q_starts,
         block_tables=localized_block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -797,10 +865,11 @@ def test_metadata_schedule_localizes_standard_block_table_pages():
         interleave_size=interleave_size,
         q_block_size=q_block_size,
     )
-    expected = generate_pcp_streaming_schedule(
+    expected = _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=[kv_len],
         cu_q_lens=[0, q_len],
-        q_start_offsets=[q_start],
+        token_owner_start_offsets=[0],
+        request_absolute_query_start_offsets=[q_start],
         block_tables=block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -888,23 +957,113 @@ def test_metadata_jax_compact_plan_tracks_group_starts():
         assert int(np.asarray(meta)[1]) == int(groups.sum())
 
 
+def test_metadata_jax_default_owner_uses_batch_flat_query_offsets():
+    kwargs = {
+        "kv_lens": np.array([14, 21], dtype=np.int32),
+        "page_indices": np.arange(16, dtype=np.int32),
+        "cu_q_lens": np.array([0, 4, 8], dtype=np.int32),
+        "distribution": np.array([0, 0, 2], dtype=np.int32),
+        "global_bucket_tokens": 8,
+        "local_kv_cache_num_blocks": 8,
+        "page_size": 4,
+        "pcp_size": 2,
+        "interleave_size": 2,
+        "q_block_size": 2,
+        "max_context_tokens": 64,
+        "compact": True,
+    }
+    tile_plan, *_ = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+        **kwargs)
+    logical = np.asarray(tile_plan)[:,
+                                    0, :2 * TilePlanField.NUM_FIELDS].reshape(
+                                        tile_plan.shape[0], 2,
+                                        TilePlanField.NUM_FIELDS)
+    active = np.any(logical[..., TilePlanField.Q_TILE_SIZE] > 0, axis=1)
+    logical = logical[active]
+
+    np.testing.assert_array_equal(logical[:, 0, TilePlanField.REQ_ID], [0, 1])
+    np.testing.assert_array_equal(
+        logical[..., TilePlanField.Q_GLOBAL_START],
+        np.array([[10, 12], [17, 19]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        logical[..., TilePlanField.Q_HBM_OFFSET],
+        np.array([[0, 0], [2, 2]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(logical[..., TilePlanField.Q_TILE_SIZE], 2)
+    # Legacy absolute-position ownership would put request 0's first rows on
+    # rank 1 and produce [12, 10], rather than the batch-flat [10, 12].
+    assert not np.array_equal(
+        logical[0, :, TilePlanField.Q_GLOBAL_START],
+        np.array([12, 10], dtype=np.int32),
+    )
+
+
+@pytest.mark.parametrize("history_tokens", [25_600, 128 * 1024])
+def test_metadata_jax_batch_flat_owner_preserves_long_absolute_history(
+        history_tokens):
+    pcp_size = 4
+    q_len = 256
+    page_size = 128
+    interleave_size = 32
+    q_block_size = 64
+    kv_len = history_tokens + q_len
+    local_kv_cache_num_blocks = (kv_len + pcp_size * page_size -
+                                 1) // (pcp_size * page_size)
+    (tile_plan, _block_tables, _current_ids, _current_starts, current_meta,
+     _history_ids, _history_starts,
+     history_meta) = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+         kv_lens=np.array([kv_len], dtype=np.int32),
+         page_indices=np.arange(local_kv_cache_num_blocks, dtype=np.int32),
+         cu_q_lens=np.array([0, q_len], dtype=np.int32),
+         distribution=np.array([0, 0, 1], dtype=np.int32),
+         global_bucket_tokens=q_len,
+         local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+         page_size=page_size,
+         pcp_size=pcp_size,
+         interleave_size=interleave_size,
+         q_block_size=q_block_size,
+         max_context_tokens=kv_len,
+         compact=True,
+     )
+    logical = np.asarray(tile_plan)[:, 0, :pcp_size *
+                                    TilePlanField.NUM_FIELDS].reshape(
+                                        tile_plan.shape[0], pcp_size,
+                                        TilePlanField.NUM_FIELDS)
+    active = np.any(logical[..., TilePlanField.Q_TILE_SIZE] > 0, axis=1)
+    logical = logical[active]
+
+    assert logical.shape[0] == 1
+    np.testing.assert_array_equal(
+        logical[0, :, TilePlanField.Q_GLOBAL_START],
+        history_tokens + np.arange(pcp_size) * interleave_size,
+    )
+    np.testing.assert_array_equal(
+        logical[0, :, TilePlanField.Q_TILE_SIZE],
+        np.full(pcp_size, q_block_size, dtype=np.int32),
+    )
+    assert np.all(logical[..., TilePlanField.HISTORY_CUT_PAGES] > 0)
+    assert int(np.asarray(current_meta)[1]) > 0
+    assert int(np.asarray(history_meta)[1]) > 0
+
+
 def test_metadata_jax_compact_plan_reconstructs_dense_schedule():
     pcp_size = 2
     page_size = 4
     interleave_size = 2
-    kwargs = dict(
-        kv_lens=np.array([23, 8], dtype=np.int32),
-        page_indices=np.arange(32, dtype=np.int32),
-        cu_q_lens=np.array([0, 8, 8], dtype=np.int32),
-        distribution=np.array([0, 0, 1], dtype=np.int32),
-        global_bucket_tokens=8,
-        local_kv_cache_num_blocks=16,
-        page_size=page_size,
-        pcp_size=pcp_size,
-        interleave_size=interleave_size,
-        q_block_size=4,
-        max_context_tokens=128,
-    )
+    kwargs = {
+        "kv_lens": np.array([23, 8], dtype=np.int32),
+        "page_indices": np.arange(32, dtype=np.int32),
+        "cu_q_lens": np.array([0, 8, 8], dtype=np.int32),
+        "distribution": np.array([0, 0, 1], dtype=np.int32),
+        "global_bucket_tokens": 8,
+        "local_kv_cache_num_blocks": 16,
+        "page_size": page_size,
+        "pcp_size": pcp_size,
+        "interleave_size": interleave_size,
+        "q_block_size": 4,
+        "max_context_tokens": 128,
+    }
     (current_dense, current_active, history_dense,
      history_active) = build_pcp_streaming_schedule_inputs_from_metadata_jax(
          **kwargs)
@@ -1156,10 +1315,10 @@ def test_metadata_schedule_supports_smaller_interleave_than_page_size():
     np.testing.assert_array_equal(active_page_groups,
                                   np.array([1], dtype=np.int32))
     np.testing.assert_array_equal(fields["req_id"][:, :2, 0],
-                                  np.zeros((2, 2), dtype=np.int32))
+                                  np.array([[0, 0], [-1, -1]], dtype=np.int32))
     np.testing.assert_array_equal(fields["kv_page_rank"][:, :2, 0],
                                   np.array([[0, 1], [0, 1]], dtype=np.int32))
     np.testing.assert_array_equal(fields["kv_global_start"][:, :2, 0],
                                   np.array([[0, 2], [0, 2]], dtype=np.int32))
     np.testing.assert_array_equal(fields["kv_valid_len"][:, :2, 0],
-                                  np.array([[4, 3], [4, 3]], dtype=np.int32))
+                                  np.array([[4, 3], [0, 0]], dtype=np.int32))

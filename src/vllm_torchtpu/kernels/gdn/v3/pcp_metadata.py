@@ -142,10 +142,9 @@ def compute_pcp_stage_metadata(
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
     """Build PCP metadata from the current public request metadata.
 
-    Today query ownership follows request-absolute positions, so the public
-    path deliberately passes the same derived starts as both coordinates. A
-    later batch-flat layout only needs to replace ``token_owner_starts``;
-    request state and convolution semantics continue using the absolute starts.
+    Query ownership follows the batch-flat request-major coordinate from
+    ``query_start_loc[:-1]``. Request state and convolution semantics remain
+    independent and use absolute starts reconstructed from ``seq_lens``.
     """
     if seq_lens.size != state_indices.size:
         raise ValueError("state_indices and seq_lens must have equal size.")
@@ -155,7 +154,7 @@ def compute_pcp_stage_metadata(
     q_lens = query_start_loc[1:] - query_start_loc[:-1]
     request_absolute_starts = seq_lens.astype(jnp.int32) - q_lens.astype(
         jnp.int32)
-    token_owner_starts = request_absolute_starts
+    token_owner_starts = query_start_loc[:-1].astype(jnp.int32)
     return _compute_pcp_stage_metadata_from_coordinates(
         cfg,
         query_start_loc,

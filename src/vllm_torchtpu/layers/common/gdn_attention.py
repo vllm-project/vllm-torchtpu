@@ -561,11 +561,9 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
 
-        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
-        # The current public metadata format assigns tokens by request-absolute
-        # position. Keep the owner coordinate separate so a later layout can
-        # change only this source; state/conv still consume ``seq_lens_`` below.
-        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
+        # PCP ownership follows the batch-flat request-major coordinate.
+        # State/conv semantics remain request-absolute through ``seq_lens_``.
+        token_owner_starts = query_start_loc_[:-1]
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
             token_owner_starts,
@@ -1078,10 +1076,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
                              axis=-1).reshape(local_b.shape[0], -1)
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
-        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
-        # Preserve today's public layout while keeping token ownership
-        # independent from the absolute positions used by GDN state below.
-        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
+        # PCP ownership follows the batch-flat request-major coordinate.
+        # State semantics remain request-absolute through ``seq_lens_`` below.
+        token_owner_starts = query_start_loc_[:-1]
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
             token_owner_starts,
@@ -1289,10 +1286,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
 
-        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
-        # Preserve today's public layout while keeping token ownership
-        # independent from the absolute positions used by GDN state below.
-        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
+        # PCP ownership follows the batch-flat request-major coordinate.
+        # State semantics remain request-absolute through ``seq_lens_`` below.
+        token_owner_starts = query_start_loc_[:-1]
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
             token_owner_starts,

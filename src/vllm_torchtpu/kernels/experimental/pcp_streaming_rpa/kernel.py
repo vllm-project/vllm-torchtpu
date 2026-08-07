@@ -37,6 +37,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     build_pcp_streaming_schedule_inputs_from_metadata_jax)
 
 AXIS = "pcp"
+ONLINE_STATE_INIT_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE = 512
 TPU_HBM_ROW_TILE = 16
 ONLINE_STATE_PADDED_LANES = 128
@@ -300,8 +301,12 @@ def _consume_scheduled_kv_page_multi_head(
 
 def _reset_multi_head_online_state(m_scratch_ref, l_scratch_ref,
                                    acc_scratch_ref):
+    # Keep the hot online-softmax loop identical to origin/main while making
+    # an all-masked first ring page well-defined: max(finite_min, -inf) stays
+    # finite, so both the probability update and the previous-state scale are
+    # exact (0 and 1 respectively) without an extra per-page validity mask.
     m_scratch_ref[...] = jnp.full(m_scratch_ref.shape,
-                                  -jnp.inf,
+                                  ONLINE_STATE_INIT_VALUE,
                                   dtype=jnp.float32)
     l_scratch_ref[...] = jnp.zeros(l_scratch_ref.shape, dtype=jnp.float32)
     acc_scratch_ref[...] = jnp.zeros(acc_scratch_ref.shape, dtype=jnp.float32)

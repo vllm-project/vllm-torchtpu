@@ -3898,7 +3898,8 @@ class TPUModelRunner(GPUModelRunner):
         else:
             position_ids = torch.zeros(num_tokens,
                                        dtype=torch.int32).to(self.device)
-        query_lens = [1] * num_reqs
+        query_lens = ([1] * actual_num_reqs + [0] *
+                      (num_reqs - actual_num_reqs))
         query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
                                                     dtype=torch.int32),
                                        dim=0,
@@ -3976,6 +3977,10 @@ class TPUModelRunner(GPUModelRunner):
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
+                sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
+                sequence_layout_protocol=(
+                    dummy_layout_plan.descriptor.protocol),
+                sequence_layout_version=(dummy_layout_plan.descriptor.version),
             )
 
             per_layer_attn_metadata = {

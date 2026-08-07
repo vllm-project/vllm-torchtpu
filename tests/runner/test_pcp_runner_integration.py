@@ -223,9 +223,14 @@ def _scheduler_output(scheduled_tokens):
 
 
 def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
+
+    def capture_forward_context(attn_metadata, *_args, **_kwargs):
+        runner._captured_dummy_attn_metadata = attn_metadata
+        return contextlib.nullcontext()
+
     monkeypatch.setattr(
         "vllm_torchtpu.runner.tpu_runner.set_forward_context",
-        lambda *_args, **_kwargs: contextlib.nullcontext(),
+        capture_forward_context,
     )
     monkeypatch.setattr(
         "vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context",
@@ -247,7 +252,7 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
         runner.input_batch.block_table[0].max_num_blocks_per_req,
         use_max_model_len=True,
     )
-    return runner._attn_metadata_builder_ctx
+    return getattr(runner, "_attn_metadata_builder_ctx", None)
 
 
 def test_prepare_inputs_builds_rank_local_partial_layout(monkeypatch):
@@ -398,7 +403,83 @@ def test_dummy_run_partial_layout_decode_like_metadata_routes_to_streaming(
     )
 
 
-def test_prepare_inputs_builds_rank_local_pcp_decode(monkeypatch):
+def test_dummy_run_marks_inactive_request_rows_after_cache_init(monkeypatch):
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=[64],
+                          scheduled_tokens=[1],
+                          token_paddings=[256])
+
+    ctx = _run_dummy_run(monkeypatch, runner, num_tokens=3)
+    md = runner._captured_dummy_attn_metadata["layer.0"]
+
+    assert ctx is not None
+    torch.testing.assert_close(
+        md.query_start_loc.cpu(),
+        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+    )
+    torch.testing.assert_close(md.request_distribution.cpu(),
+                               torch.tensor([3, 3, 3], dtype=torch.int32))
+
+
+def test_dummy_run_marks_inactive_request_rows_before_cache_init(monkeypatch):
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=[64],
+                          scheduled_tokens=[1],
+                          token_paddings=[256])
+    runner.kv_cache_config = None
+    runner._attn_layer_names = ["layer.0"]
+
+    ctx = _run_dummy_run(monkeypatch, runner, num_tokens=3)
+    md = runner._captured_dummy_attn_metadata["layer.0"]
+
+    assert ctx is None
+    torch.testing.assert_close(
+        md.query_start_loc.cpu(),
+        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+    )
+    torch.testing.assert_close(md.request_distribution.cpu(),
+                               torch.tensor([3, 3, 3], dtype=torch.int32))
+    assert md.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
+    assert md.sequence_layout_protocol == "pcp_streaming"
+    assert md.sequence_layout_version == 1
+
+
+def test_dummy_run_preinit_and_postinit_share_metadata_pytree(monkeypatch):
+    import jax
+
+    def make_runner():
+        return _make_runner(num_computed_tokens=[0],
+                            prompt_tokens=[64],
+                            scheduled_tokens=[1],
+                            token_paddings=[256])
+
+    postinit_runner = make_runner()
+    _run_dummy_run(monkeypatch, postinit_runner, num_tokens=3)
+    postinit_md = postinit_runner._captured_dummy_attn_metadata["layer.0"]
+
+    preinit_runner = make_runner()
+    preinit_runner.kv_cache_config = None
+    preinit_runner._attn_layer_names = ["layer.0"]
+    _run_dummy_run(monkeypatch, preinit_runner, num_tokens=3)
+    preinit_md = preinit_runner._captured_dummy_attn_metadata["layer.0"]
+
+    assert jax.tree_util.tree_structure(preinit_md) == (
+        jax.tree_util.tree_structure(postinit_md))
+    for field in (
+            "input_positions",
+            "block_tables",
+            "seq_lens",
+            "query_start_loc",
+            "request_distribution",
+    ):
+        preinit_value = getattr(preinit_md, field)
+        postinit_value = getattr(postinit_md, field)
+        assert preinit_value.shape == postinit_value.shape
+        assert preinit_value.dtype == postinit_value.dtype
+
+
+def test_prepare_inputs_batch_flat_decode_can_leave_rank_with_only_padding(
+        monkeypatch):
     scheduled = [1, 1]
     runner = _make_runner(num_computed_tokens=[16, 16],
                           prompt_tokens=[16, 16],
@@ -415,19 +496,19 @@ def test_prepare_inputs_builds_rank_local_pcp_decode(monkeypatch):
     assert runner.input_ids.shape[0] == 2
     assert runner.position_ids.shape[0] == 2
     torch.testing.assert_close(runner.input_ids.cpu(),
-                               torch.tensor([116, 216], dtype=torch.int32))
+                               torch.zeros(2, dtype=torch.int32))
     torch.testing.assert_close(runner.position_ids.cpu(),
-                               torch.tensor([16, 16], dtype=torch.int32))
+                               torch.zeros(2, dtype=torch.int32))
     assert md.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
     assert md.sequence_layout_protocol == "pcp_streaming"
     torch.testing.assert_close(md.request_distribution.cpu(),
                                torch.tensor([2, 2, 2], dtype=torch.int32))
     torch.testing.assert_close(
-        logits_indices.cpu(), torch.tensor([2, 3] + [-1] * 6,
+        logits_indices.cpu(), torch.tensor([0, 1] + [-1] * 6,
                                            dtype=torch.int32))
 
 
-def test_prepare_inputs_pcp_decode_refreshes_logits_indices_when_q_start_moves(
+def test_prepare_inputs_pcp_owner_does_not_rotate_with_absolute_q_start(
         monkeypatch):
     scheduled = [1]
     runner = _make_runner(num_computed_tokens=[16],
@@ -441,7 +522,9 @@ def test_prepare_inputs_pcp_decode_refreshes_logits_indices_when_q_start_moves(
     _, logits_indices, *_ = TPUModelRunner._prepare_inputs(
         runner, _scheduler_output(scheduled), 0, 1)
     torch.testing.assert_close(logits_indices.cpu(),
-                               torch.tensor([8] + [-1] * 7, dtype=torch.int32))
+                               torch.tensor([0] + [-1] * 7, dtype=torch.int32))
+    torch.testing.assert_close(runner.position_ids.cpu()[:1],
+                               torch.tensor([16], dtype=torch.int32))
 
     runner.input_batch.num_computed_tokens_cpu[0] = 32
     _, logits_indices, *_ = TPUModelRunner._prepare_inputs(
@@ -449,3 +532,47 @@ def test_prepare_inputs_pcp_decode_refreshes_logits_indices_when_q_start_moves(
 
     torch.testing.assert_close(logits_indices.cpu(),
                                torch.tensor([0] + [-1] * 7, dtype=torch.int32))
+    torch.testing.assert_close(runner.position_ids.cpu()[:1],
+                               torch.tensor([32], dtype=torch.int32))
+
+
+def test_prepare_inputs_batch_flat_owner_preserves_history_positions_and_logits(
+        monkeypatch):
+    scheduled = [25, 23]
+    runner = _make_runner(
+        num_computed_tokens=[100, 200],
+        prompt_tokens=[125, 223],
+        scheduled_tokens=scheduled,
+        token_paddings=[32],
+    )
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    attn_metadata, logits_indices, *_ = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 0, 0)
+
+    expected_ids = torch.cat((
+        torch.arange(216, 225, dtype=torch.int32),
+        torch.arange(400, 407, dtype=torch.int32),
+        torch.zeros(16, dtype=torch.int32),
+    ))
+    expected_positions = torch.cat((
+        torch.arange(116, 125, dtype=torch.int32),
+        torch.arange(200, 207, dtype=torch.int32),
+        torch.zeros(16, dtype=torch.int32),
+    ))
+    torch.testing.assert_close(runner.input_ids.cpu(), expected_ids)
+    torch.testing.assert_close(runner.position_ids.cpu(), expected_positions)
+    torch.testing.assert_close(
+        logits_indices.cpu(),
+        torch.tensor([40, 31] + [-1] * 6, dtype=torch.int32),
+    )
+
+    md = attn_metadata["layer.0"]
+    torch.testing.assert_close(md.query_start_loc.cpu()[:3],
+                               torch.tensor([0, 25, 48], dtype=torch.int32))
+    torch.testing.assert_close(md.seq_lens.cpu()[:2],
+                               torch.tensor([125, 223], dtype=torch.int32))
+    assert not hasattr(runner._attn_metadata_builder_ctx,
+                       "token_owner_start_offsets")
