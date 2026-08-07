@@ -305,9 +305,13 @@ Same merge, without the phase level:
 
 ```text
 <torch_profiler_dir>/
-└── plugins/profile/<timestamp>/
-    ├── rank0_<host>.xplane.pb
-    └── ...
+├── plugins/profile/<timestamp>/
+│   ├── rank0_<host>.xplane.pb
+│   └── ... (one .xplane.pb per rank)
+├── rank_0/
+│   └── <host>_<pid>.pt.trace.json.gz
+├── rank_1/...
+└── <host>_<pid>.async_llm.pt.trace.json.gz
 ```
 
 ### Why the rank prefix exists

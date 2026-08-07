@@ -35,8 +35,16 @@ steps:
               qwen3.5-35b-fp8-tp4-ep \
               qwen3.5-35b-fp8-dp8-ep \
               qwen3.5-35b-fp8-dp4-tp2-ep \
-              gemma-4-26b-fp8-dp4-tp2-ep-text \
               deepseek-v2-tp8-ep
+          # TODO(theminghuang): re-add gemma-4-26b-fp8-dp4-tp2-ep-text once the
+          # SparseCore halt on the torch 2.13 / torch-tpu 0.1.1.dev20260804
+          # stack is fixed. The config deterministically kills the server
+          # partway into its c512/c1024 sweep with E0200
+          # RuntimeUnexpectedCoreHalt (UserFatal on a SparseCore sequencer,
+          # observed on two different physical hosts, and it persists with
+          # USE_MOE_SPARSE_CORE=0), while the qwen MoE configs - including
+          # qwen3.5-35b at the same dp4-tp2-ep layout - pass. Server.log
+          # evidence: PR #347 (builds 2006 and 2024).
         artifact_paths:
           - "perf_eval_results/**/*"
 
