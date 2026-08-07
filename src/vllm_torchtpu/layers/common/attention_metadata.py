@@ -124,6 +124,11 @@ class AttentionMetadataBuilderContext:
     unified_mamba_state_indices: list[torch.Tensor] | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
+    # Per-chunk cache of the mamba row-offset derivation every mamba group
+    # shares, keyed by (block_size, num_blocks). Rebuilt with the context on
+    # each chunk, so entries can never go stale. See
+    # `AttentionMetadataBuilder._mamba_row_plan`.
+    mamba_row_plans: dict = field(default_factory=dict)
 
 
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
@@ -153,6 +158,59 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             (runner.max_num_reqs, block_table_obj.max_num_blocks_per_req),
             dtype=torch.int32,
             device="cpu")
+
+    def _mamba_row_plan(
+        self, ctx: "AttentionMetadataBuilderContext", target_num_blocks: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Row offsets into a mamba block table, shared across mamba groups.
+
+        Between mamba groups only `block_tables_2d` differs: `ctx.seq_lens`,
+        the mamba `block_size`, `target_num_blocks` and the checkpoint window
+        are all identical. Deriving these per group therefore re-ran the same
+        sub/floordiv/clamp/arange/add/compare chain once per group — 24 tiny
+        device programs per chunk on a 32-layer hybrid, each paying a core
+        barrier, which dominated the step. Compute once and let the groups
+        share it; only the two gathers stay per-group.
+
+        Keyed on the geometry rather than assumed uniform, so an attention
+        group (or a second mamba spec) can never pick up a mamba group's rows.
+        """
+        key = (self.target_block_size, target_num_blocks)
+        plan = ctx.mamba_row_plans.get(key)
+        if plan is not None:
+            return plan
+
+        state_offsets = torch.clamp(
+            (ctx.seq_lens - 1) // self.target_block_size,
+            min=0,
+            max=target_num_blocks - 1,
+        ).to(torch.int64)
+        state_index = state_offsets.unsqueeze(1)
+
+        ckpt_index: torch.Tensor | None = None
+        in_row: torch.Tensor | None = None
+        if ctx.mamba_ckpt_window > 1:
+            # Speculative decoding, one block per checkpoint (vLLM's
+            # MambaSpec.num_speculative_blocks scheme): the manager allocates
+            # `window - 1` extra blocks per request by inflating the token
+            # count, so they land immediately after the positional state
+            # block. Checkpoint t is therefore the row entry
+            # `state_offsets + t`.
+            ckpt_offsets = (state_index + torch.arange(
+                ctx.mamba_ckpt_window,
+                device=state_offsets.device,
+                dtype=state_offsets.dtype).unsqueeze(0))
+            # Defensive: a row too short to hold the group would alias two
+            # checkpoints onto one block and silently corrupt state, so clamp
+            # to the null block instead of a live one. `in_row` is returned so
+            # the caller can zero those columns after gathering.
+            in_row = ckpt_offsets < target_num_blocks
+            ckpt_index = torch.where(in_row, ckpt_offsets,
+                                     torch.zeros_like(ckpt_offsets))
+
+        plan = (state_index, ckpt_index, in_row)
+        ctx.mamba_row_plans[key] = plan
+        return plan
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
@@ -219,40 +277,21 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # D2H -> CPU gather -> H2D dependency.
             block_tables_2d = block_tables_dev.reshape(target_num_reqs,
                                                        target_num_blocks)
-            state_block_offsets = torch.clamp(
-                (ctx.seq_lens - 1) // self.target_block_size,
-                min=0,
-                max=target_num_blocks - 1,
-            ).to(torch.int64)
+            # Everything but the gathers is shared with the other mamba
+            # groups; see `_mamba_row_plan`.
+            state_index, ckpt_index, ckpt_in_row = self._mamba_row_plan(
+                ctx, target_num_blocks)
             mamba_state_indices = torch.gather(
                 block_tables_2d,
                 dim=1,
-                index=state_block_offsets.unsqueeze(1),
+                index=state_index,
             ).squeeze(1)
-            if ctx.mamba_ckpt_window > 1:
-                # Speculative decoding, one block per checkpoint (vLLM's
-                # MambaSpec.num_speculative_blocks scheme): the manager
-                # allocates `window - 1` extra blocks per request by
-                # inflating the token count, so they land immediately after
-                # the positional state block. Checkpoint t is therefore the
-                # row entry `state_block_offsets + t`.
-                ckpt_offsets = (
-                    state_block_offsets.unsqueeze(1) +
-                    torch.arange(ctx.mamba_ckpt_window,
-                                 device=state_block_offsets.device,
-                                 dtype=state_block_offsets.dtype).unsqueeze(0))
-                # Defensive: a row too short to hold the group would alias
-                # two checkpoints onto one block and silently corrupt state,
-                # so clamp to the null block instead of a live one.
-                in_row = ckpt_offsets < target_num_blocks
+            if ckpt_index is not None:
                 mamba_ckpt_indices = torch.gather(
                     block_tables_2d,
                     dim=1,
-                    index=torch.where(in_row, ckpt_offsets,
-                                      torch.zeros_like(ckpt_offsets)),
-                ) * in_row
-            else:
-                mamba_ckpt_indices = None
+                    index=ckpt_index,
+                ) * ckpt_in_row
             if ctx.unified_mamba_state_indices is not None:
                 # Spec decode: expose this group's state blocks for the
                 # post-sampling read-offset scatter.
