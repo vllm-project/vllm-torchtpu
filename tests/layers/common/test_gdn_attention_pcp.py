@@ -52,6 +52,13 @@ _GDN_PCP_DESCRIPTOR_CASES = _GDN_PCP_NUMERICAL_CASES + (pytest.param(
     8, (5, 7, 3, 9), 2, (1, 6, 13, 29), id="pcp8-fragmented-descriptors"), )
 
 
+def _query_start_loc_from_lengths(lengths):
+    lengths = np.asarray(lengths, dtype=np.int32)
+    return jnp.asarray(
+        np.concatenate((np.zeros(
+            (1, ), dtype=np.int32), np.cumsum(lengths, dtype=np.int32))))
+
+
 def test_pcp_gdn_helpers_are_available():
     assert callable(_exchange_pcp_token_shards_for_head_shards)
     assert callable(run_jax_gdn_attention_pcp_tp_prefill)
@@ -117,7 +124,6 @@ def test_derive_pcp_rank_major_reorder_indices_matches_host_order():
     lengths = np.array([32, 64], dtype=np.int32)
     padded_num_tokens = 96
     local_padded_num_tokens = padded_num_tokens // pcp_size
-    query_start_loc = jnp.array([0, 32, 96], dtype=jnp.int32)
 
     expected, _ = _build_pcp_rank_major_token_order(
         lengths,
@@ -126,7 +132,8 @@ def test_derive_pcp_rank_major_reorder_indices_matches_host_order():
         padded_num_tokens,
     )
     actual = _derive_pcp_rank_major_reorder_indices(
-        query_start_loc,
+        _query_start_loc_from_lengths(lengths),
+        jnp.zeros_like(jnp.asarray(lengths)),
         pcp_size=pcp_size,
         interleave_size=interleave_size,
         local_padded_num_tokens=local_padded_num_tokens,
@@ -143,7 +150,6 @@ def test_derive_pcp_rank_major_reorder_indices_matches_unaligned_host_order():
         _pcp_local_token_counts(lengths, pcp_size,
                                 interleave_size).max()) * pcp_size
     local_padded_num_tokens = padded_num_tokens // pcp_size
-    query_start_loc = jnp.array([0, 10, 20], dtype=jnp.int32)
 
     expected, _ = _build_pcp_rank_major_token_order(
         lengths,
@@ -152,7 +158,8 @@ def test_derive_pcp_rank_major_reorder_indices_matches_unaligned_host_order():
         padded_num_tokens,
     )
     actual = _derive_pcp_rank_major_reorder_indices(
-        query_start_loc,
+        _query_start_loc_from_lengths(lengths),
+        jnp.zeros_like(jnp.asarray(lengths)),
         pcp_size=pcp_size,
         interleave_size=interleave_size,
         local_padded_num_tokens=local_padded_num_tokens,
@@ -161,38 +168,80 @@ def test_derive_pcp_rank_major_reorder_indices_matches_unaligned_host_order():
     np.testing.assert_array_equal(np.array(actual), expected.astype(np.int32))
 
 
-def test_derive_pcp_rank_major_reorder_indices_uses_chunk_offsets():
+def test_derive_pcp_rank_major_reorder_indices_uses_token_owner_starts():
     pcp_size = 4
     interleave_size = 4
     lengths = np.array([13, 11], dtype=np.int32)
-    token_start_offsets = np.array([7, 22], dtype=np.int32)
+    token_owner_starts = np.array([7, 22], dtype=np.int32)
     padded_num_tokens = int(
         _pcp_local_token_counts(
             lengths,
             pcp_size,
             interleave_size,
-            token_start_offsets_per_req=token_start_offsets,
+            token_owner_starts,
         ).max()) * pcp_size
     local_padded_num_tokens = padded_num_tokens // pcp_size
-    query_start_loc = jnp.array([0, 13, 24], dtype=jnp.int32)
-    seq_lens = jnp.array(token_start_offsets + lengths, dtype=jnp.int32)
 
     expected, _ = _build_pcp_rank_major_token_order(
         lengths,
         pcp_size,
         interleave_size,
         padded_num_tokens,
-        token_start_offsets_per_req=token_start_offsets,
+        token_owner_starts,
     )
     actual = _derive_pcp_rank_major_reorder_indices(
-        query_start_loc,
+        _query_start_loc_from_lengths(lengths),
+        jnp.asarray(token_owner_starts),
         pcp_size=pcp_size,
         interleave_size=interleave_size,
         local_padded_num_tokens=local_padded_num_tokens,
-        seq_lens=seq_lens,
     )
 
     np.testing.assert_array_equal(np.array(actual), expected.astype(np.int32))
+
+
+def test_derive_pcp_rank_major_reorder_indices_uses_only_owner_coordinates():
+    pcp_size = 4
+    interleave_size = 4
+    q_lens = np.asarray([13, 11], dtype=np.int32)
+    # Request 1 begins inside rank 3's [12, 16) interleave chunk, so the
+    # batch-flat owner layout exercises a cross-request chunk boundary.
+    token_owner_starts = np.asarray([0, 13], dtype=np.int32)
+    request_absolute_starts = np.asarray([7, 22], dtype=np.int32)
+    local_padded_num_tokens = int(
+        _pcp_local_token_counts(
+            q_lens,
+            pcp_size,
+            interleave_size,
+            token_owner_starts,
+        ).max())
+    padded_num_tokens = local_padded_num_tokens * pcp_size
+
+    expected, _ = _build_pcp_rank_major_token_order(
+        q_lens,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+        token_owner_starts,
+    )
+    actual = _derive_pcp_rank_major_reorder_indices(
+        _query_start_loc_from_lengths(q_lens),
+        jnp.asarray(token_owner_starts),
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        local_padded_num_tokens=local_padded_num_tokens,
+    )
+    absolute_owned = _derive_pcp_rank_major_reorder_indices(
+        _query_start_loc_from_lengths(q_lens),
+        jnp.asarray(request_absolute_starts),
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        local_padded_num_tokens=local_padded_num_tokens,
+    )
+
+    np.testing.assert_array_equal(np.asarray(actual),
+                                  expected.astype(np.int32))
+    assert not np.array_equal(np.asarray(actual), np.asarray(absolute_owned))
 
 
 @pytest.mark.parametrize(
@@ -211,20 +260,15 @@ def test_derive_pcp_ragged_exchange_descriptors_reconstructs_reorder(
         token_start_offsets_per_req=offsets,
     )
     local_padded_num_tokens = int(local_counts.max())
-    query_start_loc = jnp.asarray(
-        np.concatenate(([0], np.cumsum(lengths, dtype=np.int32))),
-        dtype=jnp.int32,
-    )
-    seq_lens = None
-    if offsets is not None:
-        seq_lens = jnp.asarray(offsets + lengths, dtype=jnp.int32)
+    token_owner_starts = (np.zeros_like(lengths)
+                          if offsets is None else offsets)
 
     reorder = _derive_pcp_rank_major_reorder_indices(
-        query_start_loc,
+        _query_start_loc_from_lengths(lengths),
+        jnp.asarray(token_owner_starts),
         pcp_size=pcp_size,
         interleave_size=interleave_size,
         local_padded_num_tokens=local_padded_num_tokens,
-        seq_lens=seq_lens,
     )
     input_starts, sizes, output_starts = (
         _derive_pcp_ragged_exchange_descriptors(

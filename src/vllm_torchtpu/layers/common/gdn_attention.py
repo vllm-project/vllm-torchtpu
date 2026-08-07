@@ -244,28 +244,36 @@ def _pcp_rank_token_count_before(x: jnp.ndarray, ranks: jnp.ndarray, *,
 
 def _derive_pcp_rank_major_reorder_indices(
     query_start_loc: jnp.ndarray,
+    token_owner_starts: jnp.ndarray,
     *,
     pcp_size: int,
     interleave_size: int,
     local_padded_num_tokens: int,
-    seq_lens: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    """Rebuild packed-rank-major -> request-major token indices."""
+    """Rebuild packed-rank-major -> request-major token indices.
+
+    ``token_owner_starts`` is the coordinate used only to assign query rows to
+    PCP ranks.  It is deliberately independent from each request's absolute
+    sequence position, which remains an input to the GDN state/conv path.
+    """
+    query_start_loc = jnp.asarray(query_start_loc, dtype=jnp.int32)
+    if query_start_loc.ndim != 1:
+        raise ValueError("query_start_loc must be one-dimensional.")
     q_lens = query_start_loc[1:] - query_start_loc[:-1]
+    token_owner_starts = jnp.asarray(token_owner_starts, dtype=jnp.int32)
+    if q_lens.shape != token_owner_starts.shape:
+        raise ValueError(
+            "q_lens and token_owner_starts must have equal shape.")
     req_count = q_lens.shape[0]
-    if seq_lens is None:
-        q_global_starts = jnp.zeros_like(q_lens)
-    else:
-        q_global_starts = seq_lens[:req_count].astype(q_lens.dtype) - q_lens
-    q_global_ends = q_global_starts + q_lens
+    token_owner_ends = token_owner_starts + q_lens
 
     rank_ids = jnp.arange(pcp_size, dtype=jnp.int32).reshape(pcp_size, 1)
     rank_counts = (
-        _pcp_rank_token_count_before(q_global_ends.reshape(1, req_count),
+        _pcp_rank_token_count_before(token_owner_ends.reshape(1, req_count),
                                      rank_ids,
                                      pcp_size=pcp_size,
                                      interleave_size=interleave_size) -
-        _pcp_rank_token_count_before(q_global_starts.reshape(1, req_count),
+        _pcp_rank_token_count_before(token_owner_starts.reshape(1, req_count),
                                      rank_ids,
                                      pcp_size=pcp_size,
                                      interleave_size=interleave_size))
@@ -285,20 +293,19 @@ def _derive_pcp_rank_major_reorder_indices(
     safe_request_ids = jnp.minimum(request_ids, max_request_id)
     original_offsets = (original_indices -
                         query_start_loc[safe_request_ids].astype(jnp.int32))
-    original_global_positions = (
-        q_global_starts[safe_request_ids].astype(jnp.int32) + original_offsets)
+    original_owner_positions = (token_owner_starts[safe_request_ids] +
+                                original_offsets)
 
     cycle = pcp_size * interleave_size
-    cycle_offsets = (original_global_positions -
-                     (original_global_positions // cycle) * cycle)
+    cycle_offsets = (original_owner_positions -
+                     (original_owner_positions // cycle) * cycle)
     original_ranks = (cycle_offsets // interleave_size).astype(jnp.int32)
     in_req_rank_offsets = (
-        _pcp_rank_token_count_before(original_global_positions,
+        _pcp_rank_token_count_before(original_owner_positions,
                                      original_ranks,
                                      pcp_size=pcp_size,
                                      interleave_size=interleave_size) -
-        _pcp_rank_token_count_before(q_global_starts[safe_request_ids].astype(
-            jnp.int32),
+        _pcp_rank_token_count_before(token_owner_starts[safe_request_ids],
                                      original_ranks,
                                      pcp_size=pcp_size,
                                      interleave_size=interleave_size))
@@ -554,12 +561,17 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
 
+        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
+        # The current public metadata format assigns tokens by request-absolute
+        # position. Keep the owner coordinate separate so a later layout can
+        # change only this source; state/conv still consume ``seq_lens_`` below.
+        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
+            token_owner_starts,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             local_padded_num_tokens=local_qkv.shape[0],
-            seq_lens=seq_lens_,
         )
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder,
@@ -1066,12 +1078,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
                              axis=-1).reshape(local_b.shape[0], -1)
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
+        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
+        # Preserve today's public layout while keeping token ownership
+        # independent from the absolute positions used by GDN state below.
+        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
+            token_owner_starts,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             local_padded_num_tokens=local_hidden_states.shape[0],
-            seq_lens=seq_lens_,
         )
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder,
@@ -1273,12 +1289,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
 
+        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
+        # Preserve today's public layout while keeping token ownership
+        # independent from the absolute positions used by GDN state below.
+        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
+            token_owner_starts,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             local_padded_num_tokens=local_qkv.shape[0],
-            seq_lens=seq_lens_,
         )
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder,

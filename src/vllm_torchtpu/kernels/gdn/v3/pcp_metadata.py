@@ -35,7 +35,7 @@ class PcpStageMetadata:
     """Replicated schedule consumed by the PCP Pallas kernel.
 
     Stage arrays use the active prefix ``[:num_stages]``.  Each stage is one
-    request's intersection with one absolute PCP interleave round.  The valid
+    request's intersection with one token-owner PCP interleave round.  The valid
     rows owned by rank ``r`` are contiguous in that rank's packed HBM shard and
     land in the aligned slot beginning at
     ``rank_recv_start[stage, r]`` in the receive window.  Tiles visit only the
@@ -114,7 +114,7 @@ def _schedule_capacities(
 ) -> tuple[int, int]:
     """Return safe static storage capacities for stages and split tiles."""
     stage_size = pcp_size * comm_chunk_size
-    # Splitting a request at absolute PCP-round boundaries adds at most one
+    # Splitting a request at token-owner PCP-round boundaries adds at most one
     # extra stage per request beyond the stages implied by its token count.
     max_stages = pl.cdiv(cfg.batch_size, stage_size) + max_num_seqs
     # GDN tiles are also split at rank-slot boundaries so every VMEM token
@@ -140,12 +140,60 @@ def compute_pcp_stage_metadata(
     num_qkv_out_blocks: int,
     num_projection_out_blocks: int,
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
-    """Build live PCP stages and GDN tiles for arbitrary request spans.
+    """Build PCP metadata from the current public request metadata.
 
-    ``query_start_loc`` describes request-major query rows.  The absolute query
-    start of request ``s`` is reconstructed as
-    ``seq_lens[s] - query_len[s]``.  Source/destination HBM offsets follow the
-    rank-major packing used by the runner.
+    Today query ownership follows request-absolute positions, so the public
+    path deliberately passes the same derived starts as both coordinates. A
+    later batch-flat layout only needs to replace ``token_owner_starts``;
+    request state and convolution semantics continue using the absolute starts.
+    """
+    if seq_lens.size != state_indices.size:
+        raise ValueError("state_indices and seq_lens must have equal size.")
+    if query_start_loc.size != seq_lens.size + 1:
+        raise ValueError("query_start_loc must contain max_num_seqs + 1 "
+                         "entries.")
+    q_lens = query_start_loc[1:] - query_start_loc[:-1]
+    request_absolute_starts = seq_lens.astype(jnp.int32) - q_lens.astype(
+        jnp.int32)
+    token_owner_starts = request_absolute_starts
+    return _compute_pcp_stage_metadata_from_coordinates(
+        cfg,
+        query_start_loc,
+        state_indices,
+        start_seq,
+        end_seq,
+        token_owner_starts=token_owner_starts,
+        request_absolute_starts=request_absolute_starts,
+        pcp_size=pcp_size,
+        comm_chunk_size=comm_chunk_size,
+        projection_token_block_size=projection_token_block_size,
+        num_qkv_out_blocks=num_qkv_out_blocks,
+        num_projection_out_blocks=num_projection_out_blocks,
+    )
+
+
+def _compute_pcp_stage_metadata_from_coordinates(
+    cfg: config.GDNConfig,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    start_seq: jax.Array,
+    end_seq: jax.Array,
+    *,
+    token_owner_starts: jax.Array,
+    request_absolute_starts: jax.Array,
+    pcp_size: int,
+    comm_chunk_size: int,
+    projection_token_block_size: int,
+    num_qkv_out_blocks: int,
+    num_projection_out_blocks: int,
+) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
+    """Build live PCP stages and GDN tiles from independent coordinates.
+
+    ``query_start_loc`` describes request-major query rows.
+    ``token_owner_starts`` selects each row's PCP rank and determines the
+    rank-major source/destination HBM offsets. ``request_absolute_starts`` is
+    independent: it controls only request state/conv semantics such as whether
+    the first current tile has an initial state.
 
     The output shapes depend only on the compile bucket.  All loops stop at
     ``end_seq`` and at each request's real final token; the active stage and
@@ -162,12 +210,16 @@ def compute_pcp_stage_metadata(
     if num_projection_out_blocks < num_qkv_out_blocks:
         raise ValueError("num_projection_out_blocks must cover QKV blocks.")
 
-    max_num_seqs = seq_lens.size
+    max_num_seqs = state_indices.size
     if query_start_loc.size != max_num_seqs + 1:
         raise ValueError("query_start_loc must contain max_num_seqs + 1 "
                          "entries.")
-    if state_indices.size != max_num_seqs:
-        raise ValueError("state_indices and seq_lens must have equal size.")
+    if token_owner_starts.size != max_num_seqs:
+        raise ValueError("token_owner_starts and state_indices must have "
+                         "equal size.")
+    if request_absolute_starts.size != max_num_seqs:
+        raise ValueError("request_absolute_starts and state_indices must have "
+                         "equal size.")
 
     max_stages, max_tiles = _schedule_capacities(
         cfg,
@@ -178,7 +230,8 @@ def compute_pcp_stage_metadata(
     int_dtype = jnp.int32
     ranks = jnp.arange(pcp_size, dtype=int_dtype)
     query_start_loc = query_start_loc.astype(int_dtype)
-    seq_lens = seq_lens.astype(int_dtype)
+    token_owner_starts = token_owner_starts.astype(int_dtype)
+    request_absolute_starts = request_absolute_starts.astype(int_dtype)
     state_indices = state_indices.astype(int_dtype)
     start_seq = start_seq.astype(int_dtype)
     end_seq = end_seq.astype(int_dtype)
@@ -215,16 +268,16 @@ def compute_pcp_stage_metadata(
         query_begin = query_start_loc[req]
         query_end = query_start_loc[req + 1]
         query_len = query_end - query_begin
-        absolute_end = seq_lens[req]
-        absolute_begin = absolute_end - query_len
+        token_owner_begin = token_owner_starts[req]
+        token_owner_end = token_owner_begin + query_len
 
         rank_counts = (_rank_token_count_before(
-            absolute_end,
+            token_owner_end,
             ranks,
             pcp_size=pcp_size,
             comm_chunk_size=comm_chunk_size,
         ) - _rank_token_count_before(
-            absolute_begin,
+            token_owner_begin,
             ranks,
             pcp_size=pcp_size,
             comm_chunk_size=comm_chunk_size,
@@ -233,28 +286,28 @@ def compute_pcp_stage_metadata(
         next_rank_offsets = request_rank_starts + rank_counts
 
         should_emit = jnp.logical_and(req >= start_seq, query_len > 0)
-        first_window = (absolute_begin // round_size) * round_size
-        initial_window = jnp.where(should_emit, first_window, absolute_end)
+        first_window = (token_owner_begin // round_size) * round_size
+        initial_window = jnp.where(should_emit, first_window, token_owner_end)
         initial_consumed = jnp.zeros((pcp_size, ), dtype=int_dtype)
 
         def _windows_pending(carry) -> jax.Array:
             window, _, _ = carry
-            return window < absolute_end
+            return window < token_owner_end
 
         def _emit_window(carry):
             window, consumed, inner_state = carry
             rank_chunk_begin = window + ranks * comm_chunk_size
             rank_chunk_end = rank_chunk_begin + comm_chunk_size
-            overlap_begin = jnp.maximum(rank_chunk_begin, absolute_begin)
-            overlap_end = jnp.minimum(rank_chunk_end, absolute_end)
+            overlap_begin = jnp.maximum(rank_chunk_begin, token_owner_begin)
+            overlap_end = jnp.minimum(rank_chunk_end, token_owner_end)
             valid_rows = jnp.maximum(overlap_end - overlap_begin, 0)
             dense_starts = (jnp.cumsum(valid_rows, dtype=int_dtype) -
                             valid_rows)
             recv_starts = ranks * comm_chunk_size
             stage_tokens = jnp.sum(valid_rows, dtype=int_dtype)
             stage_query_begin = (query_begin +
-                                 jnp.maximum(window, absolute_begin) -
-                                 absolute_begin)
+                                 jnp.maximum(window, token_owner_begin) -
+                                 token_owner_begin)
             stage = inner_state.active_stages
             tile_begin = inner_state.active_tiles
 
@@ -371,8 +424,7 @@ def compute_pcp_stage_metadata(
         )
 
     result = jax.lax.while_loop(_requests_pending, _emit_request, initial)
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    has_initial_state = (seq_lens - query_lens) > 0
+    has_initial_state = request_absolute_starts > 0
 
     num_z_out_blocks = num_projection_out_blocks - num_qkv_out_blocks
     projection_catchup_count = jnp.zeros(

@@ -59,6 +59,16 @@ def _metadata_inputs(lengths, offsets, *, max_num_seqs):
         for x in (seq_lens, query_start, state_indices, distribution))
 
 
+def _assert_pytree_array_equal(actual, expected):
+    assert jax.tree.structure(actual) == jax.tree.structure(expected)
+    actual_leaves = jax.tree.leaves(actual)
+    expected_leaves = jax.tree.leaves(expected)
+    assert len(actual_leaves) == len(expected_leaves)
+    for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves):
+        np.testing.assert_array_equal(np.asarray(actual_leaf),
+                                      np.asarray(expected_leaf))
+
+
 def test_schedule_splits_unaligned_requests_at_absolute_pcp_rounds():
     cfg = _cfg(batch_size=128, tile_size=4)
     seq_lens, query_start, state_indices, distribution = _metadata_inputs(
@@ -129,6 +139,101 @@ def test_schedule_splits_unaligned_requests_at_absolute_pcp_rounds():
     np.testing.assert_array_equal(
         np.asarray(metadata.p_id_is_last_tile.data[:8]),
         [False, False, False, True, False, False, False, True],
+    )
+
+
+def test_dual_coordinates_separate_token_ownership_from_absolute_state():
+    cfg = _cfg(batch_size=128, tile_size=4)
+    seq_lens, query_start, state_indices, distribution = _metadata_inputs(
+        lengths=[13, 11],
+        offsets=[7, 22],
+        max_num_seqs=4,
+    )
+    request_absolute_starts = jnp.asarray([7, 22, 0, 0], dtype=jnp.int32)
+    # Batch-flat request 1 starts inside rank 3's owner chunk [12, 16), while
+    # its absolute sequence position remains 22 for GDN state semantics.
+    batch_flat_owner_starts = jnp.asarray([0, 13, 0, 0], dtype=jnp.int32)
+    fresh_absolute_starts = jnp.zeros((4, ), dtype=jnp.int32)
+
+    common_kwargs = dict(
+        cfg=cfg,
+        query_start_loc=query_start,
+        state_indices=state_indices,
+        start_seq=distribution[0],
+        end_seq=distribution[-1],
+        pcp_size=4,
+        comm_chunk_size=4,
+        projection_token_block_size=16,
+        num_qkv_out_blocks=6,
+        num_projection_out_blocks=8,
+    )
+    public_metadata, public_schedule = pcp_metadata.compute_pcp_stage_metadata(
+        cfg,
+        seq_lens,
+        query_start,
+        state_indices,
+        distribution[0],
+        distribution[-1],
+        pcp_size=4,
+        comm_chunk_size=4,
+        projection_token_block_size=16,
+        num_qkv_out_blocks=6,
+        num_projection_out_blocks=8,
+    )
+    current_metadata, current_schedule = (
+        pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
+            token_owner_starts=request_absolute_starts,
+            request_absolute_starts=request_absolute_starts,
+            **common_kwargs,
+        ))
+    owner_metadata, owner_schedule = (
+        pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
+            token_owner_starts=batch_flat_owner_starts,
+            request_absolute_starts=request_absolute_starts,
+            **common_kwargs,
+        ))
+    fresh_metadata, fresh_schedule = (
+        pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
+            token_owner_starts=batch_flat_owner_starts,
+            request_absolute_starts=fresh_absolute_starts,
+            **common_kwargs,
+        ))
+
+    # The current public path remains bit-for-bit identical: it supplies the
+    # request-absolute coordinate as the token-owner coordinate too.
+    _assert_pytree_array_equal(public_metadata, current_metadata)
+    _assert_pytree_array_equal(public_schedule, current_schedule)
+
+    assert int(owner_schedule.num_stages) == 3
+    np.testing.assert_array_equal(np.asarray(owner_schedule.request_id[:3]),
+                                  [0, 1, 1])
+    np.testing.assert_array_equal(
+        np.asarray(owner_schedule.query_row_start[:3]), [0, 13, 16])
+    np.testing.assert_array_equal(np.asarray(owner_schedule.num_tokens[:3]),
+                                  [13, 3, 8])
+    np.testing.assert_array_equal(
+        np.asarray(owner_schedule.rank_valid_rows[:3]),
+        [[4, 4, 4, 1], [0, 0, 0, 3], [4, 4, 0, 0]],
+    )
+    assert not np.array_equal(
+        np.asarray(owner_schedule.num_tokens[:3]),
+        np.asarray(current_schedule.num_tokens[:3]),
+    )
+
+    # Changing only absolute starts cannot change ownership, rank rows, or
+    # exchange stages, but it does change initial-state handling.
+    _assert_pytree_array_equal(owner_schedule, fresh_schedule)
+    np.testing.assert_array_equal(
+        np.asarray(owner_metadata.s_idx_has_initial_state),
+        [True, True, False, False],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(fresh_metadata.s_idx_has_initial_state),
+        [False, False, False, False],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(owner_metadata.p_id_to_r_base.data),
+        np.asarray(fresh_metadata.p_id_to_r_base.data),
     )
 
 
