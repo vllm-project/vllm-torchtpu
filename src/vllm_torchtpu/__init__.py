@@ -897,17 +897,36 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
         return
 
     original_resolve = qwen3_dflash._resolve_layer_attention
+    _FLAG = "use_v2_model_runner"
 
     def patched_resolve(config, layer_idx: int):
-        from unittest.mock import PropertyMock, patch
-
+        # Force the flag True for the duration of the upstream call only, by
+        # swapping the class attribute and restoring it. Deliberately not
+        # `unittest.mock.patch`: a test helper has no business in the load
+        # path, and — more usefully — looking the attribute up explicitly
+        # means that if upstream ever moves or renames it, this raises here
+        # instead of silently no-op'ing and letting the original V2 check
+        # reject the drafter with an unrelated-looking error.
         from vllm.config import get_current_vllm_config
-        cfg = get_current_vllm_config()
-        with patch.object(type(cfg),
-                          "use_v2_model_runner",
-                          new_callable=PropertyMock,
-                          return_value=True):
+        cfg_cls = type(get_current_vllm_config())
+        if not hasattr(cfg_cls, _FLAG):
+            raise RuntimeError(
+                f"VllmConfig no longer defines {_FLAG!r}; the TPU DFlash "
+                "bypass needs updating for this vLLM version.")
+
+        # Restore exactly what was there: if the flag is inherited rather than
+        # defined on this class, putting it back with setattr would leave a
+        # permanent shadow on the subclass.
+        had_own = _FLAG in cfg_cls.__dict__
+        original_flag = cfg_cls.__dict__.get(_FLAG)
+        setattr(cfg_cls, _FLAG, property(lambda self: True))
+        try:
             return original_resolve(config, layer_idx)
+        finally:
+            if had_own:
+                setattr(cfg_cls, _FLAG, original_flag)
+            else:
+                delattr(cfg_cls, _FLAG)
 
     qwen3_dflash._resolve_layer_attention = patched_resolve
     qwen3_dflash._tpu_bypass_v2_runner_patch = True

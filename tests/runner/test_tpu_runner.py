@@ -2064,3 +2064,75 @@ class TestUnifiedReadOffsetMigration:
         runner.mamba_slot_read_offsets[9] = 1
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
         assert int(runner.mamba_slot_read_offsets[5]) == 1
+
+
+class TestBuildAttentionMetadataForLayers:
+    """`TPUModelRunner.build_attention_metadata_for_layers`.
+
+    Load-bearing for every DFlash draft step, and it leans on a contract that
+    is easy to break from a distance: the TPU `AttentionMetadataBuilder` reads
+    only `num_reqs` off the common metadata (everything else arrives via
+    `_attn_metadata_builder_ctx`), which is why a bare namespace stands in for
+    `CommonAttentionMetadata`. If that ever stops holding, this should fail
+    here rather than in a draft forward.
+    """
+
+    @staticmethod
+    def _group(gid, layer_names):
+        builder = MagicMock()
+        builder.build.return_value = SimpleNamespace(tag=gid)
+        return SimpleNamespace(layer_names=layer_names,
+                               kv_cache_group_id=gid,
+                               metadata_builders=[builder])
+
+    def _runner(self, groups):
+        runner = MagicMock()
+        runner.attn_groups = [[g] for g in groups]
+        return runner
+
+    def test_builds_only_the_groups_owning_the_requested_layers(self):
+        wanted = self._group(0, ["draft.0", "draft.1"])
+        other = self._group(1, ["target.0"])
+        runner = self._runner([wanted, other])
+
+        out = TPUModelRunner.build_attention_metadata_for_layers(
+            runner, {"draft.0", "draft.1"}, 8)
+
+        assert set(out) == {"draft.0", "draft.1"}
+        # One build per group, shared by that group's layers.
+        wanted.metadata_builders[0].build.assert_called_once()
+        assert out["draft.0"] is out["draft.1"]
+        # The untouched group costs nothing -- that is the whole point.
+        other.metadata_builders[0].build.assert_not_called()
+
+    def test_passes_the_padded_request_count_through(self):
+        group = self._group(0, ["draft.0"])
+        runner = self._runner([group])
+
+        TPUModelRunner.build_attention_metadata_for_layers(
+            runner, ["draft.0"], 32)
+
+        kwargs = group.metadata_builders[0].build.call_args.kwargs
+        assert kwargs["common_attn_metadata"].num_reqs == 32
+        assert kwargs["common_prefix_len"] == 0
+
+    def test_partial_overlap_returns_only_the_requested_layers(self):
+        # A group can own layers the caller did not ask for; they must not
+        # leak into the forward context.
+        group = self._group(0, ["draft.0", "draft.1"])
+        runner = self._runner([group])
+
+        out = TPUModelRunner.build_attention_metadata_for_layers(
+            runner, {"draft.0"}, 8)
+
+        assert set(out) == {"draft.0"}
+
+    def test_no_matching_layers_builds_nothing(self):
+        group = self._group(0, ["target.0"])
+        runner = self._runner([group])
+
+        out = TPUModelRunner.build_attention_metadata_for_layers(
+            runner, {"draft.0"}, 8)
+
+        assert out == {}
+        group.metadata_builders[0].build.assert_not_called()

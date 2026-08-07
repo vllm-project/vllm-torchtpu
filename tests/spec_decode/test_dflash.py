@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pytest
 import torch
 import torch._dynamo
 
@@ -146,7 +147,7 @@ def test_tpu_precompute_context_kv(device):
     fn_eager = torch._dynamo.disable(
         DFlashProposer._tpu_precompute_and_update_kv_cache)
     dummy_md = mock.MagicMock()
-    fn_eager(proposer, hidden_states, positions, (dummy_md, dummy_md))
+    fn_eager(proposer, hidden_states, positions, tuple([dummy_md] * L))
 
     # Extract roped keys and values from the mocked layer forward calls
     roped_k_list = []
@@ -233,20 +234,13 @@ def test_prepare_dflash_inputs(device):
                             dtype=torch.int32,
                             device=device))
 
-    sampled_token_ids = [[101, 102, 103], [201, 202]]
-    num_rejected_tokens_np = np.array([1, 0], dtype=np.int32)
     next_tokens_device = torch.tensor(
         [[101, 102, 103, -1], [201, 202, -1, -1]],
         dtype=torch.int32,
         device=device)
 
     input_ids, position_ids, seq_lens = proposer._prepare_dflash_inputs(
-        chunk,
-        sampled_token_ids,
-        num_rejected_tokens_np,
-        None,
-        None,
-        next_tokens_device=next_tokens_device)
+        chunk, next_tokens_device=next_tokens_device)
 
     assert input_ids.shape == (8, )
     assert position_ids.shape == (8, )
@@ -285,6 +279,10 @@ def test_update_draft_kv_cache_from_target_unit(device):
     layer_mock1.self_attn.attn.impl = mock.MagicMock()
     layer_mock2 = mock.MagicMock()
     layer_mock2.self_attn.attn.impl = mock.MagicMock()
+    # Draft layers resolve their metadata by name; an unnamed layer is an
+    # error, not a cue to borrow another group's block table.
+    layer_mock1.self_attn.attn.layer_name = "dummy_layer"
+    layer_mock2.self_attn.attn.layer_name = "dummy_layer"
     draft_model.model.layers = [layer_mock1, layer_mock2]
     proposer.draft_model = draft_model
     proposer.num_target_layers = 2
@@ -298,8 +296,7 @@ def test_update_draft_kv_cache_from_target_unit(device):
                                                       dtype=torch.float32,
                                                       device=device))
 
-    proposer._update_draft_kv_cache_from_target(
-        chunk, num_rejected_tokens_np=np.array([0]))
+    proposer._update_draft_kv_cache_from_target(chunk)
 
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
 
@@ -360,3 +357,30 @@ def test_propose_unit(device):
     proposer._prepare_dflash_inputs.assert_called_once()
     proposer._update_draft_kv_cache_from_target.assert_called_once()
     proposer._dflash_forward_and_sample.assert_called_once()
+
+
+def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
+    """An unnamed draft layer must raise, not borrow another group's metadata.
+
+    `chunk.attn_metadata` is the target's full per-layer dict, so falling back
+    to an arbitrary entry can hand a draft layer a mamba group's block table —
+    a different block size indexing different blocks. That corrupts the draft
+    KV cache silently instead of failing.
+    """
+    proposer = _make_proposer(draft_tp=1)
+    named = mock.MagicMock()
+    named.self_attn.attn.layer_name = "dummy_layer"
+    unnamed = mock.MagicMock()
+    unnamed.self_attn.attn.layer_name = "not_in_the_metadata"
+    draft_model = mock.MagicMock()
+    draft_model.model.layers = [named, unnamed]
+    proposer.draft_model = draft_model
+
+    md = {"dummy_layer": SimpleNamespace(block_tables=None)}
+
+    with pytest.raises(RuntimeError, match="not_in_the_metadata"):
+        proposer._build_draft_layer_metadata(md)
+
+    # The resolvable layer on its own comes back in layer order.
+    draft_model.model.layers = [named]
+    assert proposer._build_draft_layer_metadata(md) == (md["dummy_layer"], )

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import dataclasses
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -84,7 +83,6 @@ class DFlashProposer:
         self.draft_model = None
         self._draft_attn_layer_names: set[str] | None = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
-        self.draft_lm_head = None
         self._static_attn_tensors_cache: dict[int, tuple[torch.Tensor,
                                                          torch.Tensor]] = {}
 
@@ -189,7 +187,6 @@ class DFlashProposer:
         self,
         chunk: DraftChunkInputs,
         num_tokens_padded: int,
-        positions: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> dict:
         """
@@ -238,10 +235,6 @@ class DFlashProposer:
     def _prepare_dflash_inputs(
         self,
         chunk: DraftChunkInputs,
-        sampled_token_ids: list[list[int]],
-        num_rejected_tokens_np: np.ndarray | None,
-        discard_sampled_tokens_req_indices: list[int] | None = None,
-        scheduler_output=None,
         next_tokens_device: torch.Tensor | None = None,
         device_seed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -304,22 +297,27 @@ class DFlashProposer:
         self,
         attn_metadata: dict[str, "AttentionMetadata"],
     ) -> tuple["AttentionMetadata", ...]:
-        default_md = next(iter(attn_metadata.values()), None)
+        """Per-layer metadata for the draft's KV write, in layer order.
+
+        `attn_metadata` is the *target's* full per-layer dict, so a draft layer
+        that fails to resolve must raise rather than fall back to an arbitrary
+        entry: the first entry is whichever layer hashed first — plausibly a
+        mamba group, whose block table indexes a different block size. Writing
+        the draft's KV through it would corrupt the cache silently instead of
+        failing.
+        """
         draft_md_list = []
         for layer in self.draft_model.model.layers:
-            layer_name = getattr(layer.self_attn.attn, "layer_name", "")
-            md = attn_metadata.get(layer_name, default_md)
-            if getattr(md, "block_tables",
-                       None) is not None and md.block_tables.dim() > 1:
-                md = dataclasses.replace(
-                    md, block_tables=md.block_tables.reshape(-1))
+            layer_name = getattr(layer.self_attn.attn, "layer_name", None)
+            md = attn_metadata.get(layer_name) if layer_name else None
+            if md is None:
+                raise RuntimeError(
+                    f"No attention metadata for draft layer {layer_name!r}; "
+                    "the draft layers must own a KV cache group of their own.")
             draft_md_list.append(md)
         return tuple(draft_md_list)
 
-    def _update_draft_kv_cache_from_target(self,
-                                           chunk,
-                                           num_rejected_tokens_np=None
-                                           ) -> None:
+    def _update_draft_kv_cache_from_target(self, chunk) -> None:
         """
         Projects the target model's hidden states into the draft model's KV cache.
 
@@ -353,12 +351,20 @@ class DFlashProposer:
         sampled_token_ids: list[list[int]],
         discard_sampled_tokens_req_indices: list[int],
         num_rejected_tokens_np: np.ndarray | None,
-        scheduler_output=None,
+        scheduler_output,
         return_device: bool = False,
         next_tokens_per_chunk: list[torch.Tensor] | None = None,
         device_seed: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
-        """Main execution step to propose draft tokens."""
+        """Main execution step to propose draft tokens.
+
+        `sampled_token_ids`, `discard_sampled_tokens_req_indices`,
+        `num_rejected_tokens_np` and `scheduler_output` are unused here: this
+        drafter is strictly device-fused and seeds from `next_tokens_per_chunk`
+        or `device_seed`. They stay in the signature because
+        `SpeculativeDecodingManager` calls `propose` polymorphically across
+        this and `Eagle3Proposer`, which does read them.
+        """
         runner = self.runner
         num_reqs = runner.input_batch.num_reqs
         if num_reqs == 0:
@@ -375,8 +381,7 @@ class DFlashProposer:
         # 1. Hoist all KV cache updates across chunks to the top of propose
         for chunk in chunks:
             with set_vllm_model_wrapper_context(mesh=None):
-                self._update_draft_kv_cache_from_target(
-                    chunk, num_rejected_tokens_np)
+                self._update_draft_kv_cache_from_target(chunk)
 
         # 2. Process each chunk
         draft_logits_per_chunk = []
@@ -385,22 +390,18 @@ class DFlashProposer:
                 i] if next_tokens_per_chunk else None
             input_ids, positions, seq_lens = self._prepare_dflash_inputs(
                 chunk,
-                sampled_token_ids,
-                num_rejected_tokens_np,
-                discard_sampled_tokens_req_indices,
-                scheduler_output,
                 next_tokens_device=next_tokens_device,
                 device_seed=device_seed)
             padded_len = input_ids.shape[0]
             draft_attn_metadata = self._build_draft_attn_metadata(
-                chunk, padded_len, positions, seq_lens)
+                chunk, padded_len, seq_lens)
 
             with (
                     set_forward_context(draft_attn_metadata, self.vllm_config,
                                         0),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh),
             ):
-                draft_tokens_chunk, hidden = self._dflash_forward_and_sample(
+                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                     input_ids, positions, block_size)
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
@@ -601,7 +602,7 @@ class DFlashProposer:
                                         self.vllm_config, 0),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh, ),
             ):
-                draft_tokens_chunk, hidden = self._dflash_forward_and_sample(
+                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                     input_ids, positions, block_size)
                 sync.synchronize(draft_tokens_chunk, wait=True)
 
@@ -631,9 +632,18 @@ class DFlashProposer:
         else:
             target_hidden = hidden_states
 
+        # Collapse the concatenated aux hidden states to the draft's width.
+        # `combine_hidden_states` is the modern spelling; bare `fc` is what
+        # drafters that predate it expose, and `precompile` still reads
+        # `fc.weight.shape[1]` to size its dummy input — so the two must agree
+        # on whether `fc` is applied.
         if hasattr(self.draft_model, "combine_hidden_states"):
             target_hidden = self.draft_model.combine_hidden_states(
                 target_hidden)
+        elif (fc_layer := getattr(self_model, "fc", None)) is not None:
+            target_hidden = fc_layer(target_hidden)
+            if isinstance(target_hidden, tuple):
+                target_hidden = target_hidden[0]
 
         if hasattr(self_model, "hidden_norm"):
             target_hidden = self_model.hidden_norm(target_hidden)
@@ -688,8 +698,7 @@ class DFlashProposer:
                 key=roped_k_all[i],
                 value=all_v[i],
                 kv_cache=kv_cache,
-                attn_metadata=(draft_md_tuple[i] if isinstance(
-                    draft_md_tuple, (tuple, list)) else draft_md_tuple),
+                attn_metadata=draft_md_tuple[i],
             )
 
         return hidden_states
