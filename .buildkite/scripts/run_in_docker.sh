@@ -99,7 +99,7 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e RUN_CODE_EVAL="${RUN_CODE_EVAL:-}" \
-  -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
+  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0" \
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e UV_NO_CACHE="1" \
