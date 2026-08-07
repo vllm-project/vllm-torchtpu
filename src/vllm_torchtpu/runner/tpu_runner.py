@@ -11,9 +11,11 @@ import dataclasses
 import math
 import os
 import time
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
@@ -1167,6 +1169,41 @@ class TPUModelRunner(GPUModelRunner):
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
         )
+
+    def build_attention_metadata_for_layers(
+        self,
+        layer_names: Collection[str],
+        num_reqs_padded: int,
+    ) -> dict[str, AttentionMetadata]:
+        """Build attention metadata for only the groups owning `layer_names`.
+
+        `_build_attention_metadata` walks every KV cache group. A drafter
+        needs only its own layers, and the group count tracks the layer count
+        whenever vLLM's spec bucketing collapses — which a drafter mixing
+        window and full attention causes on its own. Building every group and
+        discarding all but the draft's costs a block-table H2D plus a handful
+        of gathers per discarded group, per chunk, per step.
+
+        Reads the same `_attn_metadata_builder_ctx` the full build does, so
+        callers stage it identically.
+        """
+        # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
+        # common metadata; everything else it needs comes from
+        # `_attn_metadata_builder_ctx`.
+        common = SimpleNamespace(num_reqs=num_reqs_padded)
+        metadata: dict[str, AttentionMetadata] = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                selected = [n for n in group.layer_names if n in layer_names]
+                if not selected:
+                    continue
+                built = group.metadata_builders[0].build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                )
+                for name in selected:
+                    metadata[name] = built
+        return metadata
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
