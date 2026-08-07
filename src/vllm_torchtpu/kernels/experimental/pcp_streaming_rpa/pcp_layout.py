@@ -16,43 +16,73 @@
 import numpy as np
 
 
-def pcp_query_start_offsets(
+def pcp_token_owner_start_offsets(
     num_scheduled_tokens_per_req: np.ndarray,
-    token_start_offsets_per_req: list[int] | np.ndarray | None,
+    token_owner_start_offsets_per_req: list[int] | np.ndarray | None,
 ) -> np.ndarray:
-    if token_start_offsets_per_req is None:
+    """Normalize the coordinate used to assign query tokens to PCP ranks."""
+    if token_owner_start_offsets_per_req is None:
         return np.zeros(num_scheduled_tokens_per_req.size, dtype=np.int64)
-    starts = np.asarray(token_start_offsets_per_req, dtype=np.int64)
+    starts = np.asarray(token_owner_start_offsets_per_req, dtype=np.int64)
     if starts.size != num_scheduled_tokens_per_req.size:
-        raise ValueError("token_start_offsets_per_req must have the same "
-                         "number of entries as num_scheduled_tokens_per_req.")
+        raise ValueError(
+            "token_owner_start_offsets_per_req must have the same number of "
+            "entries as num_scheduled_tokens_per_req.")
     if np.any(starts < 0):
-        raise ValueError("token_start_offsets_per_req must be non-negative.")
+        raise ValueError(
+            "token_owner_start_offsets_per_req must be non-negative.")
     return starts
 
 
-def pcp_query_chunk_ranges(q_len: int, q_global_base: int, pcp_rank: int,
-                           pcp_size: int, interleave_size: int):
+def _resolve_token_owner_start_offsets(
+    num_scheduled_tokens_per_req: np.ndarray,
+    token_owner_start_offsets_per_req: list[int] | np.ndarray | None,
+    token_start_offsets_per_req: list[int] | np.ndarray | None,
+) -> np.ndarray:
+    if (token_owner_start_offsets_per_req is not None
+            and token_start_offsets_per_req is not None):
+        raise ValueError("Specify only token_owner_start_offsets_per_req; "
+                         "token_start_offsets_per_req is a legacy alias.")
+    owner_starts = token_owner_start_offsets_per_req
+    if owner_starts is None:
+        owner_starts = token_start_offsets_per_req
+    return pcp_token_owner_start_offsets(num_scheduled_tokens_per_req,
+                                         owner_starts)
+
+
+def pcp_token_owner_chunk_ranges(q_len: int, token_owner_start: int,
+                                 pcp_rank: int, pcp_size: int,
+                                 interleave_size: int):
+    """Yield absolute owner-coordinate ranges assigned to one PCP rank."""
     if q_len <= 0:
         return
     cycle = pcp_size * interleave_size
-    q_end = q_global_base + q_len
-    chunk_start = ((q_global_base // cycle) * cycle +
+    q_end = token_owner_start + q_len
+    chunk_start = ((token_owner_start // cycle) * cycle +
                    pcp_rank * interleave_size)
-    if chunk_start + interleave_size <= q_global_base:
+    if chunk_start + interleave_size <= token_owner_start:
         chunk_start += cycle
     while chunk_start < q_end:
-        overlap_start = max(chunk_start, q_global_base)
+        overlap_start = max(chunk_start, token_owner_start)
         overlap_end = min(chunk_start + interleave_size, q_end)
         if overlap_end > overlap_start:
             yield overlap_start, overlap_end
         chunk_start += cycle
 
 
+def pcp_query_chunk_ranges(q_len: int, q_global_base: int, pcp_rank: int,
+                           pcp_size: int, interleave_size: int):
+    """Compatibility alias for :func:`pcp_token_owner_chunk_ranges`."""
+    yield from pcp_token_owner_chunk_ranges(q_len, q_global_base, pcp_rank,
+                                            pcp_size, interleave_size)
+
+
 def pcp_local_token_counts(
     num_scheduled_tokens_per_req: list[int] | np.ndarray,
     pcp_size: int,
     interleave_size: int,
+    token_owner_start_offsets_per_req: list[int] | np.ndarray | None = None,
+    *,
     token_start_offsets_per_req: list[int] | np.ndarray | None = None,
 ) -> np.ndarray:
     """Return local token counts for each PCP rank under chunk interleave."""
@@ -65,12 +95,17 @@ def pcp_local_token_counts(
     tokens = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
     if tokens.size == 0:
         return np.zeros(pcp_size, dtype=np.int32)
-    starts = pcp_query_start_offsets(tokens, token_start_offsets_per_req)
+    owner_starts = _resolve_token_owner_start_offsets(
+        tokens,
+        token_owner_start_offsets_per_req,
+        token_start_offsets_per_req,
+    )
     counts = np.zeros(pcp_size, dtype=np.int64)
-    for q_len, q_start in zip(tokens, starts):
+    for q_len, token_owner_start in zip(tokens, owner_starts):
         for rank in range(pcp_size):
-            for chunk_start, chunk_end in pcp_query_chunk_ranges(
-                    int(q_len), int(q_start), rank, pcp_size, interleave_size):
+            for chunk_start, chunk_end in pcp_token_owner_chunk_ranges(
+                    int(q_len), int(token_owner_start), rank, pcp_size,
+                    interleave_size):
                 counts[rank] += chunk_end - chunk_start
     return counts.astype(np.int32)
 
@@ -80,6 +115,8 @@ def build_pcp_rank_major_token_order(
     pcp_size: int,
     interleave_size: int,
     padded_num_tokens: int,
+    token_owner_start_offsets_per_req: list[int] | np.ndarray | None = None,
+    *,
     token_start_offsets_per_req: list[int] | np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build token reorder indices for rank-major PCP chunk packing.
@@ -104,18 +141,20 @@ def build_pcp_rank_major_token_order(
     token_order = np.full(padded_num_tokens, -1, dtype=np.int64)
     total_num_tokens = int(np.sum(num_scheduled_tokens_per_req))
     inverse_order = np.full(total_num_tokens, -1, dtype=np.int64)
-    starts = pcp_query_start_offsets(
+    owner_starts = _resolve_token_owner_start_offsets(
         np.asarray(num_scheduled_tokens_per_req, dtype=np.int64),
+        token_owner_start_offsets_per_req,
         token_start_offsets_per_req,
     )
 
     req_start = 0
     rank_offsets = np.zeros(pcp_size, dtype=np.int64)
-    for num_tokens, q_global_base in zip(num_scheduled_tokens_per_req, starts):
+    for num_tokens, token_owner_start in zip(num_scheduled_tokens_per_req,
+                                             owner_starts):
         num_tokens = int(num_tokens)
         for rank in range(pcp_size):
-            for chunk_start, chunk_end in pcp_query_chunk_ranges(
-                    num_tokens, int(q_global_base), rank, pcp_size,
+            for chunk_start, chunk_end in pcp_token_owner_chunk_ranges(
+                    num_tokens, int(token_owner_start), rank, pcp_size,
                     interleave_size):
                 chunk_len = chunk_end - chunk_start
                 dst_start = rank * local_padded_num_tokens + rank_offsets[rank]
@@ -123,8 +162,8 @@ def build_pcp_rank_major_token_order(
                 if dst_end > (rank + 1) * local_padded_num_tokens:
                     raise ValueError(
                         "PCP local token count exceeds padded local capacity.")
-                local_chunk_start = chunk_start - q_global_base
-                local_chunk_end = chunk_end - q_global_base
+                local_chunk_start = chunk_start - token_owner_start
+                local_chunk_end = chunk_end - token_owner_start
                 src = np.arange(req_start + local_chunk_start,
                                 req_start + local_chunk_end,
                                 dtype=np.int64)
@@ -148,6 +187,8 @@ def apply_pcp_rank_major_token_order(
     interleave_size: int,
     padded_num_tokens: int,
     mrope_positions_cpu: np.ndarray | None = None,
+    token_owner_start_offsets_per_req: list[int] | np.ndarray | None = None,
+    *,
     token_start_offsets_per_req: list[int] | np.ndarray | None = None,
 ) -> np.ndarray:
     """Reorder per-DP token arrays into PCP rank-major chunk order."""
@@ -157,6 +198,7 @@ def apply_pcp_rank_major_token_order(
         pcp_size,
         interleave_size,
         padded_num_tokens,
+        token_owner_start_offsets_per_req,
         token_start_offsets_per_req=token_start_offsets_per_req,
     )
     valid = token_order >= 0
@@ -179,6 +221,8 @@ def build_pcp_logits_indices(
     interleave_size: int,
     padded_num_tokens: int,
     token_offset: int = 0,
+    token_owner_start_offsets_per_req: list[int] | np.ndarray | None = None,
+    *,
     token_start_offsets_per_req: list[int] | np.ndarray | None = None,
 ) -> np.ndarray:
     """Return global packed indices for each request's last query token."""
@@ -187,6 +231,7 @@ def build_pcp_logits_indices(
         pcp_size,
         interleave_size,
         padded_num_tokens,
+        token_owner_start_offsets_per_req,
         token_start_offsets_per_req=token_start_offsets_per_req,
     )
     if len(num_scheduled_tokens_per_req) == 0:

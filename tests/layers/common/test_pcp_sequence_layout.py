@@ -18,6 +18,8 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    build_pcp_logits_indices, build_pcp_rank_major_token_order)
 from vllm_torchtpu.layers.common.pcp_sequence_layout import (
     PcpSequenceLayoutEligibility, PcpSequenceLayoutMode,
     PcpSequenceLayoutPlanner)
@@ -120,7 +122,9 @@ def test_evaluate_runner_chunk_classifies_streaming_prefill():
     assert decision.global_padded_tokens == 64
     np.testing.assert_array_equal(decision.local_token_counts,
                                   np.asarray([16, 16, 16, 16]))
-    np.testing.assert_array_equal(decision.token_start_offsets_per_req,
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([0]))
+    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
                                   np.asarray([0]))
 
 
@@ -139,7 +143,9 @@ def test_evaluate_runner_chunk_accepts_decode_only_query_spans():
     assert decision.global_padded_tokens == 8
     np.testing.assert_array_equal(decision.local_token_counts,
                                   np.asarray([2, 0, 0, 0]))
-    np.testing.assert_array_equal(decision.token_start_offsets_per_req,
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([64, 64]))
+    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
                                   np.asarray([64, 64]))
 
 
@@ -167,7 +173,9 @@ def test_evaluate_runner_chunk_accepts_mixed_prefill_decode_batch():
     assert decision.global_padded_tokens == 128
     np.testing.assert_array_equal(decision.local_token_counts,
                                   np.asarray([17, 16, 16, 16]))
-    np.testing.assert_array_equal(decision.token_start_offsets_per_req,
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([0, 64]))
+    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
                                   np.asarray([0, 64]))
 
 
@@ -208,6 +216,50 @@ def test_evaluate_runner_chunk_accepts_unaligned_q_start():
                                   np.asarray([16, 16, 16, 16]))
 
 
+def test_current_owner_coordinates_are_distinct_but_request_absolute():
+    decision = _evaluate(
+        eligibility=_eligibility(pcp_size=2),
+        computed=[16],
+        prompt=[32],
+        scheduled=[16],
+        num_tokens_paddings=(16, ),
+        max_num_tokens=16,
+    )
+
+    assert decision.spans[0].absolute_query_start == 16
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([16]))
+    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
+                                  np.asarray([16]))
+    assert decision.absolute_query_start_offsets_per_req is not (
+        decision.token_owner_start_offsets_per_req)
+    np.testing.assert_array_equal(decision.local_token_counts,
+                                  np.asarray([0, 16]))
+
+    token_order, inverse_order = build_pcp_rank_major_token_order(
+        [16],
+        pcp_size=2,
+        interleave_size=16,
+        padded_num_tokens=32,
+        token_owner_start_offsets_per_req=(
+            decision.token_owner_start_offsets_per_req),
+    )
+    np.testing.assert_array_equal(token_order[:16], np.full(16, -1))
+    np.testing.assert_array_equal(token_order[16:], np.arange(16))
+    np.testing.assert_array_equal(inverse_order, np.arange(16, 32))
+    np.testing.assert_array_equal(
+        build_pcp_logits_indices(
+            [16],
+            pcp_size=2,
+            interleave_size=16,
+            padded_num_tokens=32,
+            token_owner_start_offsets_per_req=(
+                decision.token_owner_start_offsets_per_req),
+        ),
+        np.asarray([31]),
+    )
+
+
 def test_evaluate_runner_chunk_classifies_multi_active_streaming_prefill():
     decision = _evaluate(
         computed=[0, 0],
@@ -224,7 +276,9 @@ def test_evaluate_runner_chunk_classifies_multi_active_streaming_prefill():
     assert decision.global_padded_tokens == 2048
     np.testing.assert_array_equal(decision.local_token_counts,
                                   np.asarray([512, 512, 512, 512]))
-    np.testing.assert_array_equal(decision.token_start_offsets_per_req,
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([0, 0]))
+    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
                                   np.asarray([0, 0]))
 
 

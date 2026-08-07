@@ -26,7 +26,7 @@ from schedule_reference import \
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     PcpStreamingSchedule, ScheduleField, TilePlanField,
-    build_pcp_streaming_active_page_groups,
+    _build_pcp_rank_query_tiles, build_pcp_streaming_active_page_groups,
     build_pcp_streaming_schedule_inputs_from_metadata_host,
     build_pcp_streaming_schedule_inputs_from_metadata_jax,
     estimate_pcp_streaming_metadata_schedule_steps_ub,
@@ -49,6 +49,34 @@ def _assert_schedule_equal(actual: PcpStreamingSchedule,
             np.testing.assert_array_equal(actual_value,
                                           expected_value,
                                           err_msg=name)
+
+
+def test_rank_query_tiles_separate_owner_and_absolute_coordinates():
+    rank_local_q_offsets = np.array([5, 11], dtype=np.int64)
+
+    original_tiles, original_offsets = _build_pcp_rank_query_tiles(
+        q_len=3,
+        token_owner_start=0,
+        request_absolute_query_start=100,
+        rank_local_q_offsets=rank_local_q_offsets,
+        pcp_size=2,
+        interleave_size=2,
+        bq_sz=2,
+    )
+    shifted_tiles, shifted_offsets = _build_pcp_rank_query_tiles(
+        q_len=3,
+        token_owner_start=2,
+        request_absolute_query_start=100,
+        rank_local_q_offsets=rank_local_q_offsets,
+        pcp_size=2,
+        interleave_size=2,
+        bq_sz=2,
+    )
+
+    assert original_tiles == [[(100, 2, 5)], [(102, 1, 11)]]
+    assert shifted_tiles == [[(102, 1, 5)], [(100, 2, 11)]]
+    np.testing.assert_array_equal(original_offsets, np.array([7, 12]))
+    np.testing.assert_array_equal(shifted_offsets, np.array([6, 13]))
 
 
 def test_generate_schedule_uses_interleave_q_ownership_and_page_mapping():
@@ -969,7 +997,7 @@ def test_metadata_jax_compact_plan_reconstructs_dense_schedule():
         ({
             "q_start_offsets": [2],
             "kv_lens": [10]
-        }, "q_start_offset"),
+        }, "token_owner_start_offset"),
         ({
             "pad_kv_pages_to_pcp_group": False
         }, "pad_kv_pages_to_pcp_group=True"),
