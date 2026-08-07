@@ -198,8 +198,14 @@ class TestTpuCompilerCache:
             assert os.environ.get(
                 "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
             ) == "/tmp/test_xla_cache_env/torch_tpu_tier3"
+            assert os.environ.get(
+                "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+            ) == "/tmp/test_xla_cache_env/torch_tpu_tier3"
+
             assert os.environ.get("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"
                                   ) == "tpu_tier2_cache"
+            assert os.environ.get(
+                "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
 
     def test_env_override_no_clobber(self):
         """Verify that existing native variables are not overwritten by env_override."""
@@ -207,7 +213,9 @@ class TestTpuCompilerCache:
             "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
             "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT":
             "/custom/tier3/path",
+            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/custom/tier3/path",
             "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "custom_tier2",
+            "TORCH_TPU_TIER2_COMPILATION_CACHE": "custom_tier2",
         }
         with patch.dict(os.environ, env_mock, clear=True):
             import vllm_torchtpu.env_override
@@ -216,8 +224,16 @@ class TestTpuCompilerCache:
             assert os.environ.get(
                 "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
             ) == "/custom/tier3/path"
+            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+                                  ) == "/custom/tier3/path"
+
+            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+                                  ) == "/custom/tier3/path"
+
             assert os.environ.get(
                 "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE") == "custom_tier2"
+            assert os.environ.get(
+                "TORCH_TPU_TIER2_COMPILATION_CACHE") == "custom_tier2"
 
     def test_compiler_cache_dir_relocation(self):
         """Verify that TpuCompilerAdaptor relocates cache_dir under VLLM_XLA_CACHE_PATH."""

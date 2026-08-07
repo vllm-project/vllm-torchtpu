@@ -331,10 +331,21 @@ class PhaseBasedProfiler:
     def step(self, batch_composition_stats: dict) -> None:
         """Steps the profiler and logs batch composition stats."""
         have_seen_all_phases = all(self.inference_phase_seen.values())
-        is_past_initial_request = (
-            batch_composition_stats["total_num_scheduled_tokens"] > 1)
-        if is_past_initial_request and (not have_seen_all_phases
-                                        or self.current_phase != ""):
+        # A batch with no work has no phase -- the classifier divides by
+        # total_num_scheduled_tokens. execute_model already returns before
+        # calling us in that case, so this only keeps the invariant local.
+        #
+        # The threshold must stay at 0, not 1. One request in decode schedules
+        # exactly one token, so `> 1` skipped every steady-state step of a
+        # batch-size-1 run: decode_only could never be captured, and because
+        # this guard also covers _step_or_stop_profiling, the phase already
+        # capturing never counted down. That left the capture open until
+        # /stop_profile, ignoring max_iterations and filing every later step
+        # under the phase that opened it.
+        has_scheduled_work = (
+            batch_composition_stats["total_num_scheduled_tokens"] > 0)
+        if has_scheduled_work and (not have_seen_all_phases
+                                   or self.current_phase != ""):
             if self.profiling_n_steps_left <= 0:
                 self._start_profiling(batch_composition_stats)
             else:

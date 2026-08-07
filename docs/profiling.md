@@ -4,8 +4,10 @@
 process drives its own profiler session and can only trace the chips it owns, so
 a whole-slice trace is assembled from one capture per worker (see
 [`src/vllm_torchtpu/profiler_trace.py`](../src/vllm_torchtpu/profiler_trace.py)).
-The output is XPlane protobuf (`*.xplane.pb`), readable in
-[XProf](https://github.com/openxla/xprof) / TensorBoard.
+Every mode writes XPlane protobuf (`*.xplane.pb`), readable in
+[XProf](https://github.com/openxla/xprof) / TensorBoard; the two non-phased
+modes also write Chrome-format JSON. See [Trace formats](#trace-formats) for
+which mode produces what.
 
 There are three ways to profile a workload:
 
@@ -206,6 +208,12 @@ curl -X POST http://localhost:8000/stop_profile
 read by the TPU workers, so setting it only in the shell that runs `curl` has no
 effect.
 
+The traffic you send between those two calls decides which phases you get. One
+request at a time yields `prefill_only` and `decode_only`; the mixed phases need
+concurrency. See
+[a phase is missing](#the-run-produces-no-or-unexpected-traces) before running
+this against an expensive model.
+
 Two flags in that command are easy to miss. `--attention-backend CUSTOM` selects
 the batched-RPA Pallas kernel; without it vLLM falls back to `FLASH_ATTN` with
 `block_size=16`, so you would be profiling a backend you do not serve with.
@@ -358,7 +366,8 @@ ssh -L 6006:localhost:6006 <tpu-vm-host>
 
 To keep traces after the VM is torn down, or to share them, copy them down
 first. Preserve the directory hierarchy — XProf reads the
-`plugins/profile/<timestamp>/` layout, not just the individual file:
+`plugins/profile/<timestamp>/` layout, not just the individual file. This copies
+both formats; the JSON pattern simply matches nothing on a phased run:
 
 ```bash
 rsync -avzm \
@@ -381,17 +390,42 @@ and Op Profile views cover HBM usage and MXU utilization.
 
 ### Seeing every rank at once
 
-Because all of a run's ranks are merged into one `plugins/profile/<timestamp>/`
-directory, pointing XProf at the run directory loads them together — use the
-host picker to switch between ranks, or view them side by side, without merging
-anything by hand. This is the reason the capture goes through the rank-prefix
-merge described above; a per-rank directory layout would force you to open each
-rank as a separate session.
+All of a run's **XPlane** files are merged into one
+`plugins/profile/<timestamp>/` directory, so pointing XProf at the run directory
+loads them together — use the host picker to switch between ranks, or view them
+side by side, without merging anything by hand. This is the reason the capture
+goes through the rank-prefix merge described above; a per-rank directory layout
+would force you to open each rank as a separate session.
 
-Note that by migrating to the native `torch.profiler`, vllm-torchtpu concurrently generates multiple trace formats:
-* **`plugins/profile/<timestamp>/*xplane.pb`**: Raw TPU hardware traces  (viewable via TensorBoard's XProf plugin, so a viewer that asks you to choose a file type wants **XPlane**).
-* **`rank_<N>/*.pt.trace.json.gz`**: Detailed PyTorch/ATen host traces + Kineto TPU traces in standard Chrome Trace Event Format. These can be dragged directly into native viewers like [Perfetto](https://ui.perfetto.dev) or Chrome Tracing UI.
-* **`*.async_llm.*.pt.trace.json.gz`**: The vLLM AsyncLLM CPU frontend traces.
+The Chrome-format JSON traces do **not** go through that merge. They are already
+uniquely named per worker, so they never collide, but each rank keeps its own
+file under `rank_<N>/`. A viewer that opens a single file therefore shows one
+rank at a time.
+
+## Trace formats
+
+What lands on disk depends on which profiler ran:
+
+| Mode | `*.xplane.pb` | `*.pt.trace.json.gz` |
+|---|---|---|
+| [Offline script](#offline-profiling-with-examplestpu_profilingpy) | yes | yes |
+| [Server-side capture](#server-side-capture-vllm-serve) | yes | yes |
+| [Phased profiling](#phased-profiling) | yes | **no** |
+
+> [!IMPORTANT]
+> Phased profiling has not been migrated to the native `torch.profiler` — it
+> still uses TorchTPU's own handler — so a phased run writes **XPlane files
+> only**. The JSON formats below are produced by the other two modes.
+
+* **`plugins/profile/<timestamp>/*.xplane.pb`** — raw TPU hardware traces.
+  Viewable in XProf or TensorBoard's XProf plugin; a viewer that asks you to
+  choose a file type wants **XPlane**.
+* **`rank_<N>/*.pt.trace.json.gz`** — PyTorch/ATen host traces plus Kineto TPU
+  traces, in standard Chrome Trace Event Format. Drag one straight into
+  [Perfetto](https://ui.perfetto.dev) or Chrome Tracing.
+* **`*.async_llm.*.pt.trace.json.gz`** — the vLLM AsyncLLM CPU frontend traces.
+  These are not written when `--profiler-config.ignore_frontend true` is set,
+  which the examples on this page do set.
 
 ## Troubleshooting
 
@@ -418,12 +452,12 @@ harness that means `CAPTURE_PROFILE` must resolve to `1`.
 
 **A phase is missing** — the workload never produced a batch with that
 composition. `prefill_only` and `decode_only` need batches that are entirely one
-or the other, which a heavily overlapped serving run may never schedule. Check
-the `batch_composition_stats_*.json` files to see which phases the scheduler
-actually produced. `decode_only` additionally needs at least two concurrent
-requests: the profiler skips one-token steps (a guard against capturing the
-initial request), and a single decoding request schedules exactly one token per
-step.
+or the other, which a heavily overlapped serving run may never schedule. The
+mixed phases are the mirror image: `prefill_heavy`, `balanced`, and
+`decode_heavy` each need prefill and decode tokens in the *same* batch, so a run
+that only ever has one request in flight yields `prefill_only` and `decode_only`
+and nothing else. Check the `batch_composition_stats_*.json` files to see which
+phases the scheduler actually produced.
 
 **Traces are split across two timestamped directories** — ranks disagreed on the
 canonical timestamp; see the multi-host warning above.
