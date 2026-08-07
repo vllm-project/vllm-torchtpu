@@ -33,8 +33,6 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-_RENDEZVOUS_TIMEOUT_S = float(
-    os.environ.get("TORCH_TPU_MP_RENDEZVOUS_TIMEOUT_S", "300"))
 _DONE_SENTINEL = "_TORCH_TPU_MP_MULTIHOST_ENV_PREPARED"
 
 # The master's TCPStore server thread stops as soon as the TCPStore object is
@@ -85,7 +83,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
         port=rendezvous_port,
         world_size=nnodes,
         is_master=is_master,
-        timeout=timedelta(seconds=_RENDEZVOUS_TIMEOUT_S),
+        timeout=timedelta(seconds=300),
     )
     if is_master:
         # Keep the server thread alive; see module-level comment.
@@ -97,7 +95,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     ip_keys = [f"tpu_mp_host_ip_{i}" for i in range(nnodes)]
     wait_keys = ip_keys + ["tpu_mp_xprof_session_id"]
-    store.wait(wait_keys, timedelta(seconds=_RENDEZVOUS_TIMEOUT_S))
+    store.wait(wait_keys, timedelta(seconds=300))
     host_ips = [store.get(key).decode() for key in ip_keys]
     xprof_session_id = store.get("tpu_mp_xprof_session_id").decode()
 
@@ -112,8 +110,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     # Lazy import: tpu_platform.py imports this module from inside
     # check_and_update_config to avoid a top-level circular import.
-    from vllm_torchtpu.platforms.tpu_platform import \
-        TPU_MULTIHOST_TOPOLOGY_MAP
+    from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
     topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(total_chips)
     if topology is None:
         raise ValueError(
@@ -127,6 +124,5 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     logger.info(
         "TPU mp multihost: node_rank=%d host_ips=%s "
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s",
-        node_rank, host_ips, os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
-        topology)
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s", node_rank,
+        host_ips, os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"], topology)

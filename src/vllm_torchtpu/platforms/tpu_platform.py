@@ -895,26 +895,7 @@ class TpuPlatform(Platform):
                         "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
-        if multihost_backend != "ray" and parallel_config.nnodes > 1:
-            # Genuine multi-host run without Ray: each host runs its own
-            # `vllm serve --nnodes N --node-rank R [--headless]` process and
-            # spawns its local TP-slice workers via TpuMultiprocExecutor.
-            # Unlike the Ray path there's no actor system to discover peer
-            # hosts, so a short TCPStore rendezvous fills in the TORCH_TPU_*
-            # env vars (slicebuilder addresses spanning every host, full
-            # ICI topology, TPU_NUM_HOSTS/NODE_RANK) before workers are
-            # forked.
-            from vllm_torchtpu.distributed.tpu_mp_multihost import \
-                prepare_mp_multihost_env
-            prepare_mp_multihost_env(parallel_config)
-            logger.info(
-                "Force using TpuMultiprocExecutor for TPU multi-host "
-                "(nnodes=%d, node_rank=%d).", parallel_config.nnodes,
-                parallel_config.node_rank)
-            from vllm_torchtpu.executors.tpu_multiproc_executor import \
-                TpuMultiprocExecutor
-            parallel_config.distributed_executor_backend = TpuMultiprocExecutor
-        elif not multihost_backend:  # Single host
+        if not multihost_backend:  # Single host
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
                 if pcp_size > 1:
@@ -996,6 +977,25 @@ class TpuPlatform(Platform):
                 parallel_config.distributed_executor_backend = RayDistributedExecutor
                 logger.info(
                     "Force using RayDistributedExecutor for TPU on multihost.")
+        elif multihost_backend == "mp" and parallel_config.nnodes > 1:
+            # Genuine multi-host run without Ray: each host runs its own
+            # `vllm serve --nnodes N --node-rank R [--headless]` process and
+            # spawns its local TP-slice workers via TpuMultiprocExecutor.
+            # Unlike the Ray path there's no actor system to discover peer
+            # hosts, so a short TCPStore rendezvous fills in the TORCH_TPU_*
+            # env vars (slicebuilder addresses spanning every host, full
+            # ICI topology, TPU_NUM_HOSTS/NODE_RANK) before workers are
+            # forked.
+            from vllm_torchtpu.distributed.tpu_mp_multihost import \
+                prepare_mp_multihost_env
+            prepare_mp_multihost_env(parallel_config)
+            logger.info(
+                "Force using TpuMultiprocExecutor for TPU multi-host "
+                "(nnodes=%d, node_rank=%d).", parallel_config.nnodes,
+                parallel_config.node_rank)
+            from vllm_torchtpu.executors.tpu_multiproc_executor import \
+                TpuMultiprocExecutor
+            parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         else:
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
