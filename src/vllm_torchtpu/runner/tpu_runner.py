@@ -94,6 +94,8 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.mm_encoder_manager import \
+    maybe_create_mm_encoder_manager
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.structured_decoding_manager import \
@@ -4066,6 +4068,12 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
+
+        # Initialize the MM encoder manager and precompile the vision encoder
+        self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
+            self.vllm_config, self.device, self.model)
+        if self.encoder_cudagraph_manager is not None:
+            self.encoder_cudagraph_manager.precompile_vision_encoder()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).

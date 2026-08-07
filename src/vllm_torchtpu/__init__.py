@@ -572,6 +572,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     # Install this constructor patch at the engine-core boundary instead, before
     # the first scheduler is created.
     _patch_vllm_hybrid_producer_prefix_hits()
+    _patch_vllm_merge_multimodal_embeddings()
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -968,6 +969,58 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     if not already_patched:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP "
                     "block sizes.")
+
+
+def _patch_vllm_merge_multimodal_embeddings() -> None:
+    """Patch vLLM's _merge_multimodal_embeddings to use static indexing on TPU.
+
+    PyTorch boolean indexing (inputs[mask] = values) internally lowers to
+    `nonzero()` + `index_put_`, which creates dynamic coordinate shapes
+    parameterized by the number of True entries. On TPU, this causes
+    `tt_jit_index_put__nonzero` to recompile on every request with a different
+    image token count (~15s compilation each). We replace it with static prefix-sum
+    indexing and `torch.where`, which avoids `nonzero` and eliminates recompilation.
+    """
+    import sys
+
+    import torch
+    import vllm.model_executor.models.utils as vllm_utils
+    from vllm.multimodal import NestedTensors
+
+    if getattr(vllm_utils, "_tpu_static_merge_mm_patch", False):
+        return
+
+    orig_merge = vllm_utils._merge_multimodal_embeddings
+
+    def static_merge_multimodal_embeddings(
+        inputs_embeds: torch.Tensor,
+        multimodal_embeddings: NestedTensors,
+        is_multimodal: torch.Tensor,
+    ) -> torch.Tensor:
+        if len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        mm_embeds_flat = vllm_utils._flatten_embeddings(multimodal_embeddings)
+        if mm_embeds_flat.numel() == 0:
+            return inputs_embeds
+
+        idx = torch.cumsum(is_multimodal, dim=0, dtype=torch.int32) - 1
+        idx = torch.clamp(idx, 0, mm_embeds_flat.shape[0] - 1)
+        gathered = mm_embeds_flat[idx]
+        condition = is_multimodal.unsqueeze(-1)
+        return torch.where(condition, gathered, inputs_embeds)
+
+    vllm_utils._original_merge_multimodal_embeddings = orig_merge
+    vllm_utils._merge_multimodal_embeddings = static_merge_multimodal_embeddings
+    vllm_utils._tpu_static_merge_mm_patch = True
+
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name.startswith("vllm.model_executor.models") and hasattr(
+                mod, "_merge_multimodal_embeddings"):
+            setattr(mod, "_merge_multimodal_embeddings",
+                    static_merge_multimodal_embeddings)
+
+    logger.info("Applied TPU patch: static _merge_multimodal_embeddings")
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:
