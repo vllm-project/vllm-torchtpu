@@ -219,7 +219,7 @@ class RpaConfigs:
 
     @property
     def bkv_p(self) -> int:
-        return self.block.bkv_sz // self.serve.page_size
+        return pl.cdiv(self.block.bkv_sz, self.serve.page_size)
 
     @property
     def bkv_p_cache(self) -> int:
@@ -229,7 +229,7 @@ class RpaConfigs:
 
     @property
     def bkv_p_new(self) -> int:
-        if self.mode == RpaCase.DECODE:
+        if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
             return 1
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.bkv_p + 1
@@ -390,10 +390,10 @@ class RpaConfigs:
                 f" but got {q.shape[2]=}, {k.shape[2]=}, and {v.shape[2]=}")
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            if self.serve.page_size != 128:
+            if self.serve.page_size % 128 != 0:
                 raise ValueError(
-                    "Expected page_size=128 for SEQ_ALONG_LANE tile alignment, but got"
-                    f" {self.serve.page_size=}")
+                    "Expected page_size to be a multiple of 128 for SEQ_ALONG_LANE"
+                    f" tile alignment, but got {self.serve.page_size=}")
             expected_kv_cache_shape = (
                 kv_cache.shape[0],
                 self.model.num_kv_heads * 2,

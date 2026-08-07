@@ -562,7 +562,7 @@ def compute_metadata(
                 dma_entry.wb_hbm[...] = dst_hbm
                 dma_entry.set_flags(dma_sz, dma_sz)
 
-        if cfgs.bkv_p_new < cfgs.bkv_p:
+        if cfgs.block.bq_sz == 1:
             # Decode path
             assert cfgs.bkv_p_new == 1
             slot_start = (bkv_sz_cache //
