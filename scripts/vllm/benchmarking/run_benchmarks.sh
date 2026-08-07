@@ -312,6 +312,23 @@ stop_vllm_server() {
     echo "Server stopped."
 }
 
+# vllm bench serve exits 0 even when every request fails (it still writes a
+# result JSON full of zeros), so the dead-server checks on the failure paths
+# below never fire if the server dies between runs. Probe the server process
+# after each completed run so the sweep aborts with diagnostics instead of
+# benchmarking a dead endpoint.
+check_server_alive() {
+    if [ "$START_SERVER" = "1" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "ERROR: Server process died (detected after a completed run)."
+        echo "========== Last 100 lines of server.log =========="
+        tail -100 "$RESULTS_DIR/server.log" 2>/dev/null || true
+        echo "========== Disk usage =========="
+        df -h /perf_eval_results /root/.cache /dev/shm 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
 run_benchmark_once() {
     local input_len=$1
     local output_len=$2
@@ -505,6 +522,10 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
                 break
             fi
             echo "    Warmup OK -> $warmup_file"
+            if ! check_server_alive; then
+                exit_code=1
+                break 3
+            fi
         done
 
         if [ "$exit_code" -ne 0 ]; then
@@ -518,6 +539,10 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
         fi
         if [ "$bench_exit" -eq 0 ]; then
             echo "    OK -> $result_file"
+            if ! check_server_alive; then
+                exit_code=1
+                break 2
+            fi
         else
             echo "    FAILED (exit $bench_exit)"
             exit_code=$bench_exit
