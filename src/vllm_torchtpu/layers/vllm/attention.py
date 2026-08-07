@@ -587,7 +587,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-                max_model_len=max_model_len,
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:

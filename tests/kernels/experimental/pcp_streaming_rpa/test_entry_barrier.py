@@ -256,7 +256,6 @@ def _build_compiled_steps(torch, mesh):
         soft_cap=None,
         skip_kv_update=False,
         cp_kv_cache_interleave_size=PAGE_SIZE,
-        max_model_len=MAX_MODEL_LEN,
         q_block_size=Q_BLOCK_SIZE,
         q_compute_size=128,
     )

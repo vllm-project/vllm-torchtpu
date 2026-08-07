@@ -26,13 +26,21 @@ PCP_AXIS_NAME = "pcp"
 
 
 class _PCPQueryRowMapping(NamedTuple):
-    """Query-row coordinates and their current local KV-cache targets."""
+    """Query-row coordinates in the batch-flat PCP token stream."""
 
     absolute_positions: jax.Array
     request_indices: jax.Array
     source_ranks: jax.Array
     is_valid: jax.Array
-    local_slot_ids: jax.Array
+
+
+class _PCPKVWritebackMapping(NamedTuple):
+    """Unique cache destination and dense capture offset for each source row."""
+
+    cache_owner_ranks: jax.Array
+    cache_local_slot_ids: jax.Array
+    capture_offsets: jax.Array
+    writeback_counts: jax.Array
 
 
 def _pack_kv_for_cache(
@@ -68,52 +76,6 @@ def _prepare_packed_kv_for_cache(
         packed_kv = packed_kv.reshape(
             (packed_kv.shape[0], *kv_cache.shape[2:]))
     return packed_kv.astype(kv_cache.dtype)
-
-
-def _scatter_packed_kv_to_local_cache(
-    kv_cache: jax.Array,
-    packed_kv: jax.Array,
-    slot_ids: jax.Array,
-) -> jax.Array:
-    """Scatter packed KV rows assigned to this local cache shard."""
-    page_size = kv_cache.shape[1]
-    valid = slot_ids >= 0
-    page = jnp.where(valid, slot_ids // page_size, kv_cache.shape[0])
-    offset = jnp.where(valid, slot_ids % page_size, 0)
-    return kv_cache.at[page, offset].set(packed_kv, mode="drop")
-
-
-def _update_local_paged_kv_cache(
-    kv_cache: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    slot_ids: jax.Array,
-) -> jax.Array:
-    """Write local K/V rows into the local paged KV cache shard."""
-    packed_kv = _prepare_packed_kv_for_cache(k, v, kv_cache)
-    return _scatter_packed_kv_to_local_cache(kv_cache, packed_kv, slot_ids)
-
-
-def _all_gather_packed_kv(
-    packed_kv: jax.Array,
-    pcp_axis: str,
-) -> jax.Array:
-    """Gather one cache-dtype packed-KV tensor across PCP source ranks."""
-    packed_dtype = jnp.dtype(packed_kv.dtype)
-    uses_byte_transport = (packed_dtype.itemsize == 1
-                           and jnp.issubdtype(packed_dtype, jnp.floating))
-    collective_input = packed_kv
-    if uses_byte_transport:
-        # TPU collective support for float8 varies by backend version. Moving
-        # its already-quantized bytes as uint8 preserves the exact cache bits.
-        collective_input = jax.lax.bitcast_convert_type(packed_kv, jnp.uint8)
-    gathered = jax.lax.all_gather(collective_input,
-                                  axis_name=pcp_axis,
-                                  axis=0,
-                                  tiled=True)
-    if uses_byte_transport:
-        gathered = jax.lax.bitcast_convert_type(gathered, packed_dtype)
-    return gathered
 
 
 def _reshape_packed_kv_cache_for_attention(kv_cache: jax.Array) -> jax.Array:
@@ -197,7 +159,7 @@ def _pcp_rank_token_count_before(position: jax.Array, pcp_rank: jax.Array,
     return full_cycles * interleave_size + rank_tokens_in_partial
 
 
-def _compute_local_cache_slot_ids_for_rows(
+def _compute_cache_owner_and_slot_ids_for_rows(
     absolute_positions: jax.Array,
     request_indices: jax.Array,
     row_valid: jax.Array,
@@ -206,10 +168,22 @@ def _compute_local_cache_slot_ids_for_rows(
     local_kv_cache_num_blocks: int,
     page_size: int,
     pcp_size: int,
-    cache_rank: int | jax.Array,
     interleave_size: int,
-) -> jax.Array:
-    """Map arbitrary query rows to slots owned by one PCP cache rank."""
+) -> tuple[jax.Array, jax.Array]:
+    """Map arbitrary source rows to their unique PCP cache owner and slot."""
+    if local_kv_cache_num_blocks <= 0:
+        raise ValueError("local_kv_cache_num_blocks must be positive.")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive.")
+    if pcp_size <= 0:
+        raise ValueError("pcp_size must be positive.")
+    if interleave_size <= 0:
+        raise ValueError("interleave_size must be positive.")
+    if interleave_size > page_size or page_size % interleave_size != 0:
+        raise NotImplementedError(
+            "PCP slot id reconstruction requires page_size to be divisible "
+            f"by interleave_size: {page_size=} {interleave_size=}.")
+
     pages_per_seq = block_tables.shape[1]
     safe_positions = jnp.where(row_valid, absolute_positions, 0)
     safe_request_indices = jnp.where(row_valid, request_indices, 0)
@@ -228,32 +202,28 @@ def _compute_local_cache_slot_ids_for_rows(
                       (pcp_size * interleave_size)) * interleave_size +
                      (virtual_offsets % interleave_size))
     slot_ids = block_numbers * page_size + local_offsets
-    assigned_to_cache_rank = jnp.logical_and(
-        row_valid,
-        cache_owners == jnp.asarray(cache_rank, dtype=jnp.int32),
+    invalid = jnp.asarray(-1, dtype=jnp.int32)
+    return (
+        jnp.where(row_valid, cache_owners, invalid).astype(jnp.int32),
+        jnp.where(row_valid, slot_ids, invalid).astype(jnp.int32),
     )
-    return jnp.where(assigned_to_cache_rank, slot_ids, -1).astype(jnp.int32)
 
 
 def _compute_pcp_local_query_row_mapping(
     q_lens: jax.Array,
     token_owner_starts: jax.Array,
     request_absolute_starts: jax.Array,
-    block_tables: jax.Array,
     *,
     local_padded_tokens: int,
-    local_kv_cache_num_blocks: int,
-    page_size: int,
     pcp_size: int,
     pcp_rank: int | jax.Array,
     interleave_size: int,
 ) -> _PCPQueryRowMapping:
-    """Build one source rank's rows with independent owner/cache positions."""
+    """Build one source rank's batch-flat query-row coordinates."""
     q_lens = jnp.asarray(q_lens, dtype=jnp.int32)
     token_owner_starts = jnp.asarray(token_owner_starts, dtype=jnp.int32)
     request_absolute_starts = jnp.asarray(request_absolute_starts,
                                           dtype=jnp.int32)
-    block_tables = jnp.asarray(block_tables, dtype=jnp.int32)
     pcp_rank = jnp.asarray(pcp_rank, dtype=jnp.int32)
 
     token_owner_ends = token_owner_starts + q_lens
@@ -308,17 +278,6 @@ def _compute_pcp_local_query_row_mapping(
                                    -1).astype(jnp.int32)
     request_indices = jnp.where(row_valid, safe_req_indices,
                                 -1).astype(jnp.int32)
-    local_slot_ids = _compute_local_cache_slot_ids_for_rows(
-        absolute_positions,
-        request_indices,
-        row_valid,
-        block_tables,
-        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-        page_size=page_size,
-        pcp_size=pcp_size,
-        cache_rank=pcp_rank,
-        interleave_size=interleave_size,
-    )
     return _PCPQueryRowMapping(
         absolute_positions=absolute_positions,
         request_indices=request_indices,
@@ -326,46 +285,31 @@ def _compute_pcp_local_query_row_mapping(
                               pcp_rank,
                               dtype=jnp.int32),
         is_valid=row_valid,
-        local_slot_ids=local_slot_ids,
     )
 
 
 def _compute_pcp_local_query_row_mapping_from_metadata(
     kv_lens: jax.Array,
-    page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     *,
     local_padded_tokens: int,
-    local_kv_cache_num_blocks: int,
-    page_size: int,
     pcp_size: int,
     pcp_rank: int | jax.Array,
     interleave_size: int,
 ) -> _PCPQueryRowMapping:
-    """Rebuild local query-row coordinates and current KV-cache targets."""
+    """Rebuild local query-row coordinates from PCP attention metadata."""
     if local_padded_tokens <= 0:
         raise ValueError("local_padded_tokens must be positive.")
-    if local_kv_cache_num_blocks <= 0:
-        raise ValueError("local_kv_cache_num_blocks must be positive.")
-    if page_size <= 0:
-        raise ValueError("page_size must be positive.")
     if pcp_size <= 0:
         raise ValueError("pcp_size must be positive.")
     if interleave_size <= 0:
         raise ValueError("interleave_size must be positive.")
-    if interleave_size > page_size or page_size % interleave_size != 0:
-        raise NotImplementedError(
-            "PCP slot id reconstruction requires page_size to be divisible "
-            f"by interleave_size: {page_size=} {interleave_size=}.")
 
     kv_lens = jnp.asarray(kv_lens, dtype=jnp.int32)
     cu_q_lens = jnp.asarray(cu_q_lens, dtype=jnp.int32)
-    page_indices = jnp.asarray(page_indices, dtype=jnp.int32)
     distribution = jnp.asarray(distribution, dtype=jnp.int32)
     max_num_reqs = int(kv_lens.shape[0])
-    block_tables = _reshape_metadata_page_indices_jax(page_indices,
-                                                      max_num_reqs)
 
     q_lens_raw = cu_q_lens[1:max_num_reqs + 1] - cu_q_lens[:max_num_reqs]
     active_num_reqs = jnp.clip(distribution[2], 0, max_num_reqs)
@@ -383,54 +327,19 @@ def _compute_pcp_local_query_row_mapping_from_metadata(
         q_lens,
         token_owner_starts=token_owner_starts,
         request_absolute_starts=absolute_q_starts,
-        block_tables=block_tables,
         local_padded_tokens=local_padded_tokens,
-        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-        page_size=page_size,
         pcp_size=pcp_size,
         pcp_rank=pcp_rank,
         interleave_size=interleave_size,
     )
-
-
-def compute_pcp_local_slot_ids_from_metadata(
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
-    distribution: jax.Array,
-    *,
-    local_padded_tokens: int,
-    local_kv_cache_num_blocks: int,
-    page_size: int,
-    pcp_size: int,
-    pcp_rank: int | jax.Array,
-    interleave_size: int,
-) -> jax.Array:
-    """Rebuild local KV-cache slot ids from standard PCP attention metadata."""
-    mapping = _compute_pcp_local_query_row_mapping_from_metadata(
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        local_padded_tokens=local_padded_tokens,
-        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-        page_size=page_size,
-        pcp_size=pcp_size,
-        pcp_rank=pcp_rank,
-        interleave_size=interleave_size,
-    )
-    return mapping.local_slot_ids
 
 
 def _compute_pcp_rank_major_query_row_mapping_from_metadata(
     kv_lens: jax.Array,
-    page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     *,
     local_padded_tokens: int,
-    local_kv_cache_num_blocks: int,
-    page_size: int,
     pcp_size: int,
     interleave_size: int,
 ) -> _PCPQueryRowMapping:
@@ -439,12 +348,9 @@ def _compute_pcp_rank_major_query_row_mapping_from_metadata(
     mapping_by_rank = jax.vmap(
         lambda pcp_rank: _compute_pcp_local_query_row_mapping_from_metadata(
             kv_lens,
-            page_indices,
             cu_q_lens,
             distribution,
             local_padded_tokens=local_padded_tokens,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
             pcp_size=pcp_size,
             pcp_rank=pcp_rank,
             interleave_size=interleave_size,
@@ -458,9 +364,147 @@ def _compute_pcp_rank_major_query_row_mapping_from_metadata(
         source_ranks=mapping_by_rank.source_ranks.reshape(
             (rank_major_tokens, )),
         is_valid=mapping_by_rank.is_valid.reshape((rank_major_tokens, )),
-        local_slot_ids=mapping_by_rank.local_slot_ids.reshape(
-            (rank_major_tokens, )),
     )
+
+
+def _compute_pcp_kv_writeback_mapping(
+    rank_major_query_rows: _PCPQueryRowMapping,
+    block_tables: jax.Array,
+    *,
+    local_kv_cache_num_blocks: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+) -> _PCPKVWritebackMapping:
+    """Build the one-path dense ring-capture destination mapping.
+
+    Capture order is request-major and request-absolute within each cache
+    owner. Every valid source row has exactly one cache owner, one cache-local
+    slot, and one dense offset in that owner's capture buffer. There is no
+    phase or fallback classification in this mapping.
+    """
+    block_tables = jnp.asarray(block_tables, dtype=jnp.int32)
+    cache_owner_ranks, cache_local_slot_ids = \
+        _compute_cache_owner_and_slot_ids_for_rows(
+            rank_major_query_rows.absolute_positions,
+            rank_major_query_rows.request_indices,
+            rank_major_query_rows.is_valid,
+            block_tables,
+            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        )
+
+    max_num_reqs = int(block_tables.shape[0])
+    invalid_scatter_index = max_num_reqs
+    safe_request_indices = jnp.where(
+        rank_major_query_rows.is_valid,
+        rank_major_query_rows.request_indices,
+        invalid_scatter_index,
+    )
+    safe_cache_owners = jnp.where(
+        rank_major_query_rows.is_valid,
+        cache_owner_ranks,
+        pcp_size,
+    )
+    request_starts = jnp.full((max_num_reqs, ),
+                              jnp.iinfo(jnp.int32).max,
+                              dtype=jnp.int32)
+    request_starts = request_starts.at[safe_request_indices].min(
+        rank_major_query_rows.absolute_positions,
+        mode="drop",
+    )
+
+    request_owner_counts = jnp.zeros((max_num_reqs, pcp_size), dtype=jnp.int32)
+    request_owner_counts = request_owner_counts.at[
+        safe_request_indices, safe_cache_owners].add(
+            rank_major_query_rows.is_valid.astype(jnp.int32),
+            mode="drop",
+        )
+    request_owner_prefixes = (jnp.cumsum(request_owner_counts, axis=0) -
+                              request_owner_counts)
+
+    row_request_starts = request_starts[jnp.minimum(safe_request_indices,
+                                                    max_num_reqs - 1)]
+    row_cache_owners = jnp.minimum(safe_cache_owners, pcp_size - 1)
+    offsets_within_request = (_pcp_rank_token_count_before(
+        rank_major_query_rows.absolute_positions,
+        row_cache_owners,
+        pcp_size,
+        interleave_size,
+    ) - _pcp_rank_token_count_before(
+        row_request_starts,
+        row_cache_owners,
+        pcp_size,
+        interleave_size,
+    ))
+    capture_offsets = (request_owner_prefixes[
+        jnp.minimum(safe_request_indices, max_num_reqs - 1),
+        row_cache_owners,
+    ] + offsets_within_request)
+    capture_offsets = jnp.where(rank_major_query_rows.is_valid,
+                                capture_offsets, -1).astype(jnp.int32)
+    writeback_counts = jnp.sum(request_owner_counts, axis=0, dtype=jnp.int32)
+    return _PCPKVWritebackMapping(
+        cache_owner_ranks=cache_owner_ranks,
+        cache_local_slot_ids=cache_local_slot_ids,
+        capture_offsets=capture_offsets,
+        writeback_counts=writeback_counts,
+    )
+
+
+def _compact_writeback_slot_ids_for_cache_rank(
+    writeback_mapping: _PCPKVWritebackMapping,
+    cache_rank: int | jax.Array,
+) -> jax.Array:
+    """Compact cache slots into the same dense order as captured KV rows."""
+    capacity = writeback_mapping.capture_offsets.shape[0]
+    cache_rank = jnp.asarray(cache_rank, dtype=jnp.int32)
+    owned = writeback_mapping.cache_owner_ranks == cache_rank
+    offsets = jnp.where(owned, writeback_mapping.capture_offsets, capacity)
+    slots = jnp.where(owned, writeback_mapping.cache_local_slot_ids, -1)
+    compact_slots = jnp.full((capacity, ), -1, dtype=jnp.int32)
+    return compact_slots.at[offsets].set(slots, mode="drop")
+
+
+def _build_writeback_segment_descriptors(
+    compact_slot_ids: jax.Array,
+    writeback_count: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Coalesce dense captured rows into contiguous cache-copy segments."""
+    capacity = int(compact_slot_ids.shape[0])
+    rows = jnp.arange(capacity, dtype=jnp.int32)
+    writeback_count = jnp.clip(jnp.asarray(writeback_count, dtype=jnp.int32),
+                               0, capacity)
+    active = jnp.logical_and(rows < writeback_count, compact_slot_ids >= 0)
+    previous_active = jnp.concatenate((jnp.asarray([False]), active[:-1]),
+                                      axis=0)
+    previous_slots = jnp.concatenate(
+        (jnp.asarray([-2], dtype=jnp.int32), compact_slot_ids[:-1]), axis=0)
+    segment_starts = jnp.logical_and(
+        active,
+        jnp.logical_or(jnp.logical_not(previous_active), compact_slot_ids
+                       != previous_slots + 1),
+    )
+    segment_ids = jnp.cumsum(segment_starts.astype(jnp.int32)) - 1
+    num_segments = jnp.sum(segment_starts, dtype=jnp.int32)
+    drop_index = jnp.asarray(capacity, dtype=jnp.int32)
+
+    start_indices = jnp.where(segment_starts, segment_ids, drop_index)
+    source_starts = jnp.zeros((capacity, ), dtype=jnp.int32)
+    source_starts = source_starts.at[start_indices].set(rows, mode="drop")
+    destination_starts = jnp.zeros((capacity, ), dtype=jnp.int32)
+    destination_starts = destination_starts.at[start_indices].set(
+        compact_slot_ids, mode="drop")
+
+    active_segment_ids = jnp.where(active, segment_ids, drop_index)
+    lengths = jnp.zeros((capacity, ), dtype=jnp.int32)
+    lengths = lengths.at[active_segment_ids].add(active.astype(jnp.int32),
+                                                 mode="drop")
+    descriptors = jnp.stack((source_starts, destination_starts, lengths),
+                            axis=0)
+    return descriptors, num_segments
 
 
 def _select_replicated_query_row_mapping_for_pcp_rank(
@@ -475,7 +519,6 @@ def _select_replicated_query_row_mapping_for_pcp_rank(
             mapping.request_indices,
             mapping.source_ranks,
             mapping.is_valid.astype(jnp.int32),
-            mapping.local_slot_ids,
         ),
         axis=1,
     )
@@ -490,75 +533,7 @@ def _select_replicated_query_row_mapping_for_pcp_rank(
         request_indices=local_mapping[:, 1],
         source_ranks=local_mapping[:, 2],
         is_valid=local_mapping[:, 3].astype(jnp.bool_),
-        local_slot_ids=local_mapping[:, 4],
     )
-
-
-def compute_pcp_rank_major_slot_ids_from_metadata(
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
-    distribution: jax.Array,
-    *,
-    local_padded_tokens: int,
-    local_kv_cache_num_blocks: int,
-    page_size: int,
-    pcp_size: int,
-    interleave_size: int,
-) -> jax.Array:
-    """Return rank-major PCP slot ids shaped like the global sharded Q axis."""
-    mapping = _compute_pcp_rank_major_query_row_mapping_from_metadata(
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        local_padded_tokens=local_padded_tokens,
-        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-        page_size=page_size,
-        pcp_size=pcp_size,
-        interleave_size=interleave_size,
-    )
-    return mapping.local_slot_ids
-
-
-def _redistribute_packed_kv_to_local_cache(
-    kv_cache: jax.Array,
-    k_local: jax.Array,
-    v_local: jax.Array,
-    rank_major_query_rows: _PCPQueryRowMapping,
-    page_indices: jax.Array,
-    *,
-    max_num_reqs: int,
-    cache_rank: int | jax.Array,
-    pcp_axis: str,
-    pcp_size: int,
-    interleave_size: int,
-) -> jax.Array:
-    """Gather packed KV once, then scatter rows owned by this cache rank."""
-    packed_kv_local = _prepare_packed_kv_for_cache(k_local, v_local, kv_cache)
-    gathered_packed_kv = _all_gather_packed_kv(packed_kv_local, pcp_axis)
-    if gathered_packed_kv.shape[0] != \
-            rank_major_query_rows.absolute_positions.shape[0]:
-        raise ValueError(
-            "Gathered packed KV rows must match rank-major query metadata: "
-            f"{gathered_packed_kv.shape[0]} vs "
-            f"{rank_major_query_rows.absolute_positions.shape[0]}.")
-
-    block_tables = _reshape_metadata_page_indices_jax(page_indices,
-                                                      max_num_reqs)
-    local_slot_ids = _compute_local_cache_slot_ids_for_rows(
-        rank_major_query_rows.absolute_positions,
-        rank_major_query_rows.request_indices,
-        rank_major_query_rows.is_valid,
-        block_tables,
-        local_kv_cache_num_blocks=kv_cache.shape[0],
-        page_size=kv_cache.shape[1],
-        pcp_size=pcp_size,
-        cache_rank=cache_rank,
-        interleave_size=interleave_size,
-    )
-    return _scatter_packed_kv_to_local_cache(kv_cache, gathered_packed_kv,
-                                             local_slot_ids)
 
 
 def sharded_pcp_ragged_paged_attention(
@@ -577,12 +552,10 @@ def sharded_pcp_ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    max_context_tokens: int | None = None,
     update_kv_cache: bool = True,
     cp_kv_cache_interleave_size: int = 0,
     q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     q_compute_size: int | None = None,
-    return_local_shards: bool = False,
 ):
     """Runs streaming PCP RPA over local Q/K/V shards."""
     if attention_sink is not None:
@@ -652,12 +625,9 @@ def sharded_pcp_ragged_paged_attention(
         rank_major_query_rows = \
             _compute_pcp_rank_major_query_row_mapping_from_metadata(
             kv_lens,
-            page_indices,
             cu_q_lens,
             distribution,
             local_padded_tokens=q_local.shape[0],
-            local_kv_cache_num_blocks=kv_cache.shape[0],
-            page_size=kv_cache.shape[1],
             pcp_size=pcp_size,
             interleave_size=cp_kv_cache_interleave_size,
         )
@@ -668,18 +638,21 @@ def sharded_pcp_ragged_paged_attention(
         )
         query_row_valid = local_query_rows.is_valid
         cache_rank = local_query_rows.source_ranks[0]
-        kv_cache = _redistribute_packed_kv_to_local_cache(
-            kv_cache,
-            k_local,
-            v_local,
+        block_tables = _reshape_metadata_page_indices_jax(
+            page_indices, kv_lens.shape[0])
+        writeback_mapping = _compute_pcp_kv_writeback_mapping(
             rank_major_query_rows,
-            page_indices,
-            max_num_reqs=kv_lens.shape[0],
-            cache_rank=cache_rank,
-            pcp_axis=PCP_AXIS_NAME,
+            block_tables,
+            local_kv_cache_num_blocks=kv_cache.shape[0],
+            page_size=kv_cache.shape[1],
             pcp_size=pcp_size,
             interleave_size=cp_kv_cache_interleave_size,
         )
+        compact_slot_ids = _compact_writeback_slot_ids_for_cache_rank(
+            writeback_mapping, cache_rank)
+        writeback_count = writeback_mapping.writeback_counts[cache_rank]
+        packed_current_kv = _prepare_packed_kv_for_cache(
+            k_local, v_local, kv_cache)
         if q_local.shape[1] % k_local.shape[1] != 0:
             raise ValueError("Q heads must be divisible by KV heads.")
         q_per_kv = q_local.shape[1] // k_local.shape[1]
@@ -699,20 +672,27 @@ def sharded_pcp_ragged_paged_attention(
                 constant_values=0,
             )
         attention_kv_cache = _reshape_packed_kv_cache_for_attention(kv_cache)
-        output = pcp_streaming_attention_page_groups_packed_local_from_metadata(
+        segment_descriptors, num_segments = \
+            _build_writeback_segment_descriptors(
+                compact_slot_ids,
+                writeback_count,
+            )
+        output, kv_cache = \
+            pcp_streaming_attention_page_groups_packed_local_from_metadata(
             q_streaming,
+            packed_current_kv,
             attention_kv_cache,
             kv_lens,
             page_indices,
             cu_q_lens,
             distribution,
+            segment_descriptors,
+            num_segments,
             pcp_size=pcp_size,
             interleave_size=cp_kv_cache_interleave_size,
             sm_scale=sm_scale,
-            max_context_tokens=max_context_tokens,
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
-            kv_pages_per_block=1,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=tuple(mesh.axis_names),

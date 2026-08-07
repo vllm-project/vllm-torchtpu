@@ -49,31 +49,38 @@ attend to all pages needed by its query tile.
 
 ## Schedule Shape
 
-The packed schedule has shape:
+The production metadata path stores one compact HBM tile plan. During each
+current/history page group, the Pallas kernel expands the active tile into a
+VMEM runtime row with shape:
 
 ```text
-[steps, pcp_size, num_lanes, 128]
+[pcp_size, num_lanes, RuntimeScheduleField.PACKED_NUM_FIELDS]
 ```
 
-The first `ScheduleField.NUM_FIELDS` entries are logical fields, and the rest
-are padding/reserved space. The production metadata path currently uses one
-lane and one KV page per source-rank step. Steps are padded so each page group
-contains exactly `pcp_size` steps.
+The first `RuntimeScheduleField.NUM_FIELDS` entries are logical fields, and the
+rest are padding/reserved space. The source PCP rank is implicit in the ring
+round and is not duplicated in the runtime row.
 
 Important fields include:
 
 - `REQ_ID`: active request id, or `-1` for padded/inactive steps.
-- `KV_PAGE_RANK`: source PCP rank for the scheduled KV page.
 - `KV_PAGE_IDX`: local KV cache page index on that source rank.
-- `IS_FIRST_KV`: reset online-softmax state and load the Q tile.
-- `IS_LAST_KV`: store the final output for the Q tile.
 - `Q_GLOBAL_START`: global position of the first row in the local compact Q
   tile.
 - `KV_GLOBAL_START`: global position of the first KV token in the scheduled
   page.
 - `KV_VALID_LEN`: number of valid KV tokens in the scheduled page.
-- `Q_HBM_OFFSET` and `O_HBM_OFFSET`: local compact query/output offsets.
+- `Q_HBM_OFFSET`: local compact query/output offset.
 - `Q_TILE_SIZE`: number of valid rows in the local Q tile.
+- `KV_HBM_OFFSET`: compact current-KV offset; a negative value selects the
+  history-boundary page from the paged cache.
+- `CAPTURE_SRC_OFFSET`, `CAPTURE_DST_OFFSET`, and `CAPTURE_LEN`: the single
+  consumer-local current-KV fragment captured during the ring and written back
+  after the current pass.
+
+Q loading, online-state initialization, and final state/output stores are
+controlled by the tile's current/history group boundaries rather than encoded
+as duplicated runtime fields.
 
 ## Kernel Execution
 
@@ -106,4 +113,5 @@ The production path is intentionally narrow:
 - The metadata schedule path supports `num_lanes == 1` and
   `kv_pages_per_block == 1`.
 - `head_dim == 64` and attention sinks are not supported.
-- The kernel expects to update the KV cache before computing attention.
+- The current pass captures fresh KV while attention consumes the ring; the
+  cache writeback completes before the history pass begins.
