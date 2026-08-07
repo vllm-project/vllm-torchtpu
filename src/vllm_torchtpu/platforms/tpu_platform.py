@@ -349,16 +349,18 @@ def apply_tpu_patches() -> None:
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
-    from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env,
-                               _patch_vllm_compile_prefix_isolation,
-                               _patch_vllm_piecewise_backend,
-                               _patch_vllm_reset_compile_wrapper)
+    from vllm_torchtpu import (
+        _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
+        _patch_multiproc_worker_global_rank_env,
+        _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
+        _patch_vllm_piecewise_backend, _patch_vllm_reset_compile_wrapper)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_vllm_reset_compile_wrapper()
     _patch_vllm_piecewise_backend()
     _patch_vllm_compile_prefix_isolation()
+    _patch_dflash_bypass_v2_runner_check()
+    _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import \
         patch_runai_sharded_expert_streaming
     patch_runai_sharded_expert_streaming()

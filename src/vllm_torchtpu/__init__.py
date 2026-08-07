@@ -1128,6 +1128,83 @@ def _patch_vllm_compile_prefix_isolation() -> None:
         "(compile_prefix keyed off self.prefix).")
 
 
+def _patch_dflash_bypass_v2_runner_check() -> None:
+    """Bypass V2 model runner check in DFlash for TPU execution.
+
+    Upstream ``qwen3_dflash._resolve_layer_attention`` enforces
+    ``use_v2_model_runner`` for mixed SWA/full attention DFlash drafters.
+    TPU uses TPUModelRunner which handles mixed attention without Triton V2 runner.
+    """
+    try:
+        from vllm.model_executor.models import qwen3_dflash
+    except ImportError:
+        return
+
+    if getattr(qwen3_dflash, "_tpu_bypass_v2_runner_patch", False):
+        return
+
+    original_resolve = qwen3_dflash._resolve_layer_attention
+    _FLAG = "use_v2_model_runner"
+
+    def patched_resolve(config, layer_idx: int):
+        # Force the flag True for the duration of the upstream call only, by
+        # swapping the class attribute and restoring it. Deliberately not
+        # `unittest.mock.patch`: a test helper has no business in the load
+        # path, and — more usefully — looking the attribute up explicitly
+        # means that if upstream ever moves or renames it, this raises here
+        # instead of silently no-op'ing and letting the original V2 check
+        # reject the drafter with an unrelated-looking error.
+        from vllm.config import get_current_vllm_config
+        cfg_cls = type(get_current_vllm_config())
+        if not hasattr(cfg_cls, _FLAG):
+            raise RuntimeError(
+                f"VllmConfig no longer defines {_FLAG!r}; the TPU DFlash "
+                "bypass needs updating for this vLLM version.")
+
+        # Restore exactly what was there: if the flag is inherited rather than
+        # defined on this class, putting it back with setattr would leave a
+        # permanent shadow on the subclass.
+        had_own = _FLAG in cfg_cls.__dict__
+        original_flag = cfg_cls.__dict__.get(_FLAG)
+        setattr(cfg_cls, _FLAG, property(lambda self: True))
+        try:
+            return original_resolve(config, layer_idx)
+        finally:
+            if had_own:
+                setattr(cfg_cls, _FLAG, original_flag)
+            else:
+                delattr(cfg_cls, _FLAG)
+
+    qwen3_dflash._resolve_layer_attention = patched_resolve
+    qwen3_dflash._tpu_bypass_v2_runner_patch = True
+    logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
+
+
+def _patch_vllm_config_triton_tpu() -> None:
+    """Bypass V2 model runner Triton check on TPU.
+
+    The config forces use_v2_model_runner=True for hybrid DFlash drafters.
+    When it validates V2, it crashes on TPU because HAS_TRITON is False.
+    TPU uses TPUModelRunner instead, so we can safely bypass this.
+    """
+    from vllm.config.vllm import VllmConfig
+
+    if getattr(VllmConfig, "_tpu_triton_patch_applied", False):
+        return
+
+    original_validate = VllmConfig._validate_v2_model_runner
+
+    def patched_validate(self):
+        if getattr(self, "device_config",
+                   None) and self.device_config.device_type == "tpu":
+            return
+        return original_validate(self)
+
+    VllmConfig._validate_v2_model_runner = patched_validate
+    VllmConfig._tpu_triton_patch_applied = True
+    logger.info("Applied TPU patch: bypass V2 model runner Triton check.")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations
