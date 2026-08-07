@@ -321,6 +321,23 @@ if command -v buildkite-agent &>/dev/null; then
     buildkite-agent artifact upload "pd_disagg_*.json" || true
 fi
 
+# A cell whose requests failed describes a broken serving path, not a
+# measurement: after the prefill server died mid-run, one nightly still
+# went green and inserted six zero-throughput rows into BigQuery. Fail
+# the build and skip GCS/BigQuery upload when any cell recorded failed
+# requests; the raw JSONs remain available as build artifacts above.
+# The result JSONs are single-line objects with one top-level "failed"
+# field, so a grep is sufficient.
+FAILED_CELLS=$(grep -l -E '"failed": *[1-9]' "${RESULT_FILES[@]}" || true)
+if [ -n "$FAILED_CELLS" ]; then
+    for f in $FAILED_CELLS; do
+        echo "ERROR: $f recorded failed requests: $(grep -oE '"(completed|failed)": *[0-9]+' "$f" | tr '\n' ' ')"
+    done
+    echo "ERROR: failing the build and skipping GCS/BigQuery upload."
+    dump_diagnostics
+    exit 1
+fi
+
 BASE_RECORD_ID="gke-vllm-torchtpu-run-$(date +%Y%m%d-%H%M%S)"
 
 for RESULT_FILE in "${RESULT_FILES[@]}"; do

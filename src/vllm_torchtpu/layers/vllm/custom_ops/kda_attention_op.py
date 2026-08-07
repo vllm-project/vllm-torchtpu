@@ -18,6 +18,36 @@ from vllm_torchtpu.kernels.kimi_k3 import chunk_kda, ragged_kda
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
 
 
+def _token_sequence_ids(
+    query_start_loc: jax.Array,
+    num_tokens: int,
+    num_seqs: int,
+) -> jax.Array:
+    """Map each token row to the 0-indexed sequence that owns it.
+
+    A token's sequence index is the number of interior sequence starts
+    (``query_start_loc[1:num_seqs]``) lying at or below its row, so marking each
+    start and taking an inclusive cumsum computes the whole mapping in one pass
+    over the token axis.
+
+    ``jnp.searchsorted`` expresses the same thing more directly, but XLA lowers
+    it to a vectorised O(num_tokens * num_seqs) comparison below a request
+    bucket of about 64 and to a binary search above, which puts the bucket sizes
+    production actually uses on the expensive side of the threshold: at 2048
+    tokens it costs 0.74ms per layer at a bucket of 64 against 0.23ms at 68.
+    This form is flat in the bucket at 0.14ms, which is the dispatch floor.
+
+    ``mode="drop"`` discards starts at or past the token bucket instead of
+    clamping them onto the last row -- dummy AOT runs describe more requests
+    than fit. Scatter-add accumulates duplicates, so empty sequences correctly
+    advance the index by more than one. Total marks cannot exceed
+    ``num_seqs - 1``, so the clamp only restates that bound.
+    """
+    starts = query_start_loc[1:num_seqs]
+    marks = jnp.zeros((num_tokens, ), jnp.int32).at[starts].add(1, mode="drop")
+    return jnp.minimum(jnp.cumsum(marks), num_seqs - 1)
+
+
 def kimi_short_conv_scan(
     x: jax.Array,
     conv_state: jax.Array,
@@ -27,69 +57,138 @@ def kimi_short_conv_scan(
     seq_lens: jax.Array,
     start_seq: jax.Array | int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Correctness-first Kimi short convolution, one token at a time.
+    """Kimi short convolution over a ragged batch, without a token loop.
 
     The shared Pallas ragged-convolution kernel can halt the TPU when many
     donated recurrent buffers are embedded in Kimi's compiled hybrid graph.
     Keep this model-local fallback until that kernel interaction is fixed.
 
-    ``start_seq`` restricts the walk to the tokens of segments at or after that
+    ``start_seq`` restricts the work to the tokens of segments at or after that
     index; earlier tokens keep a zero output row and their convolution state is
     left untouched. That is how a caller hands the decode part of a batch to
     ``decode_kda``, which does its own convolution.
 
-    The loop bounds are *device* values, so the trip count follows the batch:
-    with every segment restricted away the loop body never runs. This is a
-    ``fori_loop`` rather than a ``scan`` for exactly that reason -- a ``scan``
-    has a static length and would walk the whole token bucket, masking as it
-    went, which costs the same whether or not there is anything to do. At
-    roughly 20us per token that is not a rounding error.
+    The kernel width is static, so the whole convolution is ``kernel_size``
+    shifted multiply-accumulates over the token axis with no loop at all. Only
+    the taps reaching back past a sequence's first token need care, and those
+    come from that sequence's carried window. Selecting per tap between ``x`` and
+    a gather from the window table means there is no special-cased path for the
+    first few tokens of a sequence.
+
+    This replaced a per-token loop. Two things made that loop expensive and
+    neither was arithmetic: each token gathered from and scattered into the whole
+    state pool, which XLA lowers to a dynamic-slice / dynamic-update-slice pair
+    over a buffer more than a megabyte wide, and the loop machinery plus the
+    per-token output scatter cost about 2us per token on their own. Together they
+    came to 13.3us per token, or 27ms for a 2048-token prefill; this form does
+    the same 2048 tokens in 0.36ms and is bitwise identical on every live slot.
+
+    The ``lax.cond`` matters for decode. Where the old loop's device-valued trip
+    count made a fully restricted batch free, fixed work over the token axis
+    would pay full price to produce a result that is then entirely masked away --
+    which is exactly what every pure-decode step does. This is a branch on a
+    device value inside one traced graph, not a host branch on batch
+    composition, so it is safe under the no-guards compile wrapper.
     """
     num_tokens = x.shape[0]
-    kernel_size = conv_weight.shape[-1]
-    weights = jnp.swapaxes(conv_weight[:, 0, :], 0, 1)
-    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    num_seqs = state_indices.shape[0]
     # Dummy AOT runs may describe more one-token requests than fit in the
     # current token bucket; normal runtime metadata instead repeats the true
     # token total in its padded request tail.
     total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-    sequence_ids = jnp.searchsorted(query_start_loc[1:],
-                                    token_ids,
-                                    side="right")
-    sequence_ids = jnp.minimum(sequence_ids, state_indices.shape[0] - 1)
+    if start_seq is None:
+        first_seq = jnp.zeros((), jnp.int32)
+    else:
+        first_seq = jnp.minimum(jnp.asarray(start_seq, jnp.int32), num_seqs)
+    first_token = jnp.minimum(query_start_loc[first_seq], total_tokens)
+
+    return jax.lax.cond(
+        first_token < total_tokens,
+        lambda: _short_conv_tokens(x, conv_state, conv_weight, query_start_loc,
+                                   state_indices, seq_lens, first_seq,
+                                   first_token, total_tokens),
+        lambda: (jnp.zeros_like(x), conv_state),
+    )
+
+
+def _short_conv_tokens(
+    x: jax.Array,
+    conv_state: jax.Array,
+    conv_weight: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    seq_lens: jax.Array,
+    first_seq: jax.Array,
+    first_token: jax.Array,
+    total_tokens: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """The loop-free convolution body. See ``kimi_short_conv_scan``."""
+    num_tokens = x.shape[0]
+    num_seqs = state_indices.shape[0]
+    kernel_size = conv_weight.shape[-1]
+    history = kernel_size - 1
+    weights = jnp.swapaxes(conv_weight[:, 0, :], 0, 1)  # [kernel_size, dim]
+
+    sequence_ids = _token_sequence_ids(query_start_loc, num_tokens, num_seqs)
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     has_initial_state = seq_lens > query_lens
 
-    if start_seq is None:
-        first_token = jnp.zeros((), jnp.int32)
-    else:
-        first_token = jnp.minimum(
-            query_start_loc[jnp.asarray(start_seq, jnp.int32)], total_tokens)
+    # Each sequence's carried window, zeroed where there is no history to carry.
+    windows = jnp.where(has_initial_state[:, None, None],
+                        conv_state[state_indices], 0)
+    windows_flat = windows.reshape(num_seqs * history, -1)
 
-    def step(token_id, carry):
-        state, out = carry
-        sequence_id = sequence_ids[token_id]
-        state_idx = state_indices[sequence_id]
-        old_state = state[state_idx]
-        is_first = token_id == query_start_loc[sequence_id]
-        old_state = jnp.where(is_first & ~has_initial_state[sequence_id],
-                              jnp.zeros_like(old_state), old_state)
-        window = jnp.concatenate((old_state, x[token_id][None, :]), axis=0)
-        output = jnp.sum(window.astype(jnp.float32) *
-                         weights.astype(jnp.float32),
-                         axis=0).astype(x.dtype)
-        new_state = window[-(kernel_size - 1):].astype(conv_state.dtype)
-        # The loop bounds already exclude every token that must not be written,
-        # so no per-token validity mask is needed here.
-        return (state.at[state_idx].set(new_state),
-                out.at[token_id].set(output))
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    position = token_ids - query_start_loc[sequence_ids]
 
-    new_state, output = jax.lax.fori_loop(
-        first_token,
-        total_tokens,
-        step,
-        (conv_state, jnp.zeros_like(x)),
-    )
+    # Tap j reads the row `history - j` places behind the current token. That row
+    # lies inside the sequence once the position is far enough in, and is window
+    # row `position + j` otherwise -- which is in range exactly when it is
+    # needed, since the fallback only applies while position < history - j. The
+    # clip keeps the masked-away lanes in bounds; padded token rows can compute a
+    # negative position and are dropped by `walked` below.
+    taps = []
+    for j in range(kernel_size):
+        shift = history - j
+        from_x = jnp.pad(x, ((shift, 0), (0, 0)))[:num_tokens]
+        flat = sequence_ids * history + position + j
+        from_window = windows_flat[jnp.clip(flat, 0, num_seqs * history - 1)]
+        taps.append(
+            jnp.where((position >= shift)[:, None], from_x, from_window))
+
+    # Reduced over the tap axis the way the per-token loop reduced over its
+    # stacked window, so the two agree bit for bit.
+    output = jnp.sum(jnp.stack(taps, axis=0).astype(jnp.float32) *
+                     weights[:, None, :].astype(jnp.float32),
+                     axis=0).astype(x.dtype)
+    walked = (token_ids >= first_token) & (token_ids < total_tokens)
+    output = jnp.where(walked[:, None], output, 0)
+
+    # The outgoing window is a sequence's last `history` source rows. Those come
+    # from `x`, except for a sequence shorter than the window, whose older rows
+    # are still the incoming window's.
+    rows = jnp.arange(history, dtype=jnp.int32)
+    local = query_lens[:, None] - history + rows
+    from_x = x[jnp.clip(query_start_loc[:-1][:, None] + local, 0,
+                        num_tokens - 1)]
+    from_window = jnp.take_along_axis(windows,
+                                      jnp.clip(query_lens[:, None] + rows, 0,
+                                               history - 1)[..., None],
+                                      axis=1)
+    new_window = jnp.where((local >= 0)[..., None], from_x, from_window)
+
+    # Only sequences that were walked and hold tokens may advance their slot.
+    # Everything else would wipe a live slot, so point it at the null block --
+    # and hand it what slot 0 already holds, so that write is a no-op. Routing
+    # the index alone would leave scratch in slot 0, which `decode_kda` and the
+    # per-token loop this replaced both leave strictly alone.
+    sequence_all = jnp.arange(num_seqs, dtype=jnp.int32)
+    keep = ((query_lens > 0) & (sequence_all >= first_seq)
+            & (query_start_loc[:-1] < total_tokens))
+    write_indices = jnp.where(keep, state_indices, 0)
+    written = jnp.where(keep[:, None, None],
+                        new_window.astype(conv_state.dtype), conv_state[0])
+    new_state = conv_state.at[write_indices].set(written)
     return output, new_state
 
 
@@ -367,10 +466,8 @@ def build_kimi_chunk_kda_op(
         # thing stays inside one graph.
         token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
         total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-        sequence_ids = jnp.searchsorted(query_start_loc[1:],
-                                        token_ids,
-                                        side="right")
-        sequence_ids = jnp.minimum(sequence_ids, num_seqs - 1)
+        sequence_ids = _token_sequence_ids(query_start_loc, num_tokens,
+                                           num_seqs)
         segment_ids = jnp.where(token_ids < total_tokens, sequence_ids + 1, 0)
 
         qkv = mixed_qkv.reshape(num_tokens, 3, num_heads, head_dim)
@@ -581,9 +678,8 @@ def build_kimi_dispatched_kda_op(
 
         token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
         total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-        sequence_ids = jnp.minimum(
-            jnp.searchsorted(query_start_loc[1:], token_ids, side="right"),
-            num_seqs - 1)
+        sequence_ids = _token_sequence_ids(query_start_loc, num_tokens,
+                                           num_seqs)
         segment_ids = jnp.where(token_ids < total_tokens, sequence_ids + 1, 0)
 
         qkv = conv_out.reshape(num_tokens, 3, num_heads, head_dim)

@@ -6,7 +6,7 @@ import pytest
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, InferencePhase,
-    PhaseBasedProfiler)
+    PhaseBasedProfiler, determine_phase_from_batch_composition_stats)
 
 
 @pytest.fixture
@@ -113,22 +113,70 @@ def test_phased_profiler_finish_when_idle_is_a_noop(profiler_fixture):
     mock_context.__exit__.assert_not_called()
 
 
-def test_phased_profiler_ignores_initial_request(profiler_fixture):
-    """Tests that profiling is not triggered for initial single-token requests."""
+def test_phased_profiler_ignores_steps_with_no_work(profiler_fixture):
+    """A batch that scheduled nothing has no phase to attribute it to.
+
+    determine_phase_from_batch_composition_stats divides by
+    total_num_scheduled_tokens, so a zero-token step must never reach it.
+    """
     profiler = profiler_fixture["profiler"]
     mock_profile = profiler_fixture["mock_profile"]
     mock_determine_phase = profiler_fixture["mock_determine_phase"]
 
     mock_determine_phase.return_value = InferencePhase.PREFILL_HEAVY
 
+    profiler.step({"num_reqs": 0, "total_num_scheduled_tokens": 0})
+    mock_profile.assert_not_called()
+    assert profiler.current_phase == ""
+
+    # A single scheduled token is real work and must be profiled.
     profiler.step({"num_reqs": 1, "total_num_scheduled_tokens": 1})
-    mock_profile.assert_not_called()
-
-    profiler.step({"num_reqs": 2, "total_num_scheduled_tokens": 1})
-    mock_profile.assert_not_called()
-
-    profiler.step({"num_reqs": 2, "total_num_scheduled_tokens": 2})
     mock_profile.assert_called_once()
+
+
+def test_determine_phase_treats_single_token_step_as_decode_only():
+    """One request in decode schedules exactly one token, all of it decode."""
+    assert determine_phase_from_batch_composition_stats({
+        "total_num_scheduled_tokens":
+        1,
+        "num_prefill_tokens":
+        0,
+    }) == InferencePhase.DECODE_ONLY
+
+
+def test_phased_profiler_full_cycle_at_batch_size_one(profiler_fixture):
+    """A max-num-seqs=1 server must still capture decode_only, bounded.
+
+    Regression: the guard on step() required more than one scheduled token, so
+    every steady-state step of a batch-size-1 run was dropped before reaching
+    the classifier. That made decode_only unreachable, and because the same
+    guard covered _step_or_stop_profiling, whichever phase was already
+    capturing never counted down -- its trace stayed open until /stop_profile,
+    silently ignoring max_iterations.
+    """
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_context = profiler_fixture["mock_context"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    # One request in decode: exactly one scheduled token, every step.
+    stats = {"num_reqs": 1, "total_num_scheduled_tokens": 1}
+    mock_determine_phase.return_value = InferencePhase.DECODE_ONLY
+
+    profiler.step(stats)
+    mock_profile.assert_called_once()
+    assert profiler.current_phase == "decode_only"
+    assert profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
+    assert (profiler.profiling_n_steps_left ==
+            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+
+    # The budget must count down on its own and close the capture.
+    for _ in range(PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR):
+        profiler.step(stats)
+
+    mock_context.__exit__.assert_called_once_with(None, None, None)
+    assert profiler.current_phase == ""
+    assert profiler.profiling_n_steps_left == 0
 
 
 def test_phased_profiler_handles_all_phases(profiler_fixture):
