@@ -12,7 +12,7 @@ before those local workers are forked:
     torch_tpu processes can find each other. Mirrors the address list
     ray_distributed_executor.py builds for the Ray backend.
   * TORCH_TPU_TOPOLOGY - ICI mesh shape for the full chip count, looked up
-    the same way the Ray backend does (TPU_MULTIHOST_TOPOLOGY_MAP).
+    the same way the Ray backend does (get_tpu_multihost_topology).
   * TPU_NUM_HOSTS / NODE_RANK - consumed by the multi-host KV-transfer paths.
 
 There is no Ray actor system here to query other hosts' IPs, so a
@@ -58,6 +58,23 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     No-op unless `--nnodes` > 1. Idempotent per-process so it is safe to call
     more than once (e.g. if check_and_update_config runs again for a
     per-engine config copy).
+
+    Called from tpu_platform.py's check_and_update_config rather than from
+    TpuMultiprocExecutor._init_executor (where the Ray backend does the
+    equivalent setup) because the two backends launch the headless node
+    differently. Ray has no separate headless worker process: one driver
+    creates the placement group and actors across the whole cluster from
+    inside its executor, so "runs in _init_executor" and "runs once,
+    covering the whole cluster" are the same fact there. `mp` is not like
+    that: each host runs its own top-level `vllm serve` process, and the
+    headless node's run_headless() hardcodes vanilla
+    vllm.v1.executor.multiproc_executor.MultiprocExecutor rather than going
+    through parallel_config.distributed_executor_backend, so
+    TpuMultiprocExecutor._init_executor() never even runs there. Putting
+    this call in check_and_update_config instead works because that hook
+    fires during VllmConfig construction identically on every node
+    (leader and headless), regardless of which executor class each one
+    ends up instantiating.
     """
     nnodes = parallel_config.nnodes
     if nnodes <= 1:
@@ -109,13 +126,10 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
 
     # Lazy import: tpu_platform.py imports this module from inside
-    # check_and_update_config to avoid a top-level circular import.
-    from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
-    topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(total_chips)
-    if topology is None:
-        raise ValueError(
-            f"Cannot find topology for {total_chips} chips. The supported "
-            f"number of chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}")
+    # check_and_update_config to avoid a top-level circular import. Mirrors
+    # the lookup ray_distributed_executor.py uses for the Ray backend.
+    from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+    topology = get_tpu_multihost_topology(total_chips)
     os.environ["TORCH_TPU_TOPOLOGY"] = topology
     os.environ["TPU_NUM_HOSTS"] = str(nnodes)
     os.environ["NODE_RANK"] = str(node_rank)
