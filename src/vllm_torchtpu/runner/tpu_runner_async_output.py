@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -16,6 +17,13 @@ class AsyncTPUCopyState:
     each D2H copy hits a precompiled program. Host-side trim and concat
     happen lazily on `wait()` and produce a single contiguous CPU tensor
     matching the real (unpadded) request count.
+
+    Shared by two threads. The runner keeps one reference on
+    `AsyncPreResults` and consumes it from the engine thread in
+    `_modify_prev_results`; the same object also reaches
+    `AsyncTPUModelRunnerOutput`, which the executor's `WorkerAsyncOutputCopy`
+    thread drains via `get_output`. Both call `wait()`, so the teardown it
+    performs has to be done exactly once — see the lock there.
     """
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
@@ -23,6 +31,9 @@ class AsyncTPUCopyState:
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock,
+                                  repr=False,
+                                  compare=False)
 
     @classmethod
     def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
@@ -39,27 +50,50 @@ class AsyncTPUCopyState:
         )
 
     def wait(self) -> None:
+        """Block until the D2H copies land, then release the source tensors.
+
+        Serialized because both the engine thread and the executor's output
+        thread hold this object (see the class docstring). Unsynchronized,
+        both could pass the `completed` check, and whichever reached
+        `chunks_tpu = None` first would drop the device buffers feeding a
+        copy the other was still inside `synchronize()` waiting for — freeing
+        a transfer's source mid-flight, which wedges the device queue rather
+        than raising. The runner already guards this hazard by hand when it
+        tears down warmup requests (`_warmup_spec_decode_cleanup`); here the
+        two owners are concurrent, so the object guards itself.
+
+        The unlocked `completed` fast path is safe: it is only ever set True
+        under the lock, and reading it is atomic.
+        """
         if self.completed:
             return
-        self.copy_ready_event.synchronize()
-        self.chunks_tpu = None
-        self.completed = True
+        with self._lock:
+            if self.completed:
+                return
+            self.copy_ready_event.synchronize()
+            self.chunks_tpu = None
+            self.completed = True
 
     @property
     def sampled_token_ids_cpu(self) -> torch.Tensor:
         """Return the unpadded concatenated CPU tensor.
 
         Performed lazily after `wait()`; trims each bucketed chunk to its real
-        length on the host (no device recompile).
+        length on the host (no device recompile). Shares `wait`'s lock so two
+        threads cannot both run the concat, and so a reader that arrives
+        while the other thread is still inside `wait()` blocks until the copy
+        has actually landed instead of reading a half-written host buffer.
         """
         if self._sampled_token_ids_cpu is None:
-            trimmed = [
-                t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
-            ]
-            if len(trimmed) == 1:
-                self._sampled_token_ids_cpu = trimmed[0]
-            else:
-                self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
+            with self._lock:
+                if self._sampled_token_ids_cpu is None:
+                    trimmed = [
+                        t[:n]
+                        for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
+                    ]
+                    self._sampled_token_ids_cpu = (trimmed[0] if len(trimmed)
+                                                   == 1 else torch.cat(
+                                                       trimmed, dim=0))
         return self._sampled_token_ids_cpu
 
 
