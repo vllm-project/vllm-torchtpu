@@ -10,47 +10,144 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.model_executor.models import ModelRegistry
-from vllm.model_executor.models.interfaces import supports_pp
-from vllm.model_executor.utils import set_weight_attrs
-from vllm.platforms import current_platform
-from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+from vllm.model_executor.models.interfaces import supports_pp
+from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.kimi_k3.common.mm_preprocess import navit_resize_image
+from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu.layers import register_layers
-from vllm_torchtpu.layers.vllm.custom_ops import \
-    kda_attention_op as kimi_custom_ops
-from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
-                                               KimiLinearForCausalLM,
-                                               KimiModel,
-                                               MultiHeadLatentAttention)
+from vllm_torchtpu.layers.vllm.custom_ops import kda_attention_op as kimi_custom_ops
+from vllm_torchtpu.models.vllm.kimi_k3 import (
+    KimiDeltaAttention,
+    KimiK3ForConditionalGeneration,
+    KimiLinearForCausalLM,
+    KimiModel,
+    MultiHeadLatentAttention,
+)
 from vllm_torchtpu.models.vllm.kimi_k3.layers import SituAndMul
 
 
 def test_kimi_architectures_are_registered() -> None:
-    architectures = (
-        "KimiLinearForCausalLM",
-        "KimiK3ForConditionalGeneration",
-    )
+    architectures = {
+        "KimiLinearForCausalLM": KimiLinearForCausalLM,
+        "KimiK3ForConditionalGeneration": KimiK3ForConditionalGeneration,
+    }
     previous = {
         architecture: ModelRegistry.models.get(architecture)
         for architecture in architectures
     }
+    previous_config = MODELS_CONFIG_MAP.get("KimiK3ForConditionalGeneration")
     try:
         register_layers()
-        for architecture in architectures:
+        for architecture, expected in architectures.items():
             registered = ModelRegistry.models[architecture]
-            assert registered.load_model_cls() is KimiLinearForCausalLM
+            assert registered.load_model_cls() is expected
+
+        quantization_config = {
+            "quant_method": "compressed-tensors",
+            "format": "mxfp4-pack-quantized",
+        }
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(quantization_config=quantization_config.copy()),
+            hf_text_config=SimpleNamespace(
+                quantization_config=quantization_config.copy()
+            ),
+            model_arch_config=SimpleNamespace(
+                quantization_config=quantization_config.copy()
+            ),
+        )
+        config_handler = MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"]
+        config_handler.verify_and_update_model_config(model_config)
+        assert all(
+            config.quantization_config["quant_method"] == "compressed-tensors"
+            for config in (
+                model_config.hf_config,
+                model_config.hf_text_config,
+                model_config.model_arch_config,
+            )
+        )
     finally:
+        if previous_config is None:
+            MODELS_CONFIG_MAP.pop("KimiK3ForConditionalGeneration", None)
+        else:
+            MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = previous_config
         for architecture, registered in previous.items():
             if registered is None:
                 ModelRegistry.models.pop(architecture, None)
             else:
                 ModelRegistry.models[architecture] = registered
+
+
+def test_kimi_k3_multimodal_interface_and_weight_mapping() -> None:
+    assert KimiK3ForConditionalGeneration.supports_multimodal
+    assert KimiK3ForConditionalGeneration.supports_encoder_tp_data
+    assert (
+        KimiK3ForConditionalGeneration.get_placeholder_str("image", 0)
+        == "<|kimi_image_placeholder|>"
+    )
+    with pytest.raises(ValueError, match="Unsupported modality"):
+        KimiK3ForConditionalGeneration.get_placeholder_str("video", 0)
+
+    assert KimiK3ForConditionalGeneration.hf_to_vllm_mapper.apply_list(
+        [
+            "language_model.layers.1.self_attn.q_proj.weight",
+            "language_model.model.embed_tokens.weight",
+            "mm_projector.proj.0.weight",
+            "mm_projector.proj.2.weight",
+            "vision_tower.encoder.blocks.0.norm1.weight",
+        ]
+    ) == [
+        "language_model.model.layers.1.self_attn.q_proj.weight",
+        "language_model.model.embed_tokens.weight",
+        "mm_projector.linear_1.weight",
+        "mm_projector.linear_2.weight",
+        "vision_tower.encoder.blocks.0.norm1.weight",
+    ]
+
+
+def test_kimi_k3_navit_resize_aligns_to_merged_patches() -> None:
+    resized = navit_resize_image(
+        width=400,
+        height=80,
+        patch_size=14,
+        merge_kernel_size=2,
+        in_patch_limit=65536,
+        patch_limit_on_one_side=512,
+        fixed_output_tokens=None,
+    )
+    assert (resized["new_width"] + resized["pad_width"]) % 28 == 0
+    assert (resized["new_height"] + resized["pad_height"]) % 28 == 0
+    assert resized["num_tokens"] == 45
+
+
+def test_kimi_k3_scatter_free_embedding_merge() -> None:
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model._has_oov_mm_tokens = False
+    language_model = nn.Module()
+    language_model.embed_input_ids = lambda ids: torch.stack(  # type: ignore[method-assign]
+        (ids.float(), ids.float() + 10), dim=-1
+    )
+    model.language_model = language_model
+    model._language_model_names = ["language_model"]
+
+    input_ids = torch.tensor([1, 2, 3, 4])
+    is_multimodal = torch.tensor([False, True, True, False])
+    media = [torch.tensor([[20.0, 21.0], [30.0, 31.0]])]
+    actual = model.embed_input_ids(input_ids, media, is_multimodal=is_multimodal)
+    expected = torch.tensor([[1.0, 11.0], [20.0, 21.0], [30.0, 31.0], [4.0, 14.0]])
+    torch.testing.assert_close(actual, expected)
+
+    with pytest.raises(ValueError, match="1 multimodal tokens to 2"):
+        model.embed_input_ids(input_ids, [media[0][:1]], is_multimodal=is_multimodal)
 
 
 @pytest.mark.parametrize("linear_beta", [None, 25.0])
@@ -59,18 +156,21 @@ def test_situ_and_mul(linear_beta: float | None) -> None:
     inputs = torch.tensor([[-3.0, 0.5, 7.0, -30.0, 2.0, 40.0]])
     gate, up = inputs.chunk(2, dim=-1)
     expected_gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
-    expected_up = (up if linear_beta is None else linear_beta *
-                   torch.tanh(up / linear_beta))
+    expected_up = (
+        up if linear_beta is None else linear_beta * torch.tanh(up / linear_beta)
+    )
 
     torch.testing.assert_close(activation(inputs), expected_gate * expected_up)
 
 
 def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
     common_mapper = KimiLinearForCausalLM.hf_to_vllm_mapper
-    assert common_mapper.apply_list([
-        "model.layers.0.mlp.gate_proj.weight",
-        "model.layers.1.self_attn.kv_a_proj_with_mqa.weight",
-    ]) == [
+    assert common_mapper.apply_list(
+        [
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.1.self_attn.kv_a_proj_with_mqa.weight",
+        ]
+    ) == [
         "model.layers.0.mlp.gate_up_proj.weight",
         "model.layers.1.self_attn.kv_a_proj_with_mqa.weight",
     ]
@@ -78,9 +178,12 @@ def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
     fused_mapper = common_mapper | KimiLinearForCausalLM.fused_mla_mapper
     weight = torch.empty(1)
     [(name, weight)] = list(
-        fused_mapper.apply([
-            ("language_model.layers.1.self_attn.q_a_proj.weight", weight),
-        ]))
+        fused_mapper.apply(
+            [
+                ("language_model.layers.1.self_attn.q_a_proj.weight", weight),
+            ]
+        )
+    )
     assert name == "model.layers.1.self_attn.fused_qkv_a_proj.weight"
     assert weight.shard_id == 0
 
@@ -108,22 +211,22 @@ def test_expert_weight_loader_uses_current_fused_moe_names() -> None:
 
     set_weight_attrs(parameter, {"weight_loader": weight_loader})
     loaded_weight = torch.ones(1)
-    loaded = model.load_weights([
-        ("model.layers.0.block_sparse_moe.experts.0.w1.weight", loaded_weight),
-    ])
+    loaded = model.load_weights(
+        [
+            ("model.layers.0.block_sparse_moe.experts.0.w1.weight", loaded_weight),
+        ]
+    )
 
-    parameter_name = (
-        "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight")
+    parameter_name = "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
     assert loaded == {parameter_name}
-    assert calls == [(
-        parameter,
-        loaded_weight,
-        parameter_name,
-        {
-            "expert_id": 0,
-            "shard_id": "w1"
-        },
-    )]
+    assert calls == [
+        (
+            parameter,
+            loaded_weight,
+            parameter_name,
+            {"expert_id": 0, "shard_id": "w1"},
+        )
+    ]
 
 
 def test_mxfp4_expert_weight_loader_rebinds_packed_checkpoint_name() -> None:
@@ -149,23 +252,25 @@ def test_mxfp4_expert_weight_loader_rebinds_packed_checkpoint_name() -> None:
 
     set_weight_attrs(parameter, {"weight_loader": weight_loader})
     loaded_weight = torch.ones(1, dtype=torch.uint8)
-    loaded = model.load_weights([
-        ("language_model.layers.0.block_sparse_moe.experts.0.w1.weight_packed",
-         loaded_weight),
-    ])
+    loaded = model.load_weights(
+        [
+            (
+                "language_model.layers.0.block_sparse_moe.experts.0.w1.weight_packed",
+                loaded_weight,
+            ),
+        ]
+    )
 
-    parameter_name = (
-        "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight")
+    parameter_name = "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
     assert loaded == {parameter_name}
-    assert calls == [(
-        parameter,
-        loaded_weight,
-        parameter_name,
-        {
-            "expert_id": 0,
-            "shard_id": "w1"
-        },
-    )]
+    assert calls == [
+        (
+            parameter,
+            loaded_weight,
+            parameter_name,
+            {"expert_id": 0, "shard_id": "w1"},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -173,28 +278,28 @@ def test_mxfp4_expert_weight_loader_rebinds_packed_checkpoint_name() -> None:
     [(None, 1024, None), (256, 2048, 128)],
 )
 def test_small_experts_use_current_padded_weight_location(
-        monkeypatch: pytest.MonkeyPatch, min_per_partition: int | None,
-        expected_intermediate: int, expected_unpadded: int | None) -> None:
-
+    monkeypatch: pytest.MonkeyPatch,
+    min_per_partition: int | None,
+    expected_intermediate: int,
+    expected_unpadded: int | None,
+) -> None:
     class FakeGate(nn.Module):
-
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
 
     class FakeMLP(nn.Module):
-
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
 
     class FakeRunner(nn.Module):
-
         def __init__(self) -> None:
             super().__init__()
             self.routed_experts = nn.Module()
             self.routed_experts.w13_weight = nn.Parameter(torch.ones(1))
             self.routed_experts.w2_weight = nn.Parameter(torch.ones(1))
             self.moe_config = SimpleNamespace(
-                intermediate_size_per_partition_unpadded=None)
+                intermediate_size_per_partition_unpadded=None
+            )
 
     fused_moe_args = {}
 
@@ -202,8 +307,7 @@ def test_small_experts_use_current_padded_weight_location(
         fused_moe_args.update(kwargs)
         return FakeRunner()
 
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
-                        lambda: 8)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 8)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
     monkeypatch.setattr(kimi_moe, "KimiMLP", FakeMLP)
     monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
@@ -222,23 +326,23 @@ def test_small_experts_use_current_padded_weight_location(
     assert fused_moe_args["intermediate_size"] == expected_intermediate
     assert fused_moe_args["activation_situ_beta"] is None
     assert fused_moe_args["activation_situ_linear_beta"] is None
-    assert (layer.experts.moe_config.intermediate_size_per_partition_unpadded
-            == expected_unpadded)
+    assert (
+        layer.experts.moe_config.intermediate_size_per_partition_unpadded
+        == expected_unpadded
+    )
     expect_zero = expected_unpadded is not None
     assert bool(layer.experts.routed_experts.w13_weight.any()) != expect_zero
     assert bool(layer.experts.routed_experts.w2_weight.any()) != expect_zero
 
 
 def test_expert_parallelism_keeps_native_intermediate_size(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeGate(nn.Module):
-
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
 
     class FakeRunner(nn.Module):
-
         def __init__(self) -> None:
             super().__init__()
             self.routed_experts = nn.Module()
@@ -250,12 +354,13 @@ def test_expert_parallelism_keeps_native_intermediate_size(
         fused_moe_args.update(kwargs)
         return FakeRunner()
 
-    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(
-        enable_expert_parallel=True))
-    monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none",
-                        lambda: vllm_config)
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
-                        lambda: 8)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=True)
+    )
+    monkeypatch.setattr(
+        kimi_moe, "get_current_vllm_config_or_none", lambda: vllm_config
+    )
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 8)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
     monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
@@ -272,15 +377,13 @@ def test_expert_parallelism_keeps_native_intermediate_size(
 
 
 def test_situ_moe_uses_tpu_activation_descriptor(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeGate(nn.Module):
-
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
 
     class FakeRunner(nn.Module):
-
         def __init__(self) -> None:
             super().__init__()
             self.routed_experts = nn.Module()
@@ -292,8 +395,7 @@ def test_situ_moe_uses_tpu_activation_descriptor(
         fused_moe_args.update(kwargs)
         return FakeRunner()
 
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
-                        lambda: 1)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
     monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
@@ -313,24 +415,21 @@ def test_situ_moe_uses_tpu_activation_descriptor(
     assert fused_moe_args["activation_situ_linear_beta"] == 25.0
 
 
-def test_latent_moe_does_not_reduce_before_norm() -> None:
-
+def test_latent_moe_transform_leaves_reduction_to_vllm_runner() -> None:
     class SquareNorm(nn.Module):
-
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             return hidden_states.square()
 
     class IdentityLinear(nn.Module):
-
         def forward(self, hidden_states: torch.Tensor):
             return hidden_states, None
 
-    transform = kimi_moe.KimiRoutedOutputTransform(SquareNorm(),
-                                                   IdentityLinear())
+    transform = kimi_moe.KimiRoutedOutputTransform(SquareNorm(), IdentityLinear())
     hidden_states = torch.tensor([[2.0, 3.0]])
 
-    torch.testing.assert_close(transform(hidden_states),
-                               hidden_states.square())
+    # vLLM v0.27 reduces the routed latent output before invoking this
+    # nonlinear transform. Reducing again here underweights it at TP > 1.
+    torch.testing.assert_close(transform(hidden_states), hidden_states.square())
 
 
 def test_model_has_no_public_cache_or_pp_api() -> None:
@@ -347,24 +446,22 @@ def test_model_is_registered_for_torch_compile() -> None:
 
 
 def test_kimi_linear_mla_keeps_its_checkpoint_layout(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeLinear(nn.Module):
-
         def __init__(self, input_size, output_size, *args, **kwargs) -> None:
             super().__init__()
             del args
             del kwargs
-            self.output_size = (sum(output_size) if isinstance(
-                output_size, list) else output_size)
-            self.weight = nn.Parameter(
-                torch.empty(self.output_size, input_size))
+            self.output_size = (
+                sum(output_size) if isinstance(output_size, list) else output_size
+            )
+            self.weight = nn.Parameter(torch.empty(self.output_size, input_size))
 
         def forward(self, inputs):
             return inputs.new_zeros(inputs.shape[0], self.output_size), None
 
     class FakeMLAWrapper(nn.Module):
-
         def __init__(self, *args) -> None:
             super().__init__()
             self.mla_modules = args[8]
@@ -372,15 +469,16 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
         def forward(self, positions, hidden_states):
             return hidden_states
 
-    monkeypatch.setattr(kimi_attention, "MultiHeadLatentAttentionWrapper",
-                        FakeMLAWrapper)
+    monkeypatch.setattr(
+        kimi_attention, "MultiHeadLatentAttentionWrapper", FakeMLAWrapper
+    )
     monkeypatch.setattr(kimi_attention, "ColumnParallelLinear", FakeLinear)
-    monkeypatch.setattr(kimi_attention, "MergedColumnParallelLinear",
-                        FakeLinear)
+    monkeypatch.setattr(kimi_attention, "MergedColumnParallelLinear", FakeLinear)
     monkeypatch.setattr(kimi_attention, "ReplicatedLinear", FakeLinear)
     monkeypatch.setattr(kimi_attention, "RowParallelLinear", FakeLinear)
-    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
-                        lambda: 1)
+    monkeypatch.setattr(
+        kimi_attention, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     config = KimiLinearConfig(
         hidden_size=16,
         num_attention_heads=4,
@@ -394,8 +492,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     # This unit test does not have a model_config, so skip the platform-level
     # normalization that requires one. The layer still gets a complete
     # VllmConfig, including the compilation config used by RMSNorm.
-    monkeypatch.setattr(current_platform, "check_and_update_config",
-                        lambda _: None)
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
     vllm_config = VllmConfig()
     with set_current_vllm_config(vllm_config):
         layer = MultiHeadLatentAttention(
@@ -501,7 +598,6 @@ def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
 
 
 class _Projection(nn.Module):
-
     def __init__(self, output_size: int) -> None:
         super().__init__()
         self.output_size = output_size
@@ -516,13 +612,11 @@ class _Projection(nn.Module):
 
 
 class _IdentityProjection(nn.Module):
-
     def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, None]:
         return inputs, None
 
 
 class _ConvWeight(nn.Module):
-
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(4, 1, 3))
@@ -572,7 +666,6 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
     def unexpected(name):
-
         def op(*args, **kwargs):
             raise AssertionError(f"{name} must not run for this batch")
 
@@ -594,8 +687,8 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
 
 
 def test_kda_custom_ops_compile_as_one_full_graph(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def jax_op(name, function, donate_argnums=()):
         del function, donate_argnums
         if "dispatched" in name:
@@ -622,9 +715,12 @@ def test_kda_custom_ops_compile_as_one_full_graph(
                 del q_weight, k_weight, v_weight, distribution
                 del query_start_loc, state_indices, seq_lens
                 num_heads, head_dim = recurrent_state.shape[1:3]
-                output = mixed_qkv[:, :num_heads * head_dim]
-                return (output.view(-1, num_heads, head_dim).clone(),
-                        conv_state + 1, recurrent_state + 1)
+                output = mixed_qkv[:, : num_heads * head_dim]
+                return (
+                    output.view(-1, num_heads, head_dim).clone(),
+                    conv_state + 1,
+                    recurrent_state + 1,
+                )
 
         elif "sconv" in name:
 
@@ -660,9 +756,11 @@ def test_kda_custom_ops_compile_as_one_full_graph(
                 del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
                 del query_start_loc, state_indices, seq_lens
                 num_heads, head_dim = recurrent_state.shape[1:3]
-                output = mixed_qkv[:, :num_heads * head_dim]
-                return (output.view(-1, num_heads,
-                                    head_dim).clone(), recurrent_state + 1)
+                output = mixed_qkv[:, : num_heads * head_dim]
+                return (
+                    output.view(-1, num_heads, head_dim).clone(),
+                    recurrent_state + 1,
+                )
 
         return torch.library.custom_op(name, mutates_args=())(implementation)
 
@@ -730,5 +828,4 @@ def test_kda_custom_ops_compile_as_one_full_graph(
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(sconv_cache, torch.ones_like(sconv_cache))
-    torch.testing.assert_close(recurrent_cache,
-                               torch.ones_like(recurrent_cache))
+    torch.testing.assert_close(recurrent_cache, torch.ones_like(recurrent_cache))

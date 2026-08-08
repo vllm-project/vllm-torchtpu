@@ -155,13 +155,6 @@ _dynamic_compile_unwrapped = False
 _tpu_patches_applied = False
 
 
-def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
-    multimodal_config = model_config.multimodal_config
-    if multimodal_config is None:
-        return False
-    return bool(multimodal_config.language_model_only)
-
-
 def _configure_torchtpu_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
     previous_mode = execution_mode.eager_mode
@@ -928,14 +921,6 @@ class TpuPlatform(Platform):
                 f"Unknown TPU multihost backend: {multihost_backend}. "
                 "Using uniproc_executor.")
             parallel_config.distributed_executor_backend = "uni"
-
-        if (scheduler_config.is_multimodal_model
-                and not _is_language_model_only_config(model_config)
-                and not scheduler_config.disable_chunked_mm_input):
-            logger.warning("TPU does not support running Multimodal models"\
-            " without setting `--disable_chunked_mm_input`. " \
-            "Forcing --disable_chunked_mm_input.")
-            scheduler_config.disable_chunked_mm_input = True
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
