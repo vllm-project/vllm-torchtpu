@@ -334,7 +334,5 @@ def _run_pool_bytes_live_in_both_directions():
                 "region-granular")
 
 
-@pytest.mark.skip(reason="fails on tpu7x with the pinned tpu-raiden-torch "
-                  "wheel; see vllm-torchtpu#358")
 def test_pool_bytes_live_in_both_directions():
     run_in_isolated_process(_run_pool_bytes_live_in_both_directions)
