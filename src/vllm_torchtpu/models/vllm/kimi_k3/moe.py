@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
@@ -19,7 +20,6 @@ from .layers import KimiMLP
 
 
 class KimiRoutedOutputTransform(nn.Module):
-
     def __init__(
         self,
         norm: RMSNorm | None,
@@ -53,13 +53,16 @@ class KimiMoE(nn.Module):
         hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         vllm_config = get_current_vllm_config_or_none()
-        self.use_ep = (vllm_config is not None
-                       and vllm_config.parallel_config.enable_expert_parallel)
-        routed_expert_hidden_size = getattr(config,
-                                            "routed_expert_hidden_size", None)
-        expert_hidden_size = (routed_expert_hidden_size
-                              if routed_expert_hidden_size is not None else
-                              hidden_size)
+        self.use_ep = (
+            vllm_config is not None
+            and vllm_config.parallel_config.enable_expert_parallel
+        )
+        routed_expert_hidden_size = getattr(config, "routed_expert_hidden_size", None)
+        expert_hidden_size = (
+            routed_expert_hidden_size
+            if routed_expert_hidden_size is not None
+            else hidden_size
+        )
 
         self.gate = GateLinear(
             input_size=hidden_size,
@@ -69,55 +72,79 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = nn.Parameter(
-            torch.zeros(config.num_experts))
+            torch.zeros(config.num_experts)
+        )
 
-        self.routed_expert_down_proj = (ReplicatedLinear(
-            hidden_size,
-            expert_hidden_size,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.routed_expert_down_proj",
-        ) if routed_expert_hidden_size is not None else None)
+        self.routed_expert_down_proj = (
+            ReplicatedLinear(
+                hidden_size,
+                expert_hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.routed_expert_down_proj",
+            )
+            if routed_expert_hidden_size is not None
+            else None
+        )
         self.routed_expert_norm = (
             RMSNorm(expert_hidden_size, config.rms_norm_eps)
             if self.routed_expert_down_proj is not None
-            and getattr(config, "latent_moe_use_norm", False) else None)
-        self.routed_expert_up_proj = (ReplicatedLinear(
-            expert_hidden_size,
-            hidden_size,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.routed_expert_up_proj",
-        ) if self.routed_expert_down_proj is not None else None)
-        routed_output_transform = (KimiRoutedOutputTransform(
-            self.routed_expert_norm, self.routed_expert_up_proj)
-                                   if self.routed_expert_up_proj is not None
-                                   else None)
+            and getattr(config, "latent_moe_use_norm", False)
+            else None
+        )
+        self.routed_expert_up_proj = (
+            ReplicatedLinear(
+                expert_hidden_size,
+                hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.routed_expert_up_proj",
+            )
+            if self.routed_expert_down_proj is not None
+            else None
+        )
+        routed_output_transform = (
+            KimiRoutedOutputTransform(
+                self.routed_expert_norm, self.routed_expert_up_proj
+            )
+            if self.routed_expert_up_proj is not None
+            else None
+        )
 
-        self.shared_experts = (KimiMLP(
-            hidden_size,
-            config.moe_intermediate_size * config.num_shared_experts,
-            config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.shared_experts",
-            reduce_results=False,
-            situ_beta=getattr(config, "activation_situ_beta", None),
-            situ_linear_beta=getattr(config, "activation_situ_linear_beta",
-                                     None),
-        ) if config.num_shared_experts > 0 else None)
+        self.shared_experts = (
+            KimiMLP(
+                hidden_size,
+                config.moe_intermediate_size * config.num_shared_experts,
+                config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_experts",
+                reduce_results=False,
+                situ_beta=getattr(config, "activation_situ_beta", None),
+                situ_linear_beta=getattr(config, "activation_situ_linear_beta", None),
+            )
+            if config.num_shared_experts > 0
+            else None
+        )
 
         padded_intermediate_size = config.moe_intermediate_size
-        min_per_partition = getattr(config,
-                                    "min_moe_intermediate_per_partition", 128)
-        if (not self.use_ep and self.tp_size > 1 and
-                padded_intermediate_size // self.tp_size < min_per_partition):
+        min_per_partition = getattr(config, "min_moe_intermediate_per_partition", 128)
+        if (
+            not self.use_ep
+            and self.tp_size > 1
+            and padded_intermediate_size // self.tp_size < min_per_partition
+        ):
             padded_intermediate_size = min_per_partition * self.tp_size
 
-        situ_beta = (getattr(config, "activation_situ_beta", None)
-                     if config.hidden_act == "situ" else None)
-        situ_linear_beta = (getattr(config, "activation_situ_linear_beta",
-                                    None)
-                            if config.hidden_act == "situ" else None)
+        situ_beta = (
+            getattr(config, "activation_situ_beta", None)
+            if config.hidden_act == "situ"
+            else None
+        )
+        situ_linear_beta = (
+            getattr(config, "activation_situ_linear_beta", None)
+            if config.hidden_act == "situ"
+            else None
+        )
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             num_experts=config.num_experts,
@@ -150,12 +177,12 @@ class KimiMoE(nn.Module):
             w13_weight.data.zero_()
             w2_weight.data.zero_()
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
-                config.moe_intermediate_size // self.tp_size)
+                config.moe_intermediate_size // self.tp_size
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
-        output = self.experts(hidden_states=hidden_states,
-                              router_logits=router_logits)
+        output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
