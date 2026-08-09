@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    VLLM_TPU_USE_DISPATCHED_KDA: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -302,6 +303,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunked kernel.
     "VLLM_TPU_USE_NAIVE_KDA":
     env_bool("VLLM_TPU_USE_NAIVE_KDA"),
+    # The fused decode/prefill dispatch introduced in #293 corrupts Kimi-K3
+    # recurrent state for mixed continuous-batching steps on production-sized
+    # TPU shapes. Keep the pre-#293 short-conv + chunk-KDA composition as the
+    # correctness-first default while retaining an opt-in for kernel work.
+    "VLLM_TPU_USE_DISPATCHED_KDA":
+    env_bool("VLLM_TPU_USE_DISPATCHED_KDA"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE":

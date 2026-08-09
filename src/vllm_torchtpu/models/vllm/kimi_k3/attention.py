@@ -39,6 +39,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _USE_NAIVE_KDA_ENV = "VLLM_TPU_USE_NAIVE_KDA"
+_USE_DISPATCHED_KDA_ENV = "VLLM_TPU_USE_DISPATCHED_KDA"
 
 
 def use_naive_kda() -> bool:
@@ -51,6 +52,18 @@ def use_naive_kda() -> bool:
     other path's compiled graph and measure the wrong kernel.
     """
     return bool(getattr(envs, _USE_NAIVE_KDA_ENV))
+
+
+def use_dispatched_kda() -> bool:
+    """Whether to use the fused decode/prefill KDA composition.
+
+    The pre-#293 composition remains the default because the dispatched path
+    has produced recurrent-state corruption during mixed continuous-batching
+    steps on production Kimi-K3 shapes. Like the naive flag, this is read from
+    the TPU environment registry so the choice participates in the compilation
+    cache key.
+    """
+    return bool(getattr(envs, _USE_DISPATCHED_KDA_ENV))
 
 
 def _load_a_log(parameter: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -432,6 +445,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
         self.kv_cache = None
         self.use_naive_kda = use_naive_kda()
+        self.use_dispatched_kda = use_dispatched_kda()
         self.sconv_op = build_kimi_sconv_op(
             prefix,
             kernel_size=self.conv_size,
@@ -562,12 +576,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         hypothetical: it once sent prefill through the decode kernel and produced
         garbage output while every unit test passed.
 
-        The reference scan needs no dispatch, so the naive path keeps the
-        original two-op shape. Choosing it is a branch on a startup
-        configuration flag rather than on the batch, so it is free of that
-        hazard.
+        Both the reference recurrence and the pre-#293 chunked path keep the
+        original two-op shape. Choosing between these startup configurations is
+        safe under the no-guards wrapper because the choice is fixed before
+        tracing and is included in the TPU compilation-cache key.
         """
-        if self.use_naive_kda:
+        if self.use_naive_kda or not self.use_dispatched_kda:
             mixed_qkv = self.sconv_op(
                 mixed_qkv,
                 sconv_cache,
@@ -578,7 +592,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.mamba_state_indices,
                 metadata.seq_lens,
             )
-            return self.kda_op(
+            recurrence = (self.kda_op
+                          if self.use_naive_kda else self.chunk_kda_op)
+            return recurrence(
                 mixed_qkv,
                 raw_gate,
                 beta,
