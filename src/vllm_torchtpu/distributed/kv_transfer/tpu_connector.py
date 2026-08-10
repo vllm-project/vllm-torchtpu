@@ -1271,6 +1271,7 @@ class TPURaidenConnectorWorker:
         self._load_block_ids: dict[str, list[int]] = {}
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
+        self.transfer_stats = TpuKVConnectorStats()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
@@ -1278,6 +1279,16 @@ class TPURaidenConnectorWorker:
             self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.tp_rank == 0:
+            if self.is_producer:
+                self.transfer_stats.record_prefill_queue_length(
+                    len(self._stage3_registered_sends))
+            else:
+                self.transfer_stats.record_decode_queue_length(
+                    len(self._stage3_submitted_loads))
+
+        if not self.transfer_stats.is_empty():
+            return self.transfer_stats.clone_and_reset()
         return None
 
     def register_runner(self, runner: TPUModelRunner) -> None:
