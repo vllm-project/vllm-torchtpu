@@ -207,6 +207,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         skip_topk: bool = False,
+        non_causal_multi_token_decode: bool = False,
+        allow_short_prefill_indexer_scoring_skip: bool = False,
     ) -> None:
         torch.nn.Module.__init__(self)
 
@@ -252,6 +254,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_b_proj=self.kv_b_proj,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
         self.prefix = prefix

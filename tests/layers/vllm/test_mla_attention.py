@@ -175,7 +175,7 @@ def test_vllm_multi_head_latent_attention_wrapper():
     with patch(
             "vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op.VllmMLAAttention.__init__",
             return_value=None,
-    ):
+    ) as mock_mla_init:
         wrapper = VllmMultiHeadLatentAttentionWrapper(
             hidden_size=1024,
             num_heads=16,
@@ -186,9 +186,13 @@ def test_vllm_multi_head_latent_attention_wrapper():
             q_lora_rank=None,
             kv_lora_rank=512,
             mla_modules=mla_modules,
+            non_causal_multi_token_decode=True,
+            allow_short_prefill_indexer_scoring_skip=True,
         )
         assert wrapper.hidden_size == 1024
         assert wrapper.num_heads == 16
+        assert mock_mla_init.call_args.kwargs[
+            "non_causal_multi_token_decode"] is True
 
 
 def test_pallas_mla_backend_impl():
