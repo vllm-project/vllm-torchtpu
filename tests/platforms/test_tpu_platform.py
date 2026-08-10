@@ -30,6 +30,26 @@ from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
 
 
+def test_pcp_v2_validation_does_not_require_triton(monkeypatch):
+    from vllm.config import vllm as vllm_config
+
+    from vllm_torchtpu import _patch_vllm_pcp_v2_validation
+
+    def validate(config):
+        assert vllm_config.HAS_TRITON
+        raise RuntimeError("other validation")
+
+    monkeypatch.setattr(vllm_config, "HAS_TRITON", False)
+    monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", validate)
+    _patch_vllm_pcp_v2_validation()
+    config = SimpleNamespace(parallel_config=SimpleNamespace(
+        prefill_context_parallel_size=4))
+
+    with pytest.raises(RuntimeError, match="other validation"):
+        VllmConfig._validate_v2_model_runner(config)
+    assert not vllm_config.HAS_TRITON
+
+
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
     target = (
         "vllm.model_executor.layers.fused_moe.router.grouped_topk_router")

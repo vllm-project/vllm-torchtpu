@@ -8,6 +8,29 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _patch_vllm_pcp_v2_validation() -> None:
+    """Allow TPU PCP to use Model Runner V2 without Triton."""
+    from vllm.config import vllm as vllm_config
+
+    original = vllm_config.VllmConfig._validate_v2_model_runner
+    if getattr(original, "_tpu_pcp_v2_validation_patch", False):
+        return
+
+    def validate(self):
+        if self.parallel_config.prefill_context_parallel_size <= 1:
+            return original(self)
+        has_triton = vllm_config.HAS_TRITON
+        vllm_config.HAS_TRITON = True
+        try:
+            return original(self)
+        finally:
+            vllm_config.HAS_TRITON = has_triton
+
+    validate._tpu_pcp_v2_validation_patch = True
+    vllm_config.VllmConfig._validate_v2_model_runner = validate
+    logger.info("Applied TPU patch: allow PCP Model Runner V2 without Triton.")
+
+
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     """Require a common local prefix hit on a hybrid KV producer.
 
