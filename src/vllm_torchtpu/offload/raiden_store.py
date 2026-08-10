@@ -624,18 +624,24 @@ class RaidenOffloadingManager(OffloadingManager):
         # prepare_load's insert_and_lock) are fetched from their peer with
         # read_remote, everything else comes from the local host pool. The
         # live peek — not the lookup-time stash — decides, so a sub-hash that
-        # became local in between is simply loaded.
+        # became local in between is simply loaded. Only the BYTES are remote:
+        # every destination is one of this instance's HBM blocks, and a peer's
+        # HBM is never involved (read_remote copies peer host DRAM to local
+        # host DRAM to local HBM). The two destination lists are disjoint
+        # subsequences of `device_ids`, each preserving its batch's
+        # hash-to-block pairing, because load() and read_remote() both require
+        # block_hashes[i] to line up with device_block_ids[i].
         remote_hashes: list[bytes] = []
-        remote_device_ids: list[int] = []
+        dst_device_ids_for_remote: list[int] = []
         local_hashes: list[bytes] = []
-        local_device_ids: list[int] = []
+        dst_device_ids_for_local: list[int] = []
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
             if self._sub_hash_status(sub_hash) == self._block_status.REMOTE:
                 remote_hashes.append(sub_hash)
-                remote_device_ids.append(dev_id)
+                dst_device_ids_for_remote.append(dev_id)
             else:
                 local_hashes.append(sub_hash)
-                local_device_ids.append(dev_id)
+                dst_device_ids_for_local.append(dev_id)
 
         def _fail_launch(what: str, failed_hashes: list[bytes],
                          in_flight: list[bytes]) -> None:
@@ -671,11 +677,11 @@ class RaidenOffloadingManager(OffloadingManager):
             self._finalize(admission)
 
         if local_hashes and not self._store.load(local_hashes,
-                                                 local_device_ids):
+                                                 dst_device_ids_for_local):
             _fail_launch("load()", local_hashes, [])
             return
         if remote_hashes and not self._store.read_remote(
-                remote_hashes, remote_device_ids):
+                remote_hashes, dst_device_ids_for_remote):
             _fail_launch("read_remote()", remote_hashes, local_hashes)
             return
         admission = Admission(
