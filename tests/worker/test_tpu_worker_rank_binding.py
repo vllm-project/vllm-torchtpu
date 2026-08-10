@@ -255,3 +255,140 @@ def test_dp_binding_rejects_unresolved_data_parallel_index():
 
     with pytest.raises(AssertionError, match="data_parallel_index"):
         binding.get_tpu_worker_binding(pc, rank=0, local_rank=0, env={})
+
+
+def test_executor_slice_binding_overrides_single_host_dp_layout():
+    # Multihost DP: the slice-global rank of a worker is not
+    # dp_rank * world_size + rank, because the DP shards are spread across
+    # hosts. The executor hands the worker its real placement instead.
+    env = {
+        "TORCH_TPU_DP_SIZE":
+        "4",
+        **binding.slice_binding_env(rank=9,
+                                    local_rank=1,
+                                    world_size=16,
+                                    local_world_size=8),
+    }
+    pc = _parallel_config(world_size=4,
+                          data_parallel_size=4,
+                          data_parallel_index=2,
+                          prefill_context_parallel_size=1)
+
+    b = binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+    assert b.as_env() == {
+        "RANK": "9",
+        "LOCAL_RANK": "1",
+        "WORLD_SIZE": "16",
+        "LOCAL_WORLD_SIZE": "8",
+    }
+    # vLLM's own distributed init stays per-engine.
+    assert b.init_rank == 1
+    assert b.init_world_size == 4
+    assert b.init_local_rank == 1
+    assert b.dp_rank == 2
+    assert b.dp_size == 4
+
+
+def test_executor_slice_binding_applies_local_rank_offset():
+    env = {
+        "TORCH_TPU_DP_SIZE":
+        "2",
+        "TPU_LOCAL_RANK_OFFSET":
+        "2",
+        **binding.slice_binding_env(rank=3,
+                                    local_rank=1,
+                                    world_size=4,
+                                    local_world_size=2),
+    }
+    pc = _parallel_config(world_size=2,
+                          data_parallel_size=2,
+                          data_parallel_index=1,
+                          prefill_context_parallel_size=1)
+
+    b = binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+    assert b.local_rank == 3
+    assert b.local_world_size == 4
+    assert b.local_rank_offset == 2
+
+
+def test_executor_slice_binding_ignored_without_dp():
+    env = binding.slice_binding_env(rank=9,
+                                    local_rank=1,
+                                    world_size=16,
+                                    local_world_size=8)
+    pc = _parallel_config(world_size=4,
+                          data_parallel_size=1,
+                          prefill_context_parallel_size=1)
+
+    b = binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+    assert b.rank == 1
+    assert b.world_size == 4
+
+
+def test_partial_executor_slice_binding_is_rejected():
+    env = {
+        "TORCH_TPU_DP_SIZE": "2",
+        binding.SLICE_RANK_ENV: "3",
+        binding.SLICE_WORLD_SIZE_ENV: "4",
+    }
+    pc = _parallel_config(world_size=2,
+                          data_parallel_size=2,
+                          data_parallel_index=1,
+                          prefill_context_parallel_size=1)
+
+    with pytest.raises(ValueError, match="incomplete"):
+        binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({
+            "world_size": 8
+        }, "does not match"),
+        ({
+            "rank": 4
+        }, "out of range"),
+        ({
+            "local_rank": 2
+        }, "out of range"),
+    ],
+)
+def test_executor_slice_binding_rejects_inconsistent_geometry(
+        overrides, message):
+    values = {
+        "rank": 3,
+        "local_rank": 1,
+        "world_size": 4,
+        "local_world_size": 2,
+    }
+    values.update(overrides)
+    env = {"TORCH_TPU_DP_SIZE": "2", **binding.slice_binding_env(**values)}
+    pc = _parallel_config(world_size=2,
+                          data_parallel_size=2,
+                          data_parallel_index=1,
+                          prefill_context_parallel_size=1)
+
+    with pytest.raises(ValueError, match=message):
+        binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+
+def test_executor_slice_binding_rejects_pcp():
+    env = {
+        "TORCH_TPU_DP_SIZE":
+        "2",
+        **binding.slice_binding_env(rank=3,
+                                    local_rank=1,
+                                    world_size=8,
+                                    local_world_size=4),
+    }
+    pc = _parallel_config(world_size=4,
+                          data_parallel_size=2,
+                          data_parallel_index=1,
+                          prefill_context_parallel_size=2)
+
+    with pytest.raises(NotImplementedError, match="context parallelism"):
+        binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
