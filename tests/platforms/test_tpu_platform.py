@@ -30,7 +30,7 @@ from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
 
 
-def test_pcp_v2_validation_does_not_require_triton(monkeypatch):
+def test_pcp_v2_validation_skips_gpu_only_checks(monkeypatch):
     from vllm.config import vllm as vllm_config
 
     from vllm_torchtpu import _patch_vllm_pcp_v2_validation
@@ -39,12 +39,21 @@ def test_pcp_v2_validation_does_not_require_triton(monkeypatch):
         assert vllm_config.HAS_TRITON
         raise RuntimeError("other validation")
 
+    def get_unsupported(config):
+        return ["prefill context parallelism", "other feature"]
+
     monkeypatch.setattr(vllm_config, "HAS_TRITON", False)
     monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", validate)
+    monkeypatch.setattr(VllmConfig,
+                        "_get_v2_model_runner_unsupported_features",
+                        get_unsupported)
     _patch_vllm_pcp_v2_validation()
     config = SimpleNamespace(parallel_config=SimpleNamespace(
         prefill_context_parallel_size=4))
 
+    assert VllmConfig._get_v2_model_runner_unsupported_features(config) == [
+        "other feature"
+    ]
     with pytest.raises(RuntimeError, match="other validation"):
         VllmConfig._validate_v2_model_runner(config)
     assert not vllm_config.HAS_TRITON

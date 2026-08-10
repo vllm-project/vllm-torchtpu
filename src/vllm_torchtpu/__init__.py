@@ -9,26 +9,38 @@ logger = init_logger(__name__)
 
 
 def _patch_vllm_pcp_v2_validation() -> None:
-    """Allow TPU PCP to use Model Runner V2 without Triton."""
+    """Allow TPU PCP through GPU-specific Model Runner V2 checks."""
     from vllm.config import vllm as vllm_config
 
-    original = vllm_config.VllmConfig._validate_v2_model_runner
-    if getattr(original, "_tpu_pcp_v2_validation_patch", False):
+    cls = vllm_config.VllmConfig
+    original_validate = cls._validate_v2_model_runner
+    if getattr(original_validate, "_tpu_pcp_v2_validation_patch", False):
         return
+    original_unsupported = cls._get_v2_model_runner_unsupported_features
+
+    def get_unsupported(self):
+        unsupported = original_unsupported(self)
+        if self.parallel_config.prefill_context_parallel_size > 1:
+            unsupported = [
+                feature for feature in unsupported
+                if feature != "prefill context parallelism"
+            ]
+        return unsupported
 
     def validate(self):
         if self.parallel_config.prefill_context_parallel_size <= 1:
-            return original(self)
+            return original_validate(self)
         has_triton = vllm_config.HAS_TRITON
         vllm_config.HAS_TRITON = True
         try:
-            return original(self)
+            return original_validate(self)
         finally:
             vllm_config.HAS_TRITON = has_triton
 
     validate._tpu_pcp_v2_validation_patch = True
-    vllm_config.VllmConfig._validate_v2_model_runner = validate
-    logger.info("Applied TPU patch: allow PCP Model Runner V2 without Triton.")
+    cls._get_v2_model_runner_unsupported_features = get_unsupported
+    cls._validate_v2_model_runner = validate
+    logger.info("Applied TPU patch: allow PCP through GPU-specific V2 checks.")
 
 
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
