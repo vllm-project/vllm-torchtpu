@@ -469,10 +469,16 @@ class TestStoreJobLifecycle(unittest.TestCase):
         (release_call, ) = self.store.calls_named("release_and_delete")
         self.assertEqual(release_call.args[0], batch)
         self.assertEqual(self.store.calls_named("release"), [])
+        # Rollback deletes only the uncommitted entries; sub-hashes the
+        # successful saves already committed to host survive it. That leaves
+        # key 0 with a broken chain (MISS, re-offered) while key 1 is fully
+        # host-resident (HIT, skipped by the directory probe).
         self.assertEqual(self.manager.lookup(_key(0), _ctx()),
                          LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
+                         LookupResult.HIT)
         out = self.manager.prepare_store([_key(0), _key(1)], _ctx())
-        self.assertEqual(out.keys_to_store, [_key(0), _key(1)])
+        self.assertEqual(out.keys_to_store, [_key(0)])
 
     def test_save_retry_succeeds_and_marks_stored(self):
         self._admit([_key(0)], [5])
@@ -1174,8 +1180,13 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
                          LookupResult.HIT)
 
     def test_all_host_batch_finishes_without_save(self):
-        seed_host_entries(self.store, _key(0))
         out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [_key(0)])
+        # The whole batch becomes host-resident between the offer and the
+        # submit (recovered across a restart, or committed by a partially
+        # failed earlier save); submit pins it in place and finishes without
+        # issuing a DMA save.
+        seed_host_entries(self.store, _key(0))
         self.manager.submit_store_job(7, out.keys_to_store, [5])
         self.assertEqual(self.store.calls_named("save"), [])
         (release, ) = self.store.calls_named("release")
