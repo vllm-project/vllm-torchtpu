@@ -39,10 +39,6 @@ Core mechanisms:
 - Memory reuse (jobs_to_flush): Handled entirely scheduler-side. Fence-pending
   stores are cancelled before launching, while active transfers are drained
   synchronously before shipping metadata, preventing torn reads upon block reuse.
-
-- Aborted request resilience: Trims keys to allocated blocks and computed
-  tokens in `_build_store_jobs`, preventing crashes and cache pollution from
-  mid-flight aborted requests.
 """
 from __future__ import annotations
 
@@ -56,7 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
     config as offloading_config_module
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
-    OffloadingConnectorMetadata, OffloadingWorkerMetadata, TransferJob)
+    OffloadingConnectorMetadata, OffloadingWorkerMetadata)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
     OffloadingConnectorScheduler
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
@@ -67,7 +63,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import GPULoadStoreSpec, OffloadKey
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (AdmissionOp,
@@ -136,38 +131,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
-
-    def _build_store_jobs(
-            self, scheduler_output: SchedulerOutput) -> dict[int, TransferJob]:
-        # TODO: Drop this override once vLLM is updated past commit 4a3447d200:
-        # upstream OffloadingConnectorScheduler handles FINISHED_ABORTED by
-        # bounding tokens to req.num_computed_tokens.
-        #
-        # Protect against mid-flight aborted requests:
-        # - Prevent crash: Prompt token hashes (offload_keys) exist upfront, but
-        #   an aborted request only has partially allocated block_ids. Trim keys
-        #   to allocated blocks so upstream slice-length assertions won't fail.
-        # - Prevent cache pollution: Blocks allocated ahead of computation have
-        #   not been written yet. Trim keys to actually computed tokens so we
-        #   never store uninitialized garbage into the offload cache.
-        for req_id in scheduler_output.finished_req_ids or ():
-            req_status = self._req_status.get(req_id)
-            if req_status is None:
-                continue
-            req = req_status.req
-            aborted = req.status == RequestStatus.FINISHED_ABORTED
-            for group_config, group_state in zip(self.config.kv_group_configs,
-                                                 req_status.group_states):
-                max_chunks = (len(group_state.block_ids) //
-                              self.config.blocks_per_chunk)
-                if aborted:
-                    max_chunks = min(
-                        max_chunks, req.num_computed_tokens //
-                        group_config.tokens_per_chunk)
-                del group_state.offload_keys[max_chunks:]
-                del group_state.block_ids[max_chunks *
-                                          self.config.blocks_per_chunk:]
-        return super()._build_store_jobs(scheduler_output)
 
     def build_connector_meta(
             self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:

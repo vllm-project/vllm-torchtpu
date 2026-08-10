@@ -866,11 +866,11 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
 
     An aborted request's offload_keys cover every full token block (hashes
     exist as soon as tokens are known) while block_ids only cover what got
-    allocated before the abort; the stock _build_store_jobs dies on its
-    slice-length assert (seen when an eval pod killed its background
-    stressors, aborting their in-flight requests). The
-    TPURaidenOffloadingScheduler override trims the keys to the chunks
-    whose blocks were allocated AND computed before delegating.
+    allocated before the abort. The connector relies on upstream bounding
+    the stored chunks to blocks that were allocated AND computed
+    (FINISHED_ABORTED caps at num_computed_tokens, storable_chunks caps at
+    allocated blocks); these tests pin that contract so a vLLM bump that
+    regresses it fails here instead of crashing an eval pod mid-abort.
     """
 
     TPC = 4  # tokens_per_chunk (= tokens_per_block, blocks_per_chunk=1)
@@ -949,15 +949,6 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         self._add_pending_store_job(sched, req_status)
         return sched, keys
 
-    def test_stock_build_store_jobs_crashes_on_aborted_request(self):
-        # Verify scheduler override behavior for request abortion.
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
-            OffloadingConnectorScheduler  # noqa: E501
-        sched, _ = self._aborted_setup()
-        with self.assertRaises(AssertionError):
-            OffloadingConnectorScheduler._build_store_jobs(
-                sched, self._sched_output("r1"))
-
     def test_aborted_request_stores_only_allocated_computed_chunks(self):
         # 8 chunks of hashes, 3 blocks allocated, 12 tokens computed: store chunks 0-2.
         sched, keys = self._aborted_setup()
@@ -983,7 +974,10 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         self._track(sched, req, [_key(i) for i in range(8)], [])
         jobs = sched._build_store_jobs(self._sched_output("r1"))
         self.assertEqual(jobs, {})
-        self.assertNotIn("r1", sched._req_status)
+        # _build_store_jobs no longer cleans up request state; that is
+        # deferred to build_connector_meta, which drops finished requests
+        # with no outstanding transfer jobs.
+        self.assertIn("r1", sched._req_status)
 
     def test_normally_finished_request_keys_untouched(self):
         # Normal completion: computed = num_tokens - 1, both chunks backed by blocks.
