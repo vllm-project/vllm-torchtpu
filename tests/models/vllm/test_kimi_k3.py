@@ -306,7 +306,7 @@ def test_situ_moe_uses_tpu_activation_descriptor(
         num_shared_experts=0,
         moe_intermediate_size=128,
     )
-    layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+    kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
 
     assert fused_moe_args["activation"] == "situ"
     assert fused_moe_args["activation_situ_beta"] == 4.0
