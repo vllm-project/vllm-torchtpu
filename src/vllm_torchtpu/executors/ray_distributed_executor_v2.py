@@ -38,6 +38,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
+from vllm_torchtpu.utils import get_dp_size
+from vllm_torchtpu.worker.tpu_rank_binding import slice_binding_env
 
 logger = init_logger(__name__)
 
@@ -49,6 +51,58 @@ class RayDistributedExecutorV2(RayExecutorV2):
     MessageQueue-based control plane, while keeping TPU-specific cluster
     initialization and PyTorch TPU/XLA parallelisms.
     """
+
+    def _get_dp_geometry(self) -> tuple[int, int, int]:
+        """Return (dp_size, dp_rank, slice_world_size) for this engine.
+
+        vLLM runs one executor per DP engine, each sized `world_size` =
+        TP x PP x PCP. TorchTPU instead needs the whole DP*TP grid bootstrapped
+        as a single slice, so the executor reasons in slice-global terms and
+        carves out the window of ranks belonging to this engine.
+        """
+        # Read the per-engine width off ParallelConfig rather than
+        # self.world_size: placement group setup needs the geometry before
+        # _get_parallel_sizes() has populated the executor attribute.
+        parallel_config = self.parallel_config
+        world_size = parallel_config.world_size
+        dp_size = get_dp_size(parallel_config)
+        if dp_size <= 1:
+            return 1, 0, world_size
+
+        dp_rank = parallel_config.data_parallel_index
+        if dp_rank is None:
+            dp_rank = parallel_config.data_parallel_rank
+        if dp_rank is None:
+            raise ValueError(
+                "ParallelConfig.data_parallel_index must be resolved when "
+                f"data_parallel_size={dp_size}.")
+        return dp_size, int(dp_rank), world_size * dp_size
+
+    def _slice_host_layout(
+            self, device_str: str) -> tuple[list[str], Dict[str, int]]:
+        """Return the slice's hosts in rank order and their device counts.
+
+        Each DP engine owns a placement group covering only its own chips, so
+        the slice-wide view has to come from the cluster itself. Reading it
+        from `ray.nodes()` and ordering by address gives every engine the same
+        answer without any of them having to agree on anything.
+        """
+        hosts: list[tuple[str, int]] = []
+        for node in ray.nodes():
+            resources = node.get("Resources", {})
+            if device_str not in resources:
+                continue
+            node_ip = node.get("NodeManagerAddress") or next(
+                (key.split(":", 1)[1]
+                 for key in resources if key.startswith("node:")), None)
+            if node_ip is None:
+                raise RuntimeError(
+                    f"Ray node {node.get('NodeID')} reports {device_str} but "
+                    "no address to reach it by.")
+            hosts.append((node_ip, int(resources[device_str])))
+
+        hosts.sort()
+        return [ip for ip, _ in hosts], {ip: count for ip, count in hosts}
 
     def _get_actor_resource_kwargs(self) -> dict[str, Any]:
         """Return Ray actor resource kwargs for the TPU platform.
@@ -85,8 +139,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
         if ray is None:
             raise ImportError(
                 "Using Ray backend requires installation of ray.")
-        self._initialize_ray_cluster()
-        placement_group = self.parallel_config.placement_group
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -95,8 +147,19 @@ class RayDistributedExecutorV2(RayExecutorV2):
             f"_parallel_size ({pp_size}) x prefill_context"
             f"_parallel_size ({pcp_size}). ")
 
+        dp_size, dp_rank, slice_world_size = self._get_dp_geometry()
+        if dp_size > 1 and pcp_size > 1:
+            raise NotImplementedError(
+                "Prefill context parallelism is not supported together with "
+                "multihost data parallelism.")
+
+        self._initialize_ray_cluster()
+        placement_group = self.parallel_config.placement_group
+
         # Step 2: Build bundle assignments for worker rank placement
-        # while respecting VLLM_RAY_BUNDLE_INDICES.
+        # while respecting VLLM_RAY_BUNDLE_INDICES. The placement group holds
+        # only this engine's bundles, so these ranks are per-engine; the
+        # slice-global view is derived from the cluster in Step 7.
         if envs.VLLM_RAY_BUNDLE_INDICES:
             bundle_to_node_id = get_bundles_for_indices(
                 placement_group,
@@ -167,6 +230,10 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
             actor_name = build_actor_name(instance_id, bundle["rank"], tp_size,
                                           pp_size, pcp_size)
+            if dp_size > 1:
+                # Every DP engine spawns the same per-engine ranks, so the
+                # upstream name is only unique once the DP rank is in it.
+                actor_name = f"{actor_name}_dp{dp_rank}"
 
             actor = (ray.remote(RayWorkerProc).options(
                 name=actor_name,
@@ -198,61 +265,113 @@ class RayDistributedExecutorV2(RayExecutorV2):
             for h in self.ray_worker_handles
         ])
 
-        node_workers: dict[str, list[int]] = defaultdict(list)
         node_physical_tpu_ids: dict[str, list[int]] = defaultdict(list)
-        for i, (node_id, physical_tpu_ids
-                ) in enumerate(worker_node_and_physical_tpu_ids):
-            node_workers[node_id].append(i)
+        # vLLM slots its per-engine workers by local_rank into a list sized
+        # world_size, so that index must stay within this engine. It is a
+        # different quantity from the slice-local rank computed below, which
+        # addresses the chips of the whole slice on a host.
+        engine_node_workers: dict[str, list[int]] = defaultdict(list)
+        for i, (node_id, physical_tpu_ids) in enumerate(
+                worker_node_and_physical_tpu_ids):
+            engine_node_workers[node_id].append(i)
             node_physical_tpu_ids[node_id].extend(physical_tpu_ids)
         for node_id, physical_tpu_ids in node_physical_tpu_ids.items():
             node_physical_tpu_ids[node_id] = sorted(physical_tpu_ids)
 
         # Step 7: Prepare the environment variables for TorchTPU/XLA.
-        # This includes construction of slice builder addresses, topology lookup,
-        # and assigning rank/local_rank for the unified multi-host slice.
-        host_workers = defaultdict(list)
-        for bundle in bundle_assignments:
-            host_workers[bundle["node_ip"]].append(bundle)
+        # This includes construction of slice builder addresses, topology
+        # lookup, and assigning rank/local_rank for the unified multi-host
+        # slice. All of it is derived from the slice-wide assignment so that
+        # every DP engine computes an identical view and merely reads different
+        # entries out of it.
+        host_order, chips_per_host = self._slice_host_layout(
+            current_platform.ray_device_key)
+        if dp_size > 1 and sum(chips_per_host.values()) != slice_world_size:
+            # Only meaningful under DP, where the slice is by definition every
+            # chip in the cluster. A single engine may legitimately occupy
+            # less than the cluster.
+            raise ValueError(
+                f"Cluster reports {sum(chips_per_host.values())} chips across "
+                f"{len(host_order)} hosts, but the TPU slice needs "
+                f"{slice_world_size} (world_size={self.world_size} x "
+                f"data_parallel_size={dp_size}).")
 
-        sb_addresses = []
+        # Slice-global rank of the first chip on each host.
+        host_rank_offset: dict[str, int] = {}
+        offset = 0
+        for ip in host_order:
+            host_rank_offset[ip] = offset
+            offset += chips_per_host[ip]
+
         base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
-        for ip in sorted(host_workers.keys()):
-            for i in range(len(host_workers[ip])):
-                sb_addresses.append(f"{ip}:{base_port + i}")
+        sb_addresses = [
+            f"{ip}:{base_port + chip}" for ip in host_order
+            for chip in range(chips_per_host[ip])
+        ]
         slicebuilder_addresses = ",".join(sb_addresses)
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = slicebuilder_addresses
         logger.info(
             f"RayDistributedExecutorV2 | Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {slicebuilder_addresses}"
         )
 
-        unique_node_ids = sorted(list(node_workers.keys()))
-        node_id_to_rank = {
-            node_id: r
-            for r, node_id in enumerate(unique_node_ids)
-        }
-        num_nodes = len(unique_node_ids)
-        master_addr = bundle_assignments[0]["node_ip"]
-        master_port = str(get_open_port())
+        node_rank_by_ip = {ip: rank for rank, ip in enumerate(host_order)}
+        num_nodes = len(host_order)
+        master_addr = host_order[0]
+        if dp_size > 1:
+            # Every worker of every DP engine joins one TorchTPU world, so the
+            # rendezvous port must be agreed on without a side channel. The
+            # slicebuilder ports occupy [base_port, base_port + chips per host)
+            # so the first port past that range is free by construction.
+            max_chips_per_host = max(chips_per_host.values())
+            master_port = (os.environ.get("TORCH_TPU_DP_MASTER_PORT")
+                           or str(base_port + max_chips_per_host))
+        else:
+            master_port = str(get_open_port())
 
-        topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(self.world_size, None)
+        topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(slice_world_size, None)
         if topology is None:
             raise ValueError(
-                f"Cannot find topology for {self.world_size} chips. "
-                f"The supported number of chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}"
-            )
+                f"Cannot find topology for {slice_world_size} chips "
+                f"(world_size={self.world_size} x "
+                f"data_parallel_size={dp_size}). The supported number of "
+                f"chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}")
         xprof_session_id = os.environ.get("TORCH_TPU_XPROF_SESSION_ID",
                                           str(time.time_ns()))
         os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
 
         # Initialize workers with correct environment variables and local_rank.
         init_worker_refs = []
-        for i, (node_id, _) in enumerate(worker_node_and_physical_tpu_ids):
-            local_rank = node_workers[node_id].index(i)
-            node_rank = node_id_to_rank[node_id]
+        for i, (node_id,
+                physical_ids) in enumerate(worker_node_and_physical_tpu_ids):
+            assignment = bundle_assignments[i]
+            if node_id != assignment["node_id"]:
+                raise RuntimeError(
+                    f"Worker {i} started on Ray node {node_id} but its bundle "
+                    f"was placed on {assignment['node_id']}; the slice rank "
+                    "to chip mapping would be wrong.")
+            node_ip = assignment["node_ip"]
+            # Slot inside this engine, handed to vLLM.
+            engine_local_rank = engine_node_workers[node_id].index(i)
+            # Ray hands each worker one chip; its physical index on the host is
+            # what TorchTPU binds to, and it also places the worker in the
+            # slice. Every engine derives this the same way from the cluster,
+            # so no two DP engines can disagree about who owns which chip.
+            if len(physical_ids) != 1:
+                raise RuntimeError(
+                    f"Worker {i} was assigned {physical_ids} chips; the TPU "
+                    "executor requires exactly one chip per worker.")
+            slice_local_rank = int(physical_ids[0])
+            local_world_size = chips_per_host[node_ip]
+            if not 0 <= slice_local_rank < local_world_size:
+                raise RuntimeError(
+                    f"Worker {i} got chip {slice_local_rank} on {node_ip}, "
+                    f"which reports only {local_world_size} chips.")
+            slice_rank = host_rank_offset[node_ip] + slice_local_rank
+            node_rank = node_rank_by_ip[node_ip]
             assigned_physical_tpu_ids = sorted(node_physical_tpu_ids[node_id])
 
             worker_env_vars = {
-                "LOCAL_WORLD_SIZE": str(len(node_workers[node_id])),
+                "LOCAL_WORLD_SIZE": str(local_world_size),
                 "NNODES": str(num_nodes),
                 "NODE_RANK": str(node_rank),
                 "TPU_NUM_HOSTS": str(num_nodes),
@@ -262,15 +381,36 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 "TORCH_TPU_XPROF_SESSION_ID": xprof_session_id,
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES": slicebuilder_addresses,
             }
-            self.ray_worker_handles[i].local_rank = local_rank
+            if dp_size > 1:
+                # TPUWorker rebuilds MASTER_ADDR/PORT from the DP pair, and
+                # TORCH_TPU_DP_SIZE is what makes get_dp_size() in the worker
+                # agree with the slice the executor actually built.
+                worker_env_vars.update({
+                    "TORCH_TPU_DP_SIZE": str(dp_size),
+                    "TORCH_TPU_DP_MASTER_ADDR": master_addr,
+                    "TORCH_TPU_DP_MASTER_PORT": master_port,
+                })
+                worker_env_vars.update(
+                    slice_binding_env(
+                        rank=slice_rank,
+                        local_rank=slice_local_rank,
+                        world_size=slice_world_size,
+                        local_world_size=local_world_size,
+                    ))
+            self.ray_worker_handles[i].local_rank = engine_local_rank
+            logger.info(
+                "RayDistributedExecutorV2 | Worker rank=%d dp_rank=%d "
+                "engine_local_rank=%d -> slice_rank=%d slice_local_rank=%d "
+                "node=%s (node_rank=%d)", i, dp_rank, engine_local_rank,
+                slice_rank, slice_local_rank, node_ip, node_rank)
             # Print all environment variables that will be set on the worker
             combined_env = {**self.driver_env_vars, **worker_env_vars}
             logger.debug(
-                f"RayDistributedExecutorV2 | Worker {i} (Rank {i}) environment variables: {combined_env}"
+                f"RayDistributedExecutorV2 | Worker {i} (slice rank {slice_rank}) environment variables: {combined_env}"
             )
             init_worker_refs.append(
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
-                    local_rank,
+                    engine_local_rank,
                     worker_env_vars,
                     self.driver_env_vars,
                     assigned_physical_gpu_ids=assigned_physical_tpu_ids,
@@ -356,11 +496,14 @@ class RayDistributedExecutorV2(RayExecutorV2):
             f"(filtered from {len(ray_nodes)} total nodes)")
 
         if pp_size == 1:
-            placement_group_specs = []
-            for node in nodes_with_device:
-                num_devices = int(node['Resources'][device_str])
-                for _ in range(num_devices):
-                    placement_group_specs.append({device_str: 1.0})
+            # One bundle per device of *this engine*, as upstream
+            # initialize_ray_cluster() does. Sizing this by the cluster's
+            # devices instead only coincides with world_size when a single
+            # engine spans the whole slice; under DP every engine would ask
+            # for every chip and none but the first could ever be scheduled.
+            placement_group_specs = [{
+                device_str: 1.0
+            } for _ in range(self.parallel_config.world_size)]
         else:
             assert pp_size == len(
                 nodes_with_device
@@ -370,27 +513,36 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 device_str: num_devices_per_pp_rank
             } for _ in range(pp_size)]
 
-        # Bind the first bundle to the current node (vLLM engine node)
-        current_ip = get_ip()
-        current_node_id = ray.get_runtime_context().get_node_id()
-        current_node_info = next(
-            (n for n in ray.nodes() if n["NodeID"] == current_node_id), None)
-        current_node_resource = (current_node_info.get("Resources", {})
-                                 if current_node_info else {})
-        if current_node_resource.get(device_str, 0) < 1:
-            raise ValueError(
-                f"Current node has no {device_str} available. "
-                f"{current_node_resource=}. vLLM engine cannot start without "
-                f"{device_str}. Make sure you have at least 1 {device_str} "
-                f"available in a node {current_node_id=} {current_ip=}.")
+        dp_size, _, _ = self._get_dp_geometry()
+        if dp_size == 1:
+            # Bind the first bundle to the current node (vLLM engine node).
+            # Under DP every engine runs on the head node, so pinning would
+            # crowd all of them onto it and split each engine's TP group
+            # across hosts; upstream skips this for RayExecutorV2 entirely
+            # (require_gpu_on_driver=False).
+            current_ip = get_ip()
+            current_node_id = ray.get_runtime_context().get_node_id()
+            current_node_info = next(
+                (n for n in ray.nodes() if n["NodeID"] == current_node_id),
+                None)
+            current_node_resource = (current_node_info.get("Resources", {})
+                                     if current_node_info else {})
+            if current_node_resource.get(device_str, 0) < 1:
+                raise ValueError(
+                    f"Current node has no {device_str} available. "
+                    f"{current_node_resource=}. vLLM engine cannot start "
+                    f"without {device_str}. Make sure you have at least 1 "
+                    f"{device_str} available in a node {current_node_id=} "
+                    f"{current_ip=}.")
+            placement_group_specs[0][f"node:{current_ip}"] = 0.001
 
-        # Ensure the first bundle is created on the current node
-        placement_group_specs[0][f"node:{current_ip}"] = 0.001
         logger.info(
             f"RayDistributedExecutorV2 | placement_group_specs={placement_group_specs}"
         )
 
-        # By default, Ray packs resources as much as possible.
+        # By default, Ray packs resources as much as possible. Each engine
+        # owns its own group; Ray's resource accounting is what keeps DP
+        # engines on disjoint chips.
         current_placement_group = ray.util.placement_group(
             placement_group_specs, strategy="PACK")
         _wait_until_pg_ready(current_placement_group)
