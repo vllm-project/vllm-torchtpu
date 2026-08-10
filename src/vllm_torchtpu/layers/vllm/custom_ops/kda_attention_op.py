@@ -645,6 +645,11 @@ def build_kimi_dispatched_kda_op(
         # projection, the same way `sconv_core` builds it.
         conv_weight = jnp.concatenate((q_weight, k_weight, v_weight), axis=0)
 
+        token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+        total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
+        first_prefill_token = jnp.minimum(query_start_loc[decode_end],
+                                          total_tokens)
+
         # --- decode segment: fused convolution + recurrence ---------------
         decode_out, conv_after_decode, pool_after_decode = decode_kda(
             _match_rows(mixed_qkv, num_seqs),
@@ -665,65 +670,96 @@ def build_kimi_dispatched_kda_op(
         )
 
         # --- prefill/mixed segment: convolution, then the chunked kernel ---
-        conv_out, conv_after_prefill = kimi_short_conv_scan(
-            mixed_qkv,
-            conv_after_decode,
-            conv_weight,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            start_seq=decode_end,
-        )
-        conv_out = jax.nn.silu(conv_out)
-
-        token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-        total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-        sequence_ids = _token_sequence_ids(query_start_loc, num_tokens,
-                                           num_seqs)
-        segment_ids = jnp.where(token_ids < total_tokens, sequence_ids + 1, 0)
-
-        qkv = conv_out.reshape(num_tokens, 3, num_heads, head_dim)
-
-        def head_major(x):  # [T, H, D] -> [H, 1, T, D]
-            return jnp.transpose(x, (1, 0, 2))[:, None]
-
-        initial_state = jnp.where(has_initial_state[:, None, None, None],
-                                  pool_after_decode[state_indices], 0.0)
-
-        chunk_out, final_state = chunk_kda(
-            head_major(qkv[:, 0]),
-            head_major(qkv[:, 1]),
-            head_major(qkv[:, 2]),
-            head_major(raw_gate.reshape(num_tokens, num_heads, head_dim)),
-            jnp.transpose(_activate_beta(beta), (1, 0))[:, None],  # [H, 1, T]
-            A_log=a_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
-            use_gate_in_kernel=True,
-            use_qk_l2norm_in_kernel=True,
-            segment_ids=segment_ids[None],
-            N_max=num_seqs,
-            initial_state=initial_state[None],
-            output_final_state=True,
-            start_seq=decode_end,
-        )
-        chunk_out = jnp.transpose(chunk_out[:, 0], (1, 0, 2))  # -> [T, H, D]
-
-        # Rows with no scheduled token have no state worth keeping; their writes
-        # go to the reserved null block, slot 0.
+        # Guarded, because a decode-only step pays dearly for it otherwise.
+        # Profiling one put 55% of the layer's device time in this segment while
+        # it had nothing to do: both Pallas calls, the tile plan, and the pool
+        # gather and write-back around them came to more than the decode kernel
+        # doing the actual work. Skipping it takes a 160-request decode step from
+        # 0.838ms to 0.416ms per layer.
         #
-        # Decode slots are excluded belt-and-braces. `start_seq` above already
-        # makes the chunked kernel pass those segments through untouched, and the
-        # state it passes through was read *after* `decode_kda` ran, so writing
-        # it back would currently be a no-op. The exclusion is what makes that
-        # independent of the read order rather than contingent on it -- and it is
-        # the guard if a request ever reaches the decode segment without carried
-        # state, where the passthrough would be zero rather than the live state.
-        sequence_ids_all = jnp.arange(num_seqs, dtype=jnp.int32)
-        keep = (query_lens > 0) & (sequence_ids_all >= decode_end)
-        write_indices = jnp.where(keep, state_indices, 0)
-        new_pool = pool_after_decode.at[write_indices].set(
-            final_state[0].astype(recurrent_state.dtype))
+        # The guard cannot help a genuinely mixed batch, where both segments hold
+        # rows, and there it costs about 4% for the fusion it blocks. That is the
+        # accepted trade: decode-only steady state is the common case and the one
+        # that sets throughput.
+        #
+        # The skipped branch still has to return a full set of correctly shaped
+        # outputs, but zeroing one output and passing two caches through costs
+        # microseconds against the hundreds saved.
+        #
+        # This is a branch on a *device* value inside one traced graph, not a host
+        # branch on batch composition -- see `kimi_short_conv_scan` for why that
+        # distinction is the whole ballgame here.
+        def run_prefill():
+            conv_out, conv_after_prefill = kimi_short_conv_scan(
+                mixed_qkv,
+                conv_after_decode,
+                conv_weight,
+                query_start_loc,
+                state_indices,
+                seq_lens,
+                start_seq=decode_end,
+            )
+            conv_out = jax.nn.silu(conv_out)
+
+            sequence_ids = _token_sequence_ids(query_start_loc, num_tokens,
+                                               num_seqs)
+            segment_ids = jnp.where(token_ids < total_tokens, sequence_ids + 1,
+                                    0)
+
+            qkv = conv_out.reshape(num_tokens, 3, num_heads, head_dim)
+
+            def head_major(x):  # [T, H, D] -> [H, 1, T, D]
+                return jnp.transpose(x, (1, 0, 2))[:, None]
+
+            initial_state = jnp.where(has_initial_state[:, None, None, None],
+                                      pool_after_decode[state_indices], 0.0)
+
+            chunk_out, final_state = chunk_kda(
+                head_major(qkv[:, 0]),
+                head_major(qkv[:, 1]),
+                head_major(qkv[:, 2]),
+                head_major(raw_gate.reshape(num_tokens, num_heads, head_dim)),
+                jnp.transpose(_activate_beta(beta), (1, 0))[:,
+                                                            None],  # [H, 1, T]
+                A_log=a_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                segment_ids=segment_ids[None],
+                N_max=num_seqs,
+                initial_state=initial_state[None],
+                output_final_state=True,
+                start_seq=decode_end,
+            )
+            chunk_out = jnp.transpose(chunk_out[:, 0],
+                                      (1, 0, 2))  # -> [T, H, D]
+
+            # Rows with no scheduled token have no state worth keeping; their
+            # writes go to the reserved null block, slot 0.
+            #
+            # Decode slots are excluded belt-and-braces. `start_seq` above
+            # already makes the chunked kernel pass those segments through
+            # untouched, and the state it passes through was read *after*
+            # `decode_kda` ran, so writing it back would currently be a no-op.
+            # The exclusion is what makes that independent of the read order
+            # rather than contingent on it -- and it is the guard if a request
+            # ever reaches the decode segment without carried state, where the
+            # passthrough would be zero rather than the live state.
+            sequence_ids_all = jnp.arange(num_seqs, dtype=jnp.int32)
+            keep = (query_lens > 0) & (sequence_ids_all >= decode_end)
+            write_indices = jnp.where(keep, state_indices, 0)
+            new_pool = pool_after_decode.at[write_indices].set(
+                final_state[0].astype(recurrent_state.dtype))
+            return chunk_out, conv_after_prefill, new_pool
+
+        def skip_prefill():
+            return (jnp.zeros(
+                (num_tokens, num_heads, head_dim),
+                activation_dtype), conv_after_decode, pool_after_decode)
+
+        chunk_out, conv_after_prefill, new_pool = jax.lax.cond(
+            first_prefill_token < total_tokens, run_prefill, skip_prefill)
 
         # --- select per token ---------------------------------------------
         # Each side left the other's rows zero, so this is a select rather than
