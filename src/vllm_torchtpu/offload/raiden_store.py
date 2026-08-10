@@ -34,9 +34,14 @@ Key components and mechanisms:
   Prefill Context Parallelism (PCP) across ranks and Data Parallelism (DP)
   with independent per-engine controller ports and job names.
 
-- Two-phase admission: Uses `insert_and_lock_detailed` to pin pre-existing host
-  entries without re-saving, while newly inserted entries trigger DMA saves.
-  Displaced entries are surfaced to vLLM as eviction events.
+- Two-phase admission: `insert_and_lock` atomically pins the whole batch, then
+  a post-admission `lookup` (stable under the job's own pins) picks out the
+  entries this admission inserted, and issues a DMA save for exactly those.
+
+- Directory as the single source of truth: `prepare_store` probes Raiden per
+  key to decide what to offer, so a key displaced from the LRU is re-offered
+  on its next appearance. The connector emits no eviction events, and
+  configurations that expect KV cache events are refused at startup.
 
 - Fault tolerance and recovery: Failed saves retry once. Timed-out drains
   poison in-flight jobs to prevent committing torn bytes from reused blocks.
@@ -62,11 +67,11 @@ from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig)
 from vllm.v1.kv_offload.base import (CanonicalKVCaches, LoadStoreSpec,
-                                     LookupResult, OffloadingEvent,
-                                     OffloadingManager, OffloadingSpec,
-                                     OffloadingWorker, OffloadKey,
-                                     PrepareStoreOutput, ReqContext,
-                                     RequestOffloadingContext, TransferResult)
+                                     LookupResult, OffloadingManager,
+                                     OffloadingSpec, OffloadingWorker,
+                                     OffloadKey, PrepareStoreOutput,
+                                     ReqContext, RequestOffloadingContext,
+                                     TransferResult)
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 from vllm_torchtpu.logger import init_logger
@@ -96,19 +101,11 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     `pinned` is set to False if `prepare_load` lost the race against eviction
     before acquiring pins. The load job then fails cleanly at submit time,
     allowing vLLM to recompute the blocks.
-
-    `displaced_keys` (loads): Local cache keys displaced when `prepare_load`
-    reserves host landing capacity for remote fetches. Forwarded to
-    `submit_load_job` so displacements commit only if the load succeeds.
     """
 
-    def __init__(self,
-                 keys: list[OffloadKey],
-                 pinned: bool = True,
-                 displaced_keys: list[OffloadKey] | None = None):
+    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
         self.keys = keys
         self.pinned = pinned
-        self.displaced_keys = displaced_keys or []
 
     def __repr__(self) -> str:
         return (f"RaidenLoadStoreSpec({len(self.keys)} keys"
@@ -156,12 +153,6 @@ class Admission:
     # retry exactly this subset), and launch failures pre-fill the batch.
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
-    # Keys whose entries this admission's insert displaced into the
-    # eviction-candidate list (stores: the HBM admission; loads: the
-    # host-landing install for a remote fetch). Committed (as eviction events +
-    # advisory forget) only if the job SUCCEEDS — a failed job's rollback
-    # restores the candidates.
-    displaced_keys: list[OffloadKey] = field(default_factory=list)
 
 
 @dataclass
@@ -273,17 +264,12 @@ class RaidenOffloadingManager(OffloadingManager):
         self._block_id_cls = store_types.RaidenBlockID
         self._raiden_id = self._store.raiden_id
 
-        # Ensure the installed `tpu_raiden` binary supports detailed admission
-        # and eviction tracking (`insert_and_lock_detailed`). Fail fast at startup
-        # to prevent silent eviction loss.
-        if not hasattr(self._store, "insert_and_lock_detailed"):
-            raise RuntimeError(
-                "TPURaidenOffloadingConnector: the tpu_raiden wheel lacks "
-                "insert_and_lock_detailed; upgrade the pinned wheel.")
-
-        # Advisory admission state: filters `prepare_store` to prevent redundant
-        # admissions for keys already stored or in-flight.
-        self._stored_keys: set[OffloadKey] = set()
+        # The connector's only cache-state bookkeeping, and it is
+        # load-bearing: it bars a second admission of a key whose store job is
+        # in flight (fence-parked or launched), covering the window between
+        # `prepare_store` and `insert_and_lock` where the Raiden directory
+        # holds nothing for the key. Every other store/skip/touch decision
+        # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
 
         # Peer location slices cached from global lookups and consumed during
@@ -293,9 +279,6 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
-        # Eviction events surfaced via `take_events()` when store admissions
-        # displace existing cache entries.
-        self._pending_events: list[OffloadingEvent] = []
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -306,9 +289,6 @@ class RaidenOffloadingManager(OffloadingManager):
             self._key_namespace + key + i.to_bytes(4, "big")
             for i in range(self._gpu_block_size_factor)
         ]
-
-    def _key_of(self, sub_hash: bytes) -> OffloadKey:
-        return OffloadKey(sub_hash[len(self._key_namespace):-4])
 
     def _expand_keys(self, keys: list[OffloadKey]) -> list[bytes]:
         out: list[bytes] = []
@@ -325,17 +305,54 @@ class RaidenOffloadingManager(OffloadingManager):
         matches = self._store.lookup([sub_hash])
         return matches[0][1].status if matches else None
 
-    def _displaced_keys_of(self, raw_displaced) -> list[OffloadKey]:
-        """Unique OffloadKeys of a detailed insert result's displacements,
-        in displacement order (sub-hashes collapse back to their key)."""
-        displaced: list[OffloadKey] = []
-        seen: set[OffloadKey] = set()
-        for sub_hash, _ in raw_displaced:
-            key = self._key_of(sub_hash)
-            if key not in seen:
-                seen.add(key)
-                displaced.append(key)
-        return displaced
+    def _newly_inserted_sub_hashes(
+            self, sub_hashes: list[bytes],
+            device_ids: list[int]) -> list[bytes] | None:
+        """Return the sub-hashes this admission itself inserted — the ones a
+        DMA save must copy to host.
+
+        Called immediately after `insert_and_lock` pinned the whole batch,
+        `sub_hashes[i]` having been admitted with device block `device_ids[i]`.
+        The pins hold the directory still, so a single lookup decides every
+        sub-hash:
+        - HBM bound to the device block this job supplied: this admission put
+          it there, so its bytes exist only on device; save it.
+        - HOST / HOST_AND_HBM: already host-resident and now pinned in place;
+          handing it to save() would trip Raiden's HBM gate and get the whole
+          batch rejected.
+        - REMOTE: the bytes live on a peer; nothing to transfer locally.
+
+        Returns None when a sub-hash is missing, or sits in a state none of
+        the above covers (an HBM entry bound to a device block this job never
+        supplied). Sub-hashes are per-key unique and `_inflight_store_keys`
+        bars same-key concurrent jobs, so neither is reachable while the
+        connector's invariants hold; the caller fails the job closed rather
+        than guess which bytes are live.
+        """
+        matched = self._store.lookup(sub_hashes)
+        if len(matched) < len(sub_hashes):
+            logger.error(
+                "TPURaidenOffloadingConnector: admitted sub-hash vanished under its own "
+                "pin (%d of %d resident); failing the store job", len(matched),
+                len(sub_hashes))
+            return None
+        to_save: list[bytes] = []
+        for i, (sub_hash, block) in enumerate(matched):
+            status = block.status
+            if status in (self._block_status.HOST,
+                          self._block_status.HOST_AND_HBM,
+                          self._block_status.REMOTE):
+                continue
+            if (status == self._block_status.HBM
+                    and block.device_block_id == device_ids[i]):
+                to_save.append(sub_hash)
+                continue
+            logger.error(
+                "TPURaidenOffloadingConnector: admitted sub-hash in unexpected state "
+                "(status=%s, device_block_id=%d, expected device %d); failing "
+                "the store job", status, block.device_block_id, device_ids[i])
+            return None
+        return to_save
 
     # -- OffloadingManager contract --------------------------------------
 
@@ -354,7 +371,6 @@ class RaidenOffloadingManager(OffloadingManager):
         allow_remote = self._enable_global
         matches = self._store.lookup(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
-            self._stored_keys.discard(key)
             return LookupResult.MISS
         all_local = True
         remote_slices: dict[bytes, object] = {}
@@ -378,21 +394,21 @@ class RaidenOffloadingManager(OffloadingManager):
             return LookupResult.MISS
         if not all_local:
             self._remote_slices.update(remote_slices)
-            return LookupResult.HIT
-        # Record newly observed local hits in the advisory filter (e.g. entries
-        # restored by a rollback), ensuring touch() and prepare_store() recognize
-        # them as locally resident.
-        self._stored_keys.add(key)
         return LookupResult.HIT
 
     def touch(self, keys, req_context: ReqContext) -> None:
         # Pin and immediate release moves entries to the Most Recently Used
-        # (MRU) position, refreshing their LRU order. The advisory filter
-        # prevents unnecessary probes for keys not stored locally.
+        # (MRU) position, refreshing their LRU order. Every key is probed
+        # first, because that probe guards the pin: Raiden's Pin() resurrects
+        # entries sitting in the eviction-candidate list back into the active
+        # set without a compensating eviction, so a key whose chain is no
+        # longer fully visible must not be touched — it is skipped and left
+        # for prepare_store to re-offer. (Scheduler calls are single-threaded,
+        # so nothing can displace an entry between this probe and the pin.)
         for key in keys:
-            if key not in self._stored_keys:
-                continue
             sub_hashes = self._sub_hashes(key)
+            if len(self._store.lookup(sub_hashes)) < len(sub_hashes):
+                continue
             if self._store.pin(sub_hashes):
                 self._store.release(sub_hashes)
 
@@ -423,16 +439,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 "fail cleanly and the blocks recompute", len(local_hashes),
                 req_context.req_id)
             return RaidenLoadStoreSpec(keys, pinned=False)
-        displaced_keys: list[OffloadKey] = []
         if remote_hashes:
             # Reserving host landing capacity may displace older LRU entries;
-            # tracked displacements commit permanently only upon load success.
-            installed, _existing, _inserted, raw_displaced = (
-                self._store.insert_and_lock_detailed(remote_hashes,
-                                                     remote_slices,
-                                                     on_host=True))
-            if installed:
-                displaced_keys = self._displaced_keys_of(raw_displaced)
+            # a displaced key misses `prepare_store`'s next probe and is
+            # re-offered there.
+            installed = self._store.insert_and_lock(remote_hashes,
+                                                    remote_slices,
+                                                    on_host=True)
             if not installed:
                 # Host landing capacity is exhausted under active pin pressure.
                 # Unwind pre-existing local pins and return an unpinned spec to
@@ -445,14 +458,29 @@ class RaidenOffloadingManager(OffloadingManager):
                     "load job will fail cleanly and the blocks recompute",
                     len(remote_hashes), req_context.req_id)
                 return RaidenLoadStoreSpec(keys, pinned=False)
-        return RaidenLoadStoreSpec(keys, displaced_keys=displaced_keys)
+        return RaidenLoadStoreSpec(keys)
 
     def prepare_store(self, keys,
                       req_context: ReqContext) -> PrepareStoreOutput | None:
-        keys_to_store = [
-            key for key in keys if key not in self._stored_keys
-            and key not in self._inflight_store_keys
-        ]
+        # The Raiden directory is the sole authority on what is stored: probe
+        # it per key, so a key whose entries were displaced from the LRU is
+        # re-offered here on its next appearance. A key is skipped only when
+        # its whole sub-hash chain is host-resident (HOST/HOST_AND_HBM) or
+        # cluster-resident (REMOTE — the data exists on a peer; no local
+        # re-store).
+        keys_to_store: list[OffloadKey] = []
+        resident_statuses = (self._block_status.HOST,
+                             self._block_status.HOST_AND_HBM,
+                             self._block_status.REMOTE)
+        for key in keys:
+            if key in self._inflight_store_keys:
+                continue
+            sub_hashes = self._sub_hashes(key)
+            matches = self._store.lookup(sub_hashes)
+            if len(matches) == len(sub_hashes) and all(
+                    block.status in resident_statuses for _, block in matches):
+                continue
+            keys_to_store.append(key)
         if len(keys_to_store) > self._capacity_keys:
             return None
         # Atomic admission happens at job-submit time via insert_and_lock;
@@ -466,9 +494,12 @@ class RaidenOffloadingManager(OffloadingManager):
         )
 
     def take_events(self):
-        events = self._pending_events
-        self._pending_events = []
-        return events
+        # This manager produces no offloading events: Raiden's admission API
+        # does not report which entries an insert displaced, and `prepare_store`
+        # rediscovers them by probing the directory. Configurations that
+        # consume the event stream are refused at startup (see
+        # `TPURaidenStoreOffloadingSpec.__init__`).
+        return []
 
     def reset_cache(self) -> None:
         # Upstream's default hook is a silent no-op, which would falsely report
@@ -492,10 +523,12 @@ class RaidenOffloadingManager(OffloadingManager):
                          gpu_block_ids: list[int]) -> None:
         """Admit and launch a store job after all worker ranks acknowledge the save fence.
 
-        Atomically admits the batch via insert_and_lock_detailed: pins pre-existing
-        entries in-place, reserves capacity, displaces older LRU entries revertibly,
-        and rolls back on failure. Dispatches save() for newly inserted entries;
-        completion is tracked asynchronously by the finalizer.
+        Atomically admits the batch via insert_and_lock (pinning pre-existing
+        entries in-place, reserving capacity, rolling back on failure), then a
+        post-admission lookup picks out the entries this admission inserted
+        and dispatches save() for exactly those; completion is tracked
+        asynchronously by the finalizer. A directory state that lookup cannot
+        account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(gpu_block_ids), (len(keys), len(gpu_block_ids))
         sub_hashes = self._expand_keys(keys)
@@ -508,18 +541,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 status=self._block_status.HBM,
             ) for dev_id in device_ids
         ]
-        # Only save newly inserted HBM entries. Pre-existing HOST entries are
-        # pinned in-place without re-saving; passing them to save() would fail
-        # Raiden's HBM-status precondition.
-        displaced_keys: list[OffloadKey] = []
-        admitted, _existing, inserted, raw_displaced = (
-            self._store.insert_and_lock_detailed(sub_hashes,
-                                                 slices,
-                                                 on_host=False))
-        if admitted:
-            to_save = list(inserted)
-            displaced_keys = self._displaced_keys_of(raw_displaced)
-        if not admitted:
+        if not self._store.insert_and_lock(sub_hashes, slices, on_host=False):
             # Atomically rolled back inside Raiden; no DMA save was issued.
             logger.warning(
                 "TPURaidenOffloadingConnector: store job %d: insert_and_lock rejected %d "
@@ -530,19 +552,27 @@ class RaidenOffloadingManager(OffloadingManager):
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE,
                             success=False))
             return
+        to_save = self._newly_inserted_sub_hashes(sub_hashes, device_ids)
+        if to_save is None:
+            # Broken invariant: unwind the admission and fail the job; the
+            # blocks recompute and the key is re-offered on its next miss.
+            self._store.release_and_delete(sub_hashes)
+            self._inflight_store_keys.difference_update(keys)
+            self._finished.append(
+                FinishedJob(job_id=job_id, op=AdmissionOp.STORE,
+                            success=False))
+            return
         if not to_save:
-            # All sub-hashes are already host-resident: unpin and finish successfully
+            # All sub-hashes are already resident: unpin and finish successfully
             # without issuing redundant DMA transfers.
             self._store.release(sub_hashes)
             self._inflight_store_keys.difference_update(keys)
-            self._stored_keys.update(keys)
-            self._commit_displacement(displaced_keys)
             self._finished.append(
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True))
             return
         if not self._store.save(to_save):
-            # Synchronous launch failure: finalize immediately to revert admitted
-            # entries and restore displaced candidates.
+            # Synchronous launch failure: finalize immediately to revert the
+            # admitted entries.
             logger.error(
                 "TPURaidenOffloadingConnector: store job %d: save() launch failed for %d "
                 "sub-blocks", job_id, len(to_save))
@@ -555,7 +585,6 @@ class RaidenOffloadingManager(OffloadingManager):
                     pending=set(),
                     failed=True,
                     failed_sub_hashes=list(to_save),
-                    displaced_keys=displaced_keys,
                 ))
             return
         admission = Admission(
@@ -566,41 +595,19 @@ class RaidenOffloadingManager(OffloadingManager):
             pending=set(to_save),
             saved_sub_hashes=to_save,
             retries_left=_SAVE_RETRIES,
-            displaced_keys=displaced_keys,
         )
         self._admissions[job_id] = admission
         for sub_hash in to_save:
             self._hash_to_admission[sub_hash] = admission
 
-    def _commit_displacement(self, displaced_keys: list[OffloadKey]) -> None:
-        """A successful admission's displacements are permanent: surface them
-        as eviction events and forget them in the advisory state, so the
-        scheduler stops treating the keys as stored and a later re-offer
-        re-admits them. (A failed admission's rollback restores the
-        candidates instead — never commit those.)"""
-        if not displaced_keys:
-            return
-        self._stored_keys.difference_update(displaced_keys)
-        self._pending_events.append(
-            OffloadingEvent(keys=list(displaced_keys),
-                            medium="raiden_host",
-                            removed=True))
-
-    def submit_load_job(
-            self,
-            job_id: int,
-            keys: list[OffloadKey],
-            gpu_block_ids: list[int],
-            req_id: str,
-            pinned: bool = True,
-            displaced_keys: list[OffloadKey] | None = None) -> None:
-        """Launch a load job; entries were pinned in prepare_load.
-
-        `displaced_keys` carries prepare_load's host-landing displacements;
-        they commit only if the job succeeds.
-        """
+    def submit_load_job(self,
+                        job_id: int,
+                        keys: list[OffloadKey],
+                        gpu_block_ids: list[int],
+                        req_id: str,
+                        pinned: bool = True) -> None:
+        """Launch a load job; entries were pinned in prepare_load."""
         assert len(keys) == len(gpu_block_ids), (len(keys), len(gpu_block_ids))
-        displaced_keys = list(displaced_keys or [])
         if not pinned:
             # prepare_load lost the pin race; nothing is held, so fail the
             # job without touching the store and let vLLM recompute.
@@ -648,7 +655,6 @@ class RaidenOffloadingManager(OffloadingManager):
                 dst_gpu_block_ids=list(gpu_block_ids),
                 remote_sub_hashes=set(remote_hashes),
                 failed_sub_hashes=list(failed_hashes),
-                displaced_keys=displaced_keys,
             )
             if in_flight:
                 # The other launch already succeeded: the job must stay
@@ -681,7 +687,6 @@ class RaidenOffloadingManager(OffloadingManager):
             req_id=req_id,
             dst_gpu_block_ids=list(gpu_block_ids),
             remote_sub_hashes=set(remote_hashes),
-            displaced_keys=displaced_keys,
         )
         self._admissions[job_id] = admission
         for sub_hash in sub_hashes:
@@ -710,8 +715,6 @@ class RaidenOffloadingManager(OffloadingManager):
             if success:
                 # Unpin the exact admitted batch; entries become evictable.
                 self._store.release(admission.sub_hashes)
-                self._stored_keys.update(admission.keys)
-                self._commit_displacement(admission.displaced_keys)
             else:
                 # Unpin and delete the newly admitted HBM entries, restoring
                 # displaced candidates.
@@ -723,12 +726,11 @@ class RaidenOffloadingManager(OffloadingManager):
         else:
             # Release pins acquired in prepare_load:
             # - On success: release() unpins entries (remote fetches are now
-            #   HOST_AND_HBM) and permanently commits host-landing displacements.
+            #   HOST_AND_HBM).
             # - On failure: release_and_delete() frees unlanded REMOTE buffers
             #   while preserving valid HOST entries; destination blocks recompute.
             if success:
                 self._store.release(admission.sub_hashes)
-                self._commit_displacement(admission.displaced_keys)
             else:
                 self._store.release_and_delete(admission.sub_hashes)
             self._finished.append(
@@ -1182,6 +1184,17 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
     def __init__(self, config: OffloadingConfig, vllm_config: VllmConfig,
                  kv_cache_config: KVCacheConfig):
+        # This connector emits no OffloadingEvents — displaced keys are
+        # rediscovered by `prepare_store`'s directory probe. Refuse
+        # configurations that expect KV cache events rather than silently
+        # dropping BlockRemoved notifications.
+        kv_events = vllm_config.kv_events_config
+        if kv_events is not None and kv_events.enable_kv_cache_events:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: enable_kv_cache_events is not "
+                "supported: the Raiden offload manager does not emit "
+                "offloading events.")
+
         super().__init__(config)
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config

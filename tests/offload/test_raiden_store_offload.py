@@ -7,8 +7,9 @@ physical TPU hardware or native C++ wheels:
 1. Registration & Lifecycle:
    - Registration gate: Blocks operations until all worker ranks register.
    - Sub-hash expansion: OffloadKey maps to gpu_block_size_factor physical sub-hashes.
-   - Atomic admission & cleanup: insert_and_lock_detailed on submit, release on success,
-     and release_and_delete on terminal failure.
+   - Atomic admission & cleanup: insert_and_lock on submit, a post-admission
+     lookup classifying the pinned batch, release on success, and
+     release_and_delete on terminal failure.
    - Load lifecycle: Pins acquired in prepare_load and released upon polled completion.
    - LRU touch: Refreshes MRU priority via pin+release.
 
@@ -17,13 +18,14 @@ physical TPU hardware or native C++ wheels:
    - Drain synchronization: Reclaims HBM blocks safely and poisons timed-out jobs.
    - Sub-hash classification: Dispatches DMA only for newly admitted HBM entries.
    - Pin race recovery: Recovers gracefully if an entry is evicted during prepare_load.
-   - Advisory state learning: Dynamically tracks restored local entries.
+   - Candidate safety: touch() probes before pinning, so a displaced entry is
+     never resurrected out of the eviction-candidate list.
 
 3. Distributed Cross-Node Sharing:
    - Tiered lookup: Queries global registry on local misses; degrades safely on outages.
    - Hybrid loading: Partitions requests into local DMA and remote RDMA concurrently.
-   - Landing capacity & displacements: Atomically reserves host landing slots and tracks
-     LRU displacements revertibly.
+   - Landing capacity: Atomically reserves host landing slots; displaced
+     entries are rediscovered by directory probes rather than tracked.
    - Compatibility namespace: Generates deterministic 16-byte hashes to isolate entries.
 """
 import enum
@@ -75,6 +77,10 @@ class _Entry:
     status: FakeBlockStatus
     device_block_id: int = -1
     pin_count: int = 0
+    # Mirrors Raiden's eviction-candidate list: a displaced entry that still
+    # physically exists (and holds its host block) but is invisible to
+    # lookup. Pin() resurrects it; a same-hash insert reclaims it.
+    is_candidate: bool = False
 
 
 @dataclass
@@ -99,8 +105,6 @@ class FakeKVCacheStore:
         # graceful degradation during registry outages (falls back to local).
         self.global_entries: dict[bytes, FakeRaidenBlockID] = {}
         self.registry_down = False
-        # Sub-hashes reported as displaced on the next insert_and_lock_detailed call.
-        self.displace_next: list[bytes] = []
         # Queued terminal outcomes drained asynchronously by poll methods.
         self._save_done: list[bytes] = []
         self._save_failed: list[bytes] = []
@@ -116,9 +120,13 @@ class FakeKVCacheStore:
     # -- store surface used by the manager -----------------------------
 
     def lookup(self, block_hashes, enable_global=False):
+        self.calls.append(_Call("lookup", (list(block_hashes), enable_global)))
         out = []
         for h in block_hashes:
             entry = self.entries.get(h)
+            if entry is not None and entry.is_candidate:
+                # Candidates are invisible to lookup (Peek semantics).
+                entry = None
             if entry is None:
                 if enable_global and not self.registry_down:
                     remote = self.global_entries.get(h)
@@ -139,7 +147,11 @@ class FakeKVCacheStore:
         if any(h not in self.entries for h in block_hashes):
             return False
         for h in block_hashes:
-            self.entries[h].pin_count += 1
+            entry = self.entries[h]
+            entry.pin_count += 1
+            # Mirrors Raiden: Pin() resurrects an eviction candidate into
+            # the active set (the very behavior touch() must never trigger).
+            entry.is_candidate = False
         return True
 
     def release(self, block_hashes) -> None:
@@ -157,6 +169,12 @@ class FakeKVCacheStore:
             return False
         for h, s in zip(block_hashes, slices):
             entry = self.entries.get(h)
+            if entry is not None and entry.is_candidate:
+                # Mirrors Raiden's ReclaimStaleCandidate: a same-hash
+                # re-admission erases the stale candidate (host block
+                # returned, registry unregistered) and inserts fresh.
+                del self.entries[h]
+                entry = None
             if entry is None:
                 self.entries[h] = _Entry(status=s.status,
                                          device_block_id=s.device_block_id,
@@ -164,32 +182,6 @@ class FakeKVCacheStore:
             else:
                 entry.pin_count += 1
         return True
-
-    def insert_and_lock_detailed(self, block_hashes, slices, on_host):
-        # Return raw 4-tuple (success, existing, inserted, displaced) matching Raiden C++ binding.
-        self.calls.append(
-            _Call("insert_and_lock_detailed",
-                  (list(block_hashes), list(slices), on_host)))
-        if self.fail_insert_and_lock:
-            return (False, [], [], [])
-        existing, inserted = [], []
-        for h, s in zip(block_hashes, slices):
-            entry = self.entries.get(h)
-            if entry is None:
-                self.entries[h] = _Entry(status=s.status,
-                                         device_block_id=s.device_block_id,
-                                         pin_count=1)
-                inserted.append(h)
-            else:
-                entry.pin_count += 1
-                existing.append(h)
-        displaced = []
-        for h in self.displace_next:
-            entry = self.entries.pop(h, None)
-            if entry is not None:
-                displaced.append((h, SimpleNamespace(status=entry.status)))
-        self.displace_next = []
-        return (True, existing, inserted, displaced)
 
     def release_and_delete(self, block_hashes) -> int:
         self.calls.append(_Call("release_and_delete", (list(block_hashes), )))
@@ -339,6 +331,17 @@ def seed_host_entries(store,
         store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
 
 
+def displace_entries(store,
+                     key: bytes,
+                     gpu_block_size_factor: int = 4) -> None:
+    """Move `key`'s entries to the eviction-candidate list: invisible to
+    lookup but still physically present (holding their host blocks), exactly
+    as a store admission's displacement leaves them until the GC or a
+    same-hash re-admission collects them."""
+    for sub_hash in sub_hashes(key, gpu_block_size_factor):
+        store.entries[sub_hash].is_candidate = True
+
+
 def seed_global_entries(store,
                         key: bytes,
                         gpu_block_size_factor: int = 4,
@@ -356,15 +359,18 @@ def seed_global_entries(store,
 
 class TestConstructionGuards(unittest.TestCase):
 
-    def test_requires_insert_and_lock_detailed(self):
-        # Require insert_and_lock_detailed to ensure LRU displacements are tracked.
-        saved = FakeKVCacheStore.insert_and_lock_detailed
-        del FakeKVCacheStore.insert_and_lock_detailed
-        try:
-            with self.assertRaises(RuntimeError):
-                make_manager(FakeKVCacheStore())
-        finally:
-            FakeKVCacheStore.insert_and_lock_detailed = saved
+    def test_spec_rejects_kv_cache_events(self):
+        # The manager emits no offloading events (displaced keys are
+        # rediscovered by directory probes), so a configuration that expects
+        # KV cache events must be refused at startup, before any config
+        # derivation, rather than silently dropping BlockRemoved
+        # notifications.
+        from vllm_torchtpu.offload.raiden_store import \
+            TPURaidenStoreOffloadingSpec
+        vllm_config = MagicMock()
+        vllm_config.kv_events_config.enable_kv_cache_events = True
+        with self.assertRaisesRegex(ValueError, "enable_kv_cache_events"):
+            TPURaidenStoreOffloadingSpec(MagicMock(), vllm_config, MagicMock())
 
     def test_registry_requires_pythonhashseed(self):
         # Require PYTHONHASHSEED to prevent hash mismatch across distributed replicas.
@@ -418,7 +424,7 @@ class TestStoreJobLifecycle(unittest.TestCase):
     def test_submit_expands_sub_hashes_and_device_blocks(self):
         self._admit([_key(0), _key(1)], [5, 9])
 
-        (call, ) = self.store.calls_named("insert_and_lock_detailed")
+        (call, ) = self.store.calls_named("insert_and_lock")
         hashes, slices, on_host = call.args
         self.assertEqual(hashes, sub_hashes(_key(0)) + sub_hashes(_key(1)))
         self.assertFalse(on_host)
@@ -607,13 +613,18 @@ class TestTouchAndMisc(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             self.manager.reset_cache()
 
-    def test_touch_pins_and_releases_stored_keys_only(self):
+    def test_touch_pins_and_releases_resident_keys_only(self):
         seed_host_entries(self.store, _key(0))
-        # Key not tracked locally: advisory filter skips probe.
+        # The directory decides: every key is probed first; a fully resident
+        # key is then pinned+released, an absent one is skipped.
         self.manager.touch([_key(0), _key(1)], _ctx())
-        self.assertEqual(self.store.calls_named("pin"), [])
+        (pin, ) = self.store.calls_named("pin")
+        self.assertEqual(pin.args[0], sub_hashes(_key(0)))
+        (release, ) = self.store.calls_named("release")
+        self.assertEqual(release.args[0], sub_hashes(_key(0)))
+        self.store.calls.clear()
 
-        # Store key through a full job so the advisory filter learns it.
+        # A key made resident by a full store job is touchable the same way.
         out = self.manager.prepare_store([_key(2)], _ctx())
         self.manager.submit_store_job(1, out.keys_to_store, [5])
         self.store.complete_save(sub_hashes(_key(2)))
@@ -625,6 +636,28 @@ class TestTouchAndMisc(unittest.TestCase):
         self.assertEqual(pin.args[0], sub_hashes(_key(2)))
         (release, ) = self.store.calls_named("release")
         self.assertEqual(release.args[0], sub_hashes(_key(2)))
+
+    def test_touch_never_pins_partially_visible_keys(self):
+        # A displaced entry sits in Raiden's eviction-candidate list: it is
+        # invisible to lookup, but Pin() would resurrect it into the active
+        # set past capacity. touch must probe first and skip the pin, on
+        # every call — nothing caches the key as "stored".
+        seed_host_entries(self.store, _key(0))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.HIT)
+        displace_entries(self.store, _key(0))
+        self.store.calls.clear()
+
+        self.manager.touch([_key(0)], _ctx())
+        self.assertEqual(self.store.calls_named("pin"), [])
+        # The candidates were left untouched (not resurrected).
+        for h in sub_hashes(_key(0)):
+            self.assertTrue(self.store.entries[h].is_candidate)
+        # Still true on a repeat touch: probe again, still refuse the pin.
+        self.store.calls.clear()
+        self.manager.touch([_key(0)], _ctx())
+        self.assertEqual(len(self.store.calls_named("lookup")), 1)
+        self.assertEqual(self.store.calls_named("pin"), [])
 
     def test_drain_jobs_blocks_until_terminal(self):
         out = self.manager.prepare_store([_key(0)], _ctx())
@@ -724,14 +757,14 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertEqual(meta.load_jobs, {})
         self.assertEqual(meta.fence_job_ids, {7})
         self.assertEqual(meta.finished_store_job_ids, [])
-        self.assertEqual(store.calls_named("insert_and_lock_detailed"), [])
+        self.assertEqual(store.calls_named("insert_and_lock"), [])
 
         # First rank acknowledges fence: store job remains parked.
         self._ack(sched, [7])
-        self.assertEqual(store.calls_named("insert_and_lock_detailed"), [])
+        self.assertEqual(store.calls_named("insert_and_lock"), [])
         # All ranks acknowledge fence: store job is admitted and launched.
         self._ack(sched, [7])
-        self.assertEqual(len(store.calls_named("insert_and_lock_detailed")), 1)
+        self.assertEqual(len(store.calls_named("insert_and_lock")), 1)
         self.assertEqual(len(store.calls_named("save")), 1)
         self.assertNotIn(7, sched._fence_pending)
 
@@ -768,7 +801,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         meta = self._build_meta(sched, self._stock_meta(jobs_to_flush={7}))
         self.assertIn(7, meta.finished_store_job_ids)
         self.assertNotIn(7, sched._fence_pending)
-        self.assertEqual(store.calls_named("insert_and_lock_detailed"), [])
+        self.assertEqual(store.calls_named("insert_and_lock"), [])
         # Cancelled keys become admittable again.
         out = manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(0)])
@@ -1150,25 +1183,16 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         self.assertFalse(self.manager.has_pending_work())
-        # Advisory filter learns resident keys to prevent duplicate store admissions.
+        # The directory probe sees them host-resident, so a second offer of
+        # the same key is skipped.
         out = self.manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [])
 
-    def test_lookup_learns_unknown_keys_for_touch(self):
-        # Lookup HIT updates advisory filter for externally populated or restored entries.
-        seed_host_entries(self.store, _key(0))
-        self.manager.touch([_key(0)], _ctx())
-        self.assertEqual(self.store.calls_named("pin"), [])
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
-        self.manager.touch([_key(0)], _ctx())
-        (pin, ) = self.store.calls_named("pin")
-        self.assertEqual(pin.args[0], sub_hashes(_key(0)))
 
-
-class TestDetailedClassification(unittest.TestCase):
-    """Classification via the detailed insert_and_lock result and
-    displacement -> eviction events."""
+class TestPostAdmissionClassification(unittest.TestCase):
+    """A post-admission lookup decides which sub-hashes of the pinned batch
+    this admission inserted (and must save), and displaced keys are
+    rediscovered by directory probes rather than eviction events."""
 
     def setUp(self):
         self.store = FakeKVCacheStore()
@@ -1178,61 +1202,87 @@ class TestDetailedClassification(unittest.TestCase):
         out = self.manager.prepare_store([key], _ctx())
         self.manager.submit_store_job(job_id, out.keys_to_store, [gpu_block])
 
-    def test_detailed_result_replaces_probe_classification(self):
+    def test_lookup_classification_saves_only_new_sub_hashes(self):
         batch = sub_hashes(_key(0))
         for h in batch[:2]:
             self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
         self._store_key(_key(0), 5, 7)
-        # Classification derived directly from insert_and_lock_detailed result.
-        (call, ) = self.store.calls_named("insert_and_lock_detailed")
+        (call, ) = self.store.calls_named("insert_and_lock")
         self.assertEqual(call.args[0], batch)
         (save, ) = self.store.calls_named("save")
         self.assertEqual(save.args[0], batch[2:])
-        self.assertEqual(self.store.calls_named("insert_and_lock"), [])
 
         self.store.complete_save(batch[2:])
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
 
-    def test_displacement_commits_only_on_success(self):
-        # Store key 1, then displace it via key 2's admission.
-        seed_host_entries(self.store, _key(1))
-        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
-                         LookupResult.HIT)
+    def test_remote_sub_hashes_are_resident_and_not_saved(self):
+        batch = sub_hashes(_key(0))
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.REMOTE)
+        self._store_key(_key(0), 5, 7)
+        (save, ) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], batch[2:])
 
-        self.store.displace_next = sub_hashes(_key(1))
-        self._store_key(_key(2), 5, 7)
-        # Displacements remain uncommitted while store job is in-flight.
-        self.assertEqual(list(self.manager.take_events()), [])
+    def test_fully_remote_key_is_not_offered(self):
+        for h in sub_hashes(_key(0)):
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.REMOTE)
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        self.assertEqual(out.keys_to_store, [])
 
-        self.store.complete_save(sub_hashes(_key(2)))
+    def test_foreign_hbm_binding_fails_closed(self):
+        batch = sub_hashes(_key(0))
+        # An HBM entry bound to a device block this job did not supply breaks
+        # the connector's invariants; the job must fail, not guess.
+        self.store.entries[batch[0]] = _Entry(status=FakeBlockStatus.HBM,
+                                              device_block_id=99)
+        self._store_key(_key(0), 5, 7)
+        self.assertEqual(self.store.calls_named("save"), [])
+        (rad, ) = self.store.calls_named("release_and_delete")
+        self.assertEqual(rad.args[0], batch)
         (finished_job, ) = self.manager.poll_finished_jobs()
-        self.assertTrue(finished_job.success)
-        (event, ) = self.manager.take_events()
-        self.assertEqual(event.keys, [_key(1)])
-        self.assertTrue(event.removed)
+        self.assertFalse(finished_job.success)
+        self.assertFalse(self.manager.has_pending_work())
+
+    def test_displaced_key_rediscovered_by_directory_probe(self):
+        seed_host_entries(self.store, _key(1))
+        self.assertEqual(
+            self.manager.prepare_store([_key(1)], _ctx()).keys_to_store, [])
+        # Displacement moves the entries to the candidate list, invisible to
+        # lookup. No event is emitted; the next prepare_store probe simply
+        # re-offers the key.
+        displace_entries(self.store, _key(1))
         self.assertEqual(list(self.manager.take_events()), [])
-        # Displaced key is evicted from advisory set upon store completion.
-        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
-                         LookupResult.MISS)
         out = self.manager.prepare_store([_key(1)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(1)])
 
-    def test_displacement_dropped_on_failure(self):
+    def test_candidate_readmission_stores_cleanly(self):
+        # The dangerous window: key 1's old entries still sit in the
+        # eviction-candidate list when the key is re-offered and re-admitted.
+        # Raiden's reclaim erases the stale candidates so the admission
+        # inserts fresh HBM entries, and the full batch is saved.
+        batch = sub_hashes(_key(1))
         seed_host_entries(self.store, _key(1))
+        displace_entries(self.store, _key(1))
+
+        out = self.manager.prepare_store([_key(1)], _ctx())
+        self.assertEqual(out.keys_to_store, [_key(1)])
+        self.manager.submit_store_job(7, [_key(1)], [5])
+        # Reclaimed and re-inserted: fresh pinned HBM entries, old
+        # candidates gone.
+        for i, h in enumerate(batch):
+            entry = self.store.entries[h]
+            self.assertFalse(entry.is_candidate)
+            self.assertEqual(entry.status, FakeBlockStatus.HBM)
+            self.assertEqual(entry.device_block_id, 20 + i)
+        (save, ) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], batch)
+
+        self.store.complete_save(batch)
+        (finished_job, ) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
         self.assertEqual(self.manager.lookup(_key(1), _ctx()),
                          LookupResult.HIT)
-
-        self.store.displace_next = sub_hashes(_key(1))
-        self._store_key(_key(2), 5, 7)
-        batch = sub_hashes(_key(2))
-        self.store.complete_save(batch, success=False)
-        self.assertEqual(self.manager.poll_finished_jobs(), [])  # retry
-        self.store.complete_save(batch, success=False)
-        (finished_job, ) = self.manager.poll_finished_jobs()
-        self.assertFalse(finished_job.success)
-        # Failed admission restores displaced candidates without emitting eviction events.
-        self.assertEqual(list(self.manager.take_events()), [])
 
 
 class TestRemoteReadFlow(unittest.TestCase):
@@ -1267,7 +1317,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         spec = self.manager.prepare_load([key], _ctx())
         self.assertTrue(spec.pinned)
         # Peer slices installed locally in REMOTE status with pin (on_host=True).
-        (ial, ) = self.store.calls_named("insert_and_lock_detailed")
+        (ial, ) = self.store.calls_named("insert_and_lock")
         self.assertEqual(ial.args[0], sub_hashes(key))
         self.assertTrue(ial.args[2])
         for h in sub_hashes(key):
@@ -1417,61 +1467,30 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.assertEqual(self.store.calls_named("read_remote"), [])
 
 
-class TestRemoteLandingDisplacement(unittest.TestCase):
-    """prepare_load's host-landing install goes through the detailed
-    insert, so entries it displaces commit exactly like a store
-    admission's — eviction event + advisory forget on success, rollback on
-    failure."""
+class TestRemoteLanding(unittest.TestCase):
+    """prepare_load installs host landing space with insert_and_lock; local
+    entries it displaces are rediscovered by prepare_store's directory probe
+    once they vanish from the directory."""
 
     def setUp(self):
         self.store = FakeKVCacheStore()
         self.manager = make_global_manager(self.store)
-        # Locally stored entry displaced by incoming remote landing allocation.
-        seed_host_entries(self.store, _key(1))
-        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
-                         LookupResult.HIT)
         seed_global_entries(self.store, _key(2))
         self.assertEqual(self.manager.lookup(_key(2), _ctx()),
                          LookupResult.HIT)
-        self.store.displace_next = sub_hashes(_key(1))
 
-    def _prepare_and_submit(self):
+    def test_landing_install_is_plain_pinned_admission(self):
         spec = self.manager.prepare_load([_key(2)], _ctx("r1"))
         self.assertTrue(spec.pinned)
-        # Detailed insert surfaces displacement on the load spec.
-        (ial, ) = self.store.calls_named("insert_and_lock_detailed")
+        (ial, ) = self.store.calls_named("insert_and_lock")
         self.assertEqual(ial.args[0], sub_hashes(_key(2)))
         self.assertTrue(ial.args[2])
-        self.assertEqual(self.store.calls_named("insert_and_lock"), [])
-        self.assertEqual(spec.displaced_keys, [_key(1)])
-        self.manager.submit_load_job(7, [_key(2)], [5],
-                                     "r1",
-                                     displaced_keys=spec.displaced_keys)
-        # Displacements remain uncommitted until remote read succeeds.
+        self.manager.submit_load_job(7, [_key(2)], [5], "r1")
         self.assertEqual(list(self.manager.take_events()), [])
-
-    def test_displacement_commits_on_load_success(self):
-        self._prepare_and_submit()
         self.store.complete_remote_read(sub_hashes(_key(2)))
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
-        (event, ) = self.manager.take_events()
-        self.assertEqual(list(event.keys), [_key(1)])
-        self.assertTrue(event.removed)
         self.assertEqual(list(self.manager.take_events()), [])
-        # Displaced entry evicted from advisory filter upon load completion.
-        out = self.manager.prepare_store([_key(1)], _ctx())
-        self.assertEqual(out.keys_to_store, [_key(1)])
-
-    def test_displacement_dropped_on_load_failure(self):
-        self._prepare_and_submit()
-        self.store.complete_remote_read(sub_hashes(_key(2)), success=False)
-        (finished_job, ) = self.manager.poll_finished_jobs()
-        self.assertFalse(finished_job.success)
-        # Failed remote read restores displaced candidates without emitting eviction events.
-        self.assertEqual(list(self.manager.take_events()), [])
-        out = self.manager.prepare_store([_key(1)], _ctx())
-        self.assertEqual(out.keys_to_store, [])
 
 
 class TestNamespace(unittest.TestCase):
@@ -1487,23 +1506,10 @@ class TestNamespace(unittest.TestCase):
         key = _key(1)
         self.manager.prepare_store([key], _ctx())
         self.manager.submit_store_job(1, [key], [3])
-        (ial, ) = self.store.calls_named("insert_and_lock_detailed")
+        (ial, ) = self.store.calls_named("insert_and_lock")
         self.assertEqual(ial.args[0], sub_hashes(key, ns=self.NS))
         (sv, ) = self.store.calls_named("save")
         self.assertEqual(sv.args[0], sub_hashes(key, ns=self.NS))
-
-    def test_displaced_key_recovery_strips_namespace(self):
-        seed_host_entries(self.store, _key(9))
-        for h in sub_hashes(_key(9)):
-            entry = self.store.entries.pop(h)
-            self.store.entries[self.NS + h] = entry
-        self.store.displace_next = sub_hashes(_key(9), ns=self.NS)
-        self.manager.prepare_store([_key(1)], _ctx())
-        self.manager.submit_store_job(1, [_key(1)], [3])
-        self.store.complete_save(sub_hashes(_key(1), ns=self.NS))
-        self.manager.poll_finished_jobs()
-        (event, ) = self.manager.take_events()
-        self.assertEqual(list(event.keys), [_key(9)])
 
     def test_namespaced_remote_flow(self):
         key = _key(1)
