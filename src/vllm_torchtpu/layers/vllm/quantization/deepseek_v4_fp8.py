@@ -30,7 +30,8 @@ from vllm_torchtpu.layers.common.quant_methods import (DEEPSEEK_V4_FP8,
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.vllm.quantization.fp8 import (VllmFp8LinearMethodTPU,
                                                         VllmFp8MoEMethodTPU)
-from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
+from vllm_torchtpu.layers.vllm.quantization.mxfp4 import \
+    VllmDeepseekV4Mxfp4MoEMethod
 from vllm_torchtpu.layers.vllm.quantization.unquantized import \
     VllmUnquantizedFusedMoEMethod
 from vllm_torchtpu.logger import init_logger
@@ -45,7 +46,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
 
     Registered under "tpu-deepseek_v4_fp8".
     Dispatches MoE quant methods based on the checkpoint's expert_dtype:
-      - "fp4" → VllmMxfp4MoEMethod
+      - "fp4" → VllmDeepseekV4Mxfp4MoEMethod
       - "fp8" → VllmFp8MoEMethodTPU
     Linear layers always use VllmFp8LinearMethodTPU (FP8 block-quant).
     """
@@ -94,7 +95,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                     raise NotImplementedError("NVFP4 is not supported yet.")
 
                 moe_config = self.get_moe_config(layer)
-                return VllmMxfp4MoEMethod(moe_config)
+                return VllmDeepseekV4Mxfp4MoEMethod(moe_config)
             else:
                 return VllmFp8MoEMethodTPU(self, layer)
 

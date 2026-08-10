@@ -10,7 +10,7 @@ ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-co
 FROM $BASE_IMAGE AS base
 
 # Install curl for health checks (minimal for base)
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl git build-essential gcc g++ cmake ninja-build && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/torchtpu-vllm
 
@@ -27,6 +27,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
     export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
     export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
+    export CXX=g++; \
+    export CC=gcc; \
+    export VLLM_TARGET_DEVICE=empty; \
     uv pip install --system \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
@@ -78,9 +81,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
 COPY . .
+# Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
+# also applies to any other scm-versioned package built in this step. With a
+# cold uv cache, resolving ".[...]" rebuilds metadata for the vllm git
+# dependency, which then gets stamped 0.0.0 and reinstalled over the correctly
+# versioned wheel from the base stage.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system -e ".[test,benchmarking]"
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    VLLM_TARGET_DEVICE=empty uv pip install --system -e ".[test,benchmarking]"
 
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
 CMD ["/bin/bash"]
@@ -93,8 +101,8 @@ FROM base AS prod
 WORKDIR /root/torchtpu-vllm
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system .
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    VLLM_TARGET_DEVICE=empty uv pip install --system .
 
 RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"

@@ -4,14 +4,22 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import \
     CompressedTensorsW4A4Mxfp4MoEMethod
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.quantization import e8m0_to_fp32
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  load_kmajor_fp4,
-                                                 prebuild_fused_moe_kernel)
+                                                 prebuild_fused_moe_kernel,
+                                                 requant_load_kmajor_fp4)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import (
     get_cpu_weight_loader_hook, release_memory_to_os)
+
+
+def _fresh(t: torch.Tensor) -> torch.Tensor:
+    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
+    the torch_tpu pallas boundary ships a plain row-major buffer)."""
+    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
 
 
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
@@ -102,20 +110,38 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w13_scale = e8m0_to_fp32(w13_weight_scale)
         w2_scale = e8m0_to_fp32(w2_weight_scale)
 
-        def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
-            # scale shape: [E, N, num_blocks]
-            # gmm_v2 scale layout: [E, num_blocks, 1, N]
-            view = scale.movedim(-1, 1).unsqueeze(-2)
-            out = torch.empty(view.shape, dtype=view.dtype, device=view.device)
-            return out.copy_(view)
+        requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
+        if requant_block is not None:
+            requant_block = int(requant_block)
 
-        w13_scale_4d = _to_kernel_scale(w13_scale)
-        w2_scale_4d = _to_kernel_scale(w2_scale)
+            # The last dim of packed weights is K/2. So K is shape[-1] * 2.
+            hidden = w13_weight_packed.shape[-1] * 2
+            inter = w2_weight_packed.shape[-1] * 2
+            if hidden % requant_block != 0 or inter % requant_block != 0:
+                raise ValueError(
+                    f"W4A8 requantization needs hidden ({hidden}) and inter ({inter}) "
+                    f"to be divisible by block ({requant_block}). Padding is not yet supported."
+                )
 
-        # Unpack to native fp4 in the kernel's K-major layout once at load
-        # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
-        w13_weight = load_kmajor_fp4(w13_weight_packed)
-        w2_weight = load_kmajor_fp4(w2_weight_packed)
+            # Apply XLA fused requantization and kmajor layout shift
+            w13_weight, w13_scale_4d = requant_load_kmajor_fp4(
+                _fresh(w13_weight_packed), w13_scale, requant_block)
+            w2_weight, w2_scale_4d = requant_load_kmajor_fp4(
+                _fresh(w2_weight_packed), w2_scale, requant_block)
+        else:
+
+            def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
+                # scale shape: [E, N, num_blocks]
+                # gmm_v2 scale layout: [E, num_blocks, 1, N]
+                return _fresh(scale.movedim(-1, 1).unsqueeze(-2))
+
+            w13_scale_4d = _to_kernel_scale(w13_scale)
+            w2_scale_4d = _to_kernel_scale(w2_scale)
+
+            # Unpack to native fp4 in the kernel's K-major layout once at load
+            # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
+            w13_weight = load_kmajor_fp4(_fresh(w13_weight_packed))
+            w2_weight = load_kmajor_fp4(_fresh(w2_weight_packed))
 
         # Clean up CPU scratchpads
         for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,

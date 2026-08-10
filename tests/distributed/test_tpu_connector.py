@@ -31,7 +31,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3RegisteredSend, stage3_fa_raiden_id_fields)
+    _Stage3RegisteredSend, _select_committed_mamba_blocks,
+    stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -59,9 +60,11 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
     )
 
 
-def _make_stage3_hybrid_kv_cache_config(*,
-                                        fa_group_index: int = 2
-                                        ) -> KVCacheConfig:
+def _make_stage3_hybrid_kv_cache_config(
+    *,
+    fa_group_index: int = 2,
+    num_speculative_blocks: int = 0,
+) -> KVCacheConfig:
     fa_group = KVCacheGroupSpec(
         layer_names=["model.layers.2.self_attn"],
         kv_cache_spec=FullAttentionSpec(
@@ -78,6 +81,7 @@ def _make_stage3_hybrid_kv_cache_config(*,
                 block_size=16,
                 shapes=((1, ), ),
                 dtypes=(torch.bfloat16, ),
+                num_speculative_blocks=num_speculative_blocks,
             ),
         ) for index in range(3)
     ]
@@ -86,6 +90,15 @@ def _make_stage3_hybrid_kv_cache_config(*,
     return KVCacheConfig(num_blocks=0,
                          kv_cache_tensors=[],
                          kv_cache_groups=groups)
+
+
+@pytest.mark.parametrize(("num_speculative_blocks", "expected"),
+                         ((0, 14), (3, 11)))
+def test_select_committed_mamba_blocks(num_speculative_blocks, expected):
+    assert _select_committed_mamba_blocks(
+        [[10, 11, 12, 13, 14]],
+        num_speculative_blocks,
+    ) == [expected]
 
 
 def _make_vllm_config(*,
@@ -346,7 +359,8 @@ class TestTPUConnector:
     def test_stage3_hybrid_wrapper_routes_request_finish_to_fa_group(
             self, mock_raiden_sched_cls, mock_raiden_worker_cls):
         cfg = _make_vllm_config(is_producer=True, pcp_size=8)
-        cache_config = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
+        cache_config = _make_stage3_hybrid_kv_cache_config(
+            fa_group_index=2, num_speculative_blocks=3)
 
         with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
                    "raiden",
@@ -366,6 +380,8 @@ class TestTPUConnector:
 
         mock_raiden_sched_cls.return_value.request_finished.assert_called_once_with(
             request, [30, 31], mamba_block_ids=[[10], [20], [40]])
+        assert (mock_raiden_sched_cls.return_value.
+                _stage3_mamba_num_speculative_blocks == 3)
         mock_raiden_worker_cls.assert_not_called()
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
@@ -794,6 +810,50 @@ class TestTPURaidenConnectorScheduler:
     def test_get_finished_count_uses_vllm_world_size(self):
         assert self.consumer.get_finished_count() == 0
 
+    def test_stage3_producer_transfers_committed_mamba_checkpoint(self):
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=16,
+                                          pcp_size=1)
+        producer._stage3_mamba_group_indices = [1]
+        producer._stage3_mamba_num_speculative_blocks = 3
+        req = MagicMock()
+        req.request_id = "mtp-producer"
+        req.num_prompt_tokens = 17
+        req.num_computed_tokens = 16
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.kv_transfer_params = None
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
+                           "prefill",
+                           create=True), patch(
+                               f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                               "producer-engine",
+                               create=True), patch(
+                                   f"{_MOD}.tpu_envs."
+                                   "TPU_RAIDEN_TRANSFER_PARALLELISM",
+                                   1,
+                                   create=True), patch(
+                                       f"{_MOD}.get_uuid",
+                                       return_value=777), patch(
+                                           f"{_MOD}.dist_utils."
+                                           "get_p2p_wait_pull_timeout",
+                                           return_value=30.0):
+            delay, _ = producer.request_finished(
+                req,
+                [100],
+                mamba_block_ids=[[10, 11, 12, 13, 14]],
+            )
+            meta = producer.build_connector_meta()
+
+        assert delay
+        assert meta.reqs_to_send[req.request_id].mamba_state_block_ids == [11]
+
     @pytest.mark.parametrize("num_computed_tokens", (65_023, 65_024))
     def test_v3_stage3_finish_keeps_partial_page_and_exact_token_count(
             self, num_computed_tokens):
@@ -1038,6 +1098,34 @@ class TestTPURaidenConnectorScheduler:
         assert load.src_job_name == "nondefault-prefill"
         assert load.src_engine_id == "producer-engine"
         assert not hasattr(load, "remote_block_ids")
+
+    def test_stage3_consumer_writes_committed_mamba_checkpoint(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=16)
+        consumer._stage3_fa_group_index = 0
+        consumer._stage3_mamba_group_indices = [1]
+        consumer._stage3_mamba_num_speculative_blocks = 3
+        req = MagicMock()
+        req.request_id = "mtp-consumer"
+        req.kv_transfer_params = {
+            "req_id": "mtp-producer",
+            "uuid": 991,
+            "num_tokens": 16,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 1,
+        }
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([200], [10, 11, 12, 13, 14])
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            consumer.update_state_after_alloc(req, blocks, 16)
+
+        load = consumer.reqs_to_load[req.request_id]
+        assert load.mamba_state_block_ids == [11]
 
     def test_stage3_consumer_preserves_distinct_source_request_id(self):
         consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
@@ -2533,6 +2621,17 @@ class TestTPURaidenConnectorWorker:
         with unittest.TestCase().assertRaisesRegex(ValueError,
                                                    "dp8_decode.*requires"):
             worker._raiden_qwen35_admission_topology()
+
+    @pytest.mark.parametrize("dp_size", [4, 8])
+    def test_v1_admission_accepts_dp_prefill_topology(self, dp_size):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=True,
+                                     dp_size=dp_size,
+                                     pcp_size=1)
+
+        assert worker._raiden_qwen35_admission_topology() == (
+            f"dp{dp_size}_prefill")
 
     def test_producer_registers_sends_with_raiden(self):
         meta = TPUConnectorMetadata()

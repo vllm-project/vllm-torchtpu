@@ -31,7 +31,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import varlen_tiles
 
-__all__ = ["chunk_kda"]
+__all__ = ["chunk_kda", "restrict_cu_seqlens"]
 
 
 def exp2(x):
@@ -115,6 +115,28 @@ class _TilePlan(NamedTuple):
     s_idx: jax.Array
     is_first: jax.Array
     is_last: jax.Array
+
+
+def restrict_cu_seqlens(
+    cu_seqlens: jax.Array,  # [..., N + 1]
+    start_seq: jax.Array | int,
+) -> jax.Array:
+    """Collapse segments before ``start_seq`` to zero length.
+
+    ``cu_seqlens`` is non-decreasing, so clamping it from below at its own
+    ``start_seq`` entry makes every earlier boundary equal and leaves every later
+    one untouched. Segments before ``start_seq`` then hold no tokens and get no
+    tiles, while the ones after keep both their absolute token offsets and their
+    absolute segment indices -- which is what a caller needs to keep addressing
+    recurrent state by request slot.
+
+    This is how a caller restricts the chunked kernel to the prefill part of a
+    batch, with the boundary a *device* scalar: a host-side branch on batch
+    composition cannot work under vLLM's guard-free single trace.
+    """
+    floor = jnp.take(cu_seqlens, jnp.asarray(start_seq, jnp.int32),
+                     axis=-1)[..., None]
+    return jnp.maximum(cu_seqlens, floor)
 
 
 def _plan_tiles(
@@ -1292,6 +1314,7 @@ def _preprocess_inputs(
     segment_ids: jax.Array | None,
     chunk_size: int,
     N_max: int | None,
+    start_seq: jax.Array | int | None,
 ) -> _PreparedKdaInputs:
     """Canonicalize inputs for the forward kernel and plan its tiles."""
     if N_max is None:
@@ -1301,6 +1324,11 @@ def _preprocess_inputs(
                 "segment count is a static shape and cannot be inferred.")
         N_max = initial_state.shape[1]
     cu_seqlens = segment_ids_to_seqlens(segment_ids, max_segs=N_max)
+    if start_seq is not None:
+        # Segments before `start_seq` keep their slot in `initial_state` and in
+        # the returned `final_state`, but contribute no tiles, so the kernel
+        # neither reads nor advances their recurrent state.
+        cu_seqlens = restrict_cu_seqlens(cu_seqlens, start_seq)
     plan = _plan_tiles(cu_seqlens,
                        num_tokens=q.shape[2],
                        chunk_size=chunk_size)
@@ -1353,6 +1381,7 @@ def chunk_kda(
     chunk_size: int = 64,
     use_qk_l2norm_in_kernel: bool = False,
     N_max: int | None = None,
+    start_seq=None,
 ):
     """Run the KDA forward kernel and return ``(output, final_state)``.
 
@@ -1378,6 +1407,11 @@ def chunk_kda(
       chunk_size: chunk length used by the kernel.
       use_qk_l2norm_in_kernel: normalize queries and keys before the kernel.
       N_max: static segment count. Defaults to ``initial_state``'s.
+      start_seq: optional device scalar; restrict the kernel to segments at or
+        after this index. Earlier segments get no tiles, so their rows of
+        ``final_state`` come back exactly as they went in and their output rows
+        are left zero -- which is how a caller hands the leading part of a batch
+        to a different kernel without a host-side branch on batch composition.
 
     Returns:
       ``(output, final_state)`` where output is ``[H, B, T, V]`` and
@@ -1442,6 +1476,7 @@ def chunk_kda(
         segment_ids=segment_ids,
         chunk_size=chunk_size,
         N_max=N_max,
+        start_seq=start_seq,
     )
 
     value, final_state = _run_chunk_kda(

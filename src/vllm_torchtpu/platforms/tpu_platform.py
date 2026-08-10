@@ -722,8 +722,7 @@ class TpuPlatform(Platform):
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
                 max_token_size=scheduler_config.max_num_batched_tokens,
-                linear_until=envs.TPU_TOKEN_BUCKET_LINEAR_UNTIL,
-                linear_interval=envs.TPU_TOKEN_BUCKET_LINEAR_INTERVAL,
+                extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
             )
         else:
             compilation_config.compile_sizes = sorted(
@@ -1015,39 +1014,25 @@ def _get_exponential_token_paddings(min_token_size: int,
     return paddings
 
 
-def _get_linear_then_exponential_token_paddings(
-        min_token_size: int, max_token_size: int, linear_until: int,
-        linear_interval: int) -> list[int]:
-    """Sizes stepping by ``linear_interval`` to ``linear_until``, doubling
-    after, capped exactly at max_token_size (see _get_exponential_token_paddings)."""
-    linear_end = min(linear_until, max_token_size)
-    paddings = sorted(
-        {min_token_size}
-        | set(range(linear_interval, linear_end + 1, linear_interval)))
-    while paddings[-1] * 2 < max_token_size:
-        paddings.append(paddings[-1] * 2)
-    if paddings[-1] < max_token_size:
-        paddings.append(max_token_size)
-    return paddings
-
-
-def _get_token_paddings(min_token_size: int,
-                        max_token_size: int,
-                        linear_until: int = 0,
-                        linear_interval: int = 16) -> list[int]:
+def _get_token_paddings(
+        min_token_size: int,
+        max_token_size: int,
+        extra_bucket_sizes: list[int] | None = None) -> list[int]:
     """Generate a list of padding size, starting from min_token_size,
     ending with a number that can cover max_token_size.
+
+    ``extra_bucket_sizes`` are merged into the list.
     """
     # assert min_token_size is power of 2
     assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
 
-    if linear_until:
-        # Linear padding sizes up to linear_until, then exponential doubling after that.
-        paddings = _get_linear_then_exponential_token_paddings(
-            min_token_size, max_token_size, linear_until, linear_interval)
-    else:
-        # Double sizes from min_token_size until max_token_size is covered.
-        paddings = _get_exponential_token_paddings(min_token_size,
-                                                   max_token_size)
+    paddings = _get_exponential_token_paddings(min_token_size, max_token_size)
+    if extra_bucket_sizes:
+        paddings = sorted(
+            set(paddings)
+            | {
+                size
+                for size in extra_bucket_sizes if 0 < size <= max_token_size
+            })
     logger.info("Using token paddings: %s", paddings)
     return paddings

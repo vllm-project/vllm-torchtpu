@@ -478,19 +478,18 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
     )
     layer._metadata = lambda: metadata
 
     calls: list[str] = []
 
-    def sconv_op(mixed_qkv, *args):
-        calls.append("sconv")
-        assert args[0] is sconv_cache
-        return mixed_qkv
-
-    def chunk_kda_op(mixed_qkv, *args):
-        calls.append("chunk")
-        assert args[3] is recurrent_cache
+    def dispatched_kda_op(mixed_qkv, *args):
+        calls.append("dispatched")
+        # It owns both caches: the convolution is fused into the decode kernel,
+        # so there is no separate convolution op to hand the conv cache to.
+        assert args[3] is sconv_cache
+        assert args[4] is recurrent_cache
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
     def unexpected(name):
@@ -500,13 +499,15 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
 
         return op
 
-    layer.sconv_op = sconv_op
-    layer.chunk_kda_op = chunk_kda_op
-    # The reference scan is only reachable via VLLM_TPU_USE_NAIVE_KDA.
+    layer.dispatched_kda_op = dispatched_kda_op
+    # Neither of these is reachable without VLLM_TPU_USE_NAIVE_KDA, and a
+    # separate `sconv_op` in front of the dispatched op would convolve twice.
+    layer.sconv_op = unexpected("sconv_op")
+    layer.chunk_kda_op = unexpected("chunk_kda_op")
     layer.kda_op = unexpected("kda_op")
 
     output = layer(torch.arange(2), torch.ones(2, 4))
-    assert calls == ["sconv", "chunk"]
+    assert calls == ["dispatched"]
     torch.testing.assert_close(output, torch.arange(8).view(2, 4).float())
 
 
@@ -515,7 +516,35 @@ def test_kda_custom_ops_compile_as_one_full_graph(
 
     def jax_op(name, function, donate_argnums=()):
         del function, donate_argnums
-        if "sconv" in name:
+        if "dispatched" in name:
+
+            def implementation(
+                mixed_qkv: torch.Tensor,
+                raw_gate: torch.Tensor,
+                beta: torch.Tensor,
+                output_gate: torch.Tensor,
+                conv_state: torch.Tensor,
+                recurrent_state: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                v_weight: torch.Tensor,
+                a_log: torch.Tensor,
+                dt_bias: torch.Tensor,
+                norm_weight: torch.Tensor,
+                query_start_loc: torch.Tensor,
+                state_indices: torch.Tensor,
+                seq_lens: torch.Tensor,
+                distribution: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
+                del q_weight, k_weight, v_weight, distribution
+                del query_start_loc, state_indices, seq_lens
+                num_heads, head_dim = recurrent_state.shape[1:3]
+                output = mixed_qkv[:, :num_heads * head_dim]
+                return (output.view(-1, num_heads, head_dim).clone(),
+                        conv_state + 1, recurrent_state + 1)
+
+        elif "sconv" in name:
 
             def implementation(
                 mixed_qkv: torch.Tensor,
@@ -590,6 +619,12 @@ def test_kda_custom_ops_compile_as_one_full_graph(
         lower_bound=None,
         eps=1e-5,
     )
+    layer.dispatched_kda_op = kimi_custom_ops.build_kimi_dispatched_kda_op(
+        "test_compile",
+        lower_bound=None,
+        eps=1e-5,
+        state_dim_first=True,
+    )
 
     sconv_cache = torch.zeros(1, 12, 2)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -598,6 +633,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
     )
     layer._metadata = lambda: metadata
     hidden_states = torch.ones(2, 4)

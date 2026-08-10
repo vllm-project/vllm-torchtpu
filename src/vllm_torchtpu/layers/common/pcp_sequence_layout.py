@@ -54,7 +54,7 @@ class PcpRequestSpan:
     computed_tokens: int
     scheduled_tokens: int
     prompt_tokens: int
-    q_start: int
+    absolute_query_start: int
 
     @property
     def crosses_prompt_boundary(self) -> bool:
@@ -71,7 +71,8 @@ class PcpSequenceLayoutDecision:
     pcp_size: int = 1
     interleave_size: int = 1
     pcp_alignment: int | None = None
-    token_start_offsets_per_req: np.ndarray | None = None
+    absolute_query_start_offsets_per_req: np.ndarray | None = None
+    token_owner_start_offsets_per_req: np.ndarray | None = None
     local_token_counts: np.ndarray | None = None
     local_required_tokens: int | None = None
     local_padded_tokens: int | None = None
@@ -143,7 +144,7 @@ class PcpSequenceLayoutEligibility:
         start_index: int,
         num_reqs: int,
         num_scheduled_tokens_per_req: np.ndarray,
-        token_start_offsets_per_req: np.ndarray | None = None,
+        absolute_query_start_offsets_per_req: np.ndarray | None = None,
         num_tokens_paddings: Sequence[int] | None = None,
         max_num_tokens: int | None = None,
         dp_target_bucket: int | None = None,
@@ -154,7 +155,8 @@ class PcpSequenceLayoutEligibility:
             start_index=start_index,
             num_reqs=num_reqs,
             num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-            token_start_offsets_per_req=token_start_offsets_per_req,
+            absolute_query_start_offsets_per_req=(
+                absolute_query_start_offsets_per_req),
         )
 
         if not self.enabled or not any(span.scheduled_tokens > 0
@@ -195,7 +197,7 @@ class PcpSequenceLayoutEligibility:
         start_index: int,
         num_reqs: int,
         num_scheduled_tokens_per_req: np.ndarray,
-        token_start_offsets_per_req: np.ndarray | None,
+        absolute_query_start_offsets_per_req: np.ndarray | None,
     ) -> tuple[PcpRequestSpan, ...]:
         scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
         if scheduled.ndim != 1:
@@ -206,13 +208,15 @@ class PcpSequenceLayoutEligibility:
                 "num_scheduled_tokens_per_req must cover every request in "
                 "the chunk.")
 
-        q_starts = None
-        if token_start_offsets_per_req is not None:
-            q_starts = np.asarray(token_start_offsets_per_req, dtype=np.int64)
-            if q_starts.ndim != 1 or q_starts.size < num_reqs:
+        absolute_query_starts = None
+        if absolute_query_start_offsets_per_req is not None:
+            absolute_query_starts = np.asarray(
+                absolute_query_start_offsets_per_req, dtype=np.int64)
+            if (absolute_query_starts.ndim != 1
+                    or absolute_query_starts.size < num_reqs):
                 raise ValueError(
-                    "token_start_offsets_per_req must cover every request in "
-                    "the chunk.")
+                    "absolute_query_start_offsets_per_req must cover every "
+                    "request in the chunk.")
 
         spans: list[PcpRequestSpan] = []
         req_ids = input_batch.req_ids[start_index:start_index + num_reqs]
@@ -227,15 +231,16 @@ class PcpSequenceLayoutEligibility:
                 scheduled_tokens = int(scheduler_tokens)
             computed_tokens = int(
                 input_batch.num_computed_tokens_cpu[req_index])
-            q_start = int(q_starts[chunk_offset]
-                          ) if q_starts is not None else computed_tokens
+            absolute_query_start = (int(absolute_query_starts[chunk_offset])
+                                    if absolute_query_starts is not None else
+                                    computed_tokens)
             spans.append(
                 PcpRequestSpan(
                     computed_tokens=computed_tokens,
                     scheduled_tokens=scheduled_tokens,
                     prompt_tokens=int(
                         input_batch.num_prompt_tokens[req_index]),
-                    q_start=q_start,
+                    absolute_query_start=absolute_query_start,
                 ))
         return tuple(spans)
 
@@ -282,12 +287,17 @@ class PcpSequenceLayoutEligibility:
 
         q_lens = np.asarray([span.scheduled_tokens for span in spans],
                             dtype=np.int32)
-        q_starts = np.asarray([span.q_start for span in spans], dtype=np.int64)
+        absolute_query_starts = np.asarray(
+            [span.absolute_query_start for span in spans], dtype=np.int64)
+        # The current layout assigns ownership in request-absolute token
+        # coordinates. Keep a distinct array so the ownership policy can be
+        # changed without changing attention/cache coordinates.
+        token_owner_starts = absolute_query_starts.copy()
         local_counts = pcp_local_token_counts(
             q_lens,
             self.pcp_size,
             self.interleave_size,
-            token_start_offsets_per_req=q_starts,
+            token_owner_start_offsets_per_req=token_owner_starts,
         )
         local_required_tokens = int(local_counts.max(initial=0))
 
@@ -313,7 +323,8 @@ class PcpSequenceLayoutEligibility:
             pcp_size=self.pcp_size,
             interleave_size=self.interleave_size,
             pcp_alignment=None,
-            token_start_offsets_per_req=q_starts,
+            absolute_query_start_offsets_per_req=absolute_query_starts,
+            token_owner_start_offsets_per_req=token_owner_starts,
             local_token_counts=local_counts,
             local_required_tokens=local_required_tokens,
             local_padded_tokens=local_padded_tokens,
@@ -621,11 +632,15 @@ def prepare_pcp_sequence_layout(
         raise RuntimeError("Native PCP rank is out of range: "
                            f"{pcp_rank=} {pcp_size=}.")
 
-    token_start_offsets_per_req = decision.token_start_offsets_per_req
+    absolute_query_start_offsets_per_req = (
+        decision.absolute_query_start_offsets_per_req)
+    token_owner_start_offsets_per_req = (
+        decision.token_owner_start_offsets_per_req)
     local_counts = decision.local_token_counts
     local_padded_tokens = decision.local_padded_tokens
     padded_total_num_scheduled_tokens = decision.global_padded_tokens
-    assert token_start_offsets_per_req is not None
+    assert absolute_query_start_offsets_per_req is not None
+    assert token_owner_start_offsets_per_req is not None
     assert local_counts is not None
     assert local_padded_tokens is not None
     assert padded_total_num_scheduled_tokens is not None
@@ -645,7 +660,7 @@ def prepare_pcp_sequence_layout(
         interleave_size,
         padded_total_num_scheduled_tokens,
         mrope_slice,
-        token_start_offsets_per_req=token_start_offsets_per_req,
+        token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
     )
 
     local_padded_total_num_scheduled_tokens = (
@@ -660,7 +675,7 @@ def prepare_pcp_sequence_layout(
         pcp_size,
         interleave_size,
         padded_total_num_scheduled_tokens,
-        token_start_offsets_per_req=token_start_offsets_per_req,
+        token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
     ).astype(np.int32)
     logits_indices_cpu = torch.full((padded_num_reqs, ),
                                     -1,
@@ -691,12 +706,14 @@ def prepare_pcp_sequence_layout(
             logits_indices=pcp_logits_indices,
         )
         logger.warning(
-            "PCP_LAYOUT_DEBUG rank=%s scheduled=%s q_starts=%s "
+            "PCP_LAYOUT_DEBUG rank=%s scheduled=%s absolute_q_starts=%s "
+            "token_owner_starts=%s "
             "local_counts=%s local_padded=%s global_padded=%s logits=%s "
             "query_start=%s seq_lens=%s layout=%s",
             pcp_rank,
             num_scheduled_tokens_per_req.tolist(),
-            token_start_offsets_per_req.tolist(),
+            absolute_query_start_offsets_per_req.tolist(),
+            token_owner_start_offsets_per_req.tolist(),
             local_counts.tolist(),
             local_padded_total_num_scheduled_tokens,
             padded_total_num_scheduled_tokens,

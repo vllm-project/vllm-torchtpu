@@ -178,7 +178,7 @@ class TestProfileCaptureAndMerge:
 
     def _run_profile_cycle(self, workers, filename="t1v-n-host-w-0.xplane.pb"):
         """Drive one start/stop cycle on every rank; return their run ts."""
-        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+        with patch("vllm_torchtpu.worker.tpu_worker.torch.profiler"):
             for worker in workers:
                 worker.profile(is_start=True)
             canonical_ts = [w.profile_canonical_ts for w in workers]
@@ -192,7 +192,7 @@ class TestProfileCaptureAndMerge:
     def test_single_rank_capture_is_merged_into_run_dir(self, tmp_path):
         worker = self._make_worker(tmp_path, rank=0, world_size=1)
 
-        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+        with patch("vllm_torchtpu.worker.tpu_worker.torch.profiler"):
             worker.profile(is_start=True)
             capture_dir = Path(worker.profile_capture_dir)
             canonical_ts = worker.profile_canonical_ts
@@ -248,7 +248,7 @@ class TestProfileCaptureAndMerge:
     def test_profile_prefix_scopes_the_run_dir(self, tmp_path):
         worker = self._make_worker(tmp_path, rank=0, world_size=1)
 
-        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+        with patch("vllm_torchtpu.worker.tpu_worker.torch.profiler"):
             worker.profile(is_start=True, profile_prefix="decode")
             canonical_ts = worker.profile_canonical_ts
             assert Path(worker.profile_capture_dir) == (tmp_path / "decode" /
@@ -264,7 +264,7 @@ class TestProfileCaptureAndMerge:
     def test_stop_without_start_is_a_noop(self, tmp_path):
         worker = self._make_worker(tmp_path, rank=0, world_size=1)
 
-        with patch("vllm_torchtpu.worker.tpu_worker.profiler_api"):
+        with patch("vllm_torchtpu.worker.tpu_worker.torch.profiler"):
             worker.profile(is_start=False)
 
         assert not list(tmp_path.iterdir())

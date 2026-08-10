@@ -7,7 +7,8 @@ import os
 from enum import Enum
 from typing import Any, Optional
 
-from torch_tpu._internal.profiler import profiler_api
+import torch.profiler
+from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
@@ -257,14 +258,21 @@ class PhaseBasedProfiler:
                 batch_composition_stats)
 
             # Start PyTorch/XLA profiler
-            handler = profiler_api.xprof_trace_handler(
-                dir_name=self.profile_dir_with_phase_suffix)
-            self.profile_context = profiler_api.profile(
+            handler = torch.profiler.tensorboard_trace_handler(
+                dir_name=self.profile_dir_with_phase_suffix, use_gzip=True)
+            config = TpuProfilerConfig(
+                run_dir=self.profile_dir_with_phase_suffix,
+                host_tracer_level=2,
+                device_tracer_level=1,
+                python_tracer_level=1,
+            )
+            self.profile_context = torch.profiler.profile(
                 activities=[
-                    profiler_api.ProfilerActivity.CPU,
-                    profiler_api.ProfilerActivity.TPU,
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.PrivateUse1,
                 ],
                 on_trace_ready=handler,
+                experimental_config=config,
             )
             try:
                 self.profile_context.__enter__()
@@ -331,10 +339,21 @@ class PhaseBasedProfiler:
     def step(self, batch_composition_stats: dict) -> None:
         """Steps the profiler and logs batch composition stats."""
         have_seen_all_phases = all(self.inference_phase_seen.values())
-        is_past_initial_request = (
-            batch_composition_stats["total_num_scheduled_tokens"] > 1)
-        if is_past_initial_request and (not have_seen_all_phases
-                                        or self.current_phase != ""):
+        # A batch with no work has no phase -- the classifier divides by
+        # total_num_scheduled_tokens. execute_model already returns before
+        # calling us in that case, so this only keeps the invariant local.
+        #
+        # The threshold must stay at 0, not 1. One request in decode schedules
+        # exactly one token, so `> 1` skipped every steady-state step of a
+        # batch-size-1 run: decode_only could never be captured, and because
+        # this guard also covers _step_or_stop_profiling, the phase already
+        # capturing never counted down. That left the capture open until
+        # /stop_profile, ignoring max_iterations and filing every later step
+        # under the phase that opened it.
+        has_scheduled_work = (
+            batch_composition_stats["total_num_scheduled_tokens"] > 0)
+        if has_scheduled_work and (not have_seen_all_phases
+                                   or self.current_phase != ""):
             if self.profiling_n_steps_left <= 0:
                 self._start_profiling(batch_composition_stats)
             else:

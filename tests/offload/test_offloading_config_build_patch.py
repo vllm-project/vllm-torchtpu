@@ -31,7 +31,7 @@ from vllm_torchtpu import (_patch_vllm_hybrid_pcp_block_sizes,
 
 def _vllm_config(*, pcp: int, block_size: int = 4096):
     return SimpleNamespace(
-        model_config=SimpleNamespace(model="test-model"),
+        model_config=SimpleNamespace(model="test-model", use_mla=False),
         cache_config=SimpleNamespace(
             block_size=block_size,
             cache_dtype="fp8",

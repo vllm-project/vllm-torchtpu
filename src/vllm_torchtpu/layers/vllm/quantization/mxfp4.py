@@ -45,8 +45,10 @@ scaling.
    - Returns output tensor
 """
 
-from typing import Optional
+import types
+from typing import Any, Optional
 
+import jax.numpy as jnp
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
@@ -67,12 +69,14 @@ from vllm.model_executor.layers.quantization.mxfp4 import (Mxfp4Config,
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
-                                                 prebuild_fused_moe_kernel)
+                                                 prebuild_fused_moe_kernel,
+                                                 quantize_native_fp4_kmajor)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
 
@@ -254,15 +258,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         return mxfp4_w4a16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_bias=layer.w13_bias,
-            w2_bias=layer.w2_bias,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
         )
+
+    rhs_quant_dtype: Any = None
 
     def _forward_monolithic_tpu(
         self,
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str
@@ -280,6 +287,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
             )
         else:
+            select_kwargs = {}
+            if input_ids is not None:
+                select_kwargs["input_ids"] = input_ids
             topk_weights, topk_ids = moe_routing.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -287,6 +297,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
                 scoring_fn=layer.scoring_func,
                 layer=layer,
+                **select_kwargs,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
@@ -297,11 +308,256 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2=layer.w2_weight,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_bias=layer.w13_bias,
-            w2_bias=layer.w2_bias,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             experts_start=layer._experts_start,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            rhs_quant_dtype=self.rhs_quant_dtype,
+        )
+
+
+REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
+                          if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512)
+
+
+def _dsv4_weight_loader(self,
+                        param,
+                        loaded_weight,
+                        weight_name,
+                        shard_id,
+                        expert_id,
+                        return_success=False):
+    """Staging weight loader for DeepSeek-V4 split checkpoints.
+
+    DeepSeek-V4 checkpoints store w1/w3/w2 as separate tensors, whereas vLLM
+    allocates fused w13/w2 parameters. This loader stages raw w1/w3/w2 shards
+    into w1_temp/w3_temp/w2_temp buffers per layer instance so they can be
+    concatenated, re-quantized to native FP4, and padded in process_weights_after_loading.
+    """
+    orig_tp_rank = self.moe_config.moe_parallel_config.tp_rank
+    self.moe_config.moe_parallel_config.tp_rank = 0
+    try:
+        if shard_id not in ("w1", "w3", "w2") or "scale" in weight_name:
+            return RoutedExperts.weight_loader(self, param, loaded_weight,
+                                               weight_name, shard_id,
+                                               expert_id, return_success)
+
+        temp_param, shard_dim = {
+            "w1": (self.w1_temp, 0),
+            "w3": (self.w3_temp, 0),
+            "w2": (self.w2_temp, 1),
+        }[shard_id]
+
+        experts_start = moe_routing.get_experts_start(self) or 0
+        local_expert_id = expert_id - experts_start
+        num_local_experts = temp_param.shape[0]
+        if local_expert_id < 0 or local_expert_id >= num_local_experts:
+            return True if return_success else None
+
+        expert_data = temp_param.data[local_expert_id]
+        if loaded_weight.ndim > 0:
+            shard_size = expert_data.shape[shard_dim]
+            narrow_size = min(shard_size, loaded_weight.shape[shard_dim])
+            if narrow_size > 0:
+                loaded_weight = loaded_weight.narrow(shard_dim, 0, narrow_size)
+                if expert_data.shape[shard_dim] > loaded_weight.shape[
+                        shard_dim]:
+                    expert_data = expert_data.narrow(
+                        shard_dim, 0, loaded_weight.shape[shard_dim])
+                expert_data.copy_(loaded_weight)
+        return True if return_success else None
+    finally:
+        self.moe_config.moe_parallel_config.tp_rank = orig_tp_rank
+
+
+# TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
+# vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
+class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
+    """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
+    rhs_quant_dtype = jnp.float4_e2m1fn
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        Mxfp4MoEMethod.create_weights(
+            self,
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        layer.w1_temp = torch.zeros(num_experts,
+                                    intermediate_size_per_partition,
+                                    hidden_size // 2,
+                                    dtype=torch.uint8,
+                                    device="cpu")
+        layer.w3_temp = torch.zeros(num_experts,
+                                    intermediate_size_per_partition,
+                                    hidden_size // 2,
+                                    dtype=torch.uint8,
+                                    device="cpu")
+        layer.w2_temp = torch.zeros(num_experts,
+                                    hidden_size,
+                                    intermediate_size_per_partition // 2,
+                                    dtype=torch.uint8,
+                                    device="cpu")
+        layer.weight_loader = types.MethodType(_dsv4_weight_loader, layer)
+
+    def _dequantize_and_pad(
+        self,
+        layer: RoutedExperts,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor
+               | None, int]:
+        """Dequantize staged shards on CPU, concatenate w13, and pad to strided block boundaries."""
+        w1_scale = layer.w13_weight_scale.data.to(
+            "cpu")[:, :self.intermediate_size, :]
+        w3_scale = layer.w13_weight_scale.data.to(
+            "cpu")[:, self.intermediate_size:, :]
+        w2_scale = layer.w2_weight_scale.data.to("cpu")
+
+        w1_dequant = dequantize_mxfp4_packed(layer.w1_temp.data.to("cpu"),
+                                             w1_scale,
+                                             axis=2,
+                                             out_dtype=torch.bfloat16)
+        w3_dequant = dequantize_mxfp4_packed(layer.w3_temp.data.to("cpu"),
+                                             w3_scale,
+                                             axis=2,
+                                             out_dtype=torch.bfloat16)
+        w2_dequant = dequantize_mxfp4_packed(layer.w2_temp.data.to("cpu"),
+                                             w2_scale,
+                                             axis=2,
+                                             out_dtype=torch.bfloat16)
+        _w13_bias = getattr(layer, "w13_bias", None)
+        _w2_bias = getattr(layer, "w2_bias", None)
+        w13_bias = _w13_bias.data.to("cpu") if _w13_bias is not None else None
+        w2_bias = _w2_bias.data.to("cpu") if _w2_bias is not None else None
+
+        w13_weight = torch.cat([w1_dequant, w3_dequant],
+                               dim=1).transpose(1, 2).contiguous()
+        w2_weight = w2_dequant.transpose(1, 2).contiguous()
+
+        orig_hidden_size = w2_weight.shape[2]
+        orig_intermediate_size = w2_weight.shape[1]
+        w13_block_size = REQUANTIZED_BLOCK_SIZE
+
+        intermediate_padded = -(-orig_intermediate_size // 128) * 128
+        hidden_padded = -(-orig_hidden_size // w13_block_size) * w13_block_size
+
+        w1_weight = w13_weight[:, :, :orig_intermediate_size]
+        w3_weight = w13_weight[:, :, orig_intermediate_size:]
+        pad_intermediate = intermediate_padded - orig_intermediate_size
+        pad_hidden = hidden_padded - orig_hidden_size
+        pad_spec_w13 = (0, pad_intermediate, 0, pad_hidden)
+
+        w13_weight_padded = torch.cat([
+            torch.nn.functional.pad(w1_weight, pad_spec_w13),
+            torch.nn.functional.pad(w3_weight, pad_spec_w13),
+        ],
+                                      dim=2)
+        w2_weight_padded = torch.nn.functional.pad(
+            w2_weight, (0, pad_hidden, 0, pad_intermediate))
+
+        w13_bias_padded = w2_bias_padded = None
+        if w13_bias is not None:
+            b1, b3 = (w13_bias[:, :orig_intermediate_size],
+                      w13_bias[:, orig_intermediate_size:])
+            w13_bias_padded = torch.cat([
+                torch.nn.functional.pad(b1, (0, pad_intermediate)),
+                torch.nn.functional.pad(b3, (0, pad_intermediate)),
+            ],
+                                        dim=1).unsqueeze(1)
+        if w2_bias is not None:
+            w2_bias_padded = torch.nn.functional.pad(
+                w2_bias, (0, pad_hidden)).unsqueeze(1)
+
+        return (w13_weight_padded, w2_weight_padded, w13_bias_padded,
+                w2_bias_padded, orig_intermediate_size)
+
+    def _requantize_native_fp4(
+        self,
+        w13_weight_padded: torch.Tensor,
+        w2_weight_padded: torch.Tensor,
+        orig_intermediate_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize padded tensors to native FP4 K-major layout on TPU."""
+        w13_block_size = REQUANTIZED_BLOCK_SIZE
+        w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
+
+        w13_weight_processed, w13_weight_scale = quantize_native_fp4_kmajor(
+            w13_weight_padded.to(device), block=w13_block_size)
+        w2_weight_processed, w2_weight_scale = quantize_native_fp4_kmajor(
+            w2_weight_padded.to(device), block=w2_block_size)
+
+        return (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+                w2_weight_scale)
+
+    def _cleanup_temp_buffers(self, layer: RoutedExperts):
+        del layer.w1_temp, layer.w3_temp, layer.w2_temp
+        del layer.w13_weight, layer.w2_weight
+        del layer.w13_weight_scale, layer.w2_weight_scale
+        if hasattr(layer, "w13_bias") and hasattr(layer, "w2_bias"):
+            del layer.w13_bias, layer.w2_bias
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # TODO(upstream): Extract generic on-disk quantization cache to a
+        # standalone utility PR.
+        assert isinstance(layer, RoutedExperts)
+        device = layer.w13_weight.device
+
+        activation_str = _get_activation_str(layer.activation)
+        if activation_str.lower() in ("silu", "silu_and_mul", "swiglu"):
+            activation_str = "silu_and_mul_with_clamp"
+        layer._tpu_activation_str = activation_str
+
+        (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
+         orig_intermediate) = self._dequantize_and_pad(layer)
+        (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+         w2_weight_scale) = self._requantize_native_fp4(
+             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+        self._cleanup_temp_buffers(layer)
+
+        layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
+                                              requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_weight_processed,
+                                             requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale,
+                                                    requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale,
+                                                   requires_grad=False)
+        if w13_bias_padded is not None and w2_bias_padded is not None:
+            layer.w13_bias = torch.nn.Parameter(w13_bias_padded.to(device),
+                                                requires_grad=False)
+            layer.w2_bias = torch.nn.Parameter(w2_bias_padded.to(device),
+                                               requires_grad=False)
+
+        sync.synchronize(layer.w13_weight, wait=True)
+        sync.synchronize(layer.w2_weight, wait=True)
+        if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
+            sync.synchronize(layer.w13_bias, wait=True)
+        if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
+            sync.synchronize(layer.w2_bias, wait=True)
+
+        logger.info(
+            "DeepSeek-V4 MXFP4 weights processed and stored as native FP4 "
+            "for GMM kernel.")
+        if layer.moe_config.moe_parallel_config.use_ep:
+            moe_routing.validate_linear_ep_placement(layer)
+        moe_routing.register_experts_start_buffer(layer, device=device)
+        prebuild_fused_moe_kernel(
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            rhs_quant_dtype=jnp.float4_e2m1fn,
         )

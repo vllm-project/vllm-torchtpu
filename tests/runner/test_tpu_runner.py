@@ -22,6 +22,7 @@ import pytest
 import torch
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, VllmConfig)
+from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
@@ -38,6 +39,28 @@ from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+
+def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
+    all_token_ids = tpu_runner._spec_warmup_all_token_ids(
+        ["request-0", "request-1"], [7, 12])
+
+    assert all_token_ids == {
+        "request-0": [0] * 8,
+        "request-1": [0] * 13,
+    }
+
+
+def test_suspend_kv_transfer_group_restores_agent_after_failure():
+    connector = object()
+
+    with patch.object(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector):
+        with pytest.raises(RuntimeError, match="synthetic warmup failed"):
+            with tpu_runner._suspend_kv_transfer_group():
+                assert kv_transfer_state._KV_CONNECTOR_AGENT is None
+                raise RuntimeError("synthetic warmup failed")
+
+        assert kv_transfer_state._KV_CONNECTOR_AGENT is connector
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):

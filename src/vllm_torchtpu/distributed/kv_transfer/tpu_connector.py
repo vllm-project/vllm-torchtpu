@@ -104,6 +104,26 @@ _STAGE3_TRANSFER_POOL_TAGS = ("fa", )
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
 
 
+def _select_committed_mamba_blocks(
+    block_tables: list[list[int]],
+    num_speculative_blocks: int,
+) -> list[int]:
+    """Select each Mamba group's last committed state checkpoint.
+
+    The final ``K`` entries are speculative, so the committed checkpoint is
+    the ``-(K + 1)`` entry for a group with speculative depth ``K``.
+    """
+    required_blocks = num_speculative_blocks + 1
+    committed_blocks: list[int] = []
+    for ordinal, block_ids in enumerate(block_tables):
+        assert len(block_ids) >= required_blocks, (
+            "Mamba block table cannot contain the committed checkpoint and "
+            f"speculative checkpoints: ordinal={ordinal}, "
+            f"blocks={len(block_ids)}, required={required_blocks}")
+        committed_blocks.append(int(block_ids[-required_blocks]))
+    return committed_blocks
+
+
 @dataclass
 class _Stage3LoadMeta:
     """Decode-local declaration for one controller-driven FA transfer.
@@ -244,13 +264,22 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                     f"full-attention KV cache group, got {fa_groups}")
             self._stage3_fa_group_index = fa_groups[0]
         self._stage3_mamba_group_indices: list[int] = []
+        stage3_mamba_num_speculative_blocks = 0
         if use_raiden and _use_raiden_stage3_transport():
-            mamba_groups = [
-                index
-                for index, group in enumerate(kv_cache_config.kv_cache_groups)
-                if isinstance(group.kv_cache_spec, MambaSpec)
-            ]
-            self._stage3_mamba_group_indices = mamba_groups
+            speculative_depths: set[int] = set()
+            for index, group in enumerate(kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                if isinstance(spec, MambaSpec):
+                    self._stage3_mamba_group_indices.append(index)
+                    speculative_depths.add(spec.num_speculative_blocks)
+            assert len(speculative_depths) <= 1, (
+                "Stage-3 requires a uniform speculative depth across Mamba "
+                f"KV cache groups: depths={speculative_depths}")
+            stage3_mamba_num_speculative_blocks = next(
+                iter(speculative_depths), 0)
+            assert stage3_mamba_num_speculative_blocks >= 0, (
+                "vLLM produced a MambaSpec with a negative speculative "
+                f"depth: value={stage3_mamba_num_speculative_blocks}")
         if use_hma:
             scheduler_cls = TPUConnectorHMAScheduler
             worker_cls = TPUConnectorHMAWorker
@@ -272,6 +301,8 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                     self._stage3_fa_group_index)
                 self.connector_scheduler._stage3_mamba_group_indices = (
                     self._stage3_mamba_group_indices)
+                self.connector_scheduler._stage3_mamba_num_speculative_blocks = (
+                    stage3_mamba_num_speculative_blocks)
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
@@ -764,6 +795,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             int, ...], int, dict[str, Any]]] = OrderedDict()
         self._stage3_fa_group_index = 0
         self._stage3_mamba_group_indices: list[int] = []
+        self._stage3_mamba_num_speculative_blocks: int = 0
         # Get DP rank and TP size from config and stagger kv_port and side_channel_port
         dp_rank = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
         tp_size = vllm_config.parallel_config.tensor_parallel_size if vllm_config.parallel_config else 1
@@ -959,21 +991,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"num_tokens={num_tokens}, page_tokens={self.block_size}")
         mamba_state_block_ids: Optional[list[int]] = None
         if self._stage3_mamba_group_indices:
-            # Live state = last live entry; 'align' mode pads the head of
-            # the table with the null block.
-            mamba_state_block_ids = []
+            mamba_block_ids: list[list[int]] = []
             for mamba_gid in self._stage3_mamba_group_indices:
                 if mamba_gid >= len(grouped_block_ids):
                     raise ValueError(
                         "GDN state reshard: mamba KV cache group is absent "
                         f"from decode allocation: index={mamba_gid}, "
                         f"groups={len(grouped_block_ids)}")
-                mamba_ids = list(grouped_block_ids[mamba_gid])
-                if not mamba_ids:
-                    raise ValueError(
-                        "GDN state reshard: destination mamba table is empty "
-                        f"(group {mamba_gid})")
-                mamba_state_block_ids.append(int(mamba_ids[-1]))
+                mamba_block_ids.append(list(grouped_block_ids[mamba_gid]))
+            mamba_state_block_ids = _select_committed_mamba_blocks(
+                mamba_block_ids, self._stage3_mamba_num_speculative_blocks)
         self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
             uuid=uuid,
             source_req_id=source_req_id,
@@ -1002,7 +1029,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self,
         request: "Request",
         block_ids: list[int],
-        mamba_block_ids: Optional[list[int]] = None,
+        mamba_block_ids: Optional[list[list[int]]] = None,
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
@@ -1104,13 +1131,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if not mamba_block_ids:
                 raise ValueError("GDN state is present but the producer's "
                                  "mamba block tables were not provided")
-            mamba_state_block_ids = []
-            for ordinal, group_ids in enumerate(mamba_block_ids):
-                if not group_ids:
-                    raise ValueError(
-                        "GDN state reshard: producer mamba table is empty "
-                        f"(ordinal {ordinal})")
-                mamba_state_block_ids.append(int(group_ids[-1]))
+            mamba_state_block_ids = _select_committed_mamba_blocks(
+                mamba_block_ids, self._stage3_mamba_num_speculative_blocks)
         uuid = get_uuid()
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
@@ -1200,6 +1222,7 @@ class TPURaidenConnectorWorker:
         self._stage3_reported_sends: set[str] = set()
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
+        self._stage3_load_start_times: dict[str, float] = {}
         # Consumer-side facades for the producers' controllers, keyed by
         # controller address: the consumer coordinates each load with the
         # SOURCE controller directly (it plans, arms this worker, and
@@ -1581,15 +1604,21 @@ class TPURaidenConnectorWorker:
         tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
         if self.is_producer:
-            if pcp_size not in (4, 8) or tp_size != 1 or dp_size != 1:
-                raise ValueError(
-                    "Raiden Qwen3.5 admission topology pcp8_prefill or pcp4_prefill requires "
-                    "kv_producer with prefill_context_parallel_size in (4, 8), "
-                    "tensor_parallel_size=1, data_parallel_size=1; got "
-                    f"prefill_context_parallel_size={pcp_size}, "
-                    f"tensor_parallel_size={tp_size}, "
-                    f"data_parallel_size={dp_size}")
-            return f"pcp{pcp_size}_prefill"
+            if tp_size == 1 and pcp_size in (4, 8) and dp_size == 1:
+                return f"pcp{pcp_size}_prefill"
+            if tp_size == 1 and pcp_size == 1 and dp_size in (4, 8):
+                return f"dp{dp_size}_prefill"
+            raise ValueError(
+                "Raiden Qwen3.5 admission topology pcp8_prefill, "
+                "pcp4_prefill, dp8_prefill, or dp4_prefill requires "
+                "kv_producer with tensor_parallel_size=1 and either "
+                "prefill_context_parallel_size in (4, 8), "
+                "data_parallel_size=1 or "
+                "prefill_context_parallel_size=1, "
+                "data_parallel_size in (4, 8); got "
+                f"prefill_context_parallel_size={pcp_size}, "
+                f"tensor_parallel_size={tp_size}, "
+                f"data_parallel_size={dp_size}")
         if pcp_size != 1 or tp_size != 1 or dp_size not in (4, 8):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp8_decode or dp4_decode requires "
@@ -2224,10 +2253,13 @@ class TPURaidenConnectorWorker:
                 continue
             self._stage3_submitted_loads[destination_req_id] = uuid
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
+            self._stage3_load_start_times[
+                destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
             controller_contacted = False
             fa_accepted = False
+            submit_ms = None
             try:
                 src_units = self._stage3_source_work_units(req_meta)
                 src_controller_address = str(
@@ -2269,6 +2301,7 @@ class TPURaidenConnectorWorker:
                             transfer_tags.append(f"{tag}.g{ordinal}")
                             dst_blocks.append(int(slot))
                             dst_counts.append(1)
+                start_submit = time.perf_counter()
                 accepted = self._start_stage3_transfer_with_d5_retry(
                     source_facade,
                     src_units=src_units,
@@ -2288,6 +2321,7 @@ class TPURaidenConnectorWorker:
                     transfer_pool_tags=transfer_tags,
                     dst_block_counts=dst_counts,
                 )
+                submit_ms = (time.perf_counter() - start_submit) * 1000
                 if accepted is not True:
                     raise RuntimeError(
                         "source controller rejected Stage-3 transfer")
@@ -2333,6 +2367,7 @@ class TPURaidenConnectorWorker:
                         "recv_armed_before_push": True,
                         "state_group_count": self._stage3_state_group_count,
                         "destination_pages": len(local_blocks),
+                        "controller_submit_ms": submit_ms,
                     },
                     sort_keys=True,
                 ),
@@ -2564,6 +2599,10 @@ class TPURaidenConnectorWorker:
                 source_req_id = self._stage3_source_request_id(req_id)
                 if (req_id not in self._reported_recving and uuid is not None
                         and num_tokens is not None):
+                    start_time = self._stage3_load_start_times.get(req_id)
+                    latency_ms = None
+                    if start_time is not None:
+                        latency_ms = (time.perf_counter() - start_time) * 1000
                     logger.info(
                         "%s",
                         json.dumps(
@@ -2573,6 +2612,7 @@ class TPURaidenConnectorWorker:
                                 "destination_req_id": req_id,
                                 "uuid": uuid,
                                 "num_tokens": num_tokens,
+                                "reshard_e2e_latency_ms": latency_ms,
                             },
                             sort_keys=True,
                         ),
@@ -2724,9 +2764,13 @@ class TPURaidenConnectorWorker:
         if isinstance(req_meta.remote_host, list):
             host = req_meta.remote_host[self.node_id]
             base_port = int(req_meta.remote_port[self.node_id])
-        else:
-            host = req_meta.remote_host
-            base_port = int(req_meta.remote_port)
+            # Per-node bases already carry the node offset (each entry is that
+            # node's first-rank control port), so dial with the node-local rank.
+            ranks_per_node = max(1, self.tp_size // len(req_meta.remote_host))
+            local_rank = self.tp_rank - self.node_id * ranks_per_node
+            return f"{host}:{self._rank_control_port(base_port, rank=local_rank)}"
+        host = req_meta.remote_host
+        base_port = int(req_meta.remote_port)
         return f"{host}:{self._rank_control_port(base_port)}"
 
     def _max_request_blocks(self) -> int:

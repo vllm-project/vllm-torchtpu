@@ -10,8 +10,9 @@ from typing import Dict, Tuple
 from urllib.parse import urlparse
 
 import torch
+import torch.profiler
 import torch_tpu  # noqa: F401
-from torch_tpu._internal.profiler import profiler_api
+from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
                                           get_kv_transfer_group,
@@ -462,13 +463,22 @@ class TPUWorker(WorkerBase):
 
             logger.info("Starting TorchTPU profiler trace at %s...",
                         self.profile_capture_dir)
-            handler = profiler_api.xprof_trace_handler(
-                dir_name=self.profile_capture_dir)
-            self.profile_context = profiler_api.profile(activities=[
-                profiler_api.ProfilerActivity.CPU,
-                profiler_api.ProfilerActivity.TPU
-            ],
-                                                        on_trace_ready=handler)
+            handler = torch.profiler.tensorboard_trace_handler(
+                dir_name=self.profile_capture_dir, use_gzip=True)
+            config = TpuProfilerConfig(
+                run_dir=self.profile_capture_dir,
+                host_tracer_level=2,
+                device_tracer_level=1,
+                python_tracer_level=1,
+            )
+            self.profile_context = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.PrivateUse1,
+                ],
+                on_trace_ready=handler,
+                experimental_config=config,
+            )
             try:
                 self.profile_context.__enter__()
             except Exception:

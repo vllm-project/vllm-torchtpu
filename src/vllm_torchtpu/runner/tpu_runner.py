@@ -29,7 +29,8 @@ from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
-                                          has_kv_transfer_group)
+                                          has_kv_transfer_group,
+                                          kv_transfer_state)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import (Attention,
@@ -37,6 +38,10 @@ from vllm.model_executor.layers.attention import (Attention,
                                                   MLAAttention)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.rotary_embedding import (MRotaryEmbedding,
+                                                         RotaryEmbedding)
+from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import \
+    MRotaryEmbeddingInterleaved
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -154,6 +159,33 @@ def _substitute_placeholder_token(
 
 
 logger = init_logger(__name__)
+
+
+def _spec_warmup_all_token_ids(
+        req_ids: list[str],
+        num_computed_tokens: list[int]) -> dict[str, list[int]]:
+    """Build complete synthetic token histories for async cached requests."""
+    assert len(req_ids) == len(num_computed_tokens), (
+        "spec-decode warmup request IDs and computed-token counts must align: "
+        f"requests={len(req_ids)}, counts={len(num_computed_tokens)}")
+    # The current sampled token is not computed yet, so the complete sequence
+    # contains num_computed + 1 tokens at scheduler handoff.
+    return {
+        req_id: [0] * (num_computed + 1)
+        for req_id, num_computed in zip(req_ids, num_computed_tokens)
+    }
+
+
+@contextmanager
+def _suspend_kv_transfer_group() -> Iterator[None]:
+    """Hide the process-global connector during worker-local warmup."""
+    connector = kv_transfer_state._KV_CONNECTOR_AGENT
+    kv_transfer_state._KV_CONNECTOR_AGENT = None
+    try:
+        yield
+    finally:
+        kv_transfer_state._KV_CONNECTOR_AGENT = connector
+
 
 _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
     "invalid_block_group_index" in getattr(KVConnectorOutput,
@@ -777,6 +809,45 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "
                     f"{self.speculative_config.method}")
+
+    def _truncate_rope_caches(self) -> None:
+        """Slice rotary cos_sin caches to max_model_len which can reduce
+        the overhead of xla layout data copy. Applicable to text-only.
+        """
+        multimodal_config = self.model_config.multimodal_config
+        if self.model_config.is_multimodal_model and not (
+                multimodal_config is not None
+                and multimodal_config.language_model_only):
+            logger.warning(
+                "TPU_ROPE_CACHE_TRUNCATE skipped, multimodal positions are "
+                "not bounded by max_model_len")
+            return
+        max_len = self.model_config.max_model_len
+        num_eligible = 0
+        num_truncated = 0
+        for name, module in self.model.named_modules():
+            if type(module) not in (RotaryEmbedding, MRotaryEmbedding,
+                                    MRotaryEmbeddingInterleaved):
+                continue
+            for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
+                buf = getattr(module, buf_name, None)
+                if buf is None or not isinstance(buf, torch.Tensor):
+                    continue
+                num_eligible += 1
+                if buf.ndim >= 1 and buf.shape[0] > max_len:
+                    truncated = buf[:max_len].clone(
+                        memory_format=torch.contiguous_format)
+                    setattr(module, buf_name, truncated)
+                    num_truncated += 1
+                    logger.info("Truncated rope cache %s.%s rows %d -> %d",
+                                name, buf_name, buf.shape[0], max_len)
+        if num_eligible:
+            logger.info("Truncated %d of %d rope caches", num_truncated,
+                        num_eligible)
+        else:
+            logger.warning(
+                "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
+                "position-indexed rope cache, nothing was truncated")
 
     def _create_mesh_for_parallelism(self) -> Mesh:
         local_devices = list(jax.local_devices())
@@ -3724,6 +3795,8 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        if envs.TPU_ROPE_CACHE_TRUNCATE:
+            self._truncate_rope_caches()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -4264,7 +4337,11 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         n0 = self.num_xla_graphs
-        with self._precompile_timed("spec-decode real warmup"):
+        # These SchedulerOutputs are built locally and therefore have no
+        # scheduler-generated kv_connector_metadata. They must not start real
+        # PD transfers or bind synthetic requests into the connector.
+        with _suspend_kv_transfer_group(), self._precompile_timed(
+                "spec-decode real warmup"):
             # (1) First-pass / first-decode shapes depend on the prompt length:
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
@@ -4368,10 +4445,11 @@ class TPUModelRunner(GPUModelRunner):
             # ---- decode all R together: real nr=R propose + verify + sample ---
             nct = [P] * R
             for t in range(n_decode):
+                all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                 creq = CachedRequestData(req_ids=list(rids),
                                          resumed_req_ids=set(),
                                          new_token_ids=[],
-                                         all_token_ids={},
+                                         all_token_ids=all_token_ids,
                                          new_block_ids=[None] * R,
                                          num_computed_tokens=list(nct),
                                          num_output_tokens=[t + 1] * R)
@@ -4459,10 +4537,11 @@ class TPUModelRunner(GPUModelRunner):
             cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
+                all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
                 creq = CachedRequestData(req_ids=[rid],
                                          resumed_req_ids=set(),
                                          new_token_ids=[],
-                                         all_token_ids={},
+                                         all_token_ids=all_token_ids,
                                          new_block_ids=[None],
                                          num_computed_tokens=[nct],
                                          num_output_tokens=[t + 1])

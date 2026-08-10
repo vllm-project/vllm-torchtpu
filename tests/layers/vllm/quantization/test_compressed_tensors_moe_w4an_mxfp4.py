@@ -222,3 +222,94 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     assert not w13_scale[:, 96:, :].any()
     assert torch.all(w2_scale[:, :, :1] == 0xff)
     assert not w2_scale[:, :, 1:].any()
+
+
+def test_mxfp4_requantize_block():
+    from vllm_torchtpu.layers.common.quantization import (
+        dequantize_mxfp4_packed, fp4_indices_to_float, quantize_tensor_to_fp4)
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 64
+    moe_config.intermediate_size_per_partition_unpadded = 64
+
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer._expert_routing_tables = lambda: (None, None)
+
+    num_experts = 4
+    hidden_size = 128
+    intermediate_size_per_partition = 64
+
+    method.create_weights(
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        params_dtype=torch.bfloat16,
+    )
+
+    weight_loader = layer.w13_weight_packed.weight_loader
+    w13_packed_val = torch.randint(0, 256, (64, 64), dtype=torch.uint8)
+    # Range 100-150 prevents inf values when converting e8m0 -> fp32
+    w13_scale_val = torch.randint(100, 150, (64, 4), dtype=torch.uint8)
+    w2_packed_val = torch.randint(0, 256, (128, 32), dtype=torch.uint8)
+    w2_scale_val = torch.randint(100, 150, (128, 2), dtype=torch.uint8)
+
+    for expert_id in range(num_experts):
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w1", expert_id)
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w3", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w1", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w3", expert_id)
+        weight_loader(layer.w2_weight_packed, w2_packed_val,
+                      "w2_weight_packed", "", expert_id)
+        weight_loader(layer.w2_weight_scale, w2_scale_val, "w2_weight_scale",
+                      "", expert_id)
+
+    w13_packed_orig = layer.w13_weight_packed._cpu_scratch.data.clone()
+    w13_scale_orig = layer.w13_weight_scale._cpu_scratch.data.clone()
+
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.envs.MOE_REQUANTIZE_BLOCK_SIZE",
+            "64"
+    ), patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+    ):
+        method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight.shape == (4, 128, 64)
+    assert layer.w2_weight.shape == (4, 64, 64)
+    assert layer.w13_weight_scale.shape == (4, 2, 1, 128)
+    assert layer.w2_weight_scale.shape == (4, 1, 1, 128)
+
+    w13_f32 = dequantize_mxfp4_packed(w13_packed_orig, w13_scale_orig)
+    w13_fp4_idx, w13_fp32_scale = quantize_tensor_to_fp4(w13_f32,
+                                                         axis=-1,
+                                                         block_size=64)
+    w13_fp4_f32_expected = fp4_indices_to_float(w13_fp4_idx)
+
+    # 3. K-major layout for GMM: [E, K, N]
+    w13_fp4_f32_expected_kmajor = w13_fp4_f32_expected.transpose(-1, -2)
+
+    # Check that the native K-major fp4 tensor matches
+    from vllm_torchtpu.layers.common.quantization import unpack_uint8_to_fp4
+    actual_w13_f32 = unpack_uint8_to_fp4(layer.w13_weight.data.cpu().view(
+        torch.uint8))
+
+    # XLA and PyTorch round quantization ties slightly differently (1% of values shift by 1 bin).
+    # Since the spacing in FP4 e2m1 is at most 1.0 around the low values, we permit a max diff of 1.0.
+    max_diff = (actual_w13_f32 - w13_fp4_f32_expected_kmajor).abs().max()
+    assert max_diff <= 1.0, f"Max diff on w13 ({max_diff}) exceeded 1.0"
+
+    # Check the scale (gmm_v2 scale layout: [E, num_blocks, 1, N])
+    w13_fp32_scale_4d = w13_fp32_scale.movedim(-1, 1).unsqueeze(-2)
+    actual_scale = layer.w13_weight_scale.data.cpu()
+    torch.testing.assert_close(actual_scale,
+                               w13_fp32_scale_4d,
+                               rtol=1e-3,
+                               atol=1e-3)

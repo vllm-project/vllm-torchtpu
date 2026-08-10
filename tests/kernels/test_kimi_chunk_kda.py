@@ -133,6 +133,7 @@ def _run(
     use_qk_l2norm_in_kernel: bool = True,
     with_initial_state: bool = False,
     a_log_value: float = 0.0,
+    start_seq: int | None = None,
     seed: int = 0,
 ):
     """Run ``chunk_kda`` and the reference on the same inputs.
@@ -196,6 +197,7 @@ def _run(
         chunk_size=CHUNK,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         N_max=num_segments,
+        start_seq=start_seq,
     )
 
     expected_output = np.zeros((HEADS, num_tokens, HEAD_DIM), np.float64)
@@ -203,6 +205,10 @@ def _run(
     start = 0
     for segment, length in enumerate(query_lens):
         span = slice(start, start + length)
+        if start_seq is not None and segment < start_seq:
+            # Restricted away: no output, and the state stays as it came in.
+            start += length
+            continue
         segment_output, segment_state = _recurrence(
             normalized["q"][:, 0, span],
             normalized["k"][:, 0, span],
@@ -396,6 +402,63 @@ def test_chunk_kda_masks_the_rows_a_tile_does_not_own(query_lens) -> None:
         query_lens, with_initial_state=True)
     _assert_close(output, expected_output, rtol=3e-2, name="output")
     _assert_close(final_state, expected_state, rtol=3e-2, name="final state")
+
+
+@pytest.mark.parametrize("start_seq", [0, 1, 2, 4])
+def test_chunk_kda_restricted_to_segments_from_start_seq(start_seq) -> None:
+    """``start_seq`` hands the leading segments to somebody else.
+
+    This is what lets a caller send decode requests to the fused decode kernel
+    and the rest here, with the boundary a device scalar rather than a host-side
+    branch -- which vLLM's guard-free single trace makes unusable. Restricted
+    segments must produce no output and, critically, must leave their recurrent
+    state exactly as it arrived: the other kernel has already written it, and
+    re-writing a stale copy would silently corrupt a live cache entry.
+
+    ``start_seq=4`` restricts every segment away, which is the pure-decode step.
+    """
+    query_lens = [1, 1, 70, 33]
+    num_tokens = 128
+    output, expected_output, final_state, expected_state = _run(
+        query_lens,
+        num_tokens=num_tokens,
+        with_initial_state=True,
+        start_seq=start_seq,
+    )
+    _assert_close(output, expected_output, rtol=3e-2, name="output")
+    _assert_close(final_state, expected_state, rtol=3e-2, name="final state")
+
+    skipped_rows = sum(query_lens[:start_seq])
+    np.testing.assert_array_equal(
+        np.asarray(output[:, :skipped_rows], np.float32),
+        np.zeros((HEADS, skipped_rows, HEAD_DIM), np.float32),
+    )
+    # Bit-for-bit, not merely close: nothing may touch these slots.
+    np.testing.assert_array_equal(
+        np.asarray(final_state[0, :start_seq]),
+        np.asarray(expected_state[0, :start_seq], np.float32),
+    )
+
+
+def test_chunk_kda_start_seq_agrees_with_an_unrestricted_run() -> None:
+    """The segments it does keep must be untouched by the restriction.
+
+    Restricting the front of the batch may not perturb the rest -- the tile plan
+    shifts, so the kept segments land on different tile indices.
+    """
+    query_lens = [1, 1, 70, 33]
+    kept_from = sum(query_lens[:2])
+    full, _, full_state, _ = _run(query_lens,
+                                  num_tokens=128,
+                                  with_initial_state=True)
+    restricted, _, restricted_state, _ = _run(query_lens,
+                                              num_tokens=128,
+                                              with_initial_state=True,
+                                              start_seq=2)
+    np.testing.assert_array_equal(np.asarray(restricted[:, kept_from:]),
+                                  np.asarray(full[:, kept_from:]))
+    np.testing.assert_array_equal(np.asarray(restricted_state[0, 2:]),
+                                  np.asarray(full_state[0, 2:]))
 
 
 def test_chunk_kda_is_unchanged_by_the_size_of_the_request_bucket() -> None:

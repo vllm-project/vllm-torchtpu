@@ -16,6 +16,7 @@ from enum import Enum
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_torchtpu.layers.vllm.fused_moe import get_fused_moe_activation
 
@@ -53,3 +54,16 @@ def test_get_fused_moe_activation_requires_situ_beta():
 
     with pytest.raises(AssertionError):
         get_fused_moe_activation("situ", moe_config)
+
+
+def test_get_fused_moe_activation_compiles():
+
+    @torch.compile(fullgraph=True)
+    def compiled_fn(x, activation):
+        act_str = get_fused_moe_activation(activation, None)
+        if act_str == "silu":
+            return x * 2
+        return x
+
+    res = compiled_fn(torch.ones(1).to("tpu"), _Activation.SILU)
+    assert res.cpu() == 2.0

@@ -18,7 +18,7 @@ import dataclasses
 import numpy as np
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    pcp_query_chunk_ranges
+    pcp_token_owner_chunk_ranges
 
 
 class ScheduleField:
@@ -142,9 +142,10 @@ def _q_global_last_for_strided_tile(q_global_start: int, q_tile_len: int, *,
             (last_row % interleave_size))
 
 
-def _iter_pcp_q_tiles(q_len: int, q_global_base: int, consumer_rank: int, *,
-                      pcp_size: int, interleave_size: int, bq_sz: int):
-    """Yield local-contiguous Q tiles for one rank.
+def _iter_pcp_token_owner_tiles(q_len: int, token_owner_start: int,
+                                consumer_rank: int, *, pcp_size: int,
+                                interleave_size: int, bq_sz: int):
+    """Yield local-contiguous Q tiles in token-ownership coordinates.
 
     The original schedule emitted one tile per PCP interleave chunk. For small
     interleave sizes that forces tiny Q tiles and repeats the same streamed KV
@@ -154,8 +155,8 @@ def _iter_pcp_q_tiles(q_len: int, q_global_base: int, consumer_rank: int, *,
     chunk's global start.
     """
     ranges = list(
-        pcp_query_chunk_ranges(q_len, q_global_base, consumer_rank, pcp_size,
-                               interleave_size))
+        pcp_token_owner_chunk_ranges(q_len, token_owner_start, consumer_rank,
+                                     pcp_size, interleave_size))
     if bq_sz <= interleave_size:
         for chunk_start, chunk_end in ranges:
             chunk_len = chunk_end - chunk_start
@@ -190,6 +191,57 @@ def _iter_pcp_q_tiles(q_len: int, q_global_base: int, consumer_rank: int, *,
             expected_chunk_start += pcp_size * interleave_size
 
         yield tile_global_start, tile_len
+
+
+def _iter_pcp_q_tiles(q_len: int, token_owner_start: int,
+                      request_absolute_query_start: int, consumer_rank: int, *,
+                      pcp_size: int, interleave_size: int, bq_sz: int):
+    """Yield rank-owned Q tiles expressed in request-absolute coordinates."""
+    for owner_tile_start, tile_len in _iter_pcp_token_owner_tiles(
+            q_len,
+            token_owner_start,
+            consumer_rank,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            bq_sz=bq_sz):
+        request_relative_start = owner_tile_start - token_owner_start
+        yield request_absolute_query_start + request_relative_start, tile_len
+
+
+def _build_pcp_rank_query_tiles(
+    q_len: int,
+    token_owner_start: int,
+    request_absolute_query_start: int,
+    rank_local_q_offsets: np.ndarray,
+    *,
+    pcp_size: int,
+    interleave_size: int,
+    bq_sz: int,
+) -> tuple[list[list[tuple[int, int, int]]], np.ndarray]:
+    """Build per-rank ``(absolute_start, size, HBM offset)`` Q tiles."""
+    next_rank_local_q_offsets = np.asarray(rank_local_q_offsets,
+                                           dtype=np.int64).copy()
+    if next_rank_local_q_offsets.shape != (pcp_size, ):
+        raise ValueError("rank_local_q_offsets must have shape (pcp_size,).")
+
+    rank_tiles: list[list[tuple[int, int, int]]] = []
+    for consumer_rank in range(pcp_size):
+        q_hbm_offset = int(next_rank_local_q_offsets[consumer_rank])
+        tiles = []
+        for q_global_start, q_tile_size in _iter_pcp_q_tiles(
+                q_len,
+                token_owner_start,
+                request_absolute_query_start,
+                consumer_rank,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                bq_sz=bq_sz):
+            tiles.append(
+                (int(q_global_start), int(q_tile_size), int(q_hbm_offset)))
+            q_hbm_offset += int(q_tile_size)
+        next_rank_local_q_offsets[consumer_rank] = q_hbm_offset
+        rank_tiles.append(tiles)
+    return rank_tiles, next_rank_local_q_offsets
 
 
 @dataclasses.dataclass(frozen=True)
@@ -342,7 +394,7 @@ def generate_pcp_streaming_schedule_from_metadata_host(
     kv_lens_active = kv_lens[:num_reqs]
     cu_q_lens_active = cu_q_lens[:num_reqs + 1]
     q_lens = cu_q_lens_active[1:] - cu_q_lens_active[:-1]
-    q_start_offsets = kv_lens_active - q_lens
+    request_absolute_query_start_offsets = kv_lens_active - q_lens
     if np.any(q_lens <= 0):
         raise NotImplementedError(
             "PCP streaming metadata schedule requires every active request "
@@ -378,7 +430,9 @@ def generate_pcp_streaming_schedule_from_metadata_host(
     return _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=kv_lens_active,
         cu_q_lens=cu_q_lens_active,
-        q_start_offsets=q_start_offsets,
+        token_owner_start_offsets=request_absolute_query_start_offsets,
+        request_absolute_query_start_offsets=(
+            request_absolute_query_start_offsets),
         block_tables=local_block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -579,21 +633,22 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
             full_chunks < chunks_per_page_i32, partial, 0)
         return jnp.where(kv_len > base, valid_len, 0)
 
-    def _rank_request_layout(q_len, q_global_base, consumer_rank: int):
+    def _rank_request_layout(q_len, token_owner_start, consumer_rank: int):
         rank_chunk_offset = jnp.asarray(consumer_rank * interleave_size,
                                         dtype=jnp.int32)
-        q_end = q_global_base + q_len
-        first_chunk = ((q_global_base // cycle_i32) * cycle_i32 +
+        token_owner_end = token_owner_start + q_len
+        first_chunk = ((token_owner_start // cycle_i32) * cycle_i32 +
                        rank_chunk_offset)
         first_chunk = jnp.where(
-            first_chunk + interleave_size_i32 <= q_global_base,
+            first_chunk + interleave_size_i32 <= token_owner_start,
             first_chunk + cycle_i32, first_chunk)
-        has_chunks = jnp.logical_and(q_len > 0, first_chunk < q_end)
+        has_chunks = jnp.logical_and(q_len > 0, first_chunk < token_owner_end)
 
-        safe_q_end_minus_one = jnp.where(q_len > 0, q_end - 1, q_global_base)
-        last_chunk = ((safe_q_end_minus_one // cycle_i32) * cycle_i32 +
+        safe_owner_end_minus_one = jnp.where(q_len > 0, token_owner_end - 1,
+                                             token_owner_start)
+        last_chunk = ((safe_owner_end_minus_one // cycle_i32) * cycle_i32 +
                       rank_chunk_offset)
-        last_chunk = jnp.where(last_chunk > safe_q_end_minus_one,
+        last_chunk = jnp.where(last_chunk > safe_owner_end_minus_one,
                                last_chunk - cycle_i32, last_chunk)
         num_chunks = jnp.where(
             has_chunks,
@@ -601,16 +656,17 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
             0,
         )
 
-        first_overlap_start = jnp.maximum(first_chunk, q_global_base)
+        first_overlap_start = jnp.maximum(first_chunk, token_owner_start)
         first_overlap_end = jnp.minimum(first_chunk + interleave_size_i32,
-                                        q_end)
+                                        token_owner_end)
         first_overlap_len = jnp.where(
             has_chunks,
             jnp.maximum(first_overlap_end - first_overlap_start, 0),
             0,
         )
-        last_overlap_start = jnp.maximum(last_chunk, q_global_base)
-        last_overlap_end = jnp.minimum(last_chunk + interleave_size_i32, q_end)
+        last_overlap_start = jnp.maximum(last_chunk, token_owner_start)
+        last_overlap_end = jnp.minimum(last_chunk + interleave_size_i32,
+                                       token_owner_end)
         last_overlap_len = jnp.where(
             has_chunks,
             jnp.maximum(last_overlap_end - last_overlap_start, 0),
@@ -651,8 +707,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
             local_count,
         )
 
-    def _rank_tile(q_len, q_global_base, rank_local_prefix, consumer_rank: int,
-                   tile_idx):
+    def _rank_tile(q_len, token_owner_start, request_absolute_query_start,
+                   rank_local_prefix, consumer_rank: int, tile_idx):
         (
             has_chunks,
             first_overlap_start,
@@ -668,7 +724,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
             last_partial,
             num_tiles,
             _local_count,
-        ) = _rank_request_layout(q_len, q_global_base, consumer_rank)
+        ) = _rank_request_layout(q_len, token_owner_start, consumer_rank)
 
         tile_idx_i32 = jnp.asarray(tile_idx, dtype=jnp.int32)
         full_tile_idx = tile_idx_i32 - first_partial_i32
@@ -694,7 +750,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
                                      full_chunk_count * interleave_size_i32)
 
         tile_active = jnp.logical_and(has_chunks, tile_idx_i32 < num_tiles)
-        q_global_start = jnp.where(
+        token_owner_tile_start = jnp.where(
             is_first_partial_tile,
             first_overlap_start,
             jnp.where(is_full_tile, full_tile_global_start,
@@ -716,12 +772,17 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         q_tile_size = jnp.where(tile_active, q_tile_size, 0)
         q_hbm_offset = jnp.where(tile_active, rank_local_prefix + local_offset,
                                  0)
-        q_global_start = jnp.where(tile_active, q_global_start, 0)
+        request_relative_start = token_owner_tile_start - token_owner_start
+        q_global_start = jnp.where(
+            tile_active,
+            request_absolute_query_start + request_relative_start,
+            0,
+        )
         return q_global_start, q_tile_size, q_hbm_offset
 
     tile_req_ids = []
     tile_kv_lens = []
-    tile_q_global_bases = []
+    tile_request_absolute_query_starts = []
     tile_q_global_starts = []
     tile_q_sizes = []
     tile_q_hbm_offsets = []
@@ -734,7 +795,11 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         req_active = jnp.logical_and(req_idx < active_num_reqs, q_len_raw > 0)
         q_len = jnp.where(req_active, q_len_raw, 0)
         kv_len = jnp.where(req_active, kv_lens[req_idx], 0)
-        q_global_base = kv_len - q_len
+        request_absolute_query_start = kv_len - q_len
+        # The public metadata path keeps the current ownership policy.
+        # Keeping these as distinct values makes the later owner-policy switch
+        # independent from causal/history/cache coordinates.
+        token_owner_start = request_absolute_query_start
         num_kv_pages = _kv_steps_for_token_count(kv_len)
 
         for tile_idx in range(max_q_tiles):
@@ -746,7 +811,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
             for consumer_rank in range(pcp_size):
                 q_global_start, q_tile_size, q_hbm_offset = _rank_tile(
                     q_len,
-                    q_global_base,
+                    token_owner_start,
+                    request_absolute_query_start,
                     rank_local_q_prefixes[consumer_rank],
                     consumer_rank,
                     tile_idx,
@@ -775,7 +841,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
                                pcp_size_i32 * pcp_size_i32)
             tile_req_ids.append(jnp.asarray(req_idx, dtype=jnp.int32))
             tile_kv_lens.append(kv_len)
-            tile_q_global_bases.append(q_global_base)
+            tile_request_absolute_query_starts.append(
+                request_absolute_query_start)
             tile_q_global_starts.append(jnp.stack(q_global_starts))
             tile_q_sizes.append(jnp.stack(q_sizes))
             tile_q_hbm_offsets.append(jnp.stack(q_hbm_offsets))
@@ -784,14 +851,15 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
 
         local_counts = []
         for consumer_rank in range(pcp_size):
-            *_, local_count = _rank_request_layout(q_len, q_global_base,
+            *_, local_count = _rank_request_layout(q_len, token_owner_start,
                                                    consumer_rank)
             local_counts.append(jnp.where(req_active, local_count, 0))
         rank_local_q_prefixes = rank_local_q_prefixes + jnp.stack(local_counts)
 
     tile_req_ids = jnp.stack(tile_req_ids)
     tile_kv_lens = jnp.stack(tile_kv_lens)
-    tile_q_global_bases = jnp.stack(tile_q_global_bases)
+    tile_request_absolute_query_starts = jnp.stack(
+        tile_request_absolute_query_starts)
     tile_q_global_starts = jnp.stack(tile_q_global_starts)
     tile_q_sizes = jnp.stack(tile_q_sizes)
     tile_q_hbm_offsets = jnp.stack(tile_q_hbm_offsets)
@@ -885,7 +953,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
                                          dtype=jnp.int32)
         return packed, active_page_groups
 
-    history_cut_pages = ((tile_q_global_bases //
+    history_cut_pages = ((tile_request_absolute_query_starts //
                           (page_size_i32 * pcp_size_i32)) * pcp_size_i32)
     history_effective_pages_by_rank = jnp.minimum(tile_effective_pages_by_rank,
                                                   history_cut_pages[:, None])
@@ -981,7 +1049,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
 def _validate_inputs(
     kv_lens: np.ndarray,
     cu_q_lens: np.ndarray,
-    q_start_offsets: np.ndarray,
+    token_owner_start_offsets: np.ndarray,
+    request_absolute_query_start_offsets: np.ndarray,
     block_tables: np.ndarray,
     page_size: int,
     pcp_size: int,
@@ -1017,8 +1086,11 @@ def _validate_inputs(
     num_reqs = int(cu_q_lens.size - 1)
     if kv_lens.size < num_reqs:
         raise ValueError("kv_lens must cover every request in cu_q_lens.")
-    if q_start_offsets.size < num_reqs:
-        raise ValueError("q_start_offsets must cover every request.")
+    if token_owner_start_offsets.size < num_reqs:
+        raise ValueError("token_owner_start_offsets must cover every request.")
+    if request_absolute_query_start_offsets.size < num_reqs:
+        raise ValueError(
+            "request_absolute_query_start_offsets must cover every request.")
     if block_tables.shape[0] < num_reqs:
         raise ValueError("block_tables must cover every request.")
     return num_reqs
@@ -1078,19 +1150,18 @@ def unpack_pcp_streaming_schedule_field(
 def _single_active_aligned_request_params(
     *,
     q_lens: np.ndarray,
-    q_start_offsets: np.ndarray,
+    token_owner_start_offsets: np.ndarray,
     block_tables: np.ndarray,
     pcp_size: int,
     interleave_size: int,
     path_name: str,
-    q_start_name: str,
 ) -> tuple[int, int]:
     if q_lens.ndim != 1:
         raise ValueError("q_lens must be a 1D array.")
-    if q_start_offsets.ndim != 1:
-        raise ValueError("q_start_offsets must be a 1D array.")
-    if q_start_offsets.size < q_lens.size:
-        raise ValueError("q_start_offsets must cover every request.")
+    if token_owner_start_offsets.ndim != 1:
+        raise ValueError("token_owner_start_offsets must be a 1D array.")
+    if token_owner_start_offsets.size < q_lens.size:
+        raise ValueError("token_owner_start_offsets must cover every request.")
     if block_tables.ndim != 2:
         raise ValueError("block_tables must be a 2D array.")
     if block_tables.shape[0] < 1 or block_tables.shape[1] == 0:
@@ -1103,30 +1174,31 @@ def _single_active_aligned_request_params(
             f"active request indices {active.tolist()}.")
 
     q_len = int(q_lens[0])
-    q_start = int(q_start_offsets[0])
+    token_owner_start = int(token_owner_start_offsets[0])
     cycle = pcp_size * interleave_size
     if q_len <= 0:
         raise NotImplementedError(f"{path_name} requires a positive q_len.")
-    if q_start < 0:
-        raise ValueError(f"{q_start_name} must be non-negative.")
+    if token_owner_start < 0:
+        raise ValueError("token_owner_start_offset must be non-negative.")
     if q_len % cycle != 0:
         raise NotImplementedError(
             f"{path_name} requires q_len to be a multiple of "
             f"pcp_size * interleave_size, got {q_len=} {pcp_size=} "
             f"{interleave_size=}.")
-    if q_start % cycle != 0:
+    if token_owner_start % cycle != 0:
         raise NotImplementedError(
-            f"{path_name} requires {q_start_name} to be aligned to "
+            f"{path_name} requires token_owner_start_offset to be aligned to "
             "pcp_size * interleave_size, got "
-            f"{q_start=} {pcp_size=} {interleave_size=}.")
-    return q_len, q_start
+            f"{token_owner_start=} {pcp_size=} {interleave_size=}.")
+    return q_len, token_owner_start
 
 
 def _single_aligned_request_params(
     *,
     kv_lens: np.ndarray,
     cu_q_lens: np.ndarray,
-    q_start_offsets: np.ndarray,
+    token_owner_start_offsets: np.ndarray,
+    request_absolute_query_start_offsets: np.ndarray,
     block_tables: np.ndarray,
     page_size: int,
     pcp_size: int,
@@ -1134,7 +1206,7 @@ def _single_aligned_request_params(
     num_lanes: int,
     bq_sz: int,
     pad_kv_pages_to_pcp_group: bool,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     if num_lanes != 1:
         raise NotImplementedError(
@@ -1151,19 +1223,22 @@ def _single_aligned_request_params(
             f"multiple of interleave_size, got {bq_sz=} "
             f"{interleave_size=}.")
 
-    q_len, q_start = _single_active_aligned_request_params(
+    q_len, token_owner_start = _single_active_aligned_request_params(
         q_lens=q_lens,
-        q_start_offsets=q_start_offsets,
+        token_owner_start_offsets=token_owner_start_offsets,
         block_tables=block_tables,
         pcp_size=pcp_size,
         interleave_size=interleave_size,
         path_name="PCP streaming vectorized schedule",
-        q_start_name="q_start_offset",
     )
+    request_absolute_query_start = int(request_absolute_query_start_offsets[0])
+    if request_absolute_query_start < 0:
+        raise ValueError(
+            "request_absolute_query_start_offset must be non-negative.")
     kv_len = int(kv_lens[0])
-    if kv_len < q_start + q_len:
+    if kv_len < request_absolute_query_start + q_len:
         raise ValueError("kv_lens must include all scheduled Q tokens.")
-    return q_len, q_start
+    return q_len, token_owner_start, request_absolute_query_start
 
 
 def estimate_pcp_streaming_schedule_steps_ub(
@@ -1185,10 +1260,12 @@ def estimate_pcp_streaming_schedule_steps_ub(
             q_len = int(q_len)
             if q_len <= 0:
                 continue
-            q_global_base = max(0, capacity_tokens - q_len)
+            request_absolute_query_start = max(0, capacity_tokens - q_len)
+            token_owner_start = request_absolute_query_start
             for q_global, tile_len in _iter_pcp_q_tiles(
                     q_len,
-                    q_global_base,
+                    token_owner_start,
+                    request_absolute_query_start,
                     consumer_rank,
                     pcp_size=pcp_size,
                     interleave_size=interleave_size,
@@ -1369,7 +1446,8 @@ def _packed_field(packed_schedule: np.ndarray, field: int) -> np.ndarray:
 def _generate_pcp_streaming_schedule_single_aligned(
     kv_lens: list[int] | np.ndarray,
     cu_q_lens: list[int] | np.ndarray,
-    q_start_offsets: list[int] | np.ndarray,
+    token_owner_start_offsets: list[int] | np.ndarray,
+    request_absolute_query_start_offsets: list[int] | np.ndarray,
     block_tables: np.ndarray,
     page_size: int,
     pcp_size: int,
@@ -1382,12 +1460,16 @@ def _generate_pcp_streaming_schedule_single_aligned(
 ) -> PcpStreamingSchedule:
     kv_lens = np.asarray(kv_lens, dtype=np.int64)
     cu_q_lens = np.asarray(cu_q_lens, dtype=np.int64)
-    q_start_offsets = np.asarray(q_start_offsets, dtype=np.int64)
+    token_owner_start_offsets = np.asarray(token_owner_start_offsets,
+                                           dtype=np.int64)
+    request_absolute_query_start_offsets = np.asarray(
+        request_absolute_query_start_offsets, dtype=np.int64)
     block_tables = np.asarray(block_tables, dtype=np.int32)
     _validate_inputs(
         kv_lens,
         cu_q_lens,
-        q_start_offsets,
+        token_owner_start_offsets,
+        request_absolute_query_start_offsets,
         block_tables,
         page_size,
         pcp_size,
@@ -1396,18 +1478,21 @@ def _generate_pcp_streaming_schedule_single_aligned(
         bq_sz,
         kv_pages_per_block,
     )
-    q_len, q_global_base = _single_aligned_request_params(
-        kv_lens=kv_lens,
-        cu_q_lens=cu_q_lens,
-        q_start_offsets=q_start_offsets,
-        block_tables=block_tables,
-        page_size=page_size,
-        pcp_size=pcp_size,
-        interleave_size=interleave_size,
-        num_lanes=num_lanes,
-        bq_sz=bq_sz,
-        pad_kv_pages_to_pcp_group=pad_kv_pages_to_pcp_group,
-    )
+    (q_len, token_owner_start,
+     request_absolute_query_start) = _single_aligned_request_params(
+         kv_lens=kv_lens,
+         cu_q_lens=cu_q_lens,
+         token_owner_start_offsets=token_owner_start_offsets,
+         request_absolute_query_start_offsets=(
+             request_absolute_query_start_offsets),
+         block_tables=block_tables,
+         page_size=page_size,
+         pcp_size=pcp_size,
+         interleave_size=interleave_size,
+         num_lanes=num_lanes,
+         bq_sz=bq_sz,
+         pad_kv_pages_to_pcp_group=pad_kv_pages_to_pcp_group,
+     )
 
     kv_len = int(kv_lens[0])
     num_kv_pages = _pcp_kv_steps_for_token_count(
@@ -1425,7 +1510,8 @@ def _generate_pcp_streaming_schedule_single_aligned(
         rank_steps = 0
         for q_global, q_tile_size in _iter_pcp_q_tiles(
                 q_len,
-                q_global_base,
+                token_owner_start,
+                request_absolute_query_start,
                 consumer_rank,
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
@@ -1532,7 +1618,8 @@ def _validate_lockstep_compact_requests(
     *,
     kv_lens: np.ndarray,
     q_lens: np.ndarray,
-    q_start_offsets: np.ndarray,
+    token_owner_start_offsets: np.ndarray,
+    request_absolute_query_start_offsets: np.ndarray,
     block_tables: np.ndarray,
     page_size: int,
     pcp_size: int,
@@ -1565,14 +1652,20 @@ def _validate_lockstep_compact_requests(
             "PCP streaming lockstep schedule requires every request to have "
             "positive q_len.")
 
-    for req_idx, (kv_len, q_len,
-                  q_start) in enumerate(zip(kv_lens, q_lens, q_start_offsets)):
+    for req_idx, (kv_len, q_len, token_owner_start,
+                  request_absolute_query_start) in enumerate(
+                      zip(kv_lens, q_lens, token_owner_start_offsets,
+                          request_absolute_query_start_offsets)):
         kv_len = int(kv_len)
         q_len = int(q_len)
-        q_start = int(q_start)
-        if q_start < 0:
-            raise ValueError("q_start_offset must be non-negative.")
-        if kv_len < q_start + q_len:
+        token_owner_start = int(token_owner_start)
+        request_absolute_query_start = int(request_absolute_query_start)
+        if token_owner_start < 0:
+            raise ValueError("token_owner_start_offset must be non-negative.")
+        if request_absolute_query_start < 0:
+            raise ValueError(
+                "request_absolute_query_start_offset must be non-negative.")
+        if kv_len < request_absolute_query_start + q_len:
             raise ValueError("kv_lens must include all scheduled Q tokens.")
         required_local_pages = _cdiv(
             _pcp_kv_steps_for_token_count(
@@ -1592,7 +1685,8 @@ def _validate_lockstep_compact_requests(
 def _generate_pcp_streaming_schedule_lockstep_compact(
     kv_lens: list[int] | np.ndarray,
     cu_q_lens: list[int] | np.ndarray,
-    q_start_offsets: list[int] | np.ndarray,
+    token_owner_start_offsets: list[int] | np.ndarray,
+    request_absolute_query_start_offsets: list[int] | np.ndarray,
     block_tables: np.ndarray,
     page_size: int,
     pcp_size: int,
@@ -1605,12 +1699,16 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
 ) -> PcpStreamingSchedule:
     kv_lens = np.asarray(kv_lens, dtype=np.int64)
     cu_q_lens = np.asarray(cu_q_lens, dtype=np.int64)
-    q_start_offsets = np.asarray(q_start_offsets, dtype=np.int64)
+    token_owner_start_offsets = np.asarray(token_owner_start_offsets,
+                                           dtype=np.int64)
+    request_absolute_query_start_offsets = np.asarray(
+        request_absolute_query_start_offsets, dtype=np.int64)
     block_tables = np.asarray(block_tables, dtype=np.int32)
     num_reqs = _validate_inputs(
         kv_lens,
         cu_q_lens,
-        q_start_offsets,
+        token_owner_start_offsets,
+        request_absolute_query_start_offsets,
         block_tables,
         page_size,
         pcp_size,
@@ -1623,7 +1721,9 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
     _validate_lockstep_compact_requests(
         kv_lens=kv_lens[:num_reqs],
         q_lens=q_lens,
-        q_start_offsets=q_start_offsets[:num_reqs],
+        token_owner_start_offsets=token_owner_start_offsets[:num_reqs],
+        request_absolute_query_start_offsets=(
+            request_absolute_query_start_offsets[:num_reqs]),
         block_tables=block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -1639,7 +1739,9 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
     rank_local_q_offsets = np.zeros(pcp_size, dtype=np.int64)
     for req_idx in range(num_reqs):
         q_len = int(q_lens[req_idx])
-        q_global_base = int(q_start_offsets[req_idx])
+        token_owner_start = int(token_owner_start_offsets[req_idx])
+        request_absolute_query_start = int(
+            request_absolute_query_start_offsets[req_idx])
         kv_len = int(kv_lens[req_idx])
         num_kv_pages = _pcp_kv_steps_for_token_count(
             kv_len,
@@ -1648,22 +1750,15 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
             interleave_size=interleave_size,
         )
 
-        rank_tiles = []
-        for consumer_rank in range(pcp_size):
-            q_hbm_offset = int(rank_local_q_offsets[consumer_rank])
-            tiles = []
-            for q_global_start, q_tile_size in _iter_pcp_q_tiles(
-                    q_len,
-                    q_global_base,
-                    consumer_rank,
-                    pcp_size=pcp_size,
-                    interleave_size=interleave_size,
-                    bq_sz=bq_sz):
-                tiles.append(
-                    (int(q_global_start), int(q_tile_size), int(q_hbm_offset)))
-                q_hbm_offset += int(q_tile_size)
-            rank_local_q_offsets[consumer_rank] = q_hbm_offset
-            rank_tiles.append(tiles)
+        rank_tiles, rank_local_q_offsets = _build_pcp_rank_query_tiles(
+            q_len,
+            token_owner_start,
+            request_absolute_query_start,
+            rank_local_q_offsets,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            bq_sz=bq_sz,
+        )
 
         num_q_tiles = max((len(tiles) for tiles in rank_tiles), default=0)
         for tile_idx in range(num_q_tiles):
@@ -1794,7 +1889,8 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
 def _generate_pcp_streaming_schedule_vectorized_aligned(
     kv_lens: list[int] | np.ndarray,
     cu_q_lens: list[int] | np.ndarray,
-    q_start_offsets: list[int] | np.ndarray,
+    token_owner_start_offsets: list[int] | np.ndarray,
+    request_absolute_query_start_offsets: list[int] | np.ndarray,
     block_tables: np.ndarray,
     page_size: int,
     pcp_size: int,
@@ -1812,7 +1908,9 @@ def _generate_pcp_streaming_schedule_vectorized_aligned(
         return _generate_pcp_streaming_schedule_single_aligned(
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
-            q_start_offsets=q_start_offsets,
+            token_owner_start_offsets=token_owner_start_offsets,
+            request_absolute_query_start_offsets=(
+                request_absolute_query_start_offsets),
             block_tables=block_tables,
             page_size=page_size,
             pcp_size=pcp_size,
@@ -1826,7 +1924,9 @@ def _generate_pcp_streaming_schedule_vectorized_aligned(
     return _generate_pcp_streaming_schedule_lockstep_compact(
         kv_lens=kv_lens,
         cu_q_lens=cu_q_lens,
-        q_start_offsets=q_start_offsets,
+        token_owner_start_offsets=token_owner_start_offsets,
+        request_absolute_query_start_offsets=(
+            request_absolute_query_start_offsets),
         block_tables=block_tables,
         page_size=page_size,
         pcp_size=pcp_size,
@@ -1863,7 +1963,8 @@ def generate_pcp_streaming_schedule(
     return _generate_pcp_streaming_schedule_vectorized_aligned(
         kv_lens=kv_lens,
         cu_q_lens=cu_q_lens,
-        q_start_offsets=q_start_offsets,
+        token_owner_start_offsets=q_start_offsets,
+        request_absolute_query_start_offsets=q_start_offsets,
         block_tables=block_tables,
         page_size=page_size,
         pcp_size=pcp_size,

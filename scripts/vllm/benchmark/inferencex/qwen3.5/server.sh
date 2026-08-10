@@ -92,9 +92,15 @@ export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
 
-# Token padding sizes step by 16 up to 64 and double after.
-export TPU_TOKEN_BUCKET_LINEAR_UNTIL="${TPU_TOKEN_BUCKET_LINEAR_UNTIL:-64}"
-export TPU_TOKEN_BUCKET_LINEAR_INTERVAL="${TPU_TOKEN_BUCKET_LINEAR_INTERVAL:-16}"
+# Add extra padding
+# 4, 8 for low concurrency 4 and 8
+# 48 for concurrency 256 when DP8+EP is enabled to reduce padding from 32->64.
+# Set it to empty to opt out of the extra buckets.
+export TPU_TOKEN_BUCKET_EXTRA="${TPU_TOKEN_BUCKET_EXTRA-4,8,48}"
+
+# Shrink the rotary cos_sin caches to max_model_len, text-only, to minimize
+# xla layout data copy overhead.
+export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
 
 # Skip padded tokens in the fused MoE so they activate no experts.
 export TPU_MOE_SKIP_PADDED_TOKENS=1

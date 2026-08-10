@@ -31,7 +31,8 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
-    build_kimi_chunk_kda_op, build_kimi_kda_op, build_kimi_sconv_op)
+    build_kimi_chunk_kda_op, build_kimi_dispatched_kda_op, build_kimi_kda_op,
+    build_kimi_sconv_op)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -371,6 +372,15 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
         )
+        # The dispatched op owns the short convolution as well: the fused decode
+        # kernel it routes decode rows to does the convolution itself, so it
+        # cannot be fed by a separate convolution op.
+        self.dispatched_kda_op = build_kimi_dispatched_kda_op(
+            prefix,
+            lower_bound=self.gate_lower_bound,
+            eps=config.rms_norm_eps,
+            state_dim_first=is_conv_state_dim_first(),
+        )
 
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
@@ -455,27 +465,67 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         recurrent_cache: torch.Tensor,
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        mixed_qkv = self.sconv_op(
-            mixed_qkv,
-            sconv_cache,
-            self.q_conv1d.weight,
-            self.k_conv1d.weight,
-            self.v_conv1d.weight,
-            metadata.query_start_loc,
-            metadata.mamba_state_indices,
-            metadata.seq_lens,
-        )
-        recurrence = self.kda_op if self.use_naive_kda else self.chunk_kda_op
-        return recurrence(
+        """Short convolution and KDA recurrence.
+
+        Both recurrences are emitted every step, each restricted to its own part
+        of the batch. `request_distribution[0]` is the split: decode requests
+        come first and go to the fused convolution-plus-recurrence decode kernel,
+        everything else to the convolution scan and the chunked kernel. Their
+        outputs are selected per token, and they advance disjoint cache slots.
+
+        The split is a *device* value on purpose. A host-side branch on batch
+        composition cannot work here: vLLM's `TorchCompileWithNoGuardsWrapper`
+        drops every Dynamo guard and traces the model once, so the first trace's
+        branch would be frozen into the graph for every later step -- and the
+        dummy run that drives that trace is decode-only. That is not
+        hypothetical: it once sent prefill through the decode kernel and produced
+        garbage output while every unit test passed.
+
+        The reference scan needs no dispatch, so the naive path keeps the
+        original two-op shape. Choosing it is a branch on a startup
+        configuration flag rather than on the batch, so it is free of that
+        hazard.
+        """
+        if self.use_naive_kda:
+            mixed_qkv = self.sconv_op(
+                mixed_qkv,
+                sconv_cache,
+                self.q_conv1d.weight,
+                self.k_conv1d.weight,
+                self.v_conv1d.weight,
+                metadata.query_start_loc,
+                metadata.mamba_state_indices,
+                metadata.seq_lens,
+            )
+            return self.kda_op(
+                mixed_qkv,
+                raw_gate,
+                beta,
+                output_gate,
+                recurrent_cache,
+                self.A_log,
+                self.dt_bias,
+                self.o_norm.weight,
+                metadata.query_start_loc,
+                metadata.mamba_state_indices,
+                metadata.seq_lens,
+            )
+
+        return self.dispatched_kda_op(
             mixed_qkv,
             raw_gate,
             beta,
             output_gate,
+            sconv_cache,
             recurrent_cache,
+            self.q_conv1d.weight,
+            self.k_conv1d.weight,
+            self.v_conv1d.weight,
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,
             metadata.query_start_loc,
             metadata.mamba_state_indices,
             metadata.seq_lens,
+            metadata.request_distribution,
         )

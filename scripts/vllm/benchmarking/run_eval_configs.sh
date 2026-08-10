@@ -31,6 +31,12 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     # mid-run. Configs load different models, so there is no reuse to keep.
     rm -rf /dev/shm/torch_tpu_cache
 
+    # Same story for vLLM's on-disk compile cache: torch 2.13 additionally
+    # saves an AOT-compiled copy under torch_compile_cache/torch_aot_compile
+    # (~1.3 GiB per rank per config), and the container overlay shares the
+    # host disk. Left unpruned, later configs fail with ENOSPC.
+    rm -rf /root/.cache/vllm/torch_compile_cache
+
     eval_args=(
         --config "$config_name"
         --run-lm-eval

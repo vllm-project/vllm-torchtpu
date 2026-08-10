@@ -23,7 +23,6 @@ _PCP_REMAP_PROBE_TIMEOUT_S = float(
 _PCP_REMAP_PROBE_SCRIPT = r"""
 import json
 import os
-import sys
 import traceback
 
 prefix = "VLLM_TPU_PCP_REMAP_PROBE "
@@ -57,11 +56,14 @@ try:
         dist.barrier()
         dist.destroy_process_group()
     print(prefix + json.dumps(payload, sort_keys=True), flush=True)
+    # This is a disposable probe process. Bypass interpreter teardown because
+    # libtpu/JAX finalizers can hang after the result has already been emitted.
+    os._exit(0)
 except BaseException as exc:
     payload["error"] = repr(exc)
     traceback.print_exc()
     print(prefix + json.dumps(payload, sort_keys=True), flush=True)
-    sys.exit(1)
+    os._exit(1)
 """
 
 

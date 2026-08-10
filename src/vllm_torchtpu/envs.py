@@ -40,12 +40,12 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
-    TPU_TOKEN_BUCKET_LINEAR_UNTIL: int = 0
-    TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_ROPE_CACHE_TRUNCATE: bool = False
 
 
 def env_with_choices(
@@ -273,15 +273,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
-    # Pad token sizes linearly up to this size with step
-    # TPU_TOKEN_BUCKET_LINEAR_INTERVAL, then double after it. For example,
-    # if set to 64, the padding sizes will be 16, 32, 48, 64, 128, 256, etc.
-    # If set to 0, it will just double sizes(16, 32, 64, 128, ...).
-    "TPU_TOKEN_BUCKET_LINEAR_UNTIL":
-    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_UNTIL") or "0"),
-    # Step for the linear range above.
-    "TPU_TOKEN_BUCKET_LINEAR_INTERVAL":
-    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_INTERVAL") or "16"),
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
@@ -298,6 +289,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunked kernel.
     "VLLM_TPU_USE_NAIVE_KDA":
     env_bool("VLLM_TPU_USE_NAIVE_KDA"),
+    # Slice the rotary cos_sin caches to max model len at load to
+    # minimize xla layout data copy overhead. Text-only.
+    "TPU_ROPE_CACHE_TRUNCATE":
+    env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+    # Extra token buckets added to the default list of buckets.
+    "TPU_TOKEN_BUCKET_EXTRA":
+    lambda: [
+        int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
+        if v.strip()
+    ],
 }
 
 

@@ -11,7 +11,7 @@ logger = init_logger(__name__)
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     """Require a common local prefix hit on a hybrid KV producer.
 
-    vLLM 0.26.0 lets a hybrid model with any KV connector resume from the
+    vLLM 0.26.1rc0 lets a hybrid model with any KV connector resume from the
     deepest per-group local hit. That is valid on a consumer when the connector
     transfers the missing groups, but a producer has no external state to fill
     the gap. In particular, FA can have a cached page where Mamba has no state
