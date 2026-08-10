@@ -11,7 +11,7 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
-                                       MLAAttentionImpl)
+                                       MLAAttentionImpl, MultipleOf)
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
@@ -449,10 +449,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     `--attention-backend CUSTOM`. The Impl subclass sets `use_batched_rpa=True`,
     which plumbs through `_pallas_rpa_kernel` → `attention()` →
     `sharded_ragged_paged_attention()` to pick the batched kernel function.
-    Declares `get_supported_kernel_block_sizes() -> [256]` (or `[128]` under
-    `USE_BATCHED_RPA_SEQ_ON_LANE`, which requires page_size=128 for
-    SEQ_ALONG_LANE tile alignment) so vLLM's standard `get_preferred_block_size`
-    flow picks the right block size automatically.
+    Any multiple of 128 is a valid page size for this kernel (with or without
+    `USE_BATCHED_RPA_SEQ_ON_LANE`); `get_preferred_block_size` is overridden
+    so the auto-selected default (no `--block-size` given) stays at 256.
     """
 
     @staticmethod
@@ -488,9 +487,11 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            return [128]
-        return [256]
+        return [MultipleOf(128)]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        return 256
 
     @staticmethod
     def get_kv_cache_page_size_bytes(
