@@ -792,7 +792,7 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         store.complete_load(sub_hashes(_key(0)))
         meta2 = self._build_meta(sched, self._stock_meta())
         self.assertEqual(meta2.finished_load_jobs, {3: "r1"})
-        self.assertEqual(meta2.failed_load_gpu_block_ids, [])
+        self.assertEqual(meta2.failed_load_device_block_ids, [])
 
     def test_flush_cancels_fence_pending_store(self):
         store = FakeKVCacheStore()
@@ -1036,7 +1036,7 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._connector_metadata = self._meta(
             finished_store_job_ids=[1, 2],
             finished_load_jobs={3: "req-a"},
-            failed_load_gpu_block_ids=[10, 11],
+            failed_load_device_block_ids=[10, 11],
         )
         sending, recving = conn.get_finished(set())
         self.assertEqual(sending, set())

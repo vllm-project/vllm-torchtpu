@@ -86,8 +86,8 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     finished_store_job_ids: list[int] = field(default_factory=list)
     # Completed load jobs (job_id -> req_id) to echo back and unblock requests.
     finished_load_jobs: dict[int, str] = field(default_factory=dict)
-    # Destination GPU blocks of failed loads, reported for scheduler recompute.
-    failed_load_gpu_block_ids: list[int] = field(default_factory=list)
+    # Destination device blocks of failed loads, reported for scheduler recompute.
+    failed_load_device_block_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -208,7 +208,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             fence_job_ids=new_fence_ids,
             finished_store_job_ids=finished_store_ids,
             finished_load_jobs=finished_loads,
-            failed_load_gpu_block_ids=failed_load_block_ids,
+            failed_load_device_block_ids=failed_load_block_ids,
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -285,7 +285,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         for job_id, req_id in meta.finished_load_jobs.items():
             self._completed_jobs[job_id] = 1
             finished_recving.add(req_id)
-        self._load_error_block_ids.update(meta.failed_load_gpu_block_ids)
+        self._load_error_block_ids.update(meta.failed_load_device_block_ids)
 
         return set(), finished_recving
 
