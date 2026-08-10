@@ -6,10 +6,21 @@ shape so each shape gets its own 60-second shm_broadcast window (~4s per shape)
 instead of all 14 shapes sharing a single window and timing out.
 """
 
+from vllm.logger import init_logger
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+logger = init_logger(__name__)
+
+# Workers size the KV pool from their OWN measured free HBM, so their block
+# counts never agree exactly. The spread that matters is relative: a few tens of
+# MiB of allocator jitter is a couple of blocks when a block is megabytes (Kimi
+# K3: ~14 MiB/block) but hundreds of blocks when a block is ~140 KiB
+# (Kimi-Linear-48B, where 8 workers landed 551348..551506 -- a spread of 158
+# against this absolute tolerance of 4). Accept whichever is larger, so the
+# check still catches a worker that genuinely disagrees about the budget.
 _NUM_BLOCKS_OVERRIDE_TOL = 4
+_NUM_BLOCKS_OVERRIDE_REL_TOL = 0.005
 
 
 class TpuMultiprocExecutor(MultiprocExecutor):
@@ -33,10 +44,27 @@ class TpuMultiprocExecutor(MultiprocExecutor):
                 if ovr is not None
             ]
             if overrides:
-                assert max(overrides) - min(
-                    overrides) <= _NUM_BLOCKS_OVERRIDE_TOL
-                self.vllm_config.cache_config.num_gpu_blocks_override = min(
-                    overrides)
+                lo, hi = min(overrides), max(overrides)
+                tol = max(_NUM_BLOCKS_OVERRIDE_TOL,
+                          int(lo * _NUM_BLOCKS_OVERRIDE_REL_TOL))
+                if hi - lo > tol:
+                    raise ValueError(
+                        "[kv-sizing] workers disagree on the compact-mamba "
+                        f"attention block count by {hi - lo} blocks "
+                        f"(min={lo}, max={hi}, tolerance={tol}). Each worker "
+                        "sizes the pool from its own measured free HBM, so a "
+                        "spread this large means the workers do not have "
+                        "comparable HBM budgets -- check the per-worker "
+                        "'Compact-mamba KV cache:' lines in "
+                        "tpu_runner._maybe_set_compact_mamba_num_blocks_"
+                        f"override for the outlier. Per-worker values: "
+                        f"{sorted(overrides)}")
+                logger.info(
+                    "[kv-sizing] compact-mamba attention blocks across %d "
+                    "workers: min=%d max=%d spread=%d (tolerance=%d); "
+                    "pinning num_gpu_blocks_override=%d", len(overrides), lo,
+                    hi, hi - lo, tol, lo)
+                self.vllm_config.cache_config.num_gpu_blocks_override = lo
 
         return specs
 
