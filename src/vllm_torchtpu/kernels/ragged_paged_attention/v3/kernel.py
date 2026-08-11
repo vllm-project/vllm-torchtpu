@@ -28,8 +28,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.ragged_paged_attention.v3 import layout as kv_layout
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
+from vllm_torchtpu.kv_cache_layout import KVCacheLayout
 
 
 class RpaCase(Enum):
@@ -87,6 +89,7 @@ def ref_ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    layout: KVCacheLayout = KVCacheLayout.HEAD_PACKED,
 ):
     if out_dtype is None:
         out_dtype = jnp.float32 if queries.dtype == jnp.float32 else jnp.bfloat16
@@ -113,21 +116,28 @@ def ref_ragged_paged_attention(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        layout=layout,
     )
+    layout = KVCacheLayout(layout)
     actual_head_dim = queries.shape[2]
     actual_num_q_heads = queries.shape[1]
     actual_num_kv_heads = keys.shape[1]
-    merged_kv = merge_kv(keys, values)
-    assert merged_kv.shape[-3:] == kv_cache.shape[-3:]
 
-    _, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim = (
-        kv_cache.shape)
-    num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
+    _, page_size, num_kv_heads_x2, kv_packing, head_dim = (
+        kv_layout.describe_cache(kv_cache, layout))
+    # Token-major, so the attention maths below never sees the layout.
+    merged_kv = merge_kv(keys, values).reshape(keys.shape[0], -1, head_dim)
+    # Head-packing rounds Kx2 up to a whole word and merge_kv pads to match;
+    # token-packing does not, so trim the padding rows it does not store.
+    merged_kv = merged_kv[:, :num_kv_heads_x2, :]
+
     assert num_kv_heads_x2 % 2 == 0
     assert actual_num_q_heads % actual_num_kv_heads == 0
     assert head_dim % 128 == 0
     assert get_dtype_packing(kv_cache.dtype) == kv_packing
-    assert num_kv_heads_x2 == align_to(actual_num_kv_heads * 2, kv_packing)
+    assert kv_cache.shape == kv_layout.kv_cache_shape(
+        layout, kv_cache.shape[0], page_size, actual_num_kv_heads * 2,
+        actual_head_dim, kv_cache.dtype)
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
@@ -150,20 +160,21 @@ def ref_ragged_paged_attention(
         assert kv_len - q_len >= 0
         gathered_kv = kv_cache[indices]
         gathered_shape = gathered_kv.shape
-        gathered_kv = gathered_kv.reshape(-1, *gathered_shape[-3:])
+        # The one layout-dependent step: present the gathered pages as
+        # [tokens, Kx2, head_dim]. Token t of page i is at row i * page_size + t
+        # in either layout, so everything below is layout-agnostic.
+        tokens = kv_layout.to_token_major(gathered_kv, layout)
         if not skip_kv_update:
             # KV-sharing (cross-layer) layers reuse the target layer's K/V that
             # is already present in the (shared) cache, so they must neither
             # insert their own K/V nor write the cache back.
-            gathered_kv = gathered_kv.at[kv_len - q_len:kv_len].set(
+            tokens = tokens.at[kv_len - q_len:kv_len].set(
                 merged_kv[q_start:q_end])
             kv_cache = kv_cache.at[indices].set(
-                gathered_kv.reshape(gathered_shape))
+                kv_layout.from_token_major(tokens, layout, gathered_shape))
 
-        kv = gathered_kv.reshape(
-            -1, num_kv_heads_x2,
-            head_dim)[:, :actual_num_kv_heads * 2, :].reshape(
-                -1, actual_num_kv_heads, head_dim * 2)
+        kv = tokens[:, :actual_num_kv_heads * 2, :].reshape(
+            -1, actual_num_kv_heads, head_dim * 2)
         k = kv[:kv_len, :, :head_dim][:, :, :actual_head_dim]
         v = kv[:kv_len, :, head_dim:][:, :, :actual_head_dim]
         k = jnp.repeat(k, actual_num_q_heads_per_kv_head, axis=1)
@@ -269,14 +280,21 @@ def get_kv_cache_shape(
     actual_num_kv_heads,
     actual_head_dim,
     kv_dtype,
+    *,
+    layout: KVCacheLayout = KVCacheLayout.HEAD_PACKED,
 ):
-    kv_packing = get_dtype_packing(kv_dtype)
-    return (
+    """v3 stores a K and a V vector per head, hence the `* 2`.
+
+    `layout` is keyword-only and defaults to today's layout, so existing
+    callers are unaffected. See `.layout` for what the two shapes mean.
+    """
+    return kv_layout.kv_cache_shape(
+        layout,
         total_num_pages,
         page_size,
-        align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
-        kv_packing,
-        align_to(actual_head_dim, 128),
+        actual_num_kv_heads * 2,
+        actual_head_dim,
+        kv_dtype,
     )
 
 
@@ -1243,6 +1261,7 @@ def dynamic_validate_inputs(
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
+    layout: KVCacheLayout = KVCacheLayout.HEAD_PACKED,
 ):
     q, k, v = queries, keys, values
     static_validate_inputs(
@@ -1269,10 +1288,12 @@ def dynamic_validate_inputs(
         p_block_sizes=p_block_sizes,
         m_block_sizes=m_block_sizes,
         vmem_limit_bytes=vmem_limit_bytes,
+        layout=layout,
     )
     max_num_tokens = q.shape[0]
-    total_num_pages = kv_cache.shape[0]
-    page_size = kv_cache.shape[1]
+    # page_size is not at a fixed dim across layouts; ask the layout.
+    total_num_pages, page_size, _, _, _ = kv_layout.describe_cache(
+        kv_cache, layout)
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
@@ -1338,6 +1359,7 @@ def static_validate_inputs(
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
+    layout: KVCacheLayout = KVCacheLayout.HEAD_PACKED,
 ):
     """Validate inputs to the RPA kernel statically."""
     if use_causal_mask:
@@ -1367,26 +1389,29 @@ def static_validate_inputs(
         raise ValueError(f"Expected {actual_num_q_heads=} to be divisible by"
                          f" {actual_num_kv_heads=}.")
 
+    # page_size does not live at a fixed dim across layouts, so derive it
+    # before rebuilding the expected shape from it.
+    (
+        _,
+        page_size,
+        num_kv_heads_x2,
+        kv_packing,
+        head_dim,
+    ) = kv_layout.describe_cache(kv_cache, layout)
+
     expected_kv_cache_shape = get_kv_cache_shape(
         kv_cache.shape[0],
-        kv_cache.shape[1],
+        page_size,
         actual_num_kv_heads,
         actual_head_dim,
         kv_cache.dtype,
+        layout=layout,
     )
 
     if kv_cache.shape != expected_kv_cache_shape:
         raise ValueError(
             f"Expected {kv_cache.shape=} to be equal to {expected_kv_cache_shape=}"
         )
-
-    (
-        _,
-        page_size,
-        num_kv_heads_x2_per_kv_packing,
-        kv_packing,
-        head_dim,
-    ) = kv_cache.shape
 
     if head_dim != align_to(actual_head_dim, 128):
         raise ValueError(
@@ -1404,13 +1429,18 @@ def static_validate_inputs(
         raise ValueError(
             f"{kv_packing=} does not match with {kv_cache.dtype=}")
 
-    num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
     if num_kv_heads_x2 % 2 != 0:
         raise ValueError(
             f"Combined KV heads must be divisible by 2, but got {num_kv_heads_x2}"
         )
-    if (num_kv_heads_x2 % kv_packing != 0
-            or num_kv_heads_x2 // 2 < actual_num_kv_heads):
+    # Only head-packing puts Kx2 on the packing dimension, so only it has to
+    # round Kx2 up to a whole word. Token-packing stores Kx2 exactly.
+    if (layout is KVCacheLayout.HEAD_PACKED
+            and num_kv_heads_x2 % kv_packing != 0):
+        raise ValueError(
+            f"Invalid {num_kv_heads_x2=}, {actual_num_kv_heads=}, {kv_packing=}"
+        )
+    if num_kv_heads_x2 // 2 < actual_num_kv_heads:
         raise ValueError(
             f"Invalid {num_kv_heads_x2=}, {actual_num_kv_heads=}, {kv_packing=}"
         )
