@@ -3000,8 +3000,7 @@ class TPUModelRunner(GPUModelRunner):
             # and packs the tokens into inputs_embeds; use whichever exists.
             num_tokens_padded = (input_ids if input_ids is not None else
                                  inputs_embeds).shape[0]
-            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-                self._token_padding_update(num_tokens_padded)
+            self._token_padding_update(num_tokens_padded)
             with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -3806,7 +3805,13 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
+            VllmCompressedTensorsW4ANMxfp4MoEMethod
+        uses_mxfp4_moe = any(
+            isinstance(getattr(module, "quant_method", None),
+                       VllmCompressedTensorsW4ANMxfp4MoEMethod)
+            for module in self.model.modules())
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 self.max_num_tokens, self.device)
             token_padding.set_padding_state(self._token_padding_state)
@@ -3983,8 +3988,7 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in self._attn_layer_names
             }
 
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-            assert self._token_padding_state is not None
+        if self._token_padding_state is not None:
             # Every row of a dummy step is padding.
             self._token_padding_state.update(0, num_tokens)
         with (
