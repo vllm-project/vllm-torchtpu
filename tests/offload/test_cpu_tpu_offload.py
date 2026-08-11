@@ -1172,11 +1172,33 @@ class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
                     7, (self._spec([3, 5]), self._spec([1, 2]))))
 
         # The store must barrier on the forward step's in-place KV write
-        # before raiden reads the device blocks.
-        sync.assert_called_once_with(wait=True)
+        # before raiden reads the device blocks; without registered device
+        # tensors it falls back to a full device sync.
+        sync.assert_called_once_with(None, wait=True)
         mgr.d2h.assert_called_once_with([3, 5], [1, 2], [1, 1])
         mgr.h2d.assert_not_called()
         self.assertEqual(handler._pending[7], (fut, 2 * 64))
+
+    def test_d2h_store_scopes_sync_to_device_tensors(self):
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenOffloadingHandler
+
+        mgr = MagicMock(spec=["d2h", "h2d"])
+        kv_tensors = [MagicMock(), MagicMock()]
+        handler = _RaidenOffloadingHandler(mgr,
+                                           tpu_to_cpu=True,
+                                           src_block_size_factor=1,
+                                           dst_block_size_factor=1,
+                                           bytes_per_kernel_block=64,
+                                           device_tensors=kv_tensors)
+        mgr.d2h.return_value = MagicMock()
+
+        with patch("vllm_torchtpu.offload.cpu_tpu._tpu_sync") as sync:
+            self.assertTrue(
+                handler.transfer_async(
+                    7, (self._spec([3, 5]), self._spec([1, 2]))))
+
+        # The barrier is scoped to the KV tensors, not a global device sync.
+        sync.assert_called_once_with(kv_tensors, wait=True)
 
     def test_h2d_load_uses_lowercase_wrapper_method(self):
         handler, mgr = self._make_handler(tpu_to_cpu=False)

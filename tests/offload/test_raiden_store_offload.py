@@ -619,6 +619,15 @@ class TestTouchAndMisc(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             self.manager.reset_cache()
 
+    def test_connector_reset_cache_reports_failure(self):
+        # The connector-level override must return False (not raise) so the
+        # scheduler's reset_connector_cache surfaces {"success": false}
+        # through /reset_prefix_cache instead of an opaque 500.
+        from vllm_torchtpu.offload.raiden_connector import \
+            TPURaidenOffloadingConnector
+        self.assertIs(TPURaidenOffloadingConnector.reset_cache(MagicMock()),
+                      False)
+
     def test_touch_pins_and_releases_resident_keys_only(self):
         seed_host_entries(self.store, _key(0))
         # The directory decides: every key is probed first; a fully resident
@@ -1304,6 +1313,25 @@ class TestRemoteReadFlow(unittest.TestCase):
                          LookupResult.MISS)
         self.assertEqual(self.manager.lookup(_key(1), _ctx()),
                          LookupResult.HIT)
+
+    def test_on_schedule_end_drops_unconsumed_remote_slices(self):
+        # A remote HIT whose request never reaches prepare_load (aborted, or
+        # declined by the scheduler) must not leave its peer slices stashed
+        # past the step: they would accumulate forever and a stale slice
+        # could later be handed to insert_and_lock.
+        from vllm.v1.kv_offload.base import ScheduleEndContext
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.assertTrue(self.manager._remote_slices)
+
+        self.manager.on_schedule_end(
+            ScheduleEndContext(new_req_ids=(), preempted_req_ids=()))
+        self.assertEqual(self.manager._remote_slices, {})
+
+        # A retried request re-runs lookup and repopulates the stash.
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.assertTrue(self.manager._remote_slices)
 
     def test_registry_down_degrades_to_local_only(self):
         seed_global_entries(self.store, _key(1))

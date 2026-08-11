@@ -28,8 +28,9 @@ Core mechanisms:
 
 - Save fence: Store jobs only read HBM after the forward pass writing those
   blocks has fully completed. Store jobs ship as `fence_job_ids`. Each rank
-  executes a post-forward `_tpu_sync(wait=True)` and acknowledges via
-  `fenced_jobs`. The scheduler launches `save()` only after all ranks have acked.
+  executes a post-forward `_tpu_sync` scoped to the registered KV pool buffers
+  and acknowledges via `fenced_jobs`. The scheduler launches `save()` only
+  after all ranks have acked.
 
 - Completion echoes: Terminal jobs discovered by the scheduler manager ship
   down to workers, which echo them back as `completed_jobs` / `finished_recving`
@@ -241,11 +242,18 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # vllm_config / kv_cache_config directly into the spec.
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
 
-        # Disable singleton worker to avoid port collisions when disagg stack
-        # runs its own control plane in the same process.
-        if os.environ.get("RAIDEN_DISABLE_SINGLETON_WORKER") not in ("1",
-                                                                     "true"):
-            os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
+        # The raiden singleton worker cannot coexist with this connector: the
+        # disagg stack runs its own control plane in the same process and the
+        # two collide on ports.
+        singleton_env = os.environ.get("RAIDEN_DISABLE_SINGLETON_WORKER")
+        if singleton_env is not None and singleton_env not in ("1", "true"):
+            raise ValueError(
+                "TPURaidenOffloadingConnector requires the raiden singleton "
+                "worker to be disabled (it collides with the in-process "
+                "control plane's ports), but RAIDEN_DISABLE_SINGLETON_WORKER="
+                f"{singleton_env!r} was set explicitly. Unset it or set it "
+                "to '1'.")
+        os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
 
         # Call through module to preserve PCP-aware patch on build_offloading_config.
         offloading_config = offloading_config_module.build_offloading_config(
@@ -266,6 +274,18 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}
             self._load_error_block_ids: set[int] = set()
+            # KV pool byte views registered in register_kv_caches; the save
+            # fence waits on exactly these buffers.
+            self._pool_sync_tensors: list[torch.Tensor] = []
+
+    # -- scheduler-side hooks ----------------------------------------------
+    def reset_cache(self) -> bool | None:
+        # External cache reset is unsupported by the Raiden store. Report
+        # failure through the endpoint's documented channel instead of raising an exception here
+        logger.warning(
+            "TPURaidenOffloadingConnector: external cache reset is not "
+            "supported by the Raiden offload store; reporting failure.")
+        return False
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(self,
@@ -305,6 +325,10 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 CanonicalKVCacheTensor(tensor=int8_view,
                                        page_size_bytes=page_size_bytes))
 
+        self._pool_sync_tensors = [
+            pool_tensor.tensor for pool_tensor in pool_tensors
+        ]
+
         group_data_refs = [[
             CanonicalKVCacheRef(tensor_idx=idx,
                                 page_size_bytes=pool_tensor.page_size_bytes)
@@ -325,7 +349,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # Run device fence: ensure previous forward writes to HBM are complete
             # before the controller's background save reads them.
             from torch_tpu._internal.sync import synchronize as _tpu_sync
-            _tpu_sync(wait=True)
+            _tpu_sync(self._pool_sync_tensors or None, wait=True)
             for job_id in meta.fence_job_ids:
                 self._fenced_jobs[job_id] = 1
 

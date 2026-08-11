@@ -64,6 +64,7 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_patches_applied = False
+_tpu_kv_connectors_registered = False
 
 
 def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
@@ -199,6 +200,11 @@ def _register_tpu_kv_connectors() -> None:
     Invoked from check_and_update_config() in every process that builds a VllmConfig
     (including the API server). Defers imports lazily until connector names are accessed.
     """
+    global _tpu_kv_connectors_registered
+    if _tpu_kv_connectors_registered:
+        return
+    _tpu_kv_connectors_registered = True
+
     from vllm.distributed.kv_transfer.kv_connector.factory import \
         KVConnectorFactory
 
@@ -210,11 +216,7 @@ def _register_tpu_kv_connectors() -> None:
         ("TPURaidenOffloadingConnector",
          "vllm_torchtpu.offload.raiden_connector"),
     ):
-        try:
-            KVConnectorFactory.register_connector(name, module_path, name)
-        except ValueError:
-            # Idempotent: ignore if already registered on repeated config updates.
-            pass
+        KVConnectorFactory.register_connector(name, module_path, name)
 
 
 def apply_tpu_patches() -> None:

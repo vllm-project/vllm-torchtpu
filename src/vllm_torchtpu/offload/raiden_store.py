@@ -71,7 +71,7 @@ from vllm.v1.kv_offload.base import (CanonicalKVCaches, LoadStoreSpec,
                                      OffloadingSpec, OffloadingWorker,
                                      OffloadKey, PrepareStoreOutput,
                                      ReqContext, RequestOffloadingContext,
-                                     TransferResult)
+                                     ScheduleEndContext, TransferResult)
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 from vllm_torchtpu.logger import init_logger
@@ -297,11 +297,6 @@ class RaidenOffloadingManager(OffloadingManager):
         f = self._gpu_block_size_factor
         return [b * f + i for b in gpu_block_ids for i in range(f)]
 
-    def _sub_hash_status(self, sub_hash: bytes):
-        """Peek one sub-hash's directory status (None when absent)."""
-        matches = self._store.lookup([sub_hash])
-        return matches[0][1].status if matches else None
-
     def _newly_inserted_sub_hashes(
             self, sub_hashes: list[bytes],
             device_ids: list[int]) -> list[bytes] | None:
@@ -498,11 +493,23 @@ class RaidenOffloadingManager(OffloadingManager):
         # `TPURaidenStoreOffloadingSpec.__init__`).
         return []
 
+    def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        # Remote slices stashed by lookup() are consumed by prepare_load()
+        # within the same scheduler step. A hit that never reaches
+        # prepare_load (request aborted, or the scheduler declined it under
+        # HBM pressure) would otherwise leave its entries behind forever —
+        # and a stale slice popped by a later request could be handed to
+        # insert_and_lock. Drop the leftovers each step; a request retried
+        # next step re-runs lookup() and repopulates the stash.
+        self._remote_slices.clear()
+
     def reset_cache(self) -> None:
-        # Upstream's default hook is a silent no-op, which would falsely report
-        # success to POST /reset_prefix_cache?reset_external=true while the
-        # Raiden store continues serving cached entries. Explicitly raise
-        # NotImplementedError since external cache reset is unsupported.
+        # Backstop only: TPURaidenOffloadingConnector.reset_cache() reports
+        # failure before the upstream scheduler reset can reach this hook.
+        # Kept as a raise (not the inherited silent no-op) so any future path
+        # that bypasses the connector override cannot falsely report success
+        # to POST /reset_prefix_cache?reset_external=true while the Raiden
+        # store continues serving cached entries.
         raise NotImplementedError(
             "TPURaidenOffloadingConnector: external cache reset is not supported "
             "by the Raiden offload store.")
@@ -632,8 +639,12 @@ class RaidenOffloadingManager(OffloadingManager):
         dst_device_ids_for_remote: list[int] = []
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
+        statuses = {
+            sub_hash: block.status
+            for sub_hash, block in self._store.lookup(sub_hashes)
+        }
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
-            if self._sub_hash_status(sub_hash) == self._block_status.REMOTE:
+            if statuses.get(sub_hash) == self._block_status.REMOTE:
                 remote_hashes.append(sub_hash)
                 dst_device_ids_for_remote.append(dev_id)
             else:
