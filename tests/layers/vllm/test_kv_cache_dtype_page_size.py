@@ -1,9 +1,13 @@
-"""Page-size accounting for narrowed KV cache dtypes.
+"""Page-size accounting for the Pallas KV cache layout.
 
-`get_kv_cache_shape` places KV heads on the Pallas 32-bit packing dimension and
-rounds their count up to a whole word. bf16 fits 2 values per word and fp8 fits
-4, so a page costs `ceil(num_kv_heads_x2 / packing)` words either way whenever
-`num_kv_heads_x2 <= 2` — fp8 then frees no memory at all.
+`get_kv_cache_shape` rounds each token's K/V vectors up to fill the 32-bit
+packing dimension, which holds `32 / bitwidth` values: 1 for fp32, 2 for bf16,
+4 for fp8. A page therefore costs `ceil(Kx2 / packing) * packing` slots where
+only `Kx2` hold data, and the surplus is charged to HBM.
+
+`Kx2` is `num_kv_heads * 2` normally, but the hd64 kernel (`head_size == 64`)
+folds K and V along head_dim, so there `Kx2 == num_kv_heads` — which is why
+bf16 can be padded too.
 """
 import contextlib
 import logging
@@ -17,24 +21,60 @@ BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
 BLOCK_SIZE = 256
 
-# `num_kv_heads` too small to fill an fp8 word, and the rest. hd64
-# (`head_size == 64`) folds K and V along head_dim, so it starts wasting one
-# tensor-parallel step earlier, at 2 heads.
-UNDERFILLED = [(1, 128), (1, 256), (1, 64), (2, 64)]
-FILLED = [(2, 128), (4, 128), (8, 128), (2, 256), (8, 256), (4, 64), (8, 64)]
+# (num_kv_heads, head_size, dtype) -> is the page padded today?
+PADDING_CASES = [
+    # hd64 folds K and V, so Kx2 == num_kv_heads and an odd count pads bf16.
+    (1, 64, BF16, True),
+    (3, 64, BF16, True),
+    (2, 64, BF16, False),
+    (4, 64, BF16, False),
+    # head_size 128/256 gives an even Kx2, which always fills a bf16 word.
+    (1, 128, BF16, False),
+    (8, 128, BF16, False),
+    # fp8 needs Kx2 divisible by 4, so it pads wherever the head count is odd
+    # or too small.
+    (1, 128, FP8, True),
+    (3, 128, FP8, True),
+    (1, 256, FP8, True),
+    (1, 64, FP8, True),
+    (2, 64, FP8, True),
+    (2, 128, FP8, False),
+    (8, 128, FP8, False),
+    (4, 64, FP8, False),
+]
+
+# fp8 must halve the page against bf16 wherever the head count fills a word.
+FP8_HALVES = [(2, 128), (4, 128), (8, 128), (2, 256), (8, 256), (4, 64),
+              (8, 64)]
+FP8_SHOULD_HALVE = [(1, 128), (1, 256), (1, 64), (2, 64)]
 
 
-def fp8_saving(num_kv_heads, head_size):
-    """How many times smaller an fp8 page is than a bf16 one."""
-    page = PallasAttentionBackend.get_kv_cache_page_size_bytes
-    return (page(BLOCK_SIZE, num_kv_heads, head_size, BF16) /
-            page(BLOCK_SIZE, num_kv_heads, head_size, FP8))
+def page_bytes(num_kv_heads, head_size, dtype):
+    return PallasAttentionBackend.get_kv_cache_page_size_bytes(
+        BLOCK_SIZE, num_kv_heads, head_size, dtype)
 
 
-@pytest.mark.parametrize("num_kv_heads,head_size", FILLED)
+def unpadded_bytes(num_kv_heads, head_size, dtype):
+    """What the page would cost with no rounding.
+
+    float32 packs one value per 32-bit word, so its page is never rounded up.
+    """
+    return page_bytes(num_kv_heads, head_size,
+                      torch.float32) // 4 * dtype.itemsize
+
+
+@pytest.mark.parametrize("num_kv_heads,head_size,dtype,padded", PADDING_CASES)
+def test_padding_matches_expectation(num_kv_heads, head_size, dtype, padded):
+    """Pins which configurations waste HBM, at every dtype."""
+    actual = page_bytes(num_kv_heads, head_size, dtype)
+    assert (actual > unpadded_bytes(num_kv_heads, head_size, dtype)) is padded
+
+
+@pytest.mark.parametrize("num_kv_heads,head_size", FP8_HALVES)
 def test_fp8_halves_the_page(num_kv_heads, head_size):
     """A layout change must keep every one of these at 2x."""
-    assert fp8_saving(num_kv_heads, head_size) == pytest.approx(2.0)
+    assert page_bytes(num_kv_heads, head_size,
+                      BF16) == 2 * page_bytes(num_kv_heads, head_size, FP8)
 
 
 @pytest.mark.xfail(
@@ -43,10 +83,11 @@ def test_fp8_halves_the_page(num_kv_heads, head_size):
     "to the bf16 page size. Fixed by moving the sequence dimension onto the "
     "packing dimension; the MLA kernel already does this.",
 )
-@pytest.mark.parametrize("num_kv_heads,head_size", UNDERFILLED)
+@pytest.mark.parametrize("num_kv_heads,head_size", FP8_SHOULD_HALVE)
 def test_fp8_should_halve_the_page(num_kv_heads, head_size):
     """These xfail today; the xfail turning green is the signal it is fixed."""
-    assert fp8_saving(num_kv_heads, head_size) == pytest.approx(2.0)
+    assert page_bytes(num_kv_heads, head_size,
+                      BF16) == 2 * page_bytes(num_kv_heads, head_size, FP8)
 
 
 @pytest.fixture(autouse=True)
@@ -87,26 +128,22 @@ def captured_warnings(logger_name: str = "vllm"):
         logging.disable(old_disable)
 
 
-WARNING_PHRASE = "frees less memory"
+WARNING_PHRASE = "larger than"
 
 
-@pytest.mark.parametrize("num_kv_heads,head_size,dtype,expected", [
-    (1, 128, FP8, True),
-    (8, 128, FP8, False),
-    (1, 128, BF16, False),
-])
-def test_warns_exactly_when_saving_is_lost(num_kv_heads, head_size, dtype,
-                                           expected):
+@pytest.mark.parametrize("num_kv_heads,head_size,dtype,padded", PADDING_CASES)
+def test_warns_exactly_when_padded(num_kv_heads, head_size, dtype, padded):
+    """Including the bf16 cases: what matters is whether HBM is wasted."""
     with captured_warnings() as messages:
-        PallasAttentionBackend.warn_if_kv_cache_dtype_is_ineffective(
+        PallasAttentionBackend.warn_if_kv_cache_is_padded(
             BLOCK_SIZE, num_kv_heads, head_size, dtype)
-    assert any(WARNING_PHRASE in m for m in messages) is expected
+    assert any(WARNING_PHRASE in m for m in messages) is padded
 
 
 def test_capture_helper_actually_captures():
-    """Guards the two `expected=False` rows above from passing vacuously — an
-    always-empty list satisfies them however the code behaves, which is exactly
-    how the `caplog` version stayed green in CI while capturing nothing."""
+    """Guards the unpadded rows above from passing vacuously — an always-empty
+    list satisfies them however the code behaves, which is exactly how the
+    `caplog` version stayed green in CI while capturing nothing."""
     with captured_warnings() as messages:
-        logging.getLogger("vllm.test").warning(f"x {WARNING_PHRASE}")
+        logging.getLogger("vllm.test").warning(f"x {WARNING_PHRASE} y")
     assert any(WARNING_PHRASE in m for m in messages)

@@ -1041,9 +1041,9 @@ class TPUModelRunner(GPUModelRunner):
                             "Using irope in Pallas is not supported yet, it "
                             "will fall back to global attention for long context."
                         )
-                    # A narrowed KV dtype can cost the same bytes as bf16 here,
-                    # with no other signal that it did.
-                    PallasAttentionBackend.warn_if_kv_cache_dtype_is_ineffective(
+                    # The layout can pad a page past what its shape and dtype
+                    # imply, with no other signal that it did.
+                    PallasAttentionBackend.warn_if_kv_cache_is_padded(
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,

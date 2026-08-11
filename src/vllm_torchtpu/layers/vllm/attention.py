@@ -394,34 +394,39 @@ class PallasAttentionBackend(AttentionBackend):
         raise RuntimeError("swap_blocks is not used for the TPU backend.")
 
     @staticmethod
-    def warn_if_kv_cache_dtype_is_ineffective(
+    def warn_if_kv_cache_is_padded(
         block_size: int,
         num_kv_heads: int,
         head_size: int,
         cache_dtype: str | torch.dtype,
     ) -> None:
-        """Warn when a narrowed KV cache dtype frees less memory than expected.
+        """Warn when a page costs more than its shape and dtype imply.
 
-        vLLM sizes the cache to whatever memory is left over, so a page that
-        did not shrink surfaces only as an unchanged `GPU KV cache size` line.
+        The Pallas layout rounds each token's K/V vectors up to fill the 32-bit
+        packing dimension, so HBM use can exceed what an operator computes from
+        shape and dtype alone. That happens at any dtype -- fp8 with one KV
+        head, but also bf16 under the hd64 kernel with an odd head count.
         """
         dtype = _resolve_kv_cache_dtype(cache_dtype)
-        if dtype.itemsize >= torch.bfloat16.itemsize:
-            return
         page_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes
-        ratio = (
-            page_bytes(block_size, num_kv_heads, head_size, torch.bfloat16) /
-            page_bytes(block_size, num_kv_heads, head_size, dtype))
-        if ratio >= 2.0:
+        # float32 packs one value per 32-bit word, so its page is never rounded
+        # up: dividing it by its itemsize gives exactly the number of K/V
+        # values a page holds. Costing those at `dtype` is the padding-free
+        # size to compare against.
+        unpadded = (
+            page_bytes(block_size, num_kv_heads, head_size, torch.float32) //
+            torch.float32.itemsize) * dtype.itemsize
+        actual = page_bytes(block_size, num_kv_heads, head_size, dtype)
+        if actual == unpadded:
             return
         logger.warning_once(
-            "KV cache dtype %s frees less memory than a narrower dtype should: "
-            "%.2fx versus 2.00x. This rank holds num_kv_heads=%d at "
-            "head_size=%d, and the Pallas KV layout rounds each token's KV "
-            "vectors up to a whole 32-bit word; that padding offsets the "
-            "narrower dtype. Lowering tensor parallelism (more KV heads per "
-            "rank) or enabling attention data parallelism avoids it.", dtype,
-            ratio, num_kv_heads, head_size)
+            "KV cache pages are %.2fx larger than num_kv_heads=%d at "
+            "head_size=%d with dtype %s requires: the Pallas layout rounds "
+            "each token's K/V vectors up to fill the 32-bit packing "
+            "dimension, so HBM use will exceed an estimate made from shape "
+            "and dtype. Lowering tensor parallelism (more KV heads per rank) "
+            "or enabling attention data parallelism avoids the padding.",
+            actual / unpadded, num_kv_heads, head_size, dtype)
 
     # In recent TPU generations, up to v6e, the SMEM size is 1MB. The
     # block_tables within the PallasMetadata constitute almost the entire SMEM
