@@ -394,25 +394,6 @@ class PallasAttentionBackend(AttentionBackend):
         raise RuntimeError("swap_blocks is not used for the TPU backend.")
 
     @staticmethod
-    def kv_cache_dtype_saving_ratio(
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype: str | torch.dtype,
-        *,
-        reference_dtype: torch.dtype = torch.bfloat16,
-    ) -> float:
-        """Page-size ratio of `reference_dtype` to `cache_dtype`.
-
-        1.0 means the narrower dtype buys nothing.
-        """
-        wide = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            block_size, num_kv_heads, head_size, reference_dtype)
-        narrow = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            block_size, num_kv_heads, head_size, cache_dtype)
-        return wide / narrow
-
-    @staticmethod
     def warn_if_kv_cache_dtype_is_ineffective(
         block_size: int,
         num_kv_heads: int,
@@ -427,8 +408,10 @@ class PallasAttentionBackend(AttentionBackend):
         dtype = _resolve_kv_cache_dtype(cache_dtype)
         if dtype.itemsize >= torch.bfloat16.itemsize:
             return
-        ratio = PallasAttentionBackend.kv_cache_dtype_saving_ratio(
-            block_size, num_kv_heads, head_size, dtype)
+        page_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes
+        ratio = (
+            page_bytes(block_size, num_kv_heads, head_size, torch.bfloat16) /
+            page_bytes(block_size, num_kv_heads, head_size, dtype))
         if ratio >= 2.0:
             return
         logger.warning_once(

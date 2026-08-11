@@ -24,15 +24,17 @@ UNDERFILLED = [(1, 128), (1, 256), (1, 64), (2, 64)]
 FILLED = [(2, 128), (4, 128), (8, 128), (2, 256), (8, 256), (4, 64), (8, 64)]
 
 
-def saving(num_kv_heads, head_size):
-    return PallasAttentionBackend.kv_cache_dtype_saving_ratio(
-        BLOCK_SIZE, num_kv_heads, head_size, FP8)
+def fp8_saving(num_kv_heads, head_size):
+    """How many times smaller an fp8 page is than a bf16 one."""
+    page = PallasAttentionBackend.get_kv_cache_page_size_bytes
+    return (page(BLOCK_SIZE, num_kv_heads, head_size, BF16) /
+            page(BLOCK_SIZE, num_kv_heads, head_size, FP8))
 
 
 @pytest.mark.parametrize("num_kv_heads,head_size", FILLED)
 def test_fp8_halves_the_page(num_kv_heads, head_size):
     """A layout change must keep every one of these at 2x."""
-    assert saving(num_kv_heads, head_size) == pytest.approx(2.0)
+    assert fp8_saving(num_kv_heads, head_size) == pytest.approx(2.0)
 
 
 @pytest.mark.xfail(
@@ -43,17 +45,14 @@ def test_fp8_halves_the_page(num_kv_heads, head_size):
 )
 @pytest.mark.parametrize("num_kv_heads,head_size", UNDERFILLED)
 def test_fp8_should_halve_the_page(num_kv_heads, head_size):
-    """These xfail today. The xfail turning green is the signal the fix landed."""
-    assert saving(num_kv_heads, head_size) == pytest.approx(2.0)
+    """These xfail today; the xfail turning green is the signal it is fixed."""
+    assert fp8_saving(num_kv_heads, head_size) == pytest.approx(2.0)
 
 
 @pytest.fixture(autouse=True)
 def _reset_warning_once():
-    """`warning_once` dedups by message across the whole process.
-
-    Without clearing it these tests would pass or fail depending on what ran
-    before them — including the same test a second time.
-    """
+    """`warning_once` dedups by message for the life of the process, so without
+    this a test passes or fails depending on what ran before it."""
     import vllm.logger
 
     vllm.logger._print_warning_once.cache_clear()
@@ -61,37 +60,27 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
-class _RecordingLogHandler(logging.Handler):
-    """Same shape as the one in tests/distributed/tpu_connector_v2_test_utils.py."""
-
-    def __init__(self):
-        super().__init__(logging.WARNING)
-        self.messages: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.messages.append(record.getMessage())
-
-
 @contextlib.contextmanager
 def captured_warnings(logger_name: str = "vllm"):
     """Collect warnings emitted under `logger_name`.
 
-    Deliberately not pytest's `caplog`. vLLM's dictConfig sets
-    `propagate=False` on the `vllm` logger and `vllm_torchtpu.logger` prefixes
-    every name with `vllm.`, so these records never reach the root logger where
-    `caplog` installs its handler. Attaching directly works in CI too.
+    Deliberately not pytest's `caplog`: vLLM's dictConfig sets
+    `propagate=False` on the `vllm` logger, so these records never reach the
+    root logger where `caplog` installs its handler.
     """
+    messages: list[str] = []
+    handler = logging.Handler(logging.WARNING)
+    handler.emit = lambda record: messages.append(record.getMessage())
     logger = logging.getLogger(logger_name)
-    handler = _RecordingLogHandler()
     old_level = logger.level
-    # Another test in this process may have raised the level or called
-    # logging.disable(); either drops the record before any handler runs.
+    # Another test may have raised the level or called logging.disable();
+    # either drops the record before any handler runs.
     old_disable = logging.root.manager.disable
     logger.addHandler(handler)
     logger.setLevel(logging.WARNING)
     logging.disable(logging.NOTSET)
     try:
-        yield handler.messages
+        yield messages
     finally:
         logger.removeHandler(handler)
         logger.setLevel(old_level)
@@ -99,10 +88,6 @@ def captured_warnings(logger_name: str = "vllm"):
 
 
 WARNING_PHRASE = "frees less memory"
-
-
-def warned(messages):
-    return any(WARNING_PHRASE in message for message in messages)
 
 
 @pytest.mark.parametrize("num_kv_heads,head_size,dtype,expected", [
@@ -115,16 +100,13 @@ def test_warns_exactly_when_saving_is_lost(num_kv_heads, head_size, dtype,
     with captured_warnings() as messages:
         PallasAttentionBackend.warn_if_kv_cache_dtype_is_ineffective(
             BLOCK_SIZE, num_kv_heads, head_size, dtype)
-    assert warned(messages) is expected
+    assert any(WARNING_PHRASE in m for m in messages) is expected
 
 
 def test_capture_helper_actually_captures():
-    """Guards the two `expected=False` cases above from passing vacuously.
-
-    An always-empty record list satisfies them no matter what the code does.
-    That is exactly how the `caplog` version stayed green in CI while
-    capturing nothing.
-    """
+    """Guards the two `expected=False` rows above from passing vacuously — an
+    always-empty list satisfies them however the code behaves, which is exactly
+    how the `caplog` version stayed green in CI while capturing nothing."""
     with captured_warnings() as messages:
-        logging.getLogger("vllm.test").warning(f"sentinel {WARNING_PHRASE}")
-    assert warned(messages)
+        logging.getLogger("vllm.test").warning(f"x {WARNING_PHRASE}")
+    assert any(WARNING_PHRASE in m for m in messages)
