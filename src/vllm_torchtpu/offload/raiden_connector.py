@@ -45,6 +45,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -61,7 +62,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
     OffloadingConnector
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_offload.base import GPULoadStoreSpec, OffloadKey
+from vllm.v1.kv_offload.base import (CanonicalKVCacheRef, CanonicalKVCaches,
+                                     CanonicalKVCacheTensor, GPULoadStoreSpec,
+                                     OffloadKey)
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu.logger import init_logger
@@ -265,6 +268,53 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._load_error_block_ids: set[int] = set()
 
     # -- worker-side hooks -------------------------------------------------
+    def register_kv_caches(self,
+                           kv_caches: dict[str,
+                                           torch.Tensor | list[torch.Tensor]]):
+        """Register the TPU UBP as zero-copy canonical offload tensors.
+
+        vLLM's generic per-layer registration does not support the TPU
+        unified block pool layout or Mamba tensor lists, so this
+        implementation deduplicates the UBP backing storages and exposes
+        each as an `int8` byte view.
+        """
+        assert self.connector_worker is not None
+        num_blocks = self.connector_worker.kv_cache_config.num_blocks
+
+        pool_storages: dict[int, tuple[torch.UntypedStorage,
+                                       torch.device]] = {}
+        for layer_kv_cache in kv_caches.values():
+            state_tensors = ([layer_kv_cache] if isinstance(
+                layer_kv_cache, torch.Tensor) else layer_kv_cache)
+            for tensor in state_tensors:
+                storage = tensor.untyped_storage()
+                pool_storages.setdefault(storage.data_ptr(),
+                                         (storage, tensor.device))
+
+        pool_tensors: list[CanonicalKVCacheTensor] = []
+        for storage, device in pool_storages.values():
+            storage_bytes = storage.nbytes()
+            assert storage_bytes % num_blocks == 0, (
+                "KV pool storage must hold whole scheduler blocks: "
+                f"storage_bytes={storage_bytes}, num_blocks={num_blocks}")
+            page_size_bytes = storage_bytes // num_blocks
+            int8_view = torch.empty(0, dtype=torch.int8,
+                                    device=device).set_(storage).view(
+                                        num_blocks, page_size_bytes)
+            pool_tensors.append(
+                CanonicalKVCacheTensor(tensor=int8_view,
+                                       page_size_bytes=page_size_bytes))
+
+        group_data_refs = [[
+            CanonicalKVCacheRef(tensor_idx=idx,
+                                page_size_bytes=pool_tensor.page_size_bytes)
+            for idx, pool_tensor in enumerate(pool_tensors)
+        ] for _ in self.connector_worker.kv_cache_config.kv_cache_groups]
+
+        self.connector_worker._init_worker(
+            CanonicalKVCaches(tensors=pool_tensors,
+                              group_data_refs=group_data_refs))
+
     def get_finished(self,
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None

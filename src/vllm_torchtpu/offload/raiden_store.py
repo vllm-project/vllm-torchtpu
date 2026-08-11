@@ -219,11 +219,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 "and cross-instance lookups can never hit.")
 
         if store is None:
-            # Load shared C++ libraries before importing the native extension.
-            from tpu_raiden.api.torch import torch_tpu_common_loader
-            torch_tpu_common_loader.load_torch_tpu_common()
-            from tpu_raiden.frameworks.torch import \
-                _tpu_raiden_torch as store_types
+            from tpu_raiden.api.torch.kv_cache_manager import _torch_impl
+            store_types = _torch_impl()
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
                 "until %d worker(s) register", world_size)
