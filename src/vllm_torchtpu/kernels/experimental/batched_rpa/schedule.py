@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+from abc import ABC, abstractmethod
 from typing import Any
 
 import jax
@@ -34,56 +35,90 @@ class FieldOffset:
   elements (e.g. `data.at[pos+1]`).
   """
 
-    def __init__(self, offset: int):
+    def __init__(self, offset: int | None = None, is_abstract: bool = False):
+        if offset is None:
+            assert is_abstract
+
         self.offset = offset
+        self.__isabstractmethod__ = is_abstract
 
     def __get__(self, obj, objtype=None):
         return obj.data.at[obj.pos + self.offset]
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class SeqAlongLaneDmaNew:
+class DmaNew(ABC):
     data: Any
     pos: Any
 
     # HBM address to fetch new KV tokens from
-    fetch_hbm = FieldOffset(0)
+    fetch_hbm = FieldOffset(is_abstract=True)
     # VMEM offset within the block where new tokens are placed
-    fetch_vmem = FieldOffset(1)
+    fetch_vmem = FieldOffset(is_abstract=True)
     # HBM address to write the updated KV cache block back to
-    wb_hbm = FieldOffset(2)
+    wb_hbm = FieldOffset(is_abstract=True)
     # VMEM offset of the cache block to write back
-    wb_vmem = FieldOffset(3)
+    wb_vmem = FieldOffset(is_abstract=True)
     # Bitpacked: Flags for whether to fetch or write back new tokens.
-    flags = FieldOffset(4)
+    _flags = FieldOffset(is_abstract=True)
+
+    @staticmethod
+    @abstractmethod
+    def num_fields() -> int:
+        ...
+
+    @abstractmethod
+    def set_flags(self, fetch_val, wb_val):
+        ...
+
+    @property
+    @abstractmethod
+    def fetch_val(self):
+        ...
+
+    @property
+    @abstractmethod
+    def wb_val(self):
+        ...
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class SeqAlongLaneDmaNew(DmaNew):
+    fetch_hbm = FieldOffset(0)
+    fetch_vmem = FieldOffset(1)
+    wb_hbm = FieldOffset(2)
+    wb_vmem = FieldOffset(3)
+    _flags = FieldOffset(4)
+
+    @staticmethod
+    def num_fields() -> int:
+        return 5
 
     @property
     def fetch_val(self):
-        return self.flags[...] & 1
+        return self._flags[...] & 1
 
     @property
     def wb_val(self):
-        return (self.flags[...] >> 1) & 1
+        return (self._flags[...] >> 1) & 1
 
     def set_flags(self, fetch_val, wb_val):
-        self.flags[...] = fetch_val | (wb_val << 1)
+        self._flags[...] = fetch_val | (wb_val << 1)
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class HeadAlongSublaneDmaNew:
-    data: Any
-    pos: Any
-
-    # HBM address to write the updated KV cache block back to
+class HeadAlongSublaneDmaNew(DmaNew):
     wb_hbm = FieldOffset(0)
-    # HBM address to fetch new KV tokens from
     fetch_hbm = FieldOffset(1)
-    # VMEM offset within the block where new tokens are placed
     fetch_vmem = FieldOffset(2)
-    # Fetch and writeback are the same flag here.
+    wb_vmem = FieldOffset(2)
     _flags = FieldOffset(3)
+
+    @staticmethod
+    def num_fields() -> int:
+        return 4
 
     @property
     def fetch_val(self):
@@ -92,10 +127,6 @@ class HeadAlongSublaneDmaNew:
     @property
     def wb_val(self):
         return self._flags[...]
-
-    @property
-    def wb_vmem(self):
-        return self.fetch_vmem
 
     def set_flags(self, fetch_val, wb_val):
         self._flags[...] = fetch_val
@@ -137,11 +168,12 @@ class SmemWrapper:
 class SmemArrayOfStructs(SmemWrapper):
     """Maps physical 1-D data into logical Array of Structs."""
 
-    struct_cls: type = dataclasses.field(metadata=dict(static=True))
+    struct_cls: type[DmaNew] = dataclasses.field(metadata=dict(static=True))
     struct_size: int = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create_shape_dtype(cls, shape, struct_cls, struct_size):
+        assert struct_size == struct_cls.num_fields()
         return cls(
             data=jax.ShapeDtypeStruct((np.prod(shape) * struct_size, ),
                                       jnp.int32),
@@ -243,39 +275,6 @@ class RpaSchedule:
         sz = self.dma_q[step, batch_idx, 1]
         return src_hbm, sz
 
-    @jax.named_scope("mask_out_steps")
-    def mask_out_steps(self, step, _, *, b_idx):
-        """Mask out unvisited metadata schedule entries at (step, b_idx)."""
-        self.s_idx[step, b_idx] = -1
-        self.q_idx[step, b_idx] = 0
-        self.k_idx[step, b_idx] = 0
-        self.is_last_k[step, b_idx] = 0
-        self.do_writeback[step, b_idx] = 0
-
-        self.dma_q[step, b_idx, 0] = 0
-        self.dma_q[step, b_idx, 1] = 0
-
-        for i in range(self.cfgs.bkv_p_cache):
-            self.dma_kv_cache[step, b_idx, i, 0] = 0
-            self.dma_kv_cache[step, b_idx, i, 1] = 0
-            self.dma_kv_cache[step, b_idx, i, 2] = 0
-
-        for i in range(self.cfgs.bkv_p_new):
-            dma_entry = self.dma_kv_new[step, b_idx, i]
-            dma_entry.fetch_hbm[...] = 0
-            dma_entry.fetch_vmem[...] = 0
-            dma_entry.wb_hbm[...] = 0
-            if self.cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                dma_entry.wb_vmem[...] = 0
-                dma_entry.flags[...] = 0
-            else:
-                dma_entry.set_flags(0, 0)
-
-        self.total_wait_kv_in[step] = 0
-        self.total_wait_kv_out[step] = 0
-        self.total_wait_q_in[step] = 0
-        self.total_wait_o_out[step] = 0
-
     def scratch_shapes(self):
         """Returns a Pytree of SMEM scratch memory."""
 
@@ -306,6 +305,40 @@ class RpaSchedule:
             lambda x: pl.BlockSpec(memory_space=pltpu.HBM),
             self,
         )
+
+
+def _mask_out_steps(
+    step: jax.typing.ArrayLike,
+    schedule_smem: RpaSchedule,
+    b_idx: jax.typing.ArrayLike,
+):
+    """Mask out unvisited metadata schedule entries at (step, b_idx)."""
+    schedule_smem.s_idx[step, b_idx] = -1
+    schedule_smem.q_idx[step, b_idx] = 0
+    schedule_smem.k_idx[step, b_idx] = 0
+    schedule_smem.is_last_k[step, b_idx] = 0
+    schedule_smem.do_writeback[step, b_idx] = 0
+
+    schedule_smem.dma_q[step, b_idx, 0] = 0
+    schedule_smem.dma_q[step, b_idx, 1] = 0
+
+    for i in range(schedule_smem.cfgs.bkv_p_cache):
+        schedule_smem.dma_kv_cache[step, b_idx, i, 0] = 0
+        schedule_smem.dma_kv_cache[step, b_idx, i, 1] = 0
+        schedule_smem.dma_kv_cache[step, b_idx, i, 2] = 0
+
+    for i in range(schedule_smem.cfgs.bkv_p_new):
+        dma_entry = schedule_smem.dma_kv_new[step, b_idx, i]
+        dma_entry.fetch_hbm[...] = 0
+        dma_entry.fetch_vmem[...] = 0
+        dma_entry.wb_hbm[...] = 0
+        dma_entry.wb_vmem[...] = 0
+        dma_entry.set_flags(0, 0)
+
+    schedule_smem.total_wait_kv_in[step] = 0
+    schedule_smem.total_wait_kv_out[step] = 0
+    schedule_smem.total_wait_q_in[step] = 0
+    schedule_smem.total_wait_o_out[step] = 0
 
 
 def _write_schedule_to_hbm(
@@ -356,10 +389,12 @@ def _compute_waits(
     q_bytes_per_token = cfgs.q_bytes_per_token
     o_bytes_per_token = cfgs.o_bytes_per_token
 
-    # Reshape buffers to (-1, 128) in u32 to perform contiguous 512-byte lane waits
-    # (1 row of 128 u32 words = 512 bytes).
-    dma_chunk_size = 512
+    # Reshape buffers to (-1, 128) in u32 to perform contiguous 512-byte lane
+    # waits (1 row of 128 u32 words = 512 bytes).
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    dma_chunk_size = num_lanes * 4
 
+    @jax.named_scope("compute_waits")
     def body(step, _):
         # KV IN
         kv_in_tokens = 0
@@ -424,18 +459,55 @@ def _compute_waits(
     jax.lax.fori_loop(start_step, end_step, body, None)
 
 
+def flush_to_hbm(
+    count: jax.typing.ArrayLike,
+    schedule: RpaSchedule,
+    schedule_hbm_ref: RpaSchedule,
+    hbm_offset: jax.typing.ArrayLike,
+    dma_sem: jax.Ref,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+
+    last_step = utils.align_to(count, cfgs.batch_size)
+
+    @pl.loop(count, last_step)
+    @jax.named_scope("mask_out_steps")
+    def body(idx):
+        step, b_idx = divmod(idx, cfgs.batch_size)
+        _mask_out_steps(step, b_idx=b_idx, schedule_smem=schedule)
+
+    _compute_waits(schedule, 0, last_step // cfgs.batch_size, cfgs=cfgs)
+    _write_schedule_to_hbm(
+        schedule,
+        schedule_hbm_ref,
+        hbm_offset,
+        cfgs.max_steps_ub,
+        dma_sem,
+        cfgs=cfgs,
+    )
+
+    return hbm_offset + cfgs.max_steps_ub, 0
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class LoopCarry:
+    hbm_offset: jax.Array | int
+    count: jax.Array | int
+
+
 def compute_metadata(
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
     schedule: RpaSchedule,
-    lane_lengths_ref: jax.Ref,
     schedule_hbm_ref: RpaSchedule,
     dma_sem: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
     skip_kv_update: bool = False,
-) -> jax.Array:
+) -> LoopCarry:
     """Fill metadata using triple nested loop of seq->q->k loop.
 
     When `skip_kv_update=True` (cross-layer KV-share path): the current step's
@@ -447,9 +519,8 @@ def compute_metadata(
     @jax.named_scope("k_loop")
     def k_loop(
         k_idx,
-        step,
+        carry: LoopCarry,
         *,
-        target_lane,
         s_idx,
         q_idx,
         q_end,
@@ -459,6 +530,8 @@ def compute_metadata(
         q_len,
         end_k_idx,
     ):
+        count = carry.count
+        step, target_lane = divmod(count, cfgs.batch_size)
 
         schedule.s_idx[step, target_lane] = s_idx
         schedule.q_idx[step, target_lane] = q_idx
@@ -520,9 +593,9 @@ def compute_metadata(
                 cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
                 hbm_token_idx_base = q_end - kv_left_frm_new
                 new_tok_offset = hbm_token_idx_base % cfgs.serve.page_size
-                # If new_sz = 150, new_tok_offset = 120, page_size = 128.
-                # The new tokens occupy indices 120 through 269 relative to the HBM page boundaries.
-                # This spans 3 pages: [120-127], [128-255], and [256-269].
+                # If new_sz = 150, new_tok_offset = 120, page_size = 128.  The new
+                # tokens occupy indices 120 through 269 relative to the HBM page
+                # boundaries.  This spans 3 pages: [120-127], [128-255], and [256-269].
                 # (120 + 150 - 1) // 128 + 1 = 269 // 128 + 1 = 3 pages.
                 num_pages_to_fetch = jnp.where(
                     new_sz > 0,
@@ -532,9 +605,9 @@ def compute_metadata(
                 fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
                 new_page_start = (hbm_token_idx_base -
                                   new_tok_offset) + i * cfgs.serve.page_size
-                # Fetched pages of new tokens are placed sequentially in VMEM immediately following
-                # the existing cached pages. E.g., if cache_pages=2, new pages go to offsets 2*page_size,
-                # 3*page_size, etc.
+                # Fetched pages of new tokens are placed sequentially in VMEM
+                # immediately following the existing cached pages. E.g., if
+                # cache_pages=2, new pages go to offsets 2*page_size, 3*page_size, etc.
                 fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
                 p_idx = jnp.minimum(
                     (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
@@ -580,11 +653,31 @@ def compute_metadata(
 
                 fill_dma_kv_new(i, dst_vmem, dma_sz, slot_start)
 
-        return step + 1
+        def flush(carry: LoopCarry):
+            hbm_offset = carry.hbm_offset
+            count = carry.count
+            new_hbm_offset, _ = flush_to_hbm(
+                count,
+                schedule,
+                schedule_hbm_ref,
+                hbm_offset,
+                dma_sem,
+                cfgs=cfgs,
+            )
+            return LoopCarry(new_hbm_offset, 0)
+
+        hbm_offset = carry.hbm_offset
+        new_count = count + 1
+
+        return jax.lax.cond(
+            new_count < cfgs.max_steps_ub * cfgs.batch_size,
+            lambda carry: carry,
+            flush,
+            LoopCarry(hbm_offset, new_count),
+        )
 
     @jax.named_scope("q_loop")
-    def q_loop(q_idx, hbm_offset, *, s_idx, q_start, q_end, k_len, q_len,
-               num_k):
+    def q_loop(q_idx, carry, *, s_idx, q_start, q_end, k_len, q_len, num_k):
         q_src = q_start + q_idx * cfgs.bq_sz
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
@@ -597,53 +690,8 @@ def compute_metadata(
                             1) // cfgs.bkv_sz + 1
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
-        steps = end_k_idx - start_k_idx
-
-        target_lane = 0
-        min_len = lane_lengths_ref[0]
-        for b in range(1, cfgs.batch_size):
-            is_better = lane_lengths_ref[b] < min_len
-            target_lane = jnp.where(is_better, b, target_lane)
-            min_len = jnp.where(is_better, lane_lengths_ref[b], min_len)
-
-        curr_ptr = lane_lengths_ref[target_lane]
-
-        will_exceed = curr_ptr + steps > cfgs.max_steps_ub
-
-        def do_flush():
-            # Mask out unvisited steps.
-            for b_idx in range(cfgs.batch_size):
-                start_step = lane_lengths_ref[b_idx]
-                mask_step_fn = functools.partial(schedule.mask_out_steps,
-                                                 b_idx=b_idx)
-                jax.lax.fori_loop(start_step, cfgs.max_steps_ub, mask_step_fn,
-                                  None)
-
-            # Write back to HBM.
-            _compute_waits(schedule, 0, cfgs.max_steps_ub, cfgs=cfgs)
-            _write_schedule_to_hbm(
-                schedule,
-                schedule_hbm_ref,
-                hbm_offset,
-                cfgs.max_steps_ub,
-                dma_sem,
-                cfgs=cfgs,
-            )
-            hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)
-
-            for b_idx in range(cfgs.batch_size):
-                lane_lengths_ref[b_idx] = 0
-            return hbm_offset_aligned + cfgs.max_steps_ub, 0
-
-        def no_flush():
-            return hbm_offset, curr_ptr
-
-        new_hbm_offset, curr_ptr = jax.lax.cond(will_exceed, do_flush,
-                                                no_flush)
-
         k_loop_fn = functools.partial(
             k_loop,
-            target_lane=target_lane,
             s_idx=s_idx,
             q_idx=q_idx,
             q_end=q_end,
@@ -653,13 +701,11 @@ def compute_metadata(
             q_len=q_len,
             end_k_idx=end_k_idx,
         )
-        lane_lengths_ref[target_lane] = jax.lax.fori_loop(
-            start_k_idx, end_k_idx, k_loop_fn, curr_ptr)
 
-        return new_hbm_offset
+        return jax.lax.fori_loop(start_k_idx, end_k_idx, k_loop_fn, carry)
 
     @jax.named_scope("seq_loop")
-    def seq_loop(s_idx, hbm_offset):
+    def seq_loop(s_idx, carry):
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
         k_len = kv_lens_ref[s_idx]
@@ -678,10 +724,11 @@ def compute_metadata(
             num_k=num_k,
         )
 
-        return jax.lax.fori_loop(0, num_q, q_loop_fn, hbm_offset)
+        return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
 
     start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
-    return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, 0)
+    init_carry = LoopCarry(0, 0)
+    return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, init_carry)
 
 
 def rpa_metadata_schedule_kernel(
@@ -693,7 +740,6 @@ def rpa_metadata_schedule_kernel(
     schedule_hbm_ref: RpaSchedule,
     # Scratch.
     schedule_ref: RpaSchedule,
-    lane_lengths_ref: jax.Ref,
     dma_sem: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
@@ -713,64 +759,41 @@ def rpa_metadata_schedule_kernel(
     - do_writeback: boolean flag indicating if a block should be flushed to
       HBM (ie does this block contain new tokens to add to KV cache).
 
-  Args:
-    cu_q_lens_ref: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-      length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
-      b=cu_q_lens[i+1] represents q/k/v of sequence i.
-    kv_lens_ref: [max_num_seqs]. Existing kv cache length of each sequence.
-    distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
-      mixed
-    schedule_hbm_ref: HBM memory that will store output of the kernel.
-    schedule_ref: Scratch memory where schedule results gets written.
-    lane_lengths_ref: Scratch memory that keeps track of number of steps for
-      each batch lane.
-    dma_sem: Semaphore used for writing scheduler output to HBM.
-    cfgs: Configuration of the kernel.
-  """
-
-    for b_idx in range(cfgs.batch_size):
-        lane_lengths_ref[b_idx] = 0
+    Args:
+        cu_q_lens_ref: [max_num_seqs + 1]. Cumulative sum of each sequence's query
+            length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
+            b=cu_q_lens[i+1] represents q/k/v of sequence i.
+        kv_lens_ref: [max_num_seqs]. Existing kv cache length of each sequence.
+            distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
+            mixed
+        schedule_hbm_ref: HBM memory that will store output of the kernel.
+        schedule_ref: Scratch memory where schedule results gets written.
+        dma_sem: Semaphore used for writing scheduler output to HBM.
+        cfgs: Configuration of the kernel.
+    """
 
     # Step 1: Compute and fill scheduler metadata.
-    hbm_offset = compute_metadata(
+    loop_carry = compute_metadata(
         cu_q_lens_ref,
         kv_lens_ref,
         distribution_ref,
         schedule_ref,
-        lane_lengths_ref,
         schedule_hbm_ref,
         dma_sem,
         cfgs=cfgs,
         skip_kv_update=skip_kv_update,
     )
-
-    # Step 2: Compute actual number of steps.
-    max_steps = 0
-    for b_idx in range(cfgs.batch_size):
-        max_steps = jnp.maximum(max_steps, lane_lengths_ref[b_idx])
-
-    pl.debug_check(
-        max_steps <= cfgs.max_steps_ub,
-        f"Max steps exceeded SMEM capacity limit! {max_steps} vs"
-        f" {cfgs.max_steps_ub}",
-    )
-    schedule_ref.actual_steps[0] = jnp.where(max_steps > 1,
-                                             hbm_offset + max_steps, max_steps)
+    count = loop_carry.count
+    hbm_offset = loop_carry.hbm_offset
+    steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
+    schedule_ref.actual_steps[0] = steps
 
     # Step 3: Mask out unvisited steps.
-    for b_idx in range(cfgs.batch_size):
-        start_step = lane_lengths_ref[b_idx]
-        mask_step_fn = functools.partial(schedule_ref.mask_out_steps,
-                                         b_idx=b_idx)
-        jax.lax.fori_loop(start_step, max_steps, mask_step_fn, None)
-
-    # Step 4: Write back results to HBM.
-    _compute_waits(schedule_ref, 0, max_steps, cfgs=cfgs)
-    _write_schedule_to_hbm(
+    flush_to_hbm(
+        count,
         schedule_ref,
         schedule_hbm_ref,
         hbm_offset,
-        max_steps,
         dma_sem,
         cfgs=cfgs,
     )
@@ -800,7 +823,6 @@ def generate_rpa_metadata(
             out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
                 schedule_shaped_dtype.scratch_shapes(),
-                pltpu.SMEM((cfgs.batch_size, ), jnp.int32),
                 pltpu.SemaphoreType.DMA((1, )),
             ],
         ),

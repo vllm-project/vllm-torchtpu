@@ -34,12 +34,11 @@ class _BypassRef(pltpu.BufferedRef):
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class KVBufferedRefSeqAlongLane(_BypassRef):
     """Handles fetching/updating KV cache using SEQ_ALONG_LANE memory layout."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -192,12 +191,11 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class KVBufferedRefHeadAlongSublane(_BypassRef):
     """Handles fetching and updating KV cache using HEAD_ALONG_SUBLANE memory layout."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -353,12 +351,11 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class BatchingORef(pltpu.BufferedRef):
     """Handles normalizing and storing the final attention output."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -439,12 +436,11 @@ class BatchingORef(pltpu.BufferedRef):
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class BatchingQRef(pltpu.BufferedRef):
     """Handles fetching Q blocks using precomputed metadata."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
