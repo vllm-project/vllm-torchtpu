@@ -16,9 +16,6 @@ from jax.experimental.pallas import tpu as pltpu
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
-_DEFAULT_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
-_SINGLE_STEP_VMEM_FRACTION = 0.95
-_SINGLE_STEP_MAX_KV_LEN = 92800
 
 
 class SegmentIds(NamedTuple):
@@ -73,78 +70,6 @@ class BlockSizes:
             block_k=128,
             block_b=1,
         )
-
-
-def _single_step_vmem_bytes(
-    q: jax.Array | jax.ShapeDtypeStruct,
-    k: jax.Array | jax.ShapeDtypeStruct,
-    v: jax.Array | jax.ShapeDtypeStruct,
-    ab: jax.Array | jax.ShapeDtypeStruct | None,
-    segment_ids: SegmentIds | None,
-    block_sizes: BlockSizes,
-) -> int:
-    """Estimate compiler VMEM for a program consuming the complete KV axis.
-
-    In addition to the explicit Pallas windows, the single-step kernel needs a
-    float32 ``[block_q, kv_seq_len]`` spill for its attention scores. For K3's
-    failing ``bf16[1, 12, 44032, 128]`` vision shape this estimate is
-    66.09375 MiB, matching the XLA allocation report.
-    """
-    block_b = block_sizes.block_b
-    block_q = block_sizes.block_q
-    kv_seq_len = k.shape[2]
-    head_dim = q.shape[3]
-
-    # Q, K, V, and output windows are double-buffered.
-    q_and_output = (4 * block_b * block_q * head_dim *
-                    int(q.dtype.itemsize))
-    k_and_v = (2 * block_b * kv_seq_len * head_dim *
-               (int(k.dtype.itemsize) + int(v.dtype.itemsize)))
-    score_spill = block_b * block_q * kv_seq_len * 4
-
-    bias_windows = 0
-    if ab is not None:
-        bias_windows = (2 * block_b * block_q * kv_seq_len *
-                        int(ab.dtype.itemsize))
-
-    segment_windows = 0
-    if segment_ids is not None:
-        segment_windows = (
-            2 * block_b * block_q * NUM_LANES *
-            int(segment_ids.q.dtype.itemsize) + block_b * NUM_SUBLANES *
-            kv_seq_len * int(segment_ids.kv.dtype.itemsize))
-
-    return q_and_output + k_and_v + score_spill + bias_windows + segment_windows
-
-
-def _select_default_block_sizes(
-    q: jax.Array | jax.ShapeDtypeStruct,
-    k: jax.Array | jax.ShapeDtypeStruct,
-    v: jax.Array | jax.ShapeDtypeStruct,
-    ab: jax.Array | jax.ShapeDtypeStruct | None,
-    segment_ids: SegmentIds | None,
-    vmem_limit_bytes: int | None,
-) -> BlockSizes:
-    """Use the fast whole-KV kernel only when its VMEM footprint fits."""
-    batch_size, num_heads, q_seq_len, d_model = q.shape
-    kv_seq_len = k.shape[2]
-    block_sizes = BlockSizes.get_default(batch_size, num_heads, q_seq_len,
-                                         kv_seq_len, d_model)
-
-    # The old length-only cutoff was tuned for Qwen2.5-VL. VMEM also scales
-    # with head dimension, dtype, masks, and compiler spill space; K3 therefore
-    # exceeds VMEM at length 44032 despite being below that cutoff.
-    vmem_limit = (vmem_limit_bytes if vmem_limit_bytes is not None else
-                  _DEFAULT_VMEM_LIMIT_BYTES)
-    estimated_vmem = _single_step_vmem_bytes(q, k, v, ab, segment_ids,
-                                             block_sizes)
-    if (kv_seq_len <= _SINGLE_STEP_MAX_KV_LEN
-            and estimated_vmem <= int(_SINGLE_STEP_VMEM_FRACTION * vmem_limit)):
-        return BlockSizes(block_q=block_sizes.block_q,
-                          block_b=block_sizes.block_b,
-                          block_k_major=kv_seq_len,
-                          block_k=kv_seq_len)
-    return block_sizes
 
 
 @functools.partial(
@@ -207,8 +132,15 @@ def flash_attention(
                 f"KV segment ids shape mismatch: expected ({batch_size=},"
                 f" {kv_seq_len=},), got {segment_ids.kv.shape}")
     if block_sizes is None:
-        block_sizes = _select_default_block_sizes(q, k, v, ab, segment_ids,
-                                                  vmem_limit_bytes)
+        block_sizes = BlockSizes.get_default(batch_size, num_heads, q_seq_len,
+                                             kv_seq_len, d_model)
+        # TODO (KWang1998 & hfan): tune the block sizes properly.
+        if kv_seq_len <= 21760:
+            # Override block_k/block_k_major to use `_flash_attention_kernel_single_batch_single_step`.
+            block_sizes = BlockSizes(block_q=block_sizes.block_q,
+                                     block_b=block_sizes.block_b,
+                                     block_k_major=kv_seq_len,
+                                     block_k=kv_seq_len)
     return _flash_attention(q, k, v, ab, segment_ids, False, causal, sm_scale,
                             block_sizes, vmem_limit_bytes, debug)
 
