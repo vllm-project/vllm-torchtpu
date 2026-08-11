@@ -68,6 +68,57 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
 
 class TestVllmGatedDeltaNetAttention:
 
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=8)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+        attn = _qwen35_397b_gdn_attn("copy_test_layer")
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        pool = torch.zeros((4, 8), dtype=torch.float32)
+        pool_alias = pool.view_as(pool)
+        original_storage = pool.untyped_storage().data_ptr()
+
+        def fake_op(*_args, **_kwargs):
+            output = torch.ones((2, 64, 128), dtype=torch.float32)
+            return torch.full_like(pool, 7), output, output + 1
+
+        fake_jax_op = MagicMock(side_effect=fake_op)
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "pcp_streaming_jax_op",
+                 return_value=fake_jax_op,
+             ) as mock_pcp_jax_op:
+            pooled_pcp_impl = attn._build_pooled_pcp_gdn_op()
+
+        output, z = pooled_pcp_impl(
+            torch.zeros((2, 64)),
+            torch.zeros((192, 64), dtype=torch.float8_e4m3fn),
+            torch.ones(192),
+            torch.zeros((2, 64)),
+            torch.zeros((2, 64)),
+            pool,
+            torch.zeros((64, 1, 4)),
+            None,
+            torch.zeros(64),
+            torch.zeros(64),
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(3, dtype=torch.int32),
+            torch.zeros(3, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )
+
+        assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (5, )
+        assert pool.untyped_storage().data_ptr() == original_storage
+        assert torch.all(pool_alias == 7)
+        assert torch.all(output == 1)
+        assert torch.all(z == 2)
+
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")

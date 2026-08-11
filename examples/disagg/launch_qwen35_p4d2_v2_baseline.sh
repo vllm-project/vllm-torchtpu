@@ -92,8 +92,11 @@ PREFILL_PORT="${PREFILL_PORT:-8400}"
 DECODE_PORT="${DECODE_PORT:-9400}"
 PROXY_PORT="${PROXY_PORT:-8000}"
 KV_PORT="${KV_PORT:-14579}"
-TPU_KV_TRANSFER_PORT="${TPU_KV_TRANSFER_PORT:-9100}"
+PREFILL_TPU_KV_TRANSFER_PORT="${PREFILL_TPU_KV_TRANSFER_PORT:-9100}"
+DECODE_TPU_KV_TRANSFER_PORT="${DECODE_TPU_KV_TRANSFER_PORT:-9200}"
 TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT:-9600}"
+PREFILL_CTRL_PORT="${PREFILL_CTRL_PORT:-27000}"
+DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 PREFILL_PCP="${PREFILL_PCP:-1}"
@@ -157,9 +160,10 @@ for compile_sizes_name in COMPILE_SIZES PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZ
   fi
 done
 
-managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}")
+managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}" "${PREFILL_CTRL_PORT}" "${DECODE_CTRL_PORT}")
 for offset in 0 1 2 3; do
-  managed_ports+=("$((TPU_KV_TRANSFER_PORT + offset))")
+  managed_ports+=("$((PREFILL_TPU_KV_TRANSFER_PORT + offset))")
+  managed_ports+=("$((DECODE_TPU_KV_TRANSFER_PORT + offset))")
 done
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
   stop_port_listeners "${managed_ports[@]}"
@@ -244,8 +248,8 @@ else
   common_args+=(--no-async-scheduling)
 fi
 
-p_kv='{"kv_connector":"TPUConnectorV2","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector","kv_role":"kv_producer","kv_port":'"${KV_PORT}"'}'
-d_kv='{"kv_connector":"TPUConnectorV2","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector","kv_role":"kv_consumer","kv_port":'"${KV_PORT}"'}'
+p_kv='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer"}'
+d_kv='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer"}'
 
 prefill_namespace="prefill_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
 decode_namespace="decode_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
@@ -261,8 +265,8 @@ TORCHTPU_VLLM_PYTHONPATH=${TORCHTPU_VLLM_SRC}
 MODEL_PATH=${MODEL_PATH}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
 EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}
-CONNECTOR=TPUConnectorV2
-CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector
+CONNECTOR=TPUConnector
+CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_connector
 PREFILL_TP=${PREFILL_TP}
 PREFILL_PCP=${PREFILL_PCP}
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
@@ -280,9 +284,11 @@ ASYNC_SCHEDULING=${ASYNC_SCHEDULING}
 BIND_HOST=${SERVE_HOST} PREFILL_PORT=${PREFILL_PORT} DECODE_PORT=${DECODE_PORT} PROXY_PORT=${PROXY_PORT}
 PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET=${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET} TPU_KV_TRANSFER_NAMESPACE=${prefill_namespace}
 DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET=${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET} TPU_KV_TRANSFER_NAMESPACE=${decode_namespace}
-KV_PORT=${KV_PORT}
-TPU_KV_TRANSFER_PORT=${TPU_KV_TRANSFER_PORT}
+PREFILL_TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}
+DECODE_TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}
 TPU_SIDE_CHANNEL_PORT=${TPU_SIDE_CHANNEL_PORT}
+PREFILL_CTRL_PORT=${PREFILL_CTRL_PORT}
+DECODE_CTRL_PORT=${DECODE_CTRL_PORT}
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 EOF
@@ -313,11 +319,16 @@ export TPU_HMA_MIN_DONE_RECVING_BATCH=1 TPU_HMA_MAX_DONE_RECVING_BATCH=1;
 export TPU_HMA_MAX_INFLIGHT_D2H_SENDS=1 TPU_HMA_MAX_INFLIGHT_PULLS=8;
 export TPU_MAX_HOST_KV_BUFFER_SIZE=64 TPU_P2P_WAIT_PULL_TIMEOUT=600;
 export TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB}";
-export TPU_KV_TRANSFER_PORT="${TPU_KV_TRANSFER_PORT}";
 export TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT}";
 export ONEHOT_MOE_PERMUTE_THRESHOLD=1024;
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
 export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0;
+
+# Raiden configurations:
+export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1;
+export TPU_RAIDEN_QWEN35_ADMISSION=1;
+export TPU_KV_RESHARD_TRANSPORT=raiden;
+export TPU_RAIDEN_TRANSFER_PARALLELISM=4;
 EOF
 )
 
@@ -338,8 +349,23 @@ fi
 printf '%q ' "${prefill_args[@]}" >"${RUN_DIR}/prefill_vllm_args.quoted"
 printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+prefill_ctrl_cmd="${python_bin} ${TORCHTPU_VLLM_SRC}/examples/disagg/run_raiden_controller.py --port ${PREFILL_CTRL_PORT}"
+decode_ctrl_cmd="${python_bin} ${TORCHTPU_VLLM_SRC}/examples/disagg/run_raiden_controller.py --port ${DECODE_CTRL_PORT}"
+
+printf '%s\n' "${prefill_ctrl_cmd}" >"${RUN_DIR}/prefill_ctrl_cmd.sh"
+printf '%s\n' "${decode_ctrl_cmd}" >"${RUN_DIR}/decode_ctrl_cmd.sh"
+
+# Launch controllers:
+setsid bash -lc "${prefill_ctrl_cmd}" >"${RUN_DIR}/logs/prefill_controller.log" 2>&1 &
+echo $! >"${RUN_DIR}/prefill_controller.pid"
+
+setsid bash -lc "${decode_ctrl_cmd}" >"${RUN_DIR}/logs/decode_controller.log" 2>&1 &
+echo $! >"${RUN_DIR}/decode_controller.pid"
+
+sleep 2
+
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:${PREFILL_CTRL_PORT}; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:${DECODE_CTRL_PORT}; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"
@@ -349,20 +375,29 @@ echo $! >"${RUN_DIR}/prefill.pid"
 setsid bash -lc "${decode_cmd}" >"${RUN_DIR}/logs/decode.log" 2>&1 &
 echo $! >"${RUN_DIR}/decode.pid"
 
+echo "prefill controller pid $(cat "${RUN_DIR}/prefill_controller.pid")"
+echo "decode controller pid $(cat "${RUN_DIR}/decode_controller.pid")"
 echo "prefill pid $(cat "${RUN_DIR}/prefill.pid")"
 echo "decode pid $(cat "${RUN_DIR}/decode.pid")"
 
 health_log="${RUN_DIR}/logs/health_poll.log"
-for ((attempt = 1; attempt <= 80; attempt++)); do
+for ((attempt = 1; attempt <= 120; attempt++)); do
   p_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${PREFILL_PORT}/health" 2>/dev/null || true)
   d_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${DECODE_PORT}/health" 2>/dev/null || true)
   echo "$(date +%H:%M:%S) P=${p_code:-NA} D=${d_code:-NA}" | tee -a "${health_log}"
   if [[ "${p_code}" == "200" && "${d_code}" == "200" ]]; then
     break
   fi
-  if grep -E "Traceback|RuntimeError|ValueError|LLVM ERROR|registered memory region overlaps|strided KV pull failed" "${RUN_DIR}/logs/prefill.log" "${RUN_DIR}/logs/decode.log" >/tmp/pd_p4d2_launch_err.$$ 2>/dev/null; then
-    cat /tmp/pd_p4d2_launch_err.$$
-    rm -f /tmp/pd_p4d2_launch_err.$$
+  if ! kill -0 "$(cat "${RUN_DIR}/prefill.pid" 2>/dev/null)" 2>/dev/null \
+     || ! kill -0 "$(cat "${RUN_DIR}/decode.pid" 2>/dev/null)" 2>/dev/null \
+     || ! kill -0 "$(cat "${RUN_DIR}/prefill_controller.pid" 2>/dev/null)" 2>/dev/null \
+     || ! kill -0 "$(cat "${RUN_DIR}/decode_controller.pid" 2>/dev/null)" 2>/dev/null; then
+    if grep -E "Traceback|RuntimeError|ValueError|LLVM ERROR|registered memory region overlaps|strided KV pull failed" "${RUN_DIR}/logs/prefill.log" "${RUN_DIR}/logs/decode.log" >/tmp/pd_p4d2_launch_err.$$ 2>/dev/null; then
+      cat /tmp/pd_p4d2_launch_err.$$
+      rm -f /tmp/pd_p4d2_launch_err.$$
+      exit 1
+    fi
+    echo "Prefill, decode, or one of their controller processes died unexpectedly!"
     exit 1
   fi
   sleep 15

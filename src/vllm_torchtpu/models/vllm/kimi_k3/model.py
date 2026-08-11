@@ -301,39 +301,49 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         params_dict = dict(self.named_parameters())
         experts_use_weight = not any(
             name.endswith("w13_weight_packed") for name in params_dict)
-        ordinary_weights: list[tuple[str, torch.Tensor]] = []
         loaded_experts: set[str] = set()
         mapper = self.hf_to_vllm_mapper
         if self.config.q_lora_rank is not None:
             mapper |= self.fused_mla_mapper
 
-        for name, loaded_weight in mapper.apply(weights):
-            if name.startswith(("vision_tower.", "mm_projector.")):
-                continue
-            if experts_use_weight and name.endswith(".weight_packed"):
-                name = name.replace(".weight_packed", ".weight")
-
-            for (param_name, weight_name, expert_id,
-                 expert_shard_id) in expert_params_mapping:
-                if weight_name not in name:
+        # Feed non-expert weights to AutoWeightsLoader as a GENERATOR, not a
+        # list: with a streamed checkpoint the loop below drains the whole
+        # stream, and a list would pin every dense weight's host tensor until
+        # the loop ends (~115 GB per rank for Kimi-K3 -- enough to OOM a
+        # 944 GB host at 8 ranks before loading finishes). Lazily interleaving
+        # expert dispatch with AutoWeightsLoader consumption frees each host
+        # tensor as soon as its parameter is loaded.
+        def _ordinary_weights():
+            for name, loaded_weight in mapper.apply(weights):
+                if name.startswith(("vision_tower.", "mm_projector.")):
                     continue
-                name = name.replace(weight_name, param_name)
-                parameter = params_dict[name]
-                parameter.weight_loader(
-                    parameter,
-                    loaded_weight,
-                    name,
-                    expert_id=expert_id,
-                    shard_id=expert_shard_id,
-                )
-                loaded_experts.add(name)
-                break
-            else:
-                ordinary_weights.append((name, loaded_weight))
+                if experts_use_weight and name.endswith(".weight_packed"):
+                    name = name.replace(".weight_packed", ".weight")
+
+                for (param_name, weight_name, expert_id,
+                     expert_shard_id) in expert_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    parameter = params_dict[name]
+                    parameter.weight_loader(
+                        parameter,
+                        loaded_weight,
+                        name,
+                        expert_id=expert_id,
+                        shard_id=expert_shard_id,
+                    )
+                    loaded_experts.add(name)
+                    break
+                else:
+                    yield name, loaded_weight
 
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loaded_experts | loader.load_weights(ordinary_weights)
+        # load_weights fully consumes the generator before returning, so
+        # loaded_experts is complete when the union is taken.
+        ordinary_loaded = loader.load_weights(_ordinary_weights())
+        return loaded_experts | ordinary_loaded

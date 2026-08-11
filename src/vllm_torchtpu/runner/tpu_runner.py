@@ -4707,7 +4707,7 @@ class TPUModelRunner(GPUModelRunner):
             cc.cache_dir, cc.local_cache_dir = saved_cache
             cc.compile_sizes = saved_sizes
             torch._dynamo.reset()
-            torch.tpu.synchronize()
+            sync.synchronize()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
             if not self.enforce_eager:
