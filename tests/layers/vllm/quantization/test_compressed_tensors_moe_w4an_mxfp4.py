@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
     VllmCompressedTensorsW4ANMxfp4MoEMethod
 

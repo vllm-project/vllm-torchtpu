@@ -643,7 +643,6 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
     layer.use_naive_kda = False
-    layer.use_dispatched_kda = True
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -684,81 +683,6 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     torch.testing.assert_close(
         output,
         torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
-    )
-
-
-def test_dispatched_kda_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("VLLM_TPU_USE_DISPATCHED_KDA", raising=False)
-    assert not kimi_attention.use_dispatched_kda()
-
-    monkeypatch.setenv("VLLM_TPU_USE_DISPATCHED_KDA", "1")
-    assert kimi_attention.use_dispatched_kda()
-
-
-def test_kda_default_routes_mixed_batch_through_pre_dispatch_composition(
-) -> None:
-    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
-    nn.Module.__init__(layer)
-    layer.use_naive_kda = False
-    layer.use_dispatched_kda = False
-
-    # Mirror the production failure shape: one request is decoding while seven
-    # fresh two-token prefills occupy every remaining live cache slot.
-    num_tokens = 15
-    mixed_qkv = torch.ones(num_tokens, 12)
-    raw_gate = torch.ones(num_tokens, 4)
-    beta = torch.ones(num_tokens, 2)
-    output_gate = torch.ones(num_tokens, 4)
-    sconv_cache = torch.zeros(9, 12, 2)
-    recurrent_cache = torch.zeros(9, 2, 2, 2)
-    layer.q_conv1d = _ConvWeight()
-    layer.k_conv1d = _ConvWeight()
-    layer.v_conv1d = _ConvWeight()
-    layer.A_log = nn.Parameter(torch.zeros(2))
-    layer.dt_bias = nn.Parameter(torch.zeros(4))
-    layer.o_norm = SimpleNamespace(weight=torch.ones(2))
-    metadata = SimpleNamespace(
-        query_start_loc=torch.tensor(
-            [0, 1, 3, 5, 7, 9, 11, 13, 15], dtype=torch.int32
-        ),
-        mamba_state_indices=torch.arange(1, 9, dtype=torch.int32),
-        seq_lens=torch.tensor([5, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
-        request_distribution=torch.tensor([1, 1, 8], dtype=torch.int32),
-    )
-    calls: list[str] = []
-
-    def sconv_op(values, *args):
-        calls.append("sconv")
-        assert args[0] is sconv_cache
-        return values + 1
-
-    def chunk_kda_op(values, *args):
-        calls.append("chunk")
-        assert args[3] is recurrent_cache
-        torch.testing.assert_close(values, mixed_qkv + 1)
-        return values[:, :4].view(num_tokens, 2, 2)
-
-    def unexpected(*args, **kwargs):
-        raise AssertionError("the dispatched and naive KDA ops must not run")
-
-    layer.sconv_op = sconv_op
-    layer.chunk_kda_op = chunk_kda_op
-    layer.kda_op = unexpected
-    layer.dispatched_kda_op = unexpected
-
-    output = layer._core_attention(
-        mixed_qkv,
-        raw_gate,
-        beta,
-        output_gate,
-        sconv_cache,
-        recurrent_cache,
-        metadata,
-    )
-
-    assert calls == ["sconv", "chunk"]
-    torch.testing.assert_close(
-        output, (mixed_qkv + 1)[:, :4].view(num_tokens, 2, 2)
     )
 
 
@@ -861,7 +785,6 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
     layer.use_naive_kda = False
-    layer.use_dispatched_kda = True
     layer.sconv_op = kimi_custom_ops.build_kimi_sconv_op(
         "test_compile",
         kernel_size=3,
