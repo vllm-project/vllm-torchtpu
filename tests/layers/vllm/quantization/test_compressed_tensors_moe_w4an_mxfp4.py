@@ -230,6 +230,72 @@ def test_mxfp4_processes_directly_materialized_dummy_weights():
     assert not hasattr(layer, "w2_weight_packed")
 
 
+def test_mxfp4_initializes_integer_dummy_weights():
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 64
+    moe_config.intermediate_size_per_partition_unpadded = 64
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size_per_partition=64,
+        params_dtype=torch.bfloat16,
+    )
+
+    parameters = (layer.w13_weight_packed, layer.w13_weight_scale,
+                  layer.w2_weight_packed, layer.w2_weight_scale)
+    for parameter in parameters:
+        parameter.data.fill_(255)
+
+    vllm_config = MagicMock()
+    vllm_config.load_config.load_format = "dummy"
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.get_current_vllm_config_or_none",
+            return_value=vllm_config):
+        method._initialize_dummy_quantized_weights(layer)
+
+    for parameter in parameters:
+        assert torch.count_nonzero(parameter) == 0
+
+
+def test_mxfp4_preserves_integer_checkpoint_weights():
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 64
+    moe_config.intermediate_size_per_partition_unpadded = 64
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size_per_partition=64,
+        params_dtype=torch.bfloat16,
+    )
+
+    parameters = (layer.w13_weight_packed, layer.w13_weight_scale,
+                  layer.w2_weight_packed, layer.w2_weight_scale)
+    for parameter in parameters:
+        parameter.data.fill_(255)
+
+    vllm_config = MagicMock()
+    vllm_config.load_config.load_format = "safetensors"
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.get_current_vllm_config_or_none",
+            return_value=vllm_config):
+        method._initialize_dummy_quantized_weights(layer)
+
+    for parameter in parameters:
+        assert torch.all(parameter == 255)
+
+
 def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     moe_config = MagicMock()
     moe_config.tp_size = 1

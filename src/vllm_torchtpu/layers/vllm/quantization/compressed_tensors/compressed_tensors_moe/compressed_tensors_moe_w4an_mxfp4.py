@@ -1,5 +1,6 @@
 import torch
 from torch_tpu._internal import sync
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import \
     CompressedTensorsW4A4Mxfp4MoEMethod
@@ -44,6 +45,30 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         """
         scratch = getattr(parameter, "_cpu_scratch", None)
         return parameter.data if scratch is None else scratch.data
+
+    def _initialize_dummy_quantized_weights(self,
+                                            layer: RoutedExperts) -> None:
+        """Initialize integer checkpoint containers for dummy model loading.
+
+        vLLM's dummy loader randomizes floating-point parameters but leaves
+        integer parameters untouched. MXFP4 packed weights and E8M0 scales are
+        uint8 tensors allocated with ``torch.empty``, so leaving them untouched
+        can produce invalid scales and NaNs after the first MoE layer. Besides
+        making dummy output unstable, NaN router logits make top-k routing
+        collapse onto a fixed set of experts and invalidate performance
+        measurements. Zero is a finite, deterministic encoding for both the
+        packed FP4 values and E8M0 scale containers.
+        """
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return
+        load_format = vllm_config.load_config.load_format
+        load_format = getattr(load_format, "value", load_format)
+        if str(load_format).lower() != "dummy":
+            return
+        for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,
+                          layer.w2_weight_packed, layer.w2_weight_scale):
+            self._loaded_data(parameter).zero_()
 
     def create_weights(
         self,
@@ -97,6 +122,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
 
+        self._initialize_dummy_quantized_weights(layer)
         self._neutralize_padded_scales(layer)
 
         # Retrieve scratchpad or directly materialized weights and move to TPU.
