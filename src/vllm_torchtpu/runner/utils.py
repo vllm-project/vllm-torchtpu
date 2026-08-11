@@ -265,6 +265,11 @@ class PhaseBasedProfiler:
                 host_tracer_level=2,
                 device_tracer_level=1,
                 python_tracer_level=1,
+                experimental_options={
+                    "tpu_trace_mode": "TRACE_COMPUTE",
+                    "tpu_num_sparse_cores_to_trace": 1,
+                    "tpu_num_sparse_core_tiles_to_trace": 1,
+                },
             )
             self.profile_context = torch.profiler.profile(
                 activities=[
