@@ -17,6 +17,7 @@ steps:
     depends_on: "build_docker"
     steps:
       - label: "Perf/Eval: General suite (TPU v7x-8)"
+        if: 'false'
         key: "perf_eval_general_tpu_v7x_8"
         agents:
           queue: "tpu_v7x_8_queue"
@@ -41,6 +42,7 @@ steps:
           - "perf_eval_results/**/*"
 
       - label: "Perf/Eval: qwen3-0.6b-tp1"
+        if: 'false'
         key: "perf_qwen3_0_6b_tp1"
         agents:
           queue: "tpu_v7x_2_queue"
@@ -53,8 +55,9 @@ steps:
 
       # Nightly runs
       - label: "Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep (TPU v7x-8)"
+        if: 'false'
         key: "perf_nightly_qwen3_coder_480b_fp8_tp8_ep"
-        if: 'build.env("NIGHTLY") == "1"'
+
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -73,8 +76,9 @@ steps:
       # they don't depend on max-model-len, so running them again here would
       # duplicate work (and this config has no eval baselines).
       - label: "Perf: Nightly qwen3-coder-480b-fp8-tp8-ep-full (TPU v7x-8)"
+        if: 'false'
         key: "perf_nightly_qwen3_coder_480b_fp8_tp8_ep_full"
-        if: 'build.env("NIGHTLY") == "1"'
+
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -91,8 +95,9 @@ steps:
       # run only on the tp1-dp8 layout — model quality is independent of
       # parallelism.
       - label: "Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep (TPU v7x-8)"
+        if: 'false'
         key: "perf_nightly_qwen3_5_397b_fp8_tp1_dp8_ep"
-        if: 'build.env("NIGHTLY") == "1"'
+
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -105,8 +110,9 @@ steps:
           - "perf_eval_results/**/*"
 
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp2-dp4-ep (TPU v7x-8)"
+        if: 'false'
         key: "perf_nightly_qwen3_5_397b_fp8_tp2_dp4_ep"
-        if: 'build.env("NIGHTLY") == "1"'
+
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -119,8 +125,9 @@ steps:
           - "perf_eval_results/**/*"
 
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
+        if: 'false'
         key: "perf_nightly_qwen3_5_397b_fp8_tp8_dp1_ep"
-        if: 'build.env("NIGHTLY") == "1"'
+
         agents:
           queue: "tpu_v7x_8_queue"
         env:

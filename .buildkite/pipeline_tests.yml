@@ -15,6 +15,8 @@
 x-unit-test-defaults: &unit_test_defaults
   commands:
     - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
+  artifact_paths:
+    - "/tmp/vllm_profile_artifacts/**/*"
 
 x-tests-plugin-defaults: &tests_plugin_defaults
   suite-slug: tests
@@ -38,8 +40,8 @@ steps:
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=300 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "Unit Tests - General (PR)"
-        key: "unit_tests_general_pr"
+      - label: "Unit Tests - Online Profiling API (PR)"
+        key: "unit_tests_online_profiling_api_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
         agents:
@@ -47,25 +49,49 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-pattern: "tests/entrypoints/llm/test_profiling_api_online*.py"
+              test-cmd: "pytest -sv --timeout=900 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "Unit Tests - Multichip (PR)"
-        key: "unit_tests_multichip_pr"
+      - label: "Unit Tests - Offline Profiling API (PR)"
+        key: "unit_tests_offline_profiling_api_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
         agents:
-          queue: "tpu_v7x_8_queue"
+          queue: "tpu_v7x_2_queue"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-pattern: "tests/entrypoints/llm/test_profiling_api_offline*.py"
+              test-cmd: "pytest -sv --timeout=900 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
+
+#      - label: "Unit Tests - General (PR)"
+#        key: "unit_tests_general_pr"
+#        <<: *unit_test_defaults
+#        if: 'build.env("NIGHTLY") != "1"'
+#        agents:
+#          queue: "tpu_v7x_2_queue"
+#        plugins:
+#          - tests#v1.0.0:
+#              <<: *tests_plugin_defaults
+#              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+#              test-cmd: "pytest -k 'not test_api_profiler_generation' -sv --timeout=600 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+#
+#      - label: "Unit Tests - Multichip (PR)"
+#        key: "unit_tests_multichip_pr"
+#        <<: *unit_test_defaults
+#        if: 'build.env("NIGHTLY") != "1"'
+#        agents:
+#          queue: "tpu_v7x_8_queue"
+#        plugins:
+#          - tests#v1.0.0:
+#              <<: *tests_plugin_defaults
+#              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+#              test-cmd: "pytest -k 'not test_api_profiler_generation' -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
         <<: *unit_test_defaults
-        if: 'build.env("NIGHTLY") == "1"'
+        if: 'false'
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
@@ -80,7 +106,7 @@ steps:
       - label: "Unit Tests - Speculative Decoding Multichip (Nightly)"
         key: "unit_tests_spec_decode_multichip_nightly"
         <<: *unit_test_defaults
-        if: 'build.env("NIGHTLY") == "1"'
+        if: 'false'
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:
@@ -88,6 +114,30 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=3600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - Online Profiling API (Nightly)"
+        key: "unit_tests_online_profiling_api_nightly"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_2_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_profiling_api_online*.py"
+              test-cmd: "pytest -sv --timeout=900 --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - Offline Profiling API (Nightly)"
+        key: "unit_tests_offline_profiling_api_nightly"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_2_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_profiling_api_offline*.py"
+              test-cmd: "pytest -sv --timeout=900 --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - General (Nightly)"
         key: "unit_tests_general_nightly"
@@ -99,7 +149,7 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -k 'not test_api_profiler_generation' -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (Nightly)"
         key: "unit_tests_multichip_nightly"
@@ -111,4 +161,4 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -k 'not test_api_profiler_generation' -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"

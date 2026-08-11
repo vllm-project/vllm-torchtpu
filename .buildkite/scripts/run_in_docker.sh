@@ -90,10 +90,13 @@ SPANNER_EVAL_VARS=(
 )
 
 echo "--- Running command in Docker container"
+mkdir -p /tmp/vllm_profile_artifacts
+chmod 777 /tmp/vllm_profile_artifacts
 docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64g --device /dev/fuse \
   -w /root/torchtpu-vllm \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
+  -v /tmp/vllm_profile_artifacts:/tmp/vllm_profile_artifacts \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
   -e FORCE_COLOR="1" \
   -e HF_HOME=/local_hf_cache \

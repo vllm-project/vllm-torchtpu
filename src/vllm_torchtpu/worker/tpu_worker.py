@@ -454,6 +454,9 @@ class TPUWorker(WorkerBase):
                         parse_profile_options
                     standard_opts, advanced_opts = parse_profile_options(
                         profile_prefix)
+                    logger.info(
+                        "Non-phased profiling armed with advanced profiling features! standard_opts: %s | advanced_opts: %s",
+                        standard_opts, advanced_opts)
                 else:
                     profile_dir = os.path.join(profile_dir, profile_prefix)
 
