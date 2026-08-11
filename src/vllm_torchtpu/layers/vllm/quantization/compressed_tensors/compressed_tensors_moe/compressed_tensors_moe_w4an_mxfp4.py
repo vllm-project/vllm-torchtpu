@@ -220,9 +220,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
 
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                topk_ids, topk_weights)
+        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+            topk_ids, topk_weights)
 
         # Execute GMM Kernel with native fp4 weights and scales
         return fused_moe_gmm(

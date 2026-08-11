@@ -154,8 +154,6 @@ def test_mxfp4_apply_masks_padded_token_routes():
     masked_weights[1:] = 0
 
     with patch(
-            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.envs.TPU_MOE_SKIP_PADDED_TOKENS",
-            True), patch(
             "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.moe_routing.select_experts",
             return_value=(topk_weights, topk_ids)), patch(
                 "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.token_padding.zero_routing_weights_for_padding",
