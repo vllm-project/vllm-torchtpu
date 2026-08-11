@@ -3988,9 +3988,10 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in self._attn_layer_names
             }
 
-        if self._token_padding_state is not None:
+        padding_state = getattr(self, "_token_padding_state", None)
+        if padding_state is not None:
             # Every row of a dummy step is padding.
-            self._token_padding_state.update(0, num_tokens)
+            padding_state.update(0, num_tokens)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -5179,7 +5180,8 @@ class TPUModelRunner(GPUModelRunner):
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""
-        if self._token_padding_state is None:
+        padding_state = getattr(self, "_token_padding_state", None)
+        if padding_state is None:
             return
         plan = self._last_sequence_layout_plan
         if plan is not None and plan.kind is SequenceLayoutKind.ALL:
@@ -5187,7 +5189,7 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # Padding-mask support is currently limited to the ALL layout.
             num_valid_tokens = num_tokens_padded
-        self._token_padding_state.update(num_valid_tokens, num_tokens_padded)
+        padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
