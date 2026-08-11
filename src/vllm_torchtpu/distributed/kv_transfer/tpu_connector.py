@@ -1283,19 +1283,15 @@ class TPURaidenConnectorWorker:
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.tp_rank == 0:
             if self.is_producer:
-                prefill_queue_len = (
-                    len(self._stage3_registered_sends)
-                    if self._raiden_stage3_enabled()
-                    else len(self._legacy_registered_sends)
-                )
+                prefill_queue_len = (len(self._stage3_registered_sends)
+                                     if self._raiden_stage3_enabled() else len(
+                                         self._legacy_registered_sends))
                 self.transfer_stats.record_prefill_queue_length(
                     prefill_queue_len)
             else:
-                decode_queue_len = (
-                    len(self._stage3_submitted_loads)
-                    if self._raiden_stage3_enabled()
-                    else len(self._legacy_submitted_loads)
-                )
+                decode_queue_len = (len(self._stage3_submitted_loads)
+                                    if self._raiden_stage3_enabled() else len(
+                                        self._legacy_submitted_loads))
                 self.transfer_stats.record_decode_queue_length(
                     decode_queue_len)
 
