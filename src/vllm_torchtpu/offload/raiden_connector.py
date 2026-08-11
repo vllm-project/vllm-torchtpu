@@ -118,7 +118,7 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
     keys: list[OffloadKey]
-    gpu_block_ids: list[int]
+    device_block_ids: list[int]
     acks: int = 0
 
 
@@ -149,11 +149,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             src_spec, dst_spec = job.src_spec, job.dst_spec
             assert isinstance(src_spec, GPULoadStoreSpec)
             assert isinstance(dst_spec, RaidenLoadStoreSpec)
-            gpu_block_ids = src_spec.block_ids.tolist()
-            assert len(gpu_block_ids) == len(
-                dst_spec.keys), (len(gpu_block_ids), len(dst_spec.keys))
+            device_block_ids = src_spec.block_ids.tolist()
+            assert len(device_block_ids) == len(
+                dst_spec.keys), (len(device_block_ids), len(dst_spec.keys))
             self._fence_pending[job_id] = _ParkedStore(
-                keys=dst_spec.keys, gpu_block_ids=gpu_block_ids)
+                keys=dst_spec.keys, device_block_ids=device_block_ids)
             new_fence_ids.add(job_id)
 
         # Submit load jobs immediately: destination HBM blocks are freshly
@@ -162,12 +162,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             src_spec, dst_spec = job.src_spec, job.dst_spec
             assert isinstance(src_spec, RaidenLoadStoreSpec)
             assert isinstance(dst_spec, GPULoadStoreSpec)
-            gpu_block_ids = dst_spec.block_ids.tolist()
-            assert len(gpu_block_ids) == len(
-                src_spec.keys), (len(gpu_block_ids), len(src_spec.keys))
+            device_block_ids = dst_spec.block_ids.tolist()
+            assert len(device_block_ids) == len(
+                src_spec.keys), (len(device_block_ids), len(src_spec.keys))
             manager.submit_load_job(job_id,
                                     src_spec.keys,
-                                    gpu_block_ids,
+                                    device_block_ids,
                                     job.req_id,
                                     pinned=src_spec.pinned)
 
@@ -201,7 +201,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             else:
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
-                failed_load_block_ids.extend(finished_job.failed_gpu_block_ids)
+                failed_load_block_ids.extend(
+                    finished_job.failed_device_block_ids)
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -229,7 +230,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
                     self._raiden_manager.submit_store_job(
-                        job_id, parked.keys, parked.gpu_block_ids)
+                        job_id, parked.keys, parked.device_block_ids)
         super().update_connector_output(connector_output)
 
 

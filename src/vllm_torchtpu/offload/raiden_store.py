@@ -25,7 +25,7 @@ the scheduler.
 Key components and mechanisms:
 
 - Block granularity and coalescing: One store entry per physical kernel block.
-  A logical GPU block maps to `gpu_block_size_factor` store entries with derived
+  A logical device block maps to `device_block_size_factor` store entries with derived
   sub-hashes `OffloadKey ‖ sub_idx`. Contiguous device kernel blocks are fused
   by Raiden into single hardware DMAs.
 
@@ -138,10 +138,10 @@ class Admission:
     # success may cover torn bytes. The finalizer treats the admission as
     # failed regardless of the poll verdict.
     poisoned: bool = False
-    # Loads only: owning request and destination GPU block IDs, reported
+    # Loads only: owning request and destination device block IDs, reported
     # through get_block_ids_with_load_errors on failure.
     req_id: str | None = None
-    dst_gpu_block_ids: list[int] = field(default_factory=list)
+    dst_device_block_ids: list[int] = field(default_factory=list)
     # Loads only: the sub-hashes fetched from a peer via read_remote
     # rather than the local host pool. Drives the remote poll.
     remote_sub_hashes: set[bytes] = field(default_factory=set)
@@ -161,7 +161,7 @@ class FinishedJob:
     op: AdmissionOp
     success: bool
     req_id: str | None = None
-    failed_gpu_block_ids: list[int] = field(default_factory=list)
+    failed_device_block_ids: list[int] = field(default_factory=list)
 
 
 class RaidenOffloadingManager(OffloadingManager):
@@ -177,7 +177,7 @@ class RaidenOffloadingManager(OffloadingManager):
         *,
         kernel_physical_blocks_capacity: int,
         offload_logical_blocks_capacity: int,
-        gpu_block_size_factor: int,
+        device_block_size_factor: int,
         world_size: int,
         raiden_controller_port: int,
         raiden_job_name: str,
@@ -190,9 +190,9 @@ class RaidenOffloadingManager(OffloadingManager):
         store_types: object | None = None,
     ):
         assert kernel_physical_blocks_capacity == (
-            offload_logical_blocks_capacity * gpu_block_size_factor)
+            offload_logical_blocks_capacity * device_block_size_factor)
         self._capacity_keys = offload_logical_blocks_capacity
-        self._gpu_block_size_factor = gpu_block_size_factor
+        self._device_block_size_factor = device_block_size_factor
         self._key_namespace = key_namespace
         # Cross-instance sharing: publishing blocks to the global registry
         # requires a peer-reachable store_server_ip.
@@ -246,7 +246,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 "(%d offloaded blocks x %d), namespace=%s, controller at "
                 "%s, all %d workers registered%s",
                 kernel_physical_blocks_capacity,
-                offload_logical_blocks_capacity, gpu_block_size_factor,
+                offload_logical_blocks_capacity, device_block_size_factor,
                 key_namespace.hex(), store.raiden_controller_address,
                 world_size,
                 (f", published at {store.store_server_address or '<nothing>'}"
@@ -284,7 +284,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # across incompatible engines; locally it is inert.
         return [
             self._key_namespace + key + i.to_bytes(4, "big")
-            for i in range(self._gpu_block_size_factor)
+            for i in range(self._device_block_size_factor)
         ]
 
     def _expand_keys(self, keys: list[OffloadKey]) -> list[bytes]:
@@ -293,9 +293,9 @@ class RaidenOffloadingManager(OffloadingManager):
             out.extend(self._sub_hashes(key))
         return out
 
-    def _expand_gpu_blocks(self, gpu_block_ids: list[int]) -> list[int]:
-        f = self._gpu_block_size_factor
-        return [b * f + i for b in gpu_block_ids for i in range(f)]
+    def _expand_device_blocks(self, device_block_ids: list[int]) -> list[int]:
+        f = self._device_block_size_factor
+        return [b * f + i for b in device_block_ids for i in range(f)]
 
     def _newly_inserted_sub_hashes(
             self, sub_hashes: list[bytes],
@@ -524,7 +524,7 @@ class RaidenOffloadingManager(OffloadingManager):
     # -- job submission bridge (called by the connector scheduler) --------
 
     def submit_store_job(self, job_id: int, keys: list[OffloadKey],
-                         gpu_block_ids: list[int]) -> None:
+                         device_block_ids: list[int]) -> None:
         """Admit and launch a store job after all worker ranks acknowledge the save fence.
 
         Atomically admits the batch via insert_and_lock (pinning pre-existing
@@ -534,9 +534,10 @@ class RaidenOffloadingManager(OffloadingManager):
         asynchronously by the finalizer. A directory state that lookup cannot
         account for fails the job closed (rollback + recompute).
         """
-        assert len(keys) == len(gpu_block_ids), (len(keys), len(gpu_block_ids))
+        assert len(keys) == len(device_block_ids), (len(keys),
+                                                    len(device_block_ids))
         sub_hashes = self._expand_keys(keys)
-        device_ids = self._expand_gpu_blocks(gpu_block_ids)
+        device_ids = self._expand_device_blocks(device_block_ids)
         slices = [
             self._block_id_cls(
                 raiden_id=self._raiden_id,
@@ -607,11 +608,12 @@ class RaidenOffloadingManager(OffloadingManager):
     def submit_load_job(self,
                         job_id: int,
                         keys: list[OffloadKey],
-                        gpu_block_ids: list[int],
+                        device_block_ids: list[int],
                         req_id: str,
                         pinned: bool = True) -> None:
         """Launch a load job; entries were pinned in prepare_load."""
-        assert len(keys) == len(gpu_block_ids), (len(keys), len(gpu_block_ids))
+        assert len(keys) == len(device_block_ids), (len(keys),
+                                                    len(device_block_ids))
         if not pinned:
             # prepare_load lost the pin race; nothing is held, so fail the
             # job without touching the store and let vLLM recompute.
@@ -620,10 +622,10 @@ class RaidenOffloadingManager(OffloadingManager):
                             op=AdmissionOp.LOAD,
                             success=False,
                             req_id=req_id,
-                            failed_gpu_block_ids=list(gpu_block_ids)))
+                            failed_device_block_ids=list(device_block_ids)))
             return
         sub_hashes = self._expand_keys(keys)
-        device_ids = self._expand_gpu_blocks(gpu_block_ids)
+        device_ids = self._expand_device_blocks(device_block_ids)
         # Partition by live directory status: REMOTE sub-hashes (installed by
         # prepare_load's insert_and_lock) are fetched from their peer with
         # read_remote, everything else comes from the local host pool. The
@@ -666,7 +668,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 pending=set(in_flight),
                 failed=True,
                 req_id=req_id,
-                dst_gpu_block_ids=list(gpu_block_ids),
+                dst_device_block_ids=list(device_block_ids),
                 remote_sub_hashes=set(remote_hashes),
                 failed_sub_hashes=list(failed_hashes),
             )
@@ -699,7 +701,7 @@ class RaidenOffloadingManager(OffloadingManager):
             sub_hashes=sub_hashes,
             pending=set(sub_hashes),
             req_id=req_id,
-            dst_gpu_block_ids=list(gpu_block_ids),
+            dst_device_block_ids=list(device_block_ids),
             remote_sub_hashes=set(remote_hashes),
         )
         self._admissions[job_id] = admission
@@ -753,8 +755,8 @@ class RaidenOffloadingManager(OffloadingManager):
                     op=AdmissionOp.LOAD,
                     success=success,
                     req_id=admission.req_id,
-                    failed_gpu_block_ids=([] if success else list(
-                        admission.dst_gpu_block_ids)),
+                    failed_device_block_ids=([] if success else list(
+                        admission.dst_device_block_ids)),
                 ))
 
     def _poll_once(self) -> None:
@@ -896,7 +898,7 @@ def derive_offload_namespace(
     kernel_block_size: int,
     per_block_shape: tuple[int, ...],
     kv_dtype: object,
-    gpu_block_size: int,
+    device_block_size: int,
     world_size: int,
     num_kv_cache_groups: int,
     num_kv_cache_tensors: int,
@@ -907,7 +909,7 @@ def derive_offload_namespace(
     hashing all configuration parameters that alter binary KV cache layout:
     - Model identity: model name, revision, quantization.
     - KV cache geometry: KV data type, kernel block size, per-block tensor shape,
-      GPU block size, and cache group/tensor counts.
+      device block size, and cache group/tensor counts.
     - Distributed topology: world size (TP/PP) and context parallelism geometry
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
@@ -918,7 +920,7 @@ def derive_offload_namespace(
     model_config = vllm_config.model_config
     material = repr((model_config.model, model_config.revision,
                      model_config.quantization, str(kv_dtype),
-                     kernel_block_size, per_block_shape, gpu_block_size,
+                     kernel_block_size, per_block_shape, device_block_size,
                      world_size, num_kv_cache_groups, num_kv_cache_tensors,
                      vllm_config.cache_config.prefix_caching_hash_algo,
                      "tpu-raiden-offload-ns1") + cp_geometry)
@@ -928,7 +930,7 @@ def derive_offload_namespace(
 def resolve_kernel_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> tuple[int, tuple[int, ...], object, int]:
-    """Resolve physical TPU kernel geometry: (kernel_block_size, per_block_shape, kv_dtype, gpu_block_size).
+    """Resolve physical TPU kernel geometry: (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
 
     Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
     (device view reconstruction) to guarantee exact geometry parity.
@@ -1046,10 +1048,10 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         import torch
 
         (kernel_block_size, per_block_shape, kv_dtype,
-         gpu_block_size) = resolve_kernel_geometry(vllm_config,
-                                                   kv_cache_config)
-        assert gpu_block_size % kernel_block_size == 0
-        gpu_block_size_factor = gpu_block_size // kernel_block_size
+         device_block_size) = resolve_kernel_geometry(vllm_config,
+                                                      kv_cache_config)
+        assert device_block_size % kernel_block_size == 0
+        device_block_size_factor = device_block_size // kernel_block_size
 
         bytes_per_kernel_block = (
             int(np.prod(per_block_shape)) *
@@ -1060,14 +1062,14 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         device_tensors: list[torch.Tensor] = []
         for kv_cache_tensor in kv_caches.tensors:
             # Verify that one canonical scheduler page equals exactly
-            # gpu_block_size_factor physical kernel rows. For hybrid models
+            # device_block_size_factor physical kernel rows. For hybrid models
             # using the unified pool, this confirms that all group pages are
             # uniformly padded and fungible across pool rows.
             assert kv_cache_tensor.page_size_bytes == (
-                gpu_block_size_factor * bytes_per_kernel_block), (
+                device_block_size_factor * bytes_per_kernel_block), (
                     "canonical page size does not match the kernel-row "
                     f"geometry: page={kv_cache_tensor.page_size_bytes}, "
-                    f"factor={gpu_block_size_factor}, "
+                    f"factor={device_block_size_factor}, "
                     f"kernel_row_bytes={bytes_per_kernel_block}")
             int8_view = kv_cache_tensor.tensor
             storage_bytes = int8_view.numel() * int8_view.element_size()
@@ -1077,10 +1079,10 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                 f"bytes_per_kernel_block={bytes_per_kernel_block}")
             num_kernel_blocks = storage_bytes // bytes_per_kernel_block
             assert num_kernel_blocks == (
-                int8_view.shape[0] * gpu_block_size_factor), (
+                int8_view.shape[0] * device_block_size_factor), (
                     "canonical KV cache geometry does not match physical "
                     f"kernel-block geometry: canonical={int8_view.shape[0]}, "
-                    f"factor={gpu_block_size_factor}, "
+                    f"factor={device_block_size_factor}, "
                     f"kernel_blocks={num_kernel_blocks}")
             device_tensors.append(
                 torch.empty(0, dtype=kv_dtype, device=int8_view.device).set_(
@@ -1215,7 +1217,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         assert config.cache.blocks_per_chunk == 1, (
             "TPURaidenOffloadingConnector: requires blocks_per_chunk == 1 (one OffloadKey "
-            "= one scheduler GPU block); got "
+            "= one scheduler device block); got "
             f"{config.cache.blocks_per_chunk}")
         parallel = config.parallel
         assert parallel.dcp_size == 1, (
@@ -1244,10 +1246,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 "kv_connector_extra_config (--kv-offloading-size)")
 
         (kernel_block_size, per_block_shape, kv_dtype,
-         gpu_block_size) = resolve_kernel_geometry(vllm_config,
-                                                   kv_cache_config)
-        assert gpu_block_size % kernel_block_size == 0
-        self.gpu_block_size_factor = gpu_block_size // kernel_block_size
+         device_block_size) = resolve_kernel_geometry(vllm_config,
+                                                      kv_cache_config)
+        assert device_block_size % kernel_block_size == 0
+        self.device_block_size_factor = device_block_size // kernel_block_size
 
         # Verify PCP scaling invariant: scheduler chunks at the logical all-PCP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
@@ -1282,7 +1284,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             "TPURaidenOffloadingConnector: cpu_bytes_to_use too small for even one "
             f"offloaded block ({bytes_per_block_all_ranks} bytes)")
         self.kernel_physical_blocks_capacity = (
-            self.offload_logical_blocks_capacity * self.gpu_block_size_factor)
+            self.offload_logical_blocks_capacity *
+            self.device_block_size_factor)
 
         # Cross-instance KV sharing: configured via extra_config. Setting
         # global_registry_address enables remote lookups and RDMA fetches;
@@ -1301,7 +1304,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             kernel_block_size=kernel_block_size,
             per_block_shape=per_block_shape,
             kv_dtype=kv_dtype,
-            gpu_block_size=gpu_block_size,
+            device_block_size=device_block_size,
             world_size=self.world_size,
             num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
             num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
@@ -1342,7 +1345,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity=self.
                 offload_logical_blocks_capacity,
-                gpu_block_size_factor=self.gpu_block_size_factor,
+                device_block_size_factor=self.device_block_size_factor,
                 world_size=self.world_size,
                 raiden_controller_port=self.raiden_controller_port,
                 raiden_job_name=self.raiden_job_name,

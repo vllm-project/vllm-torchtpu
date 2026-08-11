@@ -6,7 +6,7 @@ physical TPU hardware or native C++ wheels:
 
 1. Registration & Lifecycle:
    - Registration gate: Blocks operations until all worker ranks register.
-   - Sub-hash expansion: OffloadKey maps to gpu_block_size_factor physical sub-hashes.
+   - Sub-hash expansion: OffloadKey maps to device_block_size_factor physical sub-hashes.
    - Atomic admission & cleanup: insert_and_lock on submit, a post-admission
      lookup classifying the pinned batch, release on success, and
      release_and_delete on terminal failure.
@@ -285,15 +285,15 @@ class FakeKVCacheStore:
 
 def make_manager(store,
                  *,
-                 gpu_block_size_factor=4,
+                 device_block_size_factor=4,
                  num_blocks=8,
                  world_size=2,
                  **kwargs):
     from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
     return RaidenOffloadingManager(
-        kernel_physical_blocks_capacity=num_blocks * gpu_block_size_factor,
+        kernel_physical_blocks_capacity=num_blocks * device_block_size_factor,
         offload_logical_blocks_capacity=num_blocks,
-        gpu_block_size_factor=gpu_block_size_factor,
+        device_block_size_factor=device_block_size_factor,
         world_size=world_size,
         raiden_controller_port=0,
         raiden_job_name="test",
@@ -314,43 +314,43 @@ def make_global_manager(store, **kwargs):
 
 
 def sub_hashes(key: bytes,
-               gpu_block_size_factor: int = 4,
+               device_block_size_factor: int = 4,
                key_namespace: bytes = b"",
                ns: bytes = b"") -> list[bytes]:
     prefix = key_namespace or ns
     return [
         prefix + key + i.to_bytes(4, "big")
-        for i in range(gpu_block_size_factor)
+        for i in range(device_block_size_factor)
     ]
 
 
 def seed_host_entries(store,
                       key: bytes,
-                      gpu_block_size_factor: int = 4) -> None:
-    for sub_hash in sub_hashes(key, gpu_block_size_factor):
+                      device_block_size_factor: int = 4) -> None:
+    for sub_hash in sub_hashes(key, device_block_size_factor):
         store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
 
 
 def displace_entries(store,
                      key: bytes,
-                     gpu_block_size_factor: int = 4) -> None:
+                     device_block_size_factor: int = 4) -> None:
     """Move `key`'s entries to the eviction-candidate list: invisible to
     lookup but still physically present (holding their host blocks), exactly
     as a store admission's displacement leaves them until the GC or a
     same-hash re-admission collects them."""
-    for sub_hash in sub_hashes(key, gpu_block_size_factor):
+    for sub_hash in sub_hashes(key, device_block_size_factor):
         store.entries[sub_hash].is_candidate = True
 
 
 def seed_global_entries(store,
                         key: bytes,
-                        gpu_block_size_factor: int = 4,
+                        device_block_size_factor: int = 4,
                         key_namespace: bytes = b"",
                         ns: bytes = b"") -> None:
     """Publish a peer's REMOTE slices for `key` in the fake registry."""
     prefix = key_namespace or ns
-    for i, sub_hash in enumerate(sub_hashes(key, gpu_block_size_factor,
-                                            prefix)):
+    for i, sub_hash in enumerate(
+            sub_hashes(key, device_block_size_factor, prefix)):
         store.global_entries[sub_hash] = FakeRaidenBlockID(
             raiden_id=object(),
             host_block_id=100 + i,
@@ -416,10 +416,10 @@ class TestStoreJobLifecycle(unittest.TestCase):
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
-    def _admit(self, keys, gpu_blocks):
+    def _admit(self, keys, device_blocks):
         out = self.manager.prepare_store(keys, _ctx())
         self.assertEqual(out.keys_to_store, keys)
-        self.manager.submit_store_job(7, keys, gpu_blocks)
+        self.manager.submit_store_job(7, keys, device_blocks)
 
     def test_submit_expands_sub_hashes_and_device_blocks(self):
         self._admit([_key(0), _key(1)], [5, 9])
@@ -566,18 +566,18 @@ class TestLoadJobLifecycle(unittest.TestCase):
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         self.assertEqual(finished_job.req_id, "r1")
-        self.assertEqual(finished_job.failed_gpu_block_ids, [])
+        self.assertEqual(finished_job.failed_device_block_ids, [])
         for h in batch:
             self.assertEqual(self.store.entries[h].pin_count, 0)
 
-    def test_load_failure_reports_dst_gpu_blocks_and_keeps_host(self):
+    def test_load_failure_reports_dst_device_blocks_and_keeps_host(self):
         self.manager.prepare_load([_key(0)], _ctx("r1"))
         self.manager.submit_load_job(3, [_key(0)], [10], "r1")
         self.store.complete_load(sub_hashes(_key(0)), success=False)
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.req_id, "r1")
-        self.assertEqual(finished_job.failed_gpu_block_ids, [10])
+        self.assertEqual(finished_job.failed_device_block_ids, [10])
         # Pre-existing HOST entries remain intact and unpinned upon failure.
         for h in sub_hashes(_key(0)):
             self.assertEqual(self.store.entries[h].status,
@@ -590,7 +590,7 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.manager.submit_load_job(3, [_key(0)], [10], "r1")
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [10])
+        self.assertEqual(finished_job.failed_device_block_ids, [10])
         for h in sub_hashes(_key(0)):
             self.assertEqual(self.store.entries[h].pin_count, 0)
 
@@ -605,7 +605,7 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.assertEqual(self.store.calls_named("release"), [])
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [10])
+        self.assertEqual(finished_job.failed_device_block_ids, [10])
 
 
 class TestTouchAndMisc(unittest.TestCase):
@@ -709,20 +709,20 @@ class TestSchedulerFenceFlow(unittest.TestCase):
             jobs_to_flush=jobs_to_flush or set(),
         )
 
-    def _store_job(self, keys, gpu_block_ids, req_id="r1"):
+    def _store_job(self, keys, device_block_ids, req_id="r1"):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import \
             TransferJob
 
         from vllm_torchtpu.offload.raiden_store import RaidenLoadStoreSpec
         return TransferJob(
             req_id=req_id,
-            src_spec=GPULoadStoreSpec(gpu_block_ids,
-                                      group_sizes=[len(gpu_block_ids)],
+            src_spec=GPULoadStoreSpec(device_block_ids,
+                                      group_sizes=[len(device_block_ids)],
                                       block_indices=[0]),
             dst_spec=RaidenLoadStoreSpec(keys),
         )
 
-    def _load_job(self, keys, gpu_block_ids, req_id="r1"):
+    def _load_job(self, keys, device_block_ids, req_id="r1"):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import \
             TransferJob
 
@@ -730,8 +730,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         return TransferJob(
             req_id=req_id,
             src_spec=RaidenLoadStoreSpec(keys),
-            dst_spec=GPULoadStoreSpec(gpu_block_ids,
-                                      group_sizes=[len(gpu_block_ids)],
+            dst_spec=GPULoadStoreSpec(device_block_ids,
+                                      group_sizes=[len(device_block_ids)],
                                       block_indices=[0]),
         )
 
@@ -1106,7 +1106,7 @@ class TestFailureHardening(unittest.TestCase):
         self.store.complete_load(sub_hashes(_key(0)), success=False)
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [10])
+        self.assertEqual(finished_job.failed_device_block_ids, [10])
 
     def test_failed_save_launch_reports_failure(self):
         self.store.fail_save = True
@@ -1125,7 +1125,7 @@ class TestFailureHardening(unittest.TestCase):
         self.manager.submit_load_job(3, [_key(0)], [10], "r1")
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [10])
+        self.assertEqual(finished_job.failed_device_block_ids, [10])
 
     def test_drain_timeout_poisons_inflight_job(self):
         import vllm_torchtpu.offload.raiden_store as rs
@@ -1212,9 +1212,10 @@ class TestPostAdmissionClassification(unittest.TestCase):
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
-    def _store_key(self, key, gpu_block, job_id):
+    def _store_key(self, key, device_block, job_id):
         out = self.manager.prepare_store([key], _ctx())
-        self.manager.submit_store_job(job_id, out.keys_to_store, [gpu_block])
+        self.manager.submit_store_job(job_id, out.keys_to_store,
+                                      [device_block])
 
     def test_lookup_classification_saves_only_new_sub_hashes(self):
         batch = sub_hashes(_key(0))
@@ -1416,7 +1417,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.store.complete_remote_read(sub_hashes(key), success=False)
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [5])
+        self.assertEqual(finished_job.failed_device_block_ids, [5])
         # Failed remote read frees landing buffer while preserving peer registry mapping.
         for h in sub_hashes(key):
             self.assertNotIn(h, self.store.entries)
@@ -1439,7 +1440,7 @@ class TestRemoteReadFlow(unittest.TestCase):
                                      pinned=spec.pinned)
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [5, 6])
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
         self.assertEqual(self.store.calls_named("read_remote"), [])
 
     def test_read_remote_launch_failure_after_local_load(self):
@@ -1457,7 +1458,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.store.complete_load(sub_hashes(local_key))
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [5, 6])
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
         # Cleanup deletes REMOTE install while preserving valid HOST entries.
         for h in sub_hashes(remote_key):
             self.assertNotIn(h, self.store.entries)
@@ -1478,7 +1479,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         # Immediate terminal failure deletes REMOTE install and frees landing buffers.
         (finished_job, ) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_gpu_block_ids, [5])
+        self.assertEqual(finished_job.failed_device_block_ids, [5])
         for h in sub_hashes(key):
             self.assertNotIn(h, self.store.entries)
             self.assertIn(h, self.store.global_entries)
@@ -1567,7 +1568,7 @@ class TestNamespace(unittest.TestCase):
         kwargs = dict(kernel_block_size=256,
                       per_block_shape=(256, 8, 2, 128),
                       kv_dtype="bfloat16",
-                      gpu_block_size=1280,
+                      device_block_size=1280,
                       world_size=4,
                       num_kv_cache_groups=1,
                       num_kv_cache_tensors=64)
@@ -1633,9 +1634,9 @@ class TestHybridGeometry(unittest.TestCase):
 
     def test_hybrid_uses_attention_geometry_with_mamba_group_first(self):
         # In hybrid models, group 0 may be Mamba; verify attention spec resolution.
-        kernel, shape, dtype, gpu_block = self._resolve(
+        kernel, shape, dtype, device_block = self._resolve(
             [self._mamba_spec(), self._attn_spec()])
-        self.assertEqual((kernel, gpu_block), (256, 1280))
+        self.assertEqual((kernel, device_block), (256, 1280))
         self.assertEqual(shape, (256, 8, 2, 128))
         self.assertEqual(dtype, "bfloat16")
 
@@ -1670,9 +1671,9 @@ class TestHybridGeometry(unittest.TestCase):
                    return_value=nullcontext()), \
              patch("vllm.v1.worker.utils.select_common_block_size",
                    return_value=256):
-            kernel, shape, dtype, gpu_block = rs.resolve_kernel_geometry(
+            kernel, shape, dtype, device_block = rs.resolve_kernel_geometry(
                 MagicMock(), kv_cache_config)
-        self.assertEqual((kernel, gpu_block), (256, 1280))
+        self.assertEqual((kernel, device_block), (256, 1280))
         self.assertEqual(shape, (256, 8, 2, 128))
         selector.assert_called_once()
 
