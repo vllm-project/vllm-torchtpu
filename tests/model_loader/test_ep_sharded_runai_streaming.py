@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for EP-sharded Run:AI weight streaming (model_loader_patches).
+"""Unit tests for EP-sharded Run:AI weight streaming (ep_sharded_streaming).
 
 Covers the pieces that decide WHAT gets fetched: the per-tensor skip
 predicate, and the construction of the byte-range request plan from
@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm_torchtpu.model_loader_patches import (
+from vllm_torchtpu.model_loader.ep_sharded_streaming import (
     _sharded_runai_weights_iterator, _should_skip)
 
 # ---------------------------------------------------------------------------
@@ -251,7 +251,7 @@ def test_patch_falls_back_when_filter_inactive():
     delegate to the original iterator; the patch must not double-apply."""
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
 
-    from vllm_torchtpu import model_loader_patches as mlp
+    from vllm_torchtpu.model_loader import ep_sharded_streaming as mlp
 
     original = MagicMock(name="original_get_weights_iterator")
 
