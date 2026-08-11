@@ -93,7 +93,8 @@ def test_mxfp4_create_weights_and_process():
         method.process_weights_after_loading(layer)
     mock_prebuild.assert_called_once_with(topk=2,
                                           activation="silu",
-                                          use_ep=False)
+                                          use_ep=False,
+                                          skip_padded_tokens=True)
 
     # Validate output
     assert hasattr(layer, "w13_weight")
@@ -168,6 +169,7 @@ def test_mxfp4_apply_masks_padded_token_routes():
     assert mock_gmm.call_args.kwargs["topk_ids"].dtype == torch.int32
     assert torch.equal(mock_gmm.call_args.kwargs["topk_weights"],
                        masked_weights)
+    assert mock_gmm.call_args.kwargs["skip_padded_tokens"] is True
 
 
 def test_mxfp4_create_weights_does_not_zero_initialize():

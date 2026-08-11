@@ -186,6 +186,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=use_ep,
+            skip_padded_tokens=True,
         )
 
     def apply_monolithic(
@@ -238,4 +239,5 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             rhs_quant_dtype=None,
+            skip_padded_tokens=True,
         )
