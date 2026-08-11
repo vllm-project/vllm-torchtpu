@@ -155,12 +155,13 @@ def test_mxfp4_apply_masks_padded_token_routes():
 
     with patch(
             "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.moe_routing.select_experts",
-            return_value=(topk_weights, topk_ids)), patch(
-                "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.token_padding.zero_routing_weights_for_padding",
-                return_value=(topk_ids.to(torch.int32), masked_weights)
-            ) as mock_mask, patch(
-                "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.fused_moe_gmm",
-                return_value=torch.zeros_like(x)) as mock_gmm:
+            return_value=(topk_weights, topk_ids)
+    ), patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.token_padding.zero_routing_weights_for_padding",
+            return_value=(topk_ids.to(torch.int32), masked_weights)
+    ) as mock_mask, patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.fused_moe_gmm",
+            return_value=torch.zeros_like(x)) as mock_gmm:
         method.apply_monolithic(layer, x, router_logits)
 
     mock_mask.assert_called_once()
