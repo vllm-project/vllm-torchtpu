@@ -132,6 +132,43 @@ def test_mxfp4_create_weights_and_process():
         assert mock_gmm.call_args.kwargs["experts_start"] is None
 
 
+def test_mxfp4_apply_masks_padded_token_routes():
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer._tpu_activation_str = "silu"
+    layer.w13_weight = torch.empty(0)
+    layer.w2_weight = torch.empty(0)
+    layer.w13_weight_scale = torch.empty(0)
+    layer.w2_weight_scale = torch.empty(0)
+    layer._experts_start = None
+
+    x = torch.randn(4, 8, dtype=torch.bfloat16)
+    router_logits = torch.randn(4, 4, dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]],
+                            dtype=torch.int64)
+    topk_weights = torch.full((4, 2), 0.5)
+    masked_weights = topk_weights.clone()
+    masked_weights[1:] = 0
+
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.moe_routing.select_experts",
+            return_value=(topk_weights, topk_ids)), patch(
+                "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.token_padding.zero_routing_weights_for_padding",
+                return_value=(topk_ids.to(torch.int32), masked_weights)
+            ) as mock_mask, patch(
+                "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.fused_moe_gmm",
+                return_value=torch.zeros_like(x)) as mock_gmm:
+        method.apply_monolithic(layer, x, router_logits)
+
+    mock_mask.assert_called_once()
+    assert mock_gmm.call_args.kwargs["topk_ids"].dtype == torch.int32
+    assert torch.equal(mock_gmm.call_args.kwargs["topk_weights"],
+                       masked_weights)
+
+
 def test_mxfp4_create_weights_does_not_zero_initialize():
     moe_config = MagicMock()
     moe_config.tp_size = 1

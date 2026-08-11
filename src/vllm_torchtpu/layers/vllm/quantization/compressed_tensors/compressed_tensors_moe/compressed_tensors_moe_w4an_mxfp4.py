@@ -6,7 +6,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.quantization import e8m0_to_fp32
-from vllm_torchtpu.layers.vllm import moe_routing
+from vllm_torchtpu.layers.vllm import moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  load_kmajor_fp4,
@@ -219,6 +219,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         # Ensure correct type for routing inputs
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
+
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights)
 
         # Execute GMM Kernel with native fp4 weights and scales
         return fused_moe_gmm(

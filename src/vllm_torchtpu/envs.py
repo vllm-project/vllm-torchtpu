@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
-    TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_SKIP_PADDED_TOKENS: bool = True
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -301,9 +301,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(val)
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
     # Skip padded tokens from MoE, otherwise they will route like
-    # real tokens and activate experts whose output is thrown away.
+    # real tokens and activate experts whose output is thrown away. Enabled by
+    # default; set to 0 as a correctness/performance kill switch.
     "TPU_MOE_SKIP_PADDED_TOKENS":
-    env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    env_bool("TPU_MOE_SKIP_PADDED_TOKENS", default=True),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
