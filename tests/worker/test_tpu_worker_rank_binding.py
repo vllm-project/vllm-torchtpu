@@ -68,14 +68,13 @@ def test_binding_does_not_depend_on_pcp_size():
     Data sharding is keyed on pcp_rank; device binding is not. Making the two
     covary is exactly the coupling this change removed.
     """
-    bindings = {
-        pcp: binding.get_tpu_worker_binding(
+    bindings = {}
+    for pcp in (1, 2, 4, 8):
+        bindings[pcp] = binding.get_tpu_worker_binding(
             _parallel_config(prefill_context_parallel_size=pcp),
             rank=6,
             local_rank=6,
             env={}).as_env()
-        for pcp in (1, 2, 4, 8)
-    }
 
     assert len({tuple(sorted(b.items())) for b in bindings.values()}) == 1
     assert bindings[8]["LOCAL_RANK"] == "6"
