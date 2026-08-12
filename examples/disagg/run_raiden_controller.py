@@ -1,8 +1,13 @@
 import argparse
 import time
 
-from tpu_raiden.rpc.raiden_controller import (RaidenController,
-                                              RaidenControllerServer)
+try:
+    from tpu_sync.rpc.raiden_controller import (RaidenController,
+                                                RaidenControllerServer)
+except ModuleNotFoundError:
+    # tpu-raiden-torch wheels predating the tpu_sync package rename.
+    from tpu_raiden.rpc.raiden_controller import (RaidenController,
+                                                  RaidenControllerServer)
 
 
 def main():
