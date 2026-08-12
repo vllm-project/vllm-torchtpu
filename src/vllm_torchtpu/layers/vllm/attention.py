@@ -477,10 +477,6 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
-        # head_size == 64 always falls back to the hd64 kernel at runtime
-        # regardless of backend (see sharded_ragged_paged_attention), and
-        # batched RPA has no hd64 variant in either fork, so both of those
-        # short-circuit here independent of USE_BATCHED_RPA_LONGCTX.
         if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
