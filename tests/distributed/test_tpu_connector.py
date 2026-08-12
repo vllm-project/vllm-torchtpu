@@ -293,6 +293,9 @@ class TestTPUConnector:
         connector.get_finished(set())
         worker.get_finished.assert_called_once_with(set())
 
+        connector.get_kv_connector_stats()
+        worker.get_kv_connector_stats.assert_called_once_with()
+
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
     @patch(f"{_MOD}.TPUConnectorWorker")
@@ -2791,6 +2794,78 @@ class TestTPURaidenConnectorWorker:
 
         worker = _make_raiden_worker(dp_rank=1, tp_size=4)
         assert worker.kv_transfer_port == 9108
+
+    def test_raiden_worker_queue_length_stats_producer_stage3(self):
+        worker = _make_raiden_worker(tp_rank=0, is_producer=True)
+        worker._stage3_registered_sends = {
+            "req1": MagicMock(),
+            "req2": MagicMock(),
+            "req3": MagicMock(),
+        }
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            stats = worker.get_kv_connector_stats()
+            assert stats is not None
+            assert stats.data["prefill_queue_length"] == [3]
+
+    def test_raiden_worker_queue_length_stats_producer_legacy(self):
+        worker = _make_raiden_worker(tp_rank=0, is_producer=True)
+        worker._legacy_registered_sends = {"req1", "req2"}
+        with patch.object(worker, "_raiden_stage3_enabled",
+                          return_value=False):
+            stats = worker.get_kv_connector_stats()
+            assert stats is not None
+            assert stats.data["prefill_queue_length"] == [2]
+
+    def test_raiden_worker_queue_length_stats_consumer_stage3(self):
+        worker = _make_raiden_worker(tp_rank=0, is_producer=False)
+        worker._stage3_submitted_loads = {
+            "req1": 1,
+            "req2": 1,
+            "req3": 1,
+            "req4": 1,
+            "req5": 1,
+        }
+        worker._stage3_terminal_loads = {"req1", "req2"}
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            stats = worker.get_kv_connector_stats()
+            assert stats is not None
+            assert stats.data["decode_queue_length"] == [3]
+
+    def test_raiden_worker_queue_length_stats_consumer_legacy(self):
+        worker = _make_raiden_worker(tp_rank=0, is_producer=False)
+        worker._legacy_submitted_loads = {"req1", "req2", "req3", "req4"}
+        with patch.object(worker, "_raiden_stage3_enabled",
+                          return_value=False):
+            stats = worker.get_kv_connector_stats()
+            assert stats is not None
+            assert stats.data["decode_queue_length"] == [4]
+
+    def test_raiden_worker_queue_length_stats_non_zero_tp_rank(self):
+        worker = _make_raiden_worker(tp_rank=1, is_producer=True)
+        worker._stage3_registered_sends = {"req1": MagicMock()}
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            stats = worker.get_kv_connector_stats()
+            assert stats is None
+
+    def test_poll_finished_cleans_legacy_registered_sends_producer(self):
+        worker = _make_raiden_worker(is_producer=True)
+        worker._legacy_registered_sends = {"req1", "req2", "req3", "req4"}
+        engine = MagicMock()
+        engine.poll_stats.return_value = (["req1"], [], ["req2"])
+        with patch.object(worker, "_raiden_stage3_enabled",
+                          return_value=False):
+            worker._poll_finished(engine)
+            assert worker._legacy_registered_sends == {"req3", "req4"}
+
+    def test_poll_finished_cleans_legacy_submitted_loads_consumer(self):
+        worker = _make_raiden_worker(is_producer=False)
+        worker._legacy_submitted_loads = {"req1", "req2", "req3", "req4"}
+        engine = MagicMock()
+        engine.poll_stats.return_value = ([], ["req1"], ["req2"])
+        with patch.object(worker, "_raiden_stage3_enabled",
+                          return_value=False):
+            worker._poll_finished(engine)
+            assert worker._legacy_submitted_loads == {"req3", "req4"}
 
 
 # ---------------------------------------------------------------------------

@@ -2480,6 +2480,8 @@ class TPURaidenConnectorWorker:
         if self.is_producer and not self._raiden_stage3_enabled():
             for req_id in done_sending:
                 self._legacy_registered_sends.discard(str(req_id))
+            for req_id in failed_recving:
+                self._legacy_registered_sends.discard(str(req_id))
         elif not self.is_producer and not self._raiden_stage3_enabled():
             for req_id in done_recving:
                 self._legacy_submitted_loads.discard(str(req_id))
