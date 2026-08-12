@@ -22,6 +22,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first)
 from vllm.model_executor.layers.mla import (MLAModules,
                                             MultiHeadLatentAttentionWrapper)
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, sharded_weight_loader)
 from vllm.model_executor.utils import set_weight_attrs
@@ -61,6 +62,74 @@ def _load_a_log(parameter: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     shard_size = parameter.shape[0]
     loaded_weight = loaded_weight.narrow(0, rank * shard_size, shard_size)
     default_weight_loader(parameter, loaded_weight)
+
+
+class MixedParallelMergedLinear(MergedColumnParallelLinear):
+    """One local matmul containing replicated and TP-column weight slices.
+
+    Every rank stores complete weights for replicated outputs and only its
+    column-parallel slice for sharded outputs.  The physical output sizes are
+    therefore local sizes, so the parent is intentionally constructed with TP
+    disabled; this loader performs the selective checkpoint sharding instead.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        replicate_outputs: list[bool],
+        *,
+        bias: bool,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        if len(output_sizes) != len(replicate_outputs):
+            raise ValueError("Every fused output needs a sharding mode")
+        tp_size = get_tensor_model_parallel_world_size()
+        if any(not replicate and size % tp_size
+               for size, replicate in zip(output_sizes, replicate_outputs)):
+            raise ValueError("Column-parallel fused outputs must divide TP")
+        self.mixed_tp_size = tp_size
+        self.mixed_tp_rank = get_tensor_model_parallel_rank()
+        self.global_output_sizes = output_sizes
+        self.replicate_outputs = replicate_outputs
+        local_output_sizes = [
+            size if replicate else size // tp_size
+            for size, replicate in zip(output_sizes, replicate_outputs)
+        ]
+        super().__init__(
+            input_size,
+            local_output_sizes,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+            disable_tp=True,
+        )
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        if (isinstance(loaded_shard_id, int)
+                and not self.replicate_outputs[loaded_shard_id]):
+            output_dim = getattr(param, "output_dim", None)
+            is_sharded_weight = getattr(param, "is_sharded_weight", False)
+            is_sharded_weight |= getattr(param, "use_bitsandbytes_4bit", False)
+            if output_dim is not None and not is_sharded_weight:
+                loaded_size = loaded_weight.shape[output_dim]
+                if loaded_size % self.mixed_tp_size:
+                    raise ValueError(
+                        "Fused column-parallel checkpoint dimension does not "
+                        f"divide TP: {loaded_size=} {self.mixed_tp_size=}")
+                shard_size = loaded_size // self.mixed_tp_size
+                loaded_weight = loaded_weight.narrow(
+                    output_dim,
+                    self.mixed_tp_rank * shard_size,
+                    shard_size,
+                )
+        super().weight_loader(param, loaded_weight, loaded_shard_id)
 
 
 class MultiHeadLatentAttention(nn.Module):
@@ -104,6 +173,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.v_head_dim = int(config.v_head_dim)
         self.qk_head_dim = qk_head_dim
 
+        self.mla_gate_is_fused = False
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(
                 config.hidden_size,
@@ -116,14 +186,31 @@ class MultiHeadLatentAttention(nn.Module):
             self.q_a_layernorm = None
             self.q_b_proj = None
         else:
-            self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                config.hidden_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkv_a_proj",
-                disable_tp=True,
-            )
+            qkv_a_output_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+            if getattr(config, "mla_use_output_gate", False):
+                qkv_a_output_sizes.append(config.num_attention_heads *
+                                          self.v_head_dim)
+                self.fused_qkv_a_proj = MixedParallelMergedLinear(
+                    config.hidden_size,
+                    qkv_a_output_sizes,
+                    [True, True, False],
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
+                self.mla_gate_is_fused = True
+            else:
+                self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                    config.hidden_size,
+                    qkv_a_output_sizes,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                    disable_tp=True,
+                )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -157,7 +244,8 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.g_proj",
-        ) if getattr(config, "mla_use_output_gate", False) else None)
+        ) if (getattr(config, "mla_use_output_gate", False)
+              and not self.mla_gate_is_fused) else None)
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.v_head_dim,
             config.hidden_size,
@@ -184,6 +272,7 @@ class MultiHeadLatentAttention(nn.Module):
         # Attach it as backend-specific metadata instead of passing a stale
         # constructor argument.
         mla_modules.g_proj = self.g_proj
+        mla_modules.gate_is_fused = self.mla_gate_is_fused
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
             num_heads,
@@ -268,55 +357,22 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
         quant_config = vllm_config.quant_config
 
-        self.q_proj = ColumnParallelLinear(
+        self.fused_qkvb_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            self.projection_size,
+            [self.projection_size] * 3 + [self.total_heads],
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.q_proj",
-        )
-        self.k_proj = ColumnParallelLinear(
-            config.hidden_size,
-            self.projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k_proj",
-        )
-        self.v_proj = ColumnParallelLinear(
-            config.hidden_size,
-            self.projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v_proj",
-        )
-        self.q_conv1d = CausalDepthwiseConv1d(self.projection_size,
-                                              self.conv_size)
-        self.k_conv1d = CausalDepthwiseConv1d(self.projection_size,
-                                              self.conv_size)
-        self.v_conv1d = CausalDepthwiseConv1d(self.projection_size,
-                                              self.conv_size)
-        self.f_a_proj = ReplicatedLinear(
-            config.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.f_a_proj",
-        )
-        self.f_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            self.projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.f_b_proj",
-        )
-        self.b_proj = ColumnParallelLinear(
-            config.hidden_size,
-            self.total_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.b_proj",
+            prefix=f"{prefix}.fused_qkvb_proj",
         )
         if self.use_full_rank_gate:
+            self.fused_fa_ga_proj = None
+            self.f_a_proj = ReplicatedLinear(
+                config.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_a_proj",
+            )
             self.g_proj = ColumnParallelLinear(
                 config.hidden_size,
                 self.projection_size,
@@ -325,13 +381,32 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 prefix=f"{prefix}.g_proj",
             )
         else:
-            self.g_a_proj = ReplicatedLinear(
+            self.fused_fa_ga_proj = MergedColumnParallelLinear(
                 config.hidden_size,
-                self.head_dim,
+                [self.head_dim, self.head_dim],
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.g_a_proj",
+                prefix=f"{prefix}.fused_fa_ga_proj",
+                disable_tp=True,
             )
+            self.f_a_proj = None
+            self.g_proj = None
+        self.q_conv1d = CausalDepthwiseConv1d(self.projection_size,
+                                              self.conv_size)
+        self.k_conv1d = CausalDepthwiseConv1d(self.projection_size,
+                                              self.conv_size)
+        self.v_conv1d = CausalDepthwiseConv1d(self.projection_size,
+                                              self.conv_size)
+        self.f_b_proj = ColumnParallelLinear(
+            self.head_dim,
+            self.projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.f_b_proj",
+        )
+        if self.use_full_rank_gate:
+            self.g_b_proj = None
+        else:
             self.g_b_proj = ColumnParallelLinear(
                 self.head_dim,
                 self.projection_size,
@@ -423,18 +498,24 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         del positions
-        query, _ = self.q_proj(hidden_states)
-        key, _ = self.k_proj(hidden_states)
-        value, _ = self.v_proj(hidden_states)
+        projected, _ = self.fused_qkvb_proj(hidden_states)
+        query, key, value, beta = projected.split(
+            [self.local_projection_size] * 3 + [self.num_heads], dim=-1)
         mixed_qkv = torch.cat((query, key, value), dim=-1)
-        f_a, _ = self.f_a_proj(hidden_states)
-        raw_gate, _ = self.f_b_proj(f_a)
-        beta, _ = self.b_proj(hidden_states)
         if self.use_full_rank_gate:
+            assert self.f_a_proj is not None
+            f_a, _ = self.f_a_proj(hidden_states)
+            assert self.g_proj is not None
             output_gate, _ = self.g_proj(hidden_states)
         else:
-            g_a, _ = self.g_a_proj(hidden_states)
-            output_gate, _ = self.g_b_proj(g_a)
+            assert self.fused_fa_ga_proj is not None
+            gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
+            f_a, gate_input = gate_inputs.split([self.head_dim, self.head_dim],
+                                                dim=-1)
+        raw_gate, _ = self.f_b_proj(f_a)
+        if not self.use_full_rank_gate:
+            assert self.g_b_proj is not None
+            output_gate, _ = self.g_b_proj(gate_input)
 
         metadata = self._metadata()
         if (metadata is None or self.kv_cache is None

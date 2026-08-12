@@ -351,8 +351,9 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
 
     class FakeLinear(nn.Module):
 
-        def __init__(self, input_size, output_size, **kwargs) -> None:
+        def __init__(self, input_size, output_size, *args, **kwargs) -> None:
             super().__init__()
+            del args
             del kwargs
             self.output_size = (sum(output_size) if isinstance(
                 output_size, list) else output_size)
@@ -413,6 +414,92 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     )
 
 
+def test_mla_fuses_output_gate_with_lora_a_projections(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class FakeLinear(nn.Module):
+
+        def __init__(self, input_size, output_size, *args, **kwargs) -> None:
+            super().__init__()
+            del args
+            del kwargs
+            self.output_size = (sum(output_size) if isinstance(
+                output_size, list) else output_size)
+            self.weight = nn.Parameter(
+                torch.empty(self.output_size, input_size))
+
+    class FakeMLAWrapper(nn.Module):
+
+        def __init__(self, *args) -> None:
+            super().__init__()
+            self.mla_modules = args[8]
+
+    monkeypatch.setattr(kimi_attention, "MultiHeadLatentAttentionWrapper",
+                        FakeMLAWrapper)
+    monkeypatch.setattr(kimi_attention, "ColumnParallelLinear", FakeLinear)
+    monkeypatch.setattr(kimi_attention, "MixedParallelMergedLinear",
+                        FakeLinear)
+    monkeypatch.setattr(kimi_attention, "ReplicatedLinear", FakeLinear)
+    monkeypatch.setattr(kimi_attention, "RowParallelLinear", FakeLinear)
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        num_attention_heads=4,
+        q_lora_rank=8,
+        kv_lora_rank=8,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        mla_use_nope=True,
+        mla_use_output_gate=True,
+    )
+    monkeypatch.setattr(current_platform, "check_and_update_config",
+                        lambda _: None)
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        layer = MultiHeadLatentAttention(
+            config,
+            vllm_config,
+            prefix="model.layers.0.self_attn",
+        )
+
+    assert layer.fused_qkv_a_proj.output_size == 8 + (8 + 2) + 4 * 4
+    assert layer.g_proj is None
+    assert layer.mla_attn.mla_modules.gate_is_fused is True
+
+
+def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm.model_executor.parameter as parameter_module
+
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
+                        lambda: 2)
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_rank",
+                        lambda: 1)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank",
+                        lambda: 0)
+    monkeypatch.setattr(parameter_module,
+                        "get_tensor_model_parallel_world_size", lambda: 1)
+    layer = kimi_attention.MixedParallelMergedLinear(
+        2,
+        [4, 3],
+        [False, True],
+        bias=False,
+        quant_config=None,
+        prefix="mixed",
+    )
+    column_weight = torch.arange(8, dtype=layer.weight.dtype).view(4, 2)
+    replicated_weight = torch.arange(6, dtype=layer.weight.dtype).view(3,
+                                                                       2) + 100
+
+    layer.weight_loader(layer.weight, column_weight, 0)
+    layer.weight_loader(layer.weight, replicated_weight, 1)
+
+    expected = torch.cat((column_weight[2:], replicated_weight), dim=0)
+    torch.testing.assert_close(layer.weight, expected)
+
+
 class _Projection(nn.Module):
 
     def __init__(self, output_size: int) -> None:
@@ -444,13 +531,14 @@ class _ConvWeight(nn.Module):
 def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.q_proj = _Projection(4)
-    layer.k_proj = _Projection(4)
-    layer.v_proj = _Projection(4)
-    layer.f_a_proj = _Projection(2)
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.fused_fa_ga_proj = _Projection(4)
+    layer.f_a_proj = None
+    layer.g_proj = None
+    layer.local_projection_size = 4
+    layer.num_heads = 2
+    layer.head_dim = 2
     layer.f_b_proj = _Projection(4)
-    layer.b_proj = _Projection(2)
-    layer.g_a_proj = _Projection(2)
     layer.g_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
     layer.q_conv1d = _ConvWeight()
@@ -499,7 +587,10 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
 
     output = layer(torch.arange(2), torch.ones(2, 4))
     assert calls == ["dispatched"]
-    torch.testing.assert_close(output, torch.arange(8).view(2, 4).float())
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
+    )
 
 
 def test_kda_custom_ops_compile_as_one_full_graph(
@@ -578,13 +669,14 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     monkeypatch.setattr(kimi_custom_ops.pallas, "jax_op", jax_op)
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.q_proj = _Projection(4)
-    layer.k_proj = _Projection(4)
-    layer.v_proj = _Projection(4)
-    layer.f_a_proj = _Projection(2)
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.fused_fa_ga_proj = _Projection(4)
+    layer.f_a_proj = None
+    layer.g_proj = None
+    layer.local_projection_size = 4
+    layer.num_heads = 2
+    layer.head_dim = 2
     layer.f_b_proj = _Projection(4)
-    layer.b_proj = _Projection(2)
-    layer.g_a_proj = _Projection(2)
     layer.g_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
     layer.q_conv1d = _ConvWeight()

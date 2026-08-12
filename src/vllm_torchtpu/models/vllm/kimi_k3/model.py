@@ -220,6 +220,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         ".q_a_proj.": (".fused_qkv_a_proj.", 0),
         ".kv_a_proj_with_mqa.": (".fused_qkv_a_proj.", 1),
     }, )
+    fused_attention_params_mapping = (
+        (".self_attn.q_proj.", ".self_attn.fused_qkvb_proj.", 0),
+        (".self_attn.k_proj.", ".self_attn.fused_qkvb_proj.", 1),
+        (".self_attn.v_proj.", ".self_attn.fused_qkvb_proj.", 2),
+        (".self_attn.b_proj.", ".self_attn.fused_qkvb_proj.", 3),
+        (".self_attn.f_a_proj.", ".self_attn.fused_fa_ga_proj.", 0),
+        (".self_attn.g_a_proj.", ".self_attn.fused_fa_ga_proj.", 1),
+        (".self_attn.g_proj.", ".self_attn.fused_qkv_a_proj.", 2),
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -319,6 +328,17 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     continue
                 if experts_use_weight and name.endswith(".weight_packed"):
                     name = name.replace(".weight_packed", ".weight")
+
+                for (weight_name, param_name,
+                     shard_id) in self.fused_attention_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    candidate = name.replace(weight_name, param_name)
+                    if candidate not in params_dict:
+                        continue
+                    name = candidate
+                    loaded_weight.shard_id = shard_id
+                    break
 
                 for (param_name, weight_name, expert_id,
                      expert_shard_id) in expert_params_mapping:
