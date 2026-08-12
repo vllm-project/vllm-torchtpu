@@ -463,6 +463,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.rotary_emb = mla_modules.rotary_emb
         self.o_proj = mla_modules.o_proj
         self.g_proj = getattr(mla_modules, "g_proj", None)
+        self.gate_is_fused = getattr(mla_modules, "gate_is_fused", False)
         # `Indexer` has no `register_oot` hook and is fully built by
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
         # place. The mutation is visible through every reference to the object,
@@ -471,7 +472,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if indexer is not None:
             indexer = VllmTPUIndexer.rebind(indexer)
         self.indexer = indexer
-
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
@@ -516,6 +516,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
+        output_gate = None
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -526,10 +527,23 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 "q_b_proj is required when q_lora_rank is not None")
 
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_lora = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
+            if self.gate_is_fused:
+                q_c, kv_lora, output_gate = qkv_lora.split(
+                    [
+                        self.q_lora_rank,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                        self.num_heads * self.v_head_dim,
+                    ],
+                    dim=-1,
+                )
+            else:
+                q_c, kv_lora = qkv_lora.split(
+                    [
+                        self.q_lora_rank,
+                        self.kv_lora_rank + self.qk_rope_head_dim
+                    ],
+                    dim=-1,
+                )
             q_c = self.q_a_layernorm(q_c)
             q = self.q_b_proj(q_c)[0]
         else:
@@ -579,7 +593,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             topk_indices=topk_indices,
         )
 
-        if self.g_proj is not None:
+        if output_gate is not None:
+            attn_out *= output_gate.sigmoid()
+        elif self.g_proj is not None:
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         return self.o_proj(attn_out)[0]
 
