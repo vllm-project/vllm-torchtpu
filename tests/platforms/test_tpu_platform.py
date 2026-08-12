@@ -437,8 +437,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    def test_multimodal_keeps_chunked_mm_input(
-            self, mock_prepare_env, mock_apply_patches, vllm_config):
+    def test_multimodal_keeps_chunked_mm_input(self, mock_prepare_env,
+                                               mock_apply_patches,
+                                               vllm_config):
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=False, limit_per_prompt={"image": 1})
         vllm_config.cache_config.block_size = 16

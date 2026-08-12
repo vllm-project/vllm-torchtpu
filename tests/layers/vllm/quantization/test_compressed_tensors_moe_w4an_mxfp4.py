@@ -204,12 +204,14 @@ def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
     w13_scale = torch.full((128, 4), 127, dtype=torch.uint8)
     w2_scale = torch.full((128, 4), 127, dtype=torch.uint8)
     for expert_id in range(num_experts):
-        w13_packed = torch.randint(
-            0, 256, (128, 64), dtype=torch.uint8, generator=generator
-        )
-        w2_packed = torch.randint(
-            0, 256, (128, 64), dtype=torch.uint8, generator=generator
-        )
+        w13_packed = torch.randint(0,
+                                   256, (128, 64),
+                                   dtype=torch.uint8,
+                                   generator=generator)
+        w2_packed = torch.randint(0,
+                                  256, (128, 64),
+                                  dtype=torch.uint8,
+                                  generator=generator)
         weight_loader(
             layer.w13_weight_packed,
             w13_packed,
@@ -253,21 +255,19 @@ def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
             expert_id,
         )
 
-    with patch(
-        "vllm_torchtpu.layers.vllm.quantization.compressed_tensors."
-        "compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4."
-        "prebuild_fused_moe_kernel"
-    ):
+    with patch("vllm_torchtpu.layers.vllm.quantization.compressed_tensors."
+               "compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4."
+               "prebuild_fused_moe_kernel"):
         method.process_weights_after_loading(layer)
 
     active = torch.randn(1, hidden_size, dtype=torch.bfloat16)
     hidden_states = torch.cat(
-        (active.expand(8, -1), torch.zeros(8, hidden_size, dtype=torch.bfloat16))
-    ).to("tpu")
+        (active.expand(8, -1), torch.zeros(8,
+                                           hidden_size,
+                                           dtype=torch.bfloat16))).to("tpu")
     active_router = torch.randn(1, num_experts, dtype=torch.float32)
     router_logits = torch.cat(
-        (active_router.expand(8, -1), torch.zeros(8, num_experts))
-    ).to("tpu")
+        (active_router.expand(8, -1), torch.zeros(8, num_experts))).to("tpu")
 
     output = method.apply_monolithic(layer, hidden_states, router_logits)
     active_output = output[:8].cpu()

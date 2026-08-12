@@ -7,7 +7,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 from torch_tpu._internal import sync
-
 from vllm.model_executor.models.kimi_k25_vit import MoonViT3dPretrainedModel
 
 

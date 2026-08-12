@@ -71,19 +71,15 @@ def test_identical_mixed_prefills_do_not_interfere() -> None:
     pages_per_seq = (tokens_per_seq + page_size - 1) // page_size
 
     ql_nope_one = (
-        jnp.arange(num_q_heads * tokens_per_seq * lkv_dim, dtype=jnp.int32)
-        % 31
-    ).astype(jnp.bfloat16).reshape(num_q_heads, tokens_per_seq, lkv_dim)
+        jnp.arange(num_q_heads * tokens_per_seq * lkv_dim, dtype=jnp.int32) %
+        31).astype(jnp.bfloat16).reshape(num_q_heads, tokens_per_seq, lkv_dim)
     q_pe_one = (
-        jnp.arange(tokens_per_seq * num_q_heads * r_dim, dtype=jnp.int32)
-        % 29
-    ).astype(jnp.bfloat16).reshape(tokens_per_seq, num_q_heads, r_dim)
-    new_kv_c_one = (
-        jnp.arange(tokens_per_seq * lkv_dim, dtype=jnp.int32) % 23
-    ).astype(jnp.bfloat16).reshape(tokens_per_seq, lkv_dim)
-    new_k_pe_one = (
-        jnp.arange(tokens_per_seq * r_dim, dtype=jnp.int32) % 19
-    ).astype(jnp.bfloat16).reshape(tokens_per_seq, r_dim)
+        jnp.arange(tokens_per_seq * num_q_heads * r_dim, dtype=jnp.int32) %
+        29).astype(jnp.bfloat16).reshape(tokens_per_seq, num_q_heads, r_dim)
+    new_kv_c_one = (jnp.arange(tokens_per_seq * lkv_dim, dtype=jnp.int32) %
+                    23).astype(jnp.bfloat16).reshape(tokens_per_seq, lkv_dim)
+    new_k_pe_one = (jnp.arange(tokens_per_seq * r_dim, dtype=jnp.int32) %
+                    19).astype(jnp.bfloat16).reshape(tokens_per_seq, r_dim)
 
     ql_nope = jnp.concatenate([ql_nope_one] * num_seqs, axis=1)
     q_pe = jnp.concatenate([q_pe_one] * num_seqs, axis=0)
@@ -105,7 +101,7 @@ def test_identical_mixed_prefills_do_not_interfere() -> None:
         new_kv_c,
         new_k_pe,
         cache_kv,
-        jnp.full((num_seqs,), tokens_per_seq, jnp.int32),
+        jnp.full((num_seqs, ), tokens_per_seq, jnp.int32),
         jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32),
         jnp.arange(num_seqs + 1, dtype=jnp.int32) * tokens_per_seq,
         jnp.asarray([0, 0, num_seqs], jnp.int32),
@@ -120,17 +116,13 @@ def test_identical_mixed_prefills_do_not_interfere() -> None:
     for seq_idx in range(1, num_seqs):
         np.testing.assert_array_equal(
             expected_output,
-            np.asarray(
-                output[:, seq_idx * tokens_per_seq : (seq_idx + 1)
-                       * tokens_per_seq]
-            ),
+            np.asarray(output[:, seq_idx * tokens_per_seq:(seq_idx + 1) *
+                              tokens_per_seq]),
         )
         np.testing.assert_array_equal(
             expected_cache,
-            np.asarray(
-                updated_cache[seq_idx * pages_per_seq : (seq_idx + 1)
-                              * pages_per_seq]
-            ),
+            np.asarray(updated_cache[seq_idx * pages_per_seq:(seq_idx + 1) *
+                                     pages_per_seq]),
         )
 
 
@@ -147,41 +139,35 @@ def test_batched_decode_matches_unbatched_decode() -> None:
     packing = 2
     pages_per_seq = (previous_tokens + 1 + page_size - 1) // page_size
 
-    ql_nope_token = (
-        jnp.arange(num_q_heads * lkv_dim, dtype=jnp.int32) % 31
-    ).astype(jnp.bfloat16).reshape(num_q_heads, 1, lkv_dim)
+    ql_nope_token = (jnp.arange(num_q_heads * lkv_dim, dtype=jnp.int32) %
+                     31).astype(jnp.bfloat16).reshape(num_q_heads, 1, lkv_dim)
     ql_nope = jnp.pad(
         jnp.repeat(ql_nope_token, num_seqs, axis=1),
         ((0, 0), (0, max_num_tokens - num_seqs), (0, 0)),
     )
-    q_pe_token = (
-        jnp.arange(num_q_heads * r_dim, dtype=jnp.int32) % 29
-    ).astype(jnp.bfloat16).reshape(1, num_q_heads, r_dim)
+    q_pe_token = (jnp.arange(num_q_heads * r_dim, dtype=jnp.int32) %
+                  29).astype(jnp.bfloat16).reshape(1, num_q_heads, r_dim)
     q_pe = jnp.pad(
         jnp.repeat(q_pe_token, num_seqs, axis=0),
         ((0, max_num_tokens - num_seqs), (0, 0), (0, 0)),
     )
-    new_kv_c_token = (
-        jnp.arange(lkv_dim, dtype=jnp.int32) % 23
-    ).astype(jnp.bfloat16)[None, :]
+    new_kv_c_token = (jnp.arange(lkv_dim, dtype=jnp.int32) % 23).astype(
+        jnp.bfloat16)[None, :]
     new_kv_c = jnp.pad(
         jnp.repeat(new_kv_c_token, num_seqs, axis=0),
         ((0, max_num_tokens - num_seqs), (0, 0)),
     )
-    new_k_pe_token = (
-        jnp.arange(r_dim, dtype=jnp.int32) % 19
-    ).astype(jnp.bfloat16)[None, :]
+    new_k_pe_token = (jnp.arange(r_dim, dtype=jnp.int32) % 19).astype(
+        jnp.bfloat16)[None, :]
     new_k_pe = jnp.pad(
         jnp.repeat(new_k_pe_token, num_seqs, axis=0),
         ((0, max_num_tokens - num_seqs), (0, 0)),
     )
 
-    old_kv_c = (
-        jnp.arange(previous_tokens * lkv_dim, dtype=jnp.int32) % 17
-    ).astype(jnp.bfloat16).reshape(previous_tokens, lkv_dim)
-    old_k_pe = (
-        jnp.arange(previous_tokens * r_dim, dtype=jnp.int32) % 13
-    ).astype(jnp.bfloat16).reshape(previous_tokens, r_dim)
+    old_kv_c = (jnp.arange(previous_tokens * lkv_dim, dtype=jnp.int32) %
+                17).astype(jnp.bfloat16).reshape(previous_tokens, lkv_dim)
+    old_k_pe = (jnp.arange(previous_tokens * r_dim, dtype=jnp.int32) %
+                13).astype(jnp.bfloat16).reshape(previous_tokens, r_dim)
     old_k_pe = jnp.pad(old_k_pe, ((0, 0), (0, padded_r_dim - r_dim)))
     cache_row = jnp.concatenate([old_kv_c, old_k_pe], axis=1)
     cache_row = jnp.pad(
@@ -196,7 +182,7 @@ def test_batched_decode_matches_unbatched_decode() -> None:
         q_pe,
         new_kv_c,
         new_k_pe,
-        jnp.full((num_seqs,), previous_tokens + 1, jnp.int32),
+        jnp.full((num_seqs, ), previous_tokens + 1, jnp.int32),
         jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32),
         jnp.arange(num_seqs + 1, dtype=jnp.int32),
         jnp.asarray([num_seqs, num_seqs, num_seqs], jnp.int32),

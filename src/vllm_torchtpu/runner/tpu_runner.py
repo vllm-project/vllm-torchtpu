@@ -2864,7 +2864,13 @@ class TPUModelRunner(GPUModelRunner):
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
         if self.supports_mm_inputs:
+            has_encoder_inputs = bool(
+                scheduler_output.scheduled_encoder_inputs)
+            if has_encoder_inputs:
+                sync.synchronize(wait=True)
             self._execute_mm_encoder(scheduler_output)
+            if has_encoder_inputs:
+                sync.synchronize(wait=True)
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)

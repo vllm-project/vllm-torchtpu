@@ -11,7 +11,6 @@ from unittest.mock import patch
 import torch
 from torch import nn
 from torch_tpu._internal import sync
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
@@ -525,9 +524,9 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
             # Keep upstream's DP sharding/reassembly, but isolate its TPU
             # collective from the rank-local lazy encoder graphs.
             with patch.object(
-                vision_utils,
-                "tensor_model_parallel_all_gather",
-                _tpu_tp_all_gather,
+                    vision_utils,
+                    "tensor_model_parallel_all_gather",
+                    _tpu_tp_all_gather,
             ):
                 return vision_tower_forward(
                     self.vision_tower,
