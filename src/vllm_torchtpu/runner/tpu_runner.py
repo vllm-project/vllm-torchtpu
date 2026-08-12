@@ -95,6 +95,8 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
+from vllm_torchtpu.runner.structured_decoding_manager import \
+    StructuredDecodingManager
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
@@ -601,20 +603,7 @@ class TPUModelRunner(GPUModelRunner):
                                                     self.block_size),
             self.max_num_reqs, self.max_num_tokens)
 
-        # Structured decoding staging tensors.
-        self.grammar_bitmask_cpu = torch.zeros(
-            (self.max_num_reqs, cdiv(self.vocab_size, 32)),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=PIN_MEMORY)
-        self.require_structured_out_cpu = torch.zeros((self.max_num_reqs, 1),
-                                                      dtype=torch.bool,
-                                                      device="cpu",
-                                                      pin_memory=PIN_MEMORY)
-        self.structured_decode_arange = torch.arange(0,
-                                                     32,
-                                                     device="cpu",
-                                                     pin_memory=PIN_MEMORY)
+        self.structured_decoding_manager = StructuredDecodingManager(self)
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and
@@ -3653,11 +3642,13 @@ class TPUModelRunner(GPUModelRunner):
                                                      num_reqs)
                 if grammar_output is not None:
                     require_struct_decoding, grammar_bitmask_padded, arange = (
-                        self.prepare_structured_decoding_input(
-                            logits, grammar_output))
-                    logits = self.structured_decode(require_struct_decoding,
-                                                    grammar_bitmask_padded,
-                                                    logits, arange)
+                        self.structured_decoding_manager.
+                        prepare_structured_decoding_input(
+                            logits, grammar_output, cur_start_idx,
+                            cur_end_idx))
+                    logits = self.structured_decoding_manager.structured_decode(
+                        require_struct_decoding, grammar_bitmask_padded,
+                        logits, arange)
                 if all_greedy:
                     dummy_placeholder = torch.empty((1, 1),
                                                     dtype=logits.dtype,
@@ -4267,11 +4258,14 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
-            arange = self.structured_decode_arange.to(self.device)
+            arange = self.structured_decoding_manager.structured_decode_arange.to(
+                self.device)
             for num_reqs in self.num_reqs_paddings:
-                out = self.structured_decode(
-                    self.require_structured_out_cpu[:num_reqs].to(self.device),
-                    self.grammar_bitmask_cpu[:num_reqs].to(self.device),
+                out = self.structured_decoding_manager.structured_decode(
+                    self.structured_decoding_manager.
+                    require_structured_out_cpu[:num_reqs].to(self.device),
+                    self.structured_decoding_manager.
+                    grammar_bitmask_cpu[:num_reqs].to(self.device),
                     self._dummy_logits(num_reqs),
                     arange,
                 )
@@ -5660,63 +5654,6 @@ class TPUModelRunner(GPUModelRunner):
             logprob_token_ids=logprob_token_ids.to(torch.int32),
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
-        )
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def structured_decode(
-        self,
-        require_struct_decoding: torch.Tensor,
-        grammar_bitmask: torch.Tensor,
-        logits: torch.Tensor,
-        arange: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.where(
-            require_struct_decoding,
-            self.apply_grammar_bitmask(logits, grammar_bitmask, arange),
-            logits,
-        )
-
-    def apply_grammar_bitmask(self, logits: torch.Tensor,
-                              grammar_bitmask: torch.Tensor,
-                              arange: torch.Tensor):
-        assert logits.shape[0] == grammar_bitmask.shape[0]
-        logits_cloned = logits.clone()
-        for i in range(logits.shape[0]):
-            unpacked_bitmask = (torch.bitwise_right_shift(
-                grammar_bitmask[i][:, None], arange[None, :])
-                                & 1) == 0
-            unpacked_bitmask = unpacked_bitmask.reshape(-1)[:self.vocab_size]
-            logits_cloned[i] = logits_cloned[i].masked_fill(
-                unpacked_bitmask, -float("inf"))
-        return logits_cloned
-
-    def prepare_structured_decoding_input(
-        self, logits: torch.Tensor, grammar_output: "GrammarOutput"
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        grammar_bitmask = grammar_output.grammar_bitmask
-        num_reqs, _ = logits.shape
-
-        # Reset pre-allocated tensors
-        self.grammar_bitmask_cpu.zero_()
-        self.require_structured_out_cpu.zero_()
-
-        cumulative_mask_idx = 0
-        for req_id in grammar_output.structured_output_request_ids:
-            if req_id not in self.input_batch.req_id_to_index:
-                continue
-            batch_index = self.input_batch.req_id_to_index[req_id]
-            self.grammar_bitmask_cpu[batch_index] = torch.from_numpy(
-                grammar_bitmask[cumulative_mask_idx])
-            # It's not guaranteed that all requests in this batch require
-            # structured output, so create a bool tensor to represent
-            # the requests that need structured output.
-            self.require_structured_out_cpu[batch_index] = True
-            cumulative_mask_idx += 1
-
-        return (
-            self.require_structured_out_cpu[:num_reqs].to(logits.device),
-            self.grammar_bitmask_cpu[:num_reqs].to(logits.device),
-            self.structured_decode_arange.to(logits.device),
         )
 
 
