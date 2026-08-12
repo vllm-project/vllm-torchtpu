@@ -15,12 +15,6 @@ if TYPE_CHECKING:
 
 
 class StructuredDecodingManager:
-    """Applies vLLM v1 grammar bitmasks to logits on TPU.
-
-    Host side: scatters the scheduler-ordered compact bitmask into
-    batch-ordered, chunk-local staging buffers. Device side: a single
-    compiled graph unpacks the int32 bitmask and masks the logits.
-    """
 
     def __init__(self, runner: TPUModelRunner):
         self.runner = runner
