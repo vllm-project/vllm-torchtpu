@@ -469,8 +469,10 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
     assert layer.mla_attn.mla_modules.gate_is_fused is True
 
 
+@pytest.mark.parametrize("use_parameter_hook", [False, True],
+                         ids=["legacy-loader", "v2-parameter-hook"])
 def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, use_parameter_hook: bool) -> None:
     import vllm.model_executor.parameter as parameter_module
 
     monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
@@ -493,8 +495,10 @@ def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
     replicated_weight = torch.arange(6, dtype=layer.weight.dtype).view(3,
                                                                        2) + 100
 
-    layer.weight_loader(layer.weight, column_weight, 0)
-    layer.weight_loader(layer.weight, replicated_weight, 1)
+    loader = (layer.weight.weight_loader
+              if use_parameter_hook else layer.weight_loader)
+    loader(layer.weight, column_weight, 0)
+    loader(layer.weight, replicated_weight, 1)
 
     expected = torch.cat((column_weight[2:], replicated_weight), dim=0)
     torch.testing.assert_close(layer.weight, expected)
