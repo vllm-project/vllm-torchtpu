@@ -37,15 +37,11 @@ class KimiRoutedOutputTransform(nn.Module):
             # Routed experts shard their intermediate dimension across TP
             # ranks.  K3 normalizes the summed latent output, so reducing only
             # after this nonlinear transform (the generic FusedMoE order)
-            # produces a different result.  FusedMoE still performs its final
-            # reduction to combine the shared-expert partials; divide this
-            # replicated routed result below to compensate for that reduction.
+            # produces a different result.
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         hidden_states, _ = self.up_proj(hidden_states)
-        if reduced_before_norm:
-            hidden_states = hidden_states / self.tp_size
         return hidden_states
 
 
@@ -113,7 +109,7 @@ class KimiMoE(nn.Module):
             config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.shared_experts",
-            reduce_results=False,
+            reduce_results=True,
             situ_beta=getattr(config, "activation_situ_beta", None),
             situ_linear_beta=getattr(config, "activation_situ_linear_beta",
                                      None),
@@ -160,6 +156,7 @@ class KimiMoE(nn.Module):
         # vLLM keeps activation-specific settings on the runner's MoE config.
         self.experts.moe_config.activation_situ_beta = situ_beta
         self.experts.moe_config.activation_situ_linear_beta = situ_linear_beta
+        self.experts.moe_config.skip_final_all_reduce = True
         if config.hidden_act == "situ":
             self.experts.routed_experts.activation = "situ"
         if padded_intermediate_size != config.moe_intermediate_size:

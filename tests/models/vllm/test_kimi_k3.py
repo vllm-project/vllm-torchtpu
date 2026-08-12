@@ -337,9 +337,8 @@ def test_latent_moe_reduces_before_norm(
                                                    IdentityLinear())
     hidden_states = torch.tensor([[2.0, 3.0]])
 
-    # The division compensates for DefaultMoERunner's final TP reduction.
     torch.testing.assert_close(transform(hidden_states),
-                               (hidden_states + 1).square() / 2)
+                               (hidden_states + 1).square())
 
 
 def test_model_has_no_public_cache_or_pp_api() -> None:
