@@ -350,7 +350,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # Run device fence: ensure previous forward writes to HBM are complete
             # before the controller's background save reads them.
             from torch_tpu._internal.sync import synchronize as _tpu_sync
-            _tpu_sync(self._pool_sync_tensors or None, wait=True)
+            assert self._pool_sync_tensors, (
+                "KV pool tensors must be registered before the save fence")
+            _tpu_sync(self._pool_sync_tensors, wait=True)
             for job_id in meta.fence_job_ids:
                 self._fenced_jobs[job_id] = 1
 
