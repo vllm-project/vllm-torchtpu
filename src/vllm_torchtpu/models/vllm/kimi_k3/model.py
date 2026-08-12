@@ -4,23 +4,17 @@
 
 from __future__ import annotations
 
-import itertools
-import math
-import time
 from collections.abc import Iterable
 from typing import cast
+from unittest.mock import patch
 
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch_tpu._internal import sync
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
-from vllm.distributed.parallel_state import get_tp_group
-from vllm.logger import init_logger
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.fused_moe import \
     fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -33,18 +27,18 @@ from vllm.model_executor.layers.quantization.compressed_tensors import \
     compressed_tensors
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.models import vision as vision_utils
 from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid,
                                                    SupportsMultiModal,
                                                    SupportsQuant)
 from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
 from vllm.model_executor.models.kimi_k25_vit import (
-    KimiK25MultiModalProjector, mm_projector_forward, vision_tower_forward)
+    KimiK25MultiModalProjector, vision_tower_forward)
 from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                                               _flatten_embeddings,
                                               init_vllm_registered_model,
                                               maybe_prefix)
-from vllm.model_executor.models.vision import (get_load_balance_assignment,
-                                               is_vit_use_data_parallel)
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.kimi_k3.common.mm_preprocess import (
     KimiK3DummyInputsBuilder, KimiK3MultiModalProcessor, KimiK3ProcessingInfo)
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -58,8 +52,6 @@ from .attention import KimiDeltaAttention, MultiHeadLatentAttention
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
-
-logger = init_logger(__name__)
 
 
 class KimiDecoderLayer(nn.Module):
@@ -402,110 +394,13 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return loaded_experts | ordinary_loaded
 
 
-def _cpu_tp_all_gather(input_: torch.Tensor) -> torch.Tensor:
-    """Gather encoder output without adding an XLA collective to its graph."""
-    input_cpu = input_.detach().to(device="cpu").contiguous()
-    output_cpu = torch.empty(
-        (input_cpu.shape[0] * get_tensor_model_parallel_world_size(),
-         *input_cpu.shape[1:]),
-        dtype=input_cpu.dtype,
-        device="cpu",
-    )
-    dist.all_gather_into_tensor(output_cpu,
-                                input_cpu,
-                                group=get_tp_group().cpu_group)
-    return output_cpu.to(device=input_.device)
-
-
-@torch.inference_mode()
-def _run_tpu_dp_vision_model(
-    vision_model: nn.Module,
-    pixel_values: torch.Tensor,
-    grid_thw_list: list[list[int]],
-) -> tuple[torch.Tensor, ...]:
-    """Run rank-local MoonViT work and restore original image ordering."""
-    tp_size = get_tensor_model_parallel_world_size()
-    tp_rank = get_tensor_model_parallel_rank()
-    patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
-    cumulative_patches = [0, *itertools.accumulate(patches_per_image)]
-    image_order, image_counts, patch_counts = get_load_balance_assignment(
-        patches_per_image, tp_size)
-    cumulative_image_counts = [0, *itertools.accumulate(image_counts)]
-    local_image_indices = image_order[
-        cumulative_image_counts[tp_rank]:cumulative_image_counts[tp_rank + 1]]
-
-    if local_image_indices:
-        pixel_values_local = torch.cat([
-            pixel_values[cumulative_patches[i]:cumulative_patches[i + 1]]
-            for i in local_image_indices
-        ])
-    else:
-        pixel_values_local = torch.empty(
-            (0, *pixel_values.shape[1:]),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
-        )
-
-    merge_factor = math.prod(vision_model.merge_kernel_size)
-    max_output_len = max(patch_counts) // merge_factor
-    local_grid_thws = [grid_thw_list[i] for i in local_image_indices]
-    start = time.perf_counter()
-    if local_image_indices:
-        local_embeddings = vision_model(pixel_values_local, local_grid_thws)
-        if isinstance(local_embeddings, list):
-            local_embeddings = torch.cat(local_embeddings, dim=0)
-    else:
-        local_embeddings = torch.empty(
-            (0, merge_factor, vision_model.config.hidden_size),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
-        )
-
-    if local_embeddings.shape[0] < max_output_len:
-        padding = torch.empty(
-            (max_output_len - local_embeddings.shape[0],
-             *local_embeddings.shape[1:]),
-            device=local_embeddings.device,
-            dtype=local_embeddings.dtype,
-        )
-        local_embeddings = torch.cat((local_embeddings, padding), dim=0)
-
-    gathered_embeddings = _cpu_tp_all_gather(local_embeddings)
-    logger.info(
-        "Kimi-K3 DP vision rank=%d/%d local_images=%s local_patches=%d "
-        "output_shape=%s encode_and_gather=%.2fs",
-        tp_rank,
-        tp_size,
-        local_image_indices,
-        pixel_values_local.shape[0],
-        tuple(local_embeddings.shape),
-        time.perf_counter() - start,
-    )
-
-    rank_embeddings = []
-    for rank in range(tp_size):
-        start_idx = rank * max_output_len
-        rank_len = patch_counts[rank] // merge_factor
-        rank_embeddings.append(gathered_embeddings[start_idx:start_idx +
-                                                   rank_len])
-
-    output_lengths = [patches // merge_factor for patches in patches_per_image]
-    outputs: list[torch.Tensor | None] = [None] * len(grid_thw_list)
-    image_order_offset = 0
-    for rank, image_count in enumerate(image_counts):
-        rank_offset = 0
-        for image_idx in image_order[image_order_offset:image_order_offset +
-                                     image_count]:
-            image_len = output_lengths[image_idx]
-            outputs[image_idx] = rank_embeddings[rank][
-                rank_offset:rank_offset + image_len]
-            rank_offset += image_len
-        image_order_offset += image_count
-
-    if any(output is None for output in outputs):
-        raise RuntimeError(
-            "Kimi-K3 vision output reconstruction was incomplete")
-    return tuple(cast(torch.Tensor, output) for output in outputs)
+def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Gather a materialized encoder output without leaving the TPU."""
+    materialized = torch.empty_like(input_).copy_(input_)
+    sync.synchronize(materialized, wait=True)
+    gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
+    sync.synchronize(gathered, wait=True)
+    return gathered
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -627,13 +522,20 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
         if media_input is None:
             return None
         if self.use_data_parallel:
-            vision_outputs = _run_tpu_dp_vision_model(
-                self.vision_tower,
-                media_input["pixel_values"],
-                media_input["grid_thws"].tolist(),
-            )
-            return list(
-                mm_projector_forward(self.mm_projector, list(vision_outputs)))
+            # Keep upstream's DP sharding/reassembly, but isolate its TPU
+            # collective from the rank-local lazy encoder graphs.
+            with patch.object(
+                vision_utils,
+                "tensor_model_parallel_all_gather",
+                _tpu_tp_all_gather,
+            ):
+                return vision_tower_forward(
+                    self.vision_tower,
+                    media_input["pixel_values"],
+                    media_input["grid_thws"],
+                    mm_projector=self.mm_projector,
+                    use_data_parallel=True,
+                )
         return vision_tower_forward(
             self.vision_tower,
             media_input["pixel_values"],
