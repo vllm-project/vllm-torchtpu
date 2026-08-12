@@ -32,7 +32,7 @@ dependencies = [
     # matching our torch==2.13.0 constraint to prevent the CI Docker base image
     # from leaking structurally incompatible pre-compiled nms operators!
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260810130143",
+    "torch-tpu==0.1.1.dev20260804130134",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # wheel bundles one extension per supported torch ABI and dispatches to
