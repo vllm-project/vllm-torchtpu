@@ -270,7 +270,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         elif role == KVConnectorRole.WORKER:
             # Worker wrapper is only used for KV buffer registration; job dicts remain empty.
             self.connector_worker = OffloadingConnectorWorker(
-                spec, kv_cache_config)
+                spec, vllm_config, kv_cache_config)
             # Track per-step fence acks and completion echoes for worker metadata.
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}

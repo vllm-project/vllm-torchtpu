@@ -658,7 +658,7 @@ def _patch_vllm_offloading_connector_spec() -> None:
                 spec, vllm_config, kv_cache_config)
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(
-                spec, kv_cache_config)
+                spec, vllm_config, kv_cache_config)
 
     OffloadingConnector.__init__ = _init_with_tpu_spec
     OffloadingConnector._tpu_offloading_spec_patch = True
