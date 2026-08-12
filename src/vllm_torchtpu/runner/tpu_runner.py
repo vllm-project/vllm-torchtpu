@@ -152,18 +152,19 @@ def _reset_read_offsets_compiled(read_offsets: torch.Tensor,
     eager launches per step with one program. Non-new rows collapse onto the
     null slot, where writing 0 is a no-op."""
     targets = torch.where(keep_dev, stacked_groups, null)
-    zero = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
+    zero = torch.zeros((),
+                       dtype=read_offsets.dtype,
+                       device=read_offsets.device)
     read_offsets.index_put_((targets.reshape(-1).long(), ), zero)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _rollback_offsets_seed_compiled(read_offsets: torch.Tensor,
                                     dst_t: torch.Tensor) -> None:
-    read_offsets.index_put_(
-        (dst_t, ),
-        torch.zeros(dst_t.shape[0],
-                    dtype=read_offsets.dtype,
-                    device=read_offsets.device))
+    read_offsets.index_put_((dst_t, ),
+                            torch.zeros(dst_t.shape[0],
+                                        dtype=read_offsets.dtype,
+                                        device=read_offsets.device))
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -3579,8 +3580,8 @@ class TPUModelRunner(GPUModelRunner):
         # FIX-1: one stack + one compiled program replaces ~2*G eager
         # launches (G = mamba group count; 24 under the unified pool on
         # Qwen3.5-4B). See _reset_read_offsets_compiled.
-        stacked = torch.stack(groups) if len(groups) > 1 else groups[
-            0].unsqueeze(0)
+        stacked = torch.stack(groups) if len(
+            groups) > 1 else groups[0].unsqueeze(0)
         _reset_read_offsets_compiled(self.mamba_slot_read_offsets, keep_dev,
                                      stacked, null)
 

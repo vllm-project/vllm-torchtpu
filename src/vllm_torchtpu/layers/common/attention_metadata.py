@@ -196,10 +196,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # count, so they land immediately after the positional state
             # block. Checkpoint t is therefore the row entry
             # `state_offsets + t`.
-            ckpt_offsets = (state_index + torch.arange(
-                ctx.mamba_ckpt_window,
-                device=state_offsets.device,
-                dtype=state_offsets.dtype).unsqueeze(0))
+            ckpt_offsets = (
+                state_index +
+                torch.arange(ctx.mamba_ckpt_window,
+                             device=state_offsets.device,
+                             dtype=state_offsets.dtype).unsqueeze(0))
             # Defensive: a row too short to hold the group would alias two
             # checkpoints onto one block and silently corrupt state, so clamp
             # to the null block instead of a live one. `in_row` is returned so

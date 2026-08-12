@@ -390,12 +390,16 @@ class TestAttentionMetadataBuilderPlumbing:
         # (seq_len - 1) // 16 for a 16-token block: 0, 1, 2, 2.
         base_cols = [0, 1, 2, 2]
         for gid, meta in enumerate(metas):
-            block_tables = (
-                runner.input_batch.block_table[gid].get_cpu_tensor.return_value)
+            block_tables = (runner.input_batch.block_table[gid].get_cpu_tensor.
+                            return_value)
             for row, col0 in enumerate(base_cols):
                 for t in range(window):
-                    assert (meta.mamba_ckpt_indices[row, t] == block_tables[
-                        row, col0 + t]), (gid, row, t)
+                    assert (
+                        meta.mamba_ckpt_indices[row,
+                                                t] == block_tables[row, col0 +
+                                                                   t]), (gid,
+                                                                         row,
+                                                                         t)
 
         # Group 1's block ids sit 100 above group 0's; a plan that carried
         # blocks rather than offsets would have collapsed them together.
