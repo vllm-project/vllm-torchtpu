@@ -43,13 +43,42 @@ from vllm_torchtpu.layers.common.utils import (
 pytestmark = pytest.mark.multichip
 
 _GDN_PCP_NUMERICAL_CASES = (
+    pytest.param(2, (20, 20, 24),
+                 4, (0, 20, 40),
+                 None,
+                 id="pcp2-multi-request-padding"),
+    pytest.param(4, (34, 30), 4, (0, 34), None, id="pcp4-uneven-rank-split"),
+    pytest.param(4, (20, 20, 24),
+                 4, (0, 20, 40), (7, 22, 3),
+                 id="pcp4-chunk-continuation"),
+    pytest.param(
+        4,
+        (13, 11, 40),
+        4,
+        (0, 13, 24),
+        (7, 22, 3),
+        id="pcp4-batch-flat-owner-with-history",
+    ),
+)
+
+_GDN_PCP_DESCRIPTOR_CASES = (
     pytest.param(2, (20, 20, 24), 4, None, id="pcp2-multi-request-padding"),
     pytest.param(4, (34, 30), 4, None, id="pcp4-uneven-rank-split"),
     pytest.param(4, (20, 20, 24), 4, (7, 22, 3), id="pcp4-chunk-continuation"),
+    pytest.param(8, (5, 7, 3, 9),
+                 2, (1, 6, 13, 29),
+                 id="pcp8-fragmented-descriptors"),
 )
 
-_GDN_PCP_DESCRIPTOR_CASES = _GDN_PCP_NUMERICAL_CASES + (pytest.param(
-    8, (5, 7, 3, 9), 2, (1, 6, 13, 29), id="pcp8-fragmented-descriptors"), )
+_GDN_PCP_FUSED_PROJECTION_CASES = (
+    pytest.param((64, 64), (0, 64), None, id="batch-flat-fresh"),
+    pytest.param(
+        (17, 15, 32),
+        (0, 17, 32),
+        (5, 41, 9),
+        id="batch-flat-owner-with-history",
+    ),
+)
 
 
 def _query_start_loc_from_lengths(lengths):
@@ -338,19 +367,32 @@ def _require_tpu_devices(min_count, reason):
 
 
 @pytest.mark.parametrize(
-    ("pcp_size", "lengths", "interleave_size", "token_start_offsets"),
+    (
+        "pcp_size",
+        "lengths",
+        "interleave_size",
+        "token_owner_starts",
+        "request_absolute_starts",
+    ),
     _GDN_PCP_NUMERICAL_CASES,
 )
 @pytest.mark.parametrize("state_layout", ("split", "unified_pool"))
 def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
-        pcp_size, lengths, interleave_size, token_start_offsets, state_layout):
+        pcp_size, lengths, interleave_size, token_owner_starts,
+        request_absolute_starts, state_layout):
     _require_tpu_devices(
         pcp_size,
         f"GDN PCP numerical test requires {pcp_size} TPU devices.",
     )
     lengths = np.asarray(lengths, dtype=np.int32)
-    offsets = (None if token_start_offsets is None else np.asarray(
-        token_start_offsets, dtype=np.int32))
+    token_owner_starts = (np.zeros_like(lengths) if token_owner_starts is None
+                          else np.asarray(token_owner_starts, dtype=np.int32))
+    request_absolute_starts = (np.zeros_like(lengths) if
+                               request_absolute_starts is None else np.asarray(
+                                   request_absolute_starts, dtype=np.int32))
+    expected_owner_starts = np.concatenate((np.zeros(
+        (1, ), dtype=np.int32), np.cumsum(lengths[:-1], dtype=np.int32)))
+    np.testing.assert_array_equal(token_owner_starts, expected_owner_starts)
     n_kq = 4
     n_v = 4
     d_k = 128
@@ -362,14 +404,24 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     qkv_split_sizes = [n_kq * d_k, n_kq * d_k, n_v * d_v]
 
     rng = jax.random.key(0)
-    keys = jax.random.split(rng, 8)
+    keys = jax.random.split(rng, 9)
     mixed_qkv0 = jax.random.normal(keys[0], (num_tokens, dim),
                                    dtype=jnp.bfloat16)
     b0 = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
     a0 = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
-    conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim),
-                            dtype=jnp.bfloat16)
-    rec_state0 = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
+    if state_layout == "split" and np.any(request_absolute_starts):
+        # Nonzero history makes treating an absolute continuation as a fresh
+        # request numerically observable in both conv and recurrent state.
+        conv_state0 = (jax.random.normal(keys[7],
+                                         (num_blocks, kernel_size - 1, dim),
+                                         dtype=jnp.bfloat16) *
+                       jnp.asarray(0.01, dtype=jnp.bfloat16))
+        rec_state0 = (jax.random.normal(keys[8], (num_blocks, n_v, d_k, d_v),
+                                        dtype=jnp.float32) * 0.01)
+    else:
+        conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim),
+                                dtype=jnp.bfloat16)
+        rec_state0 = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
     conv_weight0 = jax.random.normal(keys[3], (dim, 1, kernel_size),
                                      dtype=jnp.bfloat16)
     conv_bias0 = jax.random.normal(keys[4], (dim, ), dtype=jnp.bfloat16)
@@ -382,24 +434,21 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     )
     state_indices = jnp.arange(1, len(lengths) + 1, dtype=jnp.int32)
     distribution = jnp.array([0, len(lengths), len(lengths)], dtype=jnp.int32)
-    seq_lens = jnp.asarray(
-        lengths if offsets is None else offsets + lengths,
-        dtype=jnp.int32,
-    )
+    seq_lens = jnp.asarray(request_absolute_starts + lengths, dtype=jnp.int32)
 
     padded_num_tokens = int(
         _pcp_local_token_counts(
             lengths,
             pcp_size,
             interleave_size,
-            token_start_offsets_per_req=offsets,
+            token_owner_start_offsets_per_req=token_owner_starts,
         ).max()) * pcp_size
     token_order, _ = _build_pcp_rank_major_token_order(
         lengths,
         pcp_size,
         interleave_size,
         padded_num_tokens,
-        token_start_offsets_per_req=offsets,
+        token_owner_start_offsets_per_req=token_owner_starts,
     )
     valid = token_order >= 0
     pad_tokens = padded_num_tokens - num_tokens
@@ -543,11 +592,29 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         assert np.any(np.array(pcp_pool).view(np.uint8))
 
 
-def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline():
-    """Cover FP8 QKVZ projection, both PCP exchanges, and pooled GDN."""
+@pytest.mark.parametrize(
+    ("lengths", "token_owner_starts", "request_absolute_starts"),
+    _GDN_PCP_FUSED_PROJECTION_CASES,
+)
+def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
+        lengths, token_owner_starts, request_absolute_starts):
+    """Cover PCP stage metadata, FP8 projection, and pooled GDN."""
     pcp_size = 2
-    lengths = np.asarray((64, 64), dtype=np.int32)
+    lengths = np.asarray(lengths, dtype=np.int32)
+    token_owner_starts = (np.zeros_like(lengths) if token_owner_starts is None
+                          else np.asarray(token_owner_starts, dtype=np.int32))
+    request_absolute_starts = (np.zeros_like(lengths) if
+                               request_absolute_starts is None else np.asarray(
+                                   request_absolute_starts, dtype=np.int32))
+    expected_owner_starts = np.concatenate((np.zeros(
+        (1, ), dtype=np.int32), np.cumsum(lengths[:-1], dtype=np.int32)))
+    np.testing.assert_array_equal(token_owner_starts, expected_owner_starts)
     interleave_size = 16
+    if token_owner_starts[1] % interleave_size != 0:
+        # Request 1 begins inside rank 1's owner chunk [16, 32), while its
+        # absolute continuation position is unrelated to that boundary.
+        assert token_owner_starts[1] == lengths[0]
+        assert not np.array_equal(token_owner_starts, request_absolute_starts)
     _require_tpu_devices(
         pcp_size,
         f"GDN PCP numerical test requires {pcp_size} TPU devices.",
@@ -594,11 +661,11 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline():
     A_log = jax.random.normal(keys[5], (n_v, ), dtype=jnp.float32)
     dt_bias = jax.random.normal(keys[6], (n_v, ), dtype=jnp.float32)
 
-    query_start_loc = jnp.asarray((0, 64, 128), dtype=jnp.int32)
+    query_start_loc = _query_start_loc_from_lengths(lengths)
     state_indices = jnp.arange(1, len(lengths) + 1, dtype=jnp.int32)
     distribution = jnp.asarray((0, len(lengths), len(lengths)),
                                dtype=jnp.int32)
-    seq_lens = jnp.asarray(lengths, dtype=jnp.int32)
+    seq_lens = jnp.asarray(request_absolute_starts + lengths, dtype=jnp.int32)
     (_, _), ref_output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
@@ -621,7 +688,12 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline():
     )
 
     local_required_tokens = int(
-        _pcp_local_token_counts(lengths, pcp_size, interleave_size).max())
+        _pcp_local_token_counts(
+            lengths,
+            pcp_size,
+            interleave_size,
+            token_owner_start_offsets_per_req=token_owner_starts,
+        ).max())
     projection_token_block = 2 * interleave_size
     local_padded_tokens = max(
         8 * projection_token_block,
@@ -634,6 +706,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline():
         pcp_size,
         interleave_size,
         padded_num_tokens,
+        token_owner_start_offsets_per_req=token_owner_starts,
     )
     valid = token_order >= 0
     valid_rows = np.where(valid)[0]
@@ -666,6 +739,10 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline():
         128,
     )
     global_pool_shape = (pcp_size * local_pool_shape[0], *local_pool_shape[1:])
+    # Keep this pool zero so the fused numerical case isolates owner-driven
+    # stage/DMA geometry. Nonzero absolute-history state loading is covered by
+    # the raw-QKV split-state case above; the metadata unit test separately
+    # checks that these absolute starts set the initial-state flags.
     pool = jax.device_put(
         jnp.zeros(global_pool_shape, dtype=jnp.float8_e4m3fn),
         NamedSharding(mesh, P("pcp")),

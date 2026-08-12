@@ -39,7 +39,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
+from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -248,18 +248,30 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             # Use the bundle indices specified by the user.
             bundle_indices = list(
                 map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(",")))
-            assert len(bundle_indices) == self.parallel_config.world_size, \
-            ("VLLM_RAY_BUNDLE_INDICES must have the same size"
-            f" as the world size, but got {bundle_indices=} "
-            f"and {self.parallel_config.world_size=}")
-            assert len(set(bundle_indices)) == len(bundle_indices), \
-            ("VLLM_RAY_BUNDLE_INDICES cannot have duplicate values,"
-            f" but got {bundle_indices=}")
         else:
             bundle_indices = []
             for bundle_id, bundle in enumerate(placement_group.bundle_specs):
                 if bundle.get(current_platform.ray_device_key, 0):
                     bundle_indices.append(bundle_id)
+
+        if len(bundle_indices) < self.parallel_config.world_size:
+            if len(bundle_indices
+                   ) == 0 or self.parallel_config.world_size % len(
+                       bundle_indices) != 0:
+                raise ValueError(
+                    f"world_size ({self.parallel_config.world_size}) must be divisible by "
+                    f"the number of placement group bundles ({len(bundle_indices)})."
+                )
+            workers_per_bundle = self.parallel_config.world_size // len(
+                bundle_indices)
+            expanded_indices = []
+            for b_id in bundle_indices:
+                expanded_indices.extend([b_id] * workers_per_bundle)
+            bundle_indices = expanded_indices
+        elif len(bundle_indices) != self.parallel_config.world_size:
+            raise ValueError(
+                f"Number of bundle indices ({len(bundle_indices)}) must be less than or equal to "
+                f"world_size ({self.parallel_config.world_size}).")
 
         worker_metadata: List[RayWorkerMetaData] = []
         driver_ip = get_ip()
@@ -393,11 +405,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         all_args_to_update_environment_variables = []
         total_chips = len(worker_node_and_physical_tpu_ids)
-        topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(total_chips, None)
-        if topology is None:
-            raise ValueError(
-                f'Cannot find topology for {total_chips} chips. The supported number of chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}'
-            )
+        topology = get_tpu_multihost_topology(total_chips)
         master_port = str(get_open_port())
         for i, (node_id, _) in enumerate(worker_node_and_physical_tpu_ids):
             node_rank = node_id_to_rank[node_id]

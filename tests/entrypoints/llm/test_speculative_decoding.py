@@ -14,9 +14,19 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
+import os
 import random
+import socket
 import string
+import subprocess
+import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from vllm import LLM, SamplingParams
@@ -66,6 +76,14 @@ def get_dflash_test_prompts():
     ]
 
 
+def get_mtp_test_prompts():
+    num_prompts = 10
+    return [
+        "Predict the continuation of this sequence: 1 2 3 4 5 6 7 8"
+        for _ in range(num_prompts)
+    ]
+
+
 def get_test_prompts(speculative_config: dict):
     method = speculative_config["method"]
     if method == "ngram":
@@ -74,12 +92,59 @@ def get_test_prompts(speculative_config: dict):
         return get_eagle3_test_prompts()
     if method == "dflash":
         return get_dflash_test_prompts()
+    if method == "mtp":
+        return get_mtp_test_prompts()
     raise NotImplementedError(f"{method} is not supported yet.")
+
+
+# Qwen3.5 ships its MTP head inside the target checkpoint, so the speculative
+# config carries no separate draft `model`: vLLM resolves the draft to the
+# target model itself (SpeculativeConfig, method="mtp"). Qwen3.5-4B declares
+# `mtp_num_hidden_layers: 1`, i.e. one MTP decoder layer; K > 1 re-runs that
+# same layer per draft step.
+QWEN35_MTP_MODEL = "Qwen/Qwen3.5-4B"
+
+# The data-parallel tests run the MoE sibling rather than the dense 4B, and the
+# choice is load-bearing. TorchTPU runs ONE chip slice across every DP engine,
+# so a forward's collectives pair mesh-wide: an engine that stops issuing
+# forwards strands the engines still running, which block in the device program
+# on a peer that never arrives. The idle-rank pairing that prevents that
+# (TPUModelRunner._run_dp_idle_pairing) is gated on expert parallelism, and
+# vLLM refuses `--enable-expert-parallel` for a dense model ("Number of experts
+# in the model must be greater than 0 when expert parallelism is enabled"), so
+# dense DP deadlocks as soon as the engines drain unevenly. A3B keeps the
+# active parameter count small; the MTP head and method="mtp" are identical to
+# the 4B, so these tests still exercise the same speculative path.
+QWEN35_MTP_DP_MODEL = "Qwen/Qwen3.5-35B-A3B-FP8"
+
+# Engine kwargs every Qwen3.5 run in this file needs, on top of the shared
+# ones the helpers set.
+QWEN35_KWARGS = {
+    # Qwen3.5 declares a vision modality; run it text-only so vLLM takes the
+    # language-model-only path (see TpuPlatform.check_and_update_config).
+    "language_model_only": True,
+    "limit_mm_per_prompt": {
+        "image": 0,
+        "video": 0
+    },
+    # Qwen3.5 is hybrid (GDN linear attention + full attention). TpuPlatform
+    # rejects prefix caching together with speculative decoding on hybrid
+    # Mamba models, so keep it off on both the reference and the spec engine
+    # (the reference must match the spec run's cache behaviour anyway).
+    "enable_prefix_caching": False,
+}
+
+
+def _qwen35_mtp_speculative_config(num_speculative_tokens: int = 1) -> dict:
+    return {
+        "method": "mtp",
+        "num_speculative_tokens": num_speculative_tokens,
+    }
 
 
 def _make_sampling_config(temperature: float = 0) -> SamplingParams:
     return SamplingParams(temperature=temperature,
-                          max_tokens=16,
+                          max_tokens=200,
                           ignore_eos=True,
                           repetition_penalty=1,
                           frequency_penalty=0,
@@ -96,6 +161,114 @@ def sampling_config():
 @pytest.fixture
 def model_name():
     return "Qwen/Qwen3-0.6B"
+
+
+# Spec-decode counter names. `llm.get_metrics()` reports the bare names;
+# the HTTP /metrics endpoint reports the Prometheus form with a `_total`
+# suffix. Same counters, so both transports derive their names from here.
+SPEC_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens"
+SPEC_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens"
+
+
+def _assert_no_spec_divergence(ref_texts: list[str], spec_texts: list[str]):
+    """Speculation must not change greedy output. Shared by the in-process
+    and served correctness tests so both apply the same standard."""
+    assert len(ref_texts) == len(spec_texts), (
+        f"reference produced {len(ref_texts)} outputs, "
+        f"speculative produced {len(spec_texts)}")
+
+    misses = 0
+    for ref_text, spec_text in zip(ref_texts, spec_texts):
+        if ref_text != spec_text:
+            misses += 1
+            print(f"ref_output: {ref_text}")
+            print(f"spec_output: {spec_text}")
+
+    assert misses == 0
+
+
+def _assert_acceptance_rate(
+    num_draft_tokens: float,
+    num_accepted_tokens: float,
+    min_acceptance_rate: float,
+    method: str,
+) -> float:
+    """Report the acceptance rate and hold it above the collapse floor.
+
+    Shared by the in-process and served performance tests; each reads the
+    counters from its own transport and hands the totals here.
+    """
+    acceptance_rate = 0.0
+    if num_draft_tokens > 0:
+        acceptance_rate = num_accepted_tokens / num_draft_tokens
+        print(f"Acceptance rate: {acceptance_rate:.2%}")
+        print("num_accepted_tokens:" + str(num_accepted_tokens))
+        print("num_draft_tokens:" + str(num_draft_tokens))
+
+    assert num_draft_tokens > 0, "Draft tokens should be greater than 0."
+    assert acceptance_rate >= min_acceptance_rate, \
+        f"Expected at least {min_acceptance_rate:.2%} acceptance rate for " \
+        f"{method}, got {acceptance_rate:.2%}"
+    return acceptance_rate
+
+
+class _InProcessEngine:
+    """Engine backed by LLM(...) in this process -- the default."""
+
+    def __init__(self, llm: LLM):
+        self._llm = llm
+
+    def generate(self, prompts: list[str],
+                 sampling_config: SamplingParams) -> list[str]:
+        outputs = self._llm.generate(prompts, sampling_config)
+        return [output.outputs[0].text for output in outputs]
+
+    def spec_counters(self) -> tuple[float, float, dict[str, float]]:
+        num_draft_tokens = num_accepted_tokens = 0.0
+        for metric in self._llm.get_metrics():
+            if metric.name == SPEC_DRAFT_METRIC:
+                assert isinstance(metric, Counter)
+                num_draft_tokens += metric.value
+            elif metric.name == SPEC_ACCEPTED_METRIC:
+                assert isinstance(metric, Counter)
+                num_accepted_tokens += metric.value
+        # One engine, reported under the same shape the served backend uses so
+        # callers can check per-engine counts without knowing the transport.
+        return num_draft_tokens, num_accepted_tokens, {"0": num_draft_tokens}
+
+    def shutdown(self) -> None:
+        self._llm.llm_engine.engine_core.shutdown()
+
+
+@contextlib.contextmanager
+def _engine(model_name: str, speculative_config: dict | None, kwargs: dict):
+    """Yield a spec-decode engine, in-process or served.
+
+    Data parallelism forces the served path: vLLM rejects
+    LLM(data_parallel_size>1) for single-process use unless
+    `current_platform.is_tpu()`, and this plugin registers TpuPlatform with
+    `_enum = PlatformEnum.OOT`, so the exemption never applies and the
+    constructor raises. Everything above the backend -- prompts, the
+    reference/speculative sequencing, the assertions -- stays shared.
+    """
+    if kwargs.get("data_parallel_size", 1) > 1:
+        with _serve(model_name, speculative_config, kwargs) as served:
+            yield served
+        return
+
+    llm_kwargs = {k: v for k, v in kwargs.items() if k != "data_parallel_size"}
+    llm = LLM(model=model_name,
+              speculative_config=speculative_config,
+              **llm_kwargs)
+    engine = _InProcessEngine(llm)
+    try:
+        yield engine
+    finally:
+        engine.shutdown()
+        del llm, engine
+        cleanup_dist_env_and_memory()
+        # Waiting for TPUs to be fully released.
+        time.sleep(15)
 
 
 def _test_correctness_helper(
@@ -119,38 +292,15 @@ def _test_correctness_helper(
         if extra_kwargs:
             kwargs.update(extra_kwargs)
 
-        # 1. Reference LLM Run
-        ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
+        # 1. Reference Run (no speculation)
+        with _engine(model_name, None, kwargs) as ref_engine:
+            ref_texts = ref_engine.generate(test_prompts, sampling_config)
 
-        # Waiting for TPUs to be fully released.
-        time.sleep(15)
+        # 2. Speculative Run
+        with _engine(model_name, speculative_config, kwargs) as spec_engine:
+            spec_texts = spec_engine.generate(test_prompts, sampling_config)
 
-        # 2. Speculative LLM Run
-        spec_llm = LLM(model=model_name,
-                       speculative_config=speculative_config,
-                       **kwargs)
-        try:
-            spec_outputs = spec_llm.generate(test_prompts, sampling_config)
-
-            matches = 0
-            misses = 0
-            for ref_output, spec_output in zip(ref_outputs, spec_outputs):
-                if ref_output.outputs[0].text == spec_output.outputs[0].text:
-                    matches += 1
-                else:
-                    misses += 1
-                    print(f"ref_output: {ref_output.outputs[0].text}")
-                    print(f"spec_output: {spec_output.outputs[0].text}")
-
-            assert misses == 0
-        finally:
-            spec_llm.llm_engine.engine_core.shutdown()
-            del spec_llm
-            cleanup_dist_env_and_memory()
+        _assert_no_spec_divergence(ref_texts, spec_texts)
 
 
 @pytest.mark.timeout(1800)
@@ -232,6 +382,62 @@ def test_dflash_correctness_greedy(
     )
 
 
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(4, id="bs4")])
+def test_qwen35_mtp_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """Qwen3.5 MTP must not change greedy output vs a no-spec reference.
+
+    This is the hybrid-model spec-decode path: between the target's verify
+    forward and the draft's propose the runner has to roll the GDN recurrent
+    state back over the rejected tokens. A broken rollback shows up here as a
+    text mismatch (the target decodes from contaminated state), which the
+    acceptance-rate check in test_qwen35_mtp_performance_greedy cannot see.
+    """
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        QWEN35_MTP_MODEL,
+        _qwen35_mtp_speculative_config(),
+        max_num_seqs=max_num_seqs,
+        async_scheduling=async_scheduling,
+        extra_kwargs=QWEN35_KWARGS,
+    )
+
+
+@pytest.mark.timeout(1800)
+def test_qwen35_mtp_correctness_greedy_multi_step(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """Same correctness guarantee with K=2 draft tokens per step.
+
+    Qwen3.5-4B has a single MTP layer, so K=2 runs that layer twice per step
+    and exercises the drafter's multi-step loop (per-step draft attention
+    metadata, GDN state advance/rollback across >1 speculated token) that the
+    K=1 configuration never reaches.
+    """
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        QWEN35_MTP_MODEL,
+        _qwen35_mtp_speculative_config(num_speculative_tokens=2),
+        max_num_seqs=4,
+        async_scheduling=False,
+        extra_kwargs=QWEN35_KWARGS,
+    )
+
+
 def _test_performance_helper(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -256,34 +462,25 @@ def _test_performance_helper(
         if extra_kwargs:
             kwargs.update(extra_kwargs)
 
-        spec_llm = LLM(model=model_name,
-                       speculative_config=speculative_config,
-                       **kwargs)
+        with _engine(model_name, speculative_config, kwargs) as spec_engine:
+            spec_engine.generate(test_prompts, sampling_config)
+            num_draft_tokens, num_accepted_tokens, per_engine = \
+                spec_engine.spec_counters()
 
-        spec_llm.generate(test_prompts, sampling_config)
+        # Every engine must have drafted. Under data parallelism a drafter
+        # that failed to load on one engine leaves the summed rate looking
+        # healthy; with one engine this is just "the drafter ran".
+        expected_engines = kwargs.get("data_parallel_size", 1)
+        print(f"{speculative_config['method']} per_engine={per_engine}")
+        assert len(per_engine) == expected_engines, \
+            f"expected {expected_engines} engine(s) to report draft " \
+            f"counters, got {per_engine}"
+        idle = sorted(e for e, n in per_engine.items() if n <= 0)
+        assert not idle, f"engine(s) {idle} produced no draft tokens"
 
-        metrics = spec_llm.get_metrics()
-        num_draft_tokens = num_accepted_tokens = 0
-        acceptance_rate = 0.0
-        for metric in metrics:
-            if metric.name == "vllm:spec_decode_num_draft_tokens":
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        if num_draft_tokens > 0:
-            acceptance_rate = num_accepted_tokens / num_draft_tokens
-            print(f"Acceptance rate: {acceptance_rate:.2%}")
-            print("num_accepted_tokens:" + str(num_accepted_tokens))
-            print("num_draft_tokens:" + str(num_draft_tokens))
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
-
-        assert num_draft_tokens > 0, "Draft tokens should be greater than 0."
-        assert acceptance_rate >= min_acceptance_rate, f"Expected at least {min_acceptance_rate:.2%} acceptance rate for {speculative_config['method']}, got {acceptance_rate:.2%}"
+        _assert_acceptance_rate(num_draft_tokens, num_accepted_tokens,
+                                min_acceptance_rate,
+                                speculative_config["method"])
 
 
 @pytest.mark.timeout(1800)
@@ -354,9 +551,9 @@ def test_eagle3_performance(
     # The floor is a collapse guard (acceptance ~0, hangs), not a quality
     # target. Nightly v7x/TP2 runs are deterministic per batch size: bs1
     # accepts exactly one draft token per step (80/1200 = 6.67%), bs4 lands
-    # at ~10.5-10.8%, so bs1 gets a lower floor.
+    # at ~7.7-10.8%, so bs1 gets a 5% floor and bs4 gets a 7% floor.
     [pytest.param(1, 0.05, id="bs1"),
-     pytest.param(4, 0.08, id="bs4")])
+     pytest.param(4, 0.07, id="bs4")])
 def test_dflash_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -380,6 +577,40 @@ def test_dflash_performance_greedy(
         model_name="Qwen/Qwen3-4B",
         async_scheduling=async_scheduling,
         extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(4, id="bs4")])
+def test_qwen35_mtp_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """Qwen3.5 MTP proposes and gets drafts accepted at a useful rate.
+
+    The floor is a collapse guard: it catches a drafter that silently stops
+    proposing, or one whose accepted tokens fall because the GDN state handed
+    to the draft is wrong. The prompt is a trivially predictable sequence and
+    K=1, so a healthy v7x/TP2 run accepts every draft — all four
+    configurations measure 80/80 = 100%.
+    """
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        _qwen35_mtp_speculative_config(),
+        min_acceptance_rate=0.9,
+        max_num_seqs=max_num_seqs,
+        model_name=QWEN35_MTP_MODEL,
+        async_scheduling=async_scheduling,
+        extra_kwargs=QWEN35_KWARGS,
     )
 
 
@@ -644,3 +875,310 @@ def test_eagle3_sharded_draft(
         spec_llm.llm_engine.engine_core.shutdown()
         del spec_llm
         cleanup_dist_env_and_memory()
+
+
+# ---------------------------------------------------------------------------
+# Served backend (data parallelism)
+#
+# `_engine` routes here when data_parallel_size > 1, because vLLM rejects
+# LLM(data_parallel_size>1) for single-process use unless
+# `current_platform.is_tpu()`, and this plugin registers TpuPlatform with
+# `_enum = PlatformEnum.OOT`, so the exemption never applies. Serving is also
+# how DP actually ships here (see scripts/vllm/benchmarking/configs/*.sh).
+# ---------------------------------------------------------------------------
+
+DP_SIZE = 4
+
+# Cold TPU compilation of a DP engine pair takes minutes, and an idle DP
+# engine whose peer is still compiling can trip an RPC timeout, so give
+# startup room and always drive every engine with concurrent load.
+DP_SERVER_STARTUP_TIMEOUT_S = 1800
+DP_REQUEST_TIMEOUT_S = 1500
+DP_EXECUTE_MODEL_TIMEOUT_S = 1800
+DP_CONCURRENCY = 8
+
+# Prometheus renders the same counters the in-process reader exposes, with a
+# `_total` suffix.
+_DRAFT_METRIC = SPEC_DRAFT_METRIC + "_total"
+_ACCEPTED_METRIC = SPEC_ACCEPTED_METRIC + "_total"
+
+# Engine kwargs `_serve` knows how to express as `vllm serve` flags. Anything
+# else must be added here, or a served run would quietly differ from the
+# in-process run built from the same kwargs.
+_SERVE_TRANSLATED_KEYS = {
+    "max_model_len",
+    "max_num_seqs",
+    "tensor_parallel_size",
+    "data_parallel_size",
+    "async_scheduling",
+    "enable_prefix_caching",
+    "language_model_only",
+    "limit_mm_per_prompt",
+    "disable_log_stats",
+    "enable_expert_parallel",
+}
+
+
+def _serve_args(kwargs: dict) -> list[str]:
+    """Translate engine kwargs into `vllm serve` flags.
+
+    Deriving the flags from the same kwargs dict the in-process backend
+    receives is what keeps a served run honest: the two transports cannot
+    drift apart without this raising.
+    """
+    unhandled = {k for k, v in kwargs.items() if v is not None} - \
+        _SERVE_TRANSLATED_KEYS
+    assert not unhandled, (
+        f"engine kwargs gained {sorted(unhandled)}; add the matching `vllm "
+        "serve` flag here so served runs keep matching in-process runs")
+
+    args: list[str] = []
+    for key in ("max_model_len", "max_num_seqs", "tensor_parallel_size",
+                "data_parallel_size"):
+        if kwargs.get(key) is not None:
+            args += [f"--{key.replace('_', '-')}", str(kwargs[key])]
+
+    # Tri-state flags: absent means "leave the server default alone".
+    for key in ("async_scheduling", "enable_prefix_caching"):
+        value = kwargs.get(key)
+        if value is not None:
+            flag = key.replace("_", "-")
+            args.append(f"--{flag}" if value else f"--no-{flag}")
+
+    if kwargs.get("language_model_only"):
+        args.append("--language-model-only")
+    if kwargs.get("enable_expert_parallel"):
+        args.append("--enable-expert-parallel")
+    if kwargs.get("limit_mm_per_prompt") is not None:
+        args += [
+            "--limit-mm-per-prompt",
+            json.dumps(kwargs["limit_mm_per_prompt"])
+        ]
+    # Stats are on by default, which is what /metrics needs; only the
+    # disabling direction has a flag.
+    if kwargs.get("disable_log_stats"):
+        args.append("--disable-log-stats")
+    return args
+
+
+def _get_local_tpu_chip_count() -> int:
+    try:
+        from tpu_info import device as tpu_device
+
+        _, num_chips = tpu_device.get_local_chips()
+        return num_chips
+    except Exception as e:  # noqa: BLE001 - detection failure is a skip
+        pytest.skip(f"Unable to detect local TPU chip count: {e}")
+
+
+def _require_chips_for_dp() -> None:
+    tp = _get_tensor_parallel_size()
+    needed = DP_SIZE * tp
+    available = _get_local_tpu_chip_count()
+    if available < needed:
+        pytest.skip(f"DP spec decode needs {needed} chips (dp={DP_SIZE} x "
+                    f"tp={tp}), found {available}")
+
+
+def _pick_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+class _ServedEngine:
+    """Engine behind an out-of-process `vllm serve`."""
+
+    def __init__(self, base: str, model_name: str):
+        self._base = base
+        self._model = model_name
+
+    def generate(self, prompts: list[str],
+                 sampling_config: SamplingParams) -> list[str]:
+        """Send the prompts concurrently and return their texts.
+
+        Concurrency is required, not incidental: vLLM's DP load balancer only
+        spreads work over every engine when several requests are in flight,
+        and an engine left idle while its peer compiles can time out its own
+        RPC.
+        """
+
+        def one(prompt: str) -> str:
+            payload = json.dumps({
+                "model": self._model,
+                "prompt": prompt,
+                "max_tokens": sampling_config.max_tokens,
+                "temperature": sampling_config.temperature,
+                "ignore_eos": sampling_config.ignore_eos,
+            }).encode()
+            request = urllib.request.Request(
+                f"{self._base}/v1/completions",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            with urllib.request.urlopen(
+                    request, timeout=DP_REQUEST_TIMEOUT_S) as response:
+                body = json.loads(response.read().decode())
+            return body["choices"][0]["text"]
+
+        with ThreadPoolExecutor(max_workers=DP_CONCURRENCY) as pool:
+            return list(pool.map(one, prompts))
+
+    def spec_counters(self) -> tuple[float, float, dict[str, float]]:
+        """Sum the counters, keeping the per-engine draft breakdown.
+
+        Each DP engine exports its own series (`engine="0"`, `engine="1"`,
+        ...). Matching on `name{` stops the accepted-token counter from also
+        swallowing `..._per_pos_total`, which shares its prefix.
+        """
+        with urllib.request.urlopen(f"{self._base}/metrics",
+                                    timeout=60) as response:
+            body = response.read().decode()
+
+        totals = {_DRAFT_METRIC: 0.0, _ACCEPTED_METRIC: 0.0}
+        per_engine: dict[str, float] = {}
+        for line in body.splitlines():
+            if line.startswith("#"):
+                continue
+            for name in totals:
+                if not (line.startswith(name + "{")
+                        or line.startswith(name + " ")):
+                    continue
+                try:
+                    value = float(line.rsplit(" ", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                totals[name] += value
+                if name == _DRAFT_METRIC and 'engine="' in line:
+                    engine = line.split('engine="', 1)[1].split('"', 1)[0]
+                    per_engine[engine] = per_engine.get(engine, 0.0) + value
+        return totals[_DRAFT_METRIC], totals[_ACCEPTED_METRIC], per_engine
+
+
+@contextlib.contextmanager
+def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
+    """Run `vllm serve` with these engine kwargs; yield a _ServedEngine."""
+    port = _pick_free_port()
+    cmd = [
+        sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", model_name,
+        "--port",
+        str(port), *_serve_args(kwargs)
+    ]
+    if speculative_config is not None:
+        cmd += ["--speculative-config", json.dumps(speculative_config)]
+
+    base = f"http://localhost:{port}"
+
+    # Log to a file rather than a pipe. vLLM startup writes far more than a
+    # pipe buffer holds, and nothing here drains it, so PIPE would block the
+    # server mid-startup and the health poll would never succeed.
+    log = tempfile.NamedTemporaryFile(mode="w+",
+                                      suffix=".log",
+                                      prefix="vllm_serve_dp_",
+                                      delete=False)
+
+    def _fail(message: str) -> RuntimeError:
+        log.flush()
+        with open(log.name) as fh:
+            tail = fh.read()[-4000:]
+        return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
+
+    # The first request against a fresh engine pair compiles the runtime
+    # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
+    # worker-RPC deadline -- the engine is torn down mid-compile and every
+    # request 500s. Raise the deadline past the compile.
+    env = dict(
+        os.environ,
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S))
+
+    server = subprocess.Popen(cmd,
+                              stdout=log,
+                              stderr=subprocess.STDOUT,
+                              env=env,
+                              text=True)
+    try:
+        deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
+        while True:
+            if server.poll() is not None:
+                raise _fail(
+                    f"vllm serve exited with {server.returncode} during "
+                    "startup")
+            try:
+                urllib.request.urlopen(f"{base}/health", timeout=10).close()
+                break
+            except (urllib.error.URLError, OSError):
+                pass
+            if time.time() > deadline:
+                raise _fail("vllm serve did not become healthy within "
+                            f"{DP_SERVER_STARTUP_TIMEOUT_S}s")
+            time.sleep(10)
+        print(f"vllm serve ready at {base}; log: {log.name}")
+        yield _ServedEngine(base, model_name)
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=60)
+        log.close()
+        # Waiting for TPUs to be fully released before the next engine starts.
+        time.sleep(15)
+
+
+def _qwen35_dp_kwargs() -> dict:
+    return {
+        **QWEN35_KWARGS,
+        "data_parallel_size": DP_SIZE,
+        # Required, not incidental -- see QWEN35_MTP_DP_MODEL: without it the
+        # DP engines deadlock once they drain unevenly.
+        "enable_expert_parallel": True,
+    }
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(3600)
+def test_qwen35_mtp_dp_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """MTP under data parallelism must not change greedy output.
+
+    Same helper, same prompts, same comparison as the single-engine
+    correctness tests -- only data_parallel_size differs, which routes both
+    the reference and the speculative run through the served backend.
+    """
+    _require_chips_for_dp()
+
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        QWEN35_MTP_DP_MODEL,
+        _qwen35_mtp_speculative_config(),
+        async_scheduling=False,
+        extra_kwargs=_qwen35_dp_kwargs(),
+    )
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(2400)
+def test_qwen35_mtp_dp_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """Every DP engine drafts, and the drafts are accepted at a useful rate.
+
+    The helper's per-engine check does the DP-specific work: a drafter that
+    failed to load on one engine leaves the summed rate looking healthy.
+    """
+    _require_chips_for_dp()
+
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        _qwen35_mtp_speculative_config(),
+        min_acceptance_rate=0.9,
+        model_name=QWEN35_MTP_DP_MODEL,
+        async_scheduling=False,
+        extra_kwargs=_qwen35_dp_kwargs(),
+    )

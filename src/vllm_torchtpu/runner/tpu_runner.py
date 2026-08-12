@@ -43,6 +43,7 @@ from vllm.model_executor.layers.rotary_embedding import (MRotaryEmbedding,
 from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import \
     MRotaryEmbeddingInterleaved
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
@@ -95,6 +96,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -1080,6 +1083,11 @@ class TPUModelRunner(GPUModelRunner):
                     page_size_padded=page_size_padded,
                     indexes_kv_by_block_stride=True,
                 )
+            elif isinstance(attn_module, DeepseekV32IndexerCache):
+                # DSA indexer K cache: the module declares its own uint8 spec
+                # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
+                kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
+                    self.vllm_config)
             else:
                 continue
 
@@ -3000,9 +3008,16 @@ class TPUModelRunner(GPUModelRunner):
             # and packs the tokens into inputs_embeds; use whichever exists.
             num_tokens_padded = (input_ids if input_ids is not None else
                                  inputs_embeds).shape[0]
-            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-                self._token_padding_update(num_tokens_padded)
-            with set_forward_context(
+            self._token_padding_update(num_tokens_padded)
+
+            req_id_kwargs = extract_request_ids_for_tracing(
+                self.input_batch.req_ids, start_index, num_reqs)
+
+            with TraceAnnotation(
+                    name="ModelForward",
+                    num_reqs=num_reqs,
+                    **req_id_kwargs,
+            ), set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
@@ -3806,7 +3821,13 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
+            VllmCompressedTensorsW4ANMxfp4MoEMethod
+        uses_mxfp4_moe = any(
+            isinstance(getattr(module, "quant_method", None),
+                       VllmCompressedTensorsW4ANMxfp4MoEMethod)
+            for module in self.model.modules())
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 self.max_num_tokens, self.device)
             token_padding.set_padding_state(self._token_padding_state)
@@ -3898,7 +3919,8 @@ class TPUModelRunner(GPUModelRunner):
         else:
             position_ids = torch.zeros(num_tokens,
                                        dtype=torch.int32).to(self.device)
-        query_lens = [1] * num_reqs
+        query_lens = ([1] * actual_num_reqs + [0] *
+                      (num_reqs - actual_num_reqs))
         query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
                                                     dtype=torch.int32),
                                        dim=0,
@@ -3976,6 +3998,10 @@ class TPUModelRunner(GPUModelRunner):
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
+                sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
+                sequence_layout_protocol=(
+                    dummy_layout_plan.descriptor.protocol),
+                sequence_layout_version=(dummy_layout_plan.descriptor.version),
             )
 
             per_layer_attn_metadata = {
@@ -3983,10 +4009,10 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in self._attn_layer_names
             }
 
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-            assert self._token_padding_state is not None
+        padding_state = getattr(self, "_token_padding_state", None)
+        if padding_state is not None:
             # Every row of a dummy step is padding.
-            self._token_padding_state.update(0, num_tokens)
+            padding_state.update(0, num_tokens)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -5175,7 +5201,8 @@ class TPUModelRunner(GPUModelRunner):
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""
-        if self._token_padding_state is None:
+        padding_state = getattr(self, "_token_padding_state", None)
+        if padding_state is None:
             return
         plan = self._last_sequence_layout_plan
         if plan is not None and plan.kind is SequenceLayoutKind.ALL:
@@ -5183,7 +5210,7 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # Padding-mask support is currently limited to the ALL layout.
             num_valid_tokens = num_tokens_padded
-        self._token_padding_state.update(num_valid_tokens, num_tokens_padded)
+        padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         # @support_torch_compile annotations will be put on the vLLM model if it

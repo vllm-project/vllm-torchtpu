@@ -7,9 +7,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
-from vllm.distributed import (get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -29,23 +28,11 @@ class KimiRoutedOutputTransform(nn.Module):
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
-        self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        reduced_before_norm = self.norm is not None and self.tp_size > 1
-        if reduced_before_norm:
-            # Routed experts shard their intermediate dimension across TP
-            # ranks.  K3 normalizes the summed latent output, so reducing only
-            # after this nonlinear transform (the generic FusedMoE order)
-            # produces a different result.  FusedMoE still performs its final
-            # reduction to combine the shared-expert partials; divide this
-            # replicated routed result below to compensate for that reduction.
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         hidden_states, _ = self.up_proj(hidden_states)
-        if reduced_before_norm:
-            hidden_states = hidden_states / self.tp_size
         return hidden_states
 
 
@@ -131,19 +118,15 @@ class KimiMoE(nn.Module):
         situ_linear_beta = (getattr(config, "activation_situ_linear_beta",
                                     None)
                             if config.hidden_act == "situ" else None)
-        # Current vLLM represents activations with an enum that does not yet
-        # include Kimi-K3's SITU.  SITU has the same gated weight layout as
-        # SiLU, so construct the generic MoE with SiLU and restore the TPU
-        # kernel's richer activation descriptor below.
-        moe_activation = ("silu" if config.hidden_act == "situ" else
-                          config.hidden_act)
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,
             hidden_size=expert_hidden_size,
             intermediate_size=padded_intermediate_size,
-            activation=moe_activation,
+            activation=config.hidden_act,
+            activation_situ_beta=situ_beta,
+            activation_situ_linear_beta=situ_linear_beta,
             renormalize=config.moe_renormalize,
             quant_config=quant_config,
             use_grouped_topk=config.use_grouped_topk,
@@ -156,12 +139,6 @@ class KimiMoE(nn.Module):
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=routed_output_transform,
         )
-        # SITU parameters used to be accepted directly by FusedMoE. Current
-        # vLLM keeps activation-specific settings on the runner's MoE config.
-        self.experts.moe_config.activation_situ_beta = situ_beta
-        self.experts.moe_config.activation_situ_linear_beta = situ_linear_beta
-        if config.hidden_act == "situ":
-            self.experts.routed_experts.activation = "situ"
         if padded_intermediate_size != config.moe_intermediate_size:
             routed_experts = self.experts.routed_experts
             w13_weight = getattr(routed_experts, "w13_weight", None)

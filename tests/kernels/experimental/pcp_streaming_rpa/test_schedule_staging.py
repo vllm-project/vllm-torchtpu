@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Pallas staging checks for the production PCP runtime schedule ABI."""
 
-import sys
-from pathlib import Path
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -22,81 +22,153 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from schedule_reference import \
-    generate_pcp_streaming_schedule_reference  # noqa: E402
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import kernel
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import \
+    build_runtime_schedule_reference
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
+    RuntimeScheduleField,
+    build_pcp_streaming_schedule_inputs_from_metadata_jax)
 
 pytestmark = pytest.mark.multichip
 
 
-def _stage_schedule_step_kernel(packed_ref, o_ref, dma_sem, sched_vmem_ref):
-    step = pl.program_id(0)
-    load_op = pltpu.make_async_copy(
-        src_ref=packed_ref.at[step],
-        dst_ref=sched_vmem_ref.at[:, :, :],
+def _stage_runtime_schedule_kernel(
+    tile_plan_ref,
+    block_table_ref,
+    output_ref,
+    dma_sem,
+    plan_vmem_ref,
+    block_table_vmem_ref,
+    schedule_vmem_ref,
+    *,
+    state_mode,
+    group_idx,
+    source_rank,
+    pcp_size,
+    page_size,
+    interleave_size,
+):
+    kernel._load_hbm_row(tile_plan_ref, plan_vmem_ref, dma_sem, 0)
+    kernel._load_hbm_row(block_table_ref, block_table_vmem_ref, dma_sem, 0)
+    kernel._stage_schedule_step_from_tile_plan(
+        plan_vmem_ref[...],
+        block_table_vmem_ref[...],
+        schedule_vmem_ref,
+        jnp.asarray(group_idx, dtype=jnp.int32),
+        jnp.asarray(source_rank, dtype=jnp.int32),
+        state_mode=state_mode,
+        pcp_size=pcp_size,
+        page_size=page_size,
+        interleave_size=interleave_size,
+        lane=0,
+    )
+    store = pltpu.make_async_copy(
+        src_ref=schedule_vmem_ref.at[:],
+        dst_ref=output_ref.at[:],
         sem=dma_sem,
     )
-    load_op.start()
-    load_op.wait()
+    store.start()
+    store.wait()
 
-    store_op = pltpu.make_async_copy(
-        src_ref=sched_vmem_ref.at[:, :, :],
-        dst_ref=o_ref.at[step],
-        sem=dma_sem,
+
+def _stage_runtime_schedule(tile_plan, block_tables, *, state_mode, group_idx,
+                            source_rank, pcp_size, page_size, interleave_size):
+    output_shape = jax.ShapeDtypeStruct(
+        (pcp_size, 1, RuntimeScheduleField.PACKED_NUM_FIELDS),
+        jnp.int32,
     )
-    store_op.start()
-    store_op.wait()
-
-
-def _stage_schedule_steps(packed_schedule):
-    max_steps, pcp_size, num_lanes, num_fields = packed_schedule.shape
     return pl.pallas_call(
-        _stage_schedule_step_kernel,
-        out_shape=jax.ShapeDtypeStruct(packed_schedule.shape,
-                                       packed_schedule.dtype),
+        functools.partial(
+            _stage_runtime_schedule_kernel,
+            state_mode=state_mode,
+            group_idx=group_idx,
+            source_rank=source_rank,
+            pcp_size=pcp_size,
+            page_size=page_size,
+            interleave_size=interleave_size,
+        ),
+        out_shape=output_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
-                pltpu.VMEM((pcp_size, num_lanes, num_fields),
-                           packed_schedule.dtype),
+                pltpu.VMEM((1, tile_plan.shape[2]), jnp.int32),
+                pltpu.VMEM(block_tables.shape[1:], jnp.int32),
+                pltpu.VMEM(
+                    (pcp_size, 1, RuntimeScheduleField.PACKED_NUM_FIELDS),
+                    jnp.int32,
+                ),
             ),
-            grid=(max_steps, ),
+            grid=(1, ),
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=8 * 1024 *
-                                             1024, ),
-        name="pcp_streaming_schedule_staging_smoke",
-    )(packed_schedule)
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=8 * 1024 * 1024),
+        name=f"pcp_stage_{state_mode}_runtime_schedule",
+    )(tile_plan, block_tables)
 
 
-def _require_tpu_devices(min_count, reason):
+def _require_tpu():
     devices = jax.local_devices()
-    if len(devices) < min_count or devices[0].platform != "tpu":
-        pytest.skip(reason)
-    return devices
+    if not devices or devices[0].platform != "tpu":
+        pytest.skip("Runtime schedule staging requires a TPU device.")
 
 
-def test_packed_schedule_step_can_be_staged_from_hbm_to_vmem(
-        release_jax_backend):
-    _require_tpu_devices(1, "Schedule staging smoke test requires TPU.")
-    schedule = generate_pcp_streaming_schedule_reference(
-        kv_lens=[12],
-        cu_q_lens=[0, 7],
-        q_start_offsets=[5],
-        block_tables=np.array([[100, 101]], dtype=np.int32),
-        page_size=2,
-        pcp_size=4,
-        interleave_size=2,
-        num_lanes=1,
-        bq_sz=2,
+@pytest.mark.parametrize(
+    ("state_mode", "group_idx", "source_rank"),
+    [
+        ("current", 0, 1),
+        ("current", 1, 0),
+        ("history", 0, 1),
+    ],
+)
+def test_pallas_staging_matches_runtime_schedule_reference(
+        release_jax_backend, state_mode, group_idx, source_rank):
+    _require_tpu()
+    pcp_size = 2
+    page_size = 4
+    interleave_size = 2
+    tile_plan, block_tables, *_ = \
+        build_pcp_streaming_schedule_inputs_from_metadata_jax(
+            kv_lens=np.asarray([19], dtype=np.int32),
+            page_indices=np.arange(8, dtype=np.int32) + 5,
+            cu_q_lens=np.asarray([0, 8], dtype=np.int32),
+            distribution=np.asarray([0, 0, 1], dtype=np.int32),
+            global_bucket_tokens=8,
+            local_kv_cache_num_blocks=8,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            q_block_size=4,
+        )
+    reference = build_runtime_schedule_reference(
+        tile_plan,
+        block_tables,
+        pcp_size=pcp_size,
+        page_size=page_size,
+        interleave_size=interleave_size,
     )
-    packed = jnp.asarray(schedule.packed_schedule)
-
-    staged = _stage_schedule_steps(packed)
+    active_tile = int(np.flatnonzero(reference.current_num_groups > 0)[0])
+    one_tile_plan = tile_plan[active_tile:active_tile + 1]
+    staged = jax.jit(
+        functools.partial(
+            _stage_runtime_schedule,
+            state_mode=state_mode,
+            group_idx=group_idx,
+            source_rank=source_rank,
+            pcp_size=pcp_size,
+            page_size=page_size,
+            interleave_size=interleave_size,
+        ))(one_tile_plan, block_tables)
     staged.block_until_ready()
 
-    np.testing.assert_array_equal(np.asarray(jax.device_get(staged)),
-                                  schedule.packed_schedule)
+    rows = (reference.current_rows
+            if state_mode == "current" else reference.history_rows)
+    expected = rows[active_tile, group_idx, source_rank]
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(staged))[:, 0],
+        expected,
+    )

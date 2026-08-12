@@ -146,7 +146,7 @@ def test_evaluate_runner_chunk_accepts_decode_only_query_spans():
     np.testing.assert_array_equal(
         decision.absolute_query_start_offsets_per_req, np.asarray([64, 64]))
     np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([64, 64]))
+                                  np.asarray([0, 1]))
 
 
 def test_evaluate_runner_chunk_disabled_when_pcp_is_off():
@@ -216,7 +216,7 @@ def test_evaluate_runner_chunk_accepts_unaligned_q_start():
                                   np.asarray([16, 16, 16, 16]))
 
 
-def test_current_owner_coordinates_are_distinct_but_request_absolute():
+def test_batch_flat_owner_is_independent_from_request_absolute_position():
     decision = _evaluate(
         eligibility=_eligibility(pcp_size=2),
         computed=[16],
@@ -230,11 +230,11 @@ def test_current_owner_coordinates_are_distinct_but_request_absolute():
     np.testing.assert_array_equal(
         decision.absolute_query_start_offsets_per_req, np.asarray([16]))
     np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([16]))
+                                  np.asarray([0]))
     assert decision.absolute_query_start_offsets_per_req is not (
         decision.token_owner_start_offsets_per_req)
     np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([0, 16]))
+                                  np.asarray([16, 0]))
 
     token_order, inverse_order = build_pcp_rank_major_token_order(
         [16],
@@ -244,9 +244,9 @@ def test_current_owner_coordinates_are_distinct_but_request_absolute():
         token_owner_start_offsets_per_req=(
             decision.token_owner_start_offsets_per_req),
     )
-    np.testing.assert_array_equal(token_order[:16], np.full(16, -1))
-    np.testing.assert_array_equal(token_order[16:], np.arange(16))
-    np.testing.assert_array_equal(inverse_order, np.arange(16, 32))
+    np.testing.assert_array_equal(token_order[:16], np.arange(16))
+    np.testing.assert_array_equal(token_order[16:], np.full(16, -1))
+    np.testing.assert_array_equal(inverse_order, np.arange(16))
     np.testing.assert_array_equal(
         build_pcp_logits_indices(
             [16],
@@ -256,7 +256,7 @@ def test_current_owner_coordinates_are_distinct_but_request_absolute():
             token_owner_start_offsets_per_req=(
                 decision.token_owner_start_offsets_per_req),
         ),
-        np.asarray([31]),
+        np.asarray([15]),
     )
 
 
@@ -279,7 +279,53 @@ def test_evaluate_runner_chunk_classifies_multi_active_streaming_prefill():
     np.testing.assert_array_equal(
         decision.absolute_query_start_offsets_per_req, np.asarray([0, 0]))
     np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([0, 0]))
+                                  np.asarray([0, 1024]))
+
+
+def test_batch_flat_owner_balances_32_by_256_across_pcp8():
+    num_reqs = 32
+    q_len = 256
+    decision = _evaluate(
+        eligibility=_eligibility(pcp_size=8, interleave_size=256),
+        computed=[0] * num_reqs,
+        prompt=[q_len] * num_reqs,
+        scheduled=[q_len] * num_reqs,
+        num_tokens_paddings=(1024, ),
+        max_num_tokens=1024,
+    )
+
+    np.testing.assert_array_equal(
+        decision.token_owner_start_offsets_per_req,
+        np.arange(num_reqs, dtype=np.int64) * q_len,
+    )
+    np.testing.assert_array_equal(decision.local_token_counts,
+                                  np.full(8, 1024, dtype=np.int32))
+    assert decision.local_required_tokens == 1024
+    assert decision.local_padded_tokens == 1024
+    assert decision.global_padded_tokens == 8192
+
+
+def test_batch_flat_owner_balances_four_by_8192_across_pcp8():
+    num_reqs = 4
+    q_len = 8192
+    decision = _evaluate(
+        eligibility=_eligibility(pcp_size=8, interleave_size=256),
+        computed=[0] * num_reqs,
+        prompt=[q_len] * num_reqs,
+        scheduled=[q_len] * num_reqs,
+        num_tokens_paddings=(4096, ),
+        max_num_tokens=4096,
+    )
+
+    np.testing.assert_array_equal(
+        decision.token_owner_start_offsets_per_req,
+        np.arange(num_reqs, dtype=np.int64) * q_len,
+    )
+    np.testing.assert_array_equal(decision.local_token_counts,
+                                  np.full(8, 4096, dtype=np.int32))
+    assert decision.local_required_tokens == 4096
+    assert decision.local_padded_tokens == 4096
+    assert decision.global_padded_tokens == 4 * q_len
 
 
 def test_evaluate_runner_chunk_accepts_unaligned_multi_active_q_len():
@@ -463,3 +509,37 @@ def test_pcp_sequence_layout_planner_returns_all_when_disabled():
     assert plan.global_padded_num_tokens == 32
     assert plan.local_padded_num_tokens == 32
     assert plan.requires_hidden_state_gather is False
+
+
+def test_pcp_planner_preinit_and_dummy_share_the_v1_layout_contract():
+    planner = PcpSequenceLayoutPlanner(
+        _eligibility(pcp_size=8, interleave_size=256))
+
+    assert planner.requires_backend_preinit is True
+    assert planner.backend_preinit_world_size == 8
+
+    before_cache = planner.prepare_dummy(
+        num_tokens=4096,
+        num_reqs=32,
+        kv_cache_initialized=False,
+    )
+    assert before_cache.kind is SequenceLayoutKind.PARTIAL
+    assert before_cache.descriptor.protocol == "pcp_streaming"
+    assert before_cache.descriptor.version == 1
+
+    after_cache = planner.prepare_dummy(
+        num_tokens=4096,
+        num_reqs=32,
+        kv_cache_initialized=True,
+    )
+    assert after_cache.kind is SequenceLayoutKind.PARTIAL
+    assert after_cache.descriptor.protocol == "pcp_streaming"
+    assert after_cache.descriptor.version == 1
+    assert after_cache.token_slice == slice(0, 4096)
+    assert after_cache.global_num_tokens == 8 * 4096
+    assert after_cache.global_padded_num_tokens == 8 * 4096
+    assert after_cache.local_num_tokens == 4096
+    assert after_cache.local_padded_num_tokens == 4096
+    assert after_cache.requires_hidden_state_gather is True
+
+    assert before_cache == after_cache

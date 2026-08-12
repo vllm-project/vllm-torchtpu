@@ -72,7 +72,22 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      # The data-parallel MTP tests in the same file need DP*TP chips, which
+      # the 2-chip spec-decode queue above cannot provide (they self-skip
+      # there). This step is the only place they get enough chips to run.
+      - label: "Unit Tests - Speculative Decoding Multichip (Nightly)"
+        key: "unit_tests_spec_decode_multichip_nightly"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_8_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=3600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - General (Nightly)"
         key: "unit_tests_general_nightly"

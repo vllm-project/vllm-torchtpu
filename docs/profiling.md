@@ -463,7 +463,9 @@ phases the scheduler actually produced.
 canonical timestamp; see the multi-host warning above.
 
 **Per-expert MoE timings look skewed** — with expert parallelism, a single
-device's profile reflects only the experts routed to it. `FORCE_MOE_RANDOM_ROUTING=1`
-routes tokens to uniformly random experts so one device's profile represents the
-whole EP mesh. It produces meaningless model output; use it for profiling only,
-never for serving.
+device's profile reflects only the experts routed to it.
+`VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random` routes tokens to uniformly
+random experts so one device's profile represents the whole EP mesh. It produces
+meaningless model output; use it for profiling only, never for serving. The
+variable is upstream vLLM's routing-simulation selector, so any strategy
+registered with `RoutingSimulator` can be named here.

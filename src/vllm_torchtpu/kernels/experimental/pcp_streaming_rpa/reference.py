@@ -11,162 +11,311 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reference implementation for PCP streaming prefill RPA schedules."""
+"""Host reference expansion for the production PCP runtime schedule ABI."""
+
+import dataclasses
 
 import numpy as np
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
-    PcpStreamingSchedule, validate_pcp_streaming_schedule)
+    RuntimeScheduleField, TilePlanField)
 
 
-def execute_pcp_streaming_reference(
-    q_by_rank: np.ndarray,
-    kv_cache_by_rank: np.ndarray,
-    schedule: PcpStreamingSchedule,
-    *,
-    sm_scale: float,
-    interleave_size: int | None = None,
-) -> np.ndarray:
-    """Run the PCP streaming schedule with NumPy online softmax.
+@dataclasses.dataclass(frozen=True)
+class RuntimeScheduleReference:
+    """Current/history runtime rows expanded from one production tile plan.
 
-    Args:
-        q_by_rank: [pcp_size, local_padded_tokens, kv_heads, q_per_kv, head_dim].
-        kv_cache_by_rank: [pcp_size, pages, page_size, kv_heads, 2, head_dim].
-        schedule: Host-side PCP streaming schedule.
-        sm_scale: Attention softmax scale.
-        interleave_size: Number of consecutive global tokens assigned to one
-            PCP rank before rotating to the next rank. Defaults to page_size.
-
-    Returns:
-        Rank-local packed output with the same shape as q_by_rank.
+    Row tensors have shape
+    ``[tile, group, source_rank, consumer_rank, packed_fields]``. Source rank
+    is an implicit ring coordinate in the production kernel and therefore is
+    intentionally not duplicated in ``RuntimeScheduleField``.
     """
-    validate_pcp_streaming_schedule(schedule)
 
-    pcp_size, _, kv_heads, q_per_kv, head_dim = q_by_rank.shape
-    page_size = kv_cache_by_rank.shape[2]
-    if interleave_size is None:
-        interleave_size = page_size
-    if pcp_size != schedule.pcp_size:
-        raise ValueError("q_by_rank first dimension must match schedule.")
-    output = np.zeros_like(q_by_rank, dtype=np.float32)
+    current_rows: np.ndarray
+    history_rows: np.ndarray
+    current_num_groups: np.ndarray
+    history_num_groups: np.ndarray
 
-    for consumer_rank in range(schedule.pcp_size):
-        q_tiles = [None] * schedule.num_lanes
-        m_states = [None] * schedule.num_lanes
-        l_states = [None] * schedule.num_lanes
-        acc_states = [None] * schedule.num_lanes
-        q_tile_sizes = [0] * schedule.num_lanes
-        for step in range(int(schedule.actual_steps[consumer_rank])):
-            for lane in range(schedule.num_lanes):
-                req_id = int(schedule.req_id[consumer_rank, step, lane])
-                if req_id == -1:
-                    continue
 
-                if schedule.load_q[consumer_rank, step, lane]:
-                    q_offset = int(schedule.q_hbm_offset[consumer_rank, step,
-                                                         lane])
-                    q_tile_size = int(schedule.q_tile_size[consumer_rank, step,
-                                                           lane])
-                    q_tile_sizes[lane] = q_tile_size
-                    q_tiles[lane] = q_by_rank[
-                        consumer_rank,
-                        q_offset:q_offset + q_tile_size,
-                    ].astype(np.float32)
+def _rank_token_count_before(position: int, rank: int, *, pcp_size: int,
+                             interleave_size: int) -> int:
+    cycle = pcp_size * interleave_size
+    full_cycles = position // cycle
+    cycle_offset = position - full_cycles * cycle
+    rank_start = rank * interleave_size
+    partial = min(max(cycle_offset - rank_start, 0), interleave_size)
+    return full_cycles * interleave_size + partial
 
-                if schedule.is_first_kv[consumer_rank, step, lane]:
-                    q_tile_size = q_tile_sizes[lane]
-                    m_states[lane] = np.full((q_tile_size, kv_heads, q_per_kv),
-                                             -np.inf,
-                                             dtype=np.float32)
-                    l_states[lane] = np.zeros(
-                        (q_tile_size, kv_heads, q_per_kv), dtype=np.float32)
-                    acc_states[lane] = np.zeros(
-                        (q_tile_size, kv_heads, q_per_kv, head_dim),
-                        dtype=np.float32)
 
-                q_tile = q_tiles[lane]
-                m = m_states[lane]
-                l_state = l_states[lane]
-                acc = acc_states[lane]
-                if (q_tile is None or m is None or l_state is None
-                        or acc is None):
-                    raise ValueError(
-                        "schedule entry used before Q load/reset.")
+def _local_page_valid_len(kv_len: int, local_page_idx: int, source_rank: int,
+                          *, page_size: int, pcp_size: int,
+                          interleave_size: int) -> int:
+    cycle = pcp_size * interleave_size
+    base = (local_page_idx * page_size * pcp_size +
+            source_rank * interleave_size)
+    delta = kv_len - base
+    chunks_per_page = page_size // interleave_size
+    full_chunks = min(chunks_per_page, max(delta, 0) // cycle)
+    partial = min(interleave_size, max(delta - full_chunks * cycle, 0))
+    valid_len = full_chunks * interleave_size
+    if full_chunks < chunks_per_page:
+        valid_len += partial
+    return valid_len if kv_len > base else 0
 
-                src_rank = int(schedule.kv_page_rank[consumer_rank, step,
-                                                     lane])
-                page_idx = int(schedule.kv_page_idx[consumer_rank, step, lane])
-                kv_valid_len = int(schedule.kv_valid_len[consumer_rank, step,
-                                                         lane])
-                kv_global_start = int(schedule.kv_global_start[consumer_rank,
-                                                               step, lane])
-                q_global_start = int(schedule.q_global_start[consumer_rank,
-                                                             step, lane])
-                if schedule.kv_page_indices is None:
-                    k = kv_cache_by_rank[src_rank, page_idx, :kv_valid_len, :,
-                                         0, :].astype(np.float32)
-                    v = kv_cache_by_rank[src_rank, page_idx, :kv_valid_len, :,
-                                         1, :].astype(np.float32)
-                    local_kv_pos = np.arange(kv_valid_len)
-                    kv_pos = (kv_global_start +
-                              (local_kv_pos // interleave_size) *
-                              schedule.pcp_size * interleave_size +
-                              local_kv_pos % interleave_size)
+
+def _new_rows(num_tiles: int, max_groups: int, pcp_size: int) -> np.ndarray:
+    rows = np.zeros(
+        (
+            num_tiles,
+            max_groups,
+            pcp_size,
+            pcp_size,
+            RuntimeScheduleField.PACKED_NUM_FIELDS,
+        ),
+        dtype=np.int32,
+    )
+    rows[..., RuntimeScheduleField.REQ_ID] = -1
+    return rows
+
+
+def _set_common_fields(row: np.ndarray, plan: np.ndarray, consumer_rank: int,
+                       *, req_id: int, kv_page_idx: int, kv_global_start: int,
+                       kv_valid_len: int, kv_hbm_offset: int) -> None:
+    row[RuntimeScheduleField.REQ_ID] = req_id
+    row[RuntimeScheduleField.KV_PAGE_IDX] = kv_page_idx
+    row[RuntimeScheduleField.Q_GLOBAL_START] = plan[
+        consumer_rank, TilePlanField.Q_GLOBAL_START]
+    row[RuntimeScheduleField.KV_GLOBAL_START] = kv_global_start
+    row[RuntimeScheduleField.KV_VALID_LEN] = kv_valid_len
+    row[RuntimeScheduleField.Q_HBM_OFFSET] = plan[consumer_rank,
+                                                  TilePlanField.Q_HBM_OFFSET]
+    row[RuntimeScheduleField.Q_TILE_SIZE] = plan[consumer_rank,
+                                                 TilePlanField.Q_TILE_SIZE]
+    row[RuntimeScheduleField.KV_HBM_OFFSET] = kv_hbm_offset
+
+
+def build_runtime_schedule_reference(
+    tile_plan: np.ndarray,
+    block_tables: np.ndarray,
+    *,
+    pcp_size: int,
+    page_size: int,
+    interleave_size: int,
+) -> RuntimeScheduleReference:
+    """Expand production tile metadata into the rows staged by Pallas."""
+    tile_plan = np.asarray(tile_plan, dtype=np.int32)
+    block_tables = np.asarray(block_tables, dtype=np.int32)
+    if tile_plan.ndim != 3 or tile_plan.shape[1] != 1:
+        raise ValueError("tile_plan must have shape [tiles, 1, fields].")
+    if block_tables.ndim != 2:
+        raise ValueError("block_tables must be rank 2.")
+    logical_fields = pcp_size * TilePlanField.NUM_FIELDS
+    if tile_plan.shape[2] < logical_fields:
+        raise ValueError("tile_plan does not cover all PCP rank fields.")
+    if page_size <= 0 or pcp_size <= 0 or interleave_size <= 0:
+        raise ValueError(
+            "page_size, pcp_size, and interleave_size must be positive.")
+    if interleave_size > page_size or page_size % interleave_size != 0:
+        raise ValueError("page_size must be divisible by interleave_size.")
+
+    logical = tile_plan[:,
+                        0, :logical_fields].reshape(tile_plan.shape[0],
+                                                    pcp_size,
+                                                    TilePlanField.NUM_FIELDS)
+    current_num_groups = logical[:, 0, TilePlanField.CURRENT_NUM_GROUPS].copy()
+    history_num_groups = logical[:, 0, TilePlanField.HISTORY_NUM_GROUPS].copy()
+    current_rows = _new_rows(logical.shape[0],
+                             int(current_num_groups.max(initial=0)), pcp_size)
+    history_rows = _new_rows(logical.shape[0],
+                             int(history_num_groups.max(initial=0)), pcp_size)
+
+    cycle = pcp_size * interleave_size
+    virtual_page_size = page_size * pcp_size
+    for tile_idx, plan in enumerate(logical):
+        req_id = int(plan[0, TilePlanField.REQ_ID])
+        token_owner_start = int(plan[0, TilePlanField.TOKEN_OWNER_START])
+        absolute_start = int(plan[0,
+                                  TilePlanField.REQUEST_ABSOLUTE_QUERY_START])
+        current_effective_len = int(plan[0,
+                                         TilePlanField.CURRENT_EFFECTIVE_LEN])
+        capture_current_kv = bool(plan[0, TilePlanField.CAPTURE_CURRENT_KV])
+        block_table = block_tables[req_id]
+        history_boundary_present = absolute_start % virtual_page_size != 0
+
+        for group_idx in range(int(current_num_groups[tile_idx])):
+            is_history_boundary = history_boundary_present and group_idx == 0
+            fresh_group_idx = max(group_idx - int(history_boundary_present), 0)
+            cycle_start = (token_owner_start // cycle * cycle +
+                           fresh_group_idx * cycle)
+            token_owner_end = token_owner_start + current_effective_len
+
+            for source_rank in range(pcp_size):
+                source_chunk_start = cycle_start + source_rank * interleave_size
+                overlap_start = max(source_chunk_start, token_owner_start)
+                overlap_end = min(source_chunk_start + interleave_size,
+                                  token_owner_end)
+                fresh_valid_len = max(overlap_end - overlap_start, 0)
+                fresh_global_start = (absolute_start + overlap_start -
+                                      token_owner_start)
+                source_rows_before_overlap = (_rank_token_count_before(
+                    overlap_start,
+                    source_rank,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                ) - _rank_token_count_before(
+                    token_owner_start,
+                    source_rank,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                ))
+                fresh_hbm_offset = int(plan[source_rank,
+                                            TilePlanField.CURRENT_KV_HBM_START]
+                                       ) + source_rows_before_overlap
+
+                boundary_local_page = absolute_start // virtual_page_size
+                safe_boundary_page = min(max(boundary_local_page, 0),
+                                         block_table.size - 1)
+                boundary_page_idx = int(block_table[safe_boundary_page])
+                boundary_global_start = (
+                    boundary_local_page * virtual_page_size +
+                    source_rank * interleave_size)
+                boundary_valid_len = _local_page_valid_len(
+                    absolute_start,
+                    boundary_local_page,
+                    source_rank,
+                    page_size=page_size,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                )
+
+                if is_history_boundary:
+                    kv_valid_len = boundary_valid_len
+                    kv_page_idx = boundary_page_idx
+                    kv_global_start = boundary_global_start
+                    kv_hbm_offset = -1
                 else:
-                    page_ids = schedule.kv_page_indices[consumer_rank, step,
-                                                        lane]
-                    k_pages = []
-                    v_pages = []
-                    remaining = kv_valid_len
-                    for page_id in page_ids:
-                        if remaining <= 0:
-                            break
-                        take = min(page_size, remaining)
-                        k_pages.append(kv_cache_by_rank[src_rank,
-                                                        page_id, :take, :,
-                                                        0, :])
-                        v_pages.append(kv_cache_by_rank[src_rank,
-                                                        page_id, :take, :,
-                                                        1, :])
-                        remaining -= take
-                    k = np.concatenate(k_pages, axis=0).astype(np.float32)
-                    v = np.concatenate(v_pages, axis=0).astype(np.float32)
-                    local_kv_pos = np.arange(kv_valid_len)
-                    kv_page_offset = local_kv_pos // page_size
-                    kv_token_offset = local_kv_pos % page_size
-                    kv_pos = (kv_global_start +
-                              kv_page_offset * schedule.pcp_size * page_size +
-                              (kv_token_offset // interleave_size) *
-                              schedule.pcp_size * interleave_size +
-                              kv_token_offset % interleave_size)
+                    kv_valid_len = fresh_valid_len
+                    kv_page_idx = 0
+                    kv_global_start = fresh_global_start
+                    kv_hbm_offset = fresh_hbm_offset
+                scheduled_req_id = req_id if kv_valid_len > 0 else -1
 
-                scores = np.einsum("thqd,shd->thqs", q_tile, k) * sm_scale
-                q_rows = np.arange(q_tile_size)
-                q_pos = (q_global_start + (q_rows // interleave_size) *
-                         schedule.pcp_size * interleave_size +
-                         q_rows % interleave_size)
-                mask = q_pos[:, None] >= kv_pos[None, :]
-                scores = np.where(mask[:, None, None, :], scores, -np.inf)
+                capture_len_0 = 0
+                capture_len_1 = 0
+                capture_owner_0 = -1
+                capture_owner_1 = -1
+                capture_offset_0 = 0
+                capture_offset_1 = 0
+                if (capture_current_kv and not is_history_boundary
+                        and fresh_valid_len > 0):
+                    capture_owner_0 = (fresh_global_start //
+                                       interleave_size) % pcp_size
+                    next_owner_boundary = (
+                        fresh_global_start // interleave_size +
+                        1) * interleave_size
+                    capture_len_0 = min(
+                        fresh_valid_len,
+                        max(next_owner_boundary - fresh_global_start, 0),
+                    )
+                    capture_len_1 = fresh_valid_len - capture_len_0
+                    capture_global_start_1 = (fresh_global_start +
+                                              capture_len_0)
+                    capture_owner_1 = (capture_global_start_1 //
+                                       interleave_size) % pcp_size
+                    capture_offset_0 = int(
+                        plan[capture_owner_0,
+                             TilePlanField.WRITEBACK_HBM_PREFIX]) + (
+                                 _rank_token_count_before(
+                                     fresh_global_start,
+                                     capture_owner_0,
+                                     pcp_size=pcp_size,
+                                     interleave_size=interleave_size,
+                                 ) - _rank_token_count_before(
+                                     absolute_start,
+                                     capture_owner_0,
+                                     pcp_size=pcp_size,
+                                     interleave_size=interleave_size,
+                                 ))
+                    capture_offset_1 = int(
+                        plan[capture_owner_1,
+                             TilePlanField.WRITEBACK_HBM_PREFIX]) + (
+                                 _rank_token_count_before(
+                                     capture_global_start_1,
+                                     capture_owner_1,
+                                     pcp_size=pcp_size,
+                                     interleave_size=interleave_size,
+                                 ) - _rank_token_count_before(
+                                     absolute_start,
+                                     capture_owner_1,
+                                     pcp_size=pcp_size,
+                                     interleave_size=interleave_size,
+                                 ))
 
-                m_curr = np.max(scores, axis=-1)
-                m_next = np.maximum(m, m_curr)
-                p = np.exp(scores - m_next[..., None])
-                alpha = np.exp(m - m_next)
-                l_state = alpha * l_state + np.sum(p, axis=-1)
-                acc = alpha[..., None] * acc + np.einsum(
-                    "thqs,shd->thqd", p, v)
-                m_states[lane] = m_next
-                l_states[lane] = l_state
-                acc_states[lane] = acc
+                for consumer_rank in range(pcp_size):
+                    row = current_rows[tile_idx, group_idx, source_rank,
+                                       consumer_rank]
+                    _set_common_fields(
+                        row,
+                        plan,
+                        consumer_rank,
+                        req_id=scheduled_req_id,
+                        kv_page_idx=kv_page_idx,
+                        kv_global_start=kv_global_start,
+                        kv_valid_len=kv_valid_len,
+                        kv_hbm_offset=kv_hbm_offset,
+                    )
+                    owns_0 = (capture_len_0 > 0
+                              and capture_owner_0 == consumer_rank)
+                    owns_1 = (capture_len_1 > 0
+                              and capture_owner_1 == consumer_rank)
+                    if owns_0:
+                        row[RuntimeScheduleField.CAPTURE_SRC_OFFSET] = 0
+                        row[RuntimeScheduleField.
+                            CAPTURE_DST_OFFSET] = capture_offset_0
+                        row[RuntimeScheduleField.CAPTURE_LEN] = (
+                            capture_len_0 +
+                            capture_len_1 if owns_1 else capture_len_0)
+                    elif owns_1:
+                        row[RuntimeScheduleField.
+                            CAPTURE_SRC_OFFSET] = capture_len_0
+                        row[RuntimeScheduleField.
+                            CAPTURE_DST_OFFSET] = capture_offset_1
+                        row[RuntimeScheduleField.CAPTURE_LEN] = capture_len_1
 
-                if schedule.is_last_kv[consumer_rank, step, lane]:
-                    out_offset = int(schedule.o_hbm_offset[consumer_rank, step,
-                                                           lane])
-                    output[consumer_rank, out_offset:out_offset +
-                           q_tile_size] = acc / l_state[..., None]
-                    q_tiles[lane] = None
-                    m_states[lane] = None
-                    l_states[lane] = None
-                    acc_states[lane] = None
+        for group_idx in range(int(history_num_groups[tile_idx])):
+            local_page_idx = group_idx
+            safe_local_page_idx = min(max(local_page_idx, 0),
+                                      block_table.size - 1)
+            page_idx = int(block_table[safe_local_page_idx])
+            for source_rank in range(pcp_size):
+                kv_global_start = (local_page_idx * virtual_page_size +
+                                   source_rank * interleave_size)
+                kv_valid_len = _local_page_valid_len(
+                    absolute_start,
+                    local_page_idx,
+                    source_rank,
+                    page_size=page_size,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                )
+                scheduled_req_id = req_id if kv_valid_len > 0 else -1
+                for consumer_rank in range(pcp_size):
+                    row = history_rows[tile_idx, group_idx, source_rank,
+                                       consumer_rank]
+                    _set_common_fields(
+                        row,
+                        plan,
+                        consumer_rank,
+                        req_id=scheduled_req_id,
+                        kv_page_idx=page_idx,
+                        kv_global_start=kv_global_start,
+                        kv_valid_len=kv_valid_len,
+                        kv_hbm_offset=0,
+                    )
 
-    return output
+    return RuntimeScheduleReference(
+        current_rows=current_rows,
+        history_rows=history_rows,
+        current_num_groups=current_num_groups,
+        history_num_groups=history_num_groups,
+    )

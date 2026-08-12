@@ -275,30 +275,15 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         activation_str = layer._tpu_activation_str
 
         # Step 1: Routing
-        custom_routing_fn = layer.custom_routing_function
-        if custom_routing_fn is not None:
-            # custom_routing_fn bypasses select_experts, so apply the
-            # random-routing profiling override here too (a no-op by default).
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=moe_routing.maybe_force_random_routing(
-                    router_logits),
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-            )
-        else:
-            select_kwargs = {}
-            if input_ids is not None:
-                select_kwargs["input_ids"] = input_ids
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=layer.scoring_func,
-                layer=layer,
-                **select_kwargs,
-            )
+        # Quantization-independent routing decision (simulation override ->
+        # custom_routing_function -> select_experts); shared across all TPU MoE
+        # methods so the routing-simulation hook lives in exactly one place.
+        # input_ids is forwarded for DeepSeek-V4 hash routing; mxfp4 is the only
+        # method that supplies it, matching the pre-consolidation behavior.
+        topk_weights, topk_ids = moe_routing.route(layer,
+                                                   x,
+                                                   router_logits,
+                                                   input_ids=input_ids)
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).

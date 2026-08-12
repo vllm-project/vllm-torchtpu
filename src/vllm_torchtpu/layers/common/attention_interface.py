@@ -14,6 +14,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
@@ -21,6 +22,8 @@ from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.common.utils import (repack_sparse_mla_cache,
+                                               update_sparse_mla_kv_cache)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
 
@@ -41,6 +44,7 @@ ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 
 mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
+sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
 
 
 def sharded_flash_attention(
@@ -584,3 +588,111 @@ def mla_attention(
                                               md.query_start_loc,
                                               md.request_distribution)
     return kv_cache, output_TNA
+
+
+def sparse_mla_attention(
+        ql_nope: jax.Array,
+        q_pe: jax.Array,
+        kv_c_normed: jax.Array,
+        k_pe: jax.Array,
+        kv_cache: jax.Array,
+        topk_indices: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        mesh: Mesh,
+        sm_scale: float | None = None,
+        k_scale: float | None = None) -> tuple[jax.Array, jax.Array]:
+    """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
+
+    Args:
+      ql_nope: Query nope latents (`[num_tokens, num_heads, lkv_dim]`).
+      q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
+      kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
+      k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
+      kv_cache: Paged MLA latent cache (`[num_blocks, block_size // kv_packing, kv_packing, padded_row]`).
+      topk_indices: Indexer output specifying tokens to gather (`[num_tokens, topk]`).
+      seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
+      block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
+      query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
+      request_distribution: Tensor of (decode_end, prefill_end, num_seqs) indexing bounds.
+      mesh: Target sharding mesh.
+      sm_scale: Softmax temperature scale.
+      k_scale: Dequantization scale for fp8 keys.
+
+    Returns:
+      A tuple containing:
+        - The updated `kv_cache`.
+        - The sparse attention output (`[num_tokens, num_heads, lkv_dim]`).
+
+    Contract notes:
+      * The kernel takes a SINGLE `q` of shape (T, N, nope+rope) in
+        token-major order -- no separate rope argument, and no head-major
+        transpose (the v2 kernel wants (N, T, L); this one does not).
+      * `q` must be bf16 (pre-quantization): the kernel dequantizes the
+        gathered KV to bf16 and has no q-scale plumbing.
+      * Fused KV-cache insert: writes current step's `kv_c_normed` and `k_pe`
+        into `kv_cache` before SparseCore gather execution.
+      * Per-token kv_lens derive from the "-1" tail padding in
+        `topk_indices`; every token must have at least one valid entry.
+    """
+    in_specs = (
+        P(None, None, None),  # ql_nope
+        P(None, None, None),  # q_pe
+        P(None, None),  # kv_c_normed
+        P(None, None),  # k_pe
+        P(None),  # kv_cache
+        P(None),  # topk_indices
+        P(None),  # seq_lens
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+        P(None),  # request_distribution
+    )
+    out_specs = (
+        P(None, None, None),  # attn output (T, N, D)
+        P(None),  # updated kv cache
+    )
+
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+
+    def _sparse_mla_ragged_paged_attention(ql_nope, q_pe, kv_c_normed, k_pe,
+                                           kv_cache, topk_idx, seq_lens_,
+                                           block_tables_, query_start_loc_,
+                                           request_distribution_):
+        kv_cache = update_sparse_mla_kv_cache(kv_cache, kv_c_normed, k_pe,
+                                              seq_lens_, block_tables_,
+                                              query_start_loc_)
+
+        lkv_dim = ql_nope.shape[-1]
+        rope_dim = q_pe.shape[-1]
+        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        nope_u8, rope_u8 = repack_sparse_mla_cache(kv_cache, lkv_dim, rope_dim,
+                                                   dequant_scale)
+
+        output = sparse_mla_ragged_paged_attention(
+            q,
+            nope_u8,
+            rope_u8,
+            topk_idx,
+            block_tables_,
+            query_start_loc_,
+            request_distribution_,
+            sm_scale=sm_scale or 1.0,
+            k_scale=dequant_scale,
+        )
+        # The kernel's output is lkv_dim + rope_dim wide because it attends
+        # over concatenated (nope + rope) keys. Only the nope part is the MLA
+        # value (P @ latent); drop the rope tail before the W_UV projection.
+        return output[..., :lkv_dim], kv_cache
+
+    output, updated_kv_cache = jax.jit(
+        shard_map.shard_map(_sparse_mla_ragged_paged_attention,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
+                                              kv_cache, topk_indices, seq_lens,
+                                              block_tables, query_start_loc,
+                                              request_distribution)
+    return updated_kv_cache, output

@@ -289,10 +289,13 @@ class PcpSequenceLayoutEligibility:
                             dtype=np.int32)
         absolute_query_starts = np.asarray(
             [span.absolute_query_start for span in spans], dtype=np.int64)
-        # The current layout assigns ownership in request-absolute token
-        # coordinates. Keep a distinct array so the ownership policy can be
-        # changed without changing attention/cache coordinates.
-        token_owner_starts = absolute_query_starts.copy()
+        # Assign the current batch's request-major query rows as one flat token
+        # stream. This is exactly query_start_loc[:-1]: ownership is local to
+        # this runner chunk, while attention positions and KV-cache slots keep
+        # using the independent request-absolute coordinates above.
+        token_owner_starts = np.zeros(q_lens.shape, dtype=np.int64)
+        if q_lens.size > 1:
+            np.cumsum(q_lens[:-1], dtype=np.int64, out=token_owner_starts[1:])
         local_counts = pcp_local_token_counts(
             q_lens,
             self.pcp_size,
@@ -446,11 +449,12 @@ class PcpSequenceLayoutPlanner:
         num_reqs: int,
         kv_cache_initialized: bool,
     ) -> SequenceLayoutPlan:
-        if not (self.enabled and kv_cache_initialized):
+        del kv_cache_initialized
+        if not self.enabled:
             return self._all_planner.prepare_dummy(
                 num_tokens=num_tokens,
                 num_reqs=num_reqs,
-                kv_cache_initialized=kv_cache_initialized,
+                kv_cache_initialized=False,
             )
         num_tokens = int(num_tokens)
         return SequenceLayoutPlan(

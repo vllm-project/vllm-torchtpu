@@ -173,24 +173,10 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         activation_str = get_fused_moe_activation(layer.activation,
                                                   layer.moe_config)
 
-        # Handle custom routing function if present
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
-        if custom_routing_fn is not None:
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-            )
-        else:
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
-                layer=layer,
-            )
+        # Quantization-independent routing decision (simulation override ->
+        # custom_routing_function -> select_experts); shared across all TPU MoE
+        # methods so the routing-simulation hook lives in exactly one place.
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
         res = fused_moe_gmm(
             hidden_states=x,

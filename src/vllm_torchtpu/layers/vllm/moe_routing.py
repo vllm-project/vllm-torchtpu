@@ -14,44 +14,147 @@
 """Routing helpers for TPU local MoE kernels."""
 
 import torch
+import vllm.envs as vllm_envs
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Warn once at import time rather than inside maybe_force_random_routing():
-# the notice then reaches every worker's startup log without adding a Python
-# call to the compiled forward pass, where it could trigger a graph break in
-# the exact code path we are trying to profile.
-if envs.FORCE_MOE_RANDOM_ROUTING:
+# Resolve the routing-simulation strategy once, at import, outside the compiled
+# forward pass. Doing the validation and the (test-only) warning here keeps them
+# off the traced hot path. We cache the strategy implementation and call its
+# route_tokens() directly in maybe_simulate_routing() rather than going through
+# RoutingSimulator.simulate_routing(): that wrapper calls logger.warning_once(),
+# which torch_tpu's tracer rejects inside the compiled MoE forward ("logging
+# .Logger method not supported for non-export cases"). route_tokens() itself is
+# pure tensor ops and traces cleanly.
+#
+# Exception: "uniform_random" is served by _uniform_random_routing() below
+# instead of upstream's route_tokens(), so the sampled experts keep a data
+# dependency on the real activations (see that docstring for why).
+_UNIFORM_RANDOM = "uniform_random"
+
+_SIMULATION_STRATEGY = None
+_strategy_name = vllm_envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
+if _strategy_name:
+    from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import \
+        RoutingSimulator
+    _available = RoutingSimulator.get_available_strategies()
+    if _strategy_name not in _available:
+        raise ValueError(
+            f"VLLM_MOE_ROUTING_SIMULATION_STRATEGY={_strategy_name!r} is not a "
+            f"known routing strategy. Available strategies: {_available}.")
+    _SIMULATION_STRATEGY = RoutingSimulator._routing_strategies[_strategy_name]
     logger.warning(
-        "FORCE_MOE_RANDOM_ROUTING is enabled: MoE expert routing is RANDOM. "
-        "This is a test-only feature and model output is meaningless. Never "
-        "enable it for serving or accuracy evaluation.")
+        "VLLM_MOE_ROUTING_SIMULATION_STRATEGY=%s: MoE expert routing is "
+        "SIMULATED. This is a test/profiling-only feature and model output is "
+        "meaningless. Never enable it for serving or accuracy evaluation.",
+        _strategy_name)
 
 
-def maybe_force_random_routing(router_logits: torch.Tensor) -> torch.Tensor:
-    """Optionally replace router logits with uniform noise, for profiling.
+def _uniform_random_routing(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Uniform-random expert selection that stays anchored to the real input.
 
-    Motivation: the TPU profiler (xprof) can only trace a single device, but
-    under expert parallelism each device owns a different slice of the experts.
-    Real routing is data-dependent and typically skewed, so which experts --
-    and therefore which devices -- do work depends on the input. A one-device
-    trace is then not representative of the full mesh.
+    Upstream's ``uniform_random`` strategy samples expert ids straight from
+    ``torch.randint``, reading ``router_logits`` for shape only. With no data
+    dependency on the activations, XLA is free to hoist and batch every layer's
+    routing together -- in an xprof trace the per-layer ``topk`` ops collapse
+    into one contiguous blob instead of interleaving with the real per-layer
+    work, so the profile no longer represents balanced-MoE execution, which is
+    the whole reason this feature exists.
 
-    With ``FORCE_MOE_RANDOM_ROUTING`` set, we route on uniform noise instead of
-    the model's gate. Top-k over i.i.d. noise selects a uniformly random set of
-    experts per token, so expert load is balanced across all EP shards in
-    expectation and any single device's profile represents the whole mesh.
-
-    This deliberately discards the trained gate, so model output is garbage.
-    Use it only for profiling and performance benchmarking -- never for serving
-    or accuracy evaluation. Disabled by default; a no-op when the flag is unset.
+    Adding ``router_logits.mean()`` to the noise creates that missing dependency
+    edge. It is numerically inert for routing: the same scalar is added to every
+    logit, and ``topk`` is invariant under a uniform shift, so the selected
+    experts are exactly those of the unshifted noise. The mean (rather than a
+    barrier) is deliberate -- it constrains scheduling without blocking
+    optimization across the boundary the way ``optimization_barrier`` would.
     """
-    if not envs.FORCE_MOE_RANDOM_ROUTING:
-        return router_logits
-    return torch.rand_like(router_logits)
+    noise = torch.rand_like(router_logits, dtype=torch.float32)
+    # Anchor the noise to the activations. Uniform shift => same argsort =>
+    # identical expert choice; the point is the graph edge, not the value.
+    noise = noise + router_logits.float().mean()
+    _, topk_ids = torch.topk(noise, k=topk, dim=-1)
+    topk_weights = torch.ones((router_logits.shape[0], topk),
+                              dtype=torch.float32,
+                              device=router_logits.device)
+    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
+
+def maybe_simulate_routing(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Optionally replace routing with a simulated strategy, for profiling.
+
+    Ports upstream vLLM's routing simulation onto the TPU MoE path. When
+    ``VLLM_MOE_ROUTING_SIMULATION_STRATEGY`` names a strategy (e.g.
+    ``uniform_random``), expert assignment is drawn from that strategy's
+    ``RoutingStrategy`` implementation instead of the trained gate. Uniform
+    routing balances expert load so a single-device profile represents the whole
+    EP mesh, at the cost of meaningless model output.
+
+    Returns ``(topk_weights, topk_ids)`` when a strategy is set, else ``None``
+    so the caller runs normal routing. Test/profiling only; a no-op by default.
+    """
+    if _SIMULATION_STRATEGY is None:
+        return None
+    if _strategy_name == _UNIFORM_RANDOM:
+        return _uniform_random_routing(hidden_states, router_logits, topk)
+    topk_weights, topk_ids = _SIMULATION_STRATEGY.route_tokens(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        top_k=topk,
+        indices_type=torch.int32,
+    )
+    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
+
+def route(
+    layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantization-independent routing entry point for the TPU MoE methods.
+
+    Every ``apply_monolithic`` (fp8, unquantized, nvfp4, mxfp4, and the two
+    compressed-tensors MoE methods) needs the same three-way routing
+    decision: routing simulation (test-only override) takes
+    priority if enabled, else a model-supplied ``custom_routing_function`` if
+    present, else our own ``select_experts``. That decision was previously
+    duplicated in each quant method; centralizing it here means the simulation
+    hook -- and any future routing-path change -- lives in exactly one place.
+    """
+    topk = layer.moe_config.experts_per_token
+    simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
+    if simulated is not None:
+        return simulated
+    # getattr with defaults, not direct attribute access: the compressed-tensors
+    # MoE methods are reached with layers that need not define either attribute,
+    # and previously guarded them exactly this way.
+    custom_routing_fn = getattr(layer, "custom_routing_function", None)
+    if custom_routing_fn is not None:
+        return custom_routing_fn(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=topk,
+            renormalize=layer.renormalize,
+        )
+    return select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk=topk,
+        renormalize=layer.renormalize,
+        scoring_fn=getattr(layer, "scoring_func", "softmax"),
+        layer=layer,
+        input_ids=input_ids,
+    )
 
 
 def _apply_scoring_fn(scoring_fn: str,
@@ -108,12 +211,19 @@ def select_experts(
     """Compute local routed expert IDs and weights for non-EP execution.
 
     Dispatch order:
+    0. Routing simulation, if ``VLLM_MOE_ROUTING_SIMULATION_STRATEGY`` is set
+       (test/profiling-only override; replaces the routing output wholesale).
     1. DeepSeek-V4 hash routing (if `layer.hash_indices_table` is present).
-    2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled, e.g. DeepSeek-V2/V3).
+    2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled AND the group
+       config actually requires grouped selection).
     3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for DeepSeek-V4)
        and optional `e_score_correction_bias`.
     """
-    router_logits = maybe_force_random_routing(router_logits)
+    # Profiling-only override; a no-op unless a routing-simulation strategy is
+    # set. Replaces the whole routing output, so return early.
+    simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
+    if simulated is not None:
+        return simulated
 
     hash_indices_table = getattr(layer, "hash_indices_table",
                                  None) if layer is not None else None
@@ -129,7 +239,10 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    if layer is not None and layer.use_grouped_topk:
+    use_grouped = (layer is not None and layer.use_grouped_topk
+                   and layer.num_expert_group > 1
+                   and layer.topk_group < layer.num_expert_group)
+    if use_grouped:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk
         topk_weights, topk_ids = grouped_topk(

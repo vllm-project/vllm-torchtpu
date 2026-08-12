@@ -29,6 +29,7 @@ pytestmark = pytest.mark.multichip
 P = jax.sharding.PartitionSpec
 AXIS = "pcp"
 PCP_SIZE = 4
+CAPTURE_PCP_SIZE = 8
 PAGE_SIZE = 2
 WIDTH = 128
 
@@ -128,6 +129,99 @@ def _run_ring_circulation(local_pages):
     return fn(local_pages)
 
 
+def _ring_capture_kernel(
+    local_page_ref,
+    captured_ref,
+    local_dma_sem,
+    remote_send_sems,
+    remote_recv_sems,
+    kv_vmem_ref,
+    *,
+    pcp_size,
+):
+    """Capture one passing page while every rank completes the same ring."""
+    my_id = lax.axis_index(AXIS)
+    next_rank = lax.rem(my_id + 1, pcp_size)
+    prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
+
+    load_op = pltpu.make_async_copy(
+        src_ref=local_page_ref.at[0, :, :],
+        dst_ref=kv_vmem_ref.at[0],
+        sem=local_dma_sem,
+    )
+    load_op.start()
+    load_op.wait()
+    util.local_barrier(prev_rank, next_rank)
+
+    for round_idx in range(pcp_size):
+        curr_slot = round_idx % 2
+        next_slot = 1 - curr_slot
+        src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
+        if round_idx < pcp_size - 1:
+            remote_op = pltpu.make_async_remote_copy(
+                src_ref=kv_vmem_ref.at[curr_slot],
+                dst_ref=kv_vmem_ref.at[next_slot],
+                send_sem=remote_send_sems.at[round_idx],
+                recv_sem=remote_recv_sems.at[round_idx],
+                device_id=(next_rank, ),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            remote_op.start()
+
+        # The owner of source rank r is rank (r + 1) % pcp_size. Therefore the
+        # owner has no local source/Q role for this page and sees it at round 1.
+        @pl.when(my_id == lax.rem(src_rank + 1, pcp_size))
+        def _capture_on_owner(curr_slot=curr_slot):
+            store_op = pltpu.make_async_copy(
+                src_ref=kv_vmem_ref.at[curr_slot],
+                dst_ref=captured_ref.at[0],
+                sem=local_dma_sem,
+            )
+            store_op.start()
+            store_op.wait()
+
+        if round_idx < pcp_size - 1:
+            remote_op.wait()
+
+
+def _ring_capture_call(local_page, *, pcp_size):
+    return pl.pallas_call(
+        functools.partial(_ring_capture_kernel, pcp_size=pcp_size),
+        out_shape=jax.ShapeDtypeStruct((1, PAGE_SIZE, WIDTH),
+                                       local_page.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            scratch_shapes=(
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
+                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
+                pltpu.VMEM((2, PAGE_SIZE, WIDTH), local_page.dtype),
+            ),
+            grid=(1, ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=13,
+            vmem_limit_bytes=8 * 1024 * 1024,
+        ),
+        name="pcp_streaming_ring_owner_capture_smoke",
+    )(local_page)
+
+
+def _run_ring_capture(local_pages):
+    mesh = jax.sharding.Mesh(jax.local_devices()[:CAPTURE_PCP_SIZE], (AXIS, ))
+    fn = jax.jit(
+        jax.shard_map(
+            functools.partial(_ring_capture_call, pcp_size=CAPTURE_PCP_SIZE),
+            mesh=mesh,
+            in_specs=P(AXIS, None, None),
+            out_specs=P(AXIS, None, None),
+            check_vma=False,
+        ))
+    return fn(local_pages)
+
+
 def _require_tpu_devices(min_count, reason):
     devices = jax.local_devices()
     if len(devices) < min_count or devices[0].platform != "tpu":
@@ -153,3 +247,25 @@ def test_vmem_pages_can_circulate_through_ring(release_jax_backend):
             src_rank = (rank - round_idx) % PCP_SIZE
             np.testing.assert_array_equal(out_np[rank, round_idx],
                                           local_np[src_rank])
+
+
+def test_ring_can_capture_kv_on_owner_without_changing_communication(
+        release_jax_backend):
+    _require_tpu_devices(
+        CAPTURE_PCP_SIZE,
+        "PCP ring owner capture smoke test requires eight TPU devices.",
+    )
+    local_pages = jnp.arange(
+        CAPTURE_PCP_SIZE * PAGE_SIZE * WIDTH,
+        dtype=jnp.int32,
+    ).reshape(CAPTURE_PCP_SIZE, PAGE_SIZE, WIDTH)
+
+    captured = _run_ring_capture(local_pages)
+    captured.block_until_ready()
+
+    captured_np = np.asarray(jax.device_get(captured))
+    local_np = np.asarray(jax.device_get(local_pages))
+    for cache_rank in range(CAPTURE_PCP_SIZE):
+        source_rank = (cache_rank - 1) % CAPTURE_PCP_SIZE
+        np.testing.assert_array_equal(captured_np[cache_rank],
+                                      local_np[source_rank])

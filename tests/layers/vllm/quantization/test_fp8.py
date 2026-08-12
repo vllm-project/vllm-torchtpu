@@ -484,13 +484,13 @@ class TestOnlineFp8Quantization:
         """_quantize_bf16_moe_weights should produce correct shapes."""
         from unittest.mock import MagicMock
 
-        from vllm.model_executor.layers.fused_moe import FusedMoE
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
 
         from vllm_torchtpu.layers.vllm.quantization.fp8 import \
             _quantize_bf16_moe_weights
 
         E, inter, H = 4, 64, 128
-        layer = MagicMock(spec=FusedMoE)
+        layer = MagicMock(spec=RoutedExperts)
         layer.w13_weight = torch.nn.Parameter(
             torch.randn(E, 2 * inter, H, dtype=torch.bfloat16))
         layer.w2_weight = torch.nn.Parameter(

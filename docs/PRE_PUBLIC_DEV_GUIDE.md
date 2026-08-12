@@ -8,7 +8,7 @@
 ---
 
 > [!NOTE] Relationship to Standard Documentation
-> For all general contribution guidelines, bug reporting procedures, project directory structures, and general testing policies, please refer directly to [CONTRIBUTING.md](file:///usr/local/google/home/johnqiangzhang/projects/vllm-torchtpu/CONTRIBUTING.md).
+> For all general contribution guidelines, bug reporting procedures, project directory structures, and general testing policies, please refer directly to [CONTRIBUTING.md](../CONTRIBUTING.md).
 >
 > This document is **EXCLUSIVELY** a temporary, specialized governance supplement for the pre-public phase to handle missing GitHub repo branch rulesets due to private repo on github free account.
 
@@ -42,7 +42,7 @@ Welcome to the `vllm-project/vllm-torchtpu` pre-public development phase! Please
 
 ### Purpose of This Document
 
-Until the repository goes public (at which point standard automated GitHub Branch Protections will be activated and standard [CONTRIBUTING.md](file:///usr/local/google/home/johnqiangzhang/projects/vllm-torchtpu/CONTRIBUTING.md) will take full effect), this document serves as our binding Developer Code of Conduct and Standard Operating Procedure (SOP).
+Until the repository goes public (at which point standard automated GitHub Branch Protections will be activated and standard [CONTRIBUTING.md](../CONTRIBUTING.md) will take full effect), this document serves as our binding Developer Code of Conduct and Standard Operating Procedure (SOP).
 
 Compliance relies on every developer following these procedures strictly.
 
@@ -64,7 +64,7 @@ gh auth status
 ```
 
 > [!TIP] Formatting & Linting
-> For pre-commit formatting and linting setup, directory structures, and code style rules, refer directly to [CONTRIBUTING.md](file:///usr/local/google/home/johnqiangzhang/projects/vllm-torchtpu/CONTRIBUTING.md).
+> For pre-commit formatting and linting setup, directory structures, and code style rules, refer directly to [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ---
 
@@ -186,7 +186,22 @@ After the PR is merged into `main`:
 
 ---
 
-## 5. Quick Reference Cheat Sheet (gh Commands & Links)
+## 5. FAQ & Best Practices
+
+### Question: How do I skip CI and merge a PR when necessary?
+
+Running CI checks before merging is strongly recommended. If you encounter bugs or issues with the CI/CD pipeline, please file an issue on [GitHub Issues](https://github.com/vllm-project/vllm-torchtpu/issues/new?assignees=maxwillzq).
+
+In urgent situations where you must unblock yourself immediately:
+- Prefix your PR title with `[skip-ci]`. So our automation daily email will know that and not flag it.
+- Detail the exact reason for skipping CI in the PR description.
+
+> [!NOTE]
+> Please use this bypass sparingly and only when strictly necessary. We may reach out offline for additional context.
+
+---
+
+## 6. Quick Reference Cheat Sheet (gh Commands & Links)
 
 | Objective | Command / Direct Link |
 | :--- | :--- |

@@ -101,6 +101,9 @@ class TestCompressedTensorsConfigRouting:
         monkeypatch.setattr(
             "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors._build_fp8_config",
             MagicMock())
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16.select_wna16_moe_backend",
+            MagicMock(return_value=(None, None)))
 
         layer = FakeRoutedExperts(experts_per_token=2)
 

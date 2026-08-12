@@ -12,6 +12,7 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
                                        MLAAttentionImpl)
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
@@ -27,8 +28,7 @@ from vllm_torchtpu.layers.common.attention_interface import (
     attention, mla_attention, ragged_paged_attention,
     ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.quantization import (is_floating_dtype,
-                                                      quantize_kv)
+from vllm_torchtpu.layers.common.quantization import quantize_kv
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
@@ -587,7 +587,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-                max_model_len=max_model_len,
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
@@ -811,6 +810,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
         value = value.view(k_len, self.num_kv_heads, self.head_size)
         assert key.shape == value.shape
 
+        # A layer whose head_size is narrower than the page it writes into —
+        # a DFlash draft layer sharing the target's unified pool, whose page
+        # geometry comes from whichever attention spec defined the pool (see
+        # `kv_cache_materializer._pool_attention_geometry`). Pad q/k/v out to
+        # the page width so the kernel's slot writes line up, and slice the
+        # result back below. Zeros contribute nothing to the QK dot product,
+        # `self.scale` comes from the real head_size and is passed separately,
+        # and the padded V columns are dropped — so the output is unchanged.
+        #
+        # Only the head dim is reconciled. A layer whose `num_kv_heads`
+        # disagrees with the pool's would write the wrong slots and padding
+        # cannot fix that, so the two must already agree.
+        pool_head_dim = kv_cache.shape[-1]
+        if pool_head_dim > self.head_size:
+            pad_size = pool_head_dim - self.head_size
+            query = torch.nn.functional.pad(query, (0, pad_size))
+            key = torch.nn.functional.pad(key, (0, pad_size))
+            value = torch.nn.functional.pad(value, (0, pad_size))
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float
@@ -865,6 +882,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             sink,
         )
 
+        # Drop the padding added above so callers see the layer's own width.
+        if outputs.shape[-1] > self.head_size:
+            outputs = outputs[..., :self.head_size]
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():
             sync.synchronize(kv_cache)
@@ -948,9 +968,6 @@ class PallasMLAttentionBackend(AttentionBackend):
                 kv_packing=kv_packing,
             )
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        if not is_floating_dtype(kv_dtype):
-            raise NotImplementedError(
-                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
         kv_packing = get_dtype_packing(kv_dtype)
         return mla_v2_kernel.get_kv_cache_shape(
             total_num_pages=num_blocks,
@@ -1004,6 +1021,38 @@ class PallasMLAttentionBackend(AttentionBackend):
         if include_num_layers_dimension:
             return (1, 0, 2, 3, 4)
         return (0, 1, 2, 3)
+
+
+class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
+    """Indexer backend for TPU.
+
+    `get_kv_cache_shape` and `get_kv_cache_stride_order` are deliberately
+    inherited unchanged: `make_attention_cache_tensor` allocates the indexer K
+    cache from them, and the streamindex path is built against the current
+    3-D `(num_blocks, block_size, head_size)` layout. Change them only
+    together with the kernel's cache view.
+
+    The page size hooks below delegate to `PallasMLAttentionBackend`. They are
+    not the indexer's own page size: `cache_config.block_size` is global across
+    KV cache groups, and `update_block_size_for_backend` consults whichever
+    backend `Platform._find_non_ssm_backend` returns first. An indexer cache
+    registers before its `mla_attn` sibling, so on a sparse-MLA model these are
+    the hooks that decide the block size for the MLA latent cache too --
+    hardcoding a second copy of the constant would let the two drift, and the
+    effective value would silently depend on layer registration order.
+    """
+
+    @staticmethod
+    def get_name() -> str:
+        return "TPU_STREAMINDEX_INDEXER"
+
+    @staticmethod
+    def get_page_size(vllm_config: VllmConfig) -> int:
+        return PallasMLAttentionBackend.get_page_size(vllm_config)
+
+    @staticmethod
+    def get_min_page_size(vllm_config: VllmConfig) -> int:
+        return PallasMLAttentionBackend.get_min_page_size(vllm_config)
 
 
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):
@@ -1146,6 +1195,78 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return mla_impl
 
+    def _build_sparse_mla_op(self, layer: Any):
+        from vllm_torchtpu.layers.common.attention_interface import \
+            sparse_mla_attention
+
+        vllm_context = get_vllm_model_wrapper_context()
+
+        # Per-tensor fp8 dequant scale for the packed nope cache -- the
+        # same checkpoint k_scale the dense path uses.
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def sparse_mla_attention_core_tpu(
+            kv_cache: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return sparse_mla_attention(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                vllm_context.mesh,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+            )
+
+        op_name = ("pallas::sparse_mla_attention_"
+                   f"{layer.layer_name.replace('.', '_')}")
+        sparse_mla_jax_op = pallas.jax_op(op_name,
+                                          sparse_mla_attention_core_tpu,
+                                          donate_argnums=(0, ))
+
+        def _fake_sparse_mla(kv_cache, ql_nope, q_pe, kv_c_normed, k_pe,
+                             topk_indices, *args, **kwargs):
+            num_tokens = ql_nope.size(0)
+            out_shape = (num_tokens, layer.num_heads, layer.kv_lora_rank)
+            return torch.empty_like(kv_cache), torch.empty(
+                out_shape, dtype=ql_nope.dtype, device=ql_nope.device)
+
+        sparse_mla_jax_op.register_fake(_fake_sparse_mla)
+
+        def sparse_mla_impl(
+                kv_cache: torch.Tensor, ql_nope: torch.Tensor,
+                q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
+                k_pe: torch.Tensor, topk_indices: torch.Tensor,
+                seq_lens: torch.Tensor, block_tables: torch.Tensor,
+                query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor) -> torch.Tensor:
+            new_kv, outputs = sparse_mla_jax_op(kv_cache, ql_nope, q_pe,
+                                                kv_c_normed, k_pe,
+                                                topk_indices, seq_lens,
+                                                block_tables, query_start_loc,
+                                                request_distribution)
+            kv_cache.copy_(new_kv)
+            return outputs
+
+        return sparse_mla_impl
+
     def forward(
         self,
         layer: Any,
@@ -1198,28 +1319,47 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                   value=None,
                                   k_scale=k_scale)
 
-        if not hasattr(layer, "mla_op") or layer.mla_op is None:
-            layer.mla_op = self._build_mla_op(layer,
-                                              q_scale=q_scale,
-                                              k_scale=k_scale,
-                                              v_scale=v_scale)
-
         ql_nope_flat = ql_nope.view(-1, layer.num_heads, layer.kv_lora_rank)
         q_pe_flat = q_pe.view(-1, layer.num_heads, layer.qk_rope_head_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
 
-        outputs = layer.mla_op(
-            kv_cache,
-            ql_nope_flat,
-            q_pe_flat,
-            kv_c_normed_flat,
-            k_pe_flat,
-            attn_metadata.seq_lens,
-            attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
-            attn_metadata.request_distribution,
-        )
+        topk_indices = kwargs.get("topk_indices")
+        if topk_indices is not None:
+            if (not hasattr(layer, "sparse_mla_op")
+                    or layer.sparse_mla_op is None):
+                layer.sparse_mla_op = self._build_sparse_mla_op(layer)
+
+            outputs = layer.sparse_mla_op(
+                kv_cache,
+                ql_nope_flat,
+                q_pe_flat,
+                kv_c_normed_flat,
+                k_pe_flat,
+                topk_indices,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+            )
+        else:
+            if not hasattr(layer, "mla_op") or layer.mla_op is None:
+                layer.mla_op = self._build_mla_op(layer,
+                                                  q_scale=q_scale,
+                                                  k_scale=k_scale,
+                                                  v_scale=v_scale)
+
+            outputs = layer.mla_op(
+                kv_cache,
+                ql_nope_flat,
+                q_pe_flat,
+                kv_c_normed_flat,
+                k_pe_flat,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+            )
 
         outputs_t = outputs.reshape(-1, layer.num_heads,
                                     layer.kv_lora_rank).transpose(0, 1)

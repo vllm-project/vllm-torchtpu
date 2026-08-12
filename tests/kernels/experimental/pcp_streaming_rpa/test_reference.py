@@ -11,121 +11,205 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import sys
-from pathlib import Path
+"""Host-reference coverage for the production PCP runtime schedule ABI."""
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent))
-
 import pytest
-from schedule_reference import \
-    generate_pcp_streaming_schedule_reference  # noqa: E402
 
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    build_pcp_rank_major_token_order
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import \
-    execute_pcp_streaming_reference
+    build_runtime_schedule_reference
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
+    RuntimeScheduleField,
+    build_pcp_streaming_schedule_inputs_from_metadata_jax)
 
 pytestmark = pytest.mark.multichip
 
 
-def _pack_q_rank_major(q_full, token_order, pcp_size):
-    padded = np.zeros((token_order.size, ) + q_full.shape[1:],
-                      dtype=np.float32)
-    valid = token_order >= 0
-    padded[valid] = q_full[token_order[valid]]
-    local_padded = token_order.size // pcp_size
-    return padded.reshape((pcp_size, local_padded) + q_full.shape[1:])
-
-
-def _build_pcp_kv_cache(k_full, v_full, block_tables, page_size, pcp_size):
-    num_pages = int(block_tables.max()) + 1
-    _, kv_heads, head_dim = k_full.shape
-    kv_cache = np.zeros(
-        (pcp_size, num_pages, page_size, kv_heads, 2, head_dim),
-        dtype=np.float32,
+def _build_reference(*, kv_lens, page_indices, cu_q_lens, distribution,
+                     global_bucket_tokens, local_kv_cache_num_blocks,
+                     page_size, pcp_size, interleave_size, q_block_size):
+    tile_plan, block_tables, *_ = \
+        build_pcp_streaming_schedule_inputs_from_metadata_jax(
+            kv_lens=np.asarray(kv_lens, dtype=np.int32),
+            page_indices=np.asarray(page_indices, dtype=np.int32),
+            cu_q_lens=np.asarray(cu_q_lens, dtype=np.int32),
+            distribution=np.asarray(distribution, dtype=np.int32),
+            global_bucket_tokens=global_bucket_tokens,
+            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            q_block_size=q_block_size,
+        )
+    return build_runtime_schedule_reference(
+        tile_plan,
+        block_tables,
+        pcp_size=pcp_size,
+        page_size=page_size,
+        interleave_size=interleave_size,
     )
-    for pos in range(k_full.shape[0]):
-        global_page = pos // page_size
-        src_rank = global_page % pcp_size
-        local_page_index = global_page // pcp_size
-        page = int(block_tables[0, local_page_index])
-        offset = pos % page_size
-        kv_cache[src_rank, page, offset, :, 0, :] = k_full[pos]
-        kv_cache[src_rank, page, offset, :, 1, :] = v_full[pos]
-    return kv_cache
 
 
-def _naive_full_attention(q_full, k_full, v_full, q_global_base, sm_scale):
-    q_len, kv_heads, q_per_kv, head_dim = q_full.shape
-    out = np.zeros_like(q_full, dtype=np.float32)
-    for q_idx in range(q_len):
-        q_global = q_global_base + q_idx
-        k_ctx = k_full[:q_global + 1]
-        v_ctx = v_full[:q_global + 1]
-        scores = np.einsum("hqd,shd->hqs", q_full[q_idx], k_ctx) * sm_scale
-        scores = scores - np.max(scores, axis=-1, keepdims=True)
-        probs = np.exp(scores)
-        probs = probs / np.sum(probs, axis=-1, keepdims=True)
-        out[q_idx] = np.einsum("hqs,shd->hqd", probs, v_ctx)
-    return out
+def _active_rows(rows):
+    return rows[..., RuntimeScheduleField.REQ_ID] >= 0
 
 
-def _run_reference_case(q_len, q_global_base, kv_len, num_lanes):
-    pcp_size = 4
-    page_size = interleave_size = 2
-    kv_heads = 2
-    q_per_kv = 2
-    head_dim = 4
-    rng = np.random.default_rng(123)
-    q_full = rng.normal(size=(q_len, kv_heads, q_per_kv,
-                              head_dim)).astype(np.float32)
-    k_full = rng.normal(size=(kv_len, kv_heads, head_dim)).astype(np.float32)
-    v_full = rng.normal(size=(kv_len, kv_heads, head_dim)).astype(np.float32)
-    block_tables = np.arange(
-        (kv_len + page_size * pcp_size - 1) // (page_size * pcp_size),
-        dtype=np.int32).reshape(1, -1)
+def test_runtime_reference_separates_history_boundary_and_fresh_kv():
+    reference = _build_reference(
+        kv_lens=[19],
+        page_indices=np.arange(8, dtype=np.int32) + 5,
+        cu_q_lens=[0, 8],
+        distribution=[0, 0, 1],
+        global_bucket_tokens=8,
+        local_kv_cache_num_blocks=8,
+        page_size=4,
+        pcp_size=2,
+        interleave_size=2,
+        q_block_size=4,
+    )
 
-    padded_num_tokens = ((q_len + pcp_size - 1) // pcp_size) * pcp_size
-    token_order, inverse_order = build_pcp_rank_major_token_order(
-        [q_len],
+    active_tile = int(np.flatnonzero(reference.current_num_groups > 0)[0])
+    current = reference.current_rows[active_tile]
+    history = reference.history_rows[active_tile]
+    assert int(reference.current_num_groups[active_tile]) == 3
+    assert int(reference.history_num_groups[active_tile]) == 1
+
+    boundary = current[0]
+    boundary_active = _active_rows(boundary)
+    assert np.all(
+        boundary[...,
+                 RuntimeScheduleField.KV_HBM_OFFSET][boundary_active] == -1)
+    assert np.all(boundary[..., RuntimeScheduleField.CAPTURE_LEN] == 0)
+    np.testing.assert_array_equal(
+        boundary[:, 0, RuntimeScheduleField.KV_PAGE_IDX],
+        np.array([6, 6], dtype=np.int32),
+    )
+
+    fresh = current[1:3]
+    assert np.all(
+        fresh[...,
+              RuntimeScheduleField.KV_HBM_OFFSET][_active_rows(fresh)] >= 0)
+    capture_len = fresh[..., RuntimeScheduleField.CAPTURE_LEN].sum(axis=-1)
+    np.testing.assert_array_equal(
+        capture_len,
+        fresh[..., 0, RuntimeScheduleField.KV_VALID_LEN],
+    )
+
+    history_active = _active_rows(history)
+    assert np.all(
+        history[..., RuntimeScheduleField.KV_HBM_OFFSET][history_active] == 0)
+    np.testing.assert_array_equal(
+        history[0, :, 0, RuntimeScheduleField.KV_PAGE_IDX],
+        np.array([5, 5], dtype=np.int32),
+    )
+
+
+def test_runtime_reference_routes_one_token_capture_to_absolute_cache_owner():
+    pcp_size = 8
+    interleave_size = 256
+    reference = _build_reference(
+        kv_lens=[302],
+        page_indices=[7],
+        cu_q_lens=[0, 1],
+        distribution=[0, 0, 1],
+        global_bucket_tokens=pcp_size * interleave_size,
+        local_kv_cache_num_blocks=32,
+        page_size=interleave_size,
         pcp_size=pcp_size,
         interleave_size=interleave_size,
-        padded_num_tokens=padded_num_tokens,
-        token_start_offsets_per_req=[q_global_base],
+        q_block_size=interleave_size,
     )
-    q_by_rank = _pack_q_rank_major(q_full, token_order, pcp_size)
-    kv_cache = _build_pcp_kv_cache(k_full, v_full, block_tables, page_size,
-                                   pcp_size)
-    schedule = generate_pcp_streaming_schedule_reference(
+
+    active_tile = int(np.flatnonzero(reference.current_num_groups > 0)[0])
+    current = reference.current_rows[active_tile]
+    assert int(reference.current_num_groups[active_tile]) == 2
+    fresh_source_0 = current[1, 0]
+    assert int(fresh_source_0[0, RuntimeScheduleField.KV_GLOBAL_START]) == 301
+    assert int(fresh_source_0[0, RuntimeScheduleField.KV_VALID_LEN]) == 1
+    assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_SRC_OFFSET]) == 0
+    assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_DST_OFFSET]) == 0
+    assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_LEN]) == 1
+    assert np.all(
+        np.delete(fresh_source_0[...,
+                                 RuntimeScheduleField.CAPTURE_LEN], 1) == 0)
+
+
+def test_runtime_reference_splits_capture_at_cache_owner_boundary():
+    reference = _build_reference(
+        kv_lens=[333],
+        page_indices=np.arange(8, dtype=np.int32),
+        cu_q_lens=[0, 32],
+        distribution=[0, 0, 1],
+        global_bucket_tokens=64,
+        local_kv_cache_num_blocks=8,
+        page_size=32,
+        pcp_size=2,
+        interleave_size=32,
+        q_block_size=32,
+    )
+
+    active_tile = int(np.flatnonzero(reference.current_num_groups > 0)[0])
+    current = reference.current_rows[active_tile]
+    assert int(reference.current_num_groups[active_tile]) == 2
+    fresh_source_0 = current[1, 0]
+    assert int(fresh_source_0[0, RuntimeScheduleField.KV_GLOBAL_START]) == 301
+    assert int(fresh_source_0[0, RuntimeScheduleField.KV_VALID_LEN]) == 32
+    assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_SRC_OFFSET]) == 0
+    assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_DST_OFFSET]) == 0
+    assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_LEN]) == 19
+    assert int(fresh_source_0[0,
+                              RuntimeScheduleField.CAPTURE_SRC_OFFSET]) == 19
+    assert int(fresh_source_0[0, RuntimeScheduleField.CAPTURE_DST_OFFSET]) == 0
+    assert int(fresh_source_0[0, RuntimeScheduleField.CAPTURE_LEN]) == 13
+
+
+@pytest.mark.parametrize("history_tokens", [25_600, 128 * 1024])
+def test_runtime_reference_preserves_long_absolute_history(history_tokens):
+    pcp_size = 4
+    page_size = 128
+    q_len = 256
+    kv_len = history_tokens + q_len
+    local_blocks = (kv_len + pcp_size * page_size - 1) // (pcp_size *
+                                                           page_size)
+    reference = _build_reference(
         kv_lens=[kv_len],
+        page_indices=np.arange(local_blocks, dtype=np.int32),
         cu_q_lens=[0, q_len],
-        q_start_offsets=[q_global_base],
-        block_tables=block_tables,
+        distribution=[0, 0, 1],
+        global_bucket_tokens=q_len,
+        local_kv_cache_num_blocks=local_blocks,
         page_size=page_size,
         pcp_size=pcp_size,
-        interleave_size=interleave_size,
-        num_lanes=num_lanes,
-        bq_sz=2,
+        interleave_size=32,
+        q_block_size=64,
     )
-    sm_scale = 1.0 / np.sqrt(head_dim)
 
-    packed_output = execute_pcp_streaming_reference(q_by_rank,
-                                                    kv_cache,
-                                                    schedule,
-                                                    sm_scale=sm_scale)
-    unpacked_output = packed_output.reshape((padded_num_tokens, ) +
-                                            q_full.shape[1:])[inverse_order]
-    expected = _naive_full_attention(q_full, k_full, v_full, q_global_base,
-                                     sm_scale)
-    np.testing.assert_allclose(unpacked_output, expected, rtol=1e-5, atol=1e-5)
+    active_tile = int(np.flatnonzero(reference.current_num_groups > 0)[0])
+    assert int(
+        reference.history_num_groups[active_tile]) == (history_tokens //
+                                                       (pcp_size * page_size))
+    current = reference.current_rows[active_tile]
+    current_active = _active_rows(current)
+    assert np.all(current[..., RuntimeScheduleField.Q_GLOBAL_START]
+                  [current_active] >= history_tokens)
 
 
-def test_reference_matches_naive_attention_for_single_lane_partial_chunk():
-    _run_reference_case(q_len=7, q_global_base=5, kv_len=12, num_lanes=1)
-
-
-def test_reference_matches_naive_attention_for_two_lanes():
-    _run_reference_case(q_len=16, q_global_base=0, kv_len=16, num_lanes=2)
+def test_runtime_reference_uses_only_runtime_abi_fields():
+    reference = _build_reference(
+        kv_lens=[8],
+        page_indices=[3],
+        cu_q_lens=[0, 8],
+        distribution=[0, 0, 1],
+        global_bucket_tokens=8,
+        local_kv_cache_num_blocks=4,
+        page_size=4,
+        pcp_size=2,
+        interleave_size=2,
+        q_block_size=4,
+    )
+    for rows in (reference.current_rows, reference.history_rows):
+        assert rows.shape[-1] == RuntimeScheduleField.PACKED_NUM_FIELDS
+        np.testing.assert_array_equal(
+            rows[..., RuntimeScheduleField.NUM_FIELDS:],
+            np.zeros_like(rows[..., RuntimeScheduleField.NUM_FIELDS:]),
+        )

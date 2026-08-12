@@ -206,7 +206,7 @@ def test_small_experts_use_current_padded_weight_location(
                         lambda: 8)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
     monkeypatch.setattr(kimi_moe, "KimiMLP", FakeMLP)
-    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
         hidden_size=16,
         hidden_act="silu",
@@ -220,10 +220,8 @@ def test_small_experts_use_current_padded_weight_location(
     layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
 
     assert fused_moe_args["intermediate_size"] == expected_intermediate
-    assert "activation_situ_beta" not in fused_moe_args
-    assert "activation_situ_linear_beta" not in fused_moe_args
-    assert layer.experts.moe_config.activation_situ_beta is None
-    assert layer.experts.moe_config.activation_situ_linear_beta is None
+    assert fused_moe_args["activation_situ_beta"] is None
+    assert fused_moe_args["activation_situ_linear_beta"] is None
     assert (layer.experts.moe_config.intermediate_size_per_partition_unpadded
             == expected_unpadded)
     expect_zero = expected_unpadded is not None
@@ -259,7 +257,7 @@ def test_expert_parallelism_keeps_native_intermediate_size(
     monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
                         lambda: 8)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
-    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
         hidden_size=16,
         hidden_act="silu",
@@ -297,7 +295,7 @@ def test_situ_moe_uses_tpu_activation_descriptor(
     monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
                         lambda: 1)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
-    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
         hidden_size=16,
         hidden_act="situ",
@@ -308,16 +306,14 @@ def test_situ_moe_uses_tpu_activation_descriptor(
         num_shared_experts=0,
         moe_intermediate_size=128,
     )
-    layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+    kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
 
-    assert fused_moe_args["activation"] == "silu"
-    assert layer.experts.routed_experts.activation == "situ"
-    assert layer.experts.moe_config.activation_situ_beta == 4.0
-    assert layer.experts.moe_config.activation_situ_linear_beta == 25.0
+    assert fused_moe_args["activation"] == "situ"
+    assert fused_moe_args["activation_situ_beta"] == 4.0
+    assert fused_moe_args["activation_situ_linear_beta"] == 25.0
 
 
-def test_latent_moe_reduces_before_norm(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+def test_latent_moe_does_not_reduce_before_norm() -> None:
 
     class SquareNorm(nn.Module):
 
@@ -329,17 +325,12 @@ def test_latent_moe_reduces_before_norm(
         def forward(self, hidden_states: torch.Tensor):
             return hidden_states, None
 
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
-                        lambda: 2)
-    monkeypatch.setattr(kimi_moe, "tensor_model_parallel_all_reduce",
-                        lambda hidden_states: hidden_states + 1)
     transform = kimi_moe.KimiRoutedOutputTransform(SquareNorm(),
                                                    IdentityLinear())
     hidden_states = torch.tensor([[2.0, 3.0]])
 
-    # The division compensates for DefaultMoERunner's final TP reduction.
     torch.testing.assert_close(transform(hidden_states),
-                               (hidden_states + 1).square() / 2)
+                               hidden_states.square())
 
 
 def test_model_has_no_public_cache_or_pp_api() -> None:

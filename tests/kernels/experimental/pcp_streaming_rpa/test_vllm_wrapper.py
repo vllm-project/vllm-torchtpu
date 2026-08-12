@@ -20,7 +20,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
 pytestmark = pytest.mark.multichip
 
 
-def _build_expected_pcp_local_slot_ids(
+def _build_expected_pcp_writeback_mapping(
     q_lens: np.ndarray,
     seq_lens: np.ndarray,
     block_tables: np.ndarray,
@@ -28,105 +28,75 @@ def _build_expected_pcp_local_slot_ids(
     pcp_size: int,
     interleave_size: int,
     padded_num_tokens: int,
-) -> np.ndarray:
-    if block_size <= 0:
-        raise ValueError("PCP slot ids require block_size > 0.")
-    if pcp_size <= 1:
-        raise ValueError("PCP slot ids require pcp_size > 1.")
-    if interleave_size <= 0:
-        raise ValueError("PCP slot ids require interleave_size > 0.")
-    if interleave_size > block_size or block_size % interleave_size != 0:
-        raise NotImplementedError(
-            "Native PCP prefill slot ids require block_size to be divisible "
-            f"by interleave_size, got {block_size=} "
-            f"{interleave_size=}.")
-    if padded_num_tokens % pcp_size:
-        raise ValueError(
-            f"{padded_num_tokens=} must be divisible by {pcp_size=}.")
-
+    local_kv_cache_num_blocks: int,
+):
+    """Independent NumPy reference for dense ring-capture destinations."""
     q_lens = np.asarray(q_lens, dtype=np.int64)
     seq_lens = np.asarray(seq_lens, dtype=np.int64)
-    block_tables = np.asarray(block_tables, dtype=np.int32)
-    if q_lens.ndim != 1 or seq_lens.ndim != 1:
-        raise ValueError("q_lens and seq_lens must be 1D arrays.")
-    if q_lens.size != seq_lens.size:
-        raise ValueError("q_lens and seq_lens must have the same size.")
-    if block_tables.ndim != 2 or block_tables.shape[0] < q_lens.size:
-        raise ValueError("block_tables must cover every request.")
-    if np.any(q_lens < 0):
-        raise ValueError("q_lens must be non-negative.")
-    if np.any(seq_lens < q_lens):
-        raise ValueError("seq_lens must be greater than or equal to q_lens.")
-
-    q_start_offsets = seq_lens - q_lens
+    block_tables = (np.asarray(block_tables, dtype=np.int64) %
+                    int(local_kv_cache_num_blocks))
+    owner_starts = np.zeros(q_lens.shape, dtype=np.int64)
+    if q_lens.size > 1:
+        np.cumsum(q_lens[:-1], out=owner_starts[1:])
     token_order, _ = build_pcp_rank_major_token_order(
         q_lens,
         pcp_size,
         interleave_size,
         padded_num_tokens,
-        token_start_offsets_per_req=q_start_offsets,
+        token_owner_start_offsets_per_req=owner_starts,
     )
-    slot_ids = np.full(padded_num_tokens, -1, dtype=np.int32)
-    valid = token_order >= 0
-    if not np.any(valid):
-        return slot_ids
 
-    req_ids = []
-    req_offsets = []
-    for req_id, q_len in enumerate(q_lens):
-        req_ids.extend([req_id] * int(q_len))
-        req_offsets.extend(range(int(q_len)))
-    req_ids_array = np.asarray(req_ids, dtype=np.int64)
-    req_offsets_array = np.asarray(req_offsets, dtype=np.int64)
+    cache_owners = np.full(padded_num_tokens, -1, dtype=np.int32)
+    cache_slots = np.full(padded_num_tokens, -1, dtype=np.int32)
+    capture_offsets = np.full(padded_num_tokens, -1, dtype=np.int32)
+    writeback_counts = np.zeros(pcp_size, dtype=np.int32)
+    compact_slots = np.full((pcp_size, padded_num_tokens), -1, dtype=np.int32)
 
-    valid_order = token_order[valid]
-    packed_req_ids = req_ids_array[valid_order]
-    global_positions = (q_start_offsets[packed_req_ids] +
-                        req_offsets_array[valid_order])
-
+    req_ends = np.cumsum(q_lens)
+    absolute_starts = seq_lens - q_lens
     virtual_block_size = block_size * pcp_size
-    block_indices = global_positions // virtual_block_size
-    if (np.any(block_indices < 0)
-            or int(block_indices.max(initial=-1)) >= block_tables.shape[1]):
-        raise ValueError("block_tables does not cover requested PCP slots.")
+    for source_row, request_major_row in enumerate(token_order):
+        if request_major_row < 0:
+            continue
+        req_id = int(np.searchsorted(req_ends, request_major_row,
+                                     side="right"))
+        req_start = 0 if req_id == 0 else int(req_ends[req_id - 1])
+        absolute_position = (int(absolute_starts[req_id]) +
+                             int(request_major_row) - req_start)
+        block_idx = absolute_position // virtual_block_size
+        virtual_offset = absolute_position % virtual_block_size
+        owner = (virtual_offset // interleave_size) % pcp_size
+        local_offset = ((virtual_offset //
+                         (pcp_size * interleave_size)) * interleave_size +
+                        virtual_offset % interleave_size)
+        slot = int(block_tables[req_id, block_idx] * block_size + local_offset)
+        cache_owners[source_row] = owner
+        cache_slots[source_row] = slot
 
-    block_numbers = block_tables[packed_req_ids,
-                                 block_indices].astype(np.int64)
-    if np.any(block_numbers < 0):
-        raise ValueError("block_tables contains invalid PCP slot pages.")
-    virtual_offsets = global_positions - block_indices * virtual_block_size
-    local_offsets = ((virtual_offsets //
-                      (pcp_size * interleave_size)) * interleave_size +
-                     (virtual_offsets % interleave_size))
-    slot_ids[valid] = (block_numbers * block_size + local_offsets).astype(
-        np.int32)
-    return slot_ids
+    for req_id in range(q_lens.size):
+        req_rows = np.flatnonzero(
+            (token_order >= (0 if req_id == 0 else req_ends[req_id - 1]))
+            & (token_order < req_ends[req_id]))
+        req_rows = req_rows[np.argsort(
+            np.asarray([
+                absolute_starts[req_id] + token_order[row] -
+                (0 if req_id == 0 else req_ends[req_id - 1])
+                for row in req_rows
+            ]))]
+        for source_row in req_rows:
+            owner = int(cache_owners[source_row])
+            capture_offset = int(writeback_counts[owner])
+            writeback_counts[owner] += 1
+            capture_offsets[source_row] = capture_offset
+            compact_slots[owner, capture_offset] = cache_slots[source_row]
 
-
-def _expected_local_slot_ids(q_lens, q_starts, block_tables, *,
-                             local_kv_cache_num_blocks, page_size, pcp_size,
-                             interleave_size, local_padded_tokens, pcp_rank,
-                             target_num_reqs):
-    q_lens = np.asarray(q_lens, dtype=np.int32)
-    q_starts = np.asarray(q_starts, dtype=np.int32)
-    q_lens_full = np.zeros(target_num_reqs, dtype=np.int32)
-    seq_lens_full = np.zeros(target_num_reqs, dtype=np.int32)
-    q_lens_full[:q_lens.size] = q_lens
-    seq_lens_full[:q_lens.size] = q_starts + q_lens
-    block_tables = np.asarray(block_tables, dtype=np.int32)
-    localized_tables = block_tables % int(local_kv_cache_num_blocks)
-    padded_tokens = int(local_padded_tokens) * int(pcp_size)
-    slot_ids = _build_expected_pcp_local_slot_ids(
-        q_lens_full,
-        seq_lens_full,
-        localized_tables,
-        page_size,
-        pcp_size,
-        interleave_size,
-        padded_tokens,
+    return SimpleNamespace(
+        cache_owner_ranks=cache_owners,
+        cache_local_slot_ids=cache_slots,
+        capture_offsets=capture_offsets,
+        writeback_counts=writeback_counts,
+        compact_slot_ids=compact_slots,
     )
-    local_start = int(pcp_rank) * int(local_padded_tokens)
-    return slot_ids[local_start:local_start + int(local_padded_tokens)]
 
 
 def test_sharded_wrapper_uses_real_metadata_streaming_entry():
@@ -189,8 +159,7 @@ def test_packed_kv_layout_validation_rejects_wrong_physical_group_count():
                                               v_scale=0.5)
 
 
-def test_update_local_paged_kv_cache_accepts_equivalent_tail_layout(
-        monkeypatch):
+def test_prepare_packed_kv_accepts_equivalent_tail_layout(monkeypatch):
     packed_kv = jnp.arange(3 * 8 * 2 * 8,
                            dtype=jnp.float32).reshape(3, 8, 2, 8)
 
@@ -203,196 +172,314 @@ def test_update_local_paged_kv_cache_accepts_equivalent_tail_layout(
     kv_cache = jnp.zeros((2, 4, 16, 1, 8), dtype=jnp.float32)
     k = jnp.zeros((3, 8, 8), dtype=jnp.float32)
     v = jnp.zeros_like(k)
-    slot_ids = jnp.array([0, 1, 2], dtype=jnp.int32)
-
-    out = pcp_wrapper._update_local_paged_kv_cache(kv_cache, k, v, slot_ids)
-
+    prepared = pcp_wrapper._prepare_packed_kv_for_cache(k, v, kv_cache)
     expected = packed_kv.reshape(3, 16, 1, 8)
-    np.testing.assert_array_equal(np.asarray(out[0, :3]), np.asarray(expected))
+    np.testing.assert_array_equal(np.asarray(prepared), np.asarray(expected))
 
 
-def test_compute_pcp_local_slot_ids_from_metadata_matches_runner_reference():
+def test_captured_kv_writeback_coalesces_contiguous_cache_slots():
+    compact_slots = jnp.asarray([0, 1, 2, 8, 9, 20, -1, -1], dtype=jnp.int32)
+    descriptors, num_segments = \
+        pcp_wrapper._build_writeback_segment_descriptors(
+            compact_slots,
+            jnp.asarray(6),
+        )
+
+    assert int(num_segments) == 3
+    np.testing.assert_array_equal(
+        np.asarray(descriptors),
+        np.asarray([
+            [0, 3, 5, 0, 0, 0, 0, 0],
+            [0, 8, 20, 0, 0, 0, 0, 0],
+            [3, 2, 1, 0, 0, 0, 0, 0],
+        ],
+                   dtype=np.int32),
+    )
+
+
+def test_captured_kv_writeback_preserves_fully_fragmented_capacity():
+    compact_slots = jnp.arange(16, dtype=jnp.int32) * 2
+    descriptors, num_segments = \
+        pcp_wrapper._build_writeback_segment_descriptors(
+            compact_slots,
+            jnp.asarray(compact_slots.shape[0]),
+        )
+
+    assert int(num_segments) == compact_slots.shape[0]
+    np.testing.assert_array_equal(np.asarray(descriptors[0]),
+                                  np.arange(16, dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(descriptors[1]),
+                                  np.arange(16, dtype=np.int32) * 2)
+    np.testing.assert_array_equal(np.asarray(descriptors[2]),
+                                  np.ones(16, dtype=np.int32))
+
+
+def test_metadata_reconstruction_preserves_query_row_coordinates():
+    kv_lens = jnp.asarray([8], dtype=jnp.int32)
+    cu_q_lens = jnp.asarray([0, 5], dtype=jnp.int32)
+    distribution = jnp.asarray([0, 0, 1], dtype=jnp.int32)
+
+    mapping = pcp_wrapper._compute_pcp_local_query_row_mapping_from_metadata(
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        local_padded_tokens=4,
+        pcp_size=2,
+        pcp_rank=0,
+        interleave_size=2,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(mapping.absolute_positions),
+        np.array([3, 4, 7, -1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(mapping.is_valid),
+        np.array([True, True, True, False]),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(mapping.request_indices),
+        np.array([0, 0, 0, -1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(mapping.source_ranks),
+        np.zeros(4, dtype=np.int32),
+    )
+
+
+def test_query_row_mapping_separates_owner_and_request_absolute_starts():
+    common_kwargs = dict(
+        q_lens=jnp.asarray([3, 4], dtype=jnp.int32),
+        token_owner_starts=jnp.asarray([0, 3], dtype=jnp.int32),
+        request_absolute_starts=jnp.asarray([5, 100], dtype=jnp.int32),
+        local_padded_tokens=4,
+        pcp_size=2,
+        interleave_size=2,
+    )
+
+    rank_0 = pcp_wrapper._compute_pcp_local_query_row_mapping(pcp_rank=0,
+                                                              **common_kwargs)
+    rank_1 = pcp_wrapper._compute_pcp_local_query_row_mapping(pcp_rank=1,
+                                                              **common_kwargs)
+
+    np.testing.assert_array_equal(np.asarray(rank_0.absolute_positions),
+                                  np.array([5, 6, 101, 102]))
+    np.testing.assert_array_equal(np.asarray(rank_0.request_indices),
+                                  np.array([0, 0, 1, 1]))
+    np.testing.assert_array_equal(np.asarray(rank_1.absolute_positions),
+                                  np.array([7, 100, 103, -1]))
+    np.testing.assert_array_equal(np.asarray(rank_1.request_indices),
+                                  np.array([0, 1, 1, -1]))
+    np.testing.assert_array_equal(np.asarray(rank_1.is_valid),
+                                  np.array([True, True, True, False]))
+    # Source-rank identity remains available even when the row itself is pad.
+    np.testing.assert_array_equal(np.asarray(rank_1.source_ranks),
+                                  np.ones(4, dtype=np.int32))
+
+
+def test_kv_writeback_mapping_matches_independent_dense_capture_reference():
     pcp_size = 4
     page_size = 4
     interleave_size = 2
     local_padded_tokens = 16
-    target_num_reqs = 4
-    local_kv_cache_num_blocks = 8
+    local_kv_cache_num_blocks = 16
     q_lens = np.array([5, 17, 6], dtype=np.int32)
-    q_starts = np.array([3, 9, 0], dtype=np.int32)
-    seq_lens = np.zeros(target_num_reqs, dtype=np.int32)
-    seq_lens[:q_lens.size] = q_starts + q_lens
-    cu_q_lens = np.zeros(target_num_reqs + 1, dtype=np.int32)
-    cu_q_lens[1:q_lens.size + 1] = np.cumsum(q_lens)
-    cu_q_lens[q_lens.size + 1:] = cu_q_lens[q_lens.size]
+    absolute_starts = np.array([3, 9, 0], dtype=np.int32)
+    seq_lens = absolute_starts + q_lens
+    cu_q_lens = np.concatenate(([0], np.cumsum(q_lens))).astype(np.int32)
     distribution = np.array([0, 0, q_lens.size], dtype=np.int32)
-    block_tables = (np.arange(target_num_reqs * 8, dtype=np.int32).reshape(
-        target_num_reqs, 8) + 11)
+    block_tables = (
+        np.arange(q_lens.size * 16, dtype=np.int32).reshape(q_lens.size, 16) +
+        7)
 
-    for pcp_rank in range(pcp_size):
-        actual = pcp_wrapper.compute_pcp_local_slot_ids_from_metadata(
+    query_rows = pcp_wrapper \
+        ._compute_pcp_rank_major_query_row_mapping_from_metadata(
             jnp.asarray(seq_lens),
-            jnp.asarray(block_tables.reshape(-1)),
             jnp.asarray(cu_q_lens),
             jnp.asarray(distribution),
             local_padded_tokens=local_padded_tokens,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        )
+    actual = pcp_wrapper._compute_pcp_kv_writeback_mapping(
+        query_rows,
+        jnp.asarray(block_tables),
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+    jitted_actual = pcp_wrapper.jax.jit(
+        lambda rows, tables: pcp_wrapper._compute_pcp_kv_writeback_mapping(
+            rows,
+            tables,
             local_kv_cache_num_blocks=local_kv_cache_num_blocks,
             page_size=page_size,
             pcp_size=pcp_size,
-            pcp_rank=pcp_rank,
+            interleave_size=interleave_size,
+        ))(query_rows, jnp.asarray(block_tables))
+    expected = _build_expected_pcp_writeback_mapping(
+        q_lens,
+        seq_lens,
+        block_tables,
+        page_size,
+        pcp_size,
+        interleave_size,
+        local_padded_tokens * pcp_size,
+        local_kv_cache_num_blocks,
+    )
+
+    for field in pcp_wrapper._PCPKVWritebackMapping._fields:
+        np.testing.assert_array_equal(np.asarray(getattr(actual, field)),
+                                      getattr(expected, field))
+        np.testing.assert_array_equal(
+            np.asarray(getattr(jitted_actual, field)),
+            getattr(expected, field))
+    for cache_rank in range(pcp_size):
+        compact_slots = pcp_wrapper \
+            ._compact_writeback_slot_ids_for_cache_rank(actual, cache_rank)
+        np.testing.assert_array_equal(np.asarray(compact_slots),
+                                      expected.compact_slot_ids[cache_rank])
+
+
+def test_one_token_writeback_reaches_cache_owner_without_local_q():
+    pcp_size = 8
+    page_size = interleave_size = 256
+    local_padded_tokens = 4
+    local_kv_cache_num_blocks = 32
+    block_tables = jnp.asarray([[7]], dtype=jnp.int32)
+    query_rows = pcp_wrapper \
+        ._compute_pcp_rank_major_query_row_mapping_from_metadata(
+            kv_lens=jnp.asarray([301], dtype=jnp.int32),
+            cu_q_lens=jnp.asarray([0, 1], dtype=jnp.int32),
+            distribution=jnp.asarray([0, 0, 1], dtype=jnp.int32),
+            local_padded_tokens=local_padded_tokens,
+            pcp_size=pcp_size,
             interleave_size=interleave_size,
         )
-        expected = _expected_local_slot_ids(
+    mapping = pcp_wrapper._compute_pcp_kv_writeback_mapping(
+        query_rows,
+        block_tables,
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+
+    valid_row = int(np.flatnonzero(np.asarray(query_rows.is_valid))[0])
+    assert int(query_rows.source_ranks[valid_row]) == 0
+    assert int(mapping.cache_owner_ranks[valid_row]) == 1
+    assert int(mapping.capture_offsets[valid_row]) == 0
+    np.testing.assert_array_equal(
+        np.asarray(mapping.writeback_counts),
+        np.array([0, 1, 0, 0, 0, 0, 0, 0], dtype=np.int32),
+    )
+    rank_1_slots = pcp_wrapper._compact_writeback_slot_ids_for_cache_rank(
+        mapping, 1)
+    assert int(rank_1_slots[0]) == 7 * page_size + 44
+    assert np.all(np.asarray(rank_1_slots[1:]) == -1)
+
+
+def test_batch_flat_metadata_32x256_balances_rows_with_cache_owner_skew():
+    pcp_size = 8
+    interleave_size = page_size = 256
+    num_reqs = 32
+    q_len = 256
+    local_padded_tokens = 1280
+    local_kv_cache_num_blocks = 32
+    q_lens = jnp.full((num_reqs, ), q_len, dtype=jnp.int32)
+    token_owner_starts = jnp.arange(num_reqs, dtype=jnp.int32) * q_len
+    request_absolute_starts = jnp.zeros((num_reqs, ), dtype=jnp.int32)
+    page_numbers = np.asarray([
+        19, 3, 27, 11, 0, 24, 8, 30, 14, 6, 22, 1, 17, 29, 10, 25, 5, 21, 13,
+        31, 2, 18, 28, 9, 23, 7, 16, 4, 26, 12, 20, 15
+    ],
+                              dtype=np.int32)
+    block_tables = jnp.asarray(page_numbers[:, None])
+    cu_q_lens = jnp.concatenate((jnp.zeros(
+        (1, ), dtype=jnp.int32), jnp.cumsum(q_lens, dtype=jnp.int32)))
+    distribution = jnp.asarray([0, 0, num_reqs], dtype=jnp.int32)
+
+    mappings = [
+        pcp_wrapper._compute_pcp_local_query_row_mapping(
             q_lens,
-            q_starts,
-            block_tables,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
+            token_owner_starts,
+            request_absolute_starts,
             local_padded_tokens=local_padded_tokens,
-            pcp_rank=pcp_rank,
-            target_num_reqs=target_num_reqs,
-        )
-        np.testing.assert_array_equal(np.asarray(actual), expected)
-
-
-def test_compute_pcp_local_slot_ids_from_decode_metadata_matches_reference():
-    pcp_size = 4
-    interleave_size = page_size = 4
-    local_padded_tokens = 8
-    target_num_reqs = 4
-    local_kv_cache_num_blocks = 16
-    q_lens = np.array([1, 1, 1], dtype=np.int32)
-    q_starts = np.array([7, 15, 31], dtype=np.int32)
-    seq_lens = np.zeros(target_num_reqs, dtype=np.int32)
-    seq_lens[:q_lens.size] = q_starts + q_lens
-    cu_q_lens = np.zeros(target_num_reqs + 1, dtype=np.int32)
-    cu_q_lens[1:q_lens.size + 1] = np.cumsum(q_lens)
-    cu_q_lens[q_lens.size + 1:] = cu_q_lens[q_lens.size]
-    distribution = np.array([q_lens.size, q_lens.size, q_lens.size],
-                            dtype=np.int32)
-    block_tables = (np.arange(target_num_reqs * 16, dtype=np.int32).reshape(
-        target_num_reqs, 16) + 3)
-
-    for pcp_rank in range(pcp_size):
-        actual = pcp_wrapper.compute_pcp_local_slot_ids_from_metadata(
-            jnp.asarray(seq_lens),
-            jnp.asarray(block_tables.reshape(-1)),
-            jnp.asarray(cu_q_lens),
-            jnp.asarray(distribution),
-            local_padded_tokens=local_padded_tokens,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
             pcp_size=pcp_size,
             pcp_rank=pcp_rank,
             interleave_size=interleave_size,
-        )
-        expected = _expected_local_slot_ids(
+        ) for pcp_rank in range(pcp_size)
+    ]
+    metadata_mappings = [
+        pcp_wrapper._compute_pcp_local_query_row_mapping_from_metadata(
             q_lens,
-            q_starts,
-            block_tables,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
+            cu_q_lens,
+            distribution,
             local_padded_tokens=local_padded_tokens,
-            pcp_rank=pcp_rank,
-            target_num_reqs=target_num_reqs,
-        )
-        np.testing.assert_array_equal(np.asarray(actual), expected)
-
-
-def test_compute_pcp_local_slot_ids_from_mixed_metadata_matches_reference():
-    pcp_size = 4
-    interleave_size = page_size = 4
-    local_padded_tokens = 16
-    target_num_reqs = 4
-    local_kv_cache_num_blocks = 16
-    q_lens = np.array([1, 5, 9], dtype=np.int32)
-    q_starts = np.array([7, 0, 13], dtype=np.int32)
-    seq_lens = np.zeros(target_num_reqs, dtype=np.int32)
-    seq_lens[:q_lens.size] = q_starts + q_lens
-    cu_q_lens = np.zeros(target_num_reqs + 1, dtype=np.int32)
-    cu_q_lens[1:q_lens.size + 1] = np.cumsum(q_lens)
-    cu_q_lens[q_lens.size + 1:] = cu_q_lens[q_lens.size]
-    distribution = np.array([1, 2, q_lens.size], dtype=np.int32)
-    block_tables = (np.arange(target_num_reqs * 16, dtype=np.int32).reshape(
-        target_num_reqs, 16) + 5)
-
-    for pcp_rank in range(pcp_size):
-        actual = pcp_wrapper.compute_pcp_local_slot_ids_from_metadata(
-            jnp.asarray(seq_lens),
-            jnp.asarray(block_tables.reshape(-1)),
-            jnp.asarray(cu_q_lens),
-            jnp.asarray(distribution),
-            local_padded_tokens=local_padded_tokens,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
             pcp_size=pcp_size,
             pcp_rank=pcp_rank,
             interleave_size=interleave_size,
-        )
-        expected = _expected_local_slot_ids(
-            q_lens,
-            q_starts,
-            block_tables,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            local_padded_tokens=local_padded_tokens,
-            pcp_rank=pcp_rank,
-            target_num_reqs=target_num_reqs,
-        )
-        np.testing.assert_array_equal(np.asarray(actual), expected)
+        ) for pcp_rank in range(pcp_size)
+    ]
+    for expected, actual in zip(mappings, metadata_mappings):
+        for field in pcp_wrapper._PCPQueryRowMapping._fields:
+            np.testing.assert_array_equal(np.asarray(getattr(actual, field)),
+                                          np.asarray(getattr(expected, field)))
+    rank_major_query_rows = pcp_wrapper._PCPQueryRowMapping(
+        *(jnp.concatenate([getattr(mapping, field) for mapping in mappings])
+          for field in pcp_wrapper._PCPQueryRowMapping._fields))
+    writeback_mapping = pcp_wrapper._compute_pcp_kv_writeback_mapping(
+        rank_major_query_rows,
+        block_tables,
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
 
-
-def test_compute_pcp_local_slot_ids_ignores_padded_request_slots():
-    pcp_size = 4
-    interleave_size = page_size = 4
-    local_padded_tokens = 8
-    target_num_reqs = 4
-    local_kv_cache_num_blocks = 16
-    active_q_lens = np.array([1, 5], dtype=np.int32)
-    active_q_starts = np.array([7, 0], dtype=np.int32)
-    all_q_lens = np.array([1, 5, 9], dtype=np.int32)
-    all_q_starts = np.array([7, 0, 13], dtype=np.int32)
-    seq_lens = np.zeros(target_num_reqs, dtype=np.int32)
-    seq_lens[:all_q_lens.size] = all_q_starts + all_q_lens
-    cu_q_lens = np.zeros(target_num_reqs + 1, dtype=np.int32)
-    cu_q_lens[1:all_q_lens.size + 1] = np.cumsum(all_q_lens)
-    cu_q_lens[all_q_lens.size + 1:] = cu_q_lens[all_q_lens.size]
-    distribution = np.array([1, 1, active_q_lens.size], dtype=np.int32)
-    block_tables = (np.arange(target_num_reqs * 16, dtype=np.int32).reshape(
-        target_num_reqs, 16) + 7)
-
-    for pcp_rank in range(pcp_size):
-        actual = pcp_wrapper.compute_pcp_local_slot_ids_from_metadata(
-            jnp.asarray(seq_lens),
-            jnp.asarray(block_tables.reshape(-1)),
-            jnp.asarray(cu_q_lens),
-            jnp.asarray(distribution),
-            local_padded_tokens=local_padded_tokens,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            pcp_rank=pcp_rank,
-            interleave_size=interleave_size,
+    for source_rank, mapping in enumerate(mappings):
+        assert int(np.asarray(mapping.is_valid).sum()) == 4 * q_len
+        np.testing.assert_array_equal(
+            np.asarray(mapping.source_ranks),
+            np.full(local_padded_tokens, source_rank, dtype=np.int32),
         )
-        expected = _expected_local_slot_ids(
-            active_q_lens,
-            active_q_starts,
-            block_tables,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            local_padded_tokens=local_padded_tokens,
-            pcp_rank=pcp_rank,
-            target_num_reqs=target_num_reqs,
-        )
-        np.testing.assert_array_equal(np.asarray(actual), expected)
+        assert np.all(np.asarray(mapping.request_indices)[4 * q_len:] == -1)
+
+    cache_owner_ranks = np.asarray(writeback_mapping.cache_owner_ranks)
+    cache_local_slot_ids = np.asarray(writeback_mapping.cache_local_slot_ids)
+    cache_rank_0_slots = np.where(cache_owner_ranks == 0, cache_local_slot_ids,
+                                  -1)
+    cache_rank_1_slots = np.where(cache_owner_ranks == 1, cache_local_slot_ids,
+                                  -1)
+    assert np.count_nonzero(cache_rank_0_slots >= 0) == num_reqs * q_len
+    assert np.all(cache_rank_1_slots < 0)
+    np.testing.assert_array_equal(
+        np.asarray(writeback_mapping.writeback_counts),
+        np.array([num_reqs * q_len, 0, 0, 0, 0, 0, 0, 0], dtype=np.int32),
+    )
+    capture_offsets = np.asarray(writeback_mapping.capture_offsets)
+    assert np.all(
+        capture_offsets[~np.asarray(rank_major_query_rows.is_valid)] == -1)
+    np.testing.assert_array_equal(
+        np.sort(capture_offsets[capture_offsets >= 0]),
+        np.arange(num_reqs * q_len, dtype=np.int32),
+    )
+    cache_rank_0_compact_slots = pcp_wrapper \
+        ._compact_writeback_slot_ids_for_cache_rank(writeback_mapping, 0)
+    np.testing.assert_array_equal(
+        np.asarray(cache_rank_0_compact_slots)[:num_reqs * q_len].reshape(
+            num_reqs, q_len)[:, 0],
+        page_numbers * page_size,
+    )
+    valid = np.asarray(rank_major_query_rows.is_valid)
+    request_indices = np.asarray(rank_major_query_rows.request_indices)[valid]
+    absolute_positions = np.asarray(
+        rank_major_query_rows.absolute_positions)[valid]
+    np.testing.assert_array_equal(
+        cache_rank_0_slots[valid],
+        page_numbers[request_indices] * page_size + absolute_positions,
+    )
 
 
 def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
@@ -413,33 +500,39 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
     distribution = np.array([0, 0, q_lens.size], dtype=np.int32)
     block_tables = (np.arange(target_num_reqs * 8, dtype=np.int32).reshape(
         target_num_reqs, 8) + 11)
-    expected = _expected_local_slot_ids(
+    expected_writeback = _build_expected_pcp_writeback_mapping(
         q_lens,
-        q_starts,
+        q_starts + q_lens,
         block_tables,
-        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-        page_size=page_size,
+        page_size,
         pcp_size=pcp_size,
         interleave_size=interleave_size,
-        local_padded_tokens=local_padded_tokens,
-        pcp_rank=pcp_rank,
-        target_num_reqs=target_num_reqs,
+        padded_num_tokens=local_padded_tokens * pcp_size,
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
     )
+    expected = expected_writeback.compact_slot_ids[pcp_rank]
 
     captured = {}
 
-    def fake_update(kv_cache, _k, _v, slot_ids):
-        captured["slot_ids"] = slot_ids
-        return kv_cache
+    def fake_streaming(q_streaming, _current_kv, kv_cache, _kv_lens,
+                       _page_indices, _cu_q_lens, _distribution,
+                       segment_descriptors, num_segments, **_kwargs):
+        captured["segment_descriptors"] = segment_descriptors
+        captured["num_segments"] = num_segments
+        return jnp.full_like(q_streaming, 5), kv_cache
 
-    def fake_streaming(q_streaming, *_args, **_kwargs):
-        return jnp.full_like(q_streaming, 5)
+    def fake_prepare_current(k_local, _v_local, cache):
+        return jnp.zeros((k_local.shape[0], *cache.shape[2:]),
+                         dtype=cache.dtype)
 
     def fake_select_replicated_shard(tensor, _pcp_axis, _pcp_size, *, axis):
         assert axis == 0
         token_start = pcp_rank * local_padded_tokens
         token_end = token_start + local_padded_tokens
-        return tensor[token_start:token_end]
+        local = tensor[token_start:token_end]
+        if tensor.shape[1] == 4:
+            captured["is_valid"] = local[:, 3].astype(jnp.bool_)
+        return local
 
     def fake_shard_map(fn, *, mesh, in_specs, out_specs, check_vma):
         del mesh, in_specs, out_specs, check_vma
@@ -458,8 +551,8 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
 
         return wrapped
 
-    monkeypatch.setattr(pcp_wrapper, "_update_local_paged_kv_cache",
-                        fake_update)
+    monkeypatch.setattr(pcp_wrapper, "_prepare_packed_kv_for_cache",
+                        fake_prepare_current)
     monkeypatch.setattr(
         pcp_wrapper,
         "pcp_streaming_attention_page_groups_packed_local_from_metadata",
@@ -493,15 +586,102 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
         cp_kv_cache_interleave_size=interleave_size,
     )
 
-    np.testing.assert_array_equal(np.asarray(captured["slot_ids"]), expected)
+    expected_descriptors, expected_num_segments = \
+        pcp_wrapper._build_writeback_segment_descriptors(
+            jnp.asarray(expected),
+            jnp.asarray(expected_writeback.writeback_counts[pcp_rank]),
+        )
+    np.testing.assert_array_equal(
+        np.asarray(captured["segment_descriptors"]),
+        np.asarray(expected_descriptors),
+    )
+    assert int(captured["num_segments"]) == int(expected_num_segments)
     assert np.any(expected < 0)
     expected_output = np.zeros((local_padded_tokens, 2, 128), dtype=np.float32)
-    expected_output[expected >= 0] = 5
+    expected_output[np.asarray(captured["is_valid"])] = 5
     np.testing.assert_array_equal(
         np.asarray(output),
         expected_output,
     )
     assert new_cache.shape == (local_kv_cache_num_blocks, page_size, 2, 1, 128)
+
+
+def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
+    query_rows = pcp_wrapper._PCPQueryRowMapping(
+        absolute_positions=jnp.array([0, -1, 2, -1], dtype=jnp.int32),
+        request_indices=jnp.array([0, -1, 0, -1], dtype=jnp.int32),
+        source_ranks=jnp.zeros(4, dtype=jnp.int32),
+        is_valid=jnp.array([True, False, True, False]),
+    )
+    captured = {}
+
+    def fake_compute_query_rows(*_args, **_kwargs):
+        return query_rows
+
+    def fake_select_query_rows(mapping, _pcp_axis, _pcp_size):
+        assert mapping is query_rows
+        return mapping
+
+    def fake_streaming(q_streaming, _current_kv, kv_cache, _kv_lens,
+                       _page_indices, _cu_q_lens, _distribution,
+                       _segment_descriptors, _num_segments, **_kwargs):
+        captured["writeback_called"] = True
+        return jnp.full_like(q_streaming, 5), kv_cache
+
+    def fake_prepare_current(k_local, _v_local, cache):
+        return jnp.zeros((k_local.shape[0], *cache.shape[2:]),
+                         dtype=cache.dtype)
+
+    def fake_shard_map(fn, *, mesh, in_specs, out_specs, check_vma):
+        del mesh, in_specs, out_specs, check_vma
+        return fn
+
+    monkeypatch.setattr(
+        pcp_wrapper,
+        "_compute_pcp_rank_major_query_row_mapping_from_metadata",
+        fake_compute_query_rows,
+    )
+    monkeypatch.setattr(
+        pcp_wrapper,
+        "_select_replicated_query_row_mapping_for_pcp_rank",
+        fake_select_query_rows,
+    )
+    monkeypatch.setattr(pcp_wrapper, "_prepare_packed_kv_for_cache",
+                        fake_prepare_current)
+    monkeypatch.setattr(
+        pcp_wrapper,
+        "pcp_streaming_attention_page_groups_packed_local_from_metadata",
+        fake_streaming,
+    )
+    monkeypatch.setattr(pcp_wrapper.jax, "shard_map", fake_shard_map)
+
+    num_tokens = 4
+    page_size = 4
+    mesh = SimpleNamespace(axis_names=("pcp", ), shape={"pcp": 1})
+    q = jnp.ones((num_tokens, 2, 128), dtype=jnp.float32)
+    k = jnp.ones((num_tokens, 1, 128), dtype=jnp.float32)
+    v = jnp.ones((num_tokens, 1, 128), dtype=jnp.float32)
+    kv_cache = jnp.zeros((1, page_size, 2, 1, 128), dtype=jnp.float32)
+
+    output, _ = pcp_wrapper.sharded_pcp_ragged_paged_attention(
+        mesh=mesh,
+        q=q,
+        k=k,
+        v=v,
+        kv_cache=kv_cache,
+        kv_lens=jnp.asarray([num_tokens]),
+        page_indices=jnp.asarray([0]),
+        cu_q_lens=jnp.asarray([0, num_tokens]),
+        distribution=jnp.asarray([0, 0, 1]),
+        attention_sink=None,
+        sm_scale=0.25,
+        cp_kv_cache_interleave_size=page_size,
+    )
+
+    assert captured["writeback_called"]
+    expected_output = np.zeros((num_tokens, 2, 128), dtype=np.float32)
+    expected_output[[0, 2]] = 5
+    np.testing.assert_array_equal(np.asarray(output), expected_output)
 
 
 def test_reshape_packed_kv_cache_for_attention_rejects_ambiguous_layout():

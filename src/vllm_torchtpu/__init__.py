@@ -8,6 +8,41 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _patch_vllm_pcp_v2_validation() -> None:
+    """Allow TPU PCP through GPU-specific Model Runner V2 checks."""
+    from vllm.config import vllm as vllm_config
+
+    cls = vllm_config.VllmConfig
+    original_validate = cls._validate_v2_model_runner
+    if getattr(original_validate, "_tpu_pcp_v2_validation_patch", False):
+        return
+    original_unsupported = cls._get_v2_model_runner_unsupported_features
+
+    def get_unsupported(self):
+        unsupported = original_unsupported(self)
+        if self.parallel_config.prefill_context_parallel_size > 1:
+            unsupported = [
+                feature for feature in unsupported
+                if feature != "prefill context parallelism"
+            ]
+        return unsupported
+
+    def validate(self):
+        if self.parallel_config.prefill_context_parallel_size <= 1:
+            return original_validate(self)
+        has_triton = vllm_config.HAS_TRITON
+        vllm_config.HAS_TRITON = True
+        try:
+            return original_validate(self)
+        finally:
+            vllm_config.HAS_TRITON = has_triton
+
+    validate._tpu_pcp_v2_validation_patch = True
+    cls._get_v2_model_runner_unsupported_features = get_unsupported
+    cls._validate_v2_model_runner = validate
+    logger.info("Applied TPU patch: allow PCP through GPU-specific V2 checks.")
+
+
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     """Require a common local prefix hit on a hybrid KV producer.
 
@@ -912,3 +947,41 @@ if "proxy" in envs.JAX_PLATFORMS:
         logger.error(
             f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
         )
+
+
+def _patch_vllm_block_pool_lifo_free() -> None:
+    """Restore pre-#48017 LIFO block reuse when prefix caching is off.
+
+    vllm a82f1b38 switched hashless freed blocks from prepend (LIFO reuse
+    of a small hot set of block ids) to append (FIFO) when prefix caching
+    is disabled. On TPU v7x the FIFO order cycles the entire KV block-id
+    space under sustained load and an indexed SparseCore-offloaded op on
+    the paged-KV path traps with E0200 RuntimeUnexpectedCoreHalt (UserFatal
+    on SC2). Bisect evidence: docs/sc2-sparsecore-halt-2026-08.md on branch
+    mhhua/sc2-sparsecore-halt-evidence, vllm-torchtpu-dev builds 136-146.
+    Behavior with prefix caching enabled is unchanged. Remove once the
+    SparseCore index handling is fixed in the TPU runtime.
+    """
+    from vllm.v1.core.block_pool import BlockPool
+
+    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
+        return
+
+    def free_blocks(self, ordered_blocks) -> None:
+        blocks_with_hash = []
+        blocks_without_hash = []
+        for block in ordered_blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                if block.block_hash is None:
+                    blocks_without_hash.append(block)
+                else:
+                    blocks_with_hash.append(block)
+        self.free_block_queue.prepend_n(blocks_without_hash)
+        self.free_block_queue.append_n(blocks_with_hash)
+
+    BlockPool.free_blocks = free_blocks
+    BlockPool._tpu_lifo_free_patch = True
+    from vllm_torchtpu.logger import init_logger
+    init_logger(__name__).info(
+        "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")

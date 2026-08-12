@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -25,9 +26,40 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import (
-    TpuPlatform, _validate_phased_profiling_config)
+    TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
+    TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TpuPlatform,
+    _validate_phased_profiling_config, get_tpu_multihost_topology)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
+
+
+def test_pcp_v2_validation_skips_gpu_only_checks(monkeypatch):
+    from vllm.config import vllm as vllm_config
+
+    from vllm_torchtpu import _patch_vllm_pcp_v2_validation
+
+    def validate(config):
+        assert vllm_config.HAS_TRITON
+        raise RuntimeError("other validation")
+
+    def get_unsupported(config):
+        return ["prefill context parallelism", "other feature"]
+
+    monkeypatch.setattr(vllm_config, "HAS_TRITON", False)
+    monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", validate)
+    monkeypatch.setattr(VllmConfig,
+                        "_get_v2_model_runner_unsupported_features",
+                        get_unsupported)
+    _patch_vllm_pcp_v2_validation()
+    config = SimpleNamespace(parallel_config=SimpleNamespace(
+        prefill_context_parallel_size=4))
+
+    assert VllmConfig._get_v2_model_runner_unsupported_features(config) == [
+        "other feature"
+    ]
+    with pytest.raises(RuntimeError, match="other validation"):
+        VllmConfig._validate_v2_model_runner(config)
+    assert not vllm_config.HAS_TRITON
 
 
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
@@ -416,6 +448,69 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+
+    def test_get_tpu_multihost_topology(self, monkeypatch):
+        # Test env override via TORCH_TPU_TOPOLOGY
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4,4,1")
+        assert get_tpu_multihost_topology(16) == "4,4,1"
+        monkeypatch.delenv("TORCH_TPU_TOPOLOGY", raising=False)
+
+        # Test syntax normalization ('AxBxC' -> 'A,B,C')
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4x4x1")
+        assert get_tpu_multihost_topology(16) == "4,4,1"
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "8x16x1")
+        assert get_tpu_multihost_topology(128) == "8,16,1"
+        monkeypatch.delenv("TORCH_TPU_TOPOLOGY", raising=False)
+
+        # Test 2D torus fallback map lookup (v6e / v5e)
+        assert get_tpu_multihost_topology(16, device_name="TPU v6e") == "4,4,1"
+        assert get_tpu_multihost_topology(32, device_name="TPU v5e") == "4,8,1"
+        assert get_tpu_multihost_topology(64, device_name="TPU v6e") == "8,8,1"
+
+        # Test 3D torus fallback map lookup (v4 / v5p), where megacore
+        # presents both cores of a chip as one device.
+        assert get_tpu_multihost_topology(16,
+                                          device_name="TPU v4") == "2,2,4,2"
+        assert get_tpu_multihost_topology(32,
+                                          device_name="TPU v5p") == "2,4,4,2"
+        assert get_tpu_multihost_topology(64,
+                                          device_name="TPU v4") == "4,4,4,2"
+        assert get_tpu_multihost_topology(128,
+                                          device_name="TPU v5p") == "4,4,8,2"
+        assert get_tpu_multihost_topology(256,
+                                          device_name="TPU v4") == "4,8,8,2"
+
+        # Test dual-device 3D torus lookup (v7x / Ironwood). Same meshes as
+        # v4 / v5p, but each chip contributes two devices, so a given mesh is
+        # reached at twice the world size. Both spellings of the device name
+        # have to select this map.
+        assert get_tpu_multihost_topology(16,
+                                          device_name="TPU v7") == "2,2,2,2"
+        assert get_tpu_multihost_topology(32, device_name="TPU7x") == "2,2,4,2"
+        assert get_tpu_multihost_topology(64,
+                                          device_name="TPU v7x") == "2,4,4,2"
+        assert get_tpu_multihost_topology(512,
+                                          device_name="TPU v7") == "4,8,8,2"
+
+        # A mesh must describe exactly as many devices as were asked for,
+        # otherwise the slice builder sizes its worker address list against a
+        # world that does not exist. Devices per chip is what separates the
+        # maps, so it is what the invariant is parameterized on.
+        for topo_map, devices_per_chip in (
+            (TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, 1),
+            (TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, 1),
+            (TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP, 2),
+        ):
+            for world_size, topo in topo_map.items():
+                dims = [int(d) for d in topo.split(",")]
+                # The trailing T dimension is cores per chip, never devices.
+                chips = math.prod(dims[:-1])
+                assert chips * devices_per_chip == world_size
+
+        # Test ValueError on unsupported device counts
+        with pytest.raises(ValueError,
+                           match="Cannot find topology for 10 devices"):
+            get_tpu_multihost_topology(10, device_name="TPU v6e")
 
 
 class TestPhasedProfilingConfigValidation:

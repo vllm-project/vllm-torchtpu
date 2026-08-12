@@ -43,6 +43,13 @@ MXFP4_BLOCK_SIZE = 32
 # Target block size for optimized TPU kernels
 REQUANTIZED_BLOCK_SIZE = 512
 
+# e8m0 is a bare biased exponent with no sign and no mantissa:
+# value = 2^(bits - 127) for bits in [0, 254] (255 encodes NaN). This matches
+# jnp.float8_e8m0fnu / torch.float8_e8m0fnu, and `e8m0_to_fp32` is the decoder
+# for the uint8 form used throughout this module.
+E8M0_MIN_EXP = -127
+E8M0_MAX_EXP = 127
+
 
 def is_floating_dtype(dtype: torch.dtype) -> bool:
     return torch.is_floating_point(torch.empty((), dtype=dtype))
@@ -105,8 +112,7 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
         This only affects unrealistic scale values (u8 > 200 is already ~1e22).
     """
     # e8m0 minexp is -127 (same as jnp.float8_e8m0fnu)
-    E8M0_MINEXP = -127
-    exponents = u8.to(torch.int32) + E8M0_MINEXP
+    exponents = u8.to(torch.int32) + E8M0_MIN_EXP
     ones = torch.ones_like(u8, dtype=torch.float32)
     result = torch.ldexp(ones, exponents)
     return result
@@ -203,6 +209,7 @@ def quantize_tensor(
     quant_dtype: torch.dtype,
     axis: int = -1,
     block_size: int | None = None,
+    use_ue8m0: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor with block scaling.
 
@@ -212,9 +219,13 @@ def quantize_tensor(
         axis: Axis along which quantization is performed.
         block_size: Number of elements per block. If unset, quantize over the
             entire axis.
+        use_ue8m0: If True, use unsigned e8m0 format for scale. Otherwise, use
+            float32 scale.
 
     Returns:
-        Quantized tensor and scale tensor.
+        Quantized tensor and scale tensor. The scale is float32, or uint8
+        holding e8m0 biased exponents when `use_ue8m0` is set (decode it with
+        `e8m0_to_fp32`, or view it as bytes to pack alongside the values).
     """
     block_size = block_size or tensor.shape[axis]
     if tensor.shape[axis] % block_size != 0:
@@ -240,6 +251,29 @@ def quantize_tensor(
                                    dtype=torch.float32,
                                    device=tensor.device)
     scale = abs_max * dtype_max_recip
+
+    scale_bits = None
+    if use_ue8m0:
+        # e8m0 carries only an exponent, so snap the scale to a power of two,
+        # rounding UP: a smaller scale pushes the block's largest magnitude
+        # past dtype_max, where the clamp below silently clips it. Redo the
+        # product in fp32 -- for a bf16 scale, log2(0.01575) rounds to exactly
+        # -6.0, and the ceil then hands back a scale a full octave too small.
+        scale = abs_max.to(torch.float32) * dtype_max_recip
+        scale_exp = torch.ceil(torch.log2(scale))
+        # log2 is not exactly rounded either, so repair the octave rather than
+        # trusting it. An all-zero block gives log2(0) = -inf: exp2(-inf) == 0
+        # is not < 0, so it falls through to the clamp, which pins it to the
+        # smallest representable exponent.
+        scale_exp = torch.where(
+            torch.exp2(scale_exp) < scale, scale_exp + 1,
+            scale_exp).clamp(E8M0_MIN_EXP, E8M0_MAX_EXP)
+        scale = torch.exp2(scale_exp)
+        # Keep the biased exponent byte, not the power of two itself. This is
+        # the exact inverse of `e8m0_to_fp32`, and the clamp above already
+        # bounds the byte to [0, 254].
+        scale_bits = (scale_exp - E8M0_MIN_EXP).to(torch.uint8)
+
     # Keep all-zero blocks quantized as exact zeros instead of producing
     # 0 * inf -> NaN during requantization.
     scale_inv = _safe_inverse_scale(scale)
@@ -248,7 +282,8 @@ def quantize_tensor(
                             min=float(dtype_info.min),
                             max=float(dtype_info.max))
     tensor_q = blocked_q.reshape_as(moved).to(quant_dtype).movedim(-1, axis)
-    scale = scale.squeeze(-1).to(torch.float32).movedim(-1, axis)
+    scale = scale_bits if scale_bits is not None else scale.to(torch.float32)
+    scale = scale.squeeze(-1).movedim(-1, axis)
     return tensor_q, scale
 
 

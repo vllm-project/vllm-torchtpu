@@ -151,7 +151,10 @@ class FakeRoutedExperts(RoutedExperts):
 class TestW4MoEWeightPreprocessing:
     """Verify CPU weight packing and sign-extension logic."""
 
-    def test_xor_sign_conversion(self):
+    @patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16.select_wna16_moe_backend",
+        return_value=(None, None))
+    def test_xor_sign_conversion(self, _):
         """Symmetric unsigned INT4 [0, 15] should be converted to signed [-8, 7] via XOR."""
         layer = FakeRoutedExperts(experts_per_token=2)
         layer.activation = FakeActivation("silu")
@@ -181,7 +184,10 @@ class TestW4MoEWeightPreprocessing:
         layer._map_global_expert_id_to_local_expert_id = MagicMock(
             side_effect=lambda x: x)
 
-        extra_weight_attrs = {"weight_loader": MagicMock()}
+        extra_weight_attrs = {
+            "weight_loader": MagicMock(),
+            "intermediate_size_full": 8,
+        }
 
         with patch.object(VllmCompressedTensorsW4A16MoEMethod, "_validate_w4a16_scheme"), \
              patch.object(VllmCompressedTensorsW4A16MoEMethod, "_validate_int32_weight_carriers"), \
@@ -258,7 +264,10 @@ class TestW4MoECorrectness:
 
         mock_routing.assert_called_once()
 
-    def test_fused_moe_w4a16_correctness(self, device):
+    @patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16.select_wna16_moe_backend",
+        return_value=(None, None))
+    def test_fused_moe_w4a16_correctness(self, _, device):
         """Verify mathematical correctness of W4A16 MoE on TPU against CPU reference."""
         if device.type != "tpu":
             pytest.skip(
@@ -293,7 +302,10 @@ class TestW4MoECorrectness:
             side_effect=lambda x: x)
 
         # 3. Create Weights on TPU (and cpu scratchpads) directly
-        extra_weight_attrs = {"weight_loader": MagicMock()}
+        extra_weight_attrs = {
+            "weight_loader": MagicMock(),
+            "intermediate_size_full": intermediate_size,
+        }
         with torch.device(device):
             method.create_weights(layer, num_experts, hidden_size,
                                   intermediate_size, torch.float32,

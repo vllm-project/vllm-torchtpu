@@ -239,7 +239,6 @@ def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
         skip_kv_update=False,
         cp_kv_cache_interleave_size=int(case.get("interleave_size",
                                                  PAGE_SIZE)),
-        max_model_len=GLOBAL_TOKENS,
         q_block_size=LOCAL_TOKENS,
         q_compute_size=64,
     )

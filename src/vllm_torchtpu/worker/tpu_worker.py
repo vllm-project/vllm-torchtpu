@@ -195,7 +195,36 @@ class TPUWorker(WorkerBase):
             os.environ["MASTER_PORT"] = str(master_port)
 
             if pc.enable_expert_parallel:
-                init_rank = binding.init_rank
+                # Setting data_parallel_size above puts
+                # init_distributed_environment() on its DP path, where it
+                # discards the rank and the init method it was handed and
+                # recomputes both: rank becomes
+                # `data_parallel_rank * world_size + rank`, and the rendezvous
+                # becomes data_parallel_master_ip plus a port popped from the
+                # DP port list. Both predate this worker having an
+                # executor-assigned slice placement, and both are wrong here.
+                #
+                # The address is wrong outright: data_parallel_master_ip
+                # defaults to 127.0.0.1, so each host's workers rendezvous on
+                # their own loopback and the two halves of the slice never
+                # meet -- init_process_group then blocks until the engine
+                # start timeout. Point it at the host holding slice rank 0,
+                # which every worker derived identically in Step 7 of the
+                # executor. The port needs no such fixup: it is popped from a
+                # list built once on the driver and carried unchanged into
+                # every worker, so all of them already agree on it. Leave
+                # data_parallel_master_port alone -- MASTER_PORT below is
+                # torch_tpu's own slice rendezvous, and forcing it here would
+                # collide with that.
+                pc.data_parallel_master_ip = master_addr
+                # Ray hands each engine whichever chips were free, so slice
+                # ranks do not run dp-rank-major and binding.rank is not
+                # `dp_rank * per_engine_world + self.rank`. Pre-subtract the
+                # offset the rewrite is about to add, so it lands back on the
+                # slice rank this worker is actually bound to. The subtraction
+                # can go negative for an engine placed early in the slice;
+                # that value is consumed by the rewrite before torch sees it.
+                init_rank = binding.rank - dp_rank * per_engine_world
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
             else:

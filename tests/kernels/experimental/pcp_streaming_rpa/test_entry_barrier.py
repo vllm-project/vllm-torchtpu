@@ -47,6 +47,8 @@ NUM_HEADS = 16
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 NUM_LAYERS = 28
+DECODE_QUERY_OWNER_RANK = 0
+DECODE_CACHE_OWNER_RANK = 1
 LAUNCH_TIMEOUT_SECONDS = 240
 
 
@@ -172,7 +174,11 @@ def _make_inputs(torch, sync, rank: int):
 
     prefill_valid_tokens = (PAGE_SIZE if rank == 0 else PREFILL_TOKENS -
                             PAGE_SIZE if rank == 1 else 0)
-    decode_valid_tokens = 1 if rank == 1 else 0
+    # The one-token decode is the first row in the batch-flat query stream, so
+    # rank 0 owns its Q/K/V row. Its request-absolute position is 432, which is
+    # in rank 1's cache interval [256, 512); the ring must therefore carry the
+    # fresh KV from the query owner to a different cache owner.
+    decode_valid_tokens = int(rank == DECODE_QUERY_OWNER_RANK)
     prefill_q, prefill_k, prefill_v = make_qkv(prefill_valid_tokens, 1.0)
     decode_q, decode_k, decode_v = make_qkv(decode_valid_tokens, 9.0)
 
@@ -250,7 +256,6 @@ def _build_compiled_steps(torch, mesh):
         soft_cap=None,
         skip_kv_update=False,
         cp_kv_cache_interleave_size=PAGE_SIZE,
-        max_model_len=MAX_MODEL_LEN,
         q_block_size=Q_BLOCK_SIZE,
         q_compute_size=128,
     )
@@ -301,7 +306,7 @@ def _validate_outputs(torch, caches, output,
     expected_cache = torch.zeros_like(caches[0], device="cpu").float()
     if rank == 0:
         expected_cache[0, :PAGE_SIZE, :, 1, :].fill_(1.0)
-    elif rank == 1:
+    elif rank == DECODE_CACHE_OWNER_RANK:
         prefill_on_rank = PREFILL_TOKENS - PAGE_SIZE
         expected_cache[0, :prefill_on_rank, :, 1, :].fill_(1.0)
         expected_cache[0, prefill_on_rank, :, 1, :].fill_(9.0)
@@ -314,7 +319,7 @@ def _validate_outputs(torch, caches, output,
         )
     output_cpu = output.cpu().float()
     output_max_abs = 0.0
-    if rank == 1:
+    if rank == DECODE_QUERY_OWNER_RANK:
         expected_output = (PREFILL_TOKENS + 9.0) / (PREFILL_TOKENS + 1)
         output_max_abs = float(
             (output_cpu[0] - expected_output).abs().max().item())
@@ -322,7 +327,8 @@ def _validate_outputs(torch, caches, output,
         raise AssertionError(f"rank={rank} cache_max_abs={cache_max_abs} "
                              f"output_max_abs={output_max_abs}")
     return {
-        "decode_owner": int(rank == 1),
+        "decode_query_owner": int(rank == DECODE_QUERY_OWNER_RANK),
+        "decode_cache_owner": int(rank == DECODE_CACHE_OWNER_RANK),
         "cache_max_abs": cache_max_abs,
         "output_max_abs": output_max_abs,
     }

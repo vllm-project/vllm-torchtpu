@@ -813,26 +813,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
-        custom_routing_fn = layer.custom_routing_function
-        if custom_routing_fn is not None:
-            # custom_routing_fn bypasses select_experts, so apply the
-            # random-routing profiling override here too (a no-op by default).
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=moe_routing.maybe_force_random_routing(
-                    router_logits),
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-            )
-        else:
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=layer.scoring_func,
-                layer=layer,
-            )
+        # Quantization-independent routing decision (simulation override ->
+        # custom_routing_function -> select_experts); shared across all TPU MoE
+        # methods so the routing-simulation hook lives in exactly one place.
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
