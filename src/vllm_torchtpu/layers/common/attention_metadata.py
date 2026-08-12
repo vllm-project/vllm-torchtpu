@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 from dataclasses import dataclass, field
 from typing import Any
@@ -180,6 +182,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         if plan is not None:
             return plan
 
+        is_active = (ctx.seq_lens > 0).unsqueeze(1)
         state_offsets = torch.clamp(
             (ctx.seq_lens - 1) // self.target_block_size,
             min=0,
@@ -205,7 +208,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # checkpoints onto one block and silently corrupt state, so clamp
             # to the null block instead of a live one. `in_row` is returned so
             # the caller can zero those columns after gathering.
-            in_row = ckpt_offsets < target_num_blocks
+            in_row = (ckpt_offsets < target_num_blocks) & is_active
             ckpt_index = torch.where(in_row, ckpt_offsets,
                                      torch.zeros_like(ckpt_offsets))
 
@@ -282,11 +285,14 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # groups; see `_mamba_row_plan`.
             state_index, ckpt_index, ckpt_in_row = self._mamba_row_plan(
                 ctx, target_num_blocks)
-            mamba_state_indices = torch.gather(
+            gathered_state_indices = torch.gather(
                 block_tables_2d,
                 dim=1,
                 index=state_index,
             ).squeeze(1)
+            mamba_state_indices = torch.where(
+                ctx.seq_lens > 0, gathered_state_indices,
+                torch.zeros_like(gathered_state_indices))
             if ckpt_index is not None:
                 mamba_ckpt_indices = torch.gather(
                     block_tables_2d,
