@@ -1,13 +1,15 @@
 """Page-size accounting for the Pallas KV cache layout.
 
-`get_kv_cache_shape` rounds each token's K/V vectors up to fill the 32-bit
-packing dimension, which holds `32 / bitwidth` values: 1 for fp32, 2 for bf16,
-4 for fp8. A page therefore costs `ceil(Kx2 / packing) * packing` slots where
-only `Kx2` hold data, and the surplus is charged to HBM.
+`get_kv_cache_shape` rounds up twice, and either can waste HBM:
 
-`Kx2` is `num_kv_heads * 2` normally, but the hd64 kernel (`head_size == 64`)
-folds K and V along head_dim, so there `Kx2 == num_kv_heads` — which is why
-bf16 can be padded too.
+    page = block_size x ceil(Kx2 / packing) * packing  x  cdiv(head_size, 128) * 128
+                        \\_____ packing dimension ____/     \\______ lanes ______/
+
+`packing` is `32 / bitwidth` (2 for bf16, 4 for fp8), so a narrower dtype makes
+the first round-up bite sooner. `Kx2` is `num_kv_heads * 2`, except under the
+hd64 kernel (`head_size == 64`), which folds K and V along head_dim — which is
+why bf16 can be padded too. The second round-up is dtype-independent: any
+head_size neither 64 nor a multiple of 128 leaves lanes empty.
 """
 import contextlib
 import logging
@@ -23,7 +25,8 @@ BLOCK_SIZE = 256
 
 # (num_kv_heads, head_size, dtype) -> is the page padded today?
 PADDING_CASES = [
-    # hd64 folds K and V, so Kx2 == num_kv_heads and an odd count pads bf16.
+    # Packing-dimension padding. hd64 folds K and V, so Kx2 == num_kv_heads
+    # and an odd count pads even bf16.
     (1, 64, BF16, True),
     (3, 64, BF16, True),
     (2, 64, BF16, False),
@@ -41,6 +44,13 @@ PADDING_CASES = [
     (2, 128, FP8, False),
     (8, 128, FP8, False),
     (4, 64, FP8, False),
+    # Lane padding, independent of the packing dimension. Every row here fills
+    # its 32-bit word exactly, so packing is not what pads them.
+    (1, 80, BF16, True),
+    (2, 80, BF16, True),
+    (1, 96, BF16, True),
+    (2, 96, FP8, True),
+    (2, 192, BF16, True),
 ]
 
 # fp8 must halve the page against bf16 wherever the head count fills a word.
@@ -55,12 +65,11 @@ def page_bytes(num_kv_heads, head_size, dtype):
 
 
 def unpadded_bytes(num_kv_heads, head_size, dtype):
-    """What the page would cost with no rounding.
+    """What the model needs: a key and a value vector per head, per token.
 
-    float32 packs one value per 32-bit word, so its page is never rounded up.
+    No hd64 special case — folding changes where values sit, not how many.
     """
-    return page_bytes(num_kv_heads, head_size,
-                      torch.float32) // 4 * dtype.itemsize
+    return BLOCK_SIZE * 2 * num_kv_heads * head_size * dtype.itemsize
 
 
 @pytest.mark.parametrize("num_kv_heads,head_size,dtype,padded", PADDING_CASES)

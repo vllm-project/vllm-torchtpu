@@ -402,31 +402,26 @@ class PallasAttentionBackend(AttentionBackend):
     ) -> None:
         """Warn when a page costs more than its shape and dtype imply.
 
-        The Pallas layout rounds each token's K/V vectors up to fill the 32-bit
-        packing dimension, so HBM use can exceed what an operator computes from
-        shape and dtype alone. That happens at any dtype -- fp8 with one KV
-        head, but also bf16 under the hd64 kernel with an odd head count.
+        `get_kv_cache_shape` rounds the packing dimension up to a whole 32-bit
+        word and head_size up to a whole 128-lane register; either wastes HBM.
+        Comparing against a key and a value vector per head per token needs no
+        hd64 special case, because folding K and V along head_dim moves values
+        without changing how many there are.
         """
         dtype = _resolve_kv_cache_dtype(cache_dtype)
-        page_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes
-        # float32 packs one value per 32-bit word, so its page is never rounded
-        # up: dividing it by its itemsize gives exactly the number of K/V
-        # values a page holds. Costing those at `dtype` is the padding-free
-        # size to compare against.
-        unpadded = (
-            page_bytes(block_size, num_kv_heads, head_size, torch.float32) //
-            torch.float32.itemsize) * dtype.itemsize
-        actual = page_bytes(block_size, num_kv_heads, head_size, dtype)
+        unpadded = block_size * 2 * num_kv_heads * head_size * dtype.itemsize
+        actual = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size, num_kv_heads, head_size, dtype)
         if actual == unpadded:
             return
         logger.warning_once(
             "KV cache pages are %.2fx larger than num_kv_heads=%d at "
-            "head_size=%d with dtype %s requires: the Pallas layout rounds "
-            "each token's K/V vectors up to fill the 32-bit packing "
-            "dimension, so HBM use will exceed an estimate made from shape "
-            "and dtype. Lowering tensor parallelism (more KV heads per rank) "
-            "or enabling attention data parallelism avoids the padding.",
-            actual / unpadded, num_kv_heads, head_size, dtype)
+            "head_size=%d with dtype %s requires: the Pallas layout pads "
+            "head_size to a whole 128-lane register and the K/V vectors to a "
+            "whole 32-bit word, so HBM use exceeds a shape-and-dtype estimate. "
+            "Where head_size is a multiple of 128, lowering tensor parallelism "
+            "(more KV heads per rank) or enabling attention data parallelism "
+            "avoids it.", actual / unpadded, num_kv_heads, head_size, dtype)
 
     # In recent TPU generations, up to v6e, the SMEM size is 1MB. The
     # block_tables within the PallasMetadata constitute almost the entire SMEM
