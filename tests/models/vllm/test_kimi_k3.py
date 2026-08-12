@@ -540,8 +540,13 @@ class _ConvWeight(nn.Module):
 def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.fused_input_proj = _Projection(18)
-    layer.input_projection_sizes = [4, 4, 4, 2, 2, 2]
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.fused_fa_ga_proj = _Projection(4)
+    layer.f_a_proj = None
+    layer.g_proj = None
+    layer.local_projection_size = 4
+    layer.num_heads = 2
+    layer.head_dim = 2
     layer.f_b_proj = _Projection(4)
     layer.g_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
@@ -593,7 +598,7 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     assert calls == ["dispatched"]
     torch.testing.assert_close(
         output,
-        torch.tensor([[0, 1, 2, 3], [18, 19, 20, 21]], dtype=torch.float32),
+        torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
     )
 
 
@@ -673,8 +678,13 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     monkeypatch.setattr(kimi_custom_ops.pallas, "jax_op", jax_op)
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.fused_input_proj = _Projection(18)
-    layer.input_projection_sizes = [4, 4, 4, 2, 2, 2]
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.fused_fa_ga_proj = _Projection(4)
+    layer.f_a_proj = None
+    layer.g_proj = None
+    layer.local_projection_size = 4
+    layer.num_heads = 2
+    layer.head_dim = 2
     layer.f_b_proj = _Projection(4)
     layer.g_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()

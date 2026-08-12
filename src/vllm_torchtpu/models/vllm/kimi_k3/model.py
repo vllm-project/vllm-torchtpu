@@ -221,13 +221,12 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         ".kv_a_proj_with_mqa.": (".fused_qkv_a_proj.", 1),
     }, )
     fused_attention_params_mapping = (
-        (".self_attn.q_proj.", ".self_attn.fused_input_proj.", 0),
-        (".self_attn.k_proj.", ".self_attn.fused_input_proj.", 1),
-        (".self_attn.v_proj.", ".self_attn.fused_input_proj.", 2),
-        (".self_attn.f_a_proj.", ".self_attn.fused_input_proj.", 3),
-        (".self_attn.b_proj.", ".self_attn.fused_input_proj.", 4),
-        (".self_attn.g_proj.", ".self_attn.fused_input_proj.", 5),
-        (".self_attn.g_a_proj.", ".self_attn.fused_input_proj.", 5),
+        (".self_attn.q_proj.", ".self_attn.fused_qkvb_proj.", 0),
+        (".self_attn.k_proj.", ".self_attn.fused_qkvb_proj.", 1),
+        (".self_attn.v_proj.", ".self_attn.fused_qkvb_proj.", 2),
+        (".self_attn.b_proj.", ".self_attn.fused_qkvb_proj.", 3),
+        (".self_attn.f_a_proj.", ".self_attn.fused_fa_ga_proj.", 0),
+        (".self_attn.g_a_proj.", ".self_attn.fused_fa_ga_proj.", 1),
         (".self_attn.g_proj.", ".self_attn.fused_qkv_a_proj.", 2),
     )
 

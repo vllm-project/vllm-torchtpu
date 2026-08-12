@@ -357,31 +357,40 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
         quant_config = vllm_config.quant_config
 
-        input_projection_sizes = [
-            self.projection_size,
-            self.projection_size,
-            self.projection_size,
-            self.head_dim,
-            self.total_heads,
-            self.projection_size if self.use_full_rank_gate else self.head_dim,
-        ]
-        self.fused_input_proj = MixedParallelMergedLinear(
+        self.fused_qkvb_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            input_projection_sizes,
-            [False, False, False, True, False, not self.use_full_rank_gate],
+            [self.projection_size] * 3 + [self.total_heads],
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.fused_input_proj",
+            prefix=f"{prefix}.fused_qkvb_proj",
         )
-        self.input_projection_sizes = [
-            self.local_projection_size,
-            self.local_projection_size,
-            self.local_projection_size,
-            self.head_dim,
-            self.num_heads,
-            self.local_projection_size
-            if self.use_full_rank_gate else self.head_dim,
-        ]
+        if self.use_full_rank_gate:
+            self.fused_fa_ga_proj = None
+            self.f_a_proj = ReplicatedLinear(
+                config.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_a_proj",
+            )
+            self.g_proj = ColumnParallelLinear(
+                config.hidden_size,
+                self.projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_proj",
+            )
+        else:
+            self.fused_fa_ga_proj = MergedColumnParallelLinear(
+                config.hidden_size,
+                [self.head_dim, self.head_dim],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_fa_ga_proj",
+                disable_tp=True,
+            )
+            self.f_a_proj = None
+            self.g_proj = None
         self.q_conv1d = CausalDepthwiseConv1d(self.projection_size,
                                               self.conv_size)
         self.k_conv1d = CausalDepthwiseConv1d(self.projection_size,
@@ -489,14 +498,22 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         del positions
-        projected, _ = self.fused_input_proj(hidden_states)
-        query, key, value, f_a, beta, gate_input = projected.split(
-            self.input_projection_sizes, dim=-1)
+        projected, _ = self.fused_qkvb_proj(hidden_states)
+        query, key, value, beta = projected.split(
+            [self.local_projection_size] * 3 + [self.num_heads], dim=-1)
         mixed_qkv = torch.cat((query, key, value), dim=-1)
-        raw_gate, _ = self.f_b_proj(f_a)
         if self.use_full_rank_gate:
-            output_gate = gate_input
+            assert self.f_a_proj is not None
+            f_a, _ = self.f_a_proj(hidden_states)
+            assert self.g_proj is not None
+            output_gate, _ = self.g_proj(hidden_states)
         else:
+            assert self.fused_fa_ga_proj is not None
+            gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
+            f_a, gate_input = gate_inputs.split([self.head_dim, self.head_dim],
+                                                dim=-1)
+        raw_gate, _ = self.f_b_proj(f_a)
+        if not self.use_full_rank_gate:
             assert self.g_b_proj is not None
             output_gate, _ = self.g_b_proj(gate_input)
 
