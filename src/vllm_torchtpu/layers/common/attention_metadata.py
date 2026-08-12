@@ -126,10 +126,7 @@ class AttentionMetadataBuilderContext:
     unified_mamba_state_indices: list[torch.Tensor] | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
-    # Per-chunk cache of the mamba row-offset derivation every mamba group
-    # shares, keyed by (block_size, num_blocks). Rebuilt with the context on
-    # each chunk, so entries can never go stale. See
-    # `AttentionMetadataBuilder._mamba_row_plan`.
+    # Per-chunk cache of mamba row-offset plans shared across mamba groups.
     mamba_row_plans: dict = field(default_factory=dict)
 
 
@@ -166,16 +163,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Row offsets into a mamba block table, shared across mamba groups.
 
-        Between mamba groups only `block_tables_2d` differs: `ctx.seq_lens`,
-        the mamba `block_size`, `target_num_blocks` and the checkpoint window
-        are all identical. Deriving these per group therefore re-ran the same
-        sub/floordiv/clamp/arange/add/compare chain once per group — 24 tiny
-        device programs per chunk on a 32-layer hybrid, each paying a core
-        barrier, which dominated the step. Compute once and let the groups
-        share it; only the two gathers stay per-group.
-
-        Keyed on the geometry rather than assumed uniform, so an attention
-        group (or a second mamba spec) can never pick up a mamba group's rows.
+        Derives the indexing geometry once per chunk and caches it on the
+        builder context to avoid recomputing identical row math per group.
         """
         key = (self.target_block_size, target_num_blocks)
         plan = ctx.mamba_row_plans.get(key)
@@ -193,21 +182,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         ckpt_index: torch.Tensor | None = None
         in_row: torch.Tensor | None = None
         if ctx.mamba_ckpt_window > 1:
-            # Speculative decoding, one block per checkpoint (vLLM's
-            # MambaSpec.num_speculative_blocks scheme): the manager allocates
-            # `window - 1` extra blocks per request by inflating the token
-            # count, so they land immediately after the positional state
-            # block. Checkpoint t is therefore the row entry
-            # `state_offsets + t`.
             ckpt_offsets = (
                 state_index +
                 torch.arange(ctx.mamba_ckpt_window,
                              device=state_offsets.device,
                              dtype=state_offsets.dtype).unsqueeze(0))
-            # Defensive: a row too short to hold the group would alias two
-            # checkpoints onto one block and silently corrupt state, so clamp
-            # to the null block instead of a live one. `in_row` is returned so
-            # the caller can zero those columns after gathering.
+            # Clamp out-of-bounds or inactive checkpoint offsets to null block.
             in_row = (ckpt_offsets < target_num_blocks) & is_active
             ckpt_index = torch.where(in_row, ckpt_offsets,
                                      torch.zeros_like(ckpt_offsets))
