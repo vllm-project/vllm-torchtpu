@@ -1289,7 +1289,8 @@ class TPURaidenConnectorWorker:
                 self.transfer_stats.record_prefill_queue_length(
                     prefill_queue_len)
             else:
-                decode_queue_len = (len(self._stage3_submitted_loads)
+                decode_queue_len = (len(self._stage3_submitted_loads) -
+                                    len(self._stage3_terminal_loads)
                                     if self._raiden_stage3_enabled() else len(
                                         self._legacy_submitted_loads))
                 self.transfer_stats.record_decode_queue_length(
