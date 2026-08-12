@@ -80,9 +80,9 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm import token_padding
-from vllm_torchtpu.layers.vllm.attention import (
-    TPU_STR_DTYPE_TO_TORCH_DTYPE, PallasAttentionBackend,
-    PallasBatchedRPAAttentionBackend, PallasMLAttentionBackend)
+from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
+                                                 PallasAttentionBackend,
+                                                 PallasMLAttentionBackend)
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
@@ -94,6 +94,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
@@ -1113,6 +1114,7 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
@@ -1191,13 +1193,10 @@ class TPUModelRunner(GPUModelRunner):
                         attn_module.head_size,
                         self.kv_cache_dtype,
                     )
-                    _page_size_backend = (PallasAttentionBackend
-                                          if attn_module.head_size == 64 else
-                                          PallasBatchedRPAAttentionBackend)
                     page_size_padded = (
                         self._hybrid_uniform_page_size_bytes
                         if self._hybrid_uniform_page_size_bytes is not None
-                        else _page_size_backend.get_kv_cache_page_size_bytes(
+                        else backend_cls.get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
@@ -1562,10 +1561,9 @@ class TPUModelRunner(GPUModelRunner):
         to make sure every layer is pinned to the *same* one.
         """
         attn_page_sizes = set()
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         for m in layers.values():
             if isinstance(m, Attention):
-                backend_cls = (PallasAttentionBackend if m.head_size == 64 else
-                               PallasBatchedRPAAttentionBackend)
                 attn_page_sizes.add(
                     backend_cls.get_kv_cache_page_size_bytes(
                         self.block_size,
@@ -1647,12 +1645,7 @@ class TPUModelRunner(GPUModelRunner):
         first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        if isinstance(first_attn_module, MLAAttention):
-            attention_backend = PallasMLAttentionBackend
-        elif first_attn_module.head_size == 64:
-            attention_backend = PallasAttentionBackend
-        else:
-            attention_backend = PallasBatchedRPAAttentionBackend
+        attention_backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.block_size, num_kv_heads, first_attn_module.head_size,
             self.kv_cache_dtype)
@@ -5722,6 +5715,7 @@ class TPUModelRunner(GPUModelRunner):
         if self._unified_kv_layout:
             self._initialize_unified_kv_cache(kv_cache_config)
             return
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
 
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
@@ -5897,9 +5891,6 @@ class TPUModelRunner(GPUModelRunner):
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
                             f"tp_size {tp_size} under SPMD mode")
-                    backend_cls = (PallasAttentionBackend
-                                   if kv_cache_spec.head_size == 64 else
-                                   PallasBatchedRPAAttentionBackend)
                     kv_cache_shape = backend_cls.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,

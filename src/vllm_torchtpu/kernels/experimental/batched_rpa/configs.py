@@ -77,8 +77,6 @@ class ServingConfigs:
     scale_k: int | None = None
     scale_v: int | None = None
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
-    smem_fraction_limit_for_schedule_generation: float = 0.33
-    max_schedule_size_multiplier: int = 16
 
     @property
     def pages_per_seq(self) -> int:
@@ -91,6 +89,18 @@ class ServingConfigs:
     @property
     def page_size_mask(self) -> int:
         return self.page_size - 1
+
+    @property
+    def int_ty(self) -> jnp.dtype:
+        if utils.get_dtype_packing(self.dtype_q) == 1:
+            return jnp.int32
+        if self.pages_per_seq * self.page_size > jnp.iinfo(jnp.int16).max:
+            return jnp.int32
+        match pltpu.get_tpu_info().generation:
+            case 6 | 7:
+                return jnp.int16
+            case _:
+                return jnp.int32
 
     @property
     def packing_q(self) -> int:
@@ -173,8 +183,7 @@ class RpaConfigs:
         fixed_bytes = 0
         fixed_bytes += self.serve.num_seqs  # kv_lens
         fixed_bytes += self.serve.num_seqs + 1  # cu_q_lens
-        fixed_bytes += (self.serve.num_seqs * self.serve.pages_per_seq
-                        )  # page_indices
+        fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq  # page_indices
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
         fixed_bytes += 1  # actual_steps
@@ -182,9 +191,7 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
-        smem_limit_bytes = (
-            pltpu.get_tpu_info().smem_capacity_bytes -
-            32 * 1024) * self.serve.smem_fraction_limit_for_schedule_generation
+        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
         available_bytes = smem_limit_bytes - fixed_bytes
 
         # Per step per batch item:
@@ -195,19 +202,16 @@ class RpaConfigs:
         bytes_per_step = (28 + 12 * self.bkv_p_cache +
                           4 * self.dma_kv_new_size * self.bkv_p_new)
         bytes_per_step *= self.block.batch_size
-        # Add 16 bytes for the 4 total_wait fields (total_wait_kv_in, total_wait_kv_out,
-        # total_wait_q_in, total_wait_o_out) which are 1D arrays (not multiplied by batch_size).
-        bytes_per_step += 16
 
         max_steps_ub = available_bytes // bytes_per_step
 
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
-        return int(max_steps_ub)
+        return max_steps_ub
 
     @property
     def bkv_p(self) -> int:
-        return pl.cdiv(self.block.bkv_sz, self.serve.page_size)
+        return self.block.bkv_sz // self.serve.page_size
 
     @property
     def bkv_p_cache(self) -> int:
@@ -217,7 +221,7 @@ class RpaConfigs:
 
     @property
     def bkv_p_new(self) -> int:
-        if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
+        if self.mode == RpaCase.DECODE:
             return 1
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.bkv_p + 1
@@ -270,26 +274,6 @@ class RpaConfigs:
         return self.mode == RpaCase.DECODE
 
     @property
-    def kv_bytes_per_token(self) -> int:
-        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
-        else:
-            num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
-        return num_elements * self.serve.dtype_kv.itemsize
-
-    @property
-    def q_bytes_per_token(self) -> int:
-        return (self.model.num_kv_heads *
-                self.aligned_num_q_heads_per_kv_head *
-                self.aligned_q_head_dim * self.serve.dtype_q.itemsize)
-
-    @property
-    def o_bytes_per_token(self) -> int:
-        return (self.model.num_kv_heads *
-                self.aligned_num_q_heads_per_kv_head *
-                self.aligned_q_head_dim * self.serve.dtype_out.itemsize)
-
-    @property
     def q_vmem_shape(self):
         q_per_kv_packing = (self.aligned_num_q_heads_per_kv_head //
                             self.serve.packing_q)
@@ -330,6 +314,7 @@ class RpaConfigs:
     def lm_scratch_shape(self):
         num_lanes = pltpu.get_tpu_info().num_lanes
         return (
+            self.block.batch_size,
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
             num_lanes,
@@ -338,15 +323,11 @@ class RpaConfigs:
     @property
     def acc_scratch_shape(self):
         return (
+            self.block.batch_size,
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
             self.aligned_kv_head_dim,
         )
-
-    @property
-    def max_schedule_size_multiplier(self) -> int:
-        # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
 
     def validate_inputs(
         self,
@@ -376,10 +357,10 @@ class RpaConfigs:
                 f" but got {q.shape[2]=}, {k.shape[2]=}, and {v.shape[2]=}")
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            if self.serve.page_size % 128 != 0:
+            if self.serve.page_size != 128:
                 raise ValueError(
-                    "Expected page_size to be a multiple of 128 for SEQ_ALONG_LANE"
-                    f" tile alignment, but got {self.serve.page_size=}")
+                    "Expected page_size=128 for SEQ_ALONG_LANE tile alignment, but got"
+                    f" {self.serve.page_size=}")
             expected_kv_cache_shape = (
                 kv_cache.shape[0],
                 self.model.num_kv_heads * 2,

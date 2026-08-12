@@ -35,7 +35,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import (configs, kernel,
                                                             schedule, utils)
 
@@ -47,7 +46,6 @@ def prepare_inputs(
     q_dtype: jnp.dtype,
     kv_dtype: jnp.dtype,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
-    page_size: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
 
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
@@ -98,8 +96,7 @@ def prepare_inputs(
 
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        align_tokens = max(num_lanes, page_size)
-        padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
+        padded_total_tokens = utils.align_to(total_q_tokens, num_lanes)
         new_kv_hbm = (jnp.pad(
             jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
                                                      actual_num_kv_heads_x2,
@@ -146,20 +143,16 @@ def get_kv_cache_shape(
     page_size,
     actual_num_kv_heads,
     actual_head_dim,
-    kv_dtype=None,
-    kv_packing: int | None = None,
+    kv_dtype,
     kv_layout: configs.KVLayout | None = None,
 ):
+    # No caller selects SEQ_ALONG_LANE yet; it is reachable only by passing
+    # `kv_layout` explicitly, which the tests do.
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            kv_layout = configs.KVLayout.SEQ_ALONG_LANE
-        else:
-            kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
-
-    if kv_packing is None:
-        kv_packing = utils.get_dtype_packing(kv_dtype)
+    kv_packing = utils.get_dtype_packing(kv_dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         return (
             total_num_pages,
@@ -466,10 +459,7 @@ def ragged_paged_attention(
     """
 
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            kv_layout = configs.KVLayout.SEQ_ALONG_LANE
-        else:
-            kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
 
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
@@ -526,7 +516,6 @@ def ragged_paged_attention(
         queries.dtype,
         kv_cache.dtype,
         kv_layout=kv_layout,
-        page_size=page_size,
     )
 
     default_decode, default_prefill = calculate_block_sizes(
