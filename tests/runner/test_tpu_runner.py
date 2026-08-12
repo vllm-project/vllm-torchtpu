@@ -2606,15 +2606,7 @@ class TestUpdateAttentionPageSizePadded:
 
 
 class TestBuildAttentionMetadataForLayers:
-    """`TPUModelRunner.build_attention_metadata_for_layers`.
-
-    Load-bearing for every DFlash draft step, and it leans on a contract that
-    is easy to break from a distance: the TPU `AttentionMetadataBuilder` reads
-    only `num_reqs` off the common metadata (everything else arrives via
-    `_attn_metadata_builder_ctx`), which is why a bare namespace stands in for
-    `CommonAttentionMetadata`. If that ever stops holding, this should fail
-    here rather than in a draft forward.
-    """
+    """Tests TPUModelRunner.build_attention_metadata_for_layers."""
 
     @staticmethod
     def _group(gid, layer_names):

@@ -313,7 +313,7 @@ def test_propose_unit(device):
         max_num_blocks_per_req=2,
         _attn_layer_names={"dummy_layer"},
         empty_slot_mappings=torch.zeros(128, dtype=torch.int32, device=device),
-        _build_attention_metadata=mock.MagicMock(return_value=({}, None)),
+        build_attention_metadata_for_layers=mock.MagicMock(return_value={}),
         mesh=None,
         _is_async_drafter=True,
     )

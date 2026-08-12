@@ -135,28 +135,35 @@ class ExecuteModelState:
                                    | None] = field(default_factory=list)
 
 
-# FIX-1 (launch-stream consolidation, DFlash hybrid hang): the per-step
-# mamba read-offset device ops used to be issued eagerly (a `torch.where` +
-# `index_put_` per mamba group per step, plus gather+scatter pairs on the
-# rollback path). Eager ops materialize as individually-launched tt_jit
-# programs at per-rank-dependent times, widening the cross-rank launch-order
-# race window (see DFLASH_HYBRID_HANG_HANDOFF.md). Compiling them turns each
-# cluster into one cached program launched at a fixed point in the step.
+# Compiled helper to consolidate per-step mamba read-offset operations
+# into a single cached TPU program, avoiding per-group eager launches.
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _reset_read_offsets_compiled(read_offsets: torch.Tensor,
                                  keep_dev: torch.Tensor,
                                  stacked_groups: torch.Tensor,
                                  null: torch.Tensor) -> None:
-    """One scatter for ALL mamba groups. `stacked_groups` is [G, width];
-    `keep_dev` [width] broadcasts across G. Under the unified pool G equals
-    the number of mamba KV groups (24 on Qwen3.5-4B), so this replaces ~2G
-    eager launches per step with one program. Non-new rows collapse onto the
-    null slot, where writing 0 is a no-op."""
+    """Scatter reset across all mamba groups in a single compiled program.
+    `stacked_groups` is [G, width]; `keep_dev` [width] broadcasts across G.
+    Non-new rows collapse onto the null slot, where writing 0 is a no-op."""
     targets = torch.where(keep_dev, stacked_groups, null)
     zero = torch.zeros((),
                        dtype=read_offsets.dtype,
                        device=read_offsets.device)
     read_offsets.index_put_((targets.reshape(-1).long(), ), zero)
+
+
+def _reset_read_offsets(read_offsets: torch.Tensor, keep_dev: torch.Tensor,
+                        stacked_groups: torch.Tensor,
+                        null: torch.Tensor) -> None:
+    if read_offsets.device.type == "tpu":
+        _reset_read_offsets_compiled(read_offsets, keep_dev, stacked_groups,
+                                     null)
+    else:
+        targets = torch.where(keep_dev, stacked_groups, null)
+        zero = torch.zeros((),
+                           dtype=read_offsets.dtype,
+                           device=read_offsets.device)
+        read_offsets.index_put_((targets.reshape(-1).long(), ), zero)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -168,11 +175,30 @@ def _rollback_offsets_seed_compiled(read_offsets: torch.Tensor,
                                         device=read_offsets.device))
 
 
+def _rollback_offsets_seed(read_offsets: torch.Tensor,
+                           dst_t: torch.Tensor) -> None:
+    if read_offsets.device.type == "tpu":
+        _rollback_offsets_seed_compiled(read_offsets, dst_t)
+    else:
+        read_offsets.index_put_((dst_t, ),
+                                torch.zeros(dst_t.shape[0],
+                                            dtype=read_offsets.dtype,
+                                            device=read_offsets.device))
+
+
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _rollback_offsets_migrate_compiled(read_offsets: torch.Tensor,
                                        src_t: torch.Tensor,
                                        dst_t: torch.Tensor) -> None:
     read_offsets.index_put_((dst_t, ), read_offsets[src_t])
+
+
+def _rollback_offsets_migrate(read_offsets: torch.Tensor, src_t: torch.Tensor,
+                              dst_t: torch.Tensor) -> None:
+    if read_offsets.device.type == "tpu":
+        _rollback_offsets_migrate_compiled(read_offsets, src_t, dst_t)
+    else:
+        read_offsets.index_put_((dst_t, ), read_offsets[src_t])
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -2127,9 +2153,7 @@ class TPUModelRunner(GPUModelRunner):
                                  dtype=torch.long).to(self.device,
                                                       non_blocking=True)
             assert self.mamba_slot_read_offsets is not None
-            # FIX-1: compiled instead of eager scatter.
-            _rollback_offsets_seed_compiled(self.mamba_slot_read_offsets,
-                                            dst_t)
+            _rollback_offsets_seed(self.mamba_slot_read_offsets, dst_t)
         elif self.mamba_slot_read_offsets is not None and offset_pairs:
             # Migrate the read offsets with the state: gather at the old
             # blocks, scatter at the new ones (both device-side, before the
@@ -2142,9 +2166,8 @@ class TPUModelRunner(GPUModelRunner):
             dst_t = torch.tensor([d for _, d in offset_pairs],
                                  dtype=torch.long).to(self.device,
                                                       non_blocking=True)
-            # FIX-1: compiled instead of eager gather+scatter.
-            _rollback_offsets_migrate_compiled(self.mamba_slot_read_offsets,
-                                               src_t, dst_t)
+            _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t,
+                                      dst_t)
 
         for raw, srcs_dev, dsts_dev in per_raw_dev.values():
             src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev))
@@ -3648,13 +3671,11 @@ class TPUModelRunner(GPUModelRunner):
         # No `if nothing_new: return` here — see the docstring. The device
         # work below must be issued on every rank on every step.
         keep_dev.copy_(keep, non_blocking=True)
-        # FIX-1: one stack + one compiled program replaces ~2*G eager
-        # launches (G = mamba group count; 24 under the unified pool on
-        # Qwen3.5-4B). See _reset_read_offsets_compiled.
+        # Stack groups and reset offsets across all groups in one compiled program.
         stacked = torch.stack(groups) if len(
             groups) > 1 else groups[0].unsqueeze(0)
-        _reset_read_offsets_compiled(self.mamba_slot_read_offsets, keep_dev,
-                                     stacked, null)
+        _reset_read_offsets(self.mamba_slot_read_offsets, keep_dev, stacked,
+                            null)
 
     def _read_offset_reset_scratch(
         self, width: int, device: torch.device

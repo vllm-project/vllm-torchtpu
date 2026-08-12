@@ -586,12 +586,8 @@ class DFlashProposer:
                     for layer_name in runner._attn_layer_names
                 }
             else:
-                # Must match `_build_draft_attn_metadata` exactly. torch-tpu's
-                # DEFER_AND_FUSE keys its fused programs on the live dispatch
-                # sequence, so precompiling a different sequence than propose
-                # actually runs emits programs serving never hits and leaves
-                # the real ones to compile on first use — which is what the
-                # spec-decode real warmup then has to pay for.
+                # Must match _build_draft_attn_metadata so warmup compiles the
+                # same dispatch sequence used during live inference.
                 assert self._draft_attn_layer_names is not None, (
                     "load_model() must run before precompile()")
                 per_layer_attn_metadata = (
