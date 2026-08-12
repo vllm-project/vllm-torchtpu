@@ -1024,6 +1024,8 @@ class TestWorkerSideConnector(unittest.TestCase):
 
     def test_fence_syncs_device_and_acks(self):
         conn = self._make_worker_connector()
+        kv_tensors = [MagicMock()]
+        conn._pool_sync_tensors = kv_tensors
         conn._connector_metadata = self._meta(fence_job_ids={7, 8})
 
         sync_calls = []
@@ -1036,11 +1038,25 @@ class TestWorkerSideConnector(unittest.TestCase):
                     "torch_tpu._internal.sync": fake_sync_mod,
                 }):
             sending, recving = conn.get_finished(set())
-        self.assertEqual(len(sync_calls), 1)
-        # No registered pool tensors -> falls back to a full device sync.
-        self.assertEqual(sync_calls[0], ((None, ), {"wait": True}))
+        self.assertEqual(sync_calls, [((kv_tensors, ), {"wait": True})])
         self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
         self.assertEqual((sending, recving), (set(), set()))
+
+    def test_fence_requires_registered_pool_tensors(self):
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(fence_job_ids={7})
+
+        fake_sync_mod = SimpleNamespace(synchronize=MagicMock())
+        with patch.dict(
+                sys.modules, {
+                    "torch_tpu": SimpleNamespace(_internal=None),
+                    "torch_tpu._internal": SimpleNamespace(sync=fake_sync_mod),
+                    "torch_tpu._internal.sync": fake_sync_mod,
+                }):
+            with self.assertRaises(AssertionError):
+                conn.get_finished(set())
+        fake_sync_mod.synchronize.assert_not_called()
+        self.assertEqual(conn._fenced_jobs, {})
 
     def test_fence_scopes_sync_to_registered_pool_tensors(self):
         conn = self._make_worker_connector()
