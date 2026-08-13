@@ -221,42 +221,6 @@ def _use_raiden_stage3_transport() -> bool:
     return str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
 
 
-def _reshard_store_mode() -> bool:
-    """In-engine hosting: the reshard service lives in each engine's rank-0
-    worker (an in-process KVCacheStore), not an external controller."""
-    return str(tpu_envs.TPU_RAIDEN_RESHARD_IMPL).strip().lower() == "store"
-
-
-def _reshard_advertise_host() -> str:
-    host = str(tpu_envs.TPU_RAIDEN_ADVERTISE_HOST).strip()
-    if not host:
-        raise ValueError("TPU_RAIDEN_ADVERTISE_HOST is required when "
-                         "TPU_RAIDEN_RESHARD_IMPL=store")
-    return host
-
-
-def _reshard_service_port(dp_rank: int) -> int:
-    return int(tpu_envs.TPU_RAIDEN_RESHARD_PORT_BASE) + int(dp_rank)
-
-
-def _reshard_service_address(dp_rank: int) -> str:
-    return f"{_reshard_advertise_host()}:{_reshard_service_port(dp_rank)}"
-
-
-def _reshard_dispatch_address(dp_rank: int) -> str:
-    port = int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) + int(dp_rank)
-    return f"{_reshard_advertise_host()}:{port}"
-
-
-def _resolved_reshard_controller_address(dp_rank: int) -> str:
-    """The address the facade dials and the handoff advertises: the
-    per-engine in-process store under store mode, else the role-level
-    external controller from the environment."""
-    if _reshard_store_mode():
-        return _reshard_service_address(dp_rank)
-    return str(tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS).strip()
-
-
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     if _use_raiden_stage3_transport():
         return True
@@ -1119,10 +1083,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"{expected_scheduler_blocks}, num_tokens={num_tokens}, "
                 f"page_tokens={self.block_size}, pcp_size={pcp_size}")
 
-        producer_dp_rank = (self.vllm_config.parallel_config.data_parallel_rank
-                            if self.vllm_config.parallel_config else 0)
-        controller_address = _resolved_reshard_controller_address(
-            producer_dp_rank)
+        controller_address = str(
+            tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS).strip()
         if not controller_address:
             raise ValueError("Stage-3 producer metadata requires "
                              "TPU_RAIDEN_CONTROLLER_ADDRESS")
@@ -1250,8 +1212,6 @@ class TPURaidenConnectorWorker:
         self._raiden_layout_fingerprint_payload: dict[str, Any] | None = None
         self._raiden_controller_facade: Any | None = None
         self._raiden_controller_address: str | None = None
-        # In-engine store hosting: set only on the engine's rank-0 worker.
-        self._reshard_store: Any | None = None
         self._raiden_work_unit: Any | None = None
         # Producer request registrations are retained until Raiden itself
         # reports done_sending. Consumer submissions are keyed by UUID so a
@@ -1370,9 +1330,8 @@ class TPURaidenConnectorWorker:
         stage3_enabled = self._raiden_stage3_enabled()
         controller_address = ""
         if stage3_enabled:
-            self._maybe_host_reshard_store()
-            controller_address = _resolved_reshard_controller_address(
-                self.dp_rank)
+            controller_address = str(
+                tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS).strip()
             if not controller_address:
                 raise ValueError(
                     "TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
@@ -1497,30 +1456,14 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _new_raiden_controller_facade(controller_address: str) -> Any:
-        # The reshard client surface is C++-owned by default —
-        # identical signatures, return shapes, and exception text; the
-        # Python facade remains as the env-gated rollback for one release.
-        if str(tpu_envs.TPU_RAIDEN_CLIENT_IMPL).strip().lower() == "cpp":
-            from tpu_raiden.api.torch.reshard_client import ReshardClient
-
-            return ReshardClient(controller_address)
-        try:
-            from tpu_sync.rpc.raiden_controller import \
-                RaidenControllerClientFacade
-        except ModuleNotFoundError:
-            # tpu-raiden-torch wheels predating the tpu_sync package rename.
-            from tpu_raiden.rpc.raiden_controller import \
-                RaidenControllerClientFacade
+        from tpu_raiden.rpc.raiden_controller import \
+            RaidenControllerClientFacade
 
         return RaidenControllerClientFacade(controller_address)
 
     @staticmethod
     def _new_raiden_id(fields: dict[str, Any]) -> Any:
-        try:
-            from tpu_sync.rpc.raiden_controller import RaidenId
-        except ModuleNotFoundError:
-            # tpu-raiden-torch wheels predating the tpu_sync package rename.
-            from tpu_raiden.rpc.raiden_controller import RaidenId
+        from tpu_raiden.rpc.raiden_controller import RaidenId
 
         return RaidenId(**fields)
 
@@ -1543,41 +1486,6 @@ class TPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
         return int(get_pcp_rank())
-
-    def _maybe_host_reshard_store(self) -> None:
-        """In-engine hosting (zero sidecars): each engine's transfer-rank-0
-        worker owns the in-process reshard store — the framed reshard
-        service plus the dispatch controller its local workers register
-        with. Peer ranks only register into it, with bounded retries."""
-        if not _reshard_store_mode() or self._reshard_store is not None:
-            return
-        if self._local_raiden_transfer_rank() != 0:
-            return
-        from tpu_raiden.api.torch.kv_cache_store import \
-            RaidenId as _StoreRaidenId
-        from tpu_raiden.api.torch.reshard_store import ReshardStore
-
-        default_job = "prefill" if self.is_producer else "decode"
-        job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job
-        self._reshard_store = ReshardStore(
-            raiden_id=_StoreRaidenId(
-                job_name=job_name,
-                job_replica_id=str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip(),
-                data_name="reshard_store",
-                data_replica_idx=self.dp_rank,
-            ),
-            store_server_ip=_reshard_advertise_host(),
-            raiden_controller_port=(
-                int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) +
-                int(self.dp_rank)),
-            raiden_orchestrator_address="",
-            reshard_service_port=_reshard_service_port(self.dp_rank),
-        )
-        logger.info(
-            "TPURaidenConnectorWorker rank%d --> hosting reshard store "
-            "service=%s dispatch=%s", self.tp_rank,
-            _reshard_service_address(self.dp_rank),
-            _reshard_dispatch_address(self.dp_rank))
 
     def _raiden_interleave_tokens(self, page_tokens: int,
                                   transfer_parallelism: int) -> int:
@@ -1662,31 +1570,16 @@ class TPURaidenConnectorWorker:
         unit = self._new_raiden_id(
             self._raiden_work_unit_fields(transfer_rank))
         facade = self._new_raiden_controller_facade(controller_address)
-        # Store mode: the store is brought up by this engine's rank-0
-        # worker in parallel with the peer ranks' init — bounded retry
-        # instead of the sidecar era's launcher-ordered readiness.
-        registration_deadline = time.perf_counter() + (
-            120.0 if _reshard_store_mode() else 0.0)
-        while True:
-            try:
-                facade.register_work_unit(
-                    unit=unit,
-                    shards=[data_address],
-                    control_plane_rpc_address=listener_address,
-                    pool_manifest=manifest.pool_dicts(),
-                    layout_fingerprint=fingerprint,
-                    page_tokens=page_tokens,
-                    transfer_parallelism=transfer_parallelism,
-                    transfer_rank=transfer_rank,
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 — retry-or-reraise
-                if time.perf_counter() >= registration_deadline:
-                    raise
-                logger.info(
-                    "Raiden work-unit registration to %s not accepted yet "
-                    "(%s); retrying", controller_address, exc)
-                time.sleep(0.5)
+        facade.register_work_unit(
+            unit=unit,
+            shards=[data_address],
+            control_plane_rpc_address=listener_address,
+            pool_manifest=manifest.pool_dicts(),
+            layout_fingerprint=fingerprint,
+            page_tokens=page_tokens,
+            transfer_parallelism=transfer_parallelism,
+            transfer_rank=transfer_rank,
+        )
 
         self._raiden_controller_facade = facade
         self._raiden_controller_address = controller_address
@@ -2077,11 +1970,7 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _raiden_hbm_memory_type() -> Any:
-        try:
-            from tpu_sync.rpc.raiden_controller import RaidenMemoryType
-        except ModuleNotFoundError:
-            # tpu-raiden-torch wheels predating the tpu_sync package rename.
-            from tpu_raiden.rpc.raiden_controller import RaidenMemoryType
+        from tpu_raiden.rpc.raiden_controller import RaidenMemoryType
 
         return RaidenMemoryType.HBM
 
@@ -2881,16 +2770,6 @@ class TPURaidenConnectorWorker:
                 listener_port=0,
                 parallelism=self._raiden_transfer_parallelism(),
             )
-            if _reshard_store_mode():
-                # Register this worker with its engine store's dispatch
-                # controller: the reshard coordinator submits transfer
-                # programs over the persistent channel this creates.
-                manager_kwargs.update(
-                    raiden_worker_port=0,
-                    raiden_controller_address=_reshard_dispatch_address(
-                        self.dp_rank),
-                    worker_id=(f"worker_{self._local_raiden_transfer_rank()}"),
-                )
         engine = self._new_raiden_manager(**manager_kwargs)
         logger.info(
             "TPURaidenConnectorWorker rank%d --> Raiden engine enabled | "
