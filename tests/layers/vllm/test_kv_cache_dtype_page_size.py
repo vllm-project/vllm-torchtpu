@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
+from vllm_torchtpu.runner.tpu_runner import _warn_if_kv_cache_is_padded
 
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
@@ -144,8 +145,8 @@ WARNING_PHRASE = "larger than"
 def test_warns_exactly_when_padded(num_kv_heads, head_size, dtype, padded):
     """Including the bf16 cases: what matters is whether HBM is wasted."""
     with captured_warnings() as messages:
-        PallasAttentionBackend.warn_if_kv_cache_is_padded(
-            BLOCK_SIZE, num_kv_heads, head_size, dtype)
+        _warn_if_kv_cache_is_padded(PallasAttentionBackend, BLOCK_SIZE,
+                                    num_kv_heads, head_size, dtype)
     assert any(WARNING_PHRASE in m for m in messages) is padded
 
 

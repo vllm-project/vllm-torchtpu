@@ -8,6 +8,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -50,7 +51,7 @@ from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
@@ -311,6 +312,38 @@ def _torch_tpu_wrapper():
                     delattr(torch.cuda, k)
             else:
                 setattr(torch.cuda, k, v)
+
+
+def _warn_if_kv_cache_is_padded(
+    backend: type[AttentionBackend],
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+) -> None:
+    """Warn when a page costs more than its shape and dtype imply.
+
+    The baseline is one key and one value vector per head per token. Layouts
+    exceed it by rounding the packing dimension up to a 32-bit word and
+    head_size up to a 128-lane register; either wastes HBM.
+
+    Read through `get_kv_cache_shape` so any backend works, but MLA has no
+    per-head key and value and so is not described by this baseline.
+    """
+    page_shape = backend.get_kv_cache_shape(1, block_size, num_kv_heads,
+                                            head_size, dtype)
+    actual = math.prod(page_shape) * dtype.itemsize
+    unpadded = block_size * 2 * num_kv_heads * head_size * dtype.itemsize
+    if actual == unpadded:
+        return
+    logger.warning_once(
+        "KV cache pages are %.2fx larger than num_kv_heads=%d at "
+        "head_size=%d with dtype %s requires: the %s layout pads head_size to "
+        "a whole 128-lane register and the K/V vectors to a whole 32-bit word, "
+        "so HBM use exceeds a shape-and-dtype estimate. Where head_size is a "
+        "multiple of 128, lowering tensor parallelism (more KV heads per rank) "
+        "or enabling attention data parallelism avoids it.", actual / unpadded,
+        num_kv_heads, head_size, dtype, backend.get_name())
 
 
 # Recompilation-avoidance contract:
@@ -987,14 +1020,6 @@ class TPUModelRunner(GPUModelRunner):
         hma_enabled = (
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
 
-        # Local import: the platform module imports from the package root, so
-        # importing it at module scope here is circular.
-        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-
-        # Hoisted: the lookup walks every attention layer. Validated at the
-        # point of use.
-        padding_backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
-
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
@@ -1050,14 +1075,10 @@ class TPUModelRunner(GPUModelRunner):
                             "will fall back to global attention for long context."
                         )
                     # The layout can pad a page past what its shape and dtype
-                    # imply, with no other signal that it did.
-                    if not (isinstance(padding_backend, type) and issubclass(
-                            padding_backend, PallasAttentionBackend)):
-                        raise ValueError(
-                            f"Decoder attention layer {layer_name} resolved to "
-                            f"backend {padding_backend}, which has no Pallas "
-                            "KV cache page size to measure padding against.")
-                    padding_backend.warn_if_kv_cache_is_padded(
+                    # imply, with no other signal that it did. Take the backend
+                    # off this layer so it always matches the dimensions below.
+                    _warn_if_kv_cache_is_padded(
+                        attn_module.get_attn_backend(),
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,

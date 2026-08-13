@@ -35,10 +35,23 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
+from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+
+def _attention_layer_mock():
+    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
+
+    `get_kv_cache_spec` measures page padding through the backend the layer
+    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
+    and silently makes that arithmetic meaningless.
+    """
+    layer = MagicMock(spec=Attention)
+    layer.get_attn_backend.return_value = PallasAttentionBackend
+    return layer
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
@@ -532,7 +545,7 @@ class TestTPURunner:
                                            mock_get_page_size):
         layers = {}
         for i in range(1):
-            mock_attn = MagicMock(spec=Attention)
+            mock_attn = _attention_layer_mock()
             mock_attn.num_kv_heads = 2
             mock_attn.head_size = 128
             layers[f'attn_{i}'] = mock_attn
@@ -574,7 +587,7 @@ class TestTPURunner:
         to the uniform layout, which pads every block to the mamba page and
         silently shrinks the block pool ~50x."""
         layers = {}
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
         layers['attn_0'] = mock_attn
@@ -604,7 +617,7 @@ class TestTPURunner:
         self.runner.vllm_config.kv_transfer_config = kv_tc
 
         layers = {}
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
         layers['attn_0'] = mock_attn
@@ -819,7 +832,7 @@ class TestTPURunner:
                                                   mock_get_layers):
         layers = {}
 
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.attn_type = AttentionType.DECODER
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
@@ -886,7 +899,7 @@ class TestTPURunner:
         return_value=4096)
     def test_get_kv_cache_spec_pure_attention_no_cache_config_updates(
             self, mock_get_page_size, mock_get_layers):
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.attn_type = AttentionType.DECODER
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
@@ -907,7 +920,7 @@ class TestTPURunner:
         return_value=4096)
     def test_get_kv_cache_spec_records_shared_layers(self, mock_get_page_size,
                                                      mock_get_layers):
-        owner = MagicMock(spec=Attention)
+        owner = _attention_layer_mock()
         owner.attn_type = AttentionType.DECODER
         owner.num_kv_heads = 2
         owner.head_size = 128
@@ -915,7 +928,7 @@ class TestTPURunner:
         owner.sliding_window = None
         owner.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
-        shared = MagicMock(spec=Attention)
+        shared = _attention_layer_mock()
         shared.attn_type = AttentionType.DECODER
         shared.num_kv_heads = 2
         shared.head_size = 128
@@ -934,14 +947,14 @@ class TestTPURunner:
         assert self.runner.shared_kv_cache_layers == {"layer.1": "layer.0"}
 
     def _make_shared_pair(self, attn_window, target_window):
-        attn = MagicMock(spec=Attention)
+        attn = _attention_layer_mock()
         attn.attn_type = AttentionType.DECODER
         attn.num_kv_heads = 2
         attn.head_size = 128
         attn.sliding_window = attn_window
         attn.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
-        target = MagicMock(spec=Attention)
+        target = _attention_layer_mock()
         target.attn_type = AttentionType.DECODER
         target.num_kv_heads = 2
         target.head_size = 128
@@ -989,7 +1002,7 @@ class TestTPURunner:
                               target_quant,
                               attn_scale=1.0,
                               target_scale=1.0):
-        attn = MagicMock(spec=Attention)
+        attn = _attention_layer_mock()
         attn.attn_type = AttentionType.DECODER
         attn.num_kv_heads = 2
         attn.head_size = 128
@@ -998,7 +1011,7 @@ class TestTPURunner:
         attn._v_scale_float = attn_scale
         attn.impl = MagicMock(kv_cache_quantized_dtype=attn_quant)
 
-        target = MagicMock(spec=Attention)
+        target = _attention_layer_mock()
         target.attn_type = AttentionType.DECODER
         target.num_kv_heads = 2
         target.head_size = 128

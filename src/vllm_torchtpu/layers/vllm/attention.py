@@ -393,40 +393,6 @@ class PallasAttentionBackend(AttentionBackend):
     ) -> None:
         raise RuntimeError("swap_blocks is not used for the TPU backend.")
 
-    @classmethod
-    def warn_if_kv_cache_is_padded(
-        cls,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype: str | torch.dtype,
-    ) -> None:
-        """Warn when a page costs more than its shape and dtype imply.
-
-        `get_kv_cache_shape` rounds the packing dimension up to a whole 32-bit
-        word and head_size up to a whole 128-lane register; either wastes HBM.
-        Comparing against a key and a value vector per head per token needs no
-        hd64 special case, because folding K and V along head_dim moves values
-        without changing how many there are.
-
-        Resolved through `cls` so a subclass that overrides the page size is
-        measured against its own layout, not this one's.
-        """
-        dtype = _resolve_kv_cache_dtype(cache_dtype)
-        unpadded = block_size * 2 * num_kv_heads * head_size * dtype.itemsize
-        actual = cls.get_kv_cache_page_size_bytes(block_size, num_kv_heads,
-                                                  head_size, dtype)
-        if actual == unpadded:
-            return
-        logger.warning_once(
-            "KV cache pages are %.2fx larger than num_kv_heads=%d at "
-            "head_size=%d with dtype %s requires: the Pallas layout pads "
-            "head_size to a whole 128-lane register and the K/V vectors to a "
-            "whole 32-bit word, so HBM use exceeds a shape-and-dtype estimate. "
-            "Where head_size is a multiple of 128, lowering tensor parallelism "
-            "(more KV heads per rank) or enabling attention data parallelism "
-            "avoids it.", actual / unpadded, num_kv_heads, head_size, dtype)
-
     # In recent TPU generations, up to v6e, the SMEM size is 1MB. The
     # block_tables within the PallasMetadata constitute almost the entire SMEM
     # requirement. Its size is max_num_seqs * num_page_per_seq * 4 (Int). Here
