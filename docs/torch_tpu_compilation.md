@@ -24,9 +24,9 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
 ### `VLLM_XLA_CHECK_RECOMPILATION` (Runtime Recompilation Detector)
 
 - **Default**: `0` (Disabled)
-- **Purpose**: Detects unexpected on-the-fly JIT recompilations during serving (decode / speculative steps) caused by unbucketed input shapes.
-- **How It Works**: Snapshots compiled graph count after AOT warmup, then checks for increases on each forward step. Logs an alert whenever new graphs are created.
+- **Purpose**: Detects unexpected compilation during serving — such as an input shape, dtype, or code path that AOT warmup never precompiled and that stalls the engine loop on a cache miss.
+- **How It Works**: Queries `torch.tpu._get_cache_stats()` and advances the cached graph count watermark at each checkpoint (including every AOT precompile bucket and runtime forward step), logging newly compiled graphs whenever a cache miss occurs.
 - **Overhead**: `0` (zero runtime overhead) vs `1` (queries cache stats and logs per step).
 - **Recommendation**:
-  - `1`: Enable in CI and test pipelines to catch shape coverage leaks.
+  - `1`: Enable in CI and test pipelines to catch compilation leaks and un-warmed code paths.
   - `0`: Keep disabled in production and benchmarking for maximum throughput.
