@@ -118,12 +118,51 @@ def _collect_rank_to_device_id(group: Any, global_rank: int,
     return rank_to_device_id
 
 
+def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ...]:
+    """Derive topologically ordered ranks for the current PCP group."""
+    pcp_size = int(group.world_size)
+    if pcp_size <= 1:
+        return (global_rank, )
+
+    try:
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+        )
+
+        tp_size = int(get_tensor_model_parallel_world_size())
+    except Exception:
+        tp_size = 1
+
+    try:
+        import torch_tpu  # noqa: F401
+
+        if hasattr(torch, "tpu") and hasattr(torch.tpu, "topology_aware_mesh"):
+            mesh_shape = (pcp_size, tp_size) if tp_size > 1 else (pcp_size, )
+            topo_tensor = torch.tpu.topology_aware_mesh(
+                mesh_shape=mesh_shape,
+                topology="single_slice",
+                contiguous_submeshes=True,
+            )
+            if tp_size > 1:
+                rank_coords = (topo_tensor == global_rank).nonzero(
+                    as_tuple=False)
+                if len(rank_coords) > 0:
+                    tp_coord = int(rank_coords[0][1].item())
+                    return tuple(
+                        int(r.item()) for r in topo_tensor[:, tp_coord])
+            else:
+                return tuple(int(r.item()) for r in topo_tensor.flatten())
+    except Exception:
+        pass
+
+    return tuple(int(rank) for rank in group.ranks)
+
+
 def get_pcp_group_layout() -> PcpGroupLayout:
     """Return the current PCP group's rank order and TPU device-id order.
 
-    The order of ``device_ids`` mirrors ``get_pcp_group().ranks``. This is the
-    order a PCP Pallas mesh should use so TP+PCP layouts form one PCP ring per
-    TP lane.
+    The order of ``device_ids`` uses ``torch.tpu.topology_aware_mesh`` when
+    available so TP+PCP layouts form physical 1-hop PCP rings per TP lane.
     """
 
     group = get_pcp_group()
@@ -137,8 +176,9 @@ def get_pcp_group_layout() -> PcpGroupLayout:
             world_size=1,
         )
 
-    ranks = tuple(int(rank) for rank in group.ranks)
-    rank_in_group = int(group.rank_in_group)
+    ranks = _get_topology_aware_pcp_ranks(group, global_rank)
+    rank_in_group = (ranks.index(global_rank)
+                     if global_rank in ranks else int(group.rank_in_group))
     cache_key = (global_rank, ranks, rank_in_group, device_id)
     cached = _LAYOUT_CACHE.get(cache_key)
     if cached is not None:
@@ -162,15 +202,19 @@ def get_pcp_group_layout() -> PcpGroupLayout:
     return layout
 
 
-def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
-    """Build a JAX mesh ordered by the current vLLM PCP group.
+def get_or_create_pcp_mesh(
+    axis_name: str = "pcp",
+    axis_names: tuple[str, ...] | None = None,
+) -> Any:
+    """Build a JAX mesh ordered by the topology-aware vLLM PCP group.
 
     This helper is intentionally op-local: it does not replace the runner's
     normal single-device model mesh.
     """
 
     layout = get_pcp_group_layout()
-    cache_key = (axis_name, layout.device_ids)
+    mesh_axis_names = axis_names if axis_names is not None else (axis_name, )
+    cache_key = (str(mesh_axis_names), layout.device_ids)
     cached = _MESH_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -195,6 +239,6 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
 
     mesh_devices = np.asarray(
         [devices_by_id[device_id] for device_id in layout.device_ids])
-    mesh = Mesh(mesh_devices, axis_names=(axis_name, ))
+    mesh = Mesh(mesh_devices, axis_names=mesh_axis_names)
     _MESH_CACHE[cache_key] = mesh
     return mesh
