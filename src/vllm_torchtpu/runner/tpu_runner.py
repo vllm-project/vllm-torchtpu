@@ -3500,6 +3500,12 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
                     "TPU yet.")
+            if grammar_output is not None:
+                # TODO(haotianx): remove this when structured output is support in
+                # spec decoding path.
+                raise NotImplementedError(
+                    "Structured outputs with speculative decoding is not "
+                    "supported on TPU yet.")
             # Per-chunk device rejection outputs, kept for the async-spec
             # producer below.
             next_tokens_per_chunk: list[torch.Tensor] = []
