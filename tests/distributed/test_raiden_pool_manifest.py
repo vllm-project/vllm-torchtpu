@@ -11,10 +11,9 @@ import types
 
 import pytest
 
-from vllm_torchtpu.distributed.kv_transfer.v2 import \
-    raiden_pool_manifest as rpm
+from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .tpu_connector_v2_test_utils import FakeTensor
+from .raiden_test_utils import FakeTensor
 
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):

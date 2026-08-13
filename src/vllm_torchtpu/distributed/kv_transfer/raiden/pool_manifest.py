@@ -34,7 +34,7 @@ from typing import Any, Mapping, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .common import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
+from .tags import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"

@@ -9,9 +9,9 @@ legacy segment-major vocabulary (whose per-segment extents are already
 token multiples at that degree).
 """
 
-from vllm_torchtpu.distributed.kv_transfer.v2.pool_byte_spans import (
+from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan, lower_gdn_state_shard_spans)
-from vllm_torchtpu.distributed.kv_transfer.v2.raiden_pool_manifest import \
+from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
     RegionSpec
 
 # Qwen3.5-35B TP8 shard, QK pair-blocked: one 1024-byte QK token plus one

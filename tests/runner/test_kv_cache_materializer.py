@@ -6,8 +6,7 @@ from vllm.v1.kv_cache_interface import (EncoderOnlyAttentionSpec,
                                         MambaSpec)
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_torchtpu.distributed.kv_transfer.v2 import \
-    raiden_pool_manifest as rpm
+from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
     format_kv_cache_layout_summary, materialize_kv_cache_tensors)
 

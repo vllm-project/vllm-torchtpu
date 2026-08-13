@@ -17,7 +17,7 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .raiden_pool_manifest import TAG_FA, PoolManifest
+from .pool_manifest import TAG_FA, PoolManifest
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))

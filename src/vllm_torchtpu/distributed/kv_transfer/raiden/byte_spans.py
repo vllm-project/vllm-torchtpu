@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Sequence
 
-from .common import TAG_GDN_CONV, TAG_GDN_SSM
+from .tags import TAG_GDN_CONV, TAG_GDN_SSM
 
 # Physical granule of the admitted raw TPU FP8 pool layout: byte ranges
 # whose offsets and sizes are whole multiples of this are placement-exact

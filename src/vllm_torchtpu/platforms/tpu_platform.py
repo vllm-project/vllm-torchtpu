@@ -952,10 +952,8 @@ class TpuPlatform(Platform):
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
-                "TPUConnectorV2",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "TPUConnectorHMA",
                 "OffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
@@ -964,10 +962,6 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
-            if (kv_transfer_config.kv_connector == "TPUConnectorV2"
-                    and not unified_kv_layout_enabled(vllm_config)):
-                raise ValueError("TPUConnectorV2 requires "
-                                 "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
                                     == "OffloadingConnector" and is_hybrid)
             if (is_hybrid_offloading

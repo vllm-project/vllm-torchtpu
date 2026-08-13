@@ -360,20 +360,6 @@ class TestTpuPlatform:
 
         TpuPlatform.check_and_update_config(vllm_config)
 
-    @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
-    @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
-    )
-    def test_check_and_update_config_accepts_v2_connector_with_unified_pool(
-            self, mock_prepare_env, mock_apply_patches, vllm_config):
-        vllm_config.kv_transfer_config = MagicMock()
-        vllm_config.kv_transfer_config.kv_connector = "TPUConnectorV2"
-        vllm_config.cache_config.block_size = 16
-        vllm_config.cache_config.cache_dtype = "auto"
-
-        TpuPlatform.check_and_update_config(vllm_config)
-
     @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
         [
