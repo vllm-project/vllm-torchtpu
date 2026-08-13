@@ -17,6 +17,11 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
                       "false")
 
+# vLLM 0.27.0 auto-enables breakable cudagraph for Kimi K3, disabling its
+# torch.compile pipeline. TPU does not support CUDA graphs and requires that
+# pipeline, so force the flag off before VllmConfig initialization.
+os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
+
 # Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
 # transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
 # skips per-allocation DMA mapping on multi-process v7x workers

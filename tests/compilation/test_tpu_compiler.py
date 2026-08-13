@@ -207,6 +207,14 @@ class TestTpuCompilerCache:
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
 
+    def test_env_override_disables_breakable_cudagraph(self):
+        """Verify that the TPU plugin always disables breakable cudagraph."""
+        with patch.dict(os.environ, {"VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}):
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
+
     def test_env_override_no_clobber(self):
         """Verify that existing native variables are not overwritten by env_override."""
         env_mock = {

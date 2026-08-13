@@ -1223,6 +1223,8 @@ class TPURaidenConnectorWorker:
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
         self._stage3_load_start_times: dict[str, float] = {}
+        self._legacy_registered_sends: set[str] = set()
+        self._legacy_submitted_loads: set[str] = set()
         # Consumer-side facades for the producers' controllers, keyed by
         # controller address: the consumer coordinates each load with the
         # SOURCE controller directly (it plans, arms this worker, and
@@ -1271,6 +1273,7 @@ class TPURaidenConnectorWorker:
         self._load_block_ids: dict[str, list[int]] = {}
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
+        self.transfer_stats = TpuKVConnectorStats()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
@@ -1278,6 +1281,23 @@ class TPURaidenConnectorWorker:
             self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.tp_rank == 0:
+            if self.is_producer:
+                prefill_queue_len = (len(self._stage3_registered_sends)
+                                     if self._raiden_stage3_enabled() else len(
+                                         self._legacy_registered_sends))
+                self.transfer_stats.record_prefill_queue_length(
+                    prefill_queue_len)
+            else:
+                decode_queue_len = (len(self._stage3_submitted_loads) -
+                                    len(self._stage3_terminal_loads)
+                                    if self._raiden_stage3_enabled() else len(
+                                        self._legacy_submitted_loads))
+                self.transfer_stats.record_decode_queue_length(
+                    decode_queue_len)
+
+        if not self.transfer_stats.is_empty():
+            return self.transfer_stats.clone_and_reset()
         return None
 
     def register_runner(self, runner: TPUModelRunner) -> None:
@@ -1682,6 +1702,7 @@ class TPURaidenConnectorWorker:
             for req_id, req_meta in metadata.reqs_to_send.items():
                 engine.register_read(req_id, req_meta.uuid,
                                      req_meta.local_block_ids)
+                self._legacy_registered_sends.add(str(req_id))
                 logger.debug(
                     "TPURaidenConnectorWorker rank%d --> registered send "
                     "req_id=%s uuid=%s blocks=%d", self.tp_rank, req_id,
@@ -1732,6 +1753,7 @@ class TPURaidenConnectorWorker:
                 "local_blocks=%d", self.tp_rank, req_id, req_meta.uuid,
                 endpoint, len(remote_blocks), len(local_blocks))
             submitted_loads.add(req_id)
+            self._legacy_submitted_loads.add(str(req_id))
             self._load_block_ids[req_id] = list(local_blocks)
         if wait_for_completion:
             self._wait_for_recving(submitted_loads)
@@ -2455,6 +2477,16 @@ class TPURaidenConnectorWorker:
         done_sending, done_recving, failed_recving = engine.poll_stats()
         sender_failures: set[str] = set()
         cancelled_sends: set[str] = set()
+        if self.is_producer and not self._raiden_stage3_enabled():
+            for req_id in done_sending:
+                self._legacy_registered_sends.discard(str(req_id))
+            for req_id in failed_recving:
+                self._legacy_registered_sends.discard(str(req_id))
+        elif not self.is_producer and not self._raiden_stage3_enabled():
+            for req_id in done_recving:
+                self._legacy_submitted_loads.discard(str(req_id))
+            for req_id in failed_recving:
+                self._legacy_submitted_loads.discard(str(req_id))
         if self.is_producer and self._raiden_stage3_enabled():
             # The native manager's third tuple is named failed_recving for
             # historical pull semantics, but ReshardPush sender failures are

@@ -16,7 +16,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc, MambaStateCopyFuncCalculator,
-    MambaStateDtypeCalculator, MambaStateShapeCalculator)
+    MambaStateDtypeCalculator)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
@@ -281,16 +281,16 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
         config: KimiLinearConfig = vllm_config.model_config.hf_text_config
         kda_config = config.linear_attn_config
         assert kda_config is not None
-        return MambaStateShapeCalculator.kda_state_shape(
-            vllm_config.parallel_config.tensor_parallel_size,
-            kda_config["num_heads"],
-            kda_config["head_dim"],
-            conv_kernel_size=kda_config["short_conv_kernel_size"],
-            num_spec=0,
+        local_heads = (kda_config["num_heads"] //
+                       vllm_config.parallel_config.tensor_parallel_size)
+        return (
+            (kda_config["short_conv_kernel_size"] - 1, 3, local_heads,
+             kda_config["head_dim"]),
+            (local_heads, kda_config["head_dim"], kda_config["head_dim"]),
         )
 
     @classmethod

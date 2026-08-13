@@ -228,6 +228,48 @@ class TPUWorker(WorkerBase):
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
             else:
+                # Dense DP has no cross-rank collective, so each replica
+                # should bootstrap its own isolated torch_tpu slice instead
+                # of sharing check_and_update_config's full DP*TP-wide one
+                # (RANK/WORLD_SIZE above are already replica-local via
+                # binding.as_env()). Narrow the inherited full-slice
+                # TORCH_TPU_SLICEBUILDER_ADDRESSES down to just this
+                # replica's own per_engine_world workers -- narrowing
+                # (rather than each worker picking fresh ports
+                # independently) keeps the address list agreed upon by
+                # every worker in this replica, since it's sliced
+                # deterministically out of the same parent-established list
+                # every sibling worker also inherited.
+                full_sb_addresses = os.environ.get(
+                    "TORCH_TPU_SLICEBUILDER_ADDRESSES", "")
+                sb_addresses = full_sb_addresses.split(
+                    ",") if full_sb_addresses else []
+                start = dp_rank * per_engine_world
+                my_sb_addresses = sb_addresses[start:start + per_engine_world]
+                if len(my_sb_addresses) == per_engine_world:
+                    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+                        my_sb_addresses)
+                else:
+                    logger.warning(
+                        "Expected %d slicebuilder addresses for dp_rank=%d "
+                        "at offset %d, found %d in inherited list %r; "
+                        "leaving TORCH_TPU_SLICEBUILDER_ADDRESSES as-is.",
+                        per_engine_world, dp_rank, start, len(my_sb_addresses),
+                        full_sb_addresses)
+                from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+                os.environ["TORCH_TPU_TOPOLOGY"] = \
+                    TpuPlatform._get_tpu_topology(per_engine_world)
+                # Request this worker's own physical chip explicitly,
+                # instead of relying on the flattened-rank chip binding EP
+                # uses, so independent replicas don't contend for the same
+                # chips. Both TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES must
+                # be set -- TorchTPU only honors the chip pin under the
+                # RANK/WORLD_SIZE distributed bootstrap when both agree.
+                os.environ["TPU_VISIBLE_CHIPS"] = str(
+                    binding.native_local_rank)
+                os.environ["TPU_VISIBLE_DEVICES"] = str(
+                    binding.native_local_rank)
+                os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
@@ -474,9 +516,10 @@ class TPUWorker(WorkerBase):
                 logger.warning(
                     "Profiler is already running. Ignoring start request.")
                 return
-            profile_dir = self.profile_dir
-            if profile_prefix:
-                profile_dir = os.path.join(profile_dir, profile_prefix)
+            from vllm_torchtpu.tracing.options import \
+                resolve_profile_dir_and_opts
+            profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
+                self.profile_dir, profile_prefix)
             os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own
             # sandbox under a run directory they agree on; stop merges them.
@@ -496,9 +539,10 @@ class TPUWorker(WorkerBase):
                 dir_name=self.profile_capture_dir, use_gzip=True)
             config = TpuProfilerConfig(
                 run_dir=self.profile_capture_dir,
-                host_tracer_level=2,
-                device_tracer_level=1,
-                python_tracer_level=1,
+                host_tracer_level=standard_opts["host_tracer_level"],
+                device_tracer_level=standard_opts["device_tracer_level"],
+                python_tracer_level=standard_opts["python_tracer_level"],
+                experimental_options=advanced_opts,
             )
             self.profile_context = torch.profiler.profile(
                 activities=[

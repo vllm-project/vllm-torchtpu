@@ -18,13 +18,13 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateDtypeCalculator, MambaStateShapeCalculator,
-    is_conv_state_dim_first)
+    MambaStateDtypeCalculator, is_conv_state_dim_first)
 from vllm.model_executor.layers.mla import (MLAModules,
                                             MultiHeadLatentAttentionWrapper)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, sharded_weight_loader)
+from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -106,12 +106,12 @@ class MixedParallelMergedLinear(MergedColumnParallelLinear):
             disable_tp=True,
         )
 
-    def weight_loader(
+    def _slice_loaded_weight(
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
+    ) -> torch.Tensor:
         if (isinstance(loaded_shard_id, int)
                 and not self.replicate_outputs[loaded_shard_id]):
             output_dim = getattr(param, "output_dim", None)
@@ -129,7 +129,33 @@ class MixedParallelMergedLinear(MergedColumnParallelLinear):
                     self.mixed_tp_rank * shard_size,
                     shard_size,
                 )
+        return loaded_weight
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        loaded_weight = self._slice_loaded_weight(
+            param,
+            loaded_weight,
+            loaded_shard_id,
+        )
         super().weight_loader(param, loaded_weight, loaded_shard_id)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        loaded_weight = self._slice_loaded_weight(
+            param,
+            loaded_weight,
+            loaded_shard_id,
+        )
+        super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
 
 
 class MultiHeadLatentAttention(nn.Module):
@@ -397,6 +423,17 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                                               self.conv_size)
         self.v_conv1d = CausalDepthwiseConv1d(self.projection_size,
                                               self.conv_size)
+        # Both convolution consumers take one fused weight in the kernels'
+        # [kernel_size, 3, heads, head_dim] layout;
+        # `process_weights_after_loading` folds the checkpoint's three tensors
+        # into it at load time. Non-persistent:
+        # it is derived from q/k/v_conv1d.weight, not a checkpoint entry of its
+        # own, and must not appear in a state dict.
+        self.register_buffer(
+            "conv_weight_fused",
+            torch.empty(self.conv_size, 3, self.num_heads, self.head_dim),
+            persistent=False,
+        )
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
             self.projection_size,
@@ -473,12 +510,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.kda_state_shape(
-            self.tp_size,
-            self.total_heads,
-            self.head_dim,
-            conv_kernel_size=self.conv_size,
-            num_spec=0,
+        # Keep the KDA short-convolution cache in the Pallas DMA layout.
+        return (
+            (self.conv_size - 1, 3, self.num_heads, self.head_dim),
+            (self.num_heads, self.head_dim, self.head_dim),
         )
 
     def _metadata(self) -> AttentionMetadata | None:
@@ -491,6 +526,30 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if not isinstance(layer_metadata, AttentionMetadata):
             raise TypeError("KDA received incompatible attention metadata")
         return layer_metadata
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Fold the three depthwise conv weights into the kernels' layout.
+
+        The checkpoint keeps q/k/v as separate ``[dim, 1, kernel_size]``
+        tensors, and the ops used to concatenate and transpose them on every
+        step. Both convolution consumers want ``[kernel_size, 3, heads,
+        head_dim]``, so build that once, here, at load time.
+        """
+        fused = torch.stack(
+            tuple(w[:, 0, :].t().reshape(self.conv_size, self.num_heads,
+                                         self.head_dim)
+                  for w in (self.q_conv1d.weight, self.k_conv1d.weight,
+                            self.v_conv1d.weight)),
+            dim=1,
+        )
+        # `fused` is the lazy result of a stack of views, and torch_tpu
+        # re-materializes that lineage as a per-step `tt_jit_as_strided`
+        # program at the dispatched op's boundary (same failure mode and fix as
+        # the w_scale case in quantization/fp8.py). A fresh buffer filled by
+        # copy_ breaks the lazy chain so PJRT ships a plain row-major buffer.
+        out = torch.empty_like(fused)
+        out.copy_(fused)
+        self.conv_weight_fused = out
 
     def forward(
         self,
@@ -571,9 +630,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             mixed_qkv = self.sconv_op(
                 mixed_qkv,
                 sconv_cache,
-                self.q_conv1d.weight,
-                self.k_conv1d.weight,
-                self.v_conv1d.weight,
+                self.conv_weight_fused,
                 metadata.query_start_loc,
                 metadata.mamba_state_indices,
                 metadata.seq_lens,
@@ -599,9 +656,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output_gate,
             sconv_cache,
             recurrent_cache,
-            self.q_conv1d.weight,
-            self.k_conv1d.weight,
-            self.v_conv1d.weight,
+            self.conv_weight_fused,
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,

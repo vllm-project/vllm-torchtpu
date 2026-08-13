@@ -326,6 +326,7 @@ def apply_tpu_patches() -> None:
                                _patch_moe_explicit_pcp_collectives,
                                _patch_moe_no_ep_tp_scope,
                                _patch_rowparallel_defer_bias,
+                               _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
                                _patch_vllm_hybrid_producer_prefix_hits,
                                _patch_vllm_tpu_group_custom_ops)
@@ -344,6 +345,7 @@ def apply_tpu_patches() -> None:
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
     _patch_vllm_disable_compile_ranges()
+    _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
@@ -601,7 +603,8 @@ class TpuPlatform(Platform):
     _is_hybrid: bool = False
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4",
+        "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
     additional_env_vars: list[str] = [
@@ -885,11 +888,6 @@ class TpuPlatform(Platform):
                     ensure_pcp_local_rank_remap(
                         parallel_config.world_size_across_dp,
                         get_topology=cls._get_tpu_topology)
-                # Single-host DP uses one torch_tpu slice across all DP*TP
-                # workers; the worker spawn shim exposes a DP-adjusted chip
-                # ordinal to TorchTPU for physical binding.
-                cls.device_control_env_var = \
-                    "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
@@ -902,7 +900,14 @@ class TpuPlatform(Platform):
                     parallel_config.data_parallel_master_ip or "localhost")
                 os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT",
                                       str(portpicker.pick_unused_port()))
-                # Full-slice slicebuilder list + topology (TP*PP*DP), once.
+                if parallel_config.enable_expert_parallel:
+                    # EP's expert-combine collective genuinely spans every
+                    # DP*TP worker, so torch_tpu needs one shared slice
+                    # across all of them; the worker spawn shim exposes a
+                    # DP-adjusted chip ordinal to TorchTPU for physical
+                    # binding.
+                    cls.device_control_env_var = \
+                        "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                 cls._prepare_singlehost_tpu_env(
                     parallel_config.world_size_across_dp)
             else:
@@ -1025,11 +1030,25 @@ class TpuPlatform(Platform):
         if backend_cls is None:
             return
 
-        is_hybrid = vllm_config.model_config.is_hybrid
-        if not is_hybrid and not cache_config.user_specified_block_size:
-            default = backend_cls.get_page_size(vllm_config)
+        architectures = getattr(
+            getattr(vllm_config.model_config, "hf_config", None),
+            "architectures", None) or []
+        is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+
+        if is_ds_v4 and not cache_config.user_specified_block_size:
+            # DSv4 pages hold compressed rows. Its backend's
+            # get_preferred_block_size is a hardcoded 256, which does not fit
+            # the packed latent record, so take the MLA page size directly.
+            from vllm_torchtpu.layers.vllm.attention import \
+                PallasMLAttentionBackend
             cache_config.block_size = (  # type: ignore[assignment]
-                backend_cls.get_preferred_block_size(default))
+                PallasMLAttentionBackend.get_page_size(vllm_config))
+        else:
+            is_hybrid = vllm_config.model_config.is_hybrid
+            if not is_hybrid and not cache_config.user_specified_block_size:
+                default = backend_cls.get_page_size(vllm_config)
+                cache_config.block_size = (  # type: ignore[assignment]
+                    backend_cls.get_preferred_block_size(default))
         if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 

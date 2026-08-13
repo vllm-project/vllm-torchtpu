@@ -469,8 +469,10 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
     assert layer.mla_attn.mla_modules.gate_is_fused is True
 
 
+@pytest.mark.parametrize("use_parameter_hook", [False, True],
+                         ids=["legacy-loader", "v2-parameter-hook"])
 def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, use_parameter_hook: bool) -> None:
     import vllm.model_executor.parameter as parameter_module
 
     monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
@@ -493,8 +495,10 @@ def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
     replicated_weight = torch.arange(6, dtype=layer.weight.dtype).view(3,
                                                                        2) + 100
 
-    layer.weight_loader(layer.weight, column_weight, 0)
-    layer.weight_loader(layer.weight, replicated_weight, 1)
+    loader = (layer.weight.weight_loader
+              if use_parameter_hook else layer.weight_loader)
+    loader(layer.weight, column_weight, 0)
+    loader(layer.weight, replicated_weight, 1)
 
     expected = torch.cat((column_weight[2:], replicated_weight), dim=0)
     torch.testing.assert_close(layer.weight, expected)
@@ -544,6 +548,10 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.q_conv1d = _ConvWeight()
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
+    # The ops take the fused conv weight, built once at load time.
+    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -607,9 +615,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
                 output_gate: torch.Tensor,
                 conv_state: torch.Tensor,
                 recurrent_state: torch.Tensor,
-                q_weight: torch.Tensor,
-                k_weight: torch.Tensor,
-                v_weight: torch.Tensor,
+                conv_weight: torch.Tensor,
                 a_log: torch.Tensor,
                 dt_bias: torch.Tensor,
                 norm_weight: torch.Tensor,
@@ -619,7 +625,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
                 distribution: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
-                del q_weight, k_weight, v_weight, distribution
+                del conv_weight, distribution
                 del query_start_loc, state_indices, seq_lens
                 num_heads, head_dim = recurrent_state.shape[1:3]
                 output = mixed_qkv[:, :num_heads * head_dim]
@@ -631,14 +637,12 @@ def test_kda_custom_ops_compile_as_one_full_graph(
             def implementation(
                 mixed_qkv: torch.Tensor,
                 conv_state: torch.Tensor,
-                q_weight: torch.Tensor,
-                k_weight: torch.Tensor,
-                v_weight: torch.Tensor,
+                conv_weight: torch.Tensor,
                 query_start_loc: torch.Tensor,
                 state_indices: torch.Tensor,
                 seq_lens: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor]:
-                del q_weight, k_weight, v_weight
+                del conv_weight
                 del query_start_loc, state_indices, seq_lens
                 return conv_state + 1, mixed_qkv.clone()
 
@@ -682,6 +686,10 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.q_conv1d = _ConvWeight()
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
+    # The ops take the fused conv weight, built once at load time.
+    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))

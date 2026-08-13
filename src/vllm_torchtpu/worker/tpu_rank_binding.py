@@ -465,7 +465,7 @@ def get_tpu_worker_binding(
 
     rank = int(rank)
     local_rank = int(local_rank)
-    if dp_size > 1:
+    if dp_size > 1 and parallel_config.enable_expert_parallel:
         dp_rank = parallel_config.data_parallel_index
         assert dp_rank is not None, (
             "ParallelConfig.data_parallel_index must be resolved when "
@@ -511,7 +511,8 @@ def get_tpu_worker_binding(
             pcp_remap_source=source,
         )
 
-    native_local_rank = local_rank
+    dp_rank = parallel_config.data_parallel_index or 0
+    native_local_rank = dp_rank * world_size + local_rank
     if pcp_size > 1 and use_spawned_pcp_local_rank:
         tpu_local_rank, remap, source = _get_spawned_pcp_local_rank(
             env=env,
@@ -520,7 +521,7 @@ def get_tpu_worker_binding(
         )
     else:
         tpu_local_rank, remap, source = get_pcp_worker_local_rank_env(
-            native_local_rank, world_size, pcp_size)
+            local_rank, world_size, pcp_size)
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,
@@ -530,7 +531,8 @@ def get_tpu_worker_binding(
         init_world_size=world_size,
         init_local_rank=tpu_local_rank,
         native_local_rank=native_local_rank,
-        dp_size=1,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
         local_rank_offset=local_rank_offset,
         pcp_local_rank_remap=remap,
         pcp_remap_source=source,

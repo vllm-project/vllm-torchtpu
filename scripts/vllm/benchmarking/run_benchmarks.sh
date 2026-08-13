@@ -12,7 +12,7 @@
 #
 # Available configs (in scripts/vllm/benchmarking/configs/):
 #   qwen3-coder-480b-fp8-tp8-ep  - Nightly target (TP=8, EP, FP8)
-#   qwen3-coder-30b-tp8-ep       - Guard: Qwen3-Coder-30B-A3B-Instruct (TP=8, EP)
+#   qwen3-coder-30b-tp8-ep       - Nightly: Qwen3-Coder-30B-A3B-Instruct (TP=8, EP)
 #   qwen3-coder-30b-fp8-tp8-ep   - Guard: Qwen3-Coder-30B-A3B-Instruct-FP8 (TP=8, EP)
 #
 # Profiler capture (diagnostic only):
