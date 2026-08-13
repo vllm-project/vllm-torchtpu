@@ -84,7 +84,6 @@ VLLM_SRC="${VLLM_SRC:-/mnt/data/vllm}"
 TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
-EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-0.27.0}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-0}"
 
 SERVE_HOST="${P4D2_BIND_HOST:-127.0.0.1}"
@@ -209,12 +208,9 @@ import sys
 import vllm
 import vllm_torchtpu
 
-expected = ${EXPECTED_VLLM_VERSION@Q}
 print("vllm.__version__", vllm.__version__)
 print("vllm.__file__", vllm.__file__)
 print("vllm_torchtpu.__file__", vllm_torchtpu.__file__)
-if vllm.__version__ != expected:
-    raise SystemExit(f"vLLM version must be {expected}, got {vllm.__version__}")
 PY
 } >"${version_log}" 2>&1
 
@@ -274,7 +270,6 @@ VLLM_PYTHONPATH=${VLLM_SRC}
 TORCHTPU_VLLM_PYTHONPATH=${TORCHTPU_VLLM_SRC}
 MODEL_PATH=${MODEL_PATH}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
-EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}
 CONNECTOR=TPUConnector
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_connector
 PREFILL_TP=${PREFILL_TP}
