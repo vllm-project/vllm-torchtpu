@@ -15,6 +15,9 @@
 
 from types import SimpleNamespace
 
+import numpy
+import pytest
+
 from vllm_torchtpu.distributed import pcp_rank_order as order_mod
 
 
@@ -32,45 +35,7 @@ def _config(**kwargs):
     )
 
 
-# --- expected_groups / mesh_group_orders / match_groups --------------------
-
-
-def test_expected_groups_mirrors_vllms_arange_layout():
-    """tp varies fastest, then pcp: the layout parallel_state builds."""
-    got = order_mod.expected_groups(1, 1, 4, 2)
-
-    assert sorted(sorted(g) for g in got["tp"]) == [[0, 1], [2, 3], [4, 5],
-                                                    [6, 7]]
-    assert sorted(sorted(g) for g in got["pcp"]) == [[0, 2, 4, 6],
-                                                     [1, 3, 5, 7]]
-
-
-def test_mesh_group_orders_slices_both_axes():
-    """mesh[d,:,t] is a PCP ring; mesh[d,p,:] is a TP lane."""
-    import numpy as np
-
-    mesh = np.array([[[0, 1], [6, 7], [4, 5], [2, 3]]])
-
-    got = order_mod.mesh_group_orders(mesh, 1, 4, 2)
-
-    assert got["pcp"] == [[0, 6, 4, 2], [1, 7, 5, 3]]
-    assert got["tp"] == [[0, 1], [6, 7], [4, 5], [2, 3]]
-
-
-def test_match_groups_pairs_rows_by_membership():
-    groups = [[0, 2, 4, 6], [1, 3, 5, 7]]
-    rows = [[1, 7, 5, 3], [0, 6, 4, 2]]
-
-    assert order_mod.match_groups(groups, rows) == [[0, 6, 4, 2], [1, 7, 5, 3]]
-
-
-def test_match_groups_rejects_a_different_split():
-    groups = [[0, 2, 4, 6], [1, 3, 5, 7]]
-
-    assert order_mod.match_groups(groups, [[0, 1, 2, 3], [4, 5, 6, 7]]) is None
-
-
-# --- resolve_pcp_topology_order -------------------------------------------
+# --- resolve_pcp_topology_order: not applicable -> None --------------------
 
 
 def test_no_order_when_pcp_is_disabled():
@@ -78,56 +43,74 @@ def test_no_order_when_pcp_is_disabled():
 
 
 def test_no_order_when_a_kv_transfer_config_is_present():
-    """Scoped off for P/D.
+    """P/D recomputes prefill ranks from pcp_rank arithmetic."""
+    config = _config(kv_transfer_config=SimpleNamespace())
 
-    The reshard planner derives the prefill rank as pcp_rank*tp_size+tp_rank
-    and Raiden names work units from the same composite, so reordering would
-    silently mis-address transfers rather than fail.
-    """
-    cfg = _config(kv_transfer_config=SimpleNamespace())
-
-    assert order_mod.resolve_pcp_topology_order(cfg) is None
-
-
-def test_no_order_on_multihost(monkeypatch):
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "ray")
-
-    assert order_mod.resolve_pcp_topology_order(_config()) is None
+    assert order_mod.resolve_pcp_topology_order(config) is None
 
 
 def test_no_order_when_multiple_nodes(monkeypatch):
-    """A ring crossing hosts would need multi-slice ordering over DCN."""
+    """A ring crossing hosts needs multi-slice ordering over DCN."""
     monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
 
     assert order_mod.resolve_pcp_topology_order(_config(nnodes=2)) is None
 
 
-def test_abandons_both_axes_when_the_mesh_regroups(monkeypatch):
-    """A mesh that splits ranks differently must not be applied at all.
+# --- resolve_pcp_topology_order: faults raise ------------------------------
 
-    vLLM builds TP before PCP, so accepting one axis and rejecting the other
-    would leave TP on the arange layout while PCP follows the mesh -- the
-    split that desynchronises TP partners.
-    """
-    import numpy as np
+
+def test_raises_when_pipeline_parallelism_is_present(monkeypatch):
+    """PcpStaticSupportValidator rejects this before workers spawn."""
+    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
+
+    with pytest.raises(RuntimeError, match="pipeline_parallel_size"):
+        order_mod.resolve_pcp_topology_order(_config(pp=2))
+
+
+def test_raises_when_data_parallel_replicas_are_present(monkeypatch):
+    """dp>1 here means EP, whose replicas never share a torch world."""
+    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
+
+    with pytest.raises(RuntimeError, match="data_parallel_size"):
+        order_mod.resolve_pcp_topology_order(_config(dp=2))
+
+
+def test_propagates_the_error_when_the_mesh_call_fails(monkeypatch):
+    """A missing API or dead process group must not be papered over."""
     import torch
 
-    # tp lanes paired across chips instead of within one
-    mesh = np.array([[[0, 2], [6, 4], [1, 3], [7, 5]]])
+    def _boom(_shape):
+        raise RuntimeError("topology_aware_mesh exploded")
+
+    monkeypatch.setattr(torch.tpu, "topology_aware_mesh", _boom, raising=False)
+    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
+
+    with pytest.raises(RuntimeError, match="exploded"):
+        order_mod.resolve_pcp_topology_order(_config())
+
+
+def test_raises_when_the_mesh_is_not_a_permutation(monkeypatch):
+    """A duplicated rank would silently drop a worker from the groups."""
+    import torch
+
+    mesh = numpy.array([0, 1, 2, 3, 4, 5, 6, 6]).reshape(1, 8, 1)
     monkeypatch.setattr(torch.tpu,
                         "topology_aware_mesh",
                         lambda _shape: mesh,
                         raising=False)
     monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
 
-    assert order_mod.resolve_pcp_topology_order(_config(pcp=4, tp=2)) is None
+    with pytest.raises(RuntimeError, match="not a permutation"):
+        order_mod.resolve_pcp_topology_order(_config())
 
 
-def test_returns_both_axes_for_a_matching_mesh(monkeypatch):
-    import numpy as np
+# --- resolve_pcp_topology_order: the supported path ------------------------
+
+
+def test_returns_both_axes_from_one_mesh(monkeypatch):
     import torch
 
-    mesh = np.array([[[0, 1], [6, 7], [4, 5], [2, 3]]])
+    mesh = numpy.array([[[0, 1], [6, 7], [4, 5], [2, 3]]])
     monkeypatch.setattr(torch.tpu,
                         "topology_aware_mesh",
                         lambda _shape: mesh,
@@ -140,40 +123,31 @@ def test_returns_both_axes_for_a_matching_mesh(monkeypatch):
         "pcp": [[0, 6, 4, 2], [1, 7, 5, 3]],
         "tp": [[0, 1], [6, 7], [4, 5], [2, 3]],
     }
+    assert set(got) == {"pcp", "tp"}, "keys must be vLLM group_name values"
+
+    # The invariant the whole change rests on: a TP lane all-reduces partial
+    # attention outputs, which is only meaningful if its members hold the same
+    # tokens -- that is, the same pcp position. Slicing both axes from one
+    # mesh is what guarantees it.
+    pcp_of = {r: i for ring in got["pcp"] for i, r in enumerate(ring)}
+    for lane in got["tp"]:
+        assert len({pcp_of[r] for r in lane}) == 1
 
 
-def test_falls_back_to_none_when_the_mesh_call_raises(monkeypatch):
-    """A failed mesh call costs a few hops; it must not fail startup."""
+def test_matches_the_order_measured_on_hardware(monkeypatch):
+    """pcp=8 tp=1, job j-64748dc1 on a v7 2x2x1 host."""
     import torch
 
-    def _boom(_shape):
-        raise RuntimeError("no PjRtClient")
-
-    monkeypatch.setattr(torch.tpu, "topology_aware_mesh", _boom, raising=False)
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
-    assert order_mod.resolve_pcp_topology_order(_config()) is None
-
-
-def test_rejects_a_result_that_is_not_a_permutation(monkeypatch):
-    """Applying a partial mapping would place two ranks on one ring slot."""
-    import torch
-
-    class _Fake:
-
-        def flatten(self):
-            return self
-
-        def tolist(self):
-            return [0, 1, 2, 3, 4, 5, 6, 6]
-
+    mesh = numpy.array([0, 1, 6, 7, 4, 5, 2, 3]).reshape(1, 8, 1)
     monkeypatch.setattr(torch.tpu,
                         "topology_aware_mesh",
-                        lambda _shape: _Fake(),
+                        lambda _shape: mesh,
                         raising=False)
     monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
 
-    assert order_mod.resolve_pcp_topology_order(_config()) is None
+    got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
+
+    assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]
 
 
 # --- pcp_topology_order ----------------------------------------------------
@@ -214,9 +188,68 @@ def test_context_manager_restores_the_original_function():
     assert parallel_state.init_model_parallel_group is before
 
 
-def test_context_manager_is_inert_without_orders():
+def test_context_manager_changes_no_group_without_orders():
+    """Without orders the patch still installs, but replaces nothing.
+
+    It is installed so that vLLM's own grouping is still logged, which is
+    what a topology run gets diffed against.
+    """
     from vllm.distributed import parallel_state
 
+    seen = {}
     before = parallel_state.init_model_parallel_group
-    with order_mod.pcp_topology_order(None):
-        assert parallel_state.init_model_parallel_group is before
+
+    def _record(group_ranks, local_rank, backend, **kwargs):
+        seen[kwargs.get("group_name")] = [list(g) for g in group_ranks]
+        return None
+
+    parallel_state.init_model_parallel_group = _record
+    try:
+        with order_mod.pcp_topology_order(None):
+            parallel_state.init_model_parallel_group(
+                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp")
+            parallel_state.init_model_parallel_group([[0, 1], [2, 3]],
+                                                     0,
+                                                     "gloo",
+                                                     group_name="tp")
+        # Restored even though nothing was replaced.
+        assert parallel_state.init_model_parallel_group is _record
+    finally:
+        parallel_state.init_model_parallel_group = before
+
+    assert seen["pcp"] == [[0, 1, 2, 3, 4, 5, 6, 7]]
+    assert seen["tp"] == [[0, 1], [2, 3]]
+
+
+def test_context_manager_replaces_both_axes():
+    """pcp and tp are applied together -- that is what keeps them coherent."""
+    from vllm.distributed import parallel_state
+
+    seen = {}
+    original = parallel_state.init_model_parallel_group
+
+    def _record(group_ranks, local_rank, backend, **kwargs):
+        seen[kwargs.get("group_name")] = [list(g) for g in group_ranks]
+        return None
+
+    orders = {
+        "pcp": [[0, 6, 4, 2], [1, 7, 5, 3]],
+        "tp": [[0, 1], [6, 7], [4, 5], [2, 3]],
+    }
+    parallel_state.init_model_parallel_group = _record
+    try:
+        with order_mod.pcp_topology_order(orders):
+            parallel_state.init_model_parallel_group(
+                [[0, 2, 4, 6], [1, 3, 5, 7]], 0, "gloo", group_name="pcp")
+            parallel_state.init_model_parallel_group(
+                [[0, 1], [2, 3], [4, 5], [6, 7]], 0, "gloo", group_name="tp")
+            parallel_state.init_model_parallel_group([[0]],
+                                                     0,
+                                                     "gloo",
+                                                     group_name="dp")
+    finally:
+        parallel_state.init_model_parallel_group = original
+
+    assert seen["pcp"] == orders["pcp"]
+    assert seen["tp"] == orders["tp"]
+    assert seen["dp"] == [[0]]

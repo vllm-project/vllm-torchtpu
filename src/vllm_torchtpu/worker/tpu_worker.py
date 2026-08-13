@@ -382,9 +382,9 @@ class TPUWorker(WorkerBase):
         # below. topology_aware_mesh needs open chips and a live process
         # group, so this is the first point it can be asked -- and the last
         # point the answer can still be applied.
-        pcp_order = resolve_pcp_topology_order(self.vllm_config)
+        group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
         with set_current_vllm_config(self.vllm_config), \
-                pcp_topology_order(pcp_order):
+                pcp_topology_order(group_ranks_by_name):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.
                 tensor_parallel_size,
