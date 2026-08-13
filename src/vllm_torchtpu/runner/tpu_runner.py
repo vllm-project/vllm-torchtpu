@@ -961,24 +961,6 @@ class TPUModelRunner(GPUModelRunner):
             num_windowed = partition(num_decode, num_reqs - 1, 1)
         return num_decode, num_windowed
 
-    def _resolve_attention_backend(self) -> type[PallasAttentionBackend]:
-        """The backend whose page size padding should be measured against.
-
-        Subclasses may override the page size, so a hardcoded base class would
-        misreport as soon as one diverges. Falls back when the model registers
-        a backend outside this hierarchy; MLA and the indexer take their own
-        paths and never reach the warning.
-        """
-        # Local import: the platform module imports from the package root, so
-        # importing it at module scope here is circular.
-        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
-        if isinstance(backend_cls, type) and issubclass(
-                backend_cls, PallasAttentionBackend):
-            return backend_cls
-        return PallasAttentionBackend
-
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
         Generates the KVCacheSpec by parsing the kv cache format from each
@@ -1005,10 +987,13 @@ class TPUModelRunner(GPUModelRunner):
         hma_enabled = (
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
 
-        # Hoisted: the lookup walks every attention layer, so calling it once
-        # per layer below would be quadratic. It reports one backend for the
-        # whole model, which is what padding is measured against.
-        padding_backend = self._resolve_attention_backend()
+        # Local import: the platform module imports from the package root, so
+        # importing it at module scope here is circular.
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        # Hoisted: the lookup walks every attention layer. Validated at the
+        # point of use.
+        padding_backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
@@ -1066,6 +1051,12 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     # The layout can pad a page past what its shape and dtype
                     # imply, with no other signal that it did.
+                    if not (isinstance(padding_backend, type) and issubclass(
+                            padding_backend, PallasAttentionBackend)):
+                        raise ValueError(
+                            f"Decoder attention layer {layer_name} resolved to "
+                            f"backend {padding_backend}, which has no Pallas "
+                            "KV cache page size to measure padding against.")
                     padding_backend.warn_if_kv_cache_is_padded(
                         block_size,
                         attn_module.num_kv_heads,
