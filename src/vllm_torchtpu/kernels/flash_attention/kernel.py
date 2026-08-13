@@ -134,7 +134,9 @@ def flash_attention(
     if block_sizes is None:
         block_sizes = BlockSizes.get_default(batch_size, num_heads, q_seq_len,
                                              kv_seq_len, d_model)
-        # TODO (KWang1998 & hfan): tune the block sizes properly.
+        # TODO: Port the flash-attention kernel tuner and tuned-parameter
+        # lookup from:
+        # https://github.com/vllm-project/tpu-inference/commit/24c67fa778d040fe7cd7bd6bbbee00327c0876b9
         if kv_seq_len <= 21760:
             # Override block_k/block_k_major to use `_flash_attention_kernel_single_batch_single_step`.
             block_sizes = BlockSizes(block_q=block_sizes.block_q,
