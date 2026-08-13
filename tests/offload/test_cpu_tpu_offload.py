@@ -1043,7 +1043,7 @@ class TestOffloadingConnectorSpecPatch(unittest.TestCase):
         build.assert_called_once_with(vllm_config, kv_cache_config)
         spec_cls.assert_called_once_with(offloading_config, vllm_config,
                                          kv_cache_config)
-        worker_cls.assert_called_once_with(spec, kv_cache_config)
+        worker_cls.assert_called_once_with(spec, vllm_config, kv_cache_config)
         self.assertIs(connector.connector_worker, worker)
         self.assertIsNone(connector.connector_scheduler)
 
