@@ -284,6 +284,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return _localize_gdn_mamba_spec_for_pcp(spec,
                                                 _get_pcp_size(vllm_config))
 
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
+        # TODO: Support bf16 conv state
+        conv_state_dtype = torch.float32
+        return conv_state_dtype, temporal_state_dtype
+
+    def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        conv_state_shape, temporal_state_shape = super().get_state_shape()
+        conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
+        return conv_state_shape, temporal_state_shape
+
     @staticmethod
     def _pcp_streaming_enabled() -> bool:
         vllm_context = get_vllm_model_wrapper_context()
