@@ -81,7 +81,7 @@ benchmarking = [
     "scikit-learn",
     "pandas",
     "lm-eval[api]==0.5.0.dev1",
-    "evalscope",
+    "evalscope==1.10.0",
     # Stream gs:// checkpoints via --load-format runai_streamer (multihost
     # v7x-16 hosts have no disk for an HF download).
     "runai-model-streamer[gcs]",

@@ -12,4 +12,4 @@ GPU_MEMORY_UTILIZATION=0.90
 ATTENTION_BACKEND="CUSTOM"
 EVAL_TOLERANCE="0.02"
 export VLLM_ENGINE_READY_TIMEOUT_S=1800
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size=256 --max-num-seqs=512 --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0,\"audio\":0} --hf-overrides {\"architectures\":[\"Gemma4ForCausalLM\"]}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size=256 --max-num-seqs=512 --mm-processor-kwargs {\"size\":{\"longest_edge\":262144,\"shortest_edge\":3136}} --disable-chunked-mm-input --additional_config {\"mm-encoder-tp-mode\":\"data\"} --compilation-config {\"cudagraph_mm_encoder\":true}"
