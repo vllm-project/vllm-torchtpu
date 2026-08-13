@@ -49,28 +49,22 @@ def test_no_order_when_a_kv_transfer_config_is_present():
     assert order_mod.resolve_pcp_topology_order(config) is None
 
 
-def test_no_order_when_multiple_nodes(monkeypatch):
+def test_no_order_when_multiple_nodes():
     """A ring crossing hosts needs multi-slice ordering over DCN."""
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
     assert order_mod.resolve_pcp_topology_order(_config(nnodes=2)) is None
 
 
 # --- resolve_pcp_topology_order: faults raise ------------------------------
 
 
-def test_raises_when_pipeline_parallelism_is_present(monkeypatch):
+def test_raises_when_pipeline_parallelism_is_present():
     """PcpStaticSupportValidator rejects this before workers spawn."""
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
     with pytest.raises(RuntimeError, match="pipeline_parallel_size"):
         order_mod.resolve_pcp_topology_order(_config(pp=2))
 
 
-def test_raises_when_data_parallel_replicas_are_present(monkeypatch):
+def test_raises_when_data_parallel_replicas_are_present():
     """dp>1 here means EP, whose replicas never share a torch world."""
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
     with pytest.raises(RuntimeError, match="data_parallel_size"):
         order_mod.resolve_pcp_topology_order(_config(dp=2))
 
@@ -83,8 +77,6 @@ def test_propagates_the_error_when_the_mesh_call_fails(monkeypatch):
         raise RuntimeError("topology_aware_mesh exploded")
 
     monkeypatch.setattr(torch.tpu, "topology_aware_mesh", _boom, raising=False)
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
     with pytest.raises(RuntimeError, match="exploded"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -98,8 +90,6 @@ def test_raises_when_the_mesh_is_not_a_permutation(monkeypatch):
                         "topology_aware_mesh",
                         lambda _shape: mesh,
                         raising=False)
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
     with pytest.raises(RuntimeError, match="not a permutation"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -115,8 +105,6 @@ def test_returns_both_axes_from_one_mesh(monkeypatch):
                         "topology_aware_mesh",
                         lambda _shape: mesh,
                         raising=False)
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
     got = order_mod.resolve_pcp_topology_order(_config(pcp=4, tp=2))
 
     assert got == {
@@ -143,8 +131,6 @@ def test_matches_the_order_measured_on_hardware(monkeypatch):
                         "topology_aware_mesh",
                         lambda _shape: mesh,
                         raising=False)
-    monkeypatch.setattr(order_mod.envs, "TPU_MULTIHOST_BACKEND", "")
-
     got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
 
     assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]
