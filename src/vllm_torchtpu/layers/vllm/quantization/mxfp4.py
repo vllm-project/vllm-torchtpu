@@ -45,7 +45,6 @@ scaling.
    - Returns output tensor
 """
 
-import types
 from typing import Any, Optional
 
 import jax.numpy as jnp
@@ -308,56 +307,6 @@ REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
                           if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512)
 
 
-def _dsv4_weight_loader(self,
-                        param,
-                        loaded_weight,
-                        weight_name,
-                        shard_id,
-                        expert_id,
-                        return_success=False):
-    """Staging weight loader for DeepSeek-V4 split checkpoints.
-
-    DeepSeek-V4 checkpoints store w1/w3/w2 as separate tensors, whereas vLLM
-    allocates fused w13/w2 parameters. This loader stages raw w1/w3/w2 shards
-    into w1_temp/w3_temp/w2_temp buffers per layer instance so they can be
-    concatenated, re-quantized to native FP4, and padded in process_weights_after_loading.
-    """
-    orig_tp_rank = self.moe_config.moe_parallel_config.tp_rank
-    self.moe_config.moe_parallel_config.tp_rank = 0
-    try:
-        if shard_id not in ("w1", "w3", "w2") or "scale" in weight_name:
-            return RoutedExperts.weight_loader(self, param, loaded_weight,
-                                               weight_name, shard_id,
-                                               expert_id, return_success)
-
-        temp_param, shard_dim = {
-            "w1": (self.w1_temp, 0),
-            "w3": (self.w3_temp, 0),
-            "w2": (self.w2_temp, 1),
-        }[shard_id]
-
-        experts_start = moe_routing.get_experts_start(self) or 0
-        local_expert_id = expert_id - experts_start
-        num_local_experts = temp_param.shape[0]
-        if local_expert_id < 0 or local_expert_id >= num_local_experts:
-            return True if return_success else None
-
-        expert_data = temp_param.data[local_expert_id]
-        if loaded_weight.ndim > 0:
-            shard_size = expert_data.shape[shard_dim]
-            narrow_size = min(shard_size, loaded_weight.shape[shard_dim])
-            if narrow_size > 0:
-                loaded_weight = loaded_weight.narrow(shard_dim, 0, narrow_size)
-                if expert_data.shape[shard_dim] > loaded_weight.shape[
-                        shard_dim]:
-                    expert_data = expert_data.narrow(
-                        shard_dim, 0, loaded_weight.shape[shard_dim])
-                expert_data.copy_(loaded_weight)
-        return True if return_success else None
-    finally:
-        self.moe_config.moe_parallel_config.tp_rank = orig_tp_rank
-
-
 # TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
@@ -382,22 +331,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             params_dtype,
             **extra_weight_attrs,
         )
-        layer.w1_temp = torch.zeros(num_experts,
-                                    intermediate_size_per_partition,
-                                    hidden_size // 2,
-                                    dtype=torch.uint8,
-                                    device="cpu")
-        layer.w3_temp = torch.zeros(num_experts,
-                                    intermediate_size_per_partition,
-                                    hidden_size // 2,
-                                    dtype=torch.uint8,
-                                    device="cpu")
-        layer.w2_temp = torch.zeros(num_experts,
-                                    hidden_size,
-                                    intermediate_size_per_partition // 2,
-                                    dtype=torch.uint8,
-                                    device="cpu")
-        layer.weight_loader = types.MethodType(_dsv4_weight_loader, layer)
 
     def _dequantize_and_pad(
         self,
@@ -411,15 +344,22 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             "cpu")[:, self.intermediate_size:, :]
         w2_scale = layer.w2_weight_scale.data.to("cpu")
 
-        w1_dequant = dequantize_mxfp4_packed(layer.w1_temp.data.to("cpu"),
+        # w13 packs w1|w3 as contiguous halves along dim 1, matching how the
+        # scales are sliced above.
+        w13_packed = layer.w13_weight.data.to("cpu")
+        w2_packed = layer.w2_weight.data.to("cpu")
+        w1_packed = w13_packed[:, :self.intermediate_size, :]
+        w3_packed = w13_packed[:, self.intermediate_size:, :]
+
+        w1_dequant = dequantize_mxfp4_packed(w1_packed,
                                              w1_scale,
                                              axis=2,
                                              out_dtype=torch.bfloat16)
-        w3_dequant = dequantize_mxfp4_packed(layer.w3_temp.data.to("cpu"),
+        w3_dequant = dequantize_mxfp4_packed(w3_packed,
                                              w3_scale,
                                              axis=2,
                                              out_dtype=torch.bfloat16)
-        w2_dequant = dequantize_mxfp4_packed(layer.w2_temp.data.to("cpu"),
+        w2_dequant = dequantize_mxfp4_packed(w2_packed,
                                              w2_scale,
                                              axis=2,
                                              out_dtype=torch.bfloat16)
@@ -488,8 +428,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         return (w13_weight_processed, w2_weight_processed, w13_weight_scale,
                 w2_weight_scale)
 
-    def _cleanup_temp_buffers(self, layer: RoutedExperts):
-        del layer.w1_temp, layer.w3_temp, layer.w2_temp
+    def _release_source_weights(self, layer: RoutedExperts):
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale, layer.w2_weight_scale
         if hasattr(layer, "w13_bias") and hasattr(layer, "w2_bias"):
@@ -511,7 +450,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         (w13_weight_processed, w2_weight_processed, w13_weight_scale,
          w2_weight_scale) = self._requantize_native_fp4(
              w13_weight_padded, w2_weight_padded, orig_intermediate, device)
-        self._cleanup_temp_buffers(layer)
+        self._release_source_weights(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
                                               requires_grad=False)

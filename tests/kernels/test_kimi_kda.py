@@ -128,7 +128,7 @@ def test_kda_step_matches_independent_torch_reference(
 def test_kimi_short_conv_scan_resets_each_new_sequence() -> None:
     x = jnp.asarray([[1, 2], [3, 4], [5, 6]], dtype=jnp.bfloat16)
     state = jnp.zeros((2, 2, 2), dtype=jnp.bfloat16)
-    weight = jnp.ones((2, 1, 3), dtype=jnp.bfloat16)
+    weight = jnp.ones((3, 2), dtype=jnp.bfloat16)
 
     output, new_state = kimi_short_conv_scan(
         x,

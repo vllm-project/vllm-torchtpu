@@ -315,6 +315,71 @@ def _patch_vllm_disable_compile_ranges() -> None:
                 "compile_sizes only).")
 
 
+def _patch_vllm_compile_all_ranges() -> None:
+    """Patch vllm compile all ranges to support compilation rotation.
+
+    Compilation rotation allows vllm to compile multiple sizes at the same time,
+    which greatly reduce the vllm startup time.
+    """
+    import os
+    from collections import deque
+
+    from vllm.compilation.piecewise_backend import (PiecewiseBackend,
+                                                    create_concrete_args,
+                                                    get_fake_args_from_graph)
+
+    def compile_all_ranges(self) -> None:
+        """Compile all range entries for this piecewise subgraph up front."""
+        assert self.graph is not None, (
+            "Cannot compile without a graph. "
+            "When loading from cache/AOT artifacts, "
+            "compile_all_ranges should not be called.")
+
+        local_rank = int(os.environ["LOCAL_RANK"])
+        range_entry_list = list(self.range_entries.values())
+
+        range_entry_len = len(range_entry_list)
+
+        expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
+        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
+        d.rotate(-local_rank * (len(d) // 8))
+        indexes = list(d)
+
+        for i in indexes:
+            if i >= len(range_entry_list):
+                continue
+
+            range_entry = range_entry_list[i]
+
+            if range_entry.compiled:
+                continue
+
+            self._log_compile_start(range_entry.compile_range)
+
+            if range_entry.compile_range.is_single_size():
+                args_list = create_concrete_args(
+                    self.graph, range_entry.compile_range.start)
+            else:
+                args_list = get_fake_args_from_graph(self.graph)
+
+            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                self.graph,
+                args_list,
+                self.vllm_backend.inductor_config,
+                self.compilation_config,
+                compile_range=range_entry.compile_range,
+                graph_index=self.piecewise_compile_index,
+                num_graphs=self.total_piecewise_compiles,
+                is_encoder=self.vllm_backend.is_encoder,
+            )
+
+            range_entry.compiled = True
+
+    if envs.TPU_PARALLEL_PRECOMPILE:
+        PiecewiseBackend.compile_all_ranges = compile_all_ranges
+        logger.info("Applied TPU patch: compile_all_ranges.")
+
+
 def _patch_rowparallel_defer_bias() -> None:
     """Defer RowParallelLinear bias past the TP all-reduce on TPU.
 
@@ -926,6 +991,7 @@ if "proxy" in envs.JAX_PLATFORMS:
         import vllm
         from vllm.platforms import (resolve_current_platform_cls_qualname,
                                     resolve_obj_by_qualname)
+
         pathwaysutils.initialize()
         logger.info("Module pathwaysutils is imported.")
 

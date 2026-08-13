@@ -18,6 +18,7 @@ steps:
     steps:
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
+        skip: "Temporarily disabled pending Raiden in-engine migration (#435)"
         agents:
           queue: "tpu_v7x_8_queue"
         env:

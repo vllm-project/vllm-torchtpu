@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_PARALLEL_PRECOMPILE: bool = False
 
 
 def env_with_choices(
@@ -312,6 +313,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Enable pre-compile rotation to speed up the startup time.
+    "TPU_PARALLEL_PRECOMPILE":
+    env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
 }
 
 
