@@ -54,6 +54,8 @@ from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import \
     TpuKVConnectorStats
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.utils import trim_request_id_suffix
 
 logger = init_logger(__name__)
 
@@ -865,6 +867,30 @@ class ZmqShmKvConnectorBase:
     # =========================================================
     def _coord_rank0_handle_new_send(self, req_id: ReqId,
                                      req_meta: SendMeta) -> None:
+        expected_bytes = 0
+        if self._coord_pool and self._coord_pool.spec.layer_shard_shape:
+            shape = self._coord_pool.spec.layer_shard_shape
+            actual_shape = (self._blocks_token(
+                req_meta.local_block_ids), ) + tuple(shape[1:])
+            dim_str = str(actual_shape)
+            dtype = self._coord_pool.spec.dtype
+            element_size = dtype.itemsize if hasattr(dtype, 'itemsize') else 2
+            n = 1
+            for d in actual_shape:
+                n *= d
+            expected_bytes = n * element_size * self._coord_pool.spec.num_layers
+        else:
+            dim_str = "v1_pull"
+
+        with TraceAnnotation("KV_Cache_Await_Pull",
+                             uuid=req_meta.uuid,
+                             request_id=trim_request_id_suffix(str(req_id)),
+                             bytes=expected_bytes,
+                             dimensions=dim_str):
+            self._coord_rank0_handle_new_send_inner(req_id, req_meta)
+
+    def _coord_rank0_handle_new_send_inner(self, req_id: ReqId,
+                                           req_meta: SendMeta) -> None:
         """Allocate a slot, broadcast the assignment to non-zero ranks, and
         stage rank 0's own shard inline on the main thread.
 
@@ -1406,12 +1432,36 @@ class ZmqShmKvConnectorBase:
             results: list[tuple[int, int, float, float, list[int],
                                 Optional[zmq.Frame]]] = []
             first_error: Optional[BaseException] = None
-            for fut in futures:
-                try:
-                    results.append(fut.result())
-                except BaseException as e:
-                    if first_error is None:
-                        first_error = e
+
+            expected_bytes = 0
+            if self._coord_pool and self._coord_pool.spec.layer_shard_shape:
+                shape = self._coord_pool.spec.layer_shard_shape
+                actual_shape = (entry.num_blocks, ) + tuple(shape[1:])
+                dim_str = str(actual_shape)
+                dtype = self._coord_pool.spec.dtype
+                element_size = dtype.itemsize if hasattr(dtype,
+                                                         'itemsize') else 2
+
+                n = 1
+                for d in actual_shape:
+                    n *= d
+                expected_bytes = n * element_size * self._coord_pool.spec.num_layers
+            else:
+                dim_str = "v1_pull"
+
+            with TraceAnnotation("KV_Cache_Pull",
+                                 uuid=entry.uuid,
+                                 request_id=trim_request_id_suffix(
+                                     str(entry.req_id)),
+                                 bytes=expected_bytes,
+                                 dimensions=dim_str,
+                                 source=f"hosts:{num_hosts}_ch:{n_channels}"):
+                for fut in futures:
+                    try:
+                        results.append(fut.result())
+                    except BaseException as e:
+                        if first_error is None:
+                            first_error = e
             # All channel futures have returned or timed out before we mark
             # the request failed and release its shm slot. Otherwise a late
             # successful channel from a failed pull can unpack into a slot

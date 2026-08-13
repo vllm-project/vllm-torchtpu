@@ -25,6 +25,8 @@ from vllm_torchtpu.distributed.kv_transfer.v2.strided_bridge import \
 from vllm_torchtpu.distributed.kv_transfer.v2.strided_transfer import (
     RegisteredMemoryRegion, RemoteWorkerMetadata, StridedKVTransferEngine)
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.utils import trim_request_id_suffix
 
 from . import zmq_side_channel
 from .common import LayerType, TensorLayout, head_range, linear_rank
@@ -2308,6 +2310,19 @@ class TPUConnectorV2Worker:
             self._register_v2_send_lifecycle(req_id, req_meta)
 
     def _register_v2_send_lifecycle(self, req_id: Any, req_meta: Any) -> None:
+        uuid_str = self._metadata_value(req_meta, "uuid")
+
+        # We don't have the fully unpacked kv blocks here cleanly in v2 natively formatted
+        # but we can safely annotate strided
+        with TraceAnnotation("KV_Cache_Await_Pull",
+                             uuid=int(uuid_str) if uuid_str is not None else 0,
+                             request_id=trim_request_id_suffix(str(req_id)),
+                             bytes=0,
+                             dimensions="strided"):
+            self._register_v2_send_lifecycle_inner(req_id, req_meta)
+
+    def _register_v2_send_lifecycle_inner(self, req_id: Any,
+                                          req_meta: Any) -> None:
         uuid = self._metadata_value(req_meta, "uuid")
         if uuid is None:
             raise RuntimeError("TPUConnectorV2 send metadata requires uuid")
@@ -2418,12 +2433,23 @@ class TPUConnectorV2Worker:
         self._request_v2_pull_start(req_meta)
         write_session = self.new_destination_write_session()
         try:
+            uuid_int = self._require_strided_uuid(req_meta)
             for remote_tp_rank in sorted(rank_ops):
-                copied += self.pull_rank_ops_into_session(
-                    remote_tp_rank=remote_tp_rank,
-                    ops=rank_ops[remote_tp_rank],
-                    write_session=write_session,
-                    dp_rank=dp_rank)
+                ops = rank_ops[remote_tp_rank]
+                expected_bytes = sum(op.segment_bytes * op.num_segments
+                                     for op in ops)
+                with TraceAnnotation("KV_Cache_Pull",
+                                     uuid=uuid_int,
+                                     request_id=trim_request_id_suffix(
+                                         str(req_id)),
+                                     bytes=expected_bytes,
+                                     dimensions="strided",
+                                     source=f"tp_rank:{remote_tp_rank}"):
+                    copied += self.pull_rank_ops_into_session(
+                        remote_tp_rank=remote_tp_rank,
+                        ops=ops,
+                        write_session=write_session,
+                        dp_rank=dp_rank)
             write_session.flush_all()
         except Exception:
             write_session.discard()
