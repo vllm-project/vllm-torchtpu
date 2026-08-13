@@ -109,17 +109,20 @@ def resolve_pcp_topology_order(
             f"PcpStaticSupportValidator should have rejected PCP "
             f"with pipeline parallelism before worker startup.")
 
-    # dp > 1 is only visible here under expert parallelism -- TPUWorker forces
-    # data_parallel_size to 1 otherwise. That combination cannot build its
-    # collectives (the DP replicas never join one torch world), so it would
-    # fail a few lines later with a far less obvious error.
+    # dp > 1 is only visible here under expert parallelism: TPUWorker
+    # collapses data_parallel_size to 1 for dense DP, and preserves it only
+    # for EP, which needs one unified DP*TP world for its expert collectives.
+    # Either way vLLM's ParallelConfig rejects pcp>1 together with dp>1
+    # before any worker starts, so reaching here means that gate moved or was
+    # lifted -- and the mesh's dp axis has never been exercised.
     if dp_size != 1:
         raise RuntimeError(
             f"Topology aware mesh assignment reached with "
-            f"data_parallel_size={dp_size}. PCP with expert parallelism "
-            f"across DP replicas is not supported: the replicas do not share "
-            f"a torch distributed world, so the model-parallel groups cannot "
-            f"be built.")
+            f"data_parallel_size={dp_size}. vLLM's ParallelConfig rejects "
+            f"prefill_context_parallel_size>1 together with "
+            f"data_parallel_size>1 ('PCP does not support data parallelism "
+            f"yet'), so reaching here means that gate moved or was lifted. "
+            f"The mesh's dp axis has never been exercised.")
 
     # Ordered by increasing network intensity, matching vLLM's own
     # (dp, pp, pcp, tp) decomposition. jax maps the last axis onto the
