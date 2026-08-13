@@ -166,7 +166,7 @@ def test_kimi_short_conv_scan_isolates_full_mixed_batch_slots() -> None:
         ],
         dtype=jnp.bfloat16,
     )
-    weight = jnp.ones((1, 1, 3), dtype=jnp.bfloat16)
+    weight = jnp.ones((3, 1), dtype=jnp.bfloat16)
 
     output, new_state = kimi_short_conv_scan(
         x,
