@@ -1560,7 +1560,6 @@ class TPURaidenConnectorWorker:
             raiden_controller_port=(
                 int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) +
                 int(self.dp_rank)),
-            raiden_orchestrator_address="",
             reshard_service_port=_reshard_service_port(self.dp_rank),
         )
         logger.info(
