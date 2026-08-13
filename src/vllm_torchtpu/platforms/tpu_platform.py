@@ -567,7 +567,8 @@ class TpuPlatform(Platform):
     _is_hybrid: bool = False
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4",
+        "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
     additional_env_vars: list[str] = [
@@ -987,11 +988,25 @@ class TpuPlatform(Platform):
         if backend_cls is None:
             return
 
-        is_hybrid = vllm_config.model_config.is_hybrid
-        if not is_hybrid and not cache_config.user_specified_block_size:
-            default = backend_cls.get_page_size(vllm_config)
+        architectures = getattr(
+            getattr(vllm_config.model_config, "hf_config", None),
+            "architectures", None) or []
+        is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+
+        if is_ds_v4 and not cache_config.user_specified_block_size:
+            # DSv4 pages hold compressed rows. Its backend's
+            # get_preferred_block_size is a hardcoded 256, which does not fit
+            # the packed latent record, so take the MLA page size directly.
+            from vllm_torchtpu.layers.vllm.attention import \
+                PallasMLAttentionBackend
             cache_config.block_size = (  # type: ignore[assignment]
-                backend_cls.get_preferred_block_size(default))
+                PallasMLAttentionBackend.get_page_size(vllm_config))
+        else:
+            is_hybrid = vllm_config.model_config.is_hybrid
+            if not is_hybrid and not cache_config.user_specified_block_size:
+                default = backend_cls.get_page_size(vllm_config)
+                cache_config.block_size = (  # type: ignore[assignment]
+                    backend_cls.get_preferred_block_size(default))
         if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 

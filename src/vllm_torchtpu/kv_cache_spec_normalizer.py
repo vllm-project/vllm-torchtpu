@@ -13,15 +13,26 @@ def normalize_kv_cache_specs_for_tpu(
     kv_cache_dtype: str | torch.dtype,
     *,
     enable_unified_kv_layout: bool = False,
+    exempt_layers: set[str] | None = None,
 ) -> dict[str, KVCacheSpec]:
+    """Normalize KV cache specs to the TPU's real page geometry.
+
+    `exempt_layers` pass through untouched: their packed, compressed layout is
+    not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
+    """
+    exempt = exempt_layers or set()
     normalized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_specs.items():
+        if layer_name in exempt:
+            normalized[layer_name] = spec
+            continue
         normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
     if (enable_unified_kv_layout
             and _has_hybrid_attention_and_mamba(normalized)):
         page_size = max(spec.page_size_bytes for spec in normalized.values())
         normalized = {
-            layer_name: _pad_page_size(spec, page_size)
+            layer_name:
+            (spec if layer_name in exempt else _pad_page_size(spec, page_size))
             for layer_name, spec in normalized.items()
         }
     return normalized
