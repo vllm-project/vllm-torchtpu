@@ -27,8 +27,15 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
-CACHE_DIR="${LOG_DIR:-${RUN_ROOT:-/tmp/compilation_cache_e2e_$$}}"
+CACHE_DIR="$(mktemp -d /tmp/compilation_cache_e2e_XXXXXX)"
 mkdir -p "${CACHE_DIR}"
+
+# Ensure all temporary cache files are deleted when the script finishes or errors out
+cleanup() {
+  echo "=== 🧹 Cleaning up temporary compilation cache artifacts... ==="
+  rm -rf "${CACHE_DIR}" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # Export public TorchTPU compilation cache configuration
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${CACHE_DIR}/torch_tpu_tier3"
