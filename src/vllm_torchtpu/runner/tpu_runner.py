@@ -97,6 +97,7 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
 
 if TYPE_CHECKING:
@@ -677,9 +678,10 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
         # Same scoping as the standard profiler: the prefix names the run, and
         # the per-phase subdirectories sit beneath it.
-        profile_dir = self.phased_profiling_dir
-        if profile_prefix:
-            profile_dir = os.path.join(profile_dir, profile_prefix)
+
+        profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
+            self.phased_profiling_dir, profile_prefix)
+
         # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
         # so every DP replica would call itself rank 0 and their traces would
         # overwrite each other on merge. The worker resolves the slice-global
@@ -696,6 +698,8 @@ class TPUModelRunner(GPUModelRunner):
                 or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
             num_decode_steps_to_skip=profiler_config.delay_iterations,
             decode_kv_len_threshold=decode_kv_len_threshold,
+            standard_opts=standard_opts,
+            advanced_opts=advanced_opts,
         )
 
     def stop_phased_profiling(self) -> None:
@@ -4739,7 +4743,7 @@ class TPUModelRunner(GPUModelRunner):
             cc.cache_dir, cc.local_cache_dir = saved_cache
             cc.compile_sizes = saved_sizes
             torch._dynamo.reset()
-            sync.synchronize()
+            torch.tpu.synchronize()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
             if not self.enforce_eager:

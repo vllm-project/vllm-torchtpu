@@ -149,6 +149,8 @@ class PhaseBasedProfiler:
         int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
         decode_kv_len_threshold:
         int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+        standard_opts: Optional[dict[str, Any]] = None,
+        advanced_opts: Optional[dict[str, Any]] = None,
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: Optional[str] = None
@@ -159,6 +161,8 @@ class PhaseBasedProfiler:
         # Wait for KV cache to reach a certain length before profiling decode-only phase
         # to ensure we capture traces of longer, steady-state context lengths.
         self.decode_kv_len_threshold: int = decode_kv_len_threshold
+        self.standard_opts = standard_opts or {}
+        self.advanced_opts = advanced_opts or {}
         self.profile_dir: str = profile_dir
         self.inference_phase_seen: dict[InferencePhase, bool] = {
             InferencePhase.PREFILL_ONLY: False,
@@ -260,16 +264,13 @@ class PhaseBasedProfiler:
             # Start PyTorch/XLA profiler
             handler = torch.profiler.tensorboard_trace_handler(
                 dir_name=self.profile_dir_with_phase_suffix, use_gzip=True)
+
             config = TpuProfilerConfig(
                 run_dir=self.profile_dir_with_phase_suffix,
-                host_tracer_level=2,
-                device_tracer_level=1,
-                python_tracer_level=1,
-                experimental_options={
-                    "tpu_trace_mode": "TRACE_COMPUTE",
-                    "tpu_num_sparse_cores_to_trace": 1,
-                    "tpu_num_sparse_core_tiles_to_trace": 1,
-                },
+                host_tracer_level=self.standard_opts["host_tracer_level"],
+                device_tracer_level=self.standard_opts["device_tracer_level"],
+                python_tracer_level=self.standard_opts["python_tracer_level"],
+                experimental_options=self.advanced_opts,
             )
             self.profile_context = torch.profiler.profile(
                 activities=[

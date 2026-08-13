@@ -25,6 +25,7 @@ from vllm.model_executor.layers.mla import (MLAModules,
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, sharded_weight_loader)
+from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -106,12 +107,12 @@ class MixedParallelMergedLinear(MergedColumnParallelLinear):
             disable_tp=True,
         )
 
-    def weight_loader(
+    def _slice_loaded_weight(
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
+    ) -> torch.Tensor:
         if (isinstance(loaded_shard_id, int)
                 and not self.replicate_outputs[loaded_shard_id]):
             output_dim = getattr(param, "output_dim", None)
@@ -129,7 +130,33 @@ class MixedParallelMergedLinear(MergedColumnParallelLinear):
                     self.mixed_tp_rank * shard_size,
                     shard_size,
                 )
+        return loaded_weight
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        loaded_weight = self._slice_loaded_weight(
+            param,
+            loaded_weight,
+            loaded_shard_id,
+        )
         super().weight_loader(param, loaded_weight, loaded_shard_id)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        loaded_weight = self._slice_loaded_weight(
+            param,
+            loaded_weight,
+            loaded_shard_id,
+        )
+        super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
 
 
 class MultiHeadLatentAttention(nn.Module):

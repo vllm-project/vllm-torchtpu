@@ -113,7 +113,9 @@ PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-}"
 DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-1536}"
 prefill_block_size_label="${PREFILL_BLOCK_SIZE:-auto}"
 decode_block_size_label="${DECODE_BLOCK_SIZE:-auto}"
-NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-128}"
+# Preserve an explicitly empty value so the large-cache test can exercise
+# HBM-based block profiling instead of forcing the 128-block CI baseline.
+NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE-128}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
@@ -228,13 +230,16 @@ common_args=(
   --language-model-only
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --max-num-seqs "${MAX_NUM_SEQS}"
-  --num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}"
   --no-disable-hybrid-kv-cache-manager
   --attention-backend "${ATTENTION_BACKEND}"
   --mamba-cache-mode "${MAMBA_CACHE_MODE}"
   --enable-prompt-tokens-details
   --no-enable-log-requests
 )
+
+if [[ -n "${NUM_GPU_BLOCKS_OVERRIDE}" ]]; then
+  common_args+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}")
+fi
 
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
   common_args+=(--enable-prefix-caching)
