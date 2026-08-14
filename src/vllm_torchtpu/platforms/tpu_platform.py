@@ -677,7 +677,16 @@ class TpuPlatform(Platform):
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
                 f"localhost:{p}" for p in sb_ports)
 
-        os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(world_size)
+        # A per-engine DP config copy (data_parallel_size collapsed to 1,
+        # see the caller) re-enters this function in a child process that
+        # inherits TORCH_TPU_TOPOLOGY already computed for the *real* multi-
+        # host slice by prepare_mp_multihost_dp_env. Only the single-host
+        # PCI-scan lookup below needs a fresh call, and re-running it here
+        # would fail: this process only has world_size's local share of
+        # chips, not the whole cross-host slice.
+        if "TORCH_TPU_TOPOLOGY" not in os.environ:
+            os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(
+                world_size)
 
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
@@ -943,8 +952,15 @@ class TpuPlatform(Platform):
                     # binding.
                     cls.device_control_env_var = \
                         "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
-                cls._prepare_singlehost_tpu_env(
-                    parallel_config.world_size_across_dp)
+                # Genuine multi-host DP (this host only owns a slice of the
+                # DP ranks) needs a TCPStore rendezvous across hosts instead
+                # of the single-host localhost/PCI-scan bootstrap below.
+                from vllm_torchtpu.distributed.tpu_mp_multihost import \
+                    prepare_mp_multihost_dp_env
+                if not prepare_mp_multihost_dp_env(
+                        parallel_config, parallel_config.world_size_across_dp):
+                    cls._prepare_singlehost_tpu_env(
+                        parallel_config.world_size_across_dp)
             else:
                 # vLLM hands each DP engine a ParallelConfig with
                 # data_parallel_size collapsed to 1, so the inherited

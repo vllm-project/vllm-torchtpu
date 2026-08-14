@@ -195,6 +195,7 @@ class TestTpuPlatform:
         vllm_config.parallel_config.world_size = 1
         vllm_config.parallel_config.world_size_across_dp = 1
         vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size_local = 1
         vllm_config.parallel_config.enable_expert_parallel = False
         vllm_config.parallel_config.pipeline_parallel_size = 1
         vllm_config.parallel_config.tensor_parallel_size = 1
@@ -317,6 +318,10 @@ class TestTpuPlatform:
         # Attention-DP runs the split layout; async+APC is only rejected
         # there (the pool's seed copies support async scheduling).
         vllm_config.parallel_config.data_parallel_size = 8
+        # Single-host DP: every replica is local, so this reaches
+        # _prepare_singlehost_tpu_env rather than the multi-host DP
+        # rendezvous (which needs data_parallel_size_local < data_parallel_size).
+        vllm_config.parallel_config.data_parallel_size_local = 8
         # The non-raising row reaches the single-host DP env setup; a falsy
         # master ip takes the code's "localhost" fallback.
         vllm_config.parallel_config.data_parallel_master_ip = ""
