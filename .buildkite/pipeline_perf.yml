@@ -34,8 +34,7 @@ steps:
               qwen3.5-35b-fp8-dp8-ep \
               deepseek-v2-tp8-ep \
               gemma-4-31b-fp8-dp4-tp2-multimodal \
-              gemma-4-26b-fp8-dp4-tp2-ep-text \
-              gemma-4-26b-fp8-dp1-tp2-multimodal
+              gemma-4-26b-fp8-dp4-tp2-multimodal
         artifact_paths:
           - "perf_eval_results/**/*"
 
