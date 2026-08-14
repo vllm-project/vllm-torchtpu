@@ -3,7 +3,7 @@
 # Benchmark config: RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (MoE, TP=2 on v7x-8), multimodal (image input).
 MODEL="RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
 TENSOR_PARALLELISM=2
-DATA_PARALLELISM=1
+DATA_PARALLELISM=4
 ENABLE_EP=false
 QUANTIZATION=""
 ISL_OSL_CONFIGS="1024:1024"
