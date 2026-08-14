@@ -182,7 +182,6 @@ class RaidenOffloadingManager(OffloadingManager):
         raiden_controller_port: int,
         raiden_job_name: str,
         global_registry_address: str = "",
-        raiden_orchestrator_address: str = "",
         store_server_ip: str = "",
         key_namespace: bytes = b"",
         # Test overrides: allow injecting mock store instance and type bindings.
@@ -233,7 +232,6 @@ class RaidenOffloadingManager(OffloadingManager):
                 shard_size_bytes=1,
                 raiden_controller_port=raiden_controller_port,
                 global_registry_address=global_registry_address,
-                raiden_orchestrator_address=raiden_orchestrator_address,
                 # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
                 store_server_ip=store_server_ip or "127.0.0.1",
                 # Construction blocks in RaidenController::Init() until every
@@ -1292,8 +1290,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # store_server_ip advertises the pod IP that peers dial for remote reads.
         self.global_registry_address = str(
             self.extra_config.get("global_registry_address", ""))
-        self.raiden_orchestrator_address = str(
-            self.extra_config.get("raiden_orchestrator_address", ""))
         self.store_server_ip = str(self.extra_config.get(
             "store_server_ip", ""))
 
@@ -1350,7 +1346,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 raiden_controller_port=self.raiden_controller_port,
                 raiden_job_name=self.raiden_job_name,
                 global_registry_address=self.global_registry_address,
-                raiden_orchestrator_address=self.raiden_orchestrator_address,
                 store_server_ip=self.store_server_ip,
                 key_namespace=self.key_namespace,
             )
