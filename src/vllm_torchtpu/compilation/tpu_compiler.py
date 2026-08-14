@@ -7,6 +7,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 """
 
 import copy
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -32,6 +33,15 @@ logger = init_logger(__name__)
 # Type alias for the compile range tuple
 Range = tuple[int, int]
 
+
+@dataclasses.dataclass
+class TpuCompilationHandle:
+    """Metadata handle saved to vLLM's compilation cache directory."""
+    key: str
+    tier3_cache_active: bool = False
+    executable: Any | None = None
+
+
 _tpu_backend = TpuBackend()
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -51,6 +61,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_WORKER_ID",
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
+    "TPU_PARALLEL_PRECOMPILE",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -253,17 +264,6 @@ class TpuCompilerAdaptor(CompilerInterface):
                          cache_dir: str,
                          disable_cache: bool = False,
                          prefix: str = "") -> None:
-        vllm_xla_cache_path = os.getenv("VLLM_XLA_CACHE_PATH")
-        if vllm_xla_cache_path:
-            try:
-                from vllm.envs import VLLM_CACHE_ROOT
-                rel_path = os.path.relpath(cache_dir, VLLM_CACHE_ROOT)
-                cache_dir = os.path.join(vllm_xla_cache_path, rel_path)
-            except Exception as e:
-                logger.warning(
-                    "[TpuCompilerAdaptor] Failed to relocate cache directory "
-                    "using VLLM_XLA_CACHE_PATH: %s", e)
-
         self.cache_dir = cache_dir
         self._disable_cache = disable_cache
 
@@ -325,9 +325,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn = unwrap_fn
 
         # Save the per-shape PjRt executable to disk.
-        # We pickle the inner _TorchTpuCompiledExecutable (which has
-        # __reduce__), not the aot_autograd wrapper (which has
-        # unpicklable closures).
+        # When Tier-3 C++ persistent cache is active, torch_tpu handles PJRT
+        # binary persistence natively in C++ (torch_tpu_tier3/*.bin).
+        # We store a lightweight metadata handle instead of duplicate compiled binary executables.
         handle = None
         if (key is not None and self.cache_dir is not None
                 and not self._disable_cache
@@ -336,11 +336,22 @@ class TpuCompilerAdaptor(CompilerInterface):
                 inner_exe = _tpu_backend._compiled_executables[-1]
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
+                    handle_data = TpuCompilationHandle(
+                        key=key,
+                        tier3_cache_active=True,
+                    )
+                else:
+                    handle_data = TpuCompilationHandle(
+                        key=key,
+                        tier3_cache_active=False,
+                        executable=inner_exe,
+                    )
                 with open(save_path, "wb") as f:
-                    pickle.dump(inner_exe, f)
+                    pickle.dump(handle_data, f)
                 handle = (key, save_path, was_wrapped)
                 logger.info(
-                    "[TpuCompilerAdaptor] Saved compiled executable to %s",
+                    "[TpuCompilerAdaptor] Saved compiled executable metadata to %s",
                     save_path,
                 )
             except Exception as e:
@@ -359,10 +370,9 @@ class TpuCompilerAdaptor(CompilerInterface):
     ) -> Callable[..., Any]:
         """Load a compiled executable from disk.
 
-        Unpickles the _TorchTpuCompiledExecutable, then wraps it with
-        aot_autograd (using the same graph) to reconstruct the full
-        callable. This skips FX->MLIR->compile but still sets up the
-        aot_autograd runtime wrapper that handles input mutations.
+        Unpickles the _TorchTpuCompiledExecutable (or uses Tier-3 C++ cache),
+        then wraps it with aot_autograd (using the same graph) to reconstruct
+        the full callable.
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, was_wrapped = handle
@@ -370,19 +380,37 @@ class TpuCompilerAdaptor(CompilerInterface):
                     path)
 
         with open(path, "rb") as f:
-            inner_exe = pickle.load(f)
+            loaded_data = pickle.load(f)
 
         # Re-create the aot_autograd wrapper around the cached executable.
-        # The current torch_tpu executable already handles non-tensor argument
-        # filtering internally, so the load path can return the unpickled
-        # executable directly.
         from torch._dynamo.backends.common import aot_autograd
 
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        def _cached_compiler(*_args, **_kwargs):
-            return inner_exe
+        tier3_active = False
+        inner_exe = None
+        if isinstance(loaded_data, TpuCompilationHandle):
+            tier3_active = loaded_data.tier3_cache_active
+            inner_exe = loaded_data.executable
+        elif isinstance(loaded_data, dict):
+            tier3_active = loaded_data.get("tier3_cache_active", False)
+            inner_exe = loaded_data.get("executable")
+        else:
+            inner_exe = loaded_data
+
+        if tier3_active:
+            # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
+            def _cached_compiler(g, example_inputs):
+                clean_inputs = [
+                    int(x) if isinstance(x, torch.SymInt) else x
+                    for x in example_inputs
+                ]
+                return _tpu_backend(g, clean_inputs)
+        else:
+
+            def _cached_compiler(*_args, **_kwargs):
+                return inner_exe
 
         # The tracing context has a FakeTensorMode from Dynamo, but the example
         # inputs have fake tensors from a different FakeTensorMode.

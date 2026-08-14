@@ -172,6 +172,113 @@ def test_mxfp4_apply_masks_padded_token_routes():
     assert mock_gmm.call_args.kwargs["skip_padded_tokens"] is True
 
 
+def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
+    """The decode-shaped MoE call must not mix otherwise identical rows."""
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.experts_per_token = 16
+    moe_config.intermediate_size_per_partition = 128
+    moe_config.intermediate_size_per_partition_unpadded = 128
+    moe_config.activation_situ_beta = 4.0
+    moe_config.activation_situ_linear_beta = 25.0
+
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=16)
+    layer.activation = "situ"
+    layer.moe_config.activation_situ_beta = 4.0
+    layer.moe_config.activation_situ_linear_beta = 25.0
+    layer._expert_routing_tables = lambda: (None, None)
+    num_experts = 16
+    hidden_size = 128
+    method.create_weights(
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=128,
+        params_dtype=torch.bfloat16,
+    )
+
+    generator = torch.Generator().manual_seed(0)
+    weight_loader = layer.w13_weight_packed.weight_loader
+    w13_scale = torch.full((128, 4), 127, dtype=torch.uint8)
+    w2_scale = torch.full((128, 4), 127, dtype=torch.uint8)
+    for expert_id in range(num_experts):
+        w13_packed = torch.randint(0,
+                                   256, (128, 64),
+                                   dtype=torch.uint8,
+                                   generator=generator)
+        w2_packed = torch.randint(0,
+                                  256, (128, 64),
+                                  dtype=torch.uint8,
+                                  generator=generator)
+        weight_loader(
+            layer.w13_weight_packed,
+            w13_packed,
+            "w13_weight_packed",
+            "w1",
+            expert_id,
+        )
+        weight_loader(
+            layer.w13_weight_packed,
+            w13_packed,
+            "w13_weight_packed",
+            "w3",
+            expert_id,
+        )
+        weight_loader(
+            layer.w13_weight_scale,
+            w13_scale,
+            "w13_weight_scale",
+            "w1",
+            expert_id,
+        )
+        weight_loader(
+            layer.w13_weight_scale,
+            w13_scale,
+            "w13_weight_scale",
+            "w3",
+            expert_id,
+        )
+        weight_loader(
+            layer.w2_weight_packed,
+            w2_packed,
+            "w2_weight_packed",
+            "",
+            expert_id,
+        )
+        weight_loader(
+            layer.w2_weight_scale,
+            w2_scale,
+            "w2_weight_scale",
+            "",
+            expert_id,
+        )
+
+    with patch("vllm_torchtpu.layers.vllm.quantization.compressed_tensors."
+               "compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4."
+               "prebuild_fused_moe_kernel"):
+        method.process_weights_after_loading(layer)
+
+    active = torch.randn(1, hidden_size, dtype=torch.bfloat16)
+    hidden_states = torch.cat(
+        (active.expand(8, -1), torch.zeros(8,
+                                           hidden_size,
+                                           dtype=torch.bfloat16))).to("tpu")
+    active_router = torch.randn(1, num_experts, dtype=torch.float32)
+    router_logits = torch.cat(
+        (active_router.expand(8, -1), torch.zeros(8, num_experts))).to("tpu")
+
+    output = method.apply_monolithic(layer, hidden_states, router_logits)
+    active_output = output[:8].cpu()
+    torch.testing.assert_close(
+        active_output,
+        active_output[0].expand_as(active_output),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_mxfp4_create_weights_does_not_zero_initialize():
     moe_config = MagicMock()
     moe_config.tp_size = 1

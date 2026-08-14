@@ -128,7 +128,7 @@ def test_kda_step_matches_independent_torch_reference(
 def test_kimi_short_conv_scan_resets_each_new_sequence() -> None:
     x = jnp.asarray([[1, 2], [3, 4], [5, 6]], dtype=jnp.bfloat16)
     state = jnp.zeros((2, 2, 2), dtype=jnp.bfloat16)
-    weight = jnp.ones((2, 1, 3), dtype=jnp.bfloat16)
+    weight = jnp.ones((3, 2), dtype=jnp.bfloat16)
 
     output, new_state = kimi_short_conv_scan(
         x,
@@ -146,4 +146,61 @@ def test_kimi_short_conv_scan_resets_each_new_sequence() -> None:
     np.testing.assert_array_equal(
         np.asarray(new_state),
         np.asarray([[[1, 2], [3, 4]], [[0, 0], [5, 6]]], dtype=np.float32),
+    )
+
+
+def test_kimi_short_conv_scan_isolates_full_mixed_batch_slots() -> None:
+    """One decode plus seven prefills must not share convolution history."""
+    x = jnp.arange(1, 17, dtype=jnp.bfloat16)[:, None]
+    state = jnp.asarray(
+        [
+            [[99], [98]],
+            [[10], [20]],
+            [[77], [88]],
+            [[77], [88]],
+            [[77], [88]],
+            [[77], [88]],
+            [[77], [88]],
+            [[77], [88]],
+            [[77], [88]],
+        ],
+        dtype=jnp.bfloat16,
+    )
+    weight = jnp.ones((3, 1), dtype=jnp.bfloat16)
+
+    output, new_state = kimi_short_conv_scan(
+        x,
+        state,
+        weight,
+        jnp.asarray([0, 1, 3, 5, 7, 9, 11, 13, 15], dtype=jnp.int32),
+        jnp.arange(1, 9, dtype=jnp.int32),
+        jnp.asarray([5, 2, 2, 2, 2, 2, 2, 2], dtype=jnp.int32),
+    )
+
+    # Slot 1 carries the decode request's history. Every fresh prefill must
+    # ignore its deliberately stale slot, and the final padded row must write
+    # neither output nor state. Slot 0 is the reserved null block.
+    np.testing.assert_array_equal(
+        np.asarray(output).reshape(-1),
+        np.asarray(
+            [31, 2, 5, 4, 9, 6, 13, 8, 17, 10, 21, 12, 25, 14, 29, 0],
+            dtype=np.float32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(new_state).reshape(9, 2),
+        np.asarray(
+            [
+                [99, 98],
+                [20, 1],
+                [2, 3],
+                [4, 5],
+                [6, 7],
+                [8, 9],
+                [10, 11],
+                [12, 13],
+                [14, 15],
+            ],
+            dtype=np.float32,
+        ),
     )

@@ -31,7 +31,18 @@ def profiler_fixture(tmp_path):
         mock_context = MagicMock()
         mock_profile.return_value = mock_context
 
-        profiler = PhaseBasedProfiler(profile_dir=str(tmp_path))
+        profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
+                                      standard_opts={
+                                          'host_tracer_level': 2,
+                                          'device_tracer_level': 1,
+                                          'python_tracer_level': 1
+                                      },
+                                      advanced_opts={
+                                          'tpu_trace_mode': 'TRACE_COMPUTE',
+                                          'tpu_num_sparse_cores_to_trace': 1,
+                                          'tpu_num_sparse_core_tiles_to_trace':
+                                          1
+                                      })
         profiler.num_steps_to_profile_for = (
             PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
 

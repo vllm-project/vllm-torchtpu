@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -44,13 +44,18 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import \
     MRotaryEmbeddingInterleaved
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
+                                               DeepseekV4IndexerCache)
+from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
-                                        MLAAttentionSpec, SlidingWindowSpec,
+                                        MLAAttentionSpec, SlidingWindowMLASpec,
+                                        SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
@@ -90,12 +95,17 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
+from vllm_torchtpu.runner.structured_decoding_manager import \
+    StructuredDecodingManager
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
+from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -191,6 +201,17 @@ def _suspend_kv_transfer_group() -> Iterator[None]:
 _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
     "invalid_block_group_index" in getattr(KVConnectorOutput,
                                            "__dataclass_fields__", {}))
+
+
+def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
+    """Whether this module owns one of DeepSeek-V4's custom KV caches.
+
+    These build their own specs in the TPU's packed layout, so the specs must
+    reach vLLM verbatim rather than through `_normalize_one_spec`.
+    """
+    return isinstance(attn_module,
+                      (DeepseekV4Attention, DeepseekV4SWACache,
+                       DeepseekV4IndexerCache, CompressorStateCache))
 
 
 def _build_kv_connector_output(
@@ -582,20 +603,7 @@ class TPUModelRunner(GPUModelRunner):
                                                     self.block_size),
             self.max_num_reqs, self.max_num_tokens)
 
-        # Structured decoding staging tensors.
-        self.grammar_bitmask_cpu = torch.zeros(
-            (self.max_num_reqs, cdiv(self.vocab_size, 32)),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=PIN_MEMORY)
-        self.require_structured_out_cpu = torch.zeros((self.max_num_reqs, 1),
-                                                      dtype=torch.bool,
-                                                      device="cpu",
-                                                      pin_memory=PIN_MEMORY)
-        self.structured_decode_arange = torch.arange(0,
-                                                     32,
-                                                     device="cpu",
-                                                     pin_memory=PIN_MEMORY)
+        self.structured_decoding_manager = StructuredDecodingManager(self)
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and
@@ -675,9 +683,10 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
         # Same scoping as the standard profiler: the prefix names the run, and
         # the per-phase subdirectories sit beneath it.
-        profile_dir = self.phased_profiling_dir
-        if profile_prefix:
-            profile_dir = os.path.join(profile_dir, profile_prefix)
+
+        profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
+            self.phased_profiling_dir, profile_prefix)
+
         # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
         # so every DP replica would call itself rank 0 and their traces would
         # overwrite each other on merge. The worker resolves the slice-global
@@ -694,6 +703,8 @@ class TPUModelRunner(GPUModelRunner):
                 or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
             num_decode_steps_to_skip=profiler_config.delay_iterations,
             decode_kv_len_threshold=decode_kv_len_threshold,
+            standard_opts=standard_opts,
+            advanced_opts=advanced_opts,
         )
 
     def stop_phased_profiling(self) -> None:
@@ -977,9 +988,19 @@ class TPUModelRunner(GPUModelRunner):
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
+        # DSv4 layers whose specs must reach vLLM verbatim; see
+        # `is_cache_for_ds_v4`.
+        ds_v4_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
+            # DSv4's attention, SWA, compressor and indexer caches all build
+            # their own specs, as the reference does.
+            elif is_cache_for_ds_v4(attn_module):
+                ds_v4_layers.add(layer_name)
                 spec = attn_module.get_kv_cache_spec(self.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
@@ -1097,6 +1118,7 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_spec,
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
+            exempt_layers=ds_v4_layers,
         )
 
     @staticmethod
@@ -1211,6 +1233,143 @@ class TPUModelRunner(GPUModelRunner):
                     f"{target_layer_name}, but the target cache was not "
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+    def _plan_ds_v4_auxiliary_overlay(
+            self, layer_names: Iterable[str]) -> dict[str, str]:
+        """Map each DSv4 compressor state cache to the layer it overlays.
+
+        Planned before allocation: allocating then aliasing still counts
+        against peak HBM, since every array in the loop is live at once.
+        """
+        static_forward_context = (
+            self.vllm_config.compilation_config.static_forward_context)
+        state_suffix = ".compressor.state_cache"
+        overlay: dict[str, str] = {}
+        for layer_name in layer_names:
+            attn_module = static_forward_context.get(layer_name)
+            if isinstance(
+                    attn_module,
+                    CompressorStateCache) or layer_name.endswith(state_suffix):
+                if not layer_name.endswith(state_suffix):
+                    raise ValueError(
+                        "DeepSeek-V4 compressor state cache has an unexpected "
+                        f"layer name {layer_name!r}; expected it to end with "
+                        f"{state_suffix!r} so the host layer can be derived.")
+                base = layer_name[:-len(state_suffix)]
+                # Map compressor state cache layer name to host attention layer's k_cache.
+                overlay[layer_name] = (base + ".k_cache"
+                                       if base.endswith(".indexer") else base)
+        return overlay
+
+    def _alias_ds_v4_auxiliary_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        overlay: dict[str, str],
+        per_layer_spec: Callable[[str], KVCacheSpec],
+    ) -> None:
+        """Point DeepSeek-V4 compressor state caches at their host's tensor.
+
+        The state cache is packed into the host's page, so a layout change
+        that makes it no longer fit must fail here rather than let
+        `pack_state_cache` write past the page.
+        """
+        for layer_name, host_layer_name in overlay.items():
+            if host_layer_name not in kv_caches:
+                raise ValueError(
+                    "DeepSeek-V4 auxiliary cache has no host KV layer to overlay: "
+                    f"cache={layer_name!r}, expected KV layer {host_layer_name!r}, "
+                    f"known layers={sorted(kv_caches.keys())}")
+            host = kv_caches[host_layer_name]
+            spec = per_layer_spec(layer_name)
+            # 4-D packed layout: (pages, rows/packing, packing, width).
+            host_page_entries = host.shape[1] * host.shape[2]
+            host_page_bytes = host_page_entries * host.shape[-1]
+            state_page_bytes = (spec.block_size * spec.num_kv_heads *
+                                spec.head_size * spec.dtype.itemsize)
+            if state_page_bytes > host_page_bytes:
+                raise ValueError(
+                    f"DeepSeek-V4 state cache {layer_name!r} needs "
+                    f"{state_page_bytes} B per page but its host "
+                    f"{host_layer_name!r} page holds {host_page_bytes} B.")
+            if host_page_entries % spec.block_size != 0:
+                raise ValueError(
+                    f"DeepSeek-V4 state cache {layer_name!r} has block_size "
+                    f"{spec.block_size}, which does not divide its host's "
+                    f"{host_page_entries} entries per page.")
+            kv_caches[layer_name] = host
+
+    @staticmethod
+    def _is_ds_v4_swa_layer(layer_name: str, spec: KVCacheSpec) -> bool:
+        """A DSv4 sliding-window cache (not a compressor state cache).
+
+        Both declare `SlidingWindowMLASpec`, so the name separates them.
+        """
+        return isinstance(spec,
+                          SlidingWindowMLASpec) and "swa_cache" in layer_name
+
+    def _plan_ds_v4_swa_overlay(
+        self,
+        kv_cache_config: KVCacheConfig,
+        per_layer_spec: Callable[[str], KVCacheSpec],
+        cache_shape_of: Callable[[KVCacheSpec], tuple[int, ...]],
+    ) -> dict[str, str]:
+        """Map each DSv4 SWA cache onto a compatible compressed-KV layer.
+
+        vLLM assigns page indices assuming these caches share one allocation.
+        TPU arrays cannot be byte views into a slab, so the overlay is rebuilt
+        here: an `MLAAttentionSpec` host must be at least as wide and hold at
+        least as many entries, and any unmapped remainder gets its own array.
+
+        Returns `{swa_layer_name: host_layer_name}` for the layers that overlay.
+        """
+        mla_layers: list[str] = []
+        swa_groups: list[list[str]] = []
+        for group in kv_cache_config.kv_cache_groups:
+            swa_in_group: list[str] = []
+            for layer_name in group.layer_names:
+                if layer_name in self.shared_kv_cache_layers:
+                    continue
+                spec = per_layer_spec(layer_name)
+                if isinstance(spec, MLAAttentionSpec):
+                    mla_layers.append(layer_name)
+                elif self._is_ds_v4_swa_layer(layer_name, spec):
+                    swa_in_group.append(layer_name)
+            if swa_in_group:
+                swa_groups.append(swa_in_group)
+
+        if not swa_groups:
+            return {}
+        if not mla_layers:
+            raise ValueError(
+                "DeepSeek-V4 model has SWA caches but no MLAAttentionSpec "
+                "layers to overlay them onto: swa_layers="
+                f"{[n for g in swa_groups for n in g]}")
+
+        overlay: dict[str, str] = {}
+        # One host per SWA cache, tracked globally: layers in a group share a
+        # block table, and resetting per group would reuse hosts[0] everywhere.
+        taken: set[str] = set()
+        for swa_layers in swa_groups:
+            swa_spec = per_layer_spec(swa_layers[0])
+            swa_entry_bytes = (swa_spec.num_kv_heads * swa_spec.head_size *
+                               swa_spec.dtype.itemsize)
+            for layer_name in swa_layers:
+                for host_name in mla_layers:
+                    if host_name in taken:
+                        continue
+                    host_spec = per_layer_spec(host_name)
+                    shape = cache_shape_of(host_spec)
+                    # 4-D packed MLA layout:
+                    # (pages, rows/packing, packing, width).
+                    page_entries = shape[1] * shape[2]
+                    entry_width_bytes = shape[-1] * host_spec.dtype.itemsize
+                    if (host_spec.dtype == swa_spec.dtype
+                            and entry_width_bytes >= swa_entry_bytes
+                            and page_entries >= swa_spec.storage_block_size):
+                        overlay[layer_name] = host_name
+                        taken.add(host_name)
+                        break
+        return overlay
 
     def _update_attention_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
@@ -2862,7 +3021,13 @@ class TPUModelRunner(GPUModelRunner):
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
         if self.supports_mm_inputs:
+            has_encoder_inputs = bool(
+                scheduler_output.scheduled_encoder_inputs)
+            if has_encoder_inputs:
+                sync.synchronize(wait=True)
             self._execute_mm_encoder(scheduler_output)
+            if has_encoder_inputs:
+                sync.synchronize(wait=True)
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
@@ -3007,7 +3172,15 @@ class TPUModelRunner(GPUModelRunner):
             num_tokens_padded = (input_ids if input_ids is not None else
                                  inputs_embeds).shape[0]
             self._token_padding_update(num_tokens_padded)
-            with set_forward_context(
+
+            req_id_kwargs = extract_request_ids_for_tracing(
+                self.input_batch.req_ids, start_index, num_reqs)
+
+            with TraceAnnotation(
+                    name="ModelForward",
+                    num_reqs=num_reqs,
+                    **req_id_kwargs,
+            ), set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
@@ -3333,6 +3506,12 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
                     "TPU yet.")
+            if grammar_output is not None:
+                # TODO(haotianx): remove this when structured output is support in
+                # spec decoding path.
+                raise NotImplementedError(
+                    "Structured outputs with speculative decoding is not "
+                    "supported on TPU yet.")
             # Per-chunk device rejection outputs, kept for the async-spec
             # producer below.
             next_tokens_per_chunk: list[torch.Tensor] = []
@@ -3475,11 +3654,13 @@ class TPUModelRunner(GPUModelRunner):
                                                      num_reqs)
                 if grammar_output is not None:
                     require_struct_decoding, grammar_bitmask_padded, arange = (
-                        self.prepare_structured_decoding_input(
-                            logits, grammar_output))
-                    logits = self.structured_decode(require_struct_decoding,
-                                                    grammar_bitmask_padded,
-                                                    logits, arange)
+                        self.structured_decoding_manager.
+                        prepare_structured_decoding_input(
+                            logits, grammar_output, cur_start_idx,
+                            cur_end_idx))
+                    logits = self.structured_decoding_manager.structured_decode(
+                        require_struct_decoding, grammar_bitmask_padded,
+                        logits, arange)
                 if all_greedy:
                     dummy_placeholder = torch.empty((1, 1),
                                                     dtype=logits.dtype,
@@ -3836,13 +4017,9 @@ class TPUModelRunner(GPUModelRunner):
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
 
-    def _initialize_attention_kernels(self) -> None:
-        """Pre-build Pallas RPA attention kernels before torch.compile.
-
-        Must be called after model weights are loaded and before the first
-        forward_model() call (which triggers torch.compile tracing).
-        """
-        if self._attention_kernels_initialized:
+    def _initialize_attention_kernels(self, force: bool = False) -> None:
+        """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
+        if self._attention_kernels_initialized and not force:
             return
         from vllm_torchtpu.layers.vllm.attention import (
             _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
@@ -3878,8 +4055,27 @@ class TPUModelRunner(GPUModelRunner):
                             _DRAFT_KV_BLOCK_CAP)
                     attn_layer.impl.initialize_kernel(attn_layer)
                     initialized_count += 1
-        logger.info("Pre-built RPA kernels for %d attention layers.",
-                    initialized_count)
+
+            # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
+            if hasattr(self, "model") and self.model is not None:
+                for module in self.model.modules():
+                    if hasattr(module, "_build_attn_op") and hasattr(
+                            module, "attn_op"):
+                        module.__dict__.pop("_attn_op_instance", None)
+                        _ = module.attn_op
+                        initialized_count += 1
+                    if hasattr(module, "_build_compressor_op") and hasattr(
+                            module, "compressor_op"):
+                        module.__dict__.pop("_compressor_op_instance", None)
+                        _ = module.compressor_op
+                        initialized_count += 1
+                    if hasattr(module, "_build_indexer_op") and hasattr(
+                            module, "indexer_op"):
+                        _ = module.indexer_op
+                        initialized_count += 1
+        logger.info(
+            "Pre-built attention/indexing kernels for %d layers/modules.",
+            initialized_count)
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
@@ -4074,11 +4270,14 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
-            arange = self.structured_decode_arange.to(self.device)
+            arange = self.structured_decoding_manager.structured_decode_arange.to(
+                self.device)
             for num_reqs in self.num_reqs_paddings:
-                out = self.structured_decode(
-                    self.require_structured_out_cpu[:num_reqs].to(self.device),
-                    self.grammar_bitmask_cpu[:num_reqs].to(self.device),
+                out = self.structured_decoding_manager.structured_decode(
+                    self.structured_decoding_manager.
+                    require_structured_out_cpu[:num_reqs].to(self.device),
+                    self.structured_decoding_manager.
+                    grammar_bitmask_cpu[:num_reqs].to(self.device),
                     self._dummy_logits(num_reqs),
                     arange,
                 )
@@ -4723,7 +4922,7 @@ class TPUModelRunner(GPUModelRunner):
             cc.cache_dir, cc.local_cache_dir = saved_cache
             cc.compile_sizes = saved_sizes
             torch._dynamo.reset()
-            sync.synchronize()
+            torch.tpu.synchronize()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
             if not self.enforce_eager:
@@ -4926,6 +5125,97 @@ class TPUModelRunner(GPUModelRunner):
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
 
+    def _initialize_ds_v4_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        per_layer_spec: Callable[[str], KVCacheSpec],
+        kv_caches: dict[str, torch.Tensor],
+        num_blocks: int,
+    ) -> None:
+        """Allocate and alias DeepSeek-V4's KV caches.
+
+        vLLM lays DSv4's cache groups out as one packed slab and assigns page
+        indices assuming the compressed-KV, SWA and compressor-state caches
+        share it. TPU arrays cannot be byte views into a slab, so the overlay
+        is rebuilt from the specs instead:
+
+        - every `MLAAttentionSpec` layer gets an array shaped by its own spec,
+          so the kernels see the page geometry the spec promised;
+        - every compressor state cache maps onto its compressed-KV layer's
+          array, which the compressor writes both records through;
+        - every SWA cache maps onto a distinct compressed-KV array, distinct
+          because layers of one group share a block table; any overflow gets
+          its own array.
+
+        Overlays are planned before allocating: allocating an array and
+        aliasing it afterwards still counts against peak HBM.
+        """
+        aux_overlay = self._plan_ds_v4_auxiliary_overlay([
+            n for g in kv_cache_config.kv_cache_groups for n in g.layer_names
+        ])
+        swa_overlay = self._plan_ds_v4_swa_overlay(
+            kv_cache_config,
+            per_layer_spec,
+            lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
+                num_blocks,
+                spec.storage_block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+                head_size_is_packed_width=True,
+            ),
+        )
+
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            # One array per KVCacheTensor, shared by the layers that name it:
+            # vLLM sizes `num_blocks` from `kv_cache_tensor.size`, which
+            # budgets a single array for the whole `shared_by` set.
+            shared: dict[tuple, torch.Tensor] = {}
+            for layer_name in kv_cache_tensor.shared_by:
+                if layer_name in swa_overlay or layer_name in aux_overlay:
+                    continue
+                spec = per_layer_spec(layer_name)
+                if not isinstance(spec,
+                                  (MLAAttentionSpec, SlidingWindowMLASpec)):
+                    raise NotImplementedError(
+                        f"DeepSeek-V4 layer {layer_name!r} has unexpected "
+                        f"spec {type(spec).__name__}")
+                # `head_size` is already the packed byte width, and pages hold
+                # `storage_block_size` compressed rows rather than one per
+                # token. SlidingWindowMLASpec is shaped here too so it gets
+                # the 4-D layout its host uses, not a 5-D one.
+                shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                    num_blocks,
+                    spec.storage_block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    spec.dtype,
+                    head_size_is_packed_width=True,
+                )
+                key = (tuple(shape), spec.dtype)
+                if key not in shared:
+                    shared[key] = torch.zeros(shape,
+                                              dtype=spec.dtype).to(self.device)
+                kv_caches[layer_name] = shared[key]
+
+        for swa_layer_name, host_layer_name in swa_overlay.items():
+            if host_layer_name not in kv_caches:
+                raise ValueError(
+                    "DeepSeek-V4 SWA cache has no host KV layer to overlay: "
+                    f"swa_cache={swa_layer_name!r}, expected KV layer "
+                    f"{host_layer_name!r}, known layers="
+                    f"{sorted(kv_caches.keys())}")
+            kv_caches[swa_layer_name] = kv_caches[host_layer_name]
+        if swa_overlay:
+            logger.info(
+                "DeepSeek-V4 SWA cache overlay: %d of %d sliding-window "
+                "caches share a compressed-KV array; the rest have their own.",
+                len(swa_overlay),
+                sum(1 for name in kv_caches
+                    if self._is_ds_v4_swa_layer(name, per_layer_spec(name))))
+        self._alias_ds_v4_auxiliary_caches(kv_caches, aux_overlay,
+                                           per_layer_spec)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -4951,9 +5241,14 @@ class TPUModelRunner(GPUModelRunner):
             self._initialize_unified_kv_cache(kv_cache_config)
             return
 
-        attn_block_size = None
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                # DSv4: each group's spec wraps that type's per-layer specs
+                # (one wrapper for MLA, one per SWA window class); unwrap one
+                # for the type checks. Block size differs across groups
+                # (SWA 256 vs MLA 1024), so it is not asserted uniform here.
+                spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
                 # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
                 continue
@@ -4962,11 +5257,6 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
                 )
-
-            block_size = spec.block_size
-            if attn_block_size is None:
-                attn_block_size = block_size
-            assert attn_block_size == block_size, "Block size across attention groups must be the same."
 
         block_sizes = [
             group.kv_cache_spec.block_size
@@ -5027,7 +5317,20 @@ class TPUModelRunner(GPUModelRunner):
                 return spec.kv_cache_specs[layer_name]
             return spec
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        # DSv4's packed layout and cache overlays are handled entirely in
+        # `_initialize_ds_v4_kv_cache`, so the loop below stays DSv4-free.
+        # TODO(patemotter): replace per-model flags (`_unified_kv_layout`,
+        # `_is_ds_v4`) with per-layout allocation dispatch around a shared tail.
+        _is_ds_v4 = any(
+            is_cache_for_ds_v4(module) for module in self.vllm_config.
+            compilation_config.static_forward_context.values())
+        if _is_ds_v4:
+            self._initialize_ds_v4_kv_cache(kv_cache_config, _per_layer_spec,
+                                            kv_caches,
+                                            kv_cache_config.num_blocks)
+
+        for kv_cache_tensor in ([] if _is_ds_v4 else
+                                kv_cache_config.kv_cache_tensors):
             # If the KV cache tensor is shared by multiple layers, then we
             # duplicate cache for each layer and `num_blocks` is calculated
             # based on the total size of the shared cache.
@@ -5186,6 +5489,9 @@ class TPUModelRunner(GPUModelRunner):
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.
+        # Rebuild custom attention ops here too: only now are block sizes final.
+        self._initialize_attention_kernels(force=True)
+
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
 
@@ -5360,63 +5666,6 @@ class TPUModelRunner(GPUModelRunner):
             logprob_token_ids=logprob_token_ids.to(torch.int32),
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
-        )
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def structured_decode(
-        self,
-        require_struct_decoding: torch.Tensor,
-        grammar_bitmask: torch.Tensor,
-        logits: torch.Tensor,
-        arange: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.where(
-            require_struct_decoding,
-            self.apply_grammar_bitmask(logits, grammar_bitmask, arange),
-            logits,
-        )
-
-    def apply_grammar_bitmask(self, logits: torch.Tensor,
-                              grammar_bitmask: torch.Tensor,
-                              arange: torch.Tensor):
-        assert logits.shape[0] == grammar_bitmask.shape[0]
-        logits_cloned = logits.clone()
-        for i in range(logits.shape[0]):
-            unpacked_bitmask = (torch.bitwise_right_shift(
-                grammar_bitmask[i][:, None], arange[None, :])
-                                & 1) == 0
-            unpacked_bitmask = unpacked_bitmask.reshape(-1)[:self.vocab_size]
-            logits_cloned[i] = logits_cloned[i].masked_fill(
-                unpacked_bitmask, -float("inf"))
-        return logits_cloned
-
-    def prepare_structured_decoding_input(
-        self, logits: torch.Tensor, grammar_output: "GrammarOutput"
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        grammar_bitmask = grammar_output.grammar_bitmask
-        num_reqs, _ = logits.shape
-
-        # Reset pre-allocated tensors
-        self.grammar_bitmask_cpu.zero_()
-        self.require_structured_out_cpu.zero_()
-
-        cumulative_mask_idx = 0
-        for req_id in grammar_output.structured_output_request_ids:
-            if req_id not in self.input_batch.req_id_to_index:
-                continue
-            batch_index = self.input_batch.req_id_to_index[req_id]
-            self.grammar_bitmask_cpu[batch_index] = torch.from_numpy(
-                grammar_bitmask[cumulative_mask_idx])
-            # It's not guaranteed that all requests in this batch require
-            # structured output, so create a bool tensor to represent
-            # the requests that need structured output.
-            self.require_structured_out_cpu[batch_index] = True
-            cumulative_mask_idx += 1
-
-        return (
-            self.require_structured_out_cpu[:num_reqs].to(logits.device),
-            self.grammar_bitmask_cpu[:num_reqs].to(logits.device),
-            self.structured_decode_arange.to(logits.device),
         )
 
 

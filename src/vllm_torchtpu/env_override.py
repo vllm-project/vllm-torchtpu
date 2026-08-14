@@ -3,6 +3,19 @@
 
 import os
 
+# Configure TorchTPU compilation cache environment variables directly
+if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
+    # Enable Tier-2 cache in memory (required by Tier-3)
+    os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE",
+                          "tpu_tier2_cache")
+    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
+                          os.environ["TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"])
+    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
+                          "tpu_tier2_cache")
+
+# Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
+os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+
 # Disable CUDA-specific shared experts stream for TPU
 # This prevents errors when trying to create CUDA streams on TPU hardware
 # The issue was introduced by vllm-project/vllm#26440
@@ -16,6 +29,11 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 # is safe and required for Tensor Parallelism.
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
                       "false")
+
+# vLLM 0.27.0 auto-enables breakable cudagraph for Kimi K3, disabling its
+# torch.compile pipeline. TPU does not support CUDA graphs and requires that
+# pipeline, so force the flag off before VllmConfig initialization.
+os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
 
 # Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
 # transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
@@ -223,18 +241,3 @@ def _patch_jax_pallas_fori_lowering() -> None:
 
 
 _patch_jax_pallas_fori_lowering()
-
-# Map VLLM_XLA_CACHE_PATH to TorchTPU compilation cache environment variables
-vllm_xla_cache_path = os.getenv("VLLM_XLA_CACHE_PATH")
-if vllm_xla_cache_path:
-    # Route Tier-3 native cache to a subdirectory under VLLM_XLA_CACHE_PATH
-    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
-                          os.path.join(vllm_xla_cache_path, "torch_tpu_tier3"))
-    os.environ.setdefault("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
-                          os.path.join(vllm_xla_cache_path, "torch_tpu_tier3"))
-
-    # Enable Tier-2 cache in memory (required by Tier-3)
-    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
-                          "tpu_tier2_cache")
-    os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE",
-                          "tpu_tier2_cache")

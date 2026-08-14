@@ -138,6 +138,7 @@ BASE_CMD="sudo bash ${REMOTE_SCRIPT_PATH_Q} \
     ${HF_CACHE_PATH_Q} \
     -e HF_TOKEN=${HF_TOKEN_Q} \
     -e TPU_MULTIHOST_BACKEND=ray \
+    -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 \
     -e JAX_PLATFORMS=''"
 
 # Head Node (connects via SSH IP, runs command with internal IP)

@@ -55,3 +55,10 @@ steps:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh"
         artifact_paths:
           - "perf_eval_results/**/*"
+
+      - label: "Integration: compilation-cache-e2e"
+        key: "integration_compilation_cache_e2e"
+        agents:
+          queue: "tpu_v7x_2_queue"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh"

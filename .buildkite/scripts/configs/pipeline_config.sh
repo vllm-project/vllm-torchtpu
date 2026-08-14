@@ -15,13 +15,13 @@
 
 # Priority constants for pipeline jobs.
 # Post-merge > Pre-merge > Integration pipeline > Benchmark > Other/Default > Nightly
-export PRIORITY_POST_MERGE=10
-export PRIORITY_PRE_MERGE=5
-export PRIORITY_INTEGRATION=3
-export PRIORITY_BENCHMARK=2
-export PRIORITY_DEFAULT=1
-export PRIORITY_NIGHTLY=0
-export PRIORITY_KERNEL_TUNING=-10
+export PRIORITY_POST_MERGE=11
+export PRIORITY_PRE_MERGE=6
+export PRIORITY_INTEGRATION=4
+export PRIORITY_BENCHMARK=3
+export PRIORITY_DEFAULT=2
+export PRIORITY_NIGHTLY=1
+export PRIORITY_KERNEL_TUNING=-9
 
 # Implemented dynamic job prioritization by injecting integers during upload
 upload_with_priority() {

@@ -423,8 +423,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    def test_multimodal_forces_disable_chunked_mm_input(
-            self, mock_prepare_env, mock_apply_patches, vllm_config):
+    def test_multimodal_keeps_chunked_mm_input(self, mock_prepare_env,
+                                               mock_apply_patches,
+                                               vllm_config):
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=False, limit_per_prompt={"image": 1})
         vllm_config.cache_config.block_size = 16
@@ -433,7 +434,7 @@ class TestTpuPlatform:
 
         TpuPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+        assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
     def test_get_tpu_multihost_topology(self, monkeypatch):
         # Test env override via TORCH_TPU_TOPOLOGY
@@ -531,3 +532,29 @@ class TestPhasedProfilingConfigValidation:
         monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
 
         _validate_phased_profiling_config(self._config())
+
+
+def test_config_hook_registers_tpu_kv_connectors_by_name():
+    """Verify TPU KV connectors are registered in the factory by name idempotently.
+
+    When loaded dynamically via module paths, connectors are not registered by name
+    in KVConnectorFactory. However, the API server's multi-connector metrics path resolves
+    child connectors via get_connector_class_by_name().
+
+    This test verifies that _register_tpu_kv_connectors() populates the name registry
+    safely across repeated invocations without raising duplicate-registration errors.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    from vllm_torchtpu.platforms.tpu_platform import \
+        _register_tpu_kv_connectors
+
+    _register_tpu_kv_connectors()
+    _register_tpu_kv_connectors(
+    )  # Idempotent: repeated registrations must succeed.
+
+    for name in ("TPURaidenConnector", "TPUMultiConnector",
+                 "TPURaidenOffloadingConnector"):
+        cls = KVConnectorFactory.get_connector_class_by_name(name)
+        assert cls.__name__ == name

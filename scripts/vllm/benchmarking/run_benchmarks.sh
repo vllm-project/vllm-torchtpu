@@ -12,7 +12,7 @@
 #
 # Available configs (in scripts/vllm/benchmarking/configs/):
 #   qwen3-coder-480b-fp8-tp8-ep  - Nightly target (TP=8, EP, FP8)
-#   qwen3-coder-30b-tp8-ep       - Guard: Qwen3-Coder-30B-A3B-Instruct (TP=8, EP)
+#   qwen3-coder-30b-tp8-ep       - Nightly: Qwen3-Coder-30B-A3B-Instruct (TP=8, EP)
 #   qwen3-coder-30b-fp8-tp8-ep   - Guard: Qwen3-Coder-30B-A3B-Instruct-FP8 (TP=8, EP)
 #
 # Profiler capture (diagnostic only):
@@ -101,6 +101,12 @@ fi
 
 # Defaults (config can override)
 MODEL=""
+# Optional gs:// (or s3://) checkpoint URI. When set, the server streams
+# weights from object storage via --load-format runai_streamer and serves
+# under the MODEL name (for hosts without an attached disk, e.g.
+# tpu_v7x_16_queue). Clients keep using MODEL. Env-overridable so CI can
+# resolve the snapshot path at runtime.
+MODEL_URI="${MODEL_URI:-}"
 TENSOR_PARALLELISM=1
 DATA_PARALLELISM=1
 ENABLE_EP=false
@@ -235,7 +241,12 @@ start_vllm_server() {
         prefix_caching_flag="--enable-prefix-caching"
     fi
     local kv_cache_dtype="${KV_CACHE_DTYPE:-fp8}"
-    local server_cmd="vllm serve ${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
+    local serve_target="$MODEL"
+    if [ -n "$MODEL_URI" ]; then
+        serve_target="$MODEL_URI"
+        extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
+    fi
+    local server_cmd="vllm serve ${serve_target} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
 
     echo ""
     echo "================================================"
@@ -409,11 +420,17 @@ if [ -n "$BENCHMARK_TEMPERATURE" ]; then
 else
     benchmark_temperature_json=null
 fi
+if [ -n "$MODEL_URI" ]; then
+    model_uri_json="\"$MODEL_URI\""
+else
+    model_uri_json=null
+fi
 
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
 {
     "model": "$MODEL",
+    "model_uri": $model_uri_json,
     "tensor_parallelism": $TENSOR_PARALLELISM,
     "data_parallelism": $DATA_PARALLELISM,
     "enable_ep": $ENABLE_EP,

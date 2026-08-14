@@ -116,13 +116,6 @@ def _build_layer_and_method(device):
             params_dtype=torch.bfloat16,
         )
 
-        # Populate staging buffers as left by _dsv4_weight_loader.
-        layer.w1_temp.copy_(
-            torch.randint(0, 256, layer.w1_temp.shape, dtype=torch.uint8))
-        layer.w3_temp.copy_(
-            torch.randint(0, 256, layer.w3_temp.shape, dtype=torch.uint8))
-        layer.w2_temp.copy_(
-            torch.randint(0, 256, layer.w2_temp.shape, dtype=torch.uint8))
         # Reassign CPU-created Parameters onto target TPU device.
         layer.w13_weight = torch.nn.Parameter(torch.randint(
             0, 256, layer.w13_weight.shape, dtype=torch.uint8).to(device),

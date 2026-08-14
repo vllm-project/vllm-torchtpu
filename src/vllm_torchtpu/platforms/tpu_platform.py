@@ -153,13 +153,7 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_patches_applied = False
-
-
-def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
-    multimodal_config = model_config.multimodal_config
-    if multimodal_config is None:
-        return False
-    return bool(multimodal_config.language_model_only)
+_tpu_kv_connectors_registered = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -274,6 +268,39 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
             "--profiler-config.torch_profiler_dir=<dir>.")
 
 
+def _register_tpu_kv_connectors() -> None:
+    """Register TPU-specific KV connectors in vLLM's factory name registry.
+
+    Ensures connectors loaded dynamically via module paths (e.g., TPURaidenConnector,
+    TPUMultiConnector, TPURaidenOffloadingConnector) are discoverable by name.
+
+    Required for the API server metrics pipeline: TPUMultiConnector aggregates child
+    connector statistics by looking up classes via get_connector_class_by_name().
+    Without registry registration, the first metrics collection triggers an unhandled
+    exception in the AsyncLLM output handler, causing HTTP 500 errors on subsequent requests.
+
+    Invoked from check_and_update_config() in every process that builds a VllmConfig
+    (including the API server). Defers imports lazily until connector names are accessed.
+    """
+    global _tpu_kv_connectors_registered
+    if _tpu_kv_connectors_registered:
+        return
+    _tpu_kv_connectors_registered = True
+
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    for name, module_path in (
+        ("TPURaidenConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
+        ("TPUMultiConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"),
+        ("TPURaidenOffloadingConnector",
+         "vllm_torchtpu.offload.raiden_connector"),
+    ):
+        KVConnectorFactory.register_connector(name, module_path, name)
+
+
 def apply_tpu_patches() -> None:
     """Apply all module-level patches required for TorchTPU.
 
@@ -292,6 +319,7 @@ def apply_tpu_patches() -> None:
                                _patch_moe_explicit_pcp_collectives,
                                _patch_moe_no_ep_tp_scope,
                                _patch_rowparallel_defer_bias,
+                               _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
                                _patch_vllm_hybrid_producer_prefix_hits,
                                _patch_vllm_tpu_group_custom_ops)
@@ -310,6 +338,7 @@ def apply_tpu_patches() -> None:
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
     _patch_vllm_disable_compile_ranges()
+    _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
@@ -567,7 +596,8 @@ class TpuPlatform(Platform):
     _is_hybrid: bool = False
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4",
+        "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
     additional_env_vars: list[str] = [
@@ -728,6 +758,7 @@ class TpuPlatform(Platform):
         _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
+        _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -850,11 +881,6 @@ class TpuPlatform(Platform):
                     ensure_pcp_local_rank_remap(
                         parallel_config.world_size_across_dp,
                         get_topology=cls._get_tpu_topology)
-                # Single-host DP uses one torch_tpu slice across all DP*TP
-                # workers; the worker spawn shim exposes a DP-adjusted chip
-                # ordinal to TorchTPU for physical binding.
-                cls.device_control_env_var = \
-                    "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
@@ -867,7 +893,14 @@ class TpuPlatform(Platform):
                     parallel_config.data_parallel_master_ip or "localhost")
                 os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT",
                                       str(portpicker.pick_unused_port()))
-                # Full-slice slicebuilder list + topology (TP*PP*DP), once.
+                if parallel_config.enable_expert_parallel:
+                    # EP's expert-combine collective genuinely spans every
+                    # DP*TP worker, so torch_tpu needs one shared slice
+                    # across all of them; the worker spawn shim exposes a
+                    # DP-adjusted chip ordinal to TorchTPU for physical
+                    # binding.
+                    cls.device_control_env_var = \
+                        "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                 cls._prepare_singlehost_tpu_env(
                     parallel_config.world_size_across_dp)
             else:
@@ -929,14 +962,6 @@ class TpuPlatform(Platform):
                 "Using uniproc_executor.")
             parallel_config.distributed_executor_backend = "uni"
 
-        if (scheduler_config.is_multimodal_model
-                and not _is_language_model_only_config(model_config)
-                and not scheduler_config.disable_chunked_mm_input):
-            logger.warning("TPU does not support running Multimodal models"\
-            " without setting `--disable_chunked_mm_input`. " \
-            "Forcing --disable_chunked_mm_input.")
-            scheduler_config.disable_chunked_mm_input = True
-
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
             if scheduler_config.scheduler_cls != dp_sched_cls:
@@ -955,6 +980,7 @@ class TpuPlatform(Platform):
                 "TPURaidenConnector",
                 "TPUMultiConnector",
                 "OffloadingConnector",
+                "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
                 _TPU_SUPPORTED_KV_CONNECTORS, (
@@ -963,15 +989,17 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    == "OffloadingConnector" and is_hybrid)
+                                    in ("OffloadingConnector",
+                                        "TPURaidenOffloadingConnector")
+                                    and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):
-                # Hybrid CPU offloading transfers whole pool rows; the
-                # typed-view layout has no uniform per-block row to copy.
+                # Hybrid model offloading transfers uniform pool rows; the non-unified
+                # typed-view layout lacks a common per-block stride for DMA copies.
                 raise ValueError(
-                    "CPU offloading (OffloadingConnector) on hybrid "
-                    "attention+Mamba models requires the unified block "
-                    "pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+                    f"CPU offloading ({kv_transfer_config.kv_connector}) "
+                    "on hybrid attention+Mamba models requires the unified "
+                    "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
@@ -981,11 +1009,25 @@ class TpuPlatform(Platform):
         if backend_cls is None:
             return
 
-        is_hybrid = vllm_config.model_config.is_hybrid
-        if not is_hybrid and not cache_config.user_specified_block_size:
-            default = backend_cls.get_page_size(vllm_config)
+        architectures = getattr(
+            getattr(vllm_config.model_config, "hf_config", None),
+            "architectures", None) or []
+        is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+
+        if is_ds_v4 and not cache_config.user_specified_block_size:
+            # DSv4 pages hold compressed rows. Its backend's
+            # get_preferred_block_size is a hardcoded 256, which does not fit
+            # the packed latent record, so take the MLA page size directly.
+            from vllm_torchtpu.layers.vllm.attention import \
+                PallasMLAttentionBackend
             cache_config.block_size = (  # type: ignore[assignment]
-                backend_cls.get_preferred_block_size(default))
+                PallasMLAttentionBackend.get_page_size(vllm_config))
+        else:
+            is_hybrid = vllm_config.model_config.is_hybrid
+            if not is_hybrid and not cache_config.user_specified_block_size:
+                default = backend_cls.get_page_size(vllm_config)
+                cache_config.block_size = (  # type: ignore[assignment]
+                    backend_cls.get_preferred_block_size(default))
         if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 

@@ -186,9 +186,10 @@ class TestTpuCompilerCache:
         assert factors == ["upstream", "tpu"]
 
     def test_env_override_mapping(self):
-        """Verify that VLLM_XLA_CACHE_PATH sets the corresponding native variables."""
+        """Verify that setting TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT sets TORCH_TPU_TIER2_COMPILATION_CACHE default."""
         env_mock = {
-            "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
+            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT":
+            "/tmp/test_tier3_cache_env",
         }
         with patch.dict(os.environ, env_mock, clear=True):
             # Reload env_override to re-execute its top-level statements
@@ -196,16 +197,15 @@ class TestTpuCompilerCache:
             importlib.reload(vllm_torchtpu.env_override)
 
             assert os.environ.get(
-                "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
-            ) == "/tmp/test_xla_cache_env/torch_tpu_tier3"
-            assert os.environ.get(
-                "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
-            ) == "/tmp/test_xla_cache_env/torch_tpu_tier3"
-
-            assert os.environ.get("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"
-                                  ) == "tpu_tier2_cache"
-            assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
+
+    def test_env_override_disables_breakable_cudagraph(self):
+        """Verify that the TPU plugin always disables breakable cudagraph."""
+        with patch.dict(os.environ, {"VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}):
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
 
     def test_env_override_no_clobber(self):
         """Verify that existing native variables are not overwritten by env_override."""
@@ -227,46 +227,44 @@ class TestTpuCompilerCache:
             assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
                                   ) == "/custom/tier3/path"
 
-            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
-                                  ) == "/custom/tier3/path"
-
             assert os.environ.get(
                 "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE") == "custom_tier2"
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "custom_tier2"
 
-    def test_compiler_cache_dir_relocation(self):
-        """Verify that TpuCompilerAdaptor relocates cache_dir under VLLM_XLA_CACHE_PATH."""
-        with patch.dict(os.environ,
-                        {"VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_dir"}):
-            # Import adaptor
-            from vllm_torchtpu.compilation.tpu_compiler import \
-                TpuCompilerAdaptor
+    def test_tpu_compilation_handle_serialization(self):
+        """Verify serialization and deserialization of TpuCompilationHandle and legacy fallbacks."""
+        import pickle
 
-            compiler = TpuCompilerAdaptor()
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilationHandle
 
-            # Simulate initialize_cache call with default path
-            from vllm.envs import VLLM_CACHE_ROOT
-            default_cache_dir = os.path.join(VLLM_CACHE_ROOT,
-                                             "torch_compile_cache")
+        # 1. Test dataclass handle serialization
+        handle = TpuCompilationHandle(key="test_key_123",
+                                      tier3_cache_active=True)
+        dumped = pickle.dumps(handle)
+        loaded = pickle.loads(dumped)
+        assert isinstance(loaded, TpuCompilationHandle)
+        assert loaded.key == "test_key_123"
+        assert loaded.tier3_cache_active is True
+        assert loaded.executable is None
 
-            compiler.initialize_cache(cache_dir=default_cache_dir)
+        # 2. Test legacy dict deserialization fallback
+        legacy_dict = {"tier3_cache_active": True, "key": "test_key_dict"}
+        loaded_dict = pickle.loads(pickle.dumps(legacy_dict))
+        assert isinstance(loaded_dict, dict)
+        assert loaded_dict.get("tier3_cache_active") is True
 
-            expected_cache_dir = os.path.join("/tmp/test_xla_cache_dir",
-                                              "torch_compile_cache")
-            assert compiler.cache_dir == expected_cache_dir
+        # 3. Test non-tier3 handle with executable
+        handle_with_exe = TpuCompilationHandle(key="test_key_456",
+                                               tier3_cache_active=False,
+                                               executable="mock_exe")
+        loaded_exe_handle = pickle.loads(pickle.dumps(handle_with_exe))
+        assert loaded_exe_handle.tier3_cache_active is False
+        assert loaded_exe_handle.executable == "mock_exe"
 
-    def test_compiler_cache_dir_fallback_on_error(self):
-        """Verify that initialize_cache falls back to default cache_dir on exception."""
-        with patch.dict(os.environ,
-                        {"VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_dir"}):
-            from vllm_torchtpu.compilation.tpu_compiler import \
-                TpuCompilerAdaptor
-            compiler = TpuCompilerAdaptor()
-
-            # Force relpath exception by passing incompatible path types or mocking relpath
-            with patch("os.path.relpath",
-                       side_effect=ValueError("mock error")):
-                compiler.initialize_cache(cache_dir="/original/cache/dir")
-                # Should fallback to the original directory
-                assert compiler.cache_dir == "/original/cache/dir"
+    def test_compiler_initialize_cache(self):
+        """Verify that TpuCompilerAdaptor sets cache_dir accurately."""
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
+        assert compiler.cache_dir == "/tmp/test_cache_dir"

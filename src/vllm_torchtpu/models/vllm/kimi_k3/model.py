@@ -1,30 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Text-only Kimi K3 and Kimi-Linear model."""
+"""Kimi K3 and Kimi-Linear models for TPU."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import cast
+from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch_tpu._internal import sync
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.fused_moe import \
     fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc, MambaStateCopyFuncCalculator,
-    MambaStateDtypeCalculator, MambaStateShapeCalculator)
+    MambaStateDtypeCalculator)
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors import \
+    compressed_tensors
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
+from vllm.model_executor.models import vision as vision_utils
+from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid,
+                                                   SupportsMultiModal,
+                                                   SupportsQuant)
+from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
+from vllm.model_executor.models.kimi_k25_vit import (
+    KimiK25MultiModalProjector, vision_tower_forward)
 from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
+                                              _flatten_embeddings,
+                                              init_vllm_registered_model,
                                               maybe_prefix)
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.models.kimi_k3.common.mm_preprocess import (
+    KimiK3DummyInputsBuilder, KimiK3MultiModalProcessor, KimiK3ProcessingInfo)
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import NestedTensors
+from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention
+from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
 
@@ -220,6 +244,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         ".q_a_proj.": (".fused_qkv_a_proj.", 0),
         ".kv_a_proj_with_mqa.": (".fused_qkv_a_proj.", 1),
     }, )
+    fused_attention_params_mapping = (
+        (".self_attn.q_proj.", ".self_attn.fused_qkvb_proj.", 0),
+        (".self_attn.k_proj.", ".self_attn.fused_qkvb_proj.", 1),
+        (".self_attn.v_proj.", ".self_attn.fused_qkvb_proj.", 2),
+        (".self_attn.b_proj.", ".self_attn.fused_qkvb_proj.", 3),
+        (".self_attn.f_a_proj.", ".self_attn.fused_fa_ga_proj.", 0),
+        (".self_attn.g_a_proj.", ".self_attn.fused_fa_ga_proj.", 1),
+        (".self_attn.g_proj.", ".self_attn.fused_qkv_a_proj.", 2),
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -272,16 +305,16 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
         config: KimiLinearConfig = vllm_config.model_config.hf_text_config
         kda_config = config.linear_attn_config
         assert kda_config is not None
-        return MambaStateShapeCalculator.kda_state_shape(
-            vllm_config.parallel_config.tensor_parallel_size,
-            kda_config["num_heads"],
-            kda_config["head_dim"],
-            conv_kernel_size=kda_config["short_conv_kernel_size"],
-            num_spec=0,
+        local_heads = (kda_config["num_heads"] //
+                       vllm_config.parallel_config.tensor_parallel_size)
+        return (
+            (kda_config["short_conv_kernel_size"] - 1, 3, local_heads,
+             kda_config["head_dim"]),
+            (local_heads, kda_config["head_dim"], kda_config["head_dim"]),
         )
 
     @classmethod
@@ -320,6 +353,17 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 if experts_use_weight and name.endswith(".weight_packed"):
                     name = name.replace(".weight_packed", ".weight")
 
+                for (weight_name, param_name,
+                     shard_id) in self.fused_attention_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    candidate = name.replace(weight_name, param_name)
+                    if candidate not in params_dict:
+                        continue
+                    name = candidate
+                    loaded_weight.shard_id = shard_id
+                    break
+
                 for (param_name, weight_name, expert_id,
                      expert_shard_id) in expert_params_mapping:
                     if weight_name not in name:
@@ -347,3 +391,247 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # loaded_experts is complete when the union is taken.
         ordinary_loaded = loader.load_weights(_ordinary_weights())
         return loaded_experts | ordinary_loaded
+
+
+def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Gather a materialized encoder output without leaving the TPU."""
+    materialized = torch.empty_like(input_).copy_(input_)
+    sync.synchronize(materialized, wait=True)
+    gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
+    sync.synchronize(gathered, wait=True)
+    return gathered
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    KimiK3MultiModalProcessor,
+    info=KimiK3ProcessingInfo,
+    dummy_inputs=KimiK3DummyInputsBuilder,
+)
+class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
+                                     SupportsQuant, HasInnerState, IsHybrid):
+    """Kimi-K3 with upstream preprocessing and TPU model execution."""
+
+    supports_encoder_tp_data = True
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "language_model.layers.": "language_model.model.layers.",
+            "mm_projector.proj.0": "mm_projector.linear_1",
+            "mm_projector.proj.2": "mm_projector.linear_2",
+        })
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        del i
+        if modality == "image":
+            return "<|kimi_image_placeholder|>"
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        model_config = vllm_config.model_config
+        config: KimiK3Config = model_config.hf_config
+        if model_config.multimodal_config is None:
+            raise ValueError(
+                "KimiK3ForConditionalGeneration requires multimodal config")
+
+        self.config = config
+        self.hidden_size = config.text_config.hidden_size
+        self.device = current_platform.current_device()
+        self.use_data_parallel = is_vit_use_data_parallel(
+            config.vision_config.num_attention_heads)
+
+        vision_quant_config = self._maybe_ignore_quant_config(
+            vllm_config.quant_config)
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_tower = KimiK3MoonViT3dPretrainedModel(
+                config.vision_config,
+                quant_config=vision_quant_config,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
+            if vision_quant_config is None:
+                self.vision_tower = self.vision_tower.to(
+                    device=self.device, dtype=model_config.dtype)
+            else:
+                self.vision_tower = self.vision_tower.to(device=self.device)
+
+            self.mm_projector = KimiK25MultiModalProjector(
+                config=config.vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=vision_quant_config,
+                prefix=maybe_prefix(prefix, "mm_projector"),
+            )
+            self.mm_projector = self.mm_projector.to(device=self.device,
+                                                     dtype=model_config.dtype)
+
+        self.quant_config = vllm_config.quant_config
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["KimiLinearForCausalLM"],
+            )
+        self.media_placeholder = config.media_placeholder_token_id
+
+    @staticmethod
+    def _maybe_ignore_quant_config(
+        quant_config: QuantizationConfig | None,
+    ) -> QuantizationConfig | None:
+        if isinstance(quant_config,
+                      compressed_tensors.CompressedTensorsConfig):
+            return None
+        return quant_config
+
+    def _parse_and_validate_media_input(
+            self, **kwargs: object) -> KimiK25MediaPixelInputs | None:
+        pixel_values = kwargs.pop("pixel_values", None)
+        grid_thws = kwargs.pop("grid_thws", None)
+        if pixel_values is None:
+            return None
+
+        if isinstance(pixel_values, list):
+            pixel_values = torch.cat(cast(list[torch.Tensor], pixel_values),
+                                     dim=0)
+        if not isinstance(pixel_values, torch.Tensor):
+            raise TypeError(
+                "pixel_values must be a tensor or list of tensors, "
+                f"got {type(pixel_values)}")
+
+        if pixel_values.ndim in (3, 5):
+            pixel_values = pixel_values.reshape(
+                pixel_values.shape[0] * pixel_values.shape[1],
+                *pixel_values.shape[2:])
+        pixel_values = pixel_values.to(
+            dtype=next(self.vision_tower.parameters()).dtype)
+
+        if not isinstance(grid_thws, torch.Tensor):
+            raise TypeError(
+                f"grid_thws must be a tensor, got {type(grid_thws)}")
+        grid_thws = grid_thws.reshape(-1, grid_thws.shape[-1])
+        if grid_thws.ndim != 2 or grid_thws.shape[1] != 3:
+            raise ValueError(f"unexpected grid_thws shape: {grid_thws.shape}")
+
+        return KimiK25MediaPixelInputs(type="pixel_values",
+                                       pixel_values=pixel_values,
+                                       grid_thws=grid_thws)
+
+    def embed_multimodal(self, **kwargs: object) -> NestedTensors | None:
+        media_input = self._parse_and_validate_media_input(**kwargs)
+        if media_input is None:
+            return None
+        if self.use_data_parallel:
+            # Keep upstream's DP sharding/reassembly, but isolate its TPU
+            # collective from the rank-local lazy encoder graphs.
+            with patch.object(
+                    vision_utils,
+                    "tensor_model_parallel_all_gather",
+                    _tpu_tp_all_gather,
+            ):
+                return vision_tower_forward(
+                    self.vision_tower,
+                    media_input["pixel_values"],
+                    media_input["grid_thws"],
+                    mm_projector=self.mm_projector,
+                    use_data_parallel=True,
+                )
+        return vision_tower_forward(
+            self.vision_tower,
+            media_input["pixel_values"],
+            media_input["grid_thws"],
+            mm_projector=self.mm_projector,
+            use_data_parallel=False,
+        )
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: NestedTensors | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self._embed_text_input_ids(
+            input_ids,
+            self.get_language_model().embed_input_ids,
+            is_multimodal=is_multimodal,
+        )
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+        if is_multimodal is None:
+            raise ValueError(
+                "is_multimodal is required when merging vision embeddings")
+
+        mm_embeds = _flatten_embeddings(multimodal_embeddings).to(
+            device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        mask_cpu = is_multimodal.detach().reshape(-1).to(device="cpu",
+                                                         dtype=torch.bool)
+        expected = int(mask_cpu.sum().item())
+        actual = mm_embeds.shape[0]
+        if actual != expected:
+            raise ValueError(
+                f"Attempted to assign {actual} multimodal tokens to "
+                f"{expected} placeholders")
+        if actual == 0:
+            return inputs_embeds
+
+        media_indices_cpu = mask_cpu.to(torch.int64).cumsum(0).sub_(1)
+        media_indices_cpu.clamp_(min=0)
+        media_indices = media_indices_cpu.to(device=inputs_embeds.device)
+        aligned_media = mm_embeds.index_select(0, media_indices)
+        mask = is_multimodal.reshape(-1, 1).to(device=inputs_embeds.device,
+                                               dtype=torch.bool)
+        merged = torch.where(mask, aligned_media, inputs_embeds)
+        if merged.device.type != "tpu":
+            return merged
+
+        materialized = torch.empty_like(merged).copy_(merged)
+        sync.synchronize(materialized, wait=True)
+        return materialized
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        del kwargs
+        return self.language_model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       **kwargs: object) -> torch.Tensor | None:
+        del kwargs
+        return self.language_model.compute_logits(hidden_states)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: VllmConfig,
+    ) -> tuple[torch.dtype, torch.dtype]:
+        text_config = vllm_config.model_config.hf_config.text_config
+        return KimiLinearForCausalLM.get_mamba_state_dtype_from_config(
+            vllm_config.with_hf_config(text_config))
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls,
+        vllm_config: VllmConfig,
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        text_config = vllm_config.model_config.hf_config.text_config
+        return KimiLinearForCausalLM.get_mamba_state_shape_from_config(
+            vllm_config.with_hf_config(text_config))
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        return KimiLinearForCausalLM.get_mamba_state_copy_func()
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

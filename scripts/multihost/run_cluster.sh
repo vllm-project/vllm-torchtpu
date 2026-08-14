@@ -91,13 +91,16 @@ fi
 # Launch the container with the assembled parameters.
 # --privileged: Grants extended privileges to the container for TPU exposure
 # --network host: Allows Ray nodes to communicate directly via host networking
-# --shm-size=16G: Increases shared memory
+# --shm-size=128G: shared memory; the torch_tpu compile cache lives in
+# /dev/shm/torch_tpu_cache and every DP engine caches its own compiled
+# graph set — 16G overflows at DP>=4 on GLM-5.2 (RESOURCE_EXHAUSTED in
+# dev builds 171/172)
 # -v HF_HOME: Mounts HuggingFace cache to avoid re-downloading models
 docker run \
     --privileged \
     --entrypoint /bin/bash \
     --network host \
-    --shm-size=16G \
+    --shm-size=128G \
     --name "${CONTAINER_NAME}" \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
     "${ADDITIONAL_ARGS[@]}" \
