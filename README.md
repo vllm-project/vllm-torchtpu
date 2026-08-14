@@ -36,6 +36,15 @@ gcloud auth application-default login
 
 We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
 
+Notice that the separate local installation of `vllm` is optional. Follow
+those steps when one need to develop with `vllm` directly.
+
+`VLLM_TARGET_DEVICE="empty"` is a switch that defined and recognized by
+vLLM's build process. We use it since that `vllm-torchtpu` is an
+out-of-tree platform of the `vllm` product. We pass this variable during
+the installation of `vllm-torchtpu`, as we are building `vllm` wheel from
+source during this process.
+
 #### Option A: Using `uv` (Recommended)
 
 ```bash
@@ -51,18 +60,16 @@ uv tool install keyring --with keyrings.google-artifactregistry-auth
 # Use CPU Torch when building vLLM's editable TPU package.
 export UV_TORCH_BACKEND=cpu
 
+# Install vLLM-TorchTPU and dependencies
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e .
+
+# The rest are optional, only relevant when one we want to develop with vLLM simultaneously.
+
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
 
-# Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
-# plugin alongside vllm-torchtpu.
-sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
-
-# Install vLLM in editable mode (forcing the 0.27.0 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.27.0 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
-
-# Install vLLM-TorchTPU and dependencies
-uv pip install --pre -e .
+# Install vLLM in editable mode
+VLLM_TARGET_DEVICE="empty" uv pip install  --no-deps -e ../vllm
 ```
 
 #### Option B: Using `pip`
@@ -80,18 +87,16 @@ pip install keyring keyrings.google-artifactregistry-auth
 # Set the PIP_INDEX_URL environment variable (using keyring)
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
+# Install vLLM-TorchTPU and dependencies
+VLLM_TARGET_DEVICE="empty" pip install --pre -e .
+
+# The rest are optional, only relevant when one we want to develop with vLLM simultaneously.
+
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
 
-# Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
-# plugin alongside vllm-torchtpu.
-sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
-
-# Install vLLM in editable mode (forcing the 0.27.0 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.27.0 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
-
-# Install vLLM-TorchTPU and dependencies
-pip install --pre -e .
+# Install vLLM in editable mode
+VLLM_TARGET_DEVICE="empty" pip install --no-deps -e ../vllm
 ```
 
 > [!TIP]

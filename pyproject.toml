@@ -24,6 +24,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
+    # Note: we **intentionally** build vllm from source, see README.
     # vllm==0.27.0 is required for Kimi K3 compatibility
     "vllm @ git+https://github.com/vllm-project/vllm.git@v0.27.0",
     "torch==2.13.0",
