@@ -35,6 +35,21 @@ os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
 # pipeline, so force the flag off before VllmConfig initialization.
 os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
 
+# vLLM's "mega" AOT artifact is inductor-only by construction: it saves whatever
+# a runnable's serialize() returns but reloads it through
+# torch._inductor.standalone_compile.AOTCompiledArtifact.deserialize
+# (vllm/compilation/caching.py load_all), which an out-of-tree CompilerInterface
+# cannot produce without forging that format. So the artifact is written -- 689 MB
+# per rank on the 12-layer Qwen3.5-35B -- and always fails to load:
+#   "Compiling model again due to a load failure ..., reason: a bytes-like object
+#    is required, not 'BundledAOTAutogradResult'"
+# every start silently re-traces, and the 0-entry artifact the failed reload then
+# saves makes the *next* start raise TypeError. It defaults on for torch >= 2.12
+# (vllm/envs.py use_mega_aot_artifact). Our per-range executable cache already
+# persists the same bytes, keyed one entry per (compile range, subgraph), so
+# turning this off loses nothing and is what lets a warm start reuse them.
+os.environ.setdefault("VLLM_USE_MEGA_AOT_ARTIFACT", "0")
+
 # Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
 # transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
 # skips per-allocation DMA mapping on multi-process v7x workers
