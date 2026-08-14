@@ -35,7 +35,9 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
-from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
+                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -607,6 +609,15 @@ class TestTPURunner:
         self.runner._add_shared_kv_cache_aliases = (
             TPUModelRunner._add_shared_kv_cache_aliases.__get__(self.runner))
 
+        self._find_non_ssm_backend_patcher = patch.object(
+            TpuPlatform,
+            '_find_non_ssm_backend',
+            return_value=PallasAttentionBackend)
+        self._find_non_ssm_backend_patcher.start()
+
+    def teardown_method(self):
+        self._find_non_ssm_backend_patcher.stop()
+
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -936,6 +947,9 @@ class TestTPURunner:
             assert isinstance(mamba_spec, MambaSpec)
             assert mamba_spec.page_size_padded == expected_padded_size
 
+    @patch.object(TpuPlatform,
+                  '_find_non_ssm_backend',
+                  return_value=PallasMLAttentionBackend)
     @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
@@ -944,7 +958,8 @@ class TestTPURunner:
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
     def test_get_kv_cache_spec_mla_mamba_hybrid(self, mock_mem_info,
                                                 mock_get_page_size,
-                                                mock_get_layers):
+                                                mock_get_layers,
+                                                mock_find_non_ssm_backend):
         mock_mla = MagicMock(spec=MLAAttention)
         mock_mla.num_kv_heads = 1
         mock_mla.head_size = 576

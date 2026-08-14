@@ -5901,9 +5901,6 @@ class TPUModelRunner(GPUModelRunner):
                     dtype = kv_cache_spec.dtype
                     tpu_kv_cache = torch.zeros(kv_cache_shape,
                                                dtype=dtype).to(self.device)
-                    logger.info(
-                        f"{layer_name}: shape={tuple(tpu_kv_cache.shape)}, "
-                        f"dtype={tpu_kv_cache.dtype}, mesh={self.mesh}")
 
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
