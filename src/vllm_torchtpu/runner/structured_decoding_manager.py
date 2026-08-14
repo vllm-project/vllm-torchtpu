@@ -79,7 +79,6 @@ class StructuredDecodingManager:
             self.structured_decode_arange.to(logits.device),
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def structured_decode(
         self,
         require_struct_decoding: torch.Tensor,

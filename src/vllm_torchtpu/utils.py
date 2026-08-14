@@ -153,6 +153,9 @@ class HbmBudget(NamedTuple):
     available: int
 
 
+_KV_CACHE_BUDGET_ALIGNMENT_BYTES = 32 * 1024 * 1024  # 32 MiB alignment
+
+
 def compute_hbm_budget(devices: Any,
                        gpu_memory_utilization: float) -> HbmBudget:
     """Compute the HBM budget available for the KV cache."""
@@ -162,7 +165,10 @@ def compute_hbm_budget(devices: Any,
         total_used += limit_memory - free_memory
         total_limit += limit_memory
     cap = int(total_limit * gpu_memory_utilization)
-    available = cap - total_used
+    available = max(0, cap - total_used)
+    # Align available budget down to eliminate minor allocator jitter across runs
+    available = (available // _KV_CACHE_BUDGET_ALIGNMENT_BYTES
+                 ) * _KV_CACHE_BUDGET_ALIGNMENT_BYTES
 
     return HbmBudget(total_limit=total_limit,
                      total_used=total_used,

@@ -433,6 +433,10 @@ class TPUWorker(WorkerBase):
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
+        import gc
+        gc.collect()
+        torch.tpu.synchronize()
+
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         budget = utils.compute_hbm_budget(self.devices, gpu_memory_utilization)
 

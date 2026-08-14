@@ -172,12 +172,11 @@ fi
 echo "================================================================="
 echo "=== 🔍 [Test 4] Cache File & MD5 Consistency Check (Cold vs Warm)"
 echo "================================================================="
-# TODO(@maxwillzq): Tier-3 cache file non-deterministic diff is still under investigation.
-# Log warning rather than exiting with failure until zero-diff is fully resolved.
 if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt"; then
   echo "✅ [Test 4 PASSED] Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
 else
-  echo "⚠️ [Test 4 WARNING] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  echo "❌ [Test 4 FAILED] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  exit 1
 fi
 
 echo "================================================================="

@@ -131,7 +131,6 @@ class ExecuteModelState:
                                    | None] = field(default_factory=list)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
         input_ids: torch.Tensor, token_in_tpu_cur_input_indices: torch.Tensor,
         token_in_tpu_pre_next_tokens_indices: torch.Tensor,
@@ -4285,6 +4284,8 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_sample_from_logits(self) -> None:
+        torch.manual_seed(0)
+        torch.tpu.manual_seed_all(0)
         with self._precompile_timed("sample_from_logits"):
             for num_reqs in self.num_reqs_paddings:
                 dummy_logits = self._dummy_logits(num_reqs)
@@ -4292,7 +4293,7 @@ class TPUModelRunner(GPUModelRunner):
                     (num_reqs, 1),
                     dtype=self._hidden_states_dtype,
                     device=self.device)
-                dummy_u = torch.rand_like(dummy_logits)
+                dummy_u = torch.full_like(dummy_logits, 0.5)
                 dummy_top_k = torch.zeros((num_reqs, 1),
                                           dtype=torch.int32,
                                           device=self.device)
@@ -4473,15 +4474,8 @@ class TPUModelRunner(GPUModelRunner):
                         break
 
     def _precompile_sampling_subgraphs(self) -> None:
-        """Compile sampling-path subgraphs so their bottom-HBM reservations
-        are visible to vLLM's available-memory probe in profile_run."""
-        self._precompile_compute_selected_logits()
-        if (_get_sequence_layout_planner_for_runner(
-                self).uses_selected_logits_hidden_states):
-            self._precompile_compute_logits_from_hidden_states()
-        self._precompile_structured_decoding()
-        self._precompile_sample_from_logits()
-        self._precompile_gather_logprobs()
+        """Precompilation hook for sampling subgraphs if needed."""
+        pass
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
@@ -4500,8 +4494,6 @@ class TPUModelRunner(GPUModelRunner):
                                         self.num_reqs_most_model_len,
                                         self.num_blocks_per_most_len_req,
                                         use_max_model_len=False)
-
-            self._precompile_sampling_subgraphs()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
@@ -4856,28 +4848,31 @@ class TPUModelRunner(GPUModelRunner):
 
     @contextmanager
     def _profile_isolated_cache(self) -> Iterator[None]:
-        # Isolate the kv=0-specialized profile compile into a dedicated
-        # subdirectory ("profile_cache") so it can be cached across warm
-        # restarts without colliding with the real serving cache (kv > 0)
-        # or across different models / TP sizes / dtypes.
-        import hashlib
-
-        from vllm.compilation.caching import aot_compile_hash_factors
-
-        from vllm_torchtpu.compilation.tpu_compiler import \
-            compute_tpu_compilation_hash
+        # Isolate the kv=0-specialized profile compile into a throwaway
+        # temporary directory so it materializes activation memory on TPU
+        # without polluting persistent serving caches (vLLM or Tier-3).
+        import tempfile
         cc = self.vllm_config.compilation_config
-        base_cache_dir = cc.cache_dir or vllm_envs.VLLM_CACHE_ROOT
-        factors = aot_compile_hash_factors(self.vllm_config)
-        factors.append(compute_tpu_compilation_hash(self.vllm_config))
-        hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
         saved_cache_dir = cc.cache_dir
-        cc.cache_dir = os.path.join(base_cache_dir, "profile_cache", hash_key)
-        os.makedirs(cc.cache_dir, exist_ok=True)
-        try:
-            yield
-        finally:
-            cc.cache_dir = saved_cache_dir
+        saved_tier3 = os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cc.cache_dir = os.path.join(tmp_dir, "vllm_cache")
+            os.environ[
+                "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"] = os.path.join(
+                    tmp_dir, "tier3_cache")
+            os.makedirs(cc.cache_dir, exist_ok=True)
+            os.makedirs(os.environ["TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"],
+                        exist_ok=True)
+            try:
+                yield
+            finally:
+                cc.cache_dir = saved_cache_dir
+                if saved_tier3 is not None:
+                    os.environ[
+                        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"] = saved_tier3
+                else:
+                    os.environ.pop("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+                                   None)
 
     def profile_run(
         self,
@@ -4904,12 +4899,8 @@ class TPUModelRunner(GPUModelRunner):
 
             # Compile backbone here so XLA materializes the FP8 activation
             # slab; vLLM's post-probe sees the real HBM. Cache writes are
-            # disabled so the kv=0-specialized graph never lands in the
-            # persistent serving cache. Compile only the max token bucket:
-            # every program loaded on the TPU holds a permanent bottom-of-HBM
-            # program-region reservation, and the kv=0-specialized graphs are
-            # dead after the dynamo reset below — one throwaway program keeps
-            # the region within budget for capture_model's full bucket ladder.
+            # isolated to a throwaway temporary directory so the kv=0 graph
+            # never lands in persistent serving cache.
             with self._profile_isolated_cache():
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
@@ -4924,10 +4915,9 @@ class TPUModelRunner(GPUModelRunner):
             torch._dynamo.reset()
             torch.tpu.synchronize()
 
-            # Sampling subgraphs (Phase A) — uses the restored cache_dir.
-            if not self.enforce_eager:
-                with self.maybe_setup_dummy_loras(self.lora_config):
-                    self._precompile_sampling_subgraphs()
+            import gc
+            gc.collect()
+            torch.tpu.synchronize()
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         if not has_kv_transfer_group():
@@ -5555,7 +5545,6 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
             indices_do_sample: torch.Tensor) -> torch.Tensor:
@@ -5564,69 +5553,43 @@ class TPUModelRunner(GPUModelRunner):
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
             self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(
         self, logits: torch.Tensor, bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Spec-decode verify prelude: gather the bonus-token logits + argmax, and
-        # gather the target_logits rows for the rejection sampler, in ONE compiled
-        # region keyed on [num_tokens, num_reqs] shapes. Run raw (the
-        # logits[indices] gathers + argmax at the verify site), these are eager
-        # ops torch-tpu's DEFER_AND_FUSE fuses with the live per-step dispatch
-        # into per-context programs (the cold target-side recompiles). index_select
-        # is value-identical to logits[indices]. Same pattern as the draft wraps.
         bonus_token_ids = torch.argmax(torch.index_select(
             logits, 0, bonus_logits_indices),
                                        dim=-1)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_token_ids, target_logits
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_gather_bonus_and_target_logits(
         self, logits: torch.Tensor, bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Non-greedy verify prelude: gather the bonus-token logits and the
-        # target_logits rows in ONE compiled region keyed on [num_reqs,
-        # num_tokens] shapes. Unlike the greedy spec_bonus_and_target_logits,
-        # the bonus row is kept as FULL logits (not argmax'd) because the
-        # non-greedy path samples the bonus token from them. Run raw, the
-        # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
-        # with the live per-step dispatch into per-context programs (cold
-        # recompiles).index_select is value-identical to logits[indices].
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
-    def _apply_temperature(self, logits: torch.Tensor,
-                           temperatures: torch.Tensor) -> torch.Tensor:
-        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
-        return logits / safe_temperatures
-
-    # TODO: Under SPMD mode, sample_from_logits has correctness issue.
-    #       Re-enable the torch.compile once the issue is fixed in torchxla.
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def sample_from_logits(self,
-                           logits: torch.Tensor,
+    @staticmethod
+    def sample_from_logits(logits: torch.Tensor,
                            temperatures: torch.Tensor,
                            u: torch.Tensor,
                            top_k: torch.Tensor,
                            top_p: torch.Tensor,
                            all_greedy: bool = False) -> torch.Tensor:
         """
-        Sample with xla-friendly function. This function is to be traced
-        separately from `forward` for lighter compilation overhead.
+        Sample with xla-friendly function.
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
-        scaled_logits = self._apply_temperature(logits, temperatures)
+        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
+        scaled_logits = logits / safe_temperatures
         masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
         u_clamped = torch.clamp(u,
                                 min=torch.finfo(u.dtype).tiny,
@@ -5636,21 +5599,16 @@ class TPUModelRunner(GPUModelRunner):
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def gather_logprobs(self, logits: torch.Tensor,
-                        sampled_tokens: torch.Tensor) -> LogprobsTensors:
-        """
-        Gather the top_logprobs with corresponding tokens. Use a fixed number
-        of logprobs as an alternative to having multiple pre-compiled graphs.
-        Select the number of logprobs actually demanded by each request on CPU.
-        """
+    @staticmethod
+    def _gather_logprobs_static(logits: torch.Tensor,
+                                sampled_tokens: torch.Tensor,
+                                max_logprobs: int) -> LogprobsTensors:
         token_ids = sampled_tokens.to(torch.int64)
         token_logits = logits.gather(-1, token_ids)
         token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
         log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
         token_logprobs = (token_logits - log_normalizers).to(torch.float32)
 
-        max_logprobs = self.model_config.max_logprobs
         if max_logprobs > 0:
             topk_logits, topk_indices = torch.topk(logits,
                                                    max_logprobs,
@@ -5667,6 +5625,11 @@ class TPUModelRunner(GPUModelRunner):
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
         )
+
+    def gather_logprobs(self, logits: torch.Tensor,
+                        sampled_tokens: torch.Tensor) -> LogprobsTensors:
+        return self._gather_logprobs_static(logits, sampled_tokens,
+                                            self.model_config.max_logprobs)
 
 
 def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
