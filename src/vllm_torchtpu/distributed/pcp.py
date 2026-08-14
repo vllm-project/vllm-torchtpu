@@ -214,8 +214,9 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
         f"c{getattr(device, 'core_on_chip', '?')}"
         for position, (rank, device_id, device) in enumerate(
             zip(layout.ranks, layout.device_ids, mesh_devices)))
-    logger.info("PCP_MESH | axis=%s world_size=%d my_rank_in_group=%d | %s",
-                axis_name, layout.world_size, layout.rank_in_group, positions)
+    logger.info(
+        "PCP device mesh | axis=%s world_size=%d my_rank_in_group=%d | %s",
+        axis_name, layout.world_size, layout.rank_in_group, positions)
 
     _MESH_CACHE[cache_key] = mesh
     return mesh

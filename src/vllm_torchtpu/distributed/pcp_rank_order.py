@@ -155,7 +155,7 @@ def resolve_pcp_topology_order(
                 f"{groups} whose ranks {flat} are not a permutation of "
                 f"{expected}.")
 
-    logger.info("TOPO_GROUPS | mesh_shape=%s -> %s", mesh_shape,
+    logger.info("Topology mesh | mesh_shape=%s -> %s", mesh_shape,
                 group_ranks_by_name)
     return group_ranks_by_name
 
@@ -189,11 +189,11 @@ def pcp_topology_order(
         axis = kwargs.get("group_name")
         # Logged for every axis, whether or not it is being replaced, so the
         # log shows vLLM's own layout even when the mesh does not apply.
-        logger.info("TOPO_GROUPS | %s: vLLM built %s", axis,
+        logger.info("vLLM layout | %s: vLLM built %s", axis,
                     [list(g) for g in group_ranks])
         replacement = replacements.get(axis) if axis else None
         if replacement is not None:
-            logger.info("TOPO_GROUPS | %s: replaced with %s", axis,
+            logger.info("Topology layout | %s: replaced with %s", axis,
                         replacement)
             group_ranks = replacement
         return original(group_ranks, local_rank, backend, *args, **kwargs)
