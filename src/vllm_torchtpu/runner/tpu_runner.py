@@ -3158,14 +3158,22 @@ class TPUModelRunner(GPUModelRunner):
         return (utils.get_dp_size(self.parallel_config) > 1
                 and self.parallel_config.enable_expert_parallel)
 
-    def _count_input_chunks(self, scheduler_output: "SchedulerOutput") -> int:
-        """Match _prepare_inputs chunking without staging any tensors."""
+    def _count_input_chunks(
+            self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:
+        """Match _prepare_inputs chunking without staging any tensors.
+
+        Returns (num_chunks, max_chunk_reqs). The second value is the exact
+        maximum request count of any chunk — a most-model-len chunk holds up
+        to num_reqs_most_model_len requests, which can exceed
+        num_reqs_max_model_len, so no batch-level clamp is a safe substitute.
+        """
         if scheduler_output.total_num_scheduled_tokens == 0:
-            return 0
+            return 0, 0
 
         num_reqs = self.input_batch.num_reqs
         start_index = 0
         num_chunks = 0
+        max_chunk_reqs = 0
         while start_index < num_reqs:
             use_max_model_len = self.most_model_len is None
             for i in range(start_index, num_reqs):
@@ -3181,9 +3189,11 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
-            start_index += min(chunk_reqs, num_reqs - start_index)
+            this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
+            max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
+            start_index += this_chunk_reqs
             num_chunks += 1
-        return num_chunks
+        return num_chunks, max_chunk_reqs
 
     def _dp_coordinated_step(
             self,
@@ -3332,14 +3342,14 @@ class TPUModelRunner(GPUModelRunner):
                 mm_cumsum_np = np.concatenate(
                     [[0], np.cumsum(is_mm_embed_full.cpu().numpy())])
 
-        local_num_chunks = self._count_input_chunks(scheduler_output)
+        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
+            scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
-            # Upper bound on any single chunk's request count on this rank;
-            # the DP-wide MAX of it sizes every rank's draft forwards.
-            local_num_reqs=min(self.input_batch.num_reqs,
-                               self.num_reqs_max_model_len))
+            # Exact per-chunk request bound on this rank; the DP-wide MAX of
+            # it sizes every rank's draft forwards.
+            local_num_reqs=local_max_chunk_reqs)
         # Retained for the spec-decode propose phase (sample_tokens): under
         # EP-DP locksteps every rank must run the same number of draft forwards per step,
         # and the coordinated chunk count from this one all-reduce is the shared

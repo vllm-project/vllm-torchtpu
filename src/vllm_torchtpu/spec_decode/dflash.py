@@ -262,6 +262,12 @@ class DFlashProposer:
             # shape on idle ranks.
             coordinated_reqs = max(1, self.runner._dp_step_max_reqs)
             padded_len = self._get_padded_len(coordinated_reqs * block_size)
+            # The coordinated max is an exact per-chunk bound
+            # (_count_input_chunks); a shortfall here would silently
+            # truncate draft inputs via negative F.pad, so fail loudly.
+            assert padded_len >= total_draft_tokens, (
+                f"lockstep draft bucket {padded_len} < local chunk's "
+                f"{total_draft_tokens} draft tokens")
         else:
             padded_len = self._get_padded_len(total_draft_tokens)
 
@@ -462,7 +468,14 @@ class DFlashProposer:
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
         block_size = K + 1
-        max_draft_tokens = runner.num_reqs_max_model_len * block_size  # e.g., 32 * 16 = 512
+        # A most-model-len chunk holds up to num_reqs_most_model_len
+        # requests (> num_reqs_max_model_len), and under EP-DP lockstep the
+        # coordinated bucket is sized from the DP-wide max chunk request
+        # count — so warm draft forwards up to the larger bound, or the
+        # first such step compiles XLA mid-serving.
+        max_chunk_reqs = max(runner.num_reqs_max_model_len,
+                             runner.num_reqs_most_model_len or 0)
+        max_draft_tokens = max_chunk_reqs * block_size
 
         with runner._precompile_timed("drafter first pass"):
             fc_layer = getattr(self.draft_model.model, "fc", None)
