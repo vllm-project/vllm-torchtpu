@@ -178,6 +178,7 @@ class BucketExecutables:
         self._runnables: dict[tuple[str, str], tuple[Callable[..., Any],
                                                      tuple]] = {}
         self.sizes: set[int] = set()
+        self.traces = 0
 
     def get(self, cache_dir: str, key: str,
             graph: fx.GraphModule) -> Callable[..., Any] | None:
@@ -261,9 +262,23 @@ def runnable_for(cache_dir: str,
 
 def remember(cache_dir: str, key: str, graph: fx.GraphModule, size: int,
              runnable: Callable[..., Any]) -> None:
-    """Offer a freshly compiled bucket to the traces that follow."""
+    """Offer a bucket, freshly compiled or loaded, to the traces that follow."""
     if _session is not None:
         _session.put(cache_dir, key, graph, size, runnable)
+
+
+def aot_cache_tag() -> str | None:
+    """Discriminator for vLLM's AOT artifact path while several traces run.
+
+    The path is keyed by the config and the forward code, which do not tell two
+    traces of one model apart, so without this the second trace loads the
+    first's artifact instead of tracing (and every bucket gets the first
+    structure again). The trace ordinal is enough: the partition is a function
+    of the guards, so the sequence replays identically on every rank and on a
+    warm start. None outside a warmup, which keeps the key of every other
+    compiled module exactly as it was.
+    """
+    return f"trace{_session.traces}" if _session is not None else None
 
 
 def retrace(module: torch.nn.Module, vllm_config) -> None:
@@ -279,6 +294,8 @@ def retrace(module: torch.nn.Module, vllm_config) -> None:
     from vllm.compilation.wrapper import reset_compile_wrapper
     from vllm.config import set_current_vllm_config
 
+    if _session is not None:
+        _session.traces += 1
     module.cleanup()  # drop this wrapper's bytecode hook before replacing it
     with set_current_vllm_config(vllm_config):
         reset_compile_wrapper(module)

@@ -98,7 +98,8 @@ def _patch_vllm_hybrid_producer_prefix_hits() -> None:
 
 
 def _patch_vllm_aot_compile_cache_key() -> None:
-    """Include the TPU compiler hash in vLLM's outer AOT cache key."""
+    """Include the TPU compiler hash, and the trace ordinal, in vLLM's outer
+    AOT cache key."""
     from vllm.compilation import caching
 
     original = caching.aot_compile_hash_factors
@@ -106,11 +107,13 @@ def _patch_vllm_aot_compile_cache_key() -> None:
         return
 
     def tpu_aot_compile_hash_factors(vllm_config):
+        from vllm_torchtpu.compilation import shape_variants
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash
         return [
             *original(vllm_config),
             compute_tpu_compilation_hash(vllm_config),
+            *filter(None, [shape_variants.aot_cache_tag()]),
         ]
 
     tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
