@@ -3587,7 +3587,7 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.req_id_to_index.keys())
 
         width = groups[0].shape[0]
-        keep, keep_dev, zeros, null = self._read_offset_reset_scratch(
+        keep, keep_dev, null = self._read_offset_reset_scratch(
             width, groups[0].device)
         keep.zero_()
         for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
@@ -3608,8 +3608,8 @@ class TPUModelRunner(GPUModelRunner):
 
     def _read_offset_reset_scratch(
         self, width: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reusable `(keep_cpu, keep_dev, zeros, null)` of length `width`.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reusable `(keep_cpu, keep_dev, null)` of length `width`.
 
         `_reset_read_offsets_for_new_requests` runs on every step, so its
         working set is allocated once per width rather than per step. Width
@@ -3622,11 +3622,9 @@ class TPUModelRunner(GPUModelRunner):
         key = (width, str(device))
         entry = self._read_offset_scratch.get(key)
         if entry is None:
-            offsets = self.mamba_slot_read_offsets
             entry = (
                 torch.zeros(width, dtype=torch.bool),
                 torch.zeros(width, dtype=torch.bool, device=device),
-                torch.zeros(width, dtype=offsets.dtype, device=offsets.device),
                 torch.zeros((), dtype=torch.int32, device=device),
             )
             self._read_offset_scratch[key] = entry
@@ -4688,6 +4686,7 @@ class TPUModelRunner(GPUModelRunner):
                                         use_max_model_len=False)
 
             self._precompile_sampling_subgraphs()
+            self._precompile_mamba_rollback_helpers()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
@@ -4700,6 +4699,27 @@ class TPUModelRunner(GPUModelRunner):
                 # a handful of new graphs. Warm those by running the REAL
                 # two-phase spec-decode path once on a synthetic request.
                 self._warmup_spec_decode()
+
+    def _precompile_mamba_rollback_helpers(self) -> None:
+        """Warm the compiled rollback scatters at every bucket length.
+
+        Mamba block-boundary crossings do not occur during the synthetic
+        warmup request (unlike the reset scatter, which the real warmup
+        path exercises), so without this the first real crossing would
+        compile XLA mid-serving while lockstep peers wait at their next
+        collective. All-zero indices write the null slot, moving no state.
+        """
+        offsets = self.mamba_slot_read_offsets
+        if offsets is None:
+            return
+        with self._precompile_timed("mamba rollback helpers"):
+            n = 8
+            limit = self._bucket_len(self.max_num_reqs)
+            while n <= limit:
+                idx = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                _rollback_offsets_seed_compiled(offsets, idx)
+                _rollback_offsets_migrate_compiled(offsets, idx, idx)
+                n *= 4
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
