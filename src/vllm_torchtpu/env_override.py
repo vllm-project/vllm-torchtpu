@@ -35,6 +35,12 @@ os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
 # pipeline, so force the flag off before VllmConfig initialization.
 os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
 
+# TPU uses AOT compilation cache with TpuCompilationHandle metadata.
+# Mega AOT artifact uses Inductor-specific BundledAOTAutogradResult which
+# forces AOTAutograd to re-dispatch and recompile on deserialization.
+os.environ.setdefault("VLLM_USE_AOT_COMPILE", "1")
+os.environ.setdefault("VLLM_USE_MEGA_AOT_ARTIFACT", "0")
+
 # Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
 # transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
 # skips per-allocation DMA mapping on multi-process v7x workers

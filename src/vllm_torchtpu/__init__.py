@@ -118,6 +118,56 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 
 
+def _patch_tpu_backend_serialization() -> None:
+    """Ensure TpuBackend produces serialize() returning bytes for AOTAutogradCache."""
+    try:
+        from torch_tpu._internal.compile._backend import TpuBackend
+    except ImportError:
+        return
+
+    original_call = TpuBackend.__call__
+    if getattr(original_call, "_tpu_backend_serialize_bytes_patch", False):
+        return
+
+    def patched_call(self, graph_module, example_inputs, **kwargs):
+        result = original_call(self, graph_module, example_inputs, **kwargs)
+        orig_serialize = getattr(result, "serialize", None)
+        if orig_serialize is not None:
+
+            def fixed_serialize():
+                raw = orig_serialize()
+                if hasattr(raw, "_serialize") and callable(raw._serialize):
+                    return raw._serialize()
+                elif hasattr(raw, "serialize") and callable(raw.serialize):
+                    return raw.serialize()
+                elif isinstance(raw, (bytes, bytearray)):
+                    return raw
+                import pickle
+                return pickle.dumps(raw)
+
+            result.serialize = fixed_serialize
+        return result
+
+    patched_call._tpu_backend_serialize_bytes_patch = True
+    TpuBackend.__call__ = patched_call
+    logger.info(
+        "Applied TPU patch: fix TpuBackend serialization for AOTAutogradCache."
+    )
+
+
+def _patch_vllm_aot_compile_envs() -> None:
+    """Ensure vllm.envs uses VLLM_USE_AOT_COMPILE=True and VLLM_USE_MEGA_AOT_ARTIFACT=False on TPU."""
+    try:
+        from vllm import envs as vllm_envs
+        vllm_envs.VLLM_USE_AOT_COMPILE = True
+        vllm_envs.VLLM_USE_MEGA_AOT_ARTIFACT = False
+        logger.info(
+            "Applied TPU patch: enforce VLLM_USE_AOT_COMPILE=True and VLLM_USE_MEGA_AOT_ARTIFACT=False."
+        )
+    except Exception as e:
+        logger.warning("Failed to apply TPU AOT compile env patch: %s", e)
+
+
 def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     """Keep diagnostics-only ``additional_config`` keys out of cache keys.
 

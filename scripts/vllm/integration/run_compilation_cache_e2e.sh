@@ -45,6 +45,9 @@ export VLLM_TARGET_DEVICE="tpu"
 MODEL="${1:-${MODEL:-Qwen/Qwen3-0.6B}}"
 TIER3_DIR="${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}"
 
+# Pre-sized KV cache memory (~85.96 GiB = 50,312 blocks) to bypass profile_run
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-92305620992}"
+
 # Helper function: kill orphaned processes holding TPU locks
 clean_tpu_processes() {
   echo "=== 🧹 Cleaning orphaned TPU processes... ==="
@@ -76,7 +79,8 @@ rm -rf "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 mkdir -p "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 \
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
 
 sync && sleep 10
 
@@ -144,7 +148,8 @@ echo "================================================================="
 clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 \
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
 
 sync && sleep 10
 
@@ -172,12 +177,11 @@ fi
 echo "================================================================="
 echo "=== 🔍 [Test 4] Cache File & MD5 Consistency Check (Cold vs Warm)"
 echo "================================================================="
-# TODO(@maxwillzq): Tier-3 cache file non-deterministic diff is still under investigation.
-# Log warning rather than exiting with failure until zero-diff is fully resolved.
 if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt"; then
   echo "✅ [Test 4 PASSED] Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
 else
-  echo "⚠️ [Test 4 WARNING] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  echo "❌ [Test 4 FAILED] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  exit 1
 fi
 
 echo "================================================================="
