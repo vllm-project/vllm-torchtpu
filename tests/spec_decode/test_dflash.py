@@ -318,6 +318,7 @@ def test_propose_unit(device):
         mesh=None,
         _is_async_drafter=True,
         _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
         _dp_step_num_chunks=0,
     )
 

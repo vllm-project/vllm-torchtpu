@@ -2606,7 +2606,12 @@ class TestUpdateAttentionPageSizePadded:
 
 
 class TestBuildAttentionMetadataForLayers:
-    """Tests TPUModelRunner.build_attention_metadata_for_layers."""
+    """`TPUModelRunner.build_attention_metadata_for_layers`.
+
+    The TPU builder reads only `num_reqs` off the common metadata (the rest
+    arrives via `_attn_metadata_builder_ctx`), so a bare namespace stands in
+    for `CommonAttentionMetadata`.
+    """
 
     @staticmethod
     def _group(gid, layer_names):

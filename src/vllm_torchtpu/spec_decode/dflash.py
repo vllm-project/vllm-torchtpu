@@ -264,7 +264,7 @@ class DFlashProposer:
         total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
-        if self._dp_lockstep_sharded():
+        if self.runner._dp_lockstep_enabled():
             # EP-DP lockstep: every rank must emit identical collective
             # shapes, and num_reqs is rank-local. Pad to the step's DP-wide
             # max per-chunk request count, coordinated by the same
@@ -411,7 +411,7 @@ class DFlashProposer:
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
         extra_chunks = 0
-        if self._dp_lockstep_sharded():
+        if runner._dp_lockstep_enabled():
             extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
 
         # 1. Hoist all KV cache updates across chunks to the top of propose
@@ -435,8 +435,15 @@ class DFlashProposer:
                 chunk, padded_len, seq_lens)
 
             with (
-                    set_forward_context(draft_attn_metadata, self.vllm_config,
-                                        0),
+                    # Precomputed so set_forward_context does not run its
+                    # own cross-DP CPU all_reduce per draft forward; must
+                    # pair exactly with the idle replay's calls.
+                    set_forward_context(
+                        draft_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=padded_len,
+                        num_tokens_across_dp=runner._dp_num_tokens_across_dp(
+                            padded_len)),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
@@ -659,16 +666,23 @@ class DFlashProposer:
                     for layer_name in runner._attn_layer_names
                 }
             else:
-                # Must match _build_draft_attn_metadata so warmup compiles the
-                # same dispatch sequence used during live inference.
+                # Must match `_build_draft_attn_metadata` exactly: torch-tpu
+                # fuses programs by dispatch sequence, so precompiling a
+                # different sequence leaves the real one to compile live.
                 assert self._draft_attn_layer_names is not None, (
                     "load_model() must run before precompile()")
                 per_layer_attn_metadata = (
                     runner.build_attention_metadata_for_layers(
                         self._draft_attn_layer_names, actual_num_reqs))
             with (
-                    set_forward_context(per_layer_attn_metadata,
-                                        self.vllm_config, 0),
+                    # Same contract as propose(): precomputed DP metadata,
+                    # no hidden per-forward cross-DP all_reduce.
+                    set_forward_context(
+                        per_layer_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens,
+                        num_tokens_across_dp=runner._dp_num_tokens_across_dp(
+                            num_tokens)),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh, ),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
