@@ -80,6 +80,7 @@ class DFlashProposer:
             "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
             draft_tp)
 
+        self._max_model_len = vllm_config.model_config.max_model_len
         self.draft_model = None
         self._draft_attn_layer_names: set[str] | None = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
@@ -220,8 +221,12 @@ class DFlashProposer:
             "load_model() must run before draft attention metadata is built")
 
         saved_ctx = runner._attn_metadata_builder_ctx
+        # num_reqs must be the REAL request count: the staging walk copies
+        # exactly ctx.num_reqs block-table rows, and rows beyond the live
+        # batch hold departed requests' freed block ids. With the real
+        # count, padding rows stage as zeros -> the null block.
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
-            num_reqs=padded_num_reqs,
+            num_reqs=chunk.num_reqs,
             start_index=chunk.start_index,
             use_max_model_len=chunk_ctx.use_max_model_len,
             seq_lens=seq_lens,
@@ -929,7 +934,7 @@ class DFlashProposer:
             (0, 0, 0, padded_num_reqs - next_tokens_device.shape[0]),
             value=invalid_token_id).to(torch.int32)
 
-        # Extract start positions on-device
+        # Extract start and end positions on-device
         req_indices = torch.arange(padded_num_reqs,
                                    dtype=torch.int32,
                                    device=query_start_loc.device)
@@ -938,6 +943,11 @@ class DFlashProposer:
         start_positions = position_ids[start_indices].unsqueeze(1)
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
         start_positions_padded = (start_positions * valid_mask).to(torch.int32)
+        end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1,
+                                  min=0)
+        last_positions = position_ids[end_indices].unsqueeze(1)
+        query_lens = (query_start_loc[safe_req_indices + 1] -
+                      start_indices).unsqueeze(1)
 
         # Count accepted tokens per request and extract the base token
         num_valid = (next_tokens_device_padded
@@ -959,8 +969,17 @@ class DFlashProposer:
                                        device=next_tokens_device_padded.device)
         input_ids.scatter_(0, scatter_indices, base_tokens_dev_padded)
 
-        # Compute positional encodings and sequence lengths
-        base_pos = start_positions_padded + num_accepted_dev_padded
+        # `start + num_accepted` is only correct for a (K+1)-token verify
+        # window; a request whose query this step was a PROMPT chunk (it
+        # finished prefill while others verified) must anchor one past its
+        # last token, or RoPE runs at the wrong offset and mask K/V lands on
+        # its context KV. A verify window is a query of exactly block_size
+        # tokens (a block_size-long final prompt chunk misclassifies; rare).
+        is_verify_window = (query_lens == block_size).to(torch.int32)
+        verify_base = start_positions_padded + num_accepted_dev_padded
+        prompt_base = ((last_positions + 1) * valid_mask).to(torch.int32)
+        base_pos = (is_verify_window * verify_base +
+                    (1 - is_verify_window) * prompt_base)
         offsets = torch.arange(
             0,
             block_size,
@@ -970,7 +989,14 @@ class DFlashProposer:
         positions = F.pad(positions_unpadded,
                           (0, padded_len - positions_unpadded.shape[0]),
                           value=0)
-        seq_lens = base_pos.squeeze(1) + block_size
+        # Clamp to the model's position/KV bounds (upstream parity): a
+        # request already at max_model_len (warmup sweeps one) must not
+        # index RoPE past the cache or walk the kernel off its block-table
+        # row. Padding slots keep a nonzero seq_len (the RPA kernel is not
+        # exercised with kv_len == 0); their writes land in the null block.
+        positions = torch.clamp(positions, max=self._max_model_len - 1)
+        seq_lens = torch.clamp(base_pos.squeeze(1) + block_size,
+                               max=self._max_model_len)
 
         return input_ids, positions, seq_lens
 
@@ -1011,15 +1037,18 @@ class DFlashProposer:
                                    (0, padded_num_reqs - device_seed.shape[0]),
                                    value=0).to(torch.int32)
 
-        # Extract start positions on-device
+        # Anchor one past the LAST prompt token of the chunk (not the chunk
+        # start): a wrong anchor runs RoPE at the wrong offset and writes
+        # mask K/V over the context KV.
         req_indices = torch.arange(padded_num_reqs,
                                    dtype=torch.int32,
                                    device=query_start_loc.device)
         safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
-        start_indices = query_start_loc[safe_req_indices]
-        start_positions = position_ids[start_indices].unsqueeze(1)
+        end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1,
+                                  min=0)
+        last_positions = position_ids[end_indices].unsqueeze(1) + 1
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
-        start_positions_padded = (start_positions * valid_mask).to(torch.int32)
+        start_positions_padded = (last_positions * valid_mask).to(torch.int32)
 
         # Format input_ids with seed tokens and MASK placeholders
         input_ids = torch.full((padded_len, ),
@@ -1043,6 +1072,13 @@ class DFlashProposer:
         positions = F.pad(positions_unpadded,
                           (0, padded_len - positions_unpadded.shape[0]),
                           value=0)
-        seq_lens = base_pos.squeeze(1) + block_size
+        # Clamp to the model's position/KV bounds (upstream parity): a
+        # request already at max_model_len (warmup sweeps one) must not
+        # index RoPE past the cache or walk the kernel off its block-table
+        # row. Padding slots keep a nonzero seq_len (the RPA kernel is not
+        # exercised with kv_len == 0); their writes land in the null block.
+        positions = torch.clamp(positions, max=self._max_model_len - 1)
+        seq_lens = torch.clamp(base_pos.squeeze(1) + block_size,
+                               max=self._max_model_len)
 
         return input_ids, positions, seq_lens

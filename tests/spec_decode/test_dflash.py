@@ -38,6 +38,7 @@ def _make_proposer(draft_tp: int | None = 1) -> DFlashProposer:
         draft_model_config=SimpleNamespace(hf_config=hf_config_mock))
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
+        model_config=SimpleNamespace(max_model_len=2048),
         compilation_config=SimpleNamespace(
             static_forward_context={
                 "model.layers.0.self_attn": mock.MagicMock(),
