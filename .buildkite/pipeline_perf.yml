@@ -157,6 +157,29 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      # Same config and benchmark as glm-5.2-fp8-dp16-ep above, but through
+      # the `mp` distributed-executor backend (run_multihost_mp.sh:
+      # independent `vllm serve` head + `--headless` processes with
+      # vllm-torchtpu's own multihost DP bootstrap, src/vllm_torchtpu/
+      # distributed/tpu_mp_multihost.py) instead of Ray. Regression-tests
+      # that bootstrap path directly. DATA_PARALLELISM_LOCAL is this host's
+      # DP share (8 chips/host x 2 hosts = 16) -- topology, not benchmark,
+      # so it's supplied here rather than hardcoded into the shared config.
+      - label: "Perf: Nightly glm-5.2-fp8-mp-dp16-ep (TPU v7x-16)"
+        key: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_16_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+          DATA_PARALLELISM_LOCAL: "8"
+        commands:
+          - "bash .buildkite/scripts/run_multihost_mp.sh glm-5.2-fp8-dp16-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_5_397b_fp8_tp8_dp1_ep"
         if: 'build.env("NIGHTLY") == "1"'

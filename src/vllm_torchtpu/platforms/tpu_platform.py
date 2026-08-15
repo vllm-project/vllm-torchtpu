@@ -931,7 +931,10 @@ class TpuPlatform(Platform):
             from vllm_torchtpu.executors.tpu_multiproc_executor import \
                 TpuMultiprocExecutor
             parallel_config.distributed_executor_backend = TpuMultiprocExecutor
-        elif not multihost_backend:  # Single host
+        elif multihost_backend == "mp" or not multihost_backend:
+            # Single host, or genuine multi-host DP without --nnodes (this
+            # host owns only a slice of data_parallel_size via
+            # --data-parallel-size-local / --data-parallel-start-rank).
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
                 if pcp_size > 1:
