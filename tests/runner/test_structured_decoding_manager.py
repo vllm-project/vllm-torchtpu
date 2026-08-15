@@ -15,11 +15,18 @@ BLOCK_ALL = 0
 
 def make_manager(vocab_size: int = VOCAB_SIZE,
                  max_num_reqs: int = 8,
-                 req_id_to_index: dict[str, int] | None = None):
+                 req_id_to_index: dict[str, int] | None = None,
+                 num_spec_tokens: int | None = None,
+                 num_tokens_paddings: list[int] | None = None):
+    speculative_config = (SimpleNamespace(
+        num_speculative_tokens=num_spec_tokens)
+                          if num_spec_tokens is not None else None)
     runner = SimpleNamespace(
         vocab_size=vocab_size,
         max_num_reqs=max_num_reqs,
         input_batch=SimpleNamespace(req_id_to_index=req_id_to_index or {}),
+        speculative_config=speculative_config,
+        num_tokens_paddings=num_tokens_paddings or [16, 32, 64],
     )
     return StructuredDecodingManager(runner)
 
@@ -162,3 +169,192 @@ class TestStructuredDecode:
         assert torch.equal(out[0, :32], logits[0, :32])
         assert torch.isinf(out[0, 32:]).all()
         assert torch.equal(out[1:], logits[1:])
+
+
+def row(value: int) -> list[int]:
+    """A distinguishable bitmask row: both packed words carry `value`."""
+    return [value, value]
+
+
+class TestPrepareSpecStructuredDecodingInput:
+    """Each structured request owns 1 + s_r consecutive
+    bitmask rows (draft + bonus)"""
+
+    def test_spec_buffers_only_allocated_with_spec_config(self):
+        manager = make_manager()
+        assert not hasattr(manager, "target_grammar_bitmask_cpu")
+
+        spec_manager = make_manager(num_spec_tokens=3,
+                                    max_num_reqs=8,
+                                    num_tokens_paddings=[16, 32, 64])
+        # 8 reqs * (1 + 3) = 32 rows -> the 32 bucket covers it exactly.
+        assert spec_manager.target_grammar_bitmask_cpu.shape == (32, 2)
+        assert spec_manager.require_structured_out_target_cpu.shape == (32, 1)
+
+    def test_variable_draft_counts_single_chunk(self):
+        # req0 structured, 2 drafts; req1 unstructured, 1 draft;
+        # req2 structured, 0 drafts.
+        manager = make_manager(num_spec_tokens=2,
+                               req_id_to_index={
+                                   "req0": 0,
+                                   "req1": 1,
+                                   "req2": 2
+                               })
+        grammar_output = make_grammar_output(
+            ["req0", "req2"],
+            # req0: draft rows 10, 11, bonus 12; req2: bonus row 20.
+            [row(10), row(11), row(12), row(20)],
+        )
+        scheduled = {"req0": [7, 8], "req1": [9]}
+        draft_lengths = np.array([2, 1, 0], dtype=np.int32)
+        target_logits = torch.zeros(8, VOCAB_SIZE)
+        bonus_logits = torch.zeros(4, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask,
+         arange) = manager.prepare_spec_structured_decoding_input(
+             target_logits, bonus_logits, grammar_output, scheduled,
+             draft_lengths, 0, 3)
+
+        # Target row j aligns with target_logits row j (the target
+        # model's logits at draft position j). Rows 0-1 belong to req0's
+        # draft positions, row 2 to req1's (unstructured -> untouched),
+        # rest padding.
+        assert require_target.shape == (8, 1)
+        assert require_target[:, 0].tolist() == [
+            True, True, False, False, False, False, False, False
+        ]
+        assert target_bitmask[0].tolist() == row(10)
+        assert target_bitmask[1].tolist() == row(11)
+        assert target_bitmask[2].tolist() == [0, 0]
+        # Bonus: req0 row 0, req2 row 2; req1 untouched.
+        assert require_bonus[:, 0].tolist() == [True, False, True, False]
+        assert bonus_bitmask[0].tolist() == row(12)
+        assert bonus_bitmask[1].tolist() == [0, 0]
+        assert bonus_bitmask[2].tolist() == row(20)
+        assert arange.tolist() == list(range(32))
+
+    def test_second_chunk_uses_local_rows(self):
+        # Chunk 2 covers batch rows [2, 4). req0 (chunk 1) has 1 draft;
+        # req2/req3 (chunk 2) have 1 and 2 drafts, req3 structured.
+        manager = make_manager(num_spec_tokens=2,
+                               req_id_to_index={
+                                   "req0": 0,
+                                   "req1": 1,
+                                   "req2": 2,
+                                   "req3": 3
+                               })
+        grammar_output = make_grammar_output(
+            ["req0", "req3"],
+            # req0: draft row 10, bonus 11; req3: draft rows 30, 31, bonus 32.
+            [row(10), row(11), row(30),
+             row(31), row(32)],
+        )
+        scheduled = {"req0": [1], "req2": [2], "req3": [3, 4]}
+        # Chunk-local draft lengths for [req2, req3].
+        draft_lengths = np.array([1, 2], dtype=np.int32)
+        target_logits = torch.zeros(4, VOCAB_SIZE)
+        bonus_logits = torch.zeros(2, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask,
+         _) = manager.prepare_spec_structured_decoding_input(
+             target_logits, bonus_logits, grammar_output, scheduled,
+             draft_lengths, 2, 4)
+
+        # Target rows by draft position:
+        # [req2 draft0, req3 draft0, req3 draft1, pad].
+        assert require_target[:, 0].tolist() == [False, True, True, False]
+        assert target_bitmask[1].tolist() == row(30)
+        assert target_bitmask[2].tolist() == row(31)
+        # req0's rows (chunk 1) must not leak in.
+        assert target_bitmask[0].tolist() == [0, 0]
+        # Bonus: [req2 (unstructured), req3].
+        assert require_bonus[:, 0].tolist() == [False, True]
+        assert bonus_bitmask[1].tolist() == row(32)
+
+    def test_draft_free_chunk_walks_row_strides(self):
+        # md is None for this chunk (its requests carry no drafts), but a
+        # structured request in another chunk owns 1 + 2 rows; the cursor
+        # must stride over them to find this chunk's bonus row.
+        manager = make_manager(num_spec_tokens=2,
+                               req_id_to_index={
+                                   "req0": 0,
+                                   "req1": 1
+                               })
+        grammar_output = make_grammar_output(
+            ["req0", "req1"],
+            # req0 (other chunk): drafts 10, 11, bonus 12; req1: bonus 20.
+            [row(10), row(11), row(12), row(20)],
+        )
+        scheduled = {"req0": [5, 6]}
+        logits = torch.zeros(2, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask,
+         _) = manager.prepare_spec_structured_decoding_input(
+             None, logits, grammar_output, scheduled, None, 1, 2)
+
+        assert require_target is None
+        assert target_bitmask is None
+        # req1 is local row 0 of this chunk.
+        assert require_bonus[:, 0].tolist() == [True, False]
+        assert bonus_bitmask[0].tolist() == row(20)
+
+    def test_finished_request_keeps_row_alignment(self):
+        # A request already removed from the batch still owns its 1 + s_r
+        # rows; later requests must not shift up.
+        manager = make_manager(num_spec_tokens=2, req_id_to_index={"req1": 0})
+        grammar_output = make_grammar_output(
+            ["req0", "req1"],
+            # req0 (gone, had 2 drafts): rows 10, 11, 12; req1: draft 20,
+            # bonus 21.
+            [row(10), row(11), row(12),
+             row(20), row(21)],
+        )
+        scheduled = {"req0": [1, 2], "req1": [3]}
+        draft_lengths = np.array([1], dtype=np.int32)
+        target_logits = torch.zeros(2, VOCAB_SIZE)
+        bonus_logits = torch.zeros(1, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask,
+         _) = manager.prepare_spec_structured_decoding_input(
+             target_logits, bonus_logits, grammar_output, scheduled,
+             draft_lengths, 0, 1)
+
+        assert require_target[:, 0].tolist() == [True, False]
+        assert target_bitmask[0].tolist() == row(20)
+        assert require_bonus[0, 0].item() is True
+        assert bonus_bitmask[0].tolist() == row(21)
+
+    def test_stale_rows_are_reset(self):
+        manager = make_manager(num_spec_tokens=1,
+                               req_id_to_index={
+                                   "req0": 0,
+                                   "req1": 1
+                               })
+        first = make_grammar_output(
+            ["req0", "req1"],
+            [row(10), row(11), row(20), row(21)],
+        )
+        scheduled = {"req0": [1], "req1": [2]}
+        draft_lengths = np.array([1, 1], dtype=np.int32)
+        target_logits = torch.zeros(4, VOCAB_SIZE)
+        bonus_logits = torch.zeros(2, VOCAB_SIZE)
+        manager.prepare_spec_structured_decoding_input(target_logits,
+                                                       bonus_logits, first,
+                                                       scheduled,
+                                                       draft_lengths, 0, 2)
+
+        # Second step: only req1 is structured.
+        second = make_grammar_output(["req1"], [row(30), row(31)])
+        scheduled = {"req1": [3]}
+        draft_lengths = np.array([0, 1], dtype=np.int32)
+        (require_target, target_bitmask, require_bonus, bonus_bitmask,
+         _) = manager.prepare_spec_structured_decoding_input(
+             target_logits, bonus_logits, second, scheduled, draft_lengths, 0,
+             2)
+
+        # req0's rows from the first call must be gone.
+        assert require_target[:, 0].tolist() == [True, False, False, False]
+        assert target_bitmask[0].tolist() == row(30)
+        assert require_bonus[:, 0].tolist() == [False, True]
+        assert bonus_bitmask[0].tolist() == [0, 0]
+        assert bonus_bitmask[1].tolist() == row(31)

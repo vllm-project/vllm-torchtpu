@@ -636,7 +636,6 @@ class TPUModelRunner(GPUModelRunner):
                                                     self.block_size),
             self.max_num_reqs, self.max_num_tokens)
 
-        self.structured_decoding_manager = StructuredDecodingManager(self)
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and
@@ -670,6 +669,7 @@ class TPUModelRunner(GPUModelRunner):
         self.speculative_config = self.vllm_config.speculative_config
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
+        self.structured_decoding_manager = StructuredDecodingManager(self)
 
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
@@ -3528,6 +3528,102 @@ class TPUModelRunner(GPUModelRunner):
             self._read_offset_scratch[key] = entry
         return entry
 
+    def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        """argmax logits, only used when `all_greedy` is True.
+        """
+        dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
+        return self.sample_from_logits_func(logits,
+                                            dummy,
+                                            dummy,
+                                            torch.empty((1, 1),
+                                                        dtype=torch.int32,
+                                                        device=logits.device),
+                                            torch.empty((1, 1),
+                                                        dtype=torch.float32,
+                                                        device=logits.device),
+                                            all_greedy=True)
+
+    def _sample_spec_verify_chunk(
+        self,
+        logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        grammar_output: "GrammarOutput | None",
+        scheduler_output: "SchedulerOutput",
+        cur_start_idx: int,
+        cur_end_idx: int,
+        all_greedy: bool,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """Bonus-token sampling + draft rejection for one spec-verify chunk.
+
+        Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
+        selected tokens for the chunk.
+        """
+        if all_greedy and grammar_output is None:
+            bonus_token_ids, target_logits = (
+                self.spec_bonus_and_target_logits(logits,
+                                                  md.bonus_logits_indices,
+                                                  md.target_logits_indices))
+        else:
+            bonus_logits, target_logits = (
+                self.spec_gather_bonus_and_target_logits(
+                    logits, md.bonus_logits_indices, md.target_logits_indices))
+            if grammar_output is not None:
+                target_logits, bonus_logits = (
+                    self.structured_decoding_manager.mask_spec_logits(
+                        target_logits, bonus_logits, grammar_output,
+                        scheduler_output.scheduled_spec_decode_tokens,
+                        md.draft_lengths_cpu, cur_start_idx, cur_end_idx))
+            if all_greedy:
+                bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
+            else:
+                req_temperatures, req_top_k, req_top_p = (
+                    self._build_padded_sampling_params(cur_start_idx,
+                                                       cur_end_idx,
+                                                       bonus_logits))
+                bonus_u = torch.rand_like(bonus_logits,
+                                          generator=sampling_generator)
+                bonus_token_ids = self.sample_from_logits_func(
+                    bonus_logits,
+                    req_temperatures,
+                    bonus_u,
+                    req_top_k,
+                    req_top_p,
+                    all_greedy=False).view(-1)
+        if all_greedy:
+            return self.rejection_sampler(
+                draft_token_ids=md.draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=target_logits,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=self.speculative_config.
+                num_speculative_tokens,
+            )
+        accept_u = torch.rand(md.draft_token_ids.shape,
+                              dtype=torch.float32,
+                              device=target_logits.device,
+                              generator=sampling_generator)
+        recover_u = torch.rand_like(target_logits,
+                                    dtype=torch.float32,
+                                    generator=sampling_generator)
+        return self.rejection_sampler(
+            draft_token_ids=md.draft_token_ids,
+            num_draft_tokens=md.draft_lengths,
+            target_logits=target_logits,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=md.segment_ids,
+            group_indices=md.group_indices,
+            max_draft_tokens=self.speculative_config.num_speculative_tokens,
+            temperatures=req_temperatures[md.segment_ids],
+            top_k=req_top_k[md.segment_ids],
+            top_p=req_top_p[md.segment_ids],
+            accept_u=accept_u,
+            recover_u=recover_u,
+            do_sampling=True,
+        )
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -3585,12 +3681,6 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
                     "TPU yet.")
-            if grammar_output is not None:
-                # TODO(haotianx): remove this when structured output is support in
-                # spec decoding path.
-                raise NotImplementedError(
-                    "Structured outputs with speculative decoding is not "
-                    "supported on TPU yet.")
             # Per-chunk device rejection outputs, kept for the async-spec
             # producer below.
             next_tokens_per_chunk: list[torch.Tensor] = []
@@ -3601,93 +3691,24 @@ class TPUModelRunner(GPUModelRunner):
                     state.spec_decode_metadata_list, mamba_idx_list):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
-                    if all_greedy:
-                        # Extract bonus tokens + gather target_logits from the
-                        # target model logits in one compiled region (bonus argmax
-                        # + the two gathers) so they don't eager-fuse per context.
-                        bonus_token_ids, target_logits = (
-                            self.spec_bonus_and_target_logits(
-                                logits, md.bonus_logits_indices,
-                                md.target_logits_indices))
-                        next_tokens = self.rejection_sampler(
-                            draft_token_ids=md.draft_token_ids,
-                            num_draft_tokens=md.draft_lengths,
-                            target_logits=target_logits,
-                            bonus_token_ids=bonus_token_ids,
-                            segment_ids=md.segment_ids,
-                            group_indices=md.group_indices,
-                            max_draft_tokens=self.speculative_config.
-                            num_speculative_tokens,
-                        )
-                    else:
-                        # Gather bonus + target logits in one compiled region
-                        # (mirrors the greedy spec_bonus_and_target_logits) so
-                        # the raw logits[...] gathers don't eager-fuse into
-                        # per-context programs.
-                        bonus_logits, target_logits = (
-                            self.spec_gather_bonus_and_target_logits(
-                                logits, md.bonus_logits_indices,
-                                md.target_logits_indices))
-                        req_temperatures, req_top_k, req_top_p = (
-                            self._build_padded_sampling_params(
-                                cur_start_idx, cur_end_idx, bonus_logits))
-                        bonus_u = torch.rand_like(bonus_logits,
-                                                  generator=sampling_generator)
-                        bonus_token_ids = self.sample_from_logits_func(
-                            bonus_logits,
-                            req_temperatures,
-                            bonus_u,
-                            req_top_k,
-                            req_top_p,
-                            all_greedy=False,
-                        ).view(-1)
-                        accept_u = torch.rand(md.draft_token_ids.shape,
-                                              dtype=torch.float32,
-                                              device=target_logits.device,
-                                              generator=sampling_generator)
-                        recover_u = torch.rand_like(
-                            target_logits,
-                            dtype=torch.float32,
-                            generator=sampling_generator)
-                        next_tokens = self.rejection_sampler(
-                            draft_token_ids=md.draft_token_ids,
-                            num_draft_tokens=md.draft_lengths,
-                            target_logits=target_logits,
-                            bonus_token_ids=bonus_token_ids,
-                            segment_ids=md.segment_ids,
-                            group_indices=md.group_indices,
-                            max_draft_tokens=self.speculative_config.
-                            num_speculative_tokens,
-                            temperatures=req_temperatures[md.segment_ids],
-                            top_k=req_top_k[md.segment_ids],
-                            top_p=req_top_p[md.segment_ids],
-                            accept_u=accept_u,
-                            recover_u=recover_u,
-                            do_sampling=True,
-                        )
+                    next_tokens = self._sample_spec_verify_chunk(
+                        logits, md, grammar_output, scheduler_output,
+                        cur_start_idx, cur_end_idx, all_greedy,
+                        sampling_generator)
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
                     self._update_mamba_slot_read_offsets(
                         mamba_indices, next_tokens, num_reqs)
                 else:
-                    dummy = torch.empty((1, 1),
-                                        dtype=logits.dtype,
-                                        device=logits.device)
-                    dummy_int = torch.empty((1, 1),
-                                            dtype=torch.int32,
-                                            device=logits.device)
-                    dummy_float = torch.empty((1, 1),
-                                              dtype=torch.float32,
-                                              device=logits.device)
+                    if grammar_output is not None:
+                        _, logits = (
+                            self.structured_decoding_manager.mask_spec_logits(
+                                None, logits, grammar_output,
+                                scheduler_output.scheduled_spec_decode_tokens,
+                                None, cur_start_idx, cur_end_idx))
                     if all_greedy:
-                        selected = self.sample_from_logits_func(
-                            logits,
-                            dummy,
-                            dummy,
-                            dummy_int,
-                            dummy_float,
-                            all_greedy=True)
+                        selected = self._greedy_sample(logits)
                     else:
                         temperatures_tpu, top_k_tpu, top_p_tpu = (
                             self._build_padded_sampling_params(
@@ -3732,29 +3753,10 @@ class TPUModelRunner(GPUModelRunner):
                 self._update_mamba_slot_read_offsets(mamba_indices, None,
                                                      num_reqs)
                 if grammar_output is not None:
-                    require_struct_decoding, grammar_bitmask_padded, arange = (
-                        self.structured_decoding_manager.
-                        prepare_structured_decoding_input(
-                            logits, grammar_output, cur_start_idx,
-                            cur_end_idx))
-                    logits = self.structured_decoding_manager.structured_decode(
-                        require_struct_decoding, grammar_bitmask_padded,
-                        logits, arange)
+                    logits = self.structured_decoding_manager.mask_logits(
+                        logits, grammar_output, cur_start_idx, cur_end_idx)
                 if all_greedy:
-                    dummy_placeholder = torch.empty((1, 1),
-                                                    dtype=logits.dtype,
-                                                    device=logits.device)
-                    selected_token_ids = self.sample_from_logits_func(
-                        logits,
-                        dummy_placeholder,
-                        dummy_placeholder,
-                        torch.empty((1, 1),
-                                    dtype=torch.int32,
-                                    device=logits.device),
-                        torch.empty((1, 1),
-                                    dtype=torch.float32,
-                                    device=logits.device),
-                        all_greedy=True)
+                    selected_token_ids = self._greedy_sample(logits)
                 else:
                     temperatures_tpu, top_k_tpu, top_p_tpu = (
                         self._build_padded_sampling_params(
@@ -4365,6 +4367,25 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
+            if self.speculative_config is None:
+                return
+            # For spec decoding, target logits have padded_logits_length rows.
+            max_target_rows = self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[
+                0]
+            for num_tokens in self.num_tokens_paddings:
+                if num_tokens > max_target_rows:
+                    break
+                out = self.structured_decoding_manager.structured_decode(
+                    self.structured_decoding_manager.
+                    require_structured_out_target_cpu[:num_tokens].to(
+                        self.device),
+                    self.structured_decoding_manager.
+                    target_grammar_bitmask_cpu[:num_tokens].to(self.device),
+                    self._dummy_logits(num_tokens),
+                    arange,
+                )
+                sync.synchronize(out, wait=True)
+                logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
