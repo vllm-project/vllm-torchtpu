@@ -2667,4 +2667,3 @@ class TestBuildAttentionMetadataForLayers:
 
         assert out == {}
         group.metadata_builders[0].build.assert_not_called()
->>>>>>> d55c3f24 (Build attention metadata only for the draft's own KV cache groups)
