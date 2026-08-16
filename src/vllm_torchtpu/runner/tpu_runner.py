@@ -4384,7 +4384,7 @@ class TPUModelRunner(GPUModelRunner):
                     self._dummy_logits(num_tokens),
                     arange,
                 )
-                sync.synchronize(out, wait=True)
+                synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _precompile_sample_from_logits(self) -> None:
