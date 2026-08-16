@@ -561,6 +561,96 @@ def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
+def test_onehot_auto_geometry_defers_to_the_per_call_rule(monkeypatch):
+    monkeypatch.setattr(envs,
+                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
+                        None,
+                        raising=False)
+    monkeypatch.setattr(envs,
+                        "ONEHOT_MOE_PERMUTE_AUTO",
+                        "geometry",
+                        raising=False)
+
+    def _fail():
+        raise AssertionError("the geometry rule resolves per call, not here")
+
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _fail)
+    assert (fused_moe_gmm.resolve_onehot_permute_threshold() ==
+            fused_moe_gmm._ONEHOT_AUTO)
+
+
+def test_onehot_auto_geometry_still_yields_to_an_explicit_threshold(
+        monkeypatch):
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 0, raising=False)
+    monkeypatch.setattr(envs,
+                        "ONEHOT_MOE_PERMUTE_AUTO",
+                        "geometry",
+                        raising=False)
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
+@pytest.mark.parametrize("rows,tokens,want", [(64, 6, True), (65, 6, False)])
+def test_use_onehot_permute_explicit_is_a_bare_row_count(rows, tokens, want):
+    """An explicit threshold keeps #371's semantics exactly: rows <= threshold,
+    whatever the other dimensions are."""
+    assert fused_moe_gmm.use_onehot_permute(64, rows, tokens, 4096) is want
+    assert fused_moe_gmm.use_onehot_permute(64, rows, 1 << 20, 1 << 20) is want
+
+
+def _tpu7x(monkeypatch):
+    # 16 lanes x 2 cores x 16 subcores = 512-row base block; ragged_gather_v2
+    # runs up to 4 subchunks, so the gather pads to 2048 rows.
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
+                        lambda: _fake_tpu_info(_fake_sc_info(16, 2, 16)))
+
+
+def test_onehot_geometry_rule_crosses_at_the_measured_point(monkeypatch):
+    """Qwen3.5-397B: H=4096, top_k=10. The measured crossover is ~690-700
+    node-wide tokens; the rule must land inside that and be monotone."""
+    _tpu7x(monkeypatch)
+    cheaper = fused_moe_gmm.onehot_permute_is_cheaper
+    assert cheaper(512 * 10, 512, 4096) is True
+    assert cheaper(1024 * 10, 1024, 4096) is False
+    flip = next(t for t in range(1, 2048) if not cheaper(t * 10, t, 4096))
+    assert 640 <= flip <= 760
+
+
+def test_onehot_geometry_rule_is_a_product_not_a_row_count(monkeypatch):
+    """The one-hot operator is [routed_rows, num_tokens], so the same row count
+    lands on either side depending on num_tokens -- which is exactly why a
+    threshold expressed in routed rows cannot express this decision."""
+    _tpu7x(monkeypatch)
+    cheaper = fused_moe_gmm.onehot_permute_is_cheaper
+    rows = 8000
+    assert cheaper(rows, 500, 4096) is True  # top_k=16
+    assert cheaper(rows, 2000, 4096) is False  # top_k=4, same rows
+
+
+def test_onehot_geometry_rule_follows_the_sparsecore_block(monkeypatch):
+    """Twice the block means twice the SparseCore work to beat, so twice the
+    product -- sqrt(2) more tokens at a fixed top_k."""
+    cheaper = fused_moe_gmm.onehot_permute_is_cheaper
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
+                        lambda: _fake_tpu_info(_fake_sc_info(16, 2, 16)))
+    small = next(t for t in range(1, 4096) if not cheaper(t * 10, t, 4096))
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
+                        lambda: _fake_tpu_info(_fake_sc_info(16, 2, 32)))
+    large = next(t for t in range(1, 4096) if not cheaper(t * 10, t, 4096))
+    assert abs(large / small - 2**0.5) < 0.02
+
+
+def test_onehot_geometry_rule_is_off_without_a_sparsecore(monkeypatch):
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
+                        lambda: _fake_tpu_info(None))
+    assert fused_moe_gmm.onehot_permute_is_cheaper(10, 1, 4096) is False
+
+    def _raise():
+        raise ValueError("Unsupported TPU device kind: cpu")
+
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _raise)
+    assert fused_moe_gmm.onehot_permute_is_cheaper(10, 1, 4096) is False
+
+
 def test_prepare_routed_onehot_permute_matches_plain_gather():
     num_tokens, topk, hidden = 4, 2, 8
     hidden_states = (jnp.arange(num_tokens * hidden, dtype=jnp.float32) /

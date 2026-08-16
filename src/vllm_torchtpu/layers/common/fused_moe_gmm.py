@@ -45,8 +45,26 @@ ragged_gather_reduce = _select_ragged_gather_reduce(
 
 # One-hot permute/combine cost grows O(routed_rows * num_tokens * hidden), so
 # auto mode never enables it above this many routed rows, even where the
-# SparseCore block is larger. TODO(xutingl): raise the cap after benchmarks.
+# SparseCore block is larger. Superseded by the geometry rule below when
+# ONEHOT_MOE_PERMUTE_AUTO=geometry; kept as the default until that lands.
 _ONEHOT_AUTO_CAP = 64
+
+# "Decide per call": the rule needs num_tokens and hidden_size, which exist
+# only inside the traced function, but the threshold is resolved at build time.
+_ONEHOT_AUTO = -1
+
+# ragged_gather_v2 and ragged_gather_reduce_v2 both cap num_row_subchunks at 4.
+_SC_MAX_ROW_SUBCHUNKS = 4
+
+# MXU flops costing the same as one padded SparseCore row. One measured
+# constant; derivation in docs/moe_onehot_permute_threshold.md.
+_SC_ROW_MXU_FLOPS = 9.6e6
+
+
+def sc_permute_block_rows(sc_info) -> int:
+    """Rows the SparseCore gather moves per block, occupied or not."""
+    return (sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores *
+            _SC_MAX_ROW_SUBCHUNKS)
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -55,16 +73,23 @@ def resolve_onehot_permute_threshold() -> int:
 
     Below one SparseCore block ``ragged_gather_v2`` pads to a whole block and
     does the same SparseCore work regardless of occupancy, so auto routes such
-    small batches to the one-hot path, capped at ``_ONEHOT_AUTO_CAP``.
+    small batches to the one-hot path.
 
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` overrides auto: 0 disables the one-hot
     path (kill switch), a positive value forces that threshold, and
     unset/empty/negative selects auto. Auto resolves to 0 on hosts without a
     SparseCore, leaving those paths unchanged.
+
+    Auto has two spellings, selected by ``ONEHOT_MOE_PERMUTE_AUTO``:
+    ``legacy`` (default) is #371's ``min(block_rows - 1, 64)``, which at
+    top_k=10 means ``num_tokens <= 6`` and so never fires on a real batch;
+    ``geometry`` defers to :func:`onehot_permute_is_cheaper` per call.
     """
     explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
     if explicit is not None and explicit >= 0:
         return explicit
+    if envs.ONEHOT_MOE_PERMUTE_AUTO == "geometry":
+        return _ONEHOT_AUTO
     try:
         sc_info = pltpu.get_tpu_info().sparse_core
     except ValueError:
@@ -76,6 +101,35 @@ def resolve_onehot_permute_threshold() -> int:
     threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
 
     return threshold
+
+
+def onehot_permute_is_cheaper(routed_rows: int, num_tokens: int,
+                              hidden_size: int) -> bool:
+    """Whether the one-hot matmul beats the SparseCore gather at this shape.
+
+    One-hot costs ``routed_rows * num_tokens * hidden`` flops -- the *product*,
+    not the row count -- while the gather pads to a whole block and charges for
+    it whatever the occupancy, so its cost is flat. Quadratic against flat
+    gives exactly one crossover, and it falls out of the block geometry: a
+    constant in routed rows is equivalent only at fixed ``top_k`` and an
+    uncompacted row count. Permute and combine carry the same product.
+    """
+    try:
+        sc_info = pltpu.get_tpu_info().sparse_core
+    except ValueError:
+        return False
+    if sc_info is None:
+        return False
+    return (routed_rows * num_tokens * hidden_size
+            <= _SC_ROW_MXU_FLOPS * sc_permute_block_rows(sc_info))
+
+
+def use_onehot_permute(threshold: int, routed_rows: int, num_tokens: int,
+                       hidden_size: int) -> bool:
+    """Resolve the threshold (explicit routed-row count, or the auto rule)."""
+    if threshold == _ONEHOT_AUTO:
+        return onehot_permute_is_cheaper(routed_rows, num_tokens, hidden_size)
+    return routed_rows <= threshold
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -225,24 +279,31 @@ def prepare_routed_gmm_inputs(
     group_sizes_local = group_sizes_local.sum(axis=0)
 
     if use_ep and use_sparse_core:
-        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
+        # The named scopes are the engagement observable: each path is
+        # *present* under its own name in the op table, so a profile can tell
+        # "the SparseCore arm ran" from "the one-hot arm silently ran".
+        if use_onehot_permute(onehot_moe_permute_threshold,
+                              token_indices_sorted.shape[0], num_tokens_local,
+                              hidden_states_local.shape[-1]):
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
-            onehot = jax.nn.one_hot(token_indices_sorted,
-                                    num_tokens_local,
-                                    dtype=hidden_states_local.dtype)
-            x = onehot @ hidden_states_local
+            with jax.named_scope("moe_permute_onehot"):
+                onehot = jax.nn.one_hot(token_indices_sorted,
+                                        num_tokens_local,
+                                        dtype=hidden_states_local.dtype)
+                x = onehot @ hidden_states_local
         else:
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
-            valid_count = group_sizes_local.sum(dtype=jnp.int32)
-            x = ragged_gather_v2(
-                hidden_states_local,
-                token_indices_sorted,
-                jnp.array([0], dtype=jnp.int32),
-                valid_count[None],
-            )
+            with jax.named_scope("moe_permute_sparsecore"):
+                valid_count = group_sizes_local.sum(dtype=jnp.int32)
+                x = ragged_gather_v2(
+                    hidden_states_local,
+                    token_indices_sorted,
+                    jnp.array([0], dtype=jnp.int32),
+                    valid_count[None],
+                )
     else:
         x = hidden_states_local[token_indices_sorted]
     return (x, group_sizes_local, argsort_revert_indices, topk_weights_flat,
@@ -306,40 +367,45 @@ def moe_gmm(
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
-        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+        if use_onehot_permute(onehot_moe_permute_threshold,
+                              argsort_revert_indices.size, num_tokens,
+                              gmm2_res.shape[-1]):
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
-            if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
-            onehot = jax.nn.one_hot(revert_indices,
-                                    argsort_revert_indices.size,
-                                    dtype=gmm2_res.dtype)
-            # revert_indices is a permutation, so each routed row lands in
-            # exactly one (token, k) slot: the products and the sum over k
-            # never round, and `combine` holds the topk weights exactly. Only
-            # the row reduction below accumulates; pin it to f32 to match the
-            # SparseCore combine kernels and their fallback.
-            combine = (onehot * topk_weights[..., None] *
-                       valid_mask[..., None]).sum(axis=1)
-            return jnp.matmul(combine,
-                              gmm2_res,
-                              preferred_element_type=jnp.float32).astype(
-                                  x.dtype)
-        return ragged_gather_reduce(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            reduce_group_size=topk,
-        ).astype(x.dtype)
+            with jax.named_scope("moe_combine_onehot"):
+                if skip_padded_tokens:
+                    # Zero out the GMM output rows of padded tokens that
+                    # skipped the GMM computation, otherwise those
+                    # uninitialized values can be NaN and the one-hot matmul
+                    # would spread them to every token in the batch.
+                    computed = jnp.arange(
+                        gmm2_res.shape[0],
+                        dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+                    gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+                revert_indices = argsort_revert_indices.reshape(
+                    num_tokens, topk)
+                onehot = jax.nn.one_hot(revert_indices,
+                                        argsort_revert_indices.size,
+                                        dtype=gmm2_res.dtype)
+                # revert_indices is a permutation, so each routed row lands in
+                # exactly one (token, k) slot: the products and the sum over k
+                # never round, and `combine` holds the topk weights exactly.
+                # Only the row reduction below accumulates; pin it to f32 to
+                # match the SparseCore combine kernels and their fallback.
+                combine = (onehot * topk_weights[..., None] *
+                           valid_mask[..., None]).sum(axis=1)
+                return jnp.matmul(combine,
+                                  gmm2_res,
+                                  preferred_element_type=jnp.float32).astype(
+                                      x.dtype)
+        with jax.named_scope("moe_combine_sparsecore"):
+            return ragged_gather_reduce(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                reduce_group_size=topk,
+            ).astype(x.dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape(

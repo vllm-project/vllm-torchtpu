@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    ONEHOT_MOE_PERMUTE_AUTO: str = "legacy"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -257,6 +258,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    # Which auto rule applies when ONEHOT_MOE_PERMUTE_THRESHOLD is unset.
+    # "legacy" (default) = #371's min(block_rows - 1, 64) routed rows, which at
+    # top_k=10 means num_tokens <= 6 and so never fires on a real batch;
+    # "geometry" = compare routed_rows * num_tokens * hidden against the
+    # SparseCore block the gather pads to. Ignored when the threshold is set.
+    "ONEHOT_MOE_PERMUTE_AUTO":
+    env_with_choices("ONEHOT_MOE_PERMUTE_AUTO", "legacy",
+                     ["legacy", "geometry"]),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":

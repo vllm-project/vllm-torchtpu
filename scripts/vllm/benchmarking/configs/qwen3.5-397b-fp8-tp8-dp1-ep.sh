@@ -29,7 +29,10 @@ ATTENTION_BACKEND="CUSTOM"
 
 # MoE & kernel optimizations for Qwen3.5 architecture
 export USE_MOE_SPARSE_CORE="1"
-export ONEHOT_MOE_PERMUTE_THRESHOLD="32768"
+# Routed rows (num_tokens * top_k) below which the MoE permute runs as a
+# one-hot matmul instead of the SparseCore gather. 6144 = T <= 614, the
+# bottom of the measured crossover. See docs/moe_onehot_permute_threshold.md.
+export ONEHOT_MOE_PERMUTE_THRESHOLD="6144"
 
 # Extra arguments for vllm serve
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size 256 --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"

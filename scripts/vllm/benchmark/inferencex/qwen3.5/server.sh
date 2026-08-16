@@ -90,7 +90,10 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
-export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
+# Routed rows (num_tokens * top_k) below which the MoE permute runs as a
+# one-hot matmul instead of the SparseCore gather. 6144 = T <= 614, the
+# bottom of the measured crossover. See docs/moe_onehot_permute_threshold.md.
+export ONEHOT_MOE_PERMUTE_THRESHOLD=6144
 
 # Add extra padding
 # 4, 8 for low concurrency 4 and 8
