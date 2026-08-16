@@ -1013,7 +1013,7 @@ class TPUModelRunner(GPUModelRunner):
             isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
         if has_attention and not self._unified_kv_layout:
-            self._update_attention_page_size_padded(layers)
+            self._update_attention_page_size_padded(layers, block_size)
             if has_mamba:
                 self._update_mamba_page_size_padded(layers)
 
@@ -1414,8 +1414,10 @@ class TPUModelRunner(GPUModelRunner):
                         break
         return overlay
 
-    def _update_attention_page_size_padded(
-            self, layers: dict[str, AttentionLayerBase]) -> None:
+    def _update_attention_page_size_padded(self,
+                                           layers: dict[str,
+                                                        AttentionLayerBase],
+                                           block_size: int) -> None:
         """Pad attention page sizes so vLLM's num_blocks matches what
         the TPU allocates per layer.
 
@@ -1454,7 +1456,7 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(m, Attention):
                 attn_page_sizes.add(
                     PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                        self.block_size,
+                        block_size,
                         m.num_kv_heads,
                         m.head_size,
                         self.kv_cache_dtype,
@@ -1462,7 +1464,7 @@ class TPUModelRunner(GPUModelRunner):
             elif isinstance(m, MLAAttention):
                 attn_page_sizes.add(
                     PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-                        self.block_size,
+                        block_size,
                         1,
                         m.head_size,
                         self.kv_cache_dtype,

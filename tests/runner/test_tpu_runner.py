@@ -2526,3 +2526,61 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
     # in-place dict trim keeps downstream consumers consistent
     assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] \
         == [15, 10, 0]
+
+
+class TestUpdateAttentionPageSizePadded:
+    """_update_attention_page_size_padded must size pages with the caller's
+    block_size instead of self.block_size, which is initialized at __init__
+    time. This is because for hybrid models the update is skipped during that
+    time. It only gets updated after the model is loaded, so using
+    self.block_size will cause the unify_kv_cache_spec_page_size
+    `page_size_padded >= real_page_size_bytes` assertion.
+    """
+
+    @staticmethod
+    def _attn(num_kv_heads, head_size):
+        layer = MagicMock(spec=Attention)
+        layer.num_kv_heads = num_kv_heads
+        layer.head_size = head_size
+        return layer
+
+    @staticmethod
+    def _stub(stale_block_size=16):
+        return SimpleNamespace(
+            block_size=stale_block_size,
+            kv_cache_dtype=torch.bfloat16,
+            cache_config=SimpleNamespace(mamba_page_size_padded=None),
+            _hybrid_uniform_page_size_bytes=None,
+        )
+
+    def test_uses_caller_block_size_not_stale_snapshot(self):
+        # gemma-4 E4B geometry: sliding head_dim 256 vs global head_dim 512.
+        layers = {
+            "sliding": self._attn(num_kv_heads=2, head_size=256),
+            "full": self._attn(num_kv_heads=2, head_size=512),
+        }
+        stub = self._stub(stale_block_size=16)
+
+        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
+
+        expected = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            256, 2, 512, torch.bfloat16)
+        stale = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 2, 512, torch.bfloat16)
+        assert stub._hybrid_uniform_page_size_bytes == expected
+        assert stub._hybrid_uniform_page_size_bytes != stale
+        assert stub.cache_config.mamba_page_size_padded == expected
+
+    def test_uniform_layers_leave_pinning_unset(self):
+        layers = {
+            "a": self._attn(num_kv_heads=2, head_size=256),
+            "b": self._attn(num_kv_heads=2, head_size=256),
+        }
+        stub = self._stub()
+
+        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
+
+        assert stub._hybrid_uniform_page_size_bytes is None
+        assert stub.cache_config.mamba_page_size_padded == \
+            PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                256, 2, 256, torch.bfloat16)
