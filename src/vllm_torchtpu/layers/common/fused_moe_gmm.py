@@ -16,7 +16,6 @@ import functools
 
 import jax
 from jax import numpy as jnp
-from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
@@ -42,40 +41,6 @@ def _select_ragged_gather_reduce(version: str):
 # set RAGGED_GATHER_REDUCE_VERSION=v3 to enable the destination-major kernel.
 ragged_gather_reduce = _select_ragged_gather_reduce(
     envs.RAGGED_GATHER_REDUCE_VERSION)
-
-# One-hot permute/combine cost grows O(routed_rows * num_tokens * hidden), so
-# auto mode never enables it above this many routed rows, even where the
-# SparseCore block is larger. TODO(xutingl): raise the cap after benchmarks.
-_ONEHOT_AUTO_CAP = 64
-
-
-def resolve_onehot_permute_threshold() -> int:
-    """Routed-row count at/below which MoE permute+combine run as TensorCore
-    one-hot matmuls instead of the SparseCore gather/reduce kernels.
-
-    Below one SparseCore block ``ragged_gather_v2`` pads to a whole block and
-    does the same SparseCore work regardless of occupancy, so auto routes such
-    small batches to the one-hot path, capped at ``_ONEHOT_AUTO_CAP``.
-
-    ``ONEHOT_MOE_PERMUTE_THRESHOLD`` overrides auto: 0 disables the one-hot
-    path (kill switch), a positive value forces that threshold, and
-    unset/empty/negative selects auto. Auto resolves to 0 on hosts without a
-    SparseCore, leaving those paths unchanged.
-    """
-    explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
-    if explicit is not None and explicit >= 0:
-        return explicit
-    try:
-        sc_info = pltpu.get_tpu_info().sparse_core
-    except ValueError:
-        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
-        return 0
-    if sc_info is None:
-        return 0
-    block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
-
-    return threshold
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -322,17 +287,9 @@ def moe_gmm(
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
                                     dtype=gmm2_res.dtype)
-            # revert_indices is a permutation, so each routed row lands in
-            # exactly one (token, k) slot: the products and the sum over k
-            # never round, and `combine` holds the topk weights exactly. Only
-            # the row reduction below accumulates; pin it to f32 to match the
-            # SparseCore combine kernels and their fallback.
             combine = (onehot * topk_weights[..., None] *
                        valid_mask[..., None]).sum(axis=1)
-            return jnp.matmul(combine,
-                              gmm2_res,
-                              preferred_element_type=jnp.float32).astype(
-                                  x.dtype)
+            return (combine @ gmm2_res).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,

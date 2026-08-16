@@ -23,7 +23,7 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.fused_moe_gmm import (
     fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
-    resolve_onehot_permute_threshold, unpack_fp4_to_e2m1)
+    unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
@@ -133,7 +133,7 @@ def _build_fused_moe_custom_op(
         activation=activation,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens)
 
