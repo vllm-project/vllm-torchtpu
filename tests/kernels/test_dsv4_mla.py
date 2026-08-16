@@ -215,8 +215,10 @@ def gen_random_int(rng, shape, low, high):
 
 class CorrectnessTest(parameterized.TestCase):
 
-    @parameterized.parameters(True, False)
-    def test_correctness(self, is_csa: bool = False):
+    @parameterized.product(is_csa=(True, False), shuffle_pages=(False, True))
+    def test_correctness(self,
+                         is_csa: bool = False,
+                         shuffle_pages: bool = False):
         if is_csa:
             topk = 1024
         else:
@@ -277,7 +279,12 @@ class CorrectnessTest(parameterized.TestCase):
             kv_lens_to_attend = jnp.array(kv_lens_to_attend, dtype=jnp.int32)
 
         pages_per_seq = cdiv(500, page_size)
+        # With the identity mapping a kernel that ignores `page_indices` still
+        # reads the right bytes; shuffling makes the page gather load-bearing.
         page_indices = jnp.arange(batch_size * pages_per_seq, dtype=jnp.int32)
+        if shuffle_pages:
+            page_indices = jnp.array(rng.permutation(np.asarray(page_indices)),
+                                     dtype=jnp.int32)
 
         # Cache setup
         total_pages = batch_size * pages_per_seq

@@ -133,7 +133,6 @@ ignore-missing-imports = [
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",
     "tpu_raiden", "tpu_raiden.*",
-    "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",
     "transformers", "transformers.*",
     "vllm", "vllm.*",

@@ -1031,6 +1031,153 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     "block sizes.")
 
 
+def _patch_vllm_reset_compile_wrapper() -> None:
+    """Reset the compile wrapper on every decoder layer, not just the model.
+
+    `support_torch_compile` makes each decorated module its own compile
+    wrapper, so compiling per layer puts a wrapper on all 40+ layers. vLLM's
+    `reset_compile_wrapper` only looks at the object it is handed and that
+    object's `.model` attribute; finding no wrapper there, it returns and
+    resets nothing.
+    """
+    import torch
+    import vllm.compilation.wrapper as wrapper_mod
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    original_reset = wrapper_mod.reset_compile_wrapper
+    if getattr(original_reset, "_tpu_reset_compile_wrapper_patch", False):
+        return
+
+    def reset_compile_wrapper_tpu(model: torch.nn.Module) -> None:
+        if model is None:
+            return
+        if isinstance(model, TorchCompileWithNoGuardsWrapper):
+            original_reset(model)
+            return
+
+        found_wrapper = False
+        for m in model.modules():
+            if isinstance(m, TorchCompileWithNoGuardsWrapper):
+                found_wrapper = True
+                original_reset(m)
+
+        if not found_wrapper:
+            original_reset(model)
+
+    reset_compile_wrapper_tpu._tpu_reset_compile_wrapper_patch = True
+    wrapper_mod.reset_compile_wrapper = reset_compile_wrapper_tpu
+    logger.info(
+        "Applied TPU patch: recursive reset_compile_wrapper for per-layer compilation."
+    )
+
+
+def _patch_vllm_piecewise_backend() -> None:
+    """Pick the compiled token-count bucket from a tensor's leading dimension.
+
+    A graph is compiled once per bucket of token counts, and vLLM decides
+    which one a call needs by reading an argument that is a `SymInt`. A layer
+    whose arguments are all tensors has no such argument, so vLLM assumes only
+    one bucket was compiled and asserts when several were.
+    """
+    import torch
+    from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    original_call = PiecewiseBackend.__call__
+    if getattr(original_call, "_tpu_piecewise_backend_patch", False):
+        return
+
+    def patched_call(self, *args, **kwargs):
+        if self.sym_shape_indices:
+            runtime_shape = args[self.sym_shape_indices[0]]
+            range_entry = self._find_range_for_shape(runtime_shape)
+            assert range_entry is not None, (
+                f"Shape: {runtime_shape} out of considered ranges: "
+                f"{self.compile_ranges}")
+        elif len(self.range_entries) > 1 or (self.compile_sizes
+                                             and len(self.compile_sizes) > 1):
+            # Dynamic token count from tensor dimension 0
+            first_tensor = next(
+                (x for x in args if isinstance(x, torch.Tensor)), None)
+            if first_tensor is not None:
+                runtime_shape = first_tensor.shape[0]
+                range_entry = self._find_range_for_shape(runtime_shape)
+                assert range_entry is not None, (
+                    f"Shape: {runtime_shape} out of considered ranges: "
+                    f"{self.compile_ranges}")
+            else:
+                compiled_entries = [
+                    re for re in self.range_entries.values() if re.compiled
+                ]
+                assert len(compiled_entries) == 1, (
+                    f"Expected exactly one compiled range_entry for static shape "
+                    f"compilation, but found {len(compiled_entries)}")
+                range_entry = compiled_entries[0]
+        else:
+            compiled_entries = [
+                re for re in self.range_entries.values() if re.compiled
+            ]
+            assert len(compiled_entries) == 1, (
+                f"Expected exactly one compiled range_entry for static shape "
+                f"compilation, but found {len(compiled_entries)}")
+            range_entry = compiled_entries[0]
+
+        assert range_entry.compiled, (
+            "All ranges should be compiled or loaded up front in "
+            "PiecewiseBackend.__init__. "
+            f"range_entry={range_entry.compile_range}")
+        return range_entry.runnable(*args, **kwargs)
+
+    patched_call._tpu_piecewise_backend_patch = True
+    PiecewiseBackend.__call__ = patched_call
+    logger.info(
+        "Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
+
+
+def _patch_vllm_compile_prefix_isolation() -> None:
+    """Give each support_torch_compile'd instance its own cache identity.
+
+    vLLM's shared `compile_prefix=""` is only safe when all instances of a
+    class close over identically-shaped buffers; DSv4's KV cache overlay
+    breaks that, and one layer's executable can be reused by another (XLA
+    e0102). Keying on self.prefix is a no-op for shape-uniform models.
+    """
+    import itertools
+
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    original_init = TorchCompileWithNoGuardsWrapper.__init__
+    if getattr(original_init, "_tpu_compile_prefix_isolation_patch", False):
+        return
+
+    counter = itertools.count()
+
+    def patched_init(self,
+                     compile_prefix: str = "",
+                     is_encoder: bool = False) -> None:
+        if not compile_prefix and not is_encoder:
+            prefix = getattr(self, "prefix", None)
+            if prefix:
+                compile_prefix = prefix
+            else:
+                # No self.prefix: fall back to a counter. Stable within a
+                # process but not across restarts, so the cache won't persist.
+                compile_prefix = f"_tpu_instance_{next(counter)}"
+                logger.warning(
+                    "compile_prefix isolation: %s has no self.prefix; using "
+                    "non-deterministic fallback %s (its on-disk compile "
+                    "cache will not persist across restarts).",
+                    type(self).__name__, compile_prefix)
+        original_init(self,
+                      compile_prefix=compile_prefix,
+                      is_encoder=is_encoder)
+
+    patched_init._tpu_compile_prefix_isolation_patch = True
+    TorchCompileWithNoGuardsWrapper.__init__ = patched_init
+    logger.info(
+        "Applied TPU patch: per-instance compile-artifact cache isolation "
+        "(compile_prefix keyed off self.prefix).")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations

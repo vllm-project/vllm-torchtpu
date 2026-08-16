@@ -1,0 +1,7 @@
+{
+  "mmlu_llama": {
+    "sample_len": 5700.0,
+    "exact_match,strict_match": 0.8370175438596491,
+    "exact_match_stderr,strict_match": 0.00474444949340689
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "mmlu_pro": {
+    "sample_len": 1400.0,
+    "exact_match,custom-extract": 0.35,
+    "exact_match_stderr,custom-extract": 0.012722965080721908
+  }
+}

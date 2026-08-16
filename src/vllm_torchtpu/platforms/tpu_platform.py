@@ -352,9 +352,15 @@ def apply_tpu_patches() -> None:
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env)
+                               _patch_multiproc_worker_global_rank_env,
+                               _patch_vllm_compile_prefix_isolation,
+                               _patch_vllm_piecewise_backend,
+                               _patch_vllm_reset_compile_wrapper)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    _patch_vllm_reset_compile_wrapper()
+    _patch_vllm_piecewise_backend()
+    _patch_vllm_compile_prefix_isolation()
     from vllm_torchtpu.model_loader_patches import \
         patch_runai_sharded_expert_streaming
     patch_runai_sharded_expert_streaming()
@@ -927,7 +933,10 @@ class TpuPlatform(Platform):
             from vllm_torchtpu.executors.tpu_multiproc_executor import \
                 TpuMultiprocExecutor
             parallel_config.distributed_executor_backend = TpuMultiprocExecutor
-        elif not multihost_backend:  # Single host
+        elif multihost_backend == "mp" or not multihost_backend:
+            # Single host, or genuine multi-host DP without --nnodes (this
+            # host owns only a slice of data_parallel_size via
+            # --data-parallel-size-local / --data-parallel-start-rank).
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
                 if pcp_size > 1:

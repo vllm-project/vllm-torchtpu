@@ -348,7 +348,7 @@ with contextlib.redirect_stdout(sys.stderr):
     import vllm
     import vllm_torchtpu
     from tpu_raiden.api.torch.kv_cache_manager import _torch_impl
-    from tpu_sync.rpc.raiden_controller import RaidenController, RaidenControllerServer
+    from tpu_raiden.rpc.raiden_controller import RaidenController, RaidenControllerServer
     from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnector
 
     _tpu_raiden_torch = _torch_impl()
@@ -676,30 +676,6 @@ run_role_server() {
   export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
 
   rm -f "${role_dir}/controller.ready.json"
-  # Differential-corpus recorder for the C++ reshard-controller port: the
-  # controller records raw RPC inputs and worker dispatches.
-  # A few hundred KB per request; kept with the run's measurement data.
-  export TPU_RAIDEN_PLAN_DUMP_DIR="${role_dir}/plan_dump"
-  mkdir -p "${TPU_RAIDEN_PLAN_DUMP_DIR}"
-  if [[ "${RESHARD_CONTROLLER_IMPL}" == store ]]; then
-    # Zero-sidecar store mode: no controller process at all. Each engine's
-    # transfer-rank-0 worker hosts the reshard store in-process; every
-    # participant derives per-engine addresses from these bases, staggered
-    # by dp_rank (prefill: rank 0 only; decode DP8: ranks 0..7).
-    export TPU_RAIDEN_RESHARD_IMPL=store
-    export TPU_RAIDEN_ADVERTISE_HOST="${role_host}"
-    export TPU_RAIDEN_RESHARD_PORT_BASE="${controller_port}"
-    export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE="$((controller_port + 100))"
-  else
-  export TPU_RAIDEN_RESHARD_IMPL=controller
-  if [[ "${RESHARD_CONTROLLER_IMPL}" == cpp ]]; then
-    [[ -x "${RESHARD_SIDECAR_BIN}" ]] \
-      || die "--reshard-controller-impl cpp requires an executable --reshard-sidecar-bin (got: ${RESHARD_SIDECAR_BIN})"
-    setsid "${RESHARD_SIDECAR_BIN}" --port "${controller_port}" \
-      --advertise-host "${role_host}" --request-registry-ttl-s 600 \
-      --ready-file "${role_dir}/controller.ready.json" \
-      >"${role_dir}/controller.log" 2>&1 &
-  else
   setsid "${python_bin}" - --port "${controller_port}" \
     --advertise-host "${role_host}" --request-registry-ttl-s 600 \
     --ready-file "${role_dir}/controller.ready.json" \
@@ -715,7 +691,7 @@ import threading
 import time
 from pathlib import Path
 
-from tpu_sync.rpc.raiden_controller import RaidenController, RaidenControllerServer
+from tpu_raiden.rpc.raiden_controller import RaidenController, RaidenControllerServer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--port", type=int, required=True)
@@ -763,7 +739,6 @@ finally:
                       "pid": os.getpid(), "port": server.port,
                       "address": payload["address"]}, sort_keys=True), flush=True)
 PY
-  fi
   controller_pid=$!
   record_child "${role_dir}" controller "${controller_pid}"
   controller_ticks="$(<"${role_dir}/controller.start_ticks")"
@@ -780,7 +755,6 @@ PY
   done
   [[ -s "${role_dir}/controller.ready.json" ]] \
     || die "${role} controller did not become ready"
-  fi
 
   configure_role_environment "${role}" "${role_host}" "${controller_port}" \
     "${run_id}" "${role_dir}" "${transfer_port}" "${side_channel_port}"
@@ -866,8 +840,7 @@ PY
       wait "${server_pid}" || status=$?
       die "${role} API server exited (status=${status:-0}); see ${role_dir}/server.log"
     fi
-    if ((controller_owned == 1)) \
-        && ! pid_matches_start_ticks "${controller_pid}" "${controller_ticks}"; then
+    if ! pid_matches_start_ticks "${controller_pid}" "${controller_ticks}"; then
       wait "${controller_pid}" || status=$?
       die "${role} controller exited (status=${status:-0}); see ${role_dir}/controller.log"
     fi
@@ -1648,19 +1621,6 @@ ROLE_DIR=""
 ROLE_PYTHON=""
 ROLE_HOST=""
 PREFILL_SSH=""
-# Reshard-controller implementation switch: the
-# role launcher selects the reshard hosting per host. "store" = the
-# zero-sidecar mode (engine rank-0 workers host in-process stores);
-# "python" = the inline
-# RaidenController below (default, byte-identical to the golden lineage);
-# "cpp" = the bazel-built reshard_sidecar binary at RESHARD_SIDECAR_BIN.
-RESHARD_CONTROLLER_IMPL="${RESHARD_CONTROLLER_IMPL:-python}"
-RESHARD_SIDECAR_BIN="${RESHARD_SIDECAR_BIN:-}"
-# Perf-only escape hatch: run the benchmark phases on a pair whose accuracy
-# oracle is known-failing (e.g. while a data-plane accuracy regression is
-# being root-caused upstream). The summary carries an explicit marker; a
-# skipped-oracle run is NEVER a golden accuracy verification.
-SKIP_ACCURACY_ORACLE=0
 PREFILL_HOST=""
 DECODE_HOST=""
 MODEL="${DEFAULT_MODEL}"
@@ -1713,9 +1673,6 @@ while (($#)); do
     --transfer-port) TRANSFER_PORT="${2:?missing value for $1}"; shift 2 ;;
     --side-channel-port) SIDE_CHANNEL_PORT="${2:?missing value for $1}"; shift 2 ;;
     --ssh-option) SSH_OPTIONS+=(-o "${2:?missing value for $1}"); shift 2 ;;
-    --reshard-controller-impl) RESHARD_CONTROLLER_IMPL="${2?missing value for $1}"; shift 2 ;;
-    --reshard-sidecar-bin) RESHARD_SIDECAR_BIN="${2?missing value for $1}"; shift 2 ;;
-    --skip-accuracy-oracle) SKIP_ACCURACY_ORACLE=1; shift ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --no-performance-gate) PERFORMANCE_GATE=0; shift ;;
     --keep-cache) KEEP_CACHE=1; shift ;;
@@ -1819,8 +1776,6 @@ remote_args_common=(
   --kv-port "${KV_PORT}"
   --transfer-port "${TRANSFER_PORT}"
   --side-channel-port "${SIDE_CHANNEL_PORT}"
-  --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
-  --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
 local_args_common=(
   --role-kind decode
@@ -1842,8 +1797,6 @@ local_args_common=(
   --kv-port "${KV_PORT}"
   --transfer-port "${TRANSFER_PORT}"
   --side-channel-port "${SIDE_CHANNEL_PORT}"
-  --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
-  --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
 
 log "checking installed decode environment"
@@ -2057,11 +2010,6 @@ done
 
 ORACLE_DIR="${LOCAL_RUN_DIR}/client/meaningful-32k"
 mkdir -p "${ORACLE_DIR}"
-if ((SKIP_ACCURACY_ORACLE == 1)); then
-  log "WARNING: --skip-accuracy-oracle set; running perf phases WITHOUT the accuracy gate"
-  printf 'accuracy oracle skipped by --skip-accuracy-oracle\n' \
-    >"${LOCAL_RUN_DIR}/client/ACCURACY_ORACLE_SKIPPED"
-else
 log "running the two-request meaningful-data 32K accuracy oracle"
 if ! run_meaningful_oracle "${DECODE_PYTHON}" "${prefill_url}" \
     "${decode_url}" "${SERVED_MODEL}" "${ORACLE_DIR}" \
@@ -2069,7 +2017,6 @@ if ! run_meaningful_oracle "${DECODE_PYTHON}" "${prefill_url}" \
   printf 'oracle failed; performance phases were not run\n' \
     >"${LOCAL_RUN_DIR}/client/BENCH_SKIPPED_ORACLE_FAILED"
   die "meaningful-data accuracy oracle failed"
-fi
 fi
 
 for benchmark_length in 8192 32768 65534; do
@@ -2094,10 +2041,7 @@ done
 # events from every measured request.
 sleep 2
 cp "${DECODE_ROLE_DIR}/server.log" "${RESULT_DIR}/decode.server.log"
-# Store mode hosts the reshard plane in-process: no controller.log exists.
-if [[ -f "${DECODE_ROLE_DIR}/controller.log" ]]; then
-  cp "${DECODE_ROLE_DIR}/controller.log" "${RESULT_DIR}/decode.controller.log"
-fi
+cp "${DECODE_ROLE_DIR}/controller.log" "${RESULT_DIR}/decode.controller.log"
 cp "${DECODE_ROLE_DIR}/server.command" "${RESULT_DIR}/decode.server.command"
 collect_remote_logs
 

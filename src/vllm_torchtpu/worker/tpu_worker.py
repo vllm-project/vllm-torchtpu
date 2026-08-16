@@ -184,6 +184,12 @@ class TPUWorker(WorkerBase):
                     pc.data_parallel_rank_local = dp_rank
             else:
                 pc.data_parallel_size = 1
+                # ParallelConfig's own validator requires
+                # data_parallel_size_local <= data_parallel_size. vLLM core's
+                # own analogous single-engine collapse (run_engine_core's
+                # non-MoE DP path) sets both fields together for the same
+                # reason: https://github.com/vllm-project/vllm/blob/main/vllm/config/parallel.py#L1044
+                pc.data_parallel_size_local = 1
                 pc.data_parallel_rank = 0
                 pc.data_parallel_rank_local = 0
 

@@ -4067,11 +4067,14 @@ class TPUModelRunner(GPUModelRunner):
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config)
 
+        from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+            _maybe_patch_for_deepseek_v4
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                            vllm_config=self.vllm_config), \
-             set_current_vllm_config(self.vllm_config):
+             set_current_vllm_config(self.vllm_config), \
+             _maybe_patch_for_deepseek_v4(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
@@ -5008,9 +5011,7 @@ class TPUModelRunner(GPUModelRunner):
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)
-            compiled = (self.model.get_language_model().model if hasattr(
-                self.model, "get_language_model") else self.model.model)
-            reset_compile_wrapper(compiled)
+            reset_compile_wrapper(self.model)
             # reset_compile_wrapper wipes cache_dir; restore so
             # capture_model can read/write the persistent cache.
             cc.cache_dir, cc.local_cache_dir = saved_cache

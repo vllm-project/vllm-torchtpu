@@ -31,10 +31,6 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
-    TPU_RAIDEN_RESHARD_IMPL: str = "controller"
-    TPU_RAIDEN_ADVERTISE_HOST: str = ""
-    TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
-    TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -245,31 +241,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
-    # Reshard control-plane hosting (zero sidecar processes): "store" hosts the
-    # reshard service inside each engine's rank-0 worker via an in-process
-    # KVCacheStore; "controller" keeps the external (sidecar) controller.
-    "TPU_RAIDEN_RESHARD_IMPL":
-    env_with_choices("TPU_RAIDEN_RESHARD_IMPL",
-                     "controller", ["controller", "store"],
-                     case_sensitive=False),
-    # Reshard client ownership: "cpp" backs the facade surface
-    # with the C++ ReshardClient (encodings, transport, and error text in
-    # C++, byte-compatible); "python" keeps the legacy Python facade as
-    # the one-release rollback.
-    "TPU_RAIDEN_CLIENT_IMPL":
-    env_with_choices("TPU_RAIDEN_CLIENT_IMPL",
-                     "cpp", ["cpp", "python"],
-                     case_sensitive=False),
-    # Host advertised for in-process reshard/dispatch services (store mode).
-    "TPU_RAIDEN_ADVERTISE_HOST":
-    lambda: os.getenv("TPU_RAIDEN_ADVERTISE_HOST", "").strip(),
-    # Per-engine deterministic ports (store mode): engine dp_rank i binds
-    # reshard service at RESHARD_PORT_BASE+i and its dispatch controller at
-    # STORE_DISPATCH_PORT_BASE+i; peers derive the same addresses.
-    "TPU_RAIDEN_RESHARD_PORT_BASE":
-    lambda: int(os.getenv("TPU_RAIDEN_RESHARD_PORT_BASE") or "27000"),
-    "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE":
-    lambda: int(os.getenv("TPU_RAIDEN_STORE_DISPATCH_PORT_BASE") or "27100"),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
