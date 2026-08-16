@@ -8,7 +8,6 @@ pipeline. Each shape bucket gets its own compiled executable.
 
 import copy
 import dataclasses
-import glob
 import hashlib
 import importlib.util
 import json
@@ -40,12 +39,6 @@ class TpuCompilationHandle:
     """Metadata handle saved to vLLM's compilation cache directory."""
     key: str
     tier3_cache_active: bool = False
-    tier3_bin_file: str | None = None
-    tier3_rel_path: str | None = None
-    reconstruct_fx_outputs_fn: Any = None
-    updates_default_generator_state: bool = False
-    dynamic_outputs: Any = None
-    unique_output_indices: Any = None
     executable: Any | None = None
 
 
@@ -310,23 +303,15 @@ class TpuCompilerAdaptor(CompilerInterface):
         # is fatal for these static graphs. An (empty) ShapeEnv yields empty
         # guards -- correct for static shapes -- and lets the artifact cache work.
         from torch._subclasses.fake_tensor import FakeTensor
-        clean_inputs = [
-            int(x) if isinstance(x, torch.SymInt) else x
-            for x in example_inputs
-        ]
         fake_mode = next(
-            (t.fake_mode for t in clean_inputs if isinstance(t, FakeTensor)),
+            (t.fake_mode for t in example_inputs if isinstance(t, FakeTensor)),
             None)
         if fake_mode is not None and fake_mode.shape_env is None:
             fake_mode.shape_env = ShapeEnv()
         tracing_ctx = (torch._guards.TracingContext(fake_mode)
                        if fake_mode is not None else None)
-        with (
-                torch._functorch.config.patch(
-                    autograd_cache_normalize_inputs=True),
-                torch._guards.tracing(tracing_ctx),
-        ):
-            compiled_fn = _tpu_backend(graph, clean_inputs)
+        with torch._guards.tracing(tracing_ctx):
+            compiled_fn = _tpu_backend(graph, example_inputs)
 
         if was_wrapped:
             inner_fn = compiled_fn
@@ -337,17 +322,12 @@ class TpuCompilerAdaptor(CompilerInterface):
                     return result[0]
                 return result
 
-            if hasattr(inner_fn, "serialize"):
-                unwrap_fn.serialize = inner_fn.serialize
-            if hasattr(inner_fn, "_artifacts"):
-                unwrap_fn._artifacts = inner_fn._artifacts
-
             compiled_fn = unwrap_fn
 
         # Save the per-shape PjRt executable to disk.
         # When Tier-3 C++ persistent cache is active, torch_tpu handles PJRT
         # binary persistence natively in C++ (torch_tpu_tier3/*.bin).
-        # We store a lightweight metadata handle pointing to the Tier-3 binary.
+        # We store a lightweight metadata handle instead of duplicate compiled binary executables.
         handle = None
         if (key is not None and self.cache_dir is not None
                 and not self._disable_cache
@@ -356,31 +336,10 @@ class TpuCompilerAdaptor(CompilerInterface):
                 inner_exe = _tpu_backend._compiled_executables[-1]
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                tier3_root = os.getenv(
-                    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
-                if tier3_root and os.path.exists(tier3_root):
-                    bin_files = sorted(
-                        glob.glob(os.path.join(tier3_root, "**", "*.bin"),
-                                  recursive=True),
-                        key=os.path.getmtime,
-                    )
-                    bin_file = bin_files[-1] if bin_files else None
-                    rel_path = os.path.relpath(
-                        bin_file, tier3_root) if bin_file else None
+                if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
                     handle_data = TpuCompilationHandle(
                         key=key,
                         tier3_cache_active=True,
-                        tier3_bin_file=bin_file,
-                        tier3_rel_path=rel_path,
-                        reconstruct_fx_outputs_fn=getattr(
-                            inner_exe, "_reconstruct_fx_outputs_fn", None),
-                        updates_default_generator_state=getattr(
-                            inner_exe, "_updates_default_generator_state",
-                            False),
-                        dynamic_outputs=getattr(inner_exe, "_dynamic_outputs",
-                                                None),
-                        unique_output_indices=getattr(
-                            inner_exe, "_unique_output_indices", None),
                     )
                 else:
                     handle_data = TpuCompilationHandle(
@@ -434,80 +393,35 @@ class TpuCompilerAdaptor(CompilerInterface):
         if isinstance(loaded_data, TpuCompilationHandle):
             tier3_active = loaded_data.tier3_cache_active
             inner_exe = loaded_data.executable
-            if tier3_active and inner_exe is None:
-                # Resolve the Tier-3 binary file on disk
-                bin_path = loaded_data.tier3_bin_file
-                tier3_root = os.getenv(
-                    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
-                if (not bin_path or not os.path.exists(bin_path)
-                    ) and tier3_root and loaded_data.tier3_rel_path:
-                    cand = os.path.join(tier3_root, loaded_data.tier3_rel_path)
-                    if os.path.exists(cand):
-                        bin_path = cand
-                if bin_path and os.path.exists(bin_path):
-                    from torch_tpu._internal.compile.torch_tpu_compiled_executable import \
-                        _unpickle_compiled_executable
-                    with open(bin_path, "rb") as f:
-                        bin_bytes = f.read()
-                    inner_exe = _unpickle_compiled_executable(
-                        serialized_bytes=bin_bytes,
-                        reconstruct_fx_outputs_fn=loaded_data.
-                        reconstruct_fx_outputs_fn,
-                        updates_default_generator_state=loaded_data.
-                        updates_default_generator_state,
-                        dynamic_outputs=loaded_data.dynamic_outputs,
-                        unique_output_indices=loaded_data.
-                        unique_output_indices,
-                    )
         elif isinstance(loaded_data, dict):
             tier3_active = loaded_data.get("tier3_cache_active", False)
             inner_exe = loaded_data.get("executable")
         else:
             inner_exe = loaded_data
 
-        if inner_exe is not None:
+        if tier3_active:
+            # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
+            def _cached_compiler(g, example_inputs):
+                clean_inputs = [
+                    int(x) if isinstance(x, torch.SymInt) else x
+                    for x in example_inputs
+                ]
+                return _tpu_backend(g, clean_inputs)
+        else:
 
             def _cached_compiler(*_args, **_kwargs):
                 return inner_exe
 
-            with torch._guards.tracing(None):
-                compiled_fn = aot_autograd(
-                    fw_compiler=_cached_compiler,
-                    keep_inference_input_mutations=False,
-                )(graph, example_inputs)
-
-            if was_wrapped:
-                inner_fn = compiled_fn
-
-                def unwrap_fn(*args, **kwargs):
-                    result = inner_fn(*args, **kwargs)
-                    if isinstance(result, (tuple, list)) and len(result) == 1:
-                        return result[0]
-                    return result
-
-                compiled_fn = unwrap_fn
-
-            return compiled_fn
-
-        # Fallback to direct _tpu_backend compilation if inner_exe could not be loaded
-        from torch._subclasses.fake_tensor import FakeTensor
-        clean_inputs = [
-            int(x) if isinstance(x, torch.SymInt) else x
-            for x in example_inputs
-        ]
-        fake_mode = next(
-            (t.fake_mode for t in clean_inputs if isinstance(t, FakeTensor)),
-            None)
-        if fake_mode is not None and fake_mode.shape_env is None:
-            fake_mode.shape_env = ShapeEnv()
-        tracing_ctx = (torch._guards.TracingContext(fake_mode)
-                       if fake_mode is not None else None)
-        with (
-                torch._functorch.config.patch(
-                    autograd_cache_normalize_inputs=True),
-                torch._guards.tracing(tracing_ctx),
-        ):
-            compiled_fn = _tpu_backend(graph, clean_inputs)
+        # The tracing context has a FakeTensorMode from Dynamo, but the example
+        # inputs have fake tensors from a different FakeTensorMode.
+        # `aot_autograd` calls detect_fake_mode() which asserts all
+        # FakeTensorModes match, causing a crash.
+        # Clear the tracing context and let `aot_autograd` create its own.
+        with torch._guards.tracing(None):
+            compiled_fn = aot_autograd(
+                fw_compiler=_cached_compiler,
+                keep_inference_input_mutations=False,
+            )(graph, example_inputs)
 
         if was_wrapped:
             inner_fn = compiled_fn
