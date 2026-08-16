@@ -353,57 +353,6 @@ def _warn_if_kv_cache_is_padded(
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _sample_from_logits_compiled(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    u: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    all_greedy: bool = False,
-) -> torch.Tensor:
-    """Sample with xla-friendly function compiled at module level."""
-    if all_greedy:
-        return torch.argmax(logits, dim=-1, keepdim=True)
-    is_greedy = temperatures <= SAMPLING_EPS
-    safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
-    scaled_logits = logits / safe_temperatures
-    masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
-    u_clamped = torch.clamp(u,
-                            min=torch.finfo(u.dtype).tiny,
-                            max=1.0 - torch.finfo(u.dtype).eps)
-    gumbel_noise = -torch.log(-torch.log(u_clamped))
-    noisy_logits = masked_logits + gumbel_noise
-    final_logits = torch.where(is_greedy, logits, noisy_logits)
-    return torch.argmax(final_logits, dim=-1, keepdim=True)
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _gather_logprobs_compiled(
-    logits: torch.Tensor,
-    sampled_tokens: torch.Tensor,
-    max_logprobs: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    token_ids = sampled_tokens.to(torch.int64)
-    token_logits = logits.gather(-1, token_ids)
-    token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
-    log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
-    token_logprobs = (token_logits - log_normalizers).to(torch.float32)
-
-    if max_logprobs > 0:
-        topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
-        topk_logprobs = (topk_logits - log_normalizers).to(torch.float32)
-        logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
-        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
-    else:
-        logprob_token_ids = token_ids
-        logprobs = token_logprobs
-
-    return logprob_token_ids.to(torch.int32), logprobs, token_ranks
-
-
 class TPUModelRunner(GPUModelRunner):
 
     @property
@@ -4585,8 +4534,6 @@ class TPUModelRunner(GPUModelRunner):
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
-            self._precompile_sampling_subgraphs()
-
             with self._precompile_timed("model backbone"):
                 for num_tokens in self.num_tokens_paddings:
                     logger.info("  -- num_tokens: %d", num_tokens)
@@ -4599,6 +4546,8 @@ class TPUModelRunner(GPUModelRunner):
                                         self.num_reqs_most_model_len,
                                         self.num_blocks_per_most_len_req,
                                         use_max_model_len=False)
+
+            self._precompile_sampling_subgraphs()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
@@ -5699,6 +5648,14 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
+    def _apply_temperature(self, logits: torch.Tensor,
+                           temperatures: torch.Tensor) -> torch.Tensor:
+        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
+        return logits / safe_temperatures
+
+    # TODO: Under SPMD mode, sample_from_logits has correctness issue.
+    #       Re-enable the torch.compile once the issue is fixed in torchxla.
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def sample_from_logits(self,
                            logits: torch.Tensor,
                            temperatures: torch.Tensor,
@@ -5706,21 +5663,51 @@ class TPUModelRunner(GPUModelRunner):
                            top_k: torch.Tensor,
                            top_p: torch.Tensor,
                            all_greedy: bool = False) -> torch.Tensor:
-        return _sample_from_logits_compiled(logits,
-                                            temperatures,
-                                            u,
-                                            top_k,
-                                            top_p,
-                                            all_greedy=all_greedy)
+        """
+        Sample with xla-friendly function. This function is to be traced
+        separately from `forward` for lighter compilation overhead.
+        """
+        if all_greedy:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+        is_greedy = temperatures <= SAMPLING_EPS
+        scaled_logits = self._apply_temperature(logits, temperatures)
+        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+        u_clamped = torch.clamp(u,
+                                min=torch.finfo(u.dtype).tiny,
+                                max=1.0 - torch.finfo(u.dtype).eps)
+        gumbel_noise = -torch.log(-torch.log(u_clamped))
+        noisy_logits = masked_logits + gumbel_noise
+        final_logits = torch.where(is_greedy, logits, noisy_logits)
+        return torch.argmax(final_logits, dim=-1, keepdim=True)
 
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_logprobs(self, logits: torch.Tensor,
                         sampled_tokens: torch.Tensor) -> LogprobsTensors:
-        logprob_token_ids, logprobs, token_ranks = _gather_logprobs_compiled(
-            logits,
-            sampled_tokens,
-            max_logprobs=self.model_config.max_logprobs)
+        """
+        Gather the top_logprobs with corresponding tokens. Use a fixed number
+        of logprobs as an alternative to having multiple pre-compiled graphs.
+        Select the number of logprobs actually demanded by each request on CPU.
+        """
+        token_ids = sampled_tokens.to(torch.int64)
+        token_logits = logits.gather(-1, token_ids)
+        token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
+        log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
+        token_logprobs = (token_logits - log_normalizers).to(torch.float32)
+
+        max_logprobs = self.model_config.max_logprobs
+        if max_logprobs > 0:
+            topk_logits, topk_indices = torch.topk(logits,
+                                                   max_logprobs,
+                                                   dim=-1)
+            topk_logprobs = (topk_logits - log_normalizers).to(torch.float32)
+            logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
+            logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+        else:
+            logprob_token_ids = token_ids
+            logprobs = token_logprobs
+
         return LogprobsTensors(
-            logprob_token_ids=logprob_token_ids,
+            logprob_token_ids=logprob_token_ids.to(torch.int32),
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
         )
