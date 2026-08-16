@@ -6,18 +6,29 @@ To enable persistent native C++ compilation caching in `vllm-torchtpu`, set `TOR
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
 ```
 
-## Cache Architecture & Environment Variables
+## Cache Architecture & Categories
 
-`vllm-torchtpu` separates Python-level framework tracing cache from native C++ compiled binary executables:
+`vllm-torchtpu` structures its compilation caching into three clear categories:
 
-1. **`TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`** (C++ Native PJRT Binaries):
-   - **Purpose**: Controls the persistent root directory for native C++ PJRT compiled binary executables (`.bin` files).
-   - **Scope**: Native `torch_tpu` C++ backend. This is the primary driver variable required to enable persistent executable binary caching on TPU.
+1. **Category 1 — Tier-3 Native C++ PJRT Binaries (`TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`)**:
+   - **Purpose**: Persistent root directory for native C++ PJRT compiled binary executables (`.bin` files).
+   - **Scope**: Native `torch_tpu` C++ backend. This is the primary driver required to enable persistent executable binary caching across server restarts on TPU.
 
-2. **`VLLM_CACHE_ROOT`** (vLLM Python-Level Framework Artifacts):
-   - **Purpose**: Controls the root directory for vLLM Python-level framework tracing artifacts.
-   - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
-   - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
+2. **Category 2 — vLLM Compiler Adapter Metadata Handles (`TpuCompilationHandle`)**:
+   - **Location**: `$VLLM_CACHE_ROOT/torch_compile_cache/artifact_compile_range_*`
+   - **Purpose**: Stores lightweight metadata handles (`TpuCompilationHandle`) created by `TpuCompilerAdaptor`.
+   - **Storage Optimization**: Instead of pickling multi-megabyte `PjRtLoadedExecutable` binaries (which would duplicate Category 1 storage), it only stores tiny ~100-byte metadata pointers (`tier3_rel_path` and output reconstruction functions) totaling <50KB across the entire model. On warm load, `_unpickle_compiled_executable` directly reconstructs the executable from the Tier-3 binary in microseconds.
+
+3. **Category 3 — PyTorch Dynamo / AOTAutograd Tracing Cache**:
+   - **Location**: `$VLLM_CACHE_ROOT/torch_compile_cache/torch_aot_compile`
+   - **Scope**: Stores PyTorch Dynamo FX graph bytecode, guards, and AOTAutograd tracing artifacts.
+
+## Environment Variables & Upstream Compatibility
+
+- **`VLLM_USE_AOT_COMPILE=1`** (Default on TPU):
+  Enables vLLM's outer AOT compilation workflow.
+- **`VLLM_USE_MEGA_AOT_ARTIFACT=0`** (Default on TPU):
+  Upstream vLLM introduced Mega-AOT Artifacts (`VLLM_USE_MEGA_AOT_ARTIFACT=1`) to bundle Inductor C++ shared libraries (`.so`) into a single file for GPU fast startup. Because TPU uses native OpenXLA / PJRT executables and Tier-3 C++ binary caching rather than Inductor `.so` bundles, this is explicitly disabled on TPU (`=0`) to avoid Inductor-specific deserialization failures and unexpected recompilations.
 
 ## Compilation Debugging & Telemetry
 
