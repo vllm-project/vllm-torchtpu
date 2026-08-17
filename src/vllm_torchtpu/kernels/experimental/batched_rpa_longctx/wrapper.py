@@ -198,10 +198,14 @@ def calculate_block_sizes(
     aligned_num_q_heads = (aligned_num_q_heads_per_kv_head *
                            model_cfgs.num_kv_heads)
 
-    bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2, serve_cfgs.packing_kv)
-    if utils.has_bank_conflicts(bkv_stride):
-        bkv_stride += 1
-    aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
+    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
+    else:
+        bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2,
+                             serve_cfgs.packing_kv)
+        if utils.has_bank_conflicts(bkv_stride):
+            bkv_stride += 1
+        aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
 
     q_bytes = jnp.dtype(serve_cfgs.dtype_q).itemsize
     kv_bytes = jnp.dtype(serve_cfgs.dtype_kv).itemsize
@@ -315,8 +319,11 @@ def calculate_block_sizes(
                 "Cannot find batch size that fits within VMEM limit.")
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
+        max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-               < capped_vmem_limit_bytes):
+               < capped_vmem_limit_bytes and bkv_sz <= max_seq_len
+               # and bkv_sz <= 8192
+               ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
             # size. When using causal masking, if bq size is larger than bkv size,
             # entire kv tile can be masked out for some query tokens. Similarly, if

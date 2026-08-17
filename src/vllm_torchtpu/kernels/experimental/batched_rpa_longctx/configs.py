@@ -249,6 +249,8 @@ class RpaConfigs:
 
     @property
     def aligned_num_kv_heads_x2(self) -> int:
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            return self.model.num_kv_heads * 2
         packing_kv = self.serve.packing_kv
         return utils.align_to(self.model.num_kv_heads * 2, packing_kv)
 
