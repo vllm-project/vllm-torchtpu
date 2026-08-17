@@ -35,10 +35,6 @@ os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
 # pipeline, so force the flag off before VllmConfig initialization.
 os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
 
-# Disable vLLM's Python-level framework compile cache (Dynamo/Piecewise/AOTInductor).
-# TPU relies on native C++ Tier-3 compilation cache (TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT).
-os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-
 # Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
 # transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
 # skips per-allocation DMA mapping on multi-process v7x workers
