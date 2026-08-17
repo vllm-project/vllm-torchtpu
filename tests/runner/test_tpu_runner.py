@@ -2642,6 +2642,13 @@ class TestUpdateAttentionPageSizePadded:
     `page_size_padded >= real_page_size_bytes` assertion.
     """
 
+    @pytest.fixture(autouse=True)
+    def mock_non_ssm_backend(self):
+        with patch.object(TpuPlatform,
+                          '_find_non_ssm_backend',
+                          return_value=PallasAttentionBackend):
+            yield
+
     @staticmethod
     def _attn(num_kv_heads, head_size):
         layer = MagicMock(spec=Attention)
@@ -2656,6 +2663,7 @@ class TestUpdateAttentionPageSizePadded:
             kv_cache_dtype=torch.bfloat16,
             cache_config=SimpleNamespace(mamba_page_size_padded=None),
             _hybrid_uniform_page_size_bytes=None,
+            vllm_config=MagicMock(),
         )
 
     def test_uses_caller_block_size_not_stale_snapshot(self):

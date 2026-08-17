@@ -1566,7 +1566,7 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(m, Attention):
                 attn_page_sizes.add(
                     backend_cls.get_kv_cache_page_size_bytes(
-                        self.block_size,
+                        block_size,
                         m.num_kv_heads,
                         m.head_size,
                         self.kv_cache_dtype,
