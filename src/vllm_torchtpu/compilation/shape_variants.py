@@ -7,9 +7,8 @@ for every entry of ``compile_sizes`` (``PiecewiseBackend.compile_all_ranges``
 feeds it concrete inputs per size via ``create_concrete_args``). A model that
 decides anything from the token count *while tracing* -- a wave or chunk count,
 a threshold branch -- freezes that decision at whichever bucket was traced
-first, and every other bucket inherits it. That is b/545443817: the graph traced
-at 2048 tokens, re-emitted for 4096, dies in "expand: attempting to expand a
-dimension of length 2048 -> 4096".
+first, and every other bucket inherits it, so a bucket the graph was not traced
+for fails in the shape it was frozen at.
 
 Dynamo does record what a trace assumed -- the ShapeEnv keeps the shape guards
 it discharged, even though vLLM drops them for runtime checking -- and it is
@@ -35,13 +34,16 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import sympy
 import torch
 import torch.fx as fx
 
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -90,7 +92,9 @@ def _finite(value: Any) -> int | None:
     """A ValueRanges endpoint as an int, or None when it is infinite."""
     try:
         return int(value)
-    except Exception:  # sympy int_oo raises AttributeError, not OverflowError
+    except (AttributeError, TypeError):
+        # sympy int_oo raises AttributeError and sympy.oo raises TypeError;
+        # neither raises OverflowError.
         return None
 
 
@@ -228,7 +232,7 @@ def runnable_for(cache_dir: str,
     The load path is screened too: the cache key is (subgraph, bucket) with no
     graph identity, so a graph would otherwise adopt an executable another
     trace compiled and wrap it in its own aot_autograd wrapper. On TPU that
-    executes as "Donation requested for invalid buffer" (job j-14584b09).
+    executes as "Donation requested for invalid buffer".
     Refusing here leaves the bucket to the trace that owns it, which is the
     only one that can rebuild a wrapper matching the executable.
     """
@@ -281,7 +285,7 @@ def aot_cache_tag() -> str | None:
     return f"trace{_session.traces}" if _session is not None else None
 
 
-def retrace(module: torch.nn.Module, vllm_config) -> None:
+def retrace(module: torch.nn.Module, vllm_config: VllmConfig) -> None:
     """Give the module a fresh, untraced torch.compile wrapper.
 
     ``VllmBackend`` refuses a second call ("VllmBackend can only be called

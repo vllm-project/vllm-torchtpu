@@ -24,15 +24,13 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
+from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Type alias for the compile range tuple
-Range = tuple[int, int]
 
 
 @dataclasses.dataclass
@@ -247,10 +245,9 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     return graph, True
 
 
-def _single_size(compile_range: Any) -> int | None:
+def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
-    start, end = compile_range.start, compile_range.end
-    return start if start == end else None
+    return compile_range.start if compile_range.is_single_size() else None
 
 
 class TpuCompilerAdaptor(CompilerInterface):
