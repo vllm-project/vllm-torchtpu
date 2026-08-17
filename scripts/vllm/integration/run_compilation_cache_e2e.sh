@@ -118,9 +118,12 @@ fi
 echo "================================================================="
 echo "=== 📊 [Test 2] Storage Duplication Audit (Cold Run Artifacts)"
 echo "================================================================="
-CAT1_SIZE=$(du -sb "${TIER3_DIR}" 2>/dev/null | cut -f1 || echo 0)
-CAT2_SIZE=$(find "${VLLM_CACHE_ROOT}" -type f -name "artifact_compile_range_*" -exec du -cb {} + 2>/dev/null | tail -n 1 | cut -f1 || echo 0)
-CAT3_SIZE=$(du -sb "${VLLM_CACHE_ROOT}/torch_compile_cache/torch_aot_compile" 2>/dev/null | cut -f1 || echo 0)
+CAT1_SIZE=$(du -sb "${TIER3_DIR}" 2>/dev/null | cut -f1 || true)
+CAT1_SIZE="${CAT1_SIZE:-0}"
+CAT2_SIZE=$(find "${VLLM_CACHE_ROOT}" -type f -name "artifact_compile_range_*" -exec du -cb {} + 2>/dev/null | tail -n 1 | cut -f1 || true)
+CAT2_SIZE="${CAT2_SIZE:-0}"
+CAT3_SIZE=$(du -sb "${VLLM_CACHE_ROOT}/torch_compile_cache/torch_aot_compile" 2>/dev/null | cut -f1 || true)
+CAT3_SIZE="${CAT3_SIZE:-0}"
 
 CAT1_MB=$(awk "BEGIN {printf \"%.2f\", ${CAT1_SIZE}/1048576}")
 CAT2_KB=$(awk "BEGIN {printf \"%.2f\", ${CAT2_SIZE}/1024}")
