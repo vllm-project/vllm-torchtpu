@@ -969,6 +969,26 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         if module is not None:
             setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
 
+    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs",
+                               None)
+    if original_promote is not None and not getattr(
+            original_promote, "_tpu_hybrid_promote_patch", False):
+
+        def patched_promote(specs):
+            try:
+                return original_promote(specs)
+            except ValueError:
+                return {}
+
+        patched_promote._tpu_hybrid_promote_patch = True
+        kv_cache_utils._promote_local_kv_cache_specs = patched_promote
+        for module_name in ("vllm.v1.engine.core",
+                            "vllm.v1.core.kv_cache_utils"):
+            mod = sys.modules.get(module_name)
+            if mod is not None and hasattr(mod,
+                                           "_promote_local_kv_cache_specs"):
+                setattr(mod, "_promote_local_kv_cache_specs", patched_promote)
+
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = (
             EngineCoreProc.run_engine_core)

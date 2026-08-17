@@ -370,7 +370,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 raise RuntimeError(
                     f"Worker {i} was assigned {physical_ids} chips; the TPU "
                     "executor requires exactly one chip per worker.")
-            slice_local_rank = int(physical_ids[0])
+            if dp_size > 1:
+                slice_local_rank = (dp_rank * self.world_size +
+                                    i) % chips_per_host[node_ip]
+            else:
+                slice_local_rank = int(physical_ids[0])
             local_world_size = chips_per_host[node_ip]
             if not 0 <= slice_local_rank < local_world_size:
                 raise RuntimeError(
@@ -451,6 +455,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
                         world_size=slice_world_size,
                         local_world_size=local_world_size,
                     ))
+                worker_env_vars.update({
+                    "RANK": str(slice_rank),
+                    "LOCAL_RANK": str(slice_local_rank),
+                    "WORLD_SIZE": str(slice_world_size),
+                })
             self.ray_worker_handles[i].local_rank = engine_local_rank
             logger.info(
                 "RayDistributedExecutorV2 | Worker rank=%d dp_rank=%d "
@@ -567,8 +576,14 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 device_str: num_devices_per_pp_rank
             } for _ in range(pp_size)]
 
-        dp_size, _, _ = self._get_dp_geometry()
-        if dp_size == 1:
+        dp_size, dp_rank, _ = self._get_dp_geometry()
+        if dp_size > 1:
+            host_order, chips_per_host = self._slice_host_layout(device_str)
+            target_host_idx = (dp_rank * self.world_size) // max(
+                chips_per_host.values())
+            placement_group_specs[0][
+                f"node:{host_order[target_host_idx]}"] = 0.001
+        elif dp_size == 1:
             # Bind the first bundle to the current node (vLLM engine node).
             # Under DP every engine runs on the head node, so pinning would
             # crowd all of them onto it and split each engine's TP group
