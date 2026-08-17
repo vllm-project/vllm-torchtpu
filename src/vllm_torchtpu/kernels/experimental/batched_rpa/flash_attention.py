@@ -53,9 +53,11 @@ def flash_attention_qk_softmax(
         )
     else:
         s = k.shape[-2]
+        # `-1` folds k_heads into the batch dim; upstream's `b` here silently
+        # assumes a single KV head per block.
         qk = lax.dot(
-            q.reshape(b, tq, h_size),
-            k.reshape(b, s, h_size),
+            q.reshape(-1, tq, h_size),
+            k.reshape(-1, s, h_size),
             dimension_numbers=(([2], [2]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
