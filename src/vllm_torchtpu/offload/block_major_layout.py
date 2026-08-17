@@ -26,9 +26,9 @@ contracts without requiring device pointers. When `VLLM_TPU_BLOCK_MAJOR_KV` is
 disabled, it returns None; on unsupported geometries, it fails closed (raises)
 to prevent cross-layout cache corruption.
 
-The bundled attention op relies on `pallas.jax_op` buffer donation for
-in-place bundle updates, avoiding intermediate memory copies without requiring
-dynamic capability probes.
+The bundled attention op relies on the stock Pallas `jax_op` buffer donation
+for in-place bundle updates, avoiding intermediate memory copies without
+requiring dynamic capability probes.
 
 The contract feeds three primary consumers:
 - Offload namespace: Salts cache keys with the layout fingerprint to prevent

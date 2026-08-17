@@ -1327,6 +1327,8 @@ class TestTPURunner:
         self.runner.vllm_config.compilation_config.static_forward_context = {}
         self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
         self.runner.kv_caches = []
+        # The block-major topology gates read parallel_config (PCP/PP).
+        self.runner.parallel_config = self.runner.vllm_config.parallel_config
 
         mock_input_batch = MagicMock()
         mock_block_tables = []
@@ -1438,8 +1440,8 @@ class TestTPURunner:
                 'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
                 return_value=False), patch(
                     'vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV',
-                    True), self.assertRaisesRegex(NotImplementedError,
-                                                  "hybrid attention"):
+                    True), pytest.raises(NotImplementedError,
+                                         match="hybrid attention"):
             self.runner.initialize_kv_cache(kv_cache_config)
 
         assert self.runner._kv_cache_bundle is None
