@@ -291,9 +291,14 @@ def _fa_regions(*, block_size_tokens: int, token_stride_bytes: int,
 
 def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
                       geometry: GdnHeadGeometry) -> tuple[RegionSpec, ...]:
+    # Since the mamba state relayout removal the conv cache is declared
+    # (blocks, taps, 1, dim); the singleton is layout-neutral, so normalize
+    # it away rather than duplicating the derivation below.
+    if len(conv_shape) == 4 and conv_shape[2] == 1:
+        conv_shape = (conv_shape[0], conv_shape[1], conv_shape[3])
     if len(conv_shape) != 3:
-        raise ManifestError(
-            f"GDN conv state must be (blocks, taps, dim): got {conv_shape}")
+        raise ManifestError("GDN conv state must be (blocks, taps, dim) or "
+                            f"(blocks, taps, 1, dim): got {conv_shape}")
     taps = int(conv_shape[1])
     local_dim = int(conv_shape[2])
     expected_dim = (2 * geometry.local_key_heads * geometry.key_head_dim +
