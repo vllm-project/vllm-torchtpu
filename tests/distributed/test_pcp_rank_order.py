@@ -178,8 +178,12 @@ def test_new_group_preserves_rank_order_only_for_replaced_axes():
     original_new_group = torch.distributed.new_group
     original_init = parallel_state.init_model_parallel_group
 
-    def _record_new_group(ranks=None, **kwargs):
-        calls.append(kwargs.get("sort_ranks"))
+    # sort_ranks has to be a named parameter: pcp_topology_order inspects the
+    # signature and refuses to run against a new_group that cannot preserve
+    # the order, so a **kwargs-only double trips that guard instead of
+    # exercising the wrapper.
+    def _record_new_group(ranks=None, sort_ranks=True, **kwargs):
+        calls.append(sort_ranks)
         return None
 
     def _fake_init(group_ranks, local_rank, backend, *args, **kwargs):
@@ -209,10 +213,12 @@ def test_new_group_preserves_rank_order_only_for_replaced_axes():
         torch.distributed.new_group = original_new_group
         parallel_state.init_model_parallel_group = original_init
 
+    # The replaced axes skip the sort; everything vLLM builds for itself keeps
+    # torch's default, so its groups are untouched.
     assert seen["pcp"] == [False], seen
     assert seen["tp"] == [False], seen
     for axis in ("dcp", "pp", "dp", "ep"):
-        assert seen[axis] == [None], (axis, seen)
+        assert seen[axis] == [True], (axis, seen)
 
     assert torch.distributed.new_group is original_new_group
 
