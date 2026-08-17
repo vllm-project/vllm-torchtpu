@@ -29,7 +29,7 @@ import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.distributed.pcp_rank_order import (
-    pcp_topology_order, resolve_pcp_topology_order)
+    pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -392,6 +392,10 @@ class TPUWorker(WorkerBase):
                 pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
             )
+        # The patch above substitutes rank lists on the way in; this reads the
+        # built groups back, so a patch that silently stopped applying fails
+        # here rather than costing a few percent unnoticed.
+        verify_pcp_topology_order(group_ranks_by_name)
 
         # TODO: Enable PP support. The old JAX-based PP init
         # (jax_parallel_state.init_pp_distributed_environment) was removed

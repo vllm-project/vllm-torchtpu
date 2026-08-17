@@ -47,6 +47,7 @@ the handshake instead of being recomputed from sizes.
 """
 
 import contextlib
+import inspect
 from collections.abc import Iterator
 
 import numpy
@@ -180,12 +181,24 @@ def pcp_topology_order(
     baseline run logs no groups at all and there is nothing to diff a
     topology run against.
     """
+    import torch
     from vllm.distributed import parallel_state
 
     original = parallel_state.init_model_parallel_group
     replacements = group_ranks_by_name or {}
 
+    # torch.distributed.new_group sorts its rank list unless sort_ranks=False
+    # ("if sort_ranks: ranks = sorted(ranks)"), so without the wrapper below
+    # the order resolved above is discarded before any collective sees it --
+    # while vLLM still derives rank_in_group from the unsorted list it was
+    # handed ("ranks.index(self.rank)"). The two then disagree and every shard
+    # an all_gather assembles lands in the wrong slot.
+    # The wrapper below turns that sort off, and only for the axes replaced
+    # above.
+    preserving = False
+
     def patched(group_ranks, local_rank, backend, *args, **kwargs):
+        nonlocal preserving
         axis = kwargs.get("group_name")
         # Logged for every axis, whether or not it is being replaced, so the
         # log shows vLLM's own layout even when the mesh does not apply.
@@ -196,10 +209,96 @@ def pcp_topology_order(
             logger.info("Topology layout | %s: replaced with %s", axis,
                         replacement)
             group_ranks = replacement
-        return original(group_ranks, local_rank, backend, *args, **kwargs)
+
+        preserving = replacement is not None
+        try:
+            return original(group_ranks, local_rank, backend, *args, **kwargs)
+        finally:
+            # Cleared even if the delegation raises, so no later call can see
+            # a stale True.
+            preserving = False
+
+    def new_group_preserving_order(*args, **kwargs):
+        if preserving:
+            kwargs.setdefault("sort_ranks", False)
+        return original_new_group(*args, **kwargs)
+
+    # Only installed when there is something to replace, so configurations
+    # that opt out of topology ordering never see it at all.
+    patch_new_group = bool(replacements)
+    original_new_group = torch.distributed.new_group
+    if patch_new_group:
+        if "sort_ranks" not in inspect.signature(
+                original_new_group).parameters:
+            raise RuntimeError(
+                "torch.distributed.new_group has no sort_ranks parameter on "
+                "this build, so the resolved rank order cannot survive group "
+                "construction. Ordering would be silently discarded.")
+        torch.distributed.new_group = new_group_preserving_order
 
     parallel_state.init_model_parallel_group = patched
     try:
         yield
     finally:
         parallel_state.init_model_parallel_group = original
+        if patch_new_group:
+            torch.distributed.new_group = original_new_group
+
+
+def verify_pcp_topology_order(
+        group_ranks_by_name: dict[str, list[list[int]]] | None) -> None:
+    """Assert vLLM adopted the mesh's order, by reading the built groups back.
+
+    ``pcp_topology_order`` substitutes rank lists on their way into
+    ``init_model_parallel_group``. That is a statement about the call, not
+    about the result. This checks the result.
+
+    Verifying the outcome rather than the patch is the point. The patch can
+    stop applying without failing: upstream may rename ``group_name``, pass it
+    positionally, build the groups from somewhere other than
+    ``init_model_parallel_group``, or rebuild them after this module has
+    restored the original. Each leaves the ring on vLLM's arithmetic layout,
+    costing a few percent and raising nothing. Reading the group back catches
+    all of them without needing to know which one happened, and keeps this
+    module's promise that a fallback to the arithmetic layout is an error
+    rather than an unmeasurable slowdown.
+
+    ``GroupCoordinator.ranks`` is the same attribute ``get_pcp_group_layout``
+    builds the device mesh from, so this asserts the literal input to the
+    kernel's ring rather than a proxy for it.
+    """
+    if not group_ranks_by_name:
+        return
+
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
+
+    getters = {"pcp": get_pcp_group, "tp": get_tp_group}
+    my_rank = int(dist.get_rank())
+
+    for axis, wanted in group_ranks_by_name.items():
+        getter = getters.get(axis)
+        if getter is None:
+            raise RuntimeError(
+                f"No group accessor is known for axis {axis!r}. Every axis "
+                f"pcp_topology_order replaces must also be readable back, "
+                f"otherwise it is applied without being verified.")
+
+        expected = next((group for group in wanted if my_rank in group), None)
+        if expected is None:
+            raise RuntimeError(
+                f"Rank {my_rank} does not appear in the {axis} groups "
+                f"{wanted} resolved from the topology mesh.")
+
+        # Compared as a sequence, not a set: the ring is the order, and a
+        # group with the right members in the wrong order is the exact
+        # failure this exists to catch.
+        actual = [int(rank) for rank in getter().ranks]
+        if actual != expected:
+            raise RuntimeError(
+                f"The {axis} group built for rank {my_rank} is {actual}, but "
+                f"the topology mesh asked for {expected}. vLLM did not adopt "
+                f"the requested order, so the ring is running on a layout "
+                f"this module did not choose.")
+
+        logger.info("Topology layout | %s: verified %s", axis, actual)

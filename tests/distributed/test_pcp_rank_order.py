@@ -164,6 +164,81 @@ def test_context_manager_only_touches_axes_it_was_given():
     assert seen["tp"] == [[0, 1, 2, 3, 4, 5, 6, 7]]
 
 
+def test_new_group_preserves_rank_order_only_for_replaced_axes():
+    """new_group sorts by default, which would discard the resolved order.
+
+    The wrapper keys off the axis, not the rank list: at tp=1 the replaced tp
+    lanes are singletons and so are dcp, pp and dp, so matching on contents
+    would catch axes vLLM built for itself.
+    """
+    import torch
+    from vllm.distributed import parallel_state
+
+    calls = []
+    original_new_group = torch.distributed.new_group
+    original_init = parallel_state.init_model_parallel_group
+
+    def _record_new_group(ranks=None, **kwargs):
+        calls.append(kwargs.get("sort_ranks"))
+        return None
+
+    def _fake_init(group_ranks, local_rank, backend, *args, **kwargs):
+        # Stands in for the real thing, which is what calls new_group.
+        for ranks in group_ranks:
+            torch.distributed.new_group(ranks)
+
+    orders = {
+        "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
+        "tp": [[0], [1], [6], [7], [4], [5], [2], [3]],
+    }
+    singletons = [[r] for r in range(8)]
+    seen = {}
+
+    torch.distributed.new_group = _record_new_group
+    parallel_state.init_model_parallel_group = _fake_init
+    try:
+        with order_mod.pcp_topology_order(orders):
+            patched = parallel_state.init_model_parallel_group
+            for axis, built in (("tp", singletons), ("dcp", singletons),
+                                ("pcp", [list(range(8))]), ("pp", singletons),
+                                ("dp", singletons), ("ep", [list(range(8))])):
+                calls.clear()
+                patched(built, 0, "gloo", group_name=axis)
+                seen[axis] = sorted({c for c in calls}, key=str)
+    finally:
+        torch.distributed.new_group = original_new_group
+        parallel_state.init_model_parallel_group = original_init
+
+    assert seen["pcp"] == [False], seen
+    assert seen["tp"] == [False], seen
+    for axis in ("dcp", "pp", "dp", "ep"):
+        assert seen[axis] == [None], (axis, seen)
+
+    assert torch.distributed.new_group is original_new_group
+
+
+def test_new_group_is_not_wrapped_when_there_is_nothing_to_replace():
+    import torch
+
+    before = torch.distributed.new_group
+    with order_mod.pcp_topology_order(None):
+        assert torch.distributed.new_group is before
+    assert torch.distributed.new_group is before
+
+
+def test_raises_when_new_group_cannot_preserve_order():
+    import torch
+
+    original_new_group = torch.distributed.new_group
+    torch.distributed.new_group = lambda ranks=None, backend=None: None
+    try:
+        with pytest.raises(RuntimeError, match="no sort_ranks parameter"):
+            with order_mod.pcp_topology_order({"pcp": [[0, 1]]}):
+                pass
+    finally:
+        torch.distributed.new_group = original_new_group
+
+
 def test_context_manager_restores_the_original_function():
     """The patch must not outlive group construction."""
     from vllm.distributed import parallel_state
