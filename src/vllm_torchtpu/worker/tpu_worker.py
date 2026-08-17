@@ -28,6 +28,8 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
+from vllm_torchtpu.distributed.pcp_rank_order import (
+    pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -285,7 +287,7 @@ class TPUWorker(WorkerBase):
                 "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
                 "self.rank=%d self.local_rank=%d -> tpu_rank=%d "
                 "tpu_local_rank=%d global_world=%d "
-                "init_local_rank=%d pcp_remap=%s source=%s "
+                "init_local_rank=%d "
                 "(vllm_init_rank=%d vllm_init_world=%d)",
                 dp_size,
                 dp_rank,
@@ -296,8 +298,6 @@ class TPUWorker(WorkerBase):
                 binding.local_rank,
                 binding.world_size,
                 binding.init_local_rank,
-                binding.pcp_local_rank_remap,
-                binding.pcp_remap_source,
                 init_rank,
                 init_world,
             )
@@ -313,15 +313,13 @@ class TPUWorker(WorkerBase):
                     "PCP native-rank TPU binding | rank=%d "
                     "native_local_rank=%d local_rank_env=%d "
                     "tpu_local_rank_env=%d local_world=%s "
-                    "tpu_local_world=%d remap=%s source=%s",
+                    "tpu_local_world=%d",
                     self.rank,
                     self.local_rank,
                     binding.init_local_rank,
                     binding.local_rank,
                     binding.world_size,
                     binding.local_world_size,
-                    binding.pcp_local_rank_remap,
-                    binding.pcp_remap_source,
                 )
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
@@ -380,7 +378,13 @@ class TPUWorker(WorkerBase):
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
             )
-        with set_current_vllm_config(self.vllm_config):
+        # Ring order is the PCP group's rank order, and the group is built
+        # below. topology_aware_mesh needs open chips and a live process
+        # group, so this is the first point it can be asked -- and the last
+        # point the answer can still be applied.
+        group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
+        with set_current_vllm_config(self.vllm_config), \
+                pcp_topology_order(group_ranks_by_name):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.
                 tensor_parallel_size,
@@ -388,6 +392,10 @@ class TPUWorker(WorkerBase):
                 pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
             )
+        # The patch above substitutes rank lists on the way in; this reads the
+        # built groups back, so a patch that silently stopped applying fails
+        # here rather than costing a few percent unnoticed.
+        verify_pcp_topology_order(group_ranks_by_name)
 
         # TODO: Enable PP support. The old JAX-based PP init
         # (jax_parallel_state.init_pp_distributed_environment) was removed

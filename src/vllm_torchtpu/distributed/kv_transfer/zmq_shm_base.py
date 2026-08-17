@@ -26,6 +26,8 @@ pool plus ZMQ ROUTER/DEALER coordination.
     releases the slot once all ranks have copied.
 """
 
+import hashlib
+import hmac
 import os
 import pickle
 import queue
@@ -56,6 +58,48 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import \
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _get_default_ipc_key() -> bytes:
+    key_str = os.environ.get("VLLM_TORCHTPU_IPC_KEY", "")
+    if key_str:
+        return key_str.encode("utf-8")
+    machine_id = ""
+    try:
+        if os.path.exists("/etc/machine-id"):
+            with open("/etc/machine-id", "r") as f:
+                machine_id = f.read().strip()
+    except Exception:
+        pass
+    user_id = str(os.getuid()) if hasattr(os, "getuid") else "0"
+    base_secret = f"vllm-torchtpu-ipc-auth-{machine_id}-{user_id}".encode(
+        "utf-8")
+    return hashlib.sha256(base_secret).digest()
+
+
+_IPC_AUTH_KEY: bytes = _get_default_ipc_key()
+
+
+def _secure_dumps(obj: Any) -> bytes:
+    """Serialize payload with an HMAC-SHA256 signature to prevent untrusted deserialization."""
+    raw = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    sig = hmac.new(_IPC_AUTH_KEY, raw, hashlib.sha256).digest()
+    return sig + raw
+
+
+def _secure_loads(data: bytes) -> Any:
+    """Verify HMAC-SHA256 signature before deserializing payload."""
+    sig_len = 32
+    if len(data) < sig_len:
+        raise ValueError("IPC payload too short for HMAC authentication")
+    sig, raw = data[:sig_len], data[sig_len:]
+    expected_sig = hmac.new(_IPC_AUTH_KEY, raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(sig, expected_sig):
+        raise ValueError(
+            "IPC payload HMAC authentication failed: potential tampering detected"
+        )
+    return pickle.loads(raw)
+
 
 # Wire-format tags for the ZMQ data channel.
 _MSG_PULL = b"PULL"
@@ -758,7 +802,7 @@ class ZmqShmKvConnectorBase:
 
     def _coord_send_ipc(self, tag: bytes, payload) -> None:
         """Worker (non-zero rank) -> coordinator. Enqueues a DEALER frame."""
-        data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        data = _secure_dumps(payload)
         # DEALER frames are [tag, data]; ROUTER side reassembles identity
         # from the socket itself.
         self._coord_ipc_out.put((None, tag, data))
@@ -766,7 +810,7 @@ class ZmqShmKvConnectorBase:
     def _coord_broadcast(self, tag: bytes, payload) -> None:
         """Coordinator -> every known non-zero rank. Enqueues one frame per
         rank, addressed to the rank's DEALER identity."""
-        data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        data = _secure_dumps(payload)
         with self._coord_lock:
             identities = list(self._coord_rank_to_identity.values())
         for ident in identities:
@@ -1293,8 +1337,7 @@ class ZmqShmKvConnectorBase:
         n_channels = self._n_channels
         uuid_bytes = str(entry.uuid).encode("utf-8")
         timeout_s = dist_utils.get_p2p_wait_pull_timeout()
-        req_blocks_pickle = pickle.dumps(entry.remote_blocks,
-                                         protocol=pickle.HIGHEST_PROTOCOL)
+        req_blocks_pickle = _secure_dumps(entry.remote_blocks)
         logger.info(
             "TPUConnectorWorker(%s) rank0 --> PULL req_id=%s uuid=%s "
             "from=%s:%s+0..%s blocks=%s n_channels=%s", self.node_id,
@@ -1752,7 +1795,7 @@ class ZmqShmKvConnectorBase:
                 continue
             identity, tag, payload = frames
             try:
-                obj = pickle.loads(payload)
+                obj = _secure_loads(payload)
             except Exception as e:
                 logger.warning(
                     "TPUConnectorWorker(%d) rank0 --> bad IPC "
@@ -1868,7 +1911,7 @@ class ZmqShmKvConnectorBase:
                 continue
             tag, payload = frames
             try:
-                obj = pickle.loads(payload)
+                obj = _secure_loads(payload)
             except Exception as e:
                 logger.warning(
                     "TPUConnectorWorker(%d) rank%d --> bad IPC payload tag=%s: %s",
@@ -2125,8 +2168,7 @@ class ZmqShmKvConnectorBase:
         ]
         if channel_idx == 0:
             header = self._pull_response_header(entry)
-            frames.append(
-                pickle.dumps(header, protocol=pickle.HIGHEST_PROTOCOL))
+            frames.append(_secure_dumps(header))
         total_bytes = 0
         for r in ranks_on_channel:
             global_rank = self._coord_local_to_global_rank[r]

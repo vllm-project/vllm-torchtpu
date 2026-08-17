@@ -548,5 +548,74 @@ class TestOnlineFp8Quantization:
         mock_routing.assert_called_once()
 
 
+class FakeInt8MoEConfig:
+    """The `moe_config` attributes `_process_fp8_moe_weights` actually reads."""
+
+    def __init__(self, intermediate):
+        self.intermediate_size_per_partition = intermediate
+        self.intermediate_size_per_partition_unpadded = intermediate
+        self.tp_size = 1
+        self.tp_rank = 0
+        self.has_bias = False
+
+
+class TestInt8MoERequantization:
+    """`MOE_REQUANTIZE_WEIGHT_DTYPE=int8` end to end through the loader.
+
+    int8 is a supported value of that env var but no recipe, CI config or other
+    test exercises it, which is how the truncating cast in `quantize_tensor`
+    survived. This runs the real `_process_fp8_moe_weights`. CPU-only, so it
+    takes no `device` fixture.
+    """
+
+    E, INTER, H, BLOCK = 2, 128, 384, 128
+
+    def _layer(self):
+        gen = torch.Generator().manual_seed(0)
+        E, inter, H, B = self.E, self.INTER, self.H, self.BLOCK
+        layer = FakeFusedMoELayer(
+            (torch.randn(E, 2 * inter, H, generator=gen) * 40).to(
+                torch.float8_e4m3fn),
+            (torch.randn(E, H, inter, generator=gen) * 40).to(
+                torch.float8_e4m3fn),
+            torch.rand(E, 2 * inter // B, H // B, generator=gen) + 0.5,
+            torch.rand(E, H // B, inter // B, generator=gen) + 0.5,
+        )
+        layer.moe_config = FakeInt8MoEConfig(inter)
+        return layer
+
+    def test_int8_requant_produces_int8_weights_rounded_to_nearest(
+            self, monkeypatch):
+        from vllm_torchtpu.layers.common.quantization import dequantize_tensor
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import \
+            _process_fp8_moe_weights
+
+        monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "int8")
+        layer = self._layer()
+
+        w13, w13_scale, w2, _, dtype_name, block_size = (
+            _process_fp8_moe_weights(layer,
+                                     weight_block_size=(self.BLOCK,
+                                                        self.BLOCK),
+                                     activation="silu"))
+
+        assert dtype_name == "int8" and block_size is None
+        assert w13.dtype == torch.int8 and w2.dtype == torch.int8
+        # The GMM kernel wants [E, in, out]; the loader transposes on the way.
+        assert w13.shape == (self.E, self.H, 2 * self.INTER)
+        assert w2.shape == (self.E, self.INTER, self.H)
+
+        # Per-channel scale over the contracting axis, broadcast back to [E, out, in].
+        scale = w13_scale.reshape(self.E, 1, -1).transpose(1, 2)
+        reference = dequantize_tensor(layer.w13_weight.data,
+                                      layer.w13_weight_scale_inv.data,
+                                      axis=(1, 2),
+                                      out_dtype=torch.float32)
+        err_lsb = (w13.float().transpose(1, 2) * scale -
+                   reference).abs() / scale
+        # Round-to-nearest bounds this by half an LSB; truncation gives a full one.
+        assert err_lsb.max().item() <= 0.5 + 1e-4
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

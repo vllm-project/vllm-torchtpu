@@ -7,6 +7,10 @@ from typing import Any
 
 import torch
 
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 @dataclass(frozen=True)
 class PcpGroupLayout:
@@ -196,5 +200,23 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
     mesh_devices = np.asarray(
         [devices_by_id[device_id] for device_id in layout.device_ids])
     mesh = Mesh(mesh_devices, axis_names=(axis_name, ))
+
+    # This is the mesh the PCP kernel runs on, so it is the only place that
+    # sees the rank -> device correspondence the ring actually uses.
+    # ``lax.axis_index(axis_name)`` inside the kernel returns a *position* in
+    # this array, not a rank; it coincides with rank_in_group only because
+    # device_ids above is built by walking layout.ranks in order. Logging the
+    # two side by side makes a divergence visible instead of silent.
+    # Cached per layout, so this logs once per worker rather than per step.
+    positions = ", ".join(
+        f"pos{position}=rank{rank}/dev{device_id}"
+        f"@{tuple(getattr(device, 'coords', ()))}"
+        f"c{getattr(device, 'core_on_chip', '?')}"
+        for position, (rank, device_id, device) in enumerate(
+            zip(layout.ranks, layout.device_ids, mesh_devices)))
+    logger.info(
+        "PCP device mesh | axis=%s world_size=%d my_rank_in_group=%d | %s",
+        axis_name, layout.world_size, layout.rank_in_group, positions)
+
     _MESH_CACHE[cache_key] = mesh
     return mesh
