@@ -224,6 +224,7 @@ def test_prepare_dflash_inputs(device):
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
+        _dp_lockstep_enabled=lambda: False,
     )
     chunk = _make_chunk(num_reqs=2,
                         start_index=0,
@@ -272,6 +273,7 @@ def test_update_draft_kv_cache_from_target_unit(device):
         block_size=8,
         num_tokens_paddings=[8, 16, 32],
         mesh=None,
+        _dp_lockstep_enabled=lambda: False,
     )
 
     draft_model = mock.MagicMock()
@@ -315,6 +317,8 @@ def test_propose_unit(device):
         build_attention_metadata_for_layers=mock.MagicMock(return_value={}),
         mesh=None,
         _is_async_drafter=True,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_step_num_chunks=0,
     )
 
     chunk = _make_chunk(num_reqs=2,
@@ -384,3 +388,50 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     # The resolvable layer on its own comes back in layer order.
     draft_model.model.layers = [named]
     assert proposer._build_draft_layer_metadata(md) == (md["dummy_layer"], )
+
+
+def test_dp_lockstep_run_dummy_draft():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.draft_model = mock.MagicMock()
+    proposer.runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        _dp_target_bucket=32,
+        _dp_step_max_reqs=4,
+        num_reqs_max_model_len=8,
+    )
+    proposer._dp_dummy_kv_update = mock.MagicMock()
+    proposer._dp_dummy_forward = mock.MagicMock()
+
+    proposer.run_dp_dummy_draft(num_chunks=2)
+
+    assert proposer._dp_dummy_kv_update.call_count == 2
+    assert proposer._dp_dummy_forward.call_count == 2
+
+
+def test_prepare_dflash_inputs_dp_lockstep(device):
+    proposer = _make_proposer(draft_tp=1)
+    K = 3
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[8, 16, 32],
+        _dp_lockstep_enabled=lambda: True,
+        _dp_step_max_reqs=4,
+    )
+    chunk = _make_chunk(num_reqs=1,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 3], dtype=np.int32),
+                        position_ids=torch.tensor([10, 11, 12, 0],
+                                                  dtype=torch.int32,
+                                                  device=device))
+    next_tokens_device = torch.tensor([[101, 102, 103, -1]],
+                                      dtype=torch.int32,
+                                      device=device)
+
+    input_ids, position_ids, _ = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=next_tokens_device)
+
+    # Coordinated reqs = 4 -> 4 * 4 = 16 tokens padded.
+    assert input_ids.shape == (16, )
+    assert position_ids.shape == (16, )

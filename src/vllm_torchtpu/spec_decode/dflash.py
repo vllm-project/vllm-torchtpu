@@ -253,7 +253,17 @@ class DFlashProposer:
         total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
-        padded_len = self._get_padded_len(total_draft_tokens)
+        if self._dp_lockstep_sharded():
+            # EP-DP lockstep: every rank must emit identical collective
+            # shapes, and num_reqs is rank-local. Pad to the step's DP-wide
+            # max per-chunk request count, coordinated by the same
+            # all-reduce that sizes the target bucket
+            # (`_dp_coordinated_step`); run_dp_dummy_draft replays the same
+            # shape on idle ranks.
+            coordinated_reqs = max(1, self.runner._dp_step_max_reqs)
+            padded_len = self._get_padded_len(coordinated_reqs * block_size)
+        else:
+            padded_len = self._get_padded_len(total_draft_tokens)
 
         padded_num_reqs = padded_len // block_size
         if padded_num_reqs == 0:
@@ -378,10 +388,21 @@ class DFlashProposer:
         K = self.speculative_config.num_speculative_tokens
         block_size = K + 1
 
+        # EP-DP lockstep: a rank whose step produced fewer chunks than the
+        # DP-group max must pad each draft phase to the group's chunk count —
+        # collectives pair across ranks by emission order, and propose emits
+        # ALL KV updates before ALL draft forwards, so the padding must
+        # follow the same phase structure (never interleave per chunk).
+        extra_chunks = 0
+        if self._dp_lockstep_sharded():
+            extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
+
         # 1. Hoist all KV cache updates across chunks to the top of propose
         for chunk in chunks:
             with set_vllm_model_wrapper_context(mesh=None):
                 self._update_draft_kv_cache_from_target(chunk)
+        for _ in range(extra_chunks):
+            self._dp_dummy_kv_update()
 
         # 2. Process each chunk
         draft_logits_per_chunk = []
@@ -405,6 +426,8 @@ class DFlashProposer:
                     input_ids, positions, block_size)
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
+        for _ in range(extra_chunks):
+            self._dp_dummy_forward()
 
         # 3. Extract K tokens from logits
         if return_device:
@@ -604,6 +627,67 @@ class DFlashProposer:
 
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
+
+    def _dp_lockstep_sharded(self) -> bool:
+        """True when the draft emits cross-DP collectives under EP-DP
+        lockstep. A DFlash draft always runs TP-sharded (draft_tp must equal
+        the target's TP), so this is simply whether lockstep is on.
+        """
+        return self.runner._dp_lockstep_enabled()
+
+    @torch.no_grad()
+    def _dp_dummy_kv_update(self) -> None:
+        """One padding KV-update pass at the DP-coordinated target bucket —
+        the same program a busy rank's `_update_draft_kv_cache_from_target`
+        dispatches."""
+        runner = self.runner
+        bucket = runner._dp_target_bucket
+        assert bucket is not None, "_dp_target_bucket unset in lockstep step"
+        fc_layer = getattr(self.draft_model.model, "fc", None)
+        hidden_dim = (fc_layer.weight.shape[1] if fc_layer is not None else
+                      self.vllm_config.model_config.get_hidden_size())
+        dtype = self.draft_model.model.embed_tokens.weight.dtype
+        self._dummy_precompute_and_update_kv_cache(
+            num_tokens=bucket,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            num_reqs=runner.num_reqs_max_model_len,
+        )
+
+    @torch.no_grad()
+    def _dp_dummy_forward(self) -> None:
+        """One padding draft forward at the step's coordinated draft bucket —
+        the shape `_prepare_dflash_inputs` pins every rank to under
+        lockstep, derived from the same `_dp_coordinated_step` all-reduce."""
+        runner = self.runner
+        block_size = self.speculative_config.num_speculative_tokens + 1
+        coordinated_reqs = max(1, runner._dp_step_max_reqs)
+        draft_bucket = self._get_padded_len(coordinated_reqs * block_size)
+        self._dummy_draft_forward(
+            num_tokens=draft_bucket,
+            num_reqs=runner.num_reqs_max_model_len,
+            use_max_model_len=True,
+        )
+
+    @torch.no_grad()
+    def run_dp_dummy_draft(self, num_chunks: int) -> None:
+        """Replay a busy rank's DRAFT collective trace on an idle/padding
+        rank, for `num_chunks` padding chunks (EP-DP lockstep).
+
+        Collectives pair across ranks by emission order, and a busy
+        propose() emits ALL context KV-updates before ALL draft forwards
+        (the hoist at the top of propose), so the replay keeps the same
+        phase structure: KV-updates x num_chunks, then forwards x
+        num_chunks — never interleaved per chunk.
+        """
+        if num_chunks <= 0 or self.draft_model is None:
+            return
+        if not self._dp_lockstep_sharded():
+            return
+        for _ in range(num_chunks):
+            self._dp_dummy_kv_update()
+        for _ in range(num_chunks):
+            self._dp_dummy_forward()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _tpu_precompute_and_update_kv_cache(

@@ -576,6 +576,7 @@ class TPUModelRunner(GPUModelRunner):
         # bucket and chunk count.
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
+        self._dp_step_max_reqs: int = 0
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3185,8 +3186,10 @@ class TPUModelRunner(GPUModelRunner):
         return num_chunks
 
     def _dp_coordinated_step(
-            self, local_num_tokens: int,
-            local_num_chunks: int) -> "tuple[int | None, int]":
+            self,
+            local_num_tokens: int,
+            local_num_chunks: int,
+            local_num_reqs: int = 0) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
@@ -3196,8 +3199,11 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        t = torch.tensor([int(local_num_tokens),
-                          int(local_num_chunks)],
+        t = torch.tensor([
+            int(local_num_tokens),
+            int(local_num_chunks),
+            int(local_num_reqs)
+        ],
                          dtype=torch.int64,
                          device="cpu")
         torch.distributed.all_reduce(t,
@@ -3205,6 +3211,11 @@ class TPUModelRunner(GPUModelRunner):
                                      group=get_dp_group().cpu_group)
         bucket = _get_padded_token_len(self.num_tokens_paddings,
                                        int(t[0].item()))
+        # Spec-decode draft forwards size themselves off the step's DP-wide
+        # max per-chunk request count (see DFlashProposer), riding this same
+        # all-reduce instead of paying the theoretical max bucket or a
+        # second collective.
+        self._dp_step_max_reqs = int(t[2].item())
         return bucket, int(t[1].item())
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
@@ -3323,7 +3334,12 @@ class TPUModelRunner(GPUModelRunner):
 
         local_num_chunks = self._count_input_chunks(scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens, local_num_chunks)
+            scheduler_output.total_num_scheduled_tokens,
+            local_num_chunks,
+            # Upper bound on any single chunk's request count on this rank;
+            # the DP-wide MAX of it sizes every rank's draft forwards.
+            local_num_reqs=min(self.input_batch.num_reqs,
+                               self.num_reqs_max_model_len))
         # Retained for the spec-decode propose phase (sample_tokens): under
         # EP-DP locksteps every rank must run the same number of draft forwards per step,
         # and the coordinated chunk count from this one all-reduce is the shared
