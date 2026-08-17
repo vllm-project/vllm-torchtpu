@@ -22,7 +22,7 @@ from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.utils import (repack_sparse_mla_cache,
+from vllm_torchtpu.layers.common.utils import (split_sparse_mla_cache,
                                                update_sparse_mla_kv_cache)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -667,8 +667,8 @@ def sparse_mla_attention(
         lkv_dim = ql_nope.shape[-1]
         rope_dim = q_pe.shape[-1]
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        nope_u8, rope_u8 = repack_sparse_mla_cache(kv_cache, lkv_dim, rope_dim,
-                                                   dequant_scale)
+        nope_u8, rope_u8 = split_sparse_mla_cache(kv_cache, lkv_dim, rope_dim,
+                                                  dequant_scale)
 
         output = sparse_mla_ragged_paged_attention(
             q,

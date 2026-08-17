@@ -169,10 +169,10 @@ def update_sparse_mla_kv_cache(kv_cache: jax.Array, kv_c_normed: jax.Array,
                            new_kv_cache_rows)
 
 
-def repack_sparse_mla_cache(
+def split_sparse_mla_cache(
         kv_cache: jax.Array, lkv_dim: int, rope_dim: int,
         dequant_scale: float) -> tuple[jax.Array, jax.Array]:
-    """Repack the fp8 cache (pages, page_size // kv_packing, kv_packing, padded_concat_head_dim)
+    """Split the fp8 cache (pages, page_size // kv_packing, kv_packing, padded_concat_head_dim)
     into the tiled uint8 pair csa_gather requires; see the layout contract
     constants (TILE_SUBROWS, TILE_LANE_BYTES) in csa_gather.py.
     """
@@ -196,22 +196,12 @@ def repack_sparse_mla_cache(
     pages = kv_cache.shape[0]
     page_size = kv_cache.shape[1] * kv_cache.shape[2]
     flat = kv_cache.reshape(pages, page_size, kv_cache.shape[-1])
-
     nope_u8 = jax.lax.bitcast_convert_type(
         flat[..., :lkv_dim],
         jnp.uint8).reshape(pages, page_size, lkv_dim // lane_bytes, lane_bytes)
 
-    # TODO(gxd3): if GLM 5.2 keeps rope in fp8 like nope, both sides get cheaper:
-    # this repack becomes a plain bitcast, and csa_gather's `process_rope` drops
-    # the per-element shift/mask/or that rebuilds (1, 128) uint8 into (1, 64)
-    # bf16, leaving the SparseCore to just move bytes.
-    rope_bf16 = flat[..., lkv_dim:lkv_dim + rope_dim].astype(jnp.bfloat16)
-    if dequant_scale != 1.0:
-        rope_bf16 = rope_bf16 * jnp.bfloat16(dequant_scale)
-    rope_u16 = jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16)
-    rope_u8 = jnp.concatenate([(rope_u16 >> 8).astype(jnp.uint8),
-                               (rope_u16 & 0xFF).astype(jnp.uint8)],
-                              axis=-1).reshape(pages,
-                                               page_size // tile_subrows,
-                                               tile_subrows, lane_bytes)
+    rope_u8 = jax.lax.bitcast_convert_type(
+        flat[..., lkv_dim:lkv_dim + 128],
+        jnp.uint8).reshape(pages, page_size // tile_subrows, tile_subrows,
+                           lane_bytes)
     return nope_u8, rope_u8

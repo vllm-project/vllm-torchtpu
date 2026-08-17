@@ -60,16 +60,16 @@ class CsaGatherTest(parameterized.TestCase):
         rope_cache = jnp.asarray(rope_planes).reshape(
             pages, PAGE_SIZE // csa_gather.TILE_SUBROWS,
             csa_gather.TILE_SUBROWS, csa_gather.TILE_LANE_BYTES)
-        return nope_cache, rope_cache, nope_bytes, rope_u16
+        return nope_cache, rope_cache, nope_bytes, rope_planes
 
-    def _check(self, nope_cache, rope_cache, nope_bytes, rope_u16, indices):
+    def _check(self, nope_cache, rope_cache, nope_bytes, rope_planes, indices):
         nope_out, rope_out = csa_gather.csa_gather(nope_cache, rope_cache,
                                                    jnp.asarray(indices))
-        np.testing.assert_array_equal(np.asarray(nope_out),
-                                      nope_bytes[indices])
         np.testing.assert_array_equal(
-            np.asarray(jax.lax.bitcast_convert_type(rope_out, jnp.uint16)),
-            rope_u16[indices])
+            np.asarray(nope_out).reshape(len(indices), -1),
+            nope_bytes[indices])
+        np.testing.assert_array_equal(np.asarray(rope_out),
+                                      rope_planes[indices])
 
     @parameterized.named_parameters(
         # Odd count exercises the internal padding to the SC block size;
@@ -79,21 +79,24 @@ class CsaGatherTest(parameterized.TestCase):
         dict(testcase_name="large", pages=16, n=8192),
     )
     def test_gather_matches_direct_indexing(self, pages, n):
-        nope_cache, rope_cache, nope_bytes, rope_u16 = self._make_caches(pages)
+        nope_cache, rope_cache, nope_bytes, rope_planes = self._make_caches(
+            pages)
         indices = self.rng.integers(0, pages * PAGE_SIZE, n).astype(np.int32)
-        self._check(nope_cache, rope_cache, nope_bytes, rope_u16, indices)
+        self._check(nope_cache, rope_cache, nope_bytes, rope_planes, indices)
 
     def test_all_byte_lanes(self):
         """Every position of every page: covers all four rope byte lanes and
         every tile row, in permuted (non-contiguous) order."""
         pages = 4
-        nope_cache, rope_cache, nope_bytes, rope_u16 = self._make_caches(pages)
+        nope_cache, rope_cache, nope_bytes, rope_planes = self._make_caches(
+            pages)
         indices = self.rng.permutation(pages * PAGE_SIZE).astype(np.int32)
-        self._check(nope_cache, rope_cache, nope_bytes, rope_u16, indices)
+        self._check(nope_cache, rope_cache, nope_bytes, rope_planes, indices)
 
     def test_single_repeated_index(self):
         """Maximal duplication: the gather-hotspot access pattern."""
         pages = 4
-        nope_cache, rope_cache, nope_bytes, rope_u16 = self._make_caches(pages)
+        nope_cache, rope_cache, nope_bytes, rope_planes = self._make_caches(
+            pages)
         indices = np.full(512, 77, np.int32)
-        self._check(nope_cache, rope_cache, nope_bytes, rope_u16, indices)
+        self._check(nope_cache, rope_cache, nope_bytes, rope_planes, indices)

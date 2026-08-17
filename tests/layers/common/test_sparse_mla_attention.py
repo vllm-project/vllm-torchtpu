@@ -19,7 +19,7 @@ which KV entries each token attends to and computes softmax(q @ k^T) @ v in
 float32 over the same fp8-rounded latents the kernel reads. With causal
 arange indices and kv_len <= topk this is exactly dense MLA attention, which
 makes the first cases a dense-parity check of the full path
-(insert -> repack -> SparseCore gather -> attention kernel).
+(insert -> split -> SparseCore gather -> attention kernel).
 """
 
 import math
@@ -330,18 +330,18 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         self.assertEqual(int(np.count_nonzero(rows[~touched])), 0)
 
 
-class RepackSparseMlaCacheTest(parameterized.TestCase):
-    """Repack-layout unit test; pure jnp bitcasts, runs on CPU too."""
+class SplitSparseMlaCacheTest(parameterized.TestCase):
+    """Split-layout unit test; pure jnp bitcasts, runs on CPU too."""
 
     @parameterized.parameters(1.0, 1.5)
-    def test_nope_bytes_and_rope_planes(self, dequant_scale):
+    def test_nope_bytes_and_rope_bytes(self, dequant_scale):
         pages, page_size, padded_row = 3, 8, 640
         rng = np.random.default_rng(0)
         cache = jnp.asarray(
             rng.standard_normal((pages, page_size // 4, 4, padded_row)),
             jnp.float8_e4m3fn)
 
-        nope_u8, rope_u8 = utils.repack_sparse_mla_cache(
+        nope_u8, rope_u8 = utils.split_sparse_mla_cache(
             cache, LKV_DIM, ROPE_DIM, dequant_scale)
 
         # Shapes carry the (4, 128) tiling contract csa_gather asserts.
@@ -356,13 +356,10 @@ class RepackSparseMlaCacheTest(parameterized.TestCase):
             np.asarray(
                 jax.lax.bitcast_convert_type(flat[..., :LKV_DIM], jnp.uint8)))
 
-        # Rope: decoding the hi/lo byte planes must bitwise-reproduce
-        # fp8 -> bf16 dequant (the transport encoding is lossless).
+        # Rope must be a byte-exact bitcast of the fp8 rope latents (padded to 128 bytes).
         rope_flat = np.asarray(rope_u8).reshape(pages, page_size, 128)
-        decoded_u16 = ((rope_flat[..., :ROPE_DIM].astype(np.uint16) << 8)
-                       | rope_flat[..., ROPE_DIM:].astype(np.uint16))
-        expected = flat[..., LKV_DIM:LKV_DIM + ROPE_DIM].astype(
-            jnp.bfloat16) * jnp.bfloat16(dequant_scale)
         np.testing.assert_array_equal(
-            decoded_u16,
-            np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint16)))
+            rope_flat[..., :ROPE_DIM],
+            np.asarray(
+                jax.lax.bitcast_convert_type(
+                    flat[..., LKV_DIM:LKV_DIM + ROPE_DIM], jnp.uint8)))
