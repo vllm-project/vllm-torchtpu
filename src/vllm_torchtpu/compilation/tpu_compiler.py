@@ -372,8 +372,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                     "[TpuCompilerAdaptor] Failed to save executable: %s", e)
 
         if key is not None and size is not None:
-            shape_variants.remember(self.cache_dir, key, graph, size,
-                                    compiled_fn)
+            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn, handle
 
     def load(
@@ -457,6 +456,5 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn = unwrap_fn
 
         if size is not None:
-            shape_variants.remember(self.cache_dir, key, graph, size,
-                                    compiled_fn)
+            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn

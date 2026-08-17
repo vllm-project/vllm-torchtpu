@@ -4561,12 +4561,11 @@ class TPUModelRunner(GPUModelRunner):
         one executable per bucket either way (see
         vllm_torchtpu.compilation.shape_variants).
         """
-        backbone = shape_variants.compiled_backbone(self.model)
         with shape_variants.warmup() as buckets:
             for num_tokens in self.num_tokens_paddings:
                 logger.info("  -- num_tokens: %d", num_tokens)
-                if buckets.sizes and not buckets.covers(num_tokens):
-                    shape_variants.retrace(backbone, self.vllm_config)
+                if buckets.needs_retrace(num_tokens):
+                    shape_variants.retrace(self.model, self.vllm_config)
                 self._dummy_run(num_tokens,
                                 self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req,
@@ -4576,6 +4575,13 @@ class TPUModelRunner(GPUModelRunner):
                                     self.num_reqs_most_model_len,
                                     self.num_blocks_per_most_len_req,
                                     use_max_model_len=False)
+            if buckets.refused:
+                # A refusal that no trace picked up leaves a raising closure in
+                # the live graph, which would surface as a failed request. Fail
+                # the start instead, where it can be read.
+                raise shape_variants.ShapeSpecializationError(
+                    "warmup left token buckets uncompiled: "
+                    f"{sorted(buckets.refused)}")
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.

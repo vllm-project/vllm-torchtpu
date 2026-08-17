@@ -52,17 +52,6 @@ class ShapeSpecializationError(RuntimeError):
     """A token bucket cannot be served by the graph asked to compile it."""
 
 
-def compiled_backbone(model: torch.nn.Module) -> torch.nn.Module:
-    """The ``@support_torch_compile``-wrapped module inside a vLLM model."""
-    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-
-    if isinstance(model, TorchCompileWithNoGuardsWrapper):
-        return model
-    if hasattr(model, "get_language_model"):
-        return model.get_language_model().model
-    return model.model
-
-
 # ---------------------------------------------------------------------------
 # What a trace assumed about the token count
 # ---------------------------------------------------------------------------
@@ -181,7 +170,7 @@ class BucketExecutables:
     def __init__(self) -> None:
         self._runnables: dict[tuple[str, str], tuple[Callable[..., Any],
                                                      tuple]] = {}
-        self.sizes: set[int] = set()
+        self.refused: set[int] = set()
         self.traces = 0
 
     def get(self, cache_dir: str, key: str,
@@ -199,13 +188,20 @@ class BucketExecutables:
                 "unset TPU_KERNEL_ITER_MODE to serve this model.")
         return runnable
 
-    def put(self, cache_dir: str, key: str, graph: fx.GraphModule, size: int,
+    def put(self, cache_dir: str, key: str, graph: fx.GraphModule,
             runnable: Callable[..., Any]) -> None:
         self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
-        self.sizes.add(size)
 
-    def covers(self, size: int) -> bool:
-        return size in self.sizes
+    def needs_retrace(self, size: int) -> bool:
+        """Whether a graph refused this bucket and no trace has built it yet.
+
+        Built sizes cannot answer this: every module compiled inside the
+        window shares one window, so a bucket some other module built would
+        mask this one's refusal. A refusal is recorded only once the hand-over
+        lookup has missed, and :func:`retrace` clears the set, so what is left
+        is exactly what the traces made so far cannot serve.
+        """
+        return size in self.refused
 
 
 _session: BucketExecutables | None = None
@@ -255,6 +251,7 @@ def runnable_for(cache_dir: str,
             "this module's structure independent of the token count.")
 
     logger.info("[shape-variants] %s left to a later trace: %s", key, reason)
+    _session.refused.add(size)
 
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise ShapeSpecializationError(
@@ -264,11 +261,11 @@ def runnable_for(cache_dir: str,
     return refuse
 
 
-def remember(cache_dir: str, key: str, graph: fx.GraphModule, size: int,
+def remember(cache_dir: str, key: str, graph: fx.GraphModule,
              runnable: Callable[..., Any]) -> None:
     """Offer a bucket, freshly compiled or loaded, to the traces that follow."""
     if _session is not None:
-        _session.put(cache_dir, key, graph, size, runnable)
+        _session.put(cache_dir, key, graph, runnable)
 
 
 def aot_cache_tag() -> str | None:
@@ -285,21 +282,43 @@ def aot_cache_tag() -> str | None:
     return f"trace{_session.traces}" if _session is not None else None
 
 
-def retrace(module: torch.nn.Module, vllm_config: VllmConfig) -> None:
-    """Give the module a fresh, untraced torch.compile wrapper.
+def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
+    """Give the model's compiled modules a fresh, untraced torch.compile wrapper.
 
     ``VllmBackend`` refuses a second call ("VllmBackend can only be called
     once"), so another trace needs another backend, and upstream's
     ``reset_compile_wrapper`` builds one. It also restores the first-compile
     path in ``decorators.__call__``, so ``_mark_dynamic_inputs`` runs again and
-    the new trace is dynamic like the first. The cache dirs it clears are
-    recomputed from the same factors by the next backend call.
+    the new trace is dynamic like the first.
+
+    Takes the whole model rather than a backbone: ``support_torch_compile``
+    puts a wrapper wherever it is applied, which for a per-layer model is every
+    decoder layer, and the wrappers are what hold the bytecode hooks that have
+    to be dropped before they are replaced.
     """
-    from vllm.compilation.wrapper import reset_compile_wrapper
+    from vllm.compilation.wrapper import (TorchCompileWithNoGuardsWrapper,
+                                          reset_compile_wrapper)
     from vllm.config import set_current_vllm_config
 
     if _session is not None:
         _session.traces += 1
-    module.cleanup()  # drop this wrapper's bytecode hook before replacing it
+        # The refusals belong to the traces being replaced.
+        _session.refused.clear()
+
+    wrappers = ([model]
+                if isinstance(model, TorchCompileWithNoGuardsWrapper) else [
+                    m for m in model.modules()
+                    if isinstance(m, TorchCompileWithNoGuardsWrapper)
+                ])
+    for wrapper in wrappers:
+        wrapper.cleanup()  # drop its bytecode hook before replacing it
+
+    # reset_compile_wrapper blanks the cache dirs, which the next backend call
+    # recomputes from the files Dynamo inlined -- a trace that inlines a
+    # different set lands somewhere else and the hand-over misses. Pin them,
+    # as profile_run does around its own reset.
+    config = vllm_config.compilation_config
+    saved = (config.cache_dir, config.local_cache_dir)
     with set_current_vllm_config(vllm_config):
-        reset_compile_wrapper(module)
+        reset_compile_wrapper(model)
+    config.cache_dir, config.local_cache_dir = saved

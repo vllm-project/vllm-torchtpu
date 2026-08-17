@@ -18,11 +18,15 @@ import multiprocessing
 import os
 import traceback
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+import sympy
 import torch
 import vllm
 from torch import fx, nn
+from torch.utils._sympy.value_ranges import ValueRanges
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (CompilationConfig, CompilationMode, DeviceConfig,
                          SchedulerConfig, VllmConfig, set_current_vllm_config)
@@ -209,11 +213,16 @@ def prepare(cache_root: str, splitting_ops=None):
     return make_config(splitting_ops), backend
 
 
+# Keep a report under the pipe buffer: a larger one parks the queue's feeder
+# thread until the parent reads it, and the parent is in join() by then.
+MAX_REPORT = 32 * 1024
+
+
 def _child(target, result):
     try:
         target()
     except BaseException:
-        result.put(traceback.format_exc())
+        result.put(traceback.format_exc()[-MAX_REPORT:])
     else:
         result.put(None)
 
@@ -228,15 +237,21 @@ def in_child(target) -> None:
     result = ctx.Queue()
     process = ctx.Process(target=_child, args=(target, result))
     process.start()
-    process.join(600)
-    if process.is_alive():
-        process.terminate()
-        process.join()
-        raise AssertionError("isolated test timed out")
-    if result.empty():
-        raise AssertionError(
-            f"isolated test crashed (exit {process.exitcode})")
-    failure = result.get()
+    try:
+        # Half of CI's own pytest --timeout, so this cleanup still runs: its
+        # alarm firing inside join() would leave the child alive and pytest
+        # unable to exit. terminate() has to be reached on every path.
+        process.join(300)
+        if process.is_alive():
+            raise AssertionError("isolated test timed out")
+        if result.empty():
+            raise AssertionError(
+                f"isolated test crashed (exit {process.exitcode})")
+        failure = result.get()
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join()
     if failure is not None:
         raise AssertionError(f"isolated test failed:\n{failure}")
 
@@ -259,7 +274,7 @@ def warm(model, config, buckets=BUCKETS) -> int:
     retraces = 0
     with set_current_vllm_config(config), shape_variants.warmup() as tracked:
         for num_tokens in buckets:
-            if tracked.sizes and not tracked.covers(num_tokens):
+            if tracked.needs_retrace(num_tokens):
                 shape_variants.retrace(model, config)
                 retraces += 1
             run(model, config, num_tokens)
@@ -441,6 +456,43 @@ def test_nothing_survives_warmup(tmp_path):
     in_child(partial(_session_does_not_outlive_warmup, str(tmp_path)))
 
 
+def _refused_bucket_never_retraced_raises(cache_root):
+    config, _ = prepare(cache_root)
+    model = build(WaveModel, config)
+    warm(model, config, buckets=[BUCKETS[0]])  # ladder stops before 4096
+    with pytest.raises(shape_variants.ShapeSpecializationError,
+                       match="never compiled"):
+        run(model, config, BUCKETS[-1])  # the poisoned runnable is invoked
+
+
+def test_a_refused_bucket_nobody_retraced_raises(tmp_path):
+    """The closure left behind has to raise, not return something plausible."""
+    in_child(partial(_refused_bucket_never_retraced_raises, str(tmp_path)))
+
+
+def test_warmup_scope_survives_a_failure():
+    """A failed warmup must not leave the session pinned for the next one."""
+    with pytest.raises(RuntimeError):
+        with shape_variants.warmup():
+            raise RuntimeError("boom")
+    assert shape_variants._session is None
+
+
+def test_a_guard_the_range_cannot_express_still_refuses():
+    """The guard list is read, not just var_to_range.
+
+    Dynamo folds most guards into the ranges, so a test driving the real
+    pipeline cannot tell the two apart; this one can.
+    """
+    symbol = sympy.Symbol("s0", positive=True, integer=True)
+    env = SimpleNamespace(
+        var_to_range={symbol: ValueRanges(2, 8192)},
+        guards=[SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))])
+
+    assert unsupported_reason(env, 2049) is None  # 2049 % 3 == 0, holds
+    assert unsupported_reason(env, 2048) is not None  # provably violated
+
+
 def test_env_override_keeps_the_mega_artifact_off():
     """It is inductor-only on the load side; see the commit for why."""
     with patch.dict(os.environ, clear=False) as env:
@@ -448,3 +500,6 @@ def test_env_override_keeps_the_mega_artifact_off():
         importlib.reload(vllm_torchtpu.env_override)
 
         assert os.environ["VLLM_USE_MEGA_AOT_ARTIFACT"] == "0"
+        # The write only means something while vLLM still reads this name.
+        assert "VLLM_USE_MEGA_AOT_ARTIFACT" in vllm.envs.environment_variables
+        assert vllm.envs.VLLM_USE_MEGA_AOT_ARTIFACT is False
