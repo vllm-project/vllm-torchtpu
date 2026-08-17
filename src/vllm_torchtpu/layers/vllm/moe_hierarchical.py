@@ -13,15 +13,6 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-_warned = False
-
-
-def _warn_once(message: str, *args) -> None:
-    global _warned
-    if not _warned:
-        logger.warning(message, *args)
-        _warned = True
-
 
 def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
     """``(ep_size, ep_rank, tp_size, tp_rank)``, or ``None`` to stay flat.
@@ -42,7 +33,7 @@ def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
 
     split = hierarchical_moe_split(world_size, rank)
     if split is None:
-        _warn_once(
+        logger.warning_once(
             "TPU_MOE_HIERARCHICAL_EP is set but the chip topology could not be "
             "used; falling back to flat expert parallelism.")
         return None
@@ -101,8 +92,9 @@ def hierarchical_moe_parallel_config():
             # Expert parallelism is off entirely (no --enable-expert-parallel);
             # there is no expert split to make hierarchical, and forcing one
             # would silently change what the flat TP config means.
-            _warn_once("TPU_MOE_HIERARCHICAL_EP is set but expert parallelism "
-                       "is off; leaving the MoE parallel config alone.")
+            logger.warning_once(
+                "TPU_MOE_HIERARCHICAL_EP is set but expert parallelism "
+                "is off; leaving the MoE parallel config alone.")
             return config
         return dataclasses.replace(config,
                                    ep_size=ep_size,
@@ -114,7 +106,7 @@ def hierarchical_moe_parallel_config():
     # which runs after the model is constructed, so this lands in time.
     align_ep_weight_filter()
 
-    logger.info(
+    logger.info_once(
         "Hierarchical MoE parallelism: EP between chips (ep_size=%d, "
         "ep_rank=%d), TP within a chip (tp_size=%d, tp_rank=%d)", ep_size,
         ep_rank, tp_size, tp_rank)

@@ -15,8 +15,8 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
-from vllm_torchtpu.layers.vllm.moe_hierarchical import \
-    hierarchical_moe_parallel_config
+from vllm_torchtpu.layers.vllm.moe_hierarchical import (
+    hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
 from .layers import KimiMLP
 
@@ -112,9 +112,14 @@ class KimiMoE(nn.Module):
         padded_intermediate_size = config.moe_intermediate_size
         min_per_partition = getattr(config,
                                     "min_moe_intermediate_per_partition", 128)
-        if (not self.use_ep and self.tp_size > 1 and
-                padded_intermediate_size // self.tp_size < min_per_partition):
-            padded_intermediate_size = min_per_partition * self.tp_size
+        if self.use_ep:
+            split = hierarchical_split_or_none()
+            moe_tp_size = split[2] if split is not None else 1
+        else:
+            moe_tp_size = self.tp_size
+        if (moe_tp_size > 1 and padded_intermediate_size // moe_tp_size
+                < min_per_partition):
+            padded_intermediate_size = min_per_partition * moe_tp_size
 
         situ_beta = (getattr(config, "activation_situ_beta", None)
                      if config.hidden_act == "situ" else None)
@@ -157,7 +162,7 @@ class KimiMoE(nn.Module):
             w13_weight.data.zero_()
             w2_weight.data.zero_()
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
-                config.moe_intermediate_size // self.tp_size)
+                config.moe_intermediate_size // moe_tp_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
