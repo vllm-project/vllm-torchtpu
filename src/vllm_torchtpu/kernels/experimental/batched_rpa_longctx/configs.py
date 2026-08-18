@@ -61,6 +61,14 @@ class KVLayout(enum.StrEnum):
     HEAD_ALONG_SUBLANE = enum.auto()
     SEQ_ALONG_LANE = enum.auto()
 
+    @property
+    def symbol(self):
+        match self:
+            case KVLayout.HEAD_ALONG_SUBLANE:
+                return "nhs"
+            case KVLayout.SEQ_ALONG_LANE:
+                return "snh"
+
 
 @dataclasses.dataclass(frozen=True)
 class ServingConfigs:
@@ -115,11 +123,13 @@ class RpaCase(enum.StrEnum):
 
     @property
     def symbol(self):
-        return {
-            RpaCase.DECODE: "d",
-            RpaCase.PREFILL: "p",
-            RpaCase.MIXED: "m",
-        }[self]
+        match self:
+            case RpaCase.DECODE:
+                return "d"
+            case RpaCase.PREFILL:
+                return "p"
+            case RpaCase.MIXED:
+                return "m"
 
     def get_range(
         self, distribution: jax.Array

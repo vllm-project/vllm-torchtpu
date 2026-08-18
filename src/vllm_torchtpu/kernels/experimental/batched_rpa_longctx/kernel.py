@@ -408,7 +408,8 @@ def create_allocs(
 
 
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
-    name = f"RPA{cfgs.mode.symbol}-p{cfgs.serve.page_size}"
+    serve = cfgs.serve
+    name = f"RPA{cfgs.mode.symbol}-{serve.kv_layout.symbol}-p{serve.page_size}"
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
