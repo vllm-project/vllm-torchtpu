@@ -85,6 +85,12 @@ class DFlashProposer:
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[int, tuple[torch.Tensor,
                                                          torch.Tensor]] = {}
+        # Keyed by (num_tokens, hidden_dim, dtype, num_reqs); one entry per
+        # lockstep replay bucket, see `_dummy_kv_update_inputs`.
+        self._dummy_kv_input_cache: dict[tuple,
+                                         tuple[torch.Tensor,
+                                               "AttentionMetadata"]] = {}
+        self._dummy_kv_hidden_spec: tuple[int, torch.dtype] | None = None
 
     def _get_static_attn_tensors(
             self, padded_num_reqs: int,
@@ -143,22 +149,27 @@ class DFlashProposer:
                             self._draft_replicated,
                             force_share=True)
 
-        if hasattr(self.draft_model, "get_draft_attn_causal"):
-            layer_causal_list = self.draft_model.get_draft_attn_causal()
-        elif hasattr(self.draft_model.model, "get_draft_attn_causal"):
-            layer_causal_list = self.draft_model.model.get_draft_attn_causal()
-        else:
-            raise RuntimeError(
-                "Draft model does not support get_draft_attn_causal")
+        # Only the Pallas backend consumes the per-layer causal flags, so a
+        # missing getter is fatal there and irrelevant everywhere else.
+        layer_causal_list = None
+        for owner in (self.draft_model, self.draft_model.model):
+            getter = getattr(owner, "get_draft_attn_causal", None)
+            if getter is not None:
+                layer_causal_list = getter()
+                break
 
         with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
             for i, layer in enumerate(self.draft_model.model.layers):
                 attn_impl = layer.self_attn.attn.impl
-                if isinstance(attn_impl, PallasAttentionBackendImpl):
-                    attn_impl.layer_idx = i
-                    use_causal = layer_causal_list[i]
-                    attn_impl.use_causal_mask = use_causal
-                    attn_impl.initialize_kernel(layer.self_attn.attn)
+                if not isinstance(attn_impl, PallasAttentionBackendImpl):
+                    continue
+                if layer_causal_list is None:
+                    raise RuntimeError(
+                        "Draft model does not support get_draft_attn_causal, "
+                        "required by the Pallas attention backend")
+                attn_impl.layer_idx = i
+                attn_impl.use_causal_mask = layer_causal_list[i]
+                attn_impl.initialize_kernel(layer.self_attn.attn)
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
@@ -510,13 +521,24 @@ class DFlashProposer:
                         use_max_model_len=False,
                     )
 
-    def _dummy_precompute_and_update_kv_cache(
+    def _dummy_kv_update_inputs(
         self,
         num_tokens: int,
         hidden_dim: int,
         dtype: torch.dtype,
         num_reqs: int,
-    ) -> None:
+    ) -> tuple[torch.Tensor, "AttentionMetadata"]:
+        """Reusable `(hidden, metadata)` for one KV-update replay shape.
+
+        Under lockstep this runs once per padding chunk per step, so build
+        the constant dummies once per bucket instead of reallocating six
+        tensors and re-issuing two scalar H2D writes every idle step.
+        """
+        key = (num_tokens, hidden_dim, dtype, num_reqs)
+        entry = self._dummy_kv_input_cache.get(key)
+        if entry is not None:
+            return entry
+
         runner = self.runner
         dummy_hidden = torch.zeros((num_tokens, hidden_dim),
                                    dtype=dtype,
@@ -551,6 +573,21 @@ class DFlashProposer:
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
         )
+        entry = (dummy_hidden, dummy_attn_metadata)
+        self._dummy_kv_input_cache[key] = entry
+        return entry
+
+    def _dummy_precompute_and_update_kv_cache(
+        self,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        num_reqs: int,
+    ) -> None:
+        runner = self.runner
+        dummy_hidden, dummy_attn_metadata = self._dummy_kv_update_inputs(
+            num_tokens, hidden_dim, dtype, num_reqs)
+        dummy_positions = dummy_attn_metadata.input_positions
 
         with set_vllm_model_wrapper_context(mesh=runner.mesh):
             out = self._tpu_precompute_and_update_kv_cache(
@@ -656,10 +693,14 @@ class DFlashProposer:
         runner = self.runner
         bucket = runner._dp_target_bucket
         assert bucket is not None, "_dp_target_bucket unset in lockstep step"
-        fc_layer = getattr(self.draft_model.model, "fc", None)
-        hidden_dim = (fc_layer.weight.shape[1] if fc_layer is not None else
-                      self.vllm_config.model_config.get_hidden_size())
-        dtype = self.draft_model.model.embed_tokens.weight.dtype
+        # Model-static: resolve once, not once per padding chunk per step.
+        if self._dummy_kv_hidden_spec is None:
+            fc_layer = getattr(self.draft_model.model, "fc", None)
+            self._dummy_kv_hidden_spec = (
+                fc_layer.weight.shape[1] if fc_layer is not None else
+                self.vllm_config.model_config.get_hidden_size(),
+                self.draft_model.model.embed_tokens.weight.dtype)
+        hidden_dim, dtype = self._dummy_kv_hidden_spec
         self._dummy_precompute_and_update_kv_cache(
             num_tokens=bucket,
             hidden_dim=hidden_dim,
