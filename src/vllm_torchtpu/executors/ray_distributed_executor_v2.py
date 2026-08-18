@@ -370,11 +370,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 raise RuntimeError(
                     f"Worker {i} was assigned {physical_ids} chips; the TPU "
                     "executor requires exactly one chip per worker.")
-            if dp_size > 1:
-                slice_local_rank = (dp_rank * self.world_size +
-                                    i) % chips_per_host[node_ip]
-            else:
-                slice_local_rank = int(physical_ids[0])
+            slice_local_rank = int(physical_ids[0])
             local_world_size = chips_per_host[node_ip]
             if not 0 <= slice_local_rank < local_world_size:
                 raise RuntimeError(
@@ -579,8 +575,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
         dp_size, dp_rank, _ = self._get_dp_geometry()
         if dp_size > 1:
             host_order, chips_per_host = self._slice_host_layout(device_str)
-            target_host_idx = (dp_rank * self.world_size) // max(
-                chips_per_host.values())
+            target_host_idx = (dp_rank * self.parallel_config.world_size
+                               ) // max(chips_per_host.values())
             placement_group_specs[0][
                 f"node:{host_order[target_host_idx]}"] = 0.001
         elif dp_size == 1:
