@@ -574,6 +574,17 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         dp_size, dp_rank, _ = self._get_dp_geometry()
         if dp_size > 1:
+            # Under Data Parallelism across multiple hosts, each DP engine's
+            # placement group must be pinned to its designated physical host so
+            # that:
+            # 1. DP engines are deterministically mapped to the physical slice
+            #    layout (e.g. DP 0..7 on host 0, DP 8..15 on host 1).
+            # 2. For TP > 1 (e.g. TP=2, DP=8), all TP bundles for a given DP
+            #    rank are packed onto the same host, preventing TP groups from
+            #    being split across the network.
+            # We set a fractional demand (0.001) on Ray's synthetic node:<ip>
+            # resource on bundle 0 as an affinity constraint without exhausting
+            # the node resource capacity (1.0).
             host_order, chips_per_host = self._slice_host_layout(device_str)
             target_host_idx = (dp_rank * self.parallel_config.world_size
                                ) // max(chips_per_host.values())
