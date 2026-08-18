@@ -4069,12 +4069,6 @@ class TPUModelRunner(GPUModelRunner):
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
 
-        # Initialize the MM encoder manager and precompile the vision encoder
-        self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
-            self.vllm_config, self.device, self.model)
-        if self.encoder_cudagraph_manager is not None:
-            self.encoder_cudagraph_manager.precompile_vision_encoder()
-
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
@@ -4583,6 +4577,13 @@ class TPUModelRunner(GPUModelRunner):
                 self._precompile_backbone()
 
             self._precompile_sampling_subgraphs()
+
+            # Precompile multimodal vision encoder graphs
+            self.encoder_cudagraph_manager = (maybe_create_mm_encoder_manager(
+                self.vllm_config, self.device, self.model))
+            if self.encoder_cudagraph_manager is not None:
+                with self._precompile_timed("multimodal vision encoder"):
+                    self.encoder_cudagraph_manager.precompile_vision_encoder()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
