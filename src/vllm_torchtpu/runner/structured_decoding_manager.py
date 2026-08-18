@@ -38,11 +38,15 @@ class StructuredDecodingManager:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
         if runner.speculative_config is not None:
+            from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
             num_spec_tokens = runner.speculative_config.num_speculative_tokens
             needed = runner.max_num_reqs * (1 + num_spec_tokens)
-            covering = [p for p in runner.num_tokens_paddings if p >= needed]
-            max_target_rows = (covering[0]
-                               if covering else runner.num_tokens_paddings[-1])
+            paddings = runner.num_tokens_paddings
+            # Use min here is because needed can exceed max_num_batched_tokens
+            # (which is the largest bucket), and target_logits rows never exceed
+            # the largest bucket.
+            max_target_rows = _get_padded_token_len(paddings,
+                                                    min(needed, paddings[-1]))
             self.target_grammar_bitmask_cpu = torch.zeros(
                 (max_target_rows, num_words),
                 dtype=torch.int32,

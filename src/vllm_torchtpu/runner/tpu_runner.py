@@ -4488,8 +4488,12 @@ class TPUModelRunner(GPUModelRunner):
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
         # padded_logits_length sweep to the bucket that covers the full batch.
-        max_logits_len = _get_padded_token_len(self.num_tokens_paddings,
-                                               self.max_num_reqs * (k + 1))
+        # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
+        # (which is the largest bucket), and logits rows never exceed the largest
+        # bucket.
+        max_logits_len = _get_padded_token_len(
+            self.num_tokens_paddings,
+            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]))
         with self._precompile_timed("rejection_sampler"):
             for num_tokens in self.num_tokens_paddings:
                 if num_tokens > max_logits_len:
