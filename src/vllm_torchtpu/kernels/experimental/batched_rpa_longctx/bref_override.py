@@ -208,8 +208,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
     ):
-        # TODO(kyuyeunk): Uncomment this out after jax version update.
-        # assert buffer_type == pltpu.BufferType.INPUT_OUTPUT
+        assert buffer_type == pltpu.BufferType.INPUT_OUTPUT
 
         standard_ref = _BypassRef.create(
             spec=spec,
@@ -363,13 +362,12 @@ class BatchingORef(pltpu.BufferedRef):
         cls,
         spec: pl.BlockSpec,
         dtype_or_type: jax.Array,
-        buffer_type,  # pltpu.BufferType,
+        buffer_type: pltpu.BufferType,
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
     ):
-        # TODO(kyuyeunk): Uncomment this out after jax version update.
-        # assert buffer_type == pltpu.BufferType.OUTPUT
+        assert buffer_type == pltpu.BufferType.OUTPUT
 
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
@@ -448,13 +446,12 @@ class BatchingQRef(pltpu.BufferedRef):
         cls,
         spec: pl.BlockSpec,
         dtype_or_type: jax.Array,
-        buffer_type,  # pltpu.BufferType,
+        buffer_type: pltpu.BufferType,
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
     ):
-        # TODO(kyuyeunk): Uncomment this out after jax version update.
-        # assert buffer_type == pltpu.BufferType.INPUT
+        assert buffer_type == pltpu.BufferType.INPUT
 
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
