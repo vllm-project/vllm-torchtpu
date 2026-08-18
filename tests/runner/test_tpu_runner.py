@@ -2496,9 +2496,15 @@ def test_tpu_platform_block_size_override_is_dsv4_only():
 
 
 def test_spec_token_room_guard_caps_writes_at_context_limit():
-    """The wrapped update_req_spec_token_ids caps scheduled drafts to the
-    exact remaining token-buffer room at call time; unchecked, the write
-    overflows and kills the engine for requests near max_model_len."""
+    """The wrapped update_req_spec_token_ids clamps the staged write to the
+    remaining token-buffer room (unclamped it overflows and kills the engine
+    near max_model_len) while leaving the scheduled draft count untouched.
+
+    The count has to survive: num_scheduled_tokens is already fixed at 1+K and
+    get_spec_decode_metadata anchors the logits window at the end of each
+    request's query, so a trimmed count slides the verify window forward and
+    the sampler validates the wrong drafts.
+    """
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(
             token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
@@ -2508,6 +2514,7 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
                 "edge": 1,
                 "full": 2
             },
+            spec_token_ids=[[] for _ in range(4)],
         ),
         requests={},
     )
@@ -2518,14 +2525,26 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
     TPUModelRunner._install_spec_token_room_guard(runner)
 
     scheduled = {"roomy": [1] * 15, "edge": [2] * 15, "full": [3] * 15}
+    requests = {
+        rid: SimpleNamespace(req_id=rid, prev_num_draft_len=0)
+        for rid in ("roomy", "edge", "full")
+    }
     for rid in ("roomy", "edge", "full"):
-        runner.input_batch.update_req_spec_token_ids(
-            SimpleNamespace(req_id=rid), scheduled)
+        runner.input_batch.update_req_spec_token_ids(requests[rid], scheduled)
+
+    # Only what fits is staged into token_ids_cpu.
     assert [(r, len(ids)) for r, ids in calls] \
         == [("roomy", 15), ("edge", 10), ("full", 0)]
-    # in-place dict trim keeps downstream consumers consistent
+    # ...and the clamped write keeps the first drafts, not the last.
+    assert calls[1][1] == [2] * 10
+    # The scheduler's counts are restored, so the verify window stays aligned
+    # with num_scheduled_tokens.
     assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] \
-        == [15, 10, 0]
+        == [15, 15, 15]
+    assert [requests[r].prev_num_draft_len
+            for r in ("roomy", "edge", "full")] == [0, 15, 15]
+    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] \
+        == [15, 15]
 
 
 class TestUpdateAttentionPageSizePadded:
