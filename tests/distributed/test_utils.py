@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock, patch
+
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed import utils
 
@@ -39,7 +40,7 @@ def test_get_raiden_telemetry_module_success(monkeypatch):
     mock_tpu_sync.api = mock_api
 
     with patch.dict(
-        "sys.modules",
+            "sys.modules",
         {
             "tpu_sync": mock_tpu_sync,
             "tpu_sync.api": mock_api,
@@ -59,7 +60,10 @@ def test_get_raiden_telemetry_module_success(monkeypatch):
 
 def test_get_raiden_telemetry_module_import_failure(monkeypatch):
     monkeypatch.setattr(utils, "_RAIDEN_TELEMETRY_MODULE", None)
-    with patch.dict("sys.modules", {"tpu_sync": None, "tpu_sync.api.torch.kv_cache_manager": None}):
+    with patch.dict("sys.modules", {
+            "tpu_sync": None,
+            "tpu_sync.api.torch.kv_cache_manager": None
+    }):
         result = utils.get_raiden_telemetry_module()
         assert result is None
 
@@ -76,7 +80,7 @@ def test_get_raiden_telemetry_module_torch_impl_exception(monkeypatch):
     mock_tpu_sync.api = mock_api
 
     with patch.dict(
-        "sys.modules",
+            "sys.modules",
         {
             "tpu_sync": mock_tpu_sync,
             "tpu_sync.api": mock_api,
@@ -91,22 +95,24 @@ def test_get_raiden_telemetry_module_torch_impl_exception(monkeypatch):
 def test_configure_raiden_telemetry_default(monkeypatch):
     monkeypatch.setattr(utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
     mock_telemetry = MagicMock()
-    monkeypatch.setattr(utils, "get_raiden_telemetry_module", lambda: mock_telemetry)
+    monkeypatch.setattr(utils, "get_raiden_telemetry_module",
+                        lambda: mock_telemetry)
 
     utils.configure_raiden_telemetry()
 
-    mock_telemetry.configure_telemetry.assert_called_once_with({"buffered"})
+    mock_telemetry.configure_telemetry.assert_called_once_with(["buffered"])
     assert utils._RAIDEN_TELEMETRY_CONFIGURED is True
 
 
 def test_configure_raiden_telemetry_explicit_backends(monkeypatch):
     monkeypatch.setattr(utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
     mock_telemetry = MagicMock()
-    monkeypatch.setattr(utils, "get_raiden_telemetry_module", lambda: mock_telemetry)
+    monkeypatch.setattr(utils, "get_raiden_telemetry_module",
+                        lambda: mock_telemetry)
 
     # Test list of backends
     utils.configure_raiden_telemetry(backends=["buffered", "file"])
-    mock_telemetry.configure_telemetry.assert_called_with({"buffered", "file"})
+    mock_telemetry.configure_telemetry.assert_called_with(["buffered", "file"])
 
     # Test set of backends
     utils.configure_raiden_telemetry(backends={"custom"})
@@ -116,11 +122,16 @@ def test_configure_raiden_telemetry_explicit_backends(monkeypatch):
 def test_configure_raiden_telemetry_env_override(monkeypatch):
     monkeypatch.setattr(utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
     mock_telemetry = MagicMock()
-    monkeypatch.setattr(utils, "get_raiden_telemetry_module", lambda: mock_telemetry)
-    monkeypatch.setattr(envs, "TPU_RAIDEN_TELEMETRY_BACKENDS", "buffered, otel, custom", raising=False)
+    monkeypatch.setattr(utils, "get_raiden_telemetry_module",
+                        lambda: mock_telemetry)
+    monkeypatch.setattr(envs,
+                        "TPU_RAIDEN_TELEMETRY_BACKENDS",
+                        "buffered, otel, custom",
+                        raising=False)
 
     utils.configure_raiden_telemetry()
-    mock_telemetry.configure_telemetry.assert_called_once_with({"buffered", "otel", "custom"})
+    mock_telemetry.configure_telemetry.assert_called_once_with(
+        ["buffered", "otel", "custom"])
 
 
 def test_configure_raiden_telemetry_no_module(monkeypatch):
@@ -135,7 +146,8 @@ def test_configure_raiden_telemetry_no_module(monkeypatch):
 def test_configure_raiden_telemetry_missing_configure_attribute(monkeypatch):
     monkeypatch.setattr(utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
     mock_telemetry = object()  # Has no configure_telemetry
-    monkeypatch.setattr(utils, "get_raiden_telemetry_module", lambda: mock_telemetry)
+    monkeypatch.setattr(utils, "get_raiden_telemetry_module",
+                        lambda: mock_telemetry)
 
     utils.configure_raiden_telemetry()
     assert utils._RAIDEN_TELEMETRY_CONFIGURED is False
@@ -144,10 +156,11 @@ def test_configure_raiden_telemetry_missing_configure_attribute(monkeypatch):
 def test_configure_raiden_telemetry_exception_handled(monkeypatch):
     monkeypatch.setattr(utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
     mock_telemetry = MagicMock()
-    mock_telemetry.configure_telemetry.side_effect = RuntimeError("Config failed")
-    monkeypatch.setattr(utils, "get_raiden_telemetry_module", lambda: mock_telemetry)
+    mock_telemetry.configure_telemetry.side_effect = RuntimeError(
+        "Config failed")
+    monkeypatch.setattr(utils, "get_raiden_telemetry_module",
+                        lambda: mock_telemetry)
 
     # Should catch exception and not re-raise
     utils.configure_raiden_telemetry()
     assert utils._RAIDEN_TELEMETRY_CONFIGURED is False
-

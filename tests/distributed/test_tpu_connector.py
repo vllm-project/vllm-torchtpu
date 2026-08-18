@@ -3398,19 +3398,28 @@ class TestTPUConnectorStats(unittest.TestCase):
         worker.tp_rank = 0
         worker.is_producer = True
         worker._raiden_stage3_enabled.return_value = True
-        worker._stage3_registered_sends = {"req1": MagicMock(), "req2": MagicMock()}
+        worker._stage3_registered_sends = {
+            "req1": MagicMock(),
+            "req2": MagicMock()
+        }
         worker.transfer_stats = TpuKVConnectorStats()
 
         mock_telemetry = MagicMock()
         mock_telemetry.get_and_reset_metric_samples.return_value = {
-            "tpu_raiden_rpc_latency_ms": [5.0, 10.0],
+            "tpu_raiden_transfer_duration_ms": [5.0, 10.0],
+            "tpu_raiden_sent_bytes_total": [1024],
+            "tpu_raiden_buffer_allocated_bytes": [2048],
         }
 
-        with patch("vllm_torchtpu.distributed.utils.get_raiden_telemetry_module", return_value=mock_telemetry):
+        with patch(
+                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+                return_value=mock_telemetry):
             stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
 
         assert stats is not None
-        assert stats.data["tpu_raiden_rpc_latency_ms"] == [5.0, 10.0]
+        assert stats.data["tpu_raiden_transfer_duration_ms"] == [5.0, 10.0]
+        assert stats.data["tpu_raiden_sent_bytes_total"] == [1024]
+        assert stats.data["tpu_raiden_buffer_allocated_bytes"] == [2048]
         assert stats.data["prefill_queue_length"] == [2]
         assert worker.transfer_stats.is_empty() is True
 
@@ -3425,9 +3434,16 @@ class TestTPUConnectorStats(unittest.TestCase):
         per_engine_labelvalues = {0: ["my_model", "0"]}
 
         descriptors = [
-            SimpleNamespace(name="hbm_copy_ms", type="histogram", buckets=[1.0, 10.0], description="HBM copy time"),
-            SimpleNamespace(name="transfer_count", type="counter", description="Transfer count"),
-            SimpleNamespace(name="active_reqs", type="gauge", description="Active reqs"),
+            SimpleNamespace(name="transfer_duration_ms",
+                            type="histogram",
+                            buckets=[1.0, 10.0],
+                            description="Transfer duration in milliseconds"),
+            SimpleNamespace(name="sent_bytes_total",
+                            type="counter",
+                            description="Total sent bytes"),
+            SimpleNamespace(name="buffer_allocated_bytes",
+                            type="gauge",
+                            description="Allocated buffer bytes"),
         ]
         mock_telemetry = MagicMock()
         mock_telemetry.get_metric_metadata.return_value = descriptors
@@ -3440,9 +3456,9 @@ class TestTPUConnectorStats(unittest.TestCase):
                 labelnames=labelnames,
                 per_engine_labelvalues=per_engine_labelvalues)
 
-        assert "tpu_raiden_hbm_copy_ms" in metrics.dynamic_metrics
-        assert "tpu_raiden_transfer_count" in metrics.dynamic_metrics
-        assert "tpu_raiden_active_reqs" in metrics.dynamic_metrics
+        assert "tpu_raiden_transfer_duration_ms" in metrics.dynamic_metrics
+        assert "tpu_raiden_sent_bytes_total" in metrics.dynamic_metrics
+        assert "tpu_raiden_buffer_allocated_bytes" in metrics.dynamic_metrics
 
         obs_data = {
             "d2h_transfer_time": [],
@@ -3450,17 +3466,17 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [],
             "mb_transferred": [],
             "num_failed_transfers": [],
-            "tpu_raiden_hbm_copy_ms": [2.5],
-            "tpu_raiden_transfer_count": [1],
-            "tpu_raiden_active_reqs": [8],
+            "tpu_raiden_transfer_duration_ms": [2.5],
+            "tpu_raiden_sent_bytes_total": [100],
+            "tpu_raiden_buffer_allocated_bytes": [1024],
         }
         metrics.observe(obs_data, engine_idx=0)
 
-        hist = metrics.dynamic_metrics["tpu_raiden_hbm_copy_ms"][1][0]
-        counter = metrics.dynamic_metrics["tpu_raiden_transfer_count"][1][0]
-        gauge = metrics.dynamic_metrics["tpu_raiden_active_reqs"][1][0]
+        hist = metrics.dynamic_metrics["tpu_raiden_transfer_duration_ms"][1][0]
+        counter = metrics.dynamic_metrics["tpu_raiden_sent_bytes_total"][1][0]
+        gauge = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][
+            1][0]
 
         assert hist._sum.get() == 2.5
-        assert counter._value.get() == 1.0
-        assert gauge._value.get() == 8.0
-
+        assert counter._value.get() == 100.0
+        assert gauge._value.get() == 1024.0

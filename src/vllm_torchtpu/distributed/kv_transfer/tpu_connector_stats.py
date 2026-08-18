@@ -22,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics, KVConnectorStats, PromMetric, PromMetricT)
 from vllm.v1.metrics.utils import create_metric_per_engine
+
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu.logger import init_logger
 
@@ -253,9 +254,11 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.gauge_tpu_decode_queue_length = create_metric_per_engine(
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues)
 
-        self.dynamic_metrics: dict[str, tuple[str, Any]] = self._get_raiden_metric_definitions(labelnames)
+        self.dynamic_metrics: dict[str, tuple[
+            str, Any]] = self._get_raiden_metric_definitions(labelnames)
 
-    def _get_raiden_metric_definitions(self, labelnames: list[str] | None = None):
+    def _get_raiden_metric_definitions(self,
+                                       labelnames: list[str] | None = None):
         if labelnames is None:
             labelnames = self._labelnames
         # Dynamically load TPU Raiden C++ metric schema descriptors
@@ -269,17 +272,21 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 if hasattr(telemetry, "get_metric_metadata"):
                     descriptors = telemetry.get_metric_metadata()
         except Exception as e:
-            logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
+            logger.warning(
+                "Failed to load TPU Raiden telemetry descriptors: %s", e)
 
         for desc in descriptors:
             # Construct prometheus metric objects based on the definition.
-            name =  f"tpu_raiden_{desc.name}"
+            name = f"tpu_raiden_{desc.name}"
             help_str = getattr(desc, "description", getattr(desc, "help", ""))
             mtype = desc.type
-            mtype_str = getattr(mtype, "name", str(mtype)).split(".")[-1].lower()
+            mtype_str = getattr(mtype, "name",
+                                str(mtype)).split(".")[-1].lower()
 
             if mtype_str == "histogram":
-                buckets_val = desc.buckets if desc.buckets else [1.0, 10.0, 100.0]
+                buckets_val = desc.buckets if desc.buckets else [
+                    1.0, 10.0, 100.0
+                ]
                 metric_obj = self._histogram_cls(
                     name=name,
                     documentation=help_str,
@@ -301,10 +308,9 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             else:
                 continue
 
-            metric_defs[name] = (
-                mtype_str,
-                create_metric_per_engine(metric_obj, self.per_engine_labelvalues)
-            )
+            metric_defs[name] = (mtype_str,
+                                 create_metric_per_engine(
+                                     metric_obj, self.per_engine_labelvalues))
         return metric_defs
 
     def observe(self,

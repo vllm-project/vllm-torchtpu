@@ -246,6 +246,7 @@ def get_raiden_inline_load() -> bool:
     """Load remote KV before the first forward instead of a no-forward step."""
     return _get_bool_env("TPU_RAIDEN_INLINE_LOAD", False)
 
+
 _RAIDEN_TELEMETRY_MODULE = None
 _RAIDEN_TELEMETRY_CONFIGURED = False
 
@@ -258,23 +259,28 @@ def get_raiden_telemetry_module():
             from tpu_sync.api.torch import kv_cache_manager as kcm
             _RAIDEN_TELEMETRY_MODULE = kcm._torch_impl()
         except Exception as e:
-            logger.warning("Failed to import TPU Raiden telemetry module: %s", e)
+            logger.warning("Failed to import TPU Raiden telemetry module: %s",
+                           e)
             return None
     return _RAIDEN_TELEMETRY_MODULE
 
 
-def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> None:
+def configure_raiden_telemetry(
+        backends: list[str] | set[str] | None = None) -> None:
     """Configures TPU Raiden C++ telemetry backends if available."""
     global _RAIDEN_TELEMETRY_CONFIGURED
     try:
         telemetry = get_raiden_telemetry_module()
         if telemetry is not None and hasattr(telemetry, "configure_telemetry"):
             if backends is None:
-                backends_str = getattr(envs, "TPU_RAIDEN_TELEMETRY_BACKENDS", "buffered")
-                backends = [b.strip() for b in backends_str.split(",") if b.strip()]
-            backend_set = set(backends)
-            telemetry.configure_telemetry(backend_set)
+                backends_str = getattr(envs, "TPU_RAIDEN_TELEMETRY_BACKENDS",
+                                       "buffered")
+                backends = [
+                    b.strip() for b in backends_str.split(",") if b.strip()
+                ]
+            telemetry.configure_telemetry(backends)
             _RAIDEN_TELEMETRY_CONFIGURED = True
-            logger.info("Configured TPU Raiden C++ telemetry backends: %s", backend_set)
+            logger.info("Configured TPU Raiden C++ telemetry backends: %s",
+                        backends)
     except Exception as e:
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
