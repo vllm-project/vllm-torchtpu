@@ -12,6 +12,8 @@ from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel,
                                                  requant_load_kmajor_fp4)
+from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import (
     get_cpu_weight_loader_hook, release_memory_to_os)
 from vllm_torchtpu.utils import synchronize_tensors
@@ -33,6 +35,12 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     @property
     def is_monolithic(self) -> bool:
         return True
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        # We need to take control of collective communication (AllGather/ReduceScatter)
+        # to pipeline them with MoE computation when chunking is enabled.
+        return enable_pipelined_collective_and_compute()
 
     @staticmethod
     def _loaded_data(parameter: torch.nn.Parameter) -> torch.Tensor:
@@ -238,20 +246,24 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
             topk_ids, topk_weights)
 
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale,
+            "w2_scale": layer.w2_weight_scale,
+            "w1_bias": None,
+            "w2_bias": None,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+            "rhs_quant_dtype": None,
+            "skip_padded_tokens": True,
+        }
+        if enable_pipelined_collective_and_compute():
+            return pipelined_fused_moe_gmm(**kwargs)
+
         # Execute GMM Kernel with native fp4 weights and scales
-        return fused_moe_gmm(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w1_bias=None,
-            w2_bias=None,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            experts_start=layer._experts_start,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-            rhs_quant_dtype=None,
-            skip_padded_tokens=True,
-        )
+        return fused_moe_gmm(**kwargs)
