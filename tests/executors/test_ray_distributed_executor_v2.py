@@ -427,13 +427,14 @@ class TestTpuRayDistributedExecutorV2:
         # (node_1, 10.0.0.1) based on (dp_rank * world_size) // chips_per_host
         # = (3 * 2) // 8 = 0, ensuring deterministic DP placement and packing
         # this engine's TP group onto a single node.
-        mock_ray.util.placement_group.assert_called_once_with([{
-            "TPU": 1.0,
-            "node:10.0.0.1": 0.001,
-        }, {
-            "TPU": 1.0
-        }],
-                                                              strategy="PACK")
+        mock_ray.util.placement_group.assert_called_once_with(
+            [{
+                "TPU": 1.0,
+                "node:10.0.0.1": 0.001,
+            }, {
+                "TPU": 1.0
+            }],
+            strategy="PACK")
         assert executor.parallel_config.placement_group is created_pg
 
     @patch(

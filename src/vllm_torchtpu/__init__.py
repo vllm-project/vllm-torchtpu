@@ -955,6 +955,13 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         if module is not None:
             setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
 
+    # Upstream _promote_local_kv_cache_specs asserts that all workers share a
+    # uniform KV cache spec across groups, raising ValueError when encountering
+    # heterogeneous layer configurations (e.g. hybrid attention/Mamba models,
+    # pure linear state layers, or disaggregated PCP configurations with
+    # per-group block sizing). We patch it to catch ValueError and return an
+    # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
+    # cache coordinator without crashing.
     original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs",
                                None)
     if original_promote is not None and not getattr(
