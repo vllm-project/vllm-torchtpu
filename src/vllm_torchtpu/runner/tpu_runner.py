@@ -3559,6 +3559,12 @@ class TPUModelRunner(GPUModelRunner):
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk.
         """
+        # TODO(haotianx): Remove once structured output + spec decoding + async
+        # scheduling is supported.
+        if grammar_output is not None and self.scheduler_config.async_scheduling:
+            raise NotImplementedError(
+                "Structured output with speculative decoding is not "
+                "supported with async scheduling yet.")
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = (
                 self.spec_bonus_and_target_logits(logits,
@@ -4470,8 +4476,8 @@ class TPUModelRunner(GPUModelRunner):
         ``drafter.precompile()`` (draft forward only), so they recompile every
         time the verify length (``padded_logits_length``) lands in a new
         num-tokens bucket as requests finish and the batch shrinks. Replay the
-        verify inner body (the ``use_spec`` branch in ``sample_tokens``) at
-        every ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
+        verify inner body (``_sample_spec_verify_chunk``) at every
+        ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
         produce so the real call is a cache hit. Shared sync + async.
 
         Both verify sub-branches are distinct ``dynamic=False`` graphs, so warm
@@ -4480,8 +4486,9 @@ class TPUModelRunner(GPUModelRunner):
         ``spec_bonus_and_target_logits``) and non-greedy (``do_sampling=True``
         -> ``_random_rejection_sample_with_segment``, prelude
         ``spec_gather_bonus_and_target_logits``). Which one runs is decided per
-        step by ``input_batch.all_greedy``, so both are reachable and must be
-        pre-compiled here.
+        step by ``input_batch.all_greedy`` and ``grammar_output``, so both are
+        reachable and must be pre-compiled here; the greedy + structured-output
+        combination reuses graphs warmed by these two passes.
         """
         if not (self._is_async_drafter):
             return

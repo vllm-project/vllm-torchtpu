@@ -953,6 +953,108 @@ def test_structured_output_spec_decode_non_greedy(
             cleanup_dist_env_and_memory()
 
 
+@pytest.mark.timeout(2400)
+def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch):
+    """Structured outputs under greedy eagle3 speculative decoding.
+
+    Same three assertions as the ngram combo test -- (a) every structured
+    output satisfies its schema, (b) greedy output matches a no-spec
+    reference, (c) drafts were proposed and accepted -- but with a
+    model-based drafter.
+
+    Sync scheduling only: eagle3 + async scheduling + structured output
+    raises NotImplementedError (the TPU async path keeps drafts on device,
+    so the engine cannot substitute them into the grammar bitmask).
+    """
+    async_scheduling = False
+    model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string"
+            },
+            "age": {
+                "type": "integer"
+            },
+        },
+        "required": ["name", "age"],
+    }
+    structured = SamplingParams(
+        temperature=0,
+        max_tokens=64,
+        structured_outputs=StructuredOutputsParams(json=schema),
+    )
+    unconstrained = SamplingParams(temperature=0, max_tokens=64)
+
+    with monkeypatch.context():
+        test_prompts = get_structured_spec_prompts()
+        params = [
+            structured if i % 2 == 0 else unconstrained
+            for i in range(len(test_prompts))
+        ]
+        kwargs = dict(
+            max_model_len=256,
+            max_num_seqs=4,
+            tensor_parallel_size=_get_tensor_parallel_size(),
+            async_scheduling=async_scheduling,
+            disable_log_stats=False,
+        )
+
+        # 1. Reference run: structured outputs, no speculation.
+        ref_llm = LLM(model=model_name, **kwargs)
+        ref_outputs = ref_llm.generate(test_prompts, params)
+        ref_llm.llm_engine.engine_core.shutdown()
+        del ref_llm
+        cleanup_dist_env_and_memory()
+        time.sleep(15)
+
+        # 2. eagle3 speculative run with the same structured params.
+        spec_llm = LLM(model=model_name,
+                       speculative_config={
+                           "method": "eagle3",
+                           "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+                           "num_speculative_tokens": 3,
+                           "draft_tensor_parallel_size": 1,
+                       },
+                       **kwargs)
+        spec_outputs = spec_llm.generate(test_prompts, params)
+
+        # (a) Constraint holds on every structured request.
+        for i, spec in enumerate(spec_outputs):
+            if i % 2 == 0:
+                _assert_valid_structured_json(spec.outputs[0].text)
+
+        # (b) Speculation must not change greedy output.
+        misses = 0
+        for ref, spec in zip(ref_outputs, spec_outputs):
+            if ref.outputs[0].text != spec.outputs[0].text:
+                misses += 1
+                print(f"ref:  {ref.outputs[0].text}")
+                print(f"spec: {spec.outputs[0].text}")
+        assert misses == 0
+
+        # (c) The masked verify path actually saw draft traffic.
+        num_draft_tokens = num_accepted_tokens = 0
+        for metric in spec_llm.get_metrics():
+            if metric.name == SPEC_DRAFT_METRIC:
+                assert isinstance(metric, Counter)
+                num_draft_tokens += metric.value
+            elif metric.name == SPEC_ACCEPTED_METRIC:
+                assert isinstance(metric, Counter)
+                num_accepted_tokens += metric.value
+        print(f"structured+eagle3({'async' if async_scheduling else 'sync'}): "
+              f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
+        assert num_draft_tokens > 0, \
+            "no draft tokens proposed under structured outputs"
+        assert num_accepted_tokens > 0, \
+            "no draft tokens accepted under structured outputs"
+
+        spec_llm.llm_engine.engine_core.shutdown()
+        del spec_llm
+        cleanup_dist_env_and_memory()
+
+
 @pytest.mark.timeout(1200)
 def test_eagle3_correctness_greedy_multi_chunk(
     monkeypatch: pytest.MonkeyPatch,
