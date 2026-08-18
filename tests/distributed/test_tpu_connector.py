@@ -3392,3 +3392,75 @@ class TestTPUConnectorStats(unittest.TestCase):
         stats = TPUConnectorWorker.get_kv_connector_stats(worker)
         assert stats is not None
         assert stats.data["prefill_queue_length"] == [1]
+
+    def test_raiden_worker_get_kv_connector_stats_with_telemetry(self):
+        worker = MagicMock()
+        worker.tp_rank = 0
+        worker.is_producer = True
+        worker._raiden_stage3_enabled.return_value = True
+        worker._stage3_registered_sends = {"req1": MagicMock(), "req2": MagicMock()}
+        worker.transfer_stats = TpuKVConnectorStats()
+
+        mock_telemetry = MagicMock()
+        mock_telemetry.get_and_reset_metric_samples.return_value = {
+            "tpu_raiden_rpc_latency_ms": [5.0, 10.0],
+        }
+
+        with patch("vllm_torchtpu.distributed.utils.get_raiden_telemetry_module", return_value=mock_telemetry):
+            stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
+
+        assert stats is not None
+        assert stats.data["tpu_raiden_rpc_latency_ms"] == [5.0, 10.0]
+        assert stats.data["prefill_queue_length"] == [2]
+        assert worker.transfer_stats.is_empty() is True
+
+    def test_raiden_dynamic_prom_metrics_registration_and_observe(self):
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        labelnames = ["model_name", "engine"]
+        per_engine_labelvalues = {0: ["my_model", "0"]}
+
+        descriptors = [
+            SimpleNamespace(name="hbm_copy_ms", type="histogram", buckets=[1.0, 10.0], description="HBM copy time"),
+            SimpleNamespace(name="transfer_count", type="counter", description="Transfer count"),
+            SimpleNamespace(name="active_reqs", type="gauge", description="Active reqs"),
+        ]
+        mock_telemetry = MagicMock()
+        mock_telemetry.get_metric_metadata.return_value = descriptors
+
+        with patch("vllm_torchtpu.distributed.utils.get_raiden_telemetry_module", return_value=mock_telemetry), \
+             patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"):
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=labelnames,
+                per_engine_labelvalues=per_engine_labelvalues)
+
+        assert "tpu_raiden_hbm_copy_ms" in metrics.dynamic_metrics
+        assert "tpu_raiden_transfer_count" in metrics.dynamic_metrics
+        assert "tpu_raiden_active_reqs" in metrics.dynamic_metrics
+
+        obs_data = {
+            "d2h_transfer_time": [],
+            "h2d_transfer_time": [],
+            "kv_pull_time": [],
+            "mb_transferred": [],
+            "num_failed_transfers": [],
+            "tpu_raiden_hbm_copy_ms": [2.5],
+            "tpu_raiden_transfer_count": [1],
+            "tpu_raiden_active_reqs": [8],
+        }
+        metrics.observe(obs_data, engine_idx=0)
+
+        hist = metrics.dynamic_metrics["tpu_raiden_hbm_copy_ms"][1][0]
+        counter = metrics.dynamic_metrics["tpu_raiden_transfer_count"][1][0]
+        gauge = metrics.dynamic_metrics["tpu_raiden_active_reqs"][1][0]
+
+        assert hist._sum.get() == 2.5
+        assert counter._value.get() == 1.0
+        assert gauge._value.get() == 8.0
+

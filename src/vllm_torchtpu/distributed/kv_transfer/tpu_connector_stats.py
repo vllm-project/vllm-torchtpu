@@ -253,19 +253,21 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.gauge_tpu_decode_queue_length = create_metric_per_engine(
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues)
 
-        self.dynamic_metrics: dict[str, tuple[str, Any]] = self._get_raiden_metric_definitions()
+        self.dynamic_metrics: dict[str, tuple[str, Any]] = self._get_raiden_metric_definitions(labelnames)
 
-    def _get_raiden_metric_definitions(self, labelnames: list[str]):
+    def _get_raiden_metric_definitions(self, labelnames: list[str] | None = None):
+        if labelnames is None:
+            labelnames = self._labelnames
         # Dynamically load TPU Raiden C++ metric schema descriptors
         metric_defs = {}
         try:
+            # Without this call, get_metric_metadata won't return the correct metrics definitions
             dist_utils.configure_raiden_telemetry()
             telemetry = dist_utils.get_raiden_telemetry_module()
             descriptors = []
             if telemetry is not None:
                 if hasattr(telemetry, "get_metric_metadata"):
                     descriptors = telemetry.get_metric_metadata()
-                print(f"Descriptors{descriptors}")
         except Exception as e:
             logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
 
