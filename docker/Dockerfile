@@ -62,19 +62,8 @@ WORKDIR /root/torchtpu-vllm
 RUN git config --global --add safe.directory /root/torchtpu-vllm
 RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 
-ARG VLLM_SOURCE
-# Copy vllm source (might be empty if not provided)
-COPY vllm /root/torchtpu-vllm/vllm
-
-# Install vllm from source if requested.
-# If VLLM_SOURCE is provided, we build it in editable mode.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -n "$VLLM_SOURCE" ]; then \
-      sed -i 's/vllm==[^"]*/vllm/' pyproject.toml && \
-      VLLM_TARGET_DEVICE="tpu" uv pip install --system \
-        -e /root/torchtpu-vllm/vllm ; \
-    fi
-
+# Note: we **intentionally** set VLLM_TARGET_DEVICE="empty", see README.
+ENV VLLM_TARGET_DEVICE="empty"
 
 # Variant 3: Developer Image (Dev Variant with test/benchmark tools)
 # This variant contains all source code and is intended for active development.
@@ -88,7 +77,21 @@ COPY . .
 # versioned wheel from the base stage.
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
-    VLLM_TARGET_DEVICE=empty uv pip install --system -e ".[test,benchmarking]"
+    uv pip install --system -e ".[test,benchmarking]"
+
+# Install vLLM from source if requested.
+# If VLLM_SOURCE is provided, we build it in editable mode.
+ARG VLLM_SOURCE
+# Copy vllm source (might be empty if not provided)
+COPY vllm /root/torchtpu-vllm/vllm
+
+# Install vllm from source if requested.
+# If VLLM_SOURCE is provided, we build it in editable mode.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "$VLLM_SOURCE" ]; then \
+      uv pip install --system --no-deps \
+        -e /root/torchtpu-vllm/vllm ; \
+    fi
 
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
 CMD ["/bin/bash"]
@@ -102,7 +105,7 @@ WORKDIR /root/torchtpu-vllm
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
-    VLLM_TARGET_DEVICE=empty uv pip install --system .
+    uv pip install --system .
 
 RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"

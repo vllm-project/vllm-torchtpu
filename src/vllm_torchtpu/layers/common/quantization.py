@@ -281,6 +281,11 @@ def quantize_tensor(
     blocked_q = torch.clamp(blocked * scale_inv,
                             min=float(dtype_info.min),
                             max=float(dtype_info.max))
+    if not is_floating_dtype(quant_dtype):
+        # A float->int cast truncates toward zero, biasing every element by
+        # half an LSB; float dtypes already round in the cast. Half-to-even,
+        # matching `quantized_matmul.util.quantize_block`.
+        blocked_q = torch.round(blocked_q)
     tensor_q = blocked_q.reshape_as(moved).to(quant_dtype).movedim(-1, axis)
     scale = scale_bits if scale_bits is not None else scale.to(torch.float32)
     scale = scale.squeeze(-1).movedim(-1, axis)

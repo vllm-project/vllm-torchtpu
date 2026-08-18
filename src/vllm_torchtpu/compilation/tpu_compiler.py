@@ -24,14 +24,13 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
+from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Type alias for the compile range tuple
-Range = tuple[int, int]
 
 
 @dataclasses.dataclass
@@ -246,6 +245,11 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     return graph, True
 
 
+def _single_size(compile_range: Range) -> int | None:
+    """The token bucket a compile range pins, or None for a size range."""
+    return compile_range.start if compile_range.is_single_size() else None
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -284,6 +288,15 @@ class TpuCompilerAdaptor(CompilerInterface):
         Delegates to TpuBackend which handles aot_autograd + fx_to_mlir
         + compile_mlir internally.
         """
+        # A bucket this graph cannot serve, or one an earlier trace of the same
+        # model already built, is not compiled here (see shape_variants).
+        size = _single_size(compile_range)
+        if key is not None and size is not None:
+            elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph,
+                                                    size)
+            if elsewhere is not None:
+                return elsewhere, None
+
         logger.info(
             "[TpuCompilerAdaptor] Compiling FX graph for range %s",
             compile_range,
@@ -358,6 +371,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 logger.warning(
                     "[TpuCompilerAdaptor] Failed to save executable: %s", e)
 
+        if key is not None and size is not None:
+            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn, handle
 
     def load(
@@ -376,6 +391,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, was_wrapped = handle
+        size = _single_size(compile_range)
+        elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph,
+                                                size)
+        if elsewhere is not None:
+            return elsewhere
+
         logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
                     path)
 
@@ -434,4 +455,6 @@ class TpuCompilerAdaptor(CompilerInterface):
 
             compiled_fn = unwrap_fn
 
+        if size is not None:
+            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn

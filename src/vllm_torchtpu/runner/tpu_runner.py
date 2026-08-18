@@ -67,6 +67,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   prepare_kernel_block_sizes)
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
@@ -4571,17 +4572,7 @@ class TPUModelRunner(GPUModelRunner):
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
-                for num_tokens in self.num_tokens_paddings:
-                    logger.info("  -- num_tokens: %d", num_tokens)
-                    self._dummy_run(num_tokens,
-                                    self.num_reqs_max_model_len,
-                                    self.max_num_blocks_per_req,
-                                    use_max_model_len=True)
-                    if self.most_model_len is not None:
-                        self._dummy_run(num_tokens,
-                                        self.num_reqs_most_model_len,
-                                        self.num_blocks_per_most_len_req,
-                                        use_max_model_len=False)
+                self._precompile_backbone()
 
             self._precompile_sampling_subgraphs()
 
@@ -4596,6 +4587,37 @@ class TPUModelRunner(GPUModelRunner):
                 # a handful of new graphs. Warm those by running the REAL
                 # two-phase spec-decode path once on a synthetic request.
                 self._warmup_spec_decode()
+
+    def _precompile_backbone(self) -> None:
+        """Compile the backbone for every token bucket.
+
+        One trace serves the whole ladder unless the model's structure depends
+        on the token count, in which case a bucket the current graph cannot
+        serve gets a trace of its own and hands its executable back, leaving
+        one executable per bucket either way (see
+        vllm_torchtpu.compilation.shape_variants).
+        """
+        with shape_variants.warmup() as buckets:
+            for num_tokens in self.num_tokens_paddings:
+                logger.info("  -- num_tokens: %d", num_tokens)
+                if buckets.needs_retrace(num_tokens):
+                    shape_variants.retrace(self.model, self.vllm_config)
+                self._dummy_run(num_tokens,
+                                self.num_reqs_max_model_len,
+                                self.max_num_blocks_per_req,
+                                use_max_model_len=True)
+                if self.most_model_len is not None:
+                    self._dummy_run(num_tokens,
+                                    self.num_reqs_most_model_len,
+                                    self.num_blocks_per_most_len_req,
+                                    use_max_model_len=False)
+            if buckets.refused:
+                # A refusal that no trace picked up leaves a raising closure in
+                # the live graph, which would surface as a failed request. Fail
+                # the start instead, where it can be read.
+                raise shape_variants.ShapeSpecializationError(
+                    "warmup left token buckets uncompiled: "
+                    f"{sorted(buckets.refused)}")
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.

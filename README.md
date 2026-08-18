@@ -9,7 +9,20 @@ This repository contains the integration of **TorchTPU** and **vLLM**. It is a v
 
 ## 🛠️ Installation
 
-To run the **Qwen3** model, follow these installation steps:
+Follow these installation steps:
+
+> We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
+
+> [!TIP]
+> A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials.
+>
+> To resolve this, open `~/.netrc` in your preferred text editor and delete the block associated with `us-python.pkg.dev`. It will look something like this:
+>
+> ```text
+> machine us-python.pkg.dev
+> login oauth2accesstoken
+> password <your_expired_token>
+> ```
 
 ### 1. Google Cloud Authentication
 
@@ -34,7 +47,17 @@ gcloud auth application-default login
 
 ### 2. Install vLLM-TorchTPU and dependencies
 
-We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
+First, clone the repo, for one viewing this doc from web.
+
+```sh
+git clone git@github.com:vllm-project/vllm-torchtpu.git && cd vllm-torchtpu
+```
+
+`VLLM_TARGET_DEVICE="empty"` is a switch that defined and recognized by
+vLLM's build process. We use it since that `vllm-torchtpu` is an
+out-of-tree platform of the `vllm` product. We pass this variable during
+the installation of `vllm-torchtpu`, as we are building `vllm` wheel from
+source during this process.
 
 #### Option A: Using `uv` (Recommended)
 
@@ -51,23 +74,11 @@ uv tool install keyring --with keyrings.google-artifactregistry-auth
 # Use CPU Torch when building vLLM's editable TPU package.
 export UV_TORCH_BACKEND=cpu
 
-# Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
-
-# Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
-# plugin alongside vllm-torchtpu.
-sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
-
-# Install vLLM in editable mode (forcing the 0.27.0 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.27.0 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
-
 # Install vLLM-TorchTPU and dependencies
-uv pip install --pre -e .
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e .
 ```
 
 #### Option B: Using `pip`
-
-> **Note:** Currently, `vllm==0.27.0` is supported.
 
 ```bash
 python3.12 -m venv ~/pip_venv --symlinks
@@ -80,39 +91,51 @@ pip install keyring keyrings.google-artifactregistry-auth
 # Set the PIP_INDEX_URL environment variable (using keyring)
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
+# Install vLLM-TorchTPU and dependencies
+VLLM_TARGET_DEVICE="empty" pip install --pre -e .
+```
+
+### 3. \[Optional\] Install vLLM
+
+The local installation of `vllm` is optional. Follow these steps when
+one need to develop with `vllm` directly.
+
+> **Note:** Currently, `vllm==0.27.0` is supported.
+
+#### Option A: Using `uv` (Recommended)
+
+```bash
+# Use the venv from last section
+source ~/uv_venv/bin/activate
+
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
 
-# Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
-# plugin alongside vllm-torchtpu.
-sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
-
-# Install vLLM in editable mode (forcing the 0.27.0 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.27.0 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
-
-# Install vLLM-TorchTPU and dependencies
-pip install --pre -e .
+# Install vLLM in editable mode
+VLLM_TARGET_DEVICE="empty" uv pip install  --no-deps -e ../vllm
 ```
 
-> [!TIP]
-> A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials.
->
-> To resolve this, open `~/.netrc` in your preferred text editor and delete the block associated with `us-python.pkg.dev`. It will look something like this:
->
-> ```text
-> machine us-python.pkg.dev
-> login oauth2accesstoken
-> password <your_expired_token>
-> ```
+#### Option B: Using `pip`
 
-> **Note:** Prioritize compile mode for better performance. The first startup may take several minutes while TPU graphs compile. Add `--enforce-eager` if you want eager mode.
-> On TPUv7, Qwen3-Coder-30B can fit on a single device. On v6, use a smaller model like Qwen3-4B or test with TP/EP.
+```bash
+# Use the venv from last section
+source ~/pip_venv/bin/activate
+
+# Clone vLLM to allow making local patches for debugging
+git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
+
+# Install vLLM in editable mode
+VLLM_TARGET_DEVICE="empty" pip install --no-deps -e ../vllm
+```
 
 ---
 
 ## 🌐 Online Serving
 
 Start the server with the following command:
+
+> **Note:** Prioritize compile mode for better performance. The first startup may take several minutes while TPU graphs compile. Add `--enforce-eager` if you want eager mode.
+> On TPUv7, Qwen3-Coder-30B can fit on a single device. On v6, use a smaller model like Qwen3-4B or test with TP/EP.
 
 ```bash
 vllm serve "Qwen/Qwen3-Coder-30B-A3B-Instruct" \

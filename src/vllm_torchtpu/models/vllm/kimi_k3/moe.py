@@ -15,6 +15,9 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu.layers.vllm.moe_hierarchical import (
+    hierarchical_moe_parallel_config, hierarchical_split_or_none)
+
 from .layers import KimiMLP
 
 
@@ -109,36 +112,45 @@ class KimiMoE(nn.Module):
         padded_intermediate_size = config.moe_intermediate_size
         min_per_partition = getattr(config,
                                     "min_moe_intermediate_per_partition", 128)
-        if (not self.use_ep and self.tp_size > 1 and
-                padded_intermediate_size // self.tp_size < min_per_partition):
-            padded_intermediate_size = min_per_partition * self.tp_size
+        if self.use_ep:
+            split = hierarchical_split_or_none()
+            moe_tp_size = split[2] if split is not None else 1
+        else:
+            moe_tp_size = self.tp_size
+        if (moe_tp_size > 1 and padded_intermediate_size // moe_tp_size
+                < min_per_partition):
+            padded_intermediate_size = min_per_partition * moe_tp_size
 
         situ_beta = (getattr(config, "activation_situ_beta", None)
                      if config.hidden_act == "situ" else None)
         situ_linear_beta = (getattr(config, "activation_situ_linear_beta",
                                     None)
                             if config.hidden_act == "situ" else None)
-        self.experts = FusedMoEFactory(
-            shared_experts=self.shared_experts,
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_token,
-            hidden_size=expert_hidden_size,
-            intermediate_size=padded_intermediate_size,
-            activation=config.hidden_act,
-            activation_situ_beta=situ_beta,
-            activation_situ_linear_beta=situ_linear_beta,
-            renormalize=config.moe_renormalize,
-            quant_config=quant_config,
-            use_grouped_topk=config.use_grouped_topk,
-            num_expert_group=config.num_expert_group,
-            topk_group=config.topk_group,
-            prefix=f"{prefix}.experts",
-            scoring_func=config.moe_router_activation_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=config.routed_scaling_factor,
-            routed_input_transform=self.routed_expert_down_proj,
-            routed_output_transform=routed_output_transform,
-        )
+        # Under TPU_MOE_HIERARCHICAL_EP this builds the routed experts
+        # with expert parallelism between chips and tensor parallelism
+        # within one chip, instead of vLLM's flat all-experts-per-device EP.
+        with hierarchical_moe_parallel_config():
+            self.experts = FusedMoEFactory(
+                shared_experts=self.shared_experts,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_token,
+                hidden_size=expert_hidden_size,
+                intermediate_size=padded_intermediate_size,
+                activation=config.hidden_act,
+                activation_situ_beta=situ_beta,
+                activation_situ_linear_beta=situ_linear_beta,
+                renormalize=config.moe_renormalize,
+                quant_config=quant_config,
+                use_grouped_topk=config.use_grouped_topk,
+                num_expert_group=config.num_expert_group,
+                topk_group=config.topk_group,
+                prefix=f"{prefix}.experts",
+                scoring_func=config.moe_router_activation_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                routed_scaling_factor=config.routed_scaling_factor,
+                routed_input_transform=self.routed_expert_down_proj,
+                routed_output_transform=routed_output_transform,
+            )
         if padded_intermediate_size != config.moe_intermediate_size:
             routed_experts = self.experts.routed_experts
             w13_weight = getattr(routed_experts, "w13_weight", None)
@@ -150,7 +162,7 @@ class KimiMoE(nn.Module):
             w13_weight.data.zero_()
             w2_weight.data.zero_()
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
-                config.moe_intermediate_size // self.tp_size)
+                config.moe_intermediate_size // moe_tp_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
