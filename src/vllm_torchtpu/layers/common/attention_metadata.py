@@ -126,8 +126,15 @@ class AttentionMetadataBuilderContext:
     unified_mamba_state_indices: list[torch.Tensor] | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
-    # Per-chunk cache of mamba row-offset plans shared across mamba groups.
-    mamba_row_plans: dict = field(default_factory=dict)
+    # Per-chunk cache of the shared mamba row-offset plan, keyed by
+    # (target_block_size, target_num_blocks) -> (state_index, ckpt_index,
+    # ckpt_in_row). Valid only because every context is constructed fresh
+    # per chunk: the plan derives from this chunk's seq_lens/ckpt_window,
+    # which the key deliberately omits. Do not reuse a context across
+    # chunks.
+    mamba_row_plans: dict[tuple[int, int],
+                          tuple[torch.Tensor, torch.Tensor | None, torch.Tensor
+                                | None]] = field(default_factory=dict)
 
 
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):

@@ -135,14 +135,16 @@ class ExecuteModelState:
                                    | None] = field(default_factory=list)
 
 
-# Compiled helper to consolidate per-step mamba read-offset operations
-# into a single cached TPU program, avoiding per-group eager launches.
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _reset_read_offsets_compiled(read_offsets: torch.Tensor,
-                                 keep_dev: torch.Tensor,
-                                 stacked_groups: torch.Tensor,
-                                 null: torch.Tensor) -> None:
-    """Scatter reset across all mamba groups in a single compiled program.
+# Per-step mamba read-offset operations, consolidated into single cached
+# TPU programs (avoiding per-group eager launches). Each body is defined
+# once; the compiled variant is derived from it, and the dispatchers pick
+# eager on CPU (unit tests, pre-init paths) since the tpu backend cannot
+# trace CPU tensors.
+def _reset_read_offsets_impl(read_offsets: torch.Tensor,
+                             keep_dev: torch.Tensor,
+                             stacked_groups: torch.Tensor,
+                             null: torch.Tensor) -> None:
+    """Scatter reset across all mamba groups in a single program.
     `stacked_groups` is [G, width]; `keep_dev` [width] broadcasts across G.
     Non-new rows collapse onto the null slot, where writing 0 is a no-op."""
     targets = torch.where(keep_dev, stacked_groups, null)
@@ -152,53 +154,47 @@ def _reset_read_offsets_compiled(read_offsets: torch.Tensor,
     read_offsets.index_put_((targets.reshape(-1).long(), ), zero)
 
 
-def _reset_read_offsets(read_offsets: torch.Tensor, keep_dev: torch.Tensor,
-                        stacked_groups: torch.Tensor,
-                        null: torch.Tensor) -> None:
-    if read_offsets.device.type == "tpu":
-        _reset_read_offsets_compiled(read_offsets, keep_dev, stacked_groups,
-                                     null)
-    else:
-        targets = torch.where(keep_dev, stacked_groups, null)
-        zero = torch.zeros((),
-                           dtype=read_offsets.dtype,
-                           device=read_offsets.device)
-        read_offsets.index_put_((targets.reshape(-1).long(), ), zero)
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _rollback_offsets_seed_compiled(read_offsets: torch.Tensor,
-                                    dst_t: torch.Tensor) -> None:
+def _rollback_offsets_seed_impl(read_offsets: torch.Tensor,
+                                dst_t: torch.Tensor) -> None:
     read_offsets.index_put_((dst_t, ),
                             torch.zeros(dst_t.shape[0],
                                         dtype=read_offsets.dtype,
                                         device=read_offsets.device))
 
 
+def _rollback_offsets_migrate_impl(read_offsets: torch.Tensor,
+                                   src_t: torch.Tensor,
+                                   dst_t: torch.Tensor) -> None:
+    read_offsets.index_put_((dst_t, ), read_offsets[src_t])
+
+
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
+_rollback_offsets_migrate_compiled = _tpu_compile(
+    _rollback_offsets_migrate_impl)
+
+
+def _reset_read_offsets(read_offsets: torch.Tensor, keep_dev: torch.Tensor,
+                        stacked_groups: torch.Tensor,
+                        null: torch.Tensor) -> None:
+    fn = (_reset_read_offsets_compiled
+          if read_offsets.device.type == "tpu" else _reset_read_offsets_impl)
+    fn(read_offsets, keep_dev, stacked_groups, null)
+
+
 def _rollback_offsets_seed(read_offsets: torch.Tensor,
                            dst_t: torch.Tensor) -> None:
-    if read_offsets.device.type == "tpu":
-        _rollback_offsets_seed_compiled(read_offsets, dst_t)
-    else:
-        read_offsets.index_put_((dst_t, ),
-                                torch.zeros(dst_t.shape[0],
-                                            dtype=read_offsets.dtype,
-                                            device=read_offsets.device))
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _rollback_offsets_migrate_compiled(read_offsets: torch.Tensor,
-                                       src_t: torch.Tensor,
-                                       dst_t: torch.Tensor) -> None:
-    read_offsets.index_put_((dst_t, ), read_offsets[src_t])
+    fn = (_rollback_offsets_seed_compiled if read_offsets.device.type == "tpu"
+          else _rollback_offsets_seed_impl)
+    fn(read_offsets, dst_t)
 
 
 def _rollback_offsets_migrate(read_offsets: torch.Tensor, src_t: torch.Tensor,
                               dst_t: torch.Tensor) -> None:
-    if read_offsets.device.type == "tpu":
-        _rollback_offsets_migrate_compiled(read_offsets, src_t, dst_t)
-    else:
-        read_offsets.index_put_((dst_t, ), read_offsets[src_t])
+    fn = (_rollback_offsets_migrate_compiled if read_offsets.device.type
+          == "tpu" else _rollback_offsets_migrate_impl)
+    fn(read_offsets, src_t, dst_t)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
