@@ -3,6 +3,23 @@
 
 import os
 
+# Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
+_vllm_cache_root = os.environ.setdefault("VLLM_CACHE_ROOT",
+                                         os.path.expanduser("~/.cache/vllm"))
+
+# When compilation cache is enabled (VLLM_DISABLE_COMPILE_CACHE is 0 or unset),
+# configure TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
+# 1. Explicit TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT takes top priority.
+# 2. Otherwise, VLLM_XLA_CACHE_PATH is used if specified.
+# 3. Defaults to VLLM_CACHE_ROOT/xla_cache.
+_disable_compile_cache = os.getenv("VLLM_DISABLE_COMPILE_CACHE",
+                                   "0").lower() in ("1", "true")
+if not _disable_compile_cache:
+    _tier3_default = os.getenv("VLLM_XLA_CACHE_PATH") or os.path.join(
+        _vllm_cache_root, "xla_cache")
+    os.environ.setdefault("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+                          _tier3_default)
+
 # Configure TorchTPU compilation cache environment variables directly
 if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
     # Enable Tier-2 cache in memory (required by Tier-3)
@@ -12,9 +29,6 @@ if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
                           os.environ["TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"])
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
-
-# Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
-os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
 
 # Disable CUDA-specific shared experts stream for TPU
 # This prevents errors when trying to create CUDA streams on TPU hardware

@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import pickle
+from collections.abc import Sequence
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable
@@ -39,6 +40,10 @@ class TpuCompilationHandle:
     key: str
     tier3_cache_active: bool = False
     executable: Any | None = None
+    tier3_key: str | None = None
+    updates_default_generator_state: bool = False
+    unique_output_indices: Sequence[int] | None = None
+    dynamic_outputs: Sequence[bool] | None = None
 
 
 _tpu_backend = TpuBackend()
@@ -341,7 +346,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # Save the per-shape PjRt executable to disk.
         # When Tier-3 C++ persistent cache is active, torch_tpu handles PJRT
         # binary persistence natively in C++ (torch_tpu_tier3/*.bin).
-        # We store a lightweight metadata handle instead of duplicate compiled binary executables.
+        # We store a lightweight metadata handle (tier3_key) instead of duplicate compiled binary executables.
         handle = None
         if (key is not None and self.cache_dir is not None
                 and not self._disable_cache
@@ -350,22 +355,27 @@ class TpuCompilerAdaptor(CompilerInterface):
                 inner_exe = _tpu_backend._compiled_executables[-1]
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=True,
-                    )
-                else:
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=False,
-                        executable=inner_exe,
-                    )
+                tier3_key = getattr(inner_exe, "tier3_key", None)
+                handle_data = TpuCompilationHandle(
+                    key=key,
+                    tier3_cache_active=bool(
+                        os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")),
+                    executable=None if tier3_key is not None else inner_exe,
+                    tier3_key=tier3_key,
+                    updates_default_generator_state=getattr(
+                        inner_exe, "_updates_default_generator_state", False),
+                    unique_output_indices=getattr(inner_exe,
+                                                  "_unique_output_indices",
+                                                  None),
+                    dynamic_outputs=getattr(inner_exe, "_dynamic_outputs",
+                                            None),
+                )
                 with open(save_path, "wb") as f:
                     pickle.dump(handle_data, f)
                 handle = (key, save_path, was_wrapped)
                 logger.info(
-                    "[TpuCompilerAdaptor] Saved compiled executable metadata to %s",
+                    "[TpuCompilerAdaptor] Saved compiled executable metadata (tier3_key=%s) to %s",
+                    tier3_key,
                     save_path,
                 )
             except Exception as e:
@@ -386,9 +396,8 @@ class TpuCompilerAdaptor(CompilerInterface):
     ) -> Callable[..., Any]:
         """Load a compiled executable from disk.
 
-        Unpickles the _TorchTpuCompiledExecutable (or uses Tier-3 C++ cache),
-        then wraps it with aot_autograd (using the same graph) to reconstruct
-        the full callable.
+        Directly reconstructs the TorchTpuCompiledExecutable from the cached handle / tier3_key,
+        completely skipping Python FX->MLIR lowering and aot_autograd re-tracing.
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, was_wrapped = handle
@@ -404,46 +413,80 @@ class TpuCompilerAdaptor(CompilerInterface):
         with open(path, "rb") as f:
             loaded_data = pickle.load(f)
 
-        # Re-create the aot_autograd wrapper around the cached executable.
-        from torch._dynamo.backends.common import aot_autograd
-
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-
-        tier3_active = False
+        tier3_key = None
         inner_exe = None
         if isinstance(loaded_data, TpuCompilationHandle):
-            tier3_active = loaded_data.tier3_cache_active
+            tier3_key = loaded_data.tier3_key
             inner_exe = loaded_data.executable
         elif isinstance(loaded_data, dict):
-            tier3_active = loaded_data.get("tier3_cache_active", False)
+            tier3_key = loaded_data.get("tier3_key")
             inner_exe = loaded_data.get("executable")
         else:
             inner_exe = loaded_data
 
-        if tier3_active:
-            # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
-            def _cached_compiler(g, example_inputs):
-                clean_inputs = [
-                    int(x) if isinstance(x, torch.SymInt) else x
-                    for x in example_inputs
-                ]
-                return _tpu_backend(g, clean_inputs)
-        else:
+        if inner_exe is None and tier3_key is not None:
+            # Reconstruct TorchTpuCompiledExecutable directly from Tier-3 key!
+            try:
+                from torch_tpu._internal.compile import tpu_torch_compile
+                from torch_tpu._internal.compile.torch_tpu_compiled_executable import \
+                    TorchTpuCompiledExecutable
+
+                pjrt_exe = tpu_torch_compile.load_executable_from_tier3_key(
+                    tier3_key)
+                updates_default_generator_state = getattr(
+                    loaded_data,
+                    "updates_default_generator_state", False) if isinstance(
+                        loaded_data, TpuCompilationHandle) else False
+                dynamic_outputs = getattr(
+                    loaded_data, "dynamic_outputs", None) if isinstance(
+                        loaded_data, TpuCompilationHandle) else None
+                unique_output_indices = getattr(
+                    loaded_data, "unique_output_indices", None) if isinstance(
+                        loaded_data, TpuCompilationHandle) else None
+
+                inner_exe = TorchTpuCompiledExecutable(
+                    executable=pjrt_exe,
+                    reconstruct_fx_outputs_fn=None,
+                    updates_default_generator_state=
+                    updates_default_generator_state,
+                    dynamic_outputs=dynamic_outputs,
+                    unique_output_indices=unique_output_indices,
+                    tier3_key=tier3_key,
+                )
+                logger.info(
+                    "[TpuCompilerAdaptor] Reconstructed inner_exe from tier3_key: %s",
+                    tier3_key,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[TpuCompilerAdaptor] Failed to load from tier3_key %s: %s",
+                    tier3_key, e)
+
+        if inner_exe is None:
+            logger.warning(
+                "[TpuCompilerAdaptor] No executable found in %s, falling back",
+                path)
+            return None
+
+        # Re-create the aot_autograd wrapper around the cached executable.
+        # Returning inner_exe from _cached_compiler takes 0ms (no FX->MLIR lowering)
+        # while constructing the correct input adapter & buffer donation masks.
+        from torch._dynamo.backends.common import aot_autograd
+
+        if graph is not None:
+            graph = copy.deepcopy(graph)
+            graph, was_wrapped = _ensure_tuple_output(graph)
 
             def _cached_compiler(*_args, **_kwargs):
                 return inner_exe
 
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `aot_autograd` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None):
-            compiled_fn = aot_autograd(
-                fw_compiler=_cached_compiler,
-                keep_inference_input_mutations=False,
-            )(graph, example_inputs)
+            with torch._guards.tracing(None):
+                compiled_fn = aot_autograd(
+                    fw_compiler=_cached_compiler,
+                    keep_inference_input_mutations=False,
+                )(graph, example_inputs)
+        else:
+            compiled_fn = inner_exe
 
         if was_wrapped:
             inner_fn = compiled_fn

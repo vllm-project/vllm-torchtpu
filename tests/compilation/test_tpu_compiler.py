@@ -185,52 +185,48 @@ class TestTpuCompilerCache:
 
         assert factors == ["upstream", "tpu"]
 
-    def test_env_override_mapping(self):
-        """Verify that setting TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT sets TORCH_TPU_TIER2_COMPILATION_CACHE default."""
+    def test_env_override_tier3_default_when_cache_enabled(self):
+        """Verify that when compile cache is enabled, TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT defaults to VLLM_CACHE_ROOT/xla_cache."""
         env_mock = {
-            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT":
-            "/tmp/test_tier3_cache_env",
+            "VLLM_DISABLE_COMPILE_CACHE": "0",
+            "VLLM_CACHE_ROOT": "/tmp/custom_vllm_cache",
         }
         with patch.dict(os.environ, env_mock, clear=True):
-            # Reload env_override to re-execute its top-level statements
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
+            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+                                  ) == "/tmp/custom_vllm_cache/xla_cache"
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
 
-    def test_env_override_disables_breakable_cudagraph(self):
-        """Verify that the TPU plugin always disables breakable cudagraph."""
-        with patch.dict(os.environ, {"VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}):
+    def test_env_override_tier3_respects_vllm_xla_cache_path(self):
+        """Verify that VLLM_XLA_CACHE_PATH overrides the default VLLM_CACHE_ROOT/xla_cache path."""
+        env_mock = {
+            "VLLM_DISABLE_COMPILE_CACHE": "0",
+            "VLLM_CACHE_ROOT": "/tmp/custom_vllm_cache",
+            "VLLM_XLA_CACHE_PATH": "/mnt/gcs_xla_cache",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
-            assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
+            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+                                  ) == "/mnt/gcs_xla_cache"
 
-    def test_env_override_no_clobber(self):
-        """Verify that existing native variables are not overwritten by env_override."""
+    def test_env_override_tier3_disabled_when_vllm_disable_compile_cache_1(
+            self):
+        """Verify that TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT is not set when VLLM_DISABLE_COMPILE_CACHE=1."""
         env_mock = {
-            "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
-            "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT":
-            "/custom/tier3/path",
-            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/custom/tier3/path",
-            "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "custom_tier2",
-            "TORCH_TPU_TIER2_COMPILATION_CACHE": "custom_tier2",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "VLLM_CACHE_ROOT": "/tmp/custom_vllm_cache",
         }
         with patch.dict(os.environ, env_mock, clear=True):
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
             assert os.environ.get(
-                "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
-            ) == "/custom/tier3/path"
-            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
-                                  ) == "/custom/tier3/path"
-
-            assert os.environ.get(
-                "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE") == "custom_tier2"
-            assert os.environ.get(
-                "TORCH_TPU_TIER2_COMPILATION_CACHE") == "custom_tier2"
+                "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT") is None
 
     def test_tpu_compilation_handle_serialization(self):
         """Verify serialization and deserialization of TpuCompilationHandle and legacy fallbacks."""
@@ -268,3 +264,172 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+    def test_tpu_compiler_adaptor_load_direct_executable(self, tmp_path):
+        """Verify that TpuCompilerAdaptor.load directly returns the unpickled executable without re-tracing."""
+        import pickle
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilationHandle, TpuCompilerAdaptor)
+
+        class MockExecutable:
+
+            def __call__(self, x):
+                return x * 2
+
+        mock_exe = MockExecutable()
+        handle_path = tmp_path / "mock_handle.pkl"
+        handle_data = TpuCompilationHandle(
+            key="test_key",
+            tier3_cache_active=True,
+            executable=mock_exe,
+        )
+        with open(handle_path, "wb") as f:
+            pickle.dump(handle_data, f)
+
+        adaptor = TpuCompilerAdaptor()
+        adaptor.initialize_cache(cache_dir=str(tmp_path))
+
+        # Test loading unwrapped
+        loaded_fn = adaptor.load(
+            handle=("test_key", str(handle_path), False),
+            graph=None,
+            example_inputs=[],
+            graph_index=0,
+            compile_range=(512, 512),
+        )
+        assert loaded_fn(10) == 20
+
+        # Test loading with tuple unwrapping (was_wrapped=True)
+        class MockTupleExecutable:
+
+            def __call__(self, x):
+                return (x * 3, )
+
+        tuple_handle_path = tmp_path / "mock_tuple_handle.pkl"
+        with open(tuple_handle_path, "wb") as f:
+            pickle.dump(
+                TpuCompilationHandle(key="tuple_key",
+                                     tier3_cache_active=True,
+                                     executable=MockTupleExecutable()), f)
+
+        loaded_tuple_fn = adaptor.load(
+            handle=("tuple_key", str(tuple_handle_path), True),
+            graph=None,
+            example_inputs=[],
+            graph_index=0,
+            compile_range=(512, 512),
+        )
+        assert loaded_tuple_fn(10) == 30
+
+        # Test loading with tier3_key (lightweight handle where executable=None)
+        tier3_handle_path = tmp_path / "mock_tier3_handle.pkl"
+        with open(tier3_handle_path, "wb") as f:
+            pickle.dump(
+                TpuCompilationHandle(
+                    key="tier3_test_key",
+                    tier3_cache_active=True,
+                    executable=None,
+                    tier3_key=
+                    "1234567890abcdef_1234567890abcdef_1234567890abcdef",
+                ), f)
+
+        with patch(
+                "torch_tpu._internal.compile.tpu_torch_compile.load_executable_from_tier3_key",
+                return_value=MockExecutable(),
+                create=True,
+        ):
+            loaded_tier3_fn = adaptor.load(
+                handle=("tier3_test_key", str(tier3_handle_path), False),
+                graph=None,
+                example_inputs=[],
+                graph_index=0,
+                compile_range=(512, 512),
+            )
+            assert loaded_tier3_fn(15) == 30
+
+    def test_patch_vllm_compile_all_ranges(self):
+        """Verify that TPU_PARALLEL_PRECOMPILE patches PiecewiseBackend and partitions ranges across ranks."""
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from vllm_torchtpu import _patch_vllm_compile_all_ranges
+
+        class MockRange:
+
+            def __init__(self, size):
+                self.start = size
+                self.end = size
+
+            def is_single_size(self):
+                return True
+
+        class MockRangeEntry:
+
+            def __init__(self, size):
+                self.compile_range = MockRange(size)
+                self.compiled = False
+                self.runnable = None
+
+        class MockPiecewiseBackend:
+
+            def __init__(self):
+                self.graph = MagicMock()
+                self.range_entries = {
+                    512: MockRangeEntry(512),
+                    1024: MockRangeEntry(1024),
+                    2048: MockRangeEntry(2048),
+                    4096: MockRangeEntry(4096),
+                }
+                self.piecewise_compile_index = 0
+                self.total_piecewise_compiles = 1
+                self.vllm_backend = MagicMock()
+                self.compilation_config = MagicMock()
+                self.returns_tuple = False
+
+            def _log_compile_start(self, r):
+                pass
+
+        compiled_order = []
+
+        def mock_compile(graph, args, inductor_config, compilation_config,
+                         compile_range, **kwargs):
+            compiled_order.append(compile_range.start)
+            return MagicMock()
+
+        with patch("vllm_torchtpu.envs.TPU_PARALLEL_PRECOMPILE", True):
+            _patch_vllm_compile_all_ranges()
+
+            from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+            # Test Rank 0 partition
+            backend_rank0 = MockPiecewiseBackend()
+            backend_rank0.vllm_backend.compiler_manager.compile = mock_compile
+            compiled_order.clear()
+
+            with patch.dict(os.environ, {
+                    "LOCAL_RANK": "0",
+                    "WORLD_SIZE": "4"
+            }):
+                PiecewiseBackend.compile_all_ranges(backend_rank0)
+                # First compiled should be 512 (index 0)
+                assert compiled_order[0] == 512
+                assert len(compiled_order) == 4
+                assert all(e.compiled
+                           for e in backend_rank0.range_entries.values())
+
+            # Test Rank 1 partition
+            backend_rank1 = MockPiecewiseBackend()
+            backend_rank1.vllm_backend.compiler_manager.compile = mock_compile
+            compiled_order.clear()
+
+            with patch.dict(os.environ, {
+                    "LOCAL_RANK": "1",
+                    "WORLD_SIZE": "4"
+            }):
+                PiecewiseBackend.compile_all_ranges(backend_rank1)
+                # First compiled should be 1024 (index 1)
+                assert compiled_order[0] == 1024
+                assert len(compiled_order) == 4
+                assert all(e.compiled
+                           for e in backend_rank1.range_entries.values())
