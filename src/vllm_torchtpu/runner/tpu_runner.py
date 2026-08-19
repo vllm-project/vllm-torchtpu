@@ -1660,6 +1660,8 @@ class TPUModelRunner(GPUModelRunner):
         filling the connector reserve back up with KV blocks and defeating
         the worker-side subtraction.
         """
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            return kv_cache_memory_bytes
         budget = utils.compute_hbm_budget(
             [self.device], self.cache_config.gpu_memory_utilization)
         return budget.available - utils.estimate_kv_connector_hbm_reserve(
