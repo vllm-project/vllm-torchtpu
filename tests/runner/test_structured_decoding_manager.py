@@ -17,7 +17,8 @@ def make_manager(vocab_size: int = VOCAB_SIZE,
                  max_num_reqs: int = 8,
                  req_id_to_index: dict[str, int] | None = None,
                  num_spec_tokens: int | None = None,
-                 num_tokens_paddings: list[int] | None = None):
+                 num_tokens_paddings: list[int] | None = None,
+                 pcp_mtp_k1: bool = False):
     speculative_config = (SimpleNamespace(
         num_speculative_tokens=num_spec_tokens)
                           if num_spec_tokens is not None else None)
@@ -27,6 +28,7 @@ def make_manager(vocab_size: int = VOCAB_SIZE,
         input_batch=SimpleNamespace(req_id_to_index=req_id_to_index or {}),
         speculative_config=speculative_config,
         num_tokens_paddings=num_tokens_paddings or [16, 32, 64],
+        _pcp_mtp_k1_enabled=pcp_mtp_k1,
     )
     return StructuredDecodingManager(runner)
 
@@ -190,6 +192,12 @@ class TestPrepareSpecStructuredDecodingInput:
         # 8 reqs * (1 + 3) = 32 rows -> the 32 bucket covers it exactly.
         assert spec_manager.target_grammar_bitmask_cpu.shape == (32, 2)
         assert spec_manager.require_structured_out_target_cpu.shape == (32, 1)
+
+    def test_prefill_only_pcp_mtp_k1_skips_target_buffers(self):
+        # Prefill-only PCP MTP K1 never verifies drafts.
+        manager = make_manager(num_spec_tokens=1, pcp_mtp_k1=True)
+        assert not hasattr(manager, "target_grammar_bitmask_cpu")
+        assert not hasattr(manager, "require_structured_out_target_cpu")
 
     def test_variable_draft_counts_single_chunk(self):
         # req0 structured, 2 drafts; req1 unstructured, 1 draft;

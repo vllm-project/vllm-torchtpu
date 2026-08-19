@@ -4491,7 +4491,9 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
-            if self.speculative_config is None:
+            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
+            # we skip it here as well.
+            if self.speculative_config is None or self._pcp_mtp_k1_enabled:
                 return
             # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[
