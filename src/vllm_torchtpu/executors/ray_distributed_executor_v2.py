@@ -618,6 +618,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 self.collective_rpc("get_num_gpu_blocks_override"))
             if agreed is not None:
                 self.vllm_config.cache_config.num_gpu_blocks_override = agreed
+                self.collective_rpc("set_num_gpu_blocks_override",
+                                    args=(agreed, ))
+                # Re-query specs so all workers' KVCacheSpecs are regenerated
+                # with the agreed num_gpu_blocks_override in sync.
+                specs = super().get_kv_cache_specs()
 
         return specs
 

@@ -666,6 +666,9 @@ class TPUWorker(WorkerBase):
     def get_num_gpu_blocks_override(self) -> int | None:
         return self.vllm_config.cache_config.num_gpu_blocks_override
 
+    def set_num_gpu_blocks_override(self, agreed: int | None) -> None:
+        self.vllm_config.cache_config.num_gpu_blocks_override = agreed
+
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.model_runner.get_kv_prewarm_shapes()
 
