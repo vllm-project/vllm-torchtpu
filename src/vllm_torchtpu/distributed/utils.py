@@ -249,12 +249,15 @@ def get_raiden_inline_load() -> bool:
 
 _RAIDEN_TELEMETRY_MODULE = None
 _RAIDEN_TELEMETRY_CONFIGURED = False
+_RAIDEN_TELEMETRY_IMPORT_ATTEMPTED = False
 
 
 def get_raiden_telemetry_module():
     """Gets and caches the TPU Raiden C++ extension module."""
-    global _RAIDEN_TELEMETRY_MODULE
-    if _RAIDEN_TELEMETRY_MODULE is None:
+    global _RAIDEN_TELEMETRY_MODULE, _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED
+    if not _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED:
+        # Try to load raiden module only once and ignore other attempts
+        _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED = True
         try:
             from tpu_sync.api.torch import kv_cache_manager as kcm
             _RAIDEN_TELEMETRY_MODULE = kcm._torch_impl()

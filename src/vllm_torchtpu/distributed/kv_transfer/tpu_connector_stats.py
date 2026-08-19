@@ -359,8 +359,9 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
 
         # Dynamic metric observations
         for name, (mtype, per_engine_obj) in self.dynamic_metrics.items():
-            if name in transfer_stats_data and transfer_stats_data[name]:
-                for val in transfer_stats_data[name]:
+            values = transfer_stats_data.get(name)
+            if values:
+                for val in values:
                     if mtype == "histogram":
                         per_engine_obj[engine_idx].observe(val)
                     elif mtype == "counter":

@@ -32,6 +32,8 @@ class TestRaidenTelemetryUtils:
 
     def test_get_raiden_telemetry_module_cached(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_MODULE", None)
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_IMPORT_ATTEMPTED",
+                            False)
         mock_impl = MagicMock()
         mock_kcm = MagicMock()
         mock_kcm._torch_impl.return_value = mock_impl
