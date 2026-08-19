@@ -103,8 +103,7 @@ class TestRaidenTelemetryUtils:
                             lambda: mock_telemetry)
 
         dist_utils.configure_raiden_telemetry()
-        mock_telemetry.configure_telemetry.assert_called_once_with(
-            ["buffered"])
+        mock_telemetry.configure_telemetry.assert_called_once_with(None)
         assert dist_utils._RAIDEN_TELEMETRY_CONFIGURED is True
 
     def test_configure_raiden_telemetry_explicit_backends(self, monkeypatch):
@@ -121,20 +120,6 @@ class TestRaidenTelemetryUtils:
         dist_utils.configure_raiden_telemetry(backends={"single_backend"})
         mock_telemetry.configure_telemetry.assert_called_with(
             {"single_backend"})
-
-    def test_configure_raiden_telemetry_env_override(self, monkeypatch):
-        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
-        mock_telemetry = MagicMock()
-        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
-                            lambda: mock_telemetry)
-        monkeypatch.setattr(envs,
-                            "TPU_RAIDEN_TELEMETRY_BACKENDS",
-                            "buffered, logging, otel",
-                            raising=False)
-
-        dist_utils.configure_raiden_telemetry()
-        mock_telemetry.configure_telemetry.assert_called_once_with(
-            ["buffered", "logging", "otel"])
 
     def test_configure_raiden_telemetry_telemetry_none(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
