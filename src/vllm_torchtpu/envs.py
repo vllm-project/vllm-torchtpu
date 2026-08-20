@@ -410,10 +410,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
-    # Enable block-major KV cache layout for Raiden offloading. Bundles all layer
-    # fragments into a single contiguous array in HBM, collapsing per-block
-    # transfers into a single hardware DMA instead of one per fragment.
-    # See offload/block_major_layout.py for layout contract details.
+    # Enables the block-major KV cache layout for Raiden offloading. Bundles all
+    # attention layer fragments into a single contiguous array in HBM, collapsing
+    # per-block transfers from F independent DMAs into a single hardware DMA.
+    # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
 }

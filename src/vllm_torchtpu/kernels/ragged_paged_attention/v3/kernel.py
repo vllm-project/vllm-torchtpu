@@ -1963,17 +1963,16 @@ def ragged_paged_attention_bundled(
     distribution: jax.Array,
     **kwargs,
 ):
-    """Executes ragged paged attention against a bundled block-major KV cache in-place.
+    """Executes ragged paged attention directly against a bundled block-major KV cache in place.
 
-    Flattens the multi-layer bundle (`[num_pages, num_layers, page_size, ...]`) to
+    Flattens the multi-layer bundle (shape `[num_pages, num_layers, page_size, ...]`) into
     a flat page view (`[num_pages * num_layers, page_size, ...]`) via zero-copy
     metadata reshape. Logical page indices are remapped to target the specific
     layer's contiguous slots:
 
-      Dense: flat_page = page * num_layers + layer_idx
-      Hybrid: flat_page = (page // factor) * (num_layers * factor) + layer_idx * factor + (page % factor)
+      flat_page = page * num_layers + layer_idx
 
-    Because the bundle is laid out block-major (pages/blocks outermost, layers next),
+    Because the bundle is laid out block-major (blocks outermost, layers second),
     element `bundle[page, layer]` maps directly to flat row `page * num_layers + layer`.
     The inner Pallas kernel writes exclusively into the target layer's slots.
 

@@ -291,8 +291,7 @@ def _pallas_rpa_kernel_default_bundled(
     first argument and a dynamic int32 scalar layer_idx as the second argument.
     """
     if sinks is not None:
-        # Attention sinks only exist on hd64 models, which have no bundled
-        # kernel (the runner gates head_size=64 fail-closed).
+        # Attention sinks are unsupported in the bundled block-major kernel path.
         raise NotImplementedError(
             "VLLM_TPU_BLOCK_MAJOR_KV=1: attention sinks are not supported "
             "by the bundled RPA path")
@@ -591,19 +590,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
 
-    # Bundled (block-major) RPA kernel entry; same signature as the
-    # default but takes the whole KV cache bundle plus a dynamic
-    # layer_idx scalar. Registered separately so it doesn't collide with
-    # the layer-major op in the shared registry.
+    # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
+    # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
+    # collisions with layer-major ops in the shared registry.
     _kernel_entry_bundled: ClassVar = staticmethod(
         _pallas_rpa_kernel_default_bundled)
     _kernel_op_prefix_bundled: ClassVar[str] = "pallas::rpa_kernel_bundled"
 
-    # Class-level registry of bundled kernel impls, mirroring the
-    # layer-major `_kernel_registry` sharing pattern: all attention
-    # layers with the same config share one custom op, so the FX graph
-    # contains one `OpOverload` node repeated N times instead of N
-    # distinct ops (one MLIR module / JAX trace each).
+    # Class-level registry of bundled kernel instances. Layers sharing identical
+    # configurations reuse a single custom op, emitting one shared OpOverload node
+    # across the FX graph rather than duplicating JAX tracing and MLIR compilation.
     _bundled_kernel_registry: ClassVar[dict] = {}
 
     def __init__(
@@ -656,12 +652,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # model. Forward can then reuse the custom op without resolving a PCP
         # mesh from inside Dynamo's fullgraph capture.
         self._kernel_config_cache: dict = {}
-        # Block-major bundled kernel. Built by `setup_bundled` (called by
-        # the runner right after the bundle is allocated, before
-        # torch.compile traces capture_model) via `pallas.jax_op`, the
-        # same donation mechanism as the layer-major path. During
-        # profile_run `ctx.kv_cache_bundle` is None so forward never
-        # touches this.
+        # Block-major bundled kernel and pre-allocated layer index. Initialized by
+        # setup_bundled() after bundle allocation and prior to torch.compile tracing.
+        # During profile_run, ctx.kv_cache_bundle is None and forward falls back to
+        # standard execution.
         self.rpa_kernel_bundled = None
         self._bundle_layer_idx_tensor: torch.Tensor | None = None
 
@@ -848,11 +842,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         `layer_idx` scalar. Layers sharing identical kernel configurations reuse
         the cached op via `_bundled_kernel_registry`.
         """
-        # Fail closed when the layer-major kernel is overridden (subclass
-        # ClassVar like batched RPA, or a per-instance rebind like the
-        # tp=1 draft's local kernel) without a bundled counterpart,
-        # preventing silent fallback to default kernels. Read through
-        # `self` so instance-attribute overrides are seen too.
+        # Fail closed when the layer-major kernel is overridden (e.g. subclass
+        # ClassVar like batched RPA, or per-instance rebinds like single-device
+        # local kernels) without a corresponding bundled counterpart, preventing
+        # silent fallback to default kernels. Read via `self` to detect instance overrides.
         if (self._kernel_entry is not PallasAttentionBackendImpl._kernel_entry
                 and self._kernel_entry_bundled
                 is PallasAttentionBackendImpl._kernel_entry_bundled):

@@ -240,9 +240,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
-        # Opt in to vLLM cross-layer (uniform) KV cache allocation when block-major layout
-        # is enabled. Required for `KVConnectorModelRunnerMixin.use_uniform_kv_cache()` to
-        # permit bundled tensor materialization in the TPU model runner.
+        # Opt in to uniform cross-layer KV cache allocation when block-major layout is enabled.
+        # Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()` preconditions to enable
+        # bundled tensor allocation in the TPU model runner.
         from vllm_torchtpu import envs as tpu_envs
         return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
 

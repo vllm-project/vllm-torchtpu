@@ -431,8 +431,7 @@ def attention_bundled(
     """Dispatches ragged paged attention over the bundled block-major KV cache across the TPU mesh.
 
     Args:
-        kv_cache_bundle: Full-model KV cache bundle (`[num_pages, num_layers, ...]` for
-            dense models or `[device_blocks, F, factor, ...]` for hybrid models).
+        kv_cache_bundle: Full-model KV cache bundle of shape `[num_pages, num_layers, ...]`.
         layer_idx: Dynamic scalar integer tensor specifying the target layer's bundle index.
         q: Query tensor of shape `[num_tokens, num_heads, head_dim]`.
         k: Key tensor of shape `[num_tokens, num_kv_heads, head_dim]`.
@@ -449,7 +448,8 @@ def attention_bundled(
         use_causal_mask: Whether to apply lower-triangular causal masking.
 
     Returns:
-        A tuple of (output, new_bundle), where new_bundle aliases the input bundle in-place.
+        A tuple of (new_bundle, output), where new_bundle aliases the input bundle in-place
+        and output is the computed attention result tensor.
     """
     from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import \
         ragged_paged_attention_bundled
@@ -482,10 +482,9 @@ def attention_bundled(
         return new_bundle, output
 
     # Shard across KV heads along the TPU "model" axis (Tensor Parallelism):
-    # - Dense (6D): [num_pages, num_layers, page_size, KV_HEADS, p, head_dim] -> shard dim 3.
-    # - Hybrid (7D): [device_blocks, F, factor, page_size, KV_HEADS, p, head_dim] -> shard dim 4.
-    # The layer dimension (F) and factor remain unsharded (None).
-    # Query/Key/Value shard on the head dimension (dim 1); metadata is replicated; layer_idx is scalar.
+    # - Dense bundle (6D): [num_pages, num_layers, page_size, num_kv_heads, p, head_dim] -> shard dim 3.
+    # The layer dimension (dim 1) remains unsharded.
+    # Query, Key, and Value shard on the head dimension (dim 1); metadata is replicated; layer_idx is a scalar.
     qkv_spec = P(None, "model", None)
     bundle_spec = P(None, None, None, "model", None, None)
     data_spec = P(None)

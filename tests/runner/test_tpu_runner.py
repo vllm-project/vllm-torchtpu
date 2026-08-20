@@ -1288,16 +1288,9 @@ class TestTPURunner:
         assert self.runner.mrope_positions.np.dtype == np.int32
 
     def test_initialize_kv_cache_block_major(self):
-        """When VLLM_TPU_BLOCK_MAJOR_KV=1 and all layers share an attention
-        spec, a single bundled tensor of shape
-        ``[num_blocks, num_layers, *per_layer_shape]`` backs the per-layer
-        views passed to bind_kv_cache. Each per-layer view shares storage
-        with the bundle (mutation through one shows up in the bundle)."""
+        """Verifies that block-major initialization allocates a single shared bundle backing all layer views."""
         num_blocks = 4
-        # Byte-consistent with the page size below: 16*4*1*128 bf16 elements
-        # = 16384 B (allocate_uniform_kv_caches views the byte buffer as this
-        # shape, so unlike the old hand-rolled allocation it must tile
-        # exactly).
+        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact uniform tiling.
         per_layer_shape = (16, 4, 1, 128)
         # FullAttentionSpec.real_page_size_bytes for (16, 2, 128, bf16) is
         # block_size * (k+v) * head_size * itemsize = 16 * 4 * 128 * 2 = 16384.

@@ -62,14 +62,17 @@ BLOCK_MAJOR_LAYOUT_VERSION = 1
 
 @dataclass(frozen=True)
 class BlockMajorContract:
-    """Immutable specification of the bundled KV layout agreed upon across ranks."""
-    # Number of physical fragments folded into the bundle's layer dimension (dim 1).
+    """Immutable specification of the bundled KV layout agreed upon across ranks.
+
+    Attributes:
+        fragment_count: Number of physical fragments folded into the bundle's layer dimension (dim 1).
+        fragment_row_bytes: Byte size of a single fragment's row for one kernel block.
+        bundle_row_bytes: Total contiguous byte length of one bundled kernel block across all fragments (= F * fragment_row_bytes).
+        logical_fingerprint: Deterministic SHA-256 digest of layout parameters; must match across all serving peers.
+    """
     fragment_count: int
-    # Byte size of a single fragment's row for one kernel block.
     fragment_row_bytes: int
-    # Total contiguous byte length of one bundled kernel block across all fragments (= F * fragment_row_bytes).
     bundle_row_bytes: int
-    # Deterministic SHA-256 digest of layout parameters; must match across all serving peers.
     logical_fingerprint: str
 
 
@@ -108,27 +111,21 @@ def resolve_block_major_contract(
     from vllm_torchtpu.offload.raiden_store import resolve_kernel_geometry
 
     kv_cache_tensors = kv_cache_config.kv_cache_tensors
-    if not kv_cache_tensors:
-        raise ValueError(
-            "VLLM_TPU_BLOCK_MAJOR_KV=1: resolved KVCacheConfig has no "
-            "kv_cache_tensors to bundle")
-
     (kernel_block_size, per_block_shape, kv_dtype,
      device_block_size) = resolve_kernel_geometry(vllm_config, kv_cache_config)
     assert device_block_size % kernel_block_size == 0
     factor = device_block_size // kernel_block_size
     if factor != 1:
-        # The bundled RPA wrappers and the worker's [kernel_blocks, F, *R]
-        # view only implement the factor==1 layout; a factor>1 bundle would
-        # pass every byte-count assert while scrambling layer vs sub-block
-        # order on DMA.
+        # The bundled RPA kernel and worker view require factor == 1 (device_block_size == kernel_block_size).
+        # A factor > 1 bundle would pass flat byte-size validations while scrambling layer vs. sub-block
+        # dimensional ordering during DMA transfers.
         raise ValueError(
             "VLLM_TPU_BLOCK_MAJOR_KV=1: device_block_size "
             f"{device_block_size} != kernel_block_size {kernel_block_size} "
             f"(factor {factor}); the block-major bundle requires them to "
             "match")
 
-    # Compute physical row byte size for a single fragment kernel block.
+    # Compute the physical byte size of a single fragment row for one kernel block.
     import numpy as np
     import torch
     fragment_row_bytes = (int(np.prod(per_block_shape)) *

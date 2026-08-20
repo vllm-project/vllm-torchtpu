@@ -973,9 +973,10 @@ def derive_offload_namespace(
     - Distributed topology: world size (TP/PP) and context parallelism geometry
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
+    - Layout contract: block-major layout version, row bytes, and logical fingerprint.
 
     Returns:
-        A 16-byte SHA-256 digest unique to this engine configuration.
+        A 16-byte SHA-256 digest unique to this engine and layout configuration.
     """
     model_config = vllm_config.model_config
     material_fields = (model_config.model, model_config.revision,

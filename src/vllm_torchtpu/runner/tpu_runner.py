@@ -579,12 +579,11 @@ class TPUModelRunner(GPUModelRunner):
         self._last_sequence_layout_plan = None
 
         # Block-major KV cache (opt-in via VLLM_TPU_BLOCK_MAJOR_KV). When
-        # not None, `_initialize_kv_cache_states` allocates a single
-        # bundled tensor of shape
+        # enabled, `_initialize_kv_cache_states` allocates a single bundled tensor
         # `[num_blocks, num_layers, page_size, K2/p, p, head_dim]` and
-        # `_kv_cache_bundle_layer_index` maps each attention layer name
-        # to its index along dim 1 of the bundle. The attention forward
-        # path routes through the bundled RPA kernel when these are set.
+        # `_kv_cache_bundle_layer_index` maps each attention layer name to its index
+        # along dim 1 of the bundle. The attention forward path routes through
+        # the bundled RPA kernel when these are set.
         self._kv_cache_bundle: torch.Tensor | None = None
         self._kv_cache_bundle_layer_index: dict[str, int] = {}
 
@@ -5991,10 +5990,8 @@ class TPUModelRunner(GPUModelRunner):
             for gid in range(len(self.kv_cache_config.kv_cache_groups))
         }
         if self._unified_kv_layout:
-            # This return skips the block-major gate block below, so fail
-            # closed here: proceeding layer-major while the offload spec
-            # derives a block-major contract from the env var would
-            # register a bundle layout over unified-pool memory.
+            # Fail closed: unified pool allocation bypasses the block-major gate below,
+            # which would incorrectly register a block-major contract over unified-pool memory.
             if envs.VLLM_TPU_BLOCK_MAJOR_KV:
                 raise NotImplementedError(
                     "VLLM_TPU_BLOCK_MAJOR_KV=1: the unified KV block pool "
@@ -6087,21 +6084,19 @@ class TPUModelRunner(GPUModelRunner):
             is_cache_for_ds_v4(module) for module in self.vllm_config.
             compilation_config.static_forward_context.values())
 
-        # ---- Block-major KV (VLLM_TPU_BLOCK_MAJOR_KV) ----
-        # Bundle all attention layers into one
-        # [num_blocks, num_layers, page_size, K2/p, p, H] tensor and bind
-        # per-layer (strided) views into vLLM's per-layer slots. num_blocks
-        # is OUTERMOST so each block's all-layer payload is contiguous in
-        # HBM: the attention forward routes through the bundled RPA kernel
-        # via the wrapper context, and TPURaidenOffloadingConnector's
-        # storage dedup sees ONE canonical storage, which the offload
-        # worker registers with Raiden as a single [kernel_blocks, F, *R]
-        # array — one DMA per transfer instead of F.
+        # ---- Block-major KV Cache Initialization (VLLM_TPU_BLOCK_MAJOR_KV) ----
+        # Bundles all attention layer fragments into a single contiguous array in HBM:
+        #   [num_blocks, num_layers, page_size, K2/p, p, head_dim]
         #
-        # There is deliberately NO silent layer-major fallback: the offload
-        # namespace is versioned by the layout contract, so a half-applied
-        # layout would poison the shared cache. Unsupported topologies
-        # raise instead.
+        # Because num_blocks is the outermost dimension, all layer fragments for a logical
+        # block are contiguous in memory. This collapses save, load, and transfer operations
+        # from F independent DMAs into a single hardware DMA.
+        #
+        # During forward execution, attention layers route through the bundled RPA kernel
+        # via VllmModelWrapperContext. Bound per-layer strided views share storage with
+        # the bundle, enabling deduplication during connector registration.
+        #
+        # Fail closed on unsupported model topologies to prevent cross-layout cache corruption.
         self._kv_cache_bundle = None
         self._kv_cache_bundle_layer_index = {}
         bundle_view_by_name: dict[str, torch.Tensor] = {}
@@ -6111,27 +6106,19 @@ class TPUModelRunner(GPUModelRunner):
             if self.use_spmd:
                 unsupported = "SPMD"
             elif kv_cache_config.has_mamba_layers:
-                unsupported = ("hybrid attention+mamba models (block-major "
-                               "Phase 2)")
+                unsupported = "hybrid attention+mamba models"
             elif _is_ds_v4:
                 unsupported = "the DSv4 packed KV layout"
             elif self.parallel_config.prefill_context_parallel_size > 1:
                 unsupported = "prefill context parallelism"
             elif self.parallel_config.pipeline_parallel_size > 1:
-                # Never validated under PP; per-stage bundles would also
-                # need per-stage offload namespaces.
+                # Per-stage bundles require per-stage offload namespace isolation.
                 unsupported = "pipeline parallelism"
             elif self.speculative_config is not None:
-                # Draft layers share the target's static_forward_context
-                # and would be indexed into the bundle, but the spec-decode
-                # propose paths run outside the bundle-carrying wrapper
-                # context and would fall back to layer-major access on
-                # strided bundle views.
+                # Speculative decode propose paths execute outside the bundle wrapper context.
                 unsupported = "speculative decoding"
             elif self.model_config.get_head_size() == 64:
-                # No bundled hd64 kernel: the wrapper halted the TPU core
-                # on mixed prefill+decode shapes and was dropped — no
-                # target model needs head_dim 64.
+                # Bundled RPA kernel is not supported for head_size=64 architectures.
                 unsupported = "head_size=64 models (no bundled hd64 kernel)"
             if unsupported is not None:
                 raise NotImplementedError(
@@ -6156,11 +6143,10 @@ class TPUModelRunner(GPUModelRunner):
                         "VLLM_TPU_BLOCK_MAJOR_KV=1: kv_cache_tensor "
                         f"shared by non-attention layers {shared_by}")
 
-            # Allocation goes through vLLM's uniform-KV (cross-layer)
-            # machinery: with the Pallas backend's stride order
-            # (num_blocks outermost, num_layers second) the returned
-            # cross-layer tensor IS the block-major bundle.
-            # Validate uniform cross-layer KV allocation requirements (single uniform attention group,
+            # Allocate via vLLM's uniform cross-layer KV machinery. Given the Pallas backend's
+            # stride order (num_blocks outermost, num_layers second), the returned cross-layer
+            # tensor is identical to the canonical block-major bundle.
+            # Validate uniform cross-layer KV requirements (single uniform attention group,
             # cross-layer connector preference, and no per-token-head KV quantization).
             if not KVConnectorModelRunnerMixin.use_uniform_kv_cache(
                     self.attn_groups):
@@ -6171,11 +6157,10 @@ class TPUModelRunner(GPUModelRunner):
                     "attention group, a connector preferring cross-layer "
                     "blocks, and no per-token-head KV quantization)")
             attn_group = self.attn_groups[0][0]
-            # TPU runner initializes AttentionGroups without backends; bind PallasAttentionBackend
-            # explicitly for uniform KV cache allocation.
+            # Bind PallasAttentionBackend explicitly for uniform KV cache allocation.
             attn_group.backend = PallasAttentionBackend
             sample_spec = next(iter(attn_specs))
-            # Pass resolved KV datatype (e.g. torch.bfloat16) to avoid packing-free placeholder shapes from "auto".
+            # Pass resolved KV datatype (e.g. torch.bfloat16) to ensure exact memory tiling.
             uniform_views, bundle, _ = (
                 KVConnectorModelRunnerMixin.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -6185,18 +6170,18 @@ class TPUModelRunner(GPUModelRunner):
                     kernel_block_sizes=[sample_spec.block_size],
                 ))
             # Bundle shape: (num_blocks, num_layers, block_size, K2/p, p, H).
-            # The kernel takes the top-level bundle directly to ensure valid JAX buffer donation.
-            # Per-layer strided views are bound to vLLM exclusively for shape/dtype probing and storage deduplication.
+            # The bundled RPA kernel executes directly on the top-level bundle to preserve JAX buffer donation.
+            # Bound per-layer strided views are retained for vLLM metadata probing and storage deduplication.
             logger.info(
                 "Block-major KV cache: allocated bundle of shape %s "
                 "dtype=%s via allocate_uniform_kv_caches; attention "
                 "routes through the bundled RPA kernel with dynamic "
                 "layer_idx.", tuple(bundle.shape), bundle.dtype)
             self._kv_cache_bundle = bundle
-            # Synchronize device allocation immediately. Lazy HBM allocation would cause Raiden's KVCacheManager
-            # to deadlock on AwaitBuffer() during connector registration prior to forward execution.
+            # Synchronize HBM allocation immediately to prevent deadlocks in Raiden's KVCacheManager
+            # during connector registration prior to forward execution.
             synchronize_tensors(self._kv_cache_bundle, wait=True)
-            # Map layer names to bundle layer dimension index (kv_cache_tensors order, matching the contract).
+            # Map layer names to bundle layer dimension indices matching the layout contract.
             for idx, kv_cache_tensor in enumerate(
                     kv_cache_config.kv_cache_tensors):
                 for name in kv_cache_tensor.shared_by:
@@ -6347,14 +6332,12 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_caches,
         )
 
-        # Initialize and cache bundled kernels across all attention layers prior to torch.compile tracing.
+        # Pre-build and cache bundled RPA kernels across all attention layers before torch.compile tracing.
         if self._kv_cache_bundle is not None:
             from vllm_torchtpu.layers.vllm.attention import \
                 PallasAttentionBackendImpl
             layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-            # Only enter the wrapper context if there are actually layers
-            # to set up (mock-runner tests have an empty static_forward_context
-            # and don't expose `self.mesh`).
+            # Only enter wrapper context when eligible attention layers are present.
             eligible = [
                 (name, attn_layer) for name, attn_layer in layers.items()
                 if name in self._kv_cache_bundle_layer_index
@@ -6380,6 +6363,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
+            # Register KV caches with connector. TPURaidenOffloadingConnector deduplicates strided
+            # views by underlying storage, registering only the single canonical bundle.
             kv_connector.register_kv_caches(kv_caches)
             # TPUConnector reads runner.kv_caches lazily and doesn't need
             # set_host_xfer_buffer_ops; only call it on connectors that

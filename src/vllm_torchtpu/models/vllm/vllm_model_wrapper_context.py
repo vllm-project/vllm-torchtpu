@@ -28,9 +28,9 @@ class VllmModelWrapperContext:
     kv_caches: Optional[List[torch.Tensor]] = None
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None
     vllm_config: Optional[object] = None
-    # Full-model block-major KV cache bundle shared across layers. When mounted,
-    # attention layers route forward execution through the bundled RPA kernel with
-    # in-place bundle updates, bypassing the per-layer tensor views bound by vLLM.
+    # Full-model block-major KV cache bundle shared across layers. When set,
+    # attention forward execution routes through the bundled RPA custom op with
+    # in-place buffer donation, bypassing the per-layer tensor views bound by vLLM.
     kv_cache_bundle: Optional[torch.Tensor] = None
 
 

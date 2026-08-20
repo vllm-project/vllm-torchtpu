@@ -313,9 +313,8 @@ def test_bundled_interface_forwards_scale_softcap_causal():
         np.asarray(new_bundle[:, layer, ...]),
         err_msg="non-default-param kv update differs from layer-major")
 
-    # And the params must actually change the result — this half fails
-    # if a wrapper regresses to ignoring them (both paths agreeing on
-    # the DEFAULT answer would still pass the parity check above).
+    # Parameter sensitivity check: verify that non-default attention parameters alter
+    # the computed output rather than silently falling back to default values.
     bundle_default = jnp.asarray(init_np, dtype=c["kv_dtype"]).swapaxes(0, 1)
     w_d = _to_jax_workload(wl_np, c["kv_dtype"])
     _, out_default = attention_bundled(
@@ -329,4 +328,4 @@ def test_bundled_interface_forwards_scale_softcap_causal():
     )
     assert not np.array_equal(np.asarray(out_default), np.asarray(out_b)), (
         "non-default sm_scale/soft_cap produced the default-param output — "
-        "the bundled interface is dropping attention parameters again")
+        "the bundled interface dropped attention parameters")
