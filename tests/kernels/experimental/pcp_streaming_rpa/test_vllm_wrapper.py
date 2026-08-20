@@ -159,6 +159,19 @@ def test_packed_kv_layout_validation_rejects_wrong_physical_group_count():
                                               v_scale=0.5)
 
 
+def test_seq_along_lane_layout_validation_accepts_fp8_multi_head():
+    q_local = jnp.zeros((32, 2, 2, 128), dtype=jnp.bfloat16)
+    kv_cache_local = jnp.zeros((2, 4, 32, 4, 128), dtype=jnp.float8_e4m3fn)
+
+    assert pcp_kernel._validate_packed_kv_layout(
+        q_local,
+        kv_cache_local,
+        kv_layout=pcp_wrapper.KVLayout.SEQ_ALONG_LANE,
+        k_scale=0.5,
+        v_scale=0.5,
+    ) == (2, 4, 4)
+
+
 def test_prepare_packed_kv_accepts_equivalent_tail_layout(monkeypatch):
     packed_kv = jnp.arange(3 * 8 * 2 * 8,
                            dtype=jnp.float32).reshape(3, 8, 2, 8)
@@ -214,6 +227,23 @@ def test_captured_kv_writeback_preserves_fully_fragmented_capacity():
                                   np.ones(16, dtype=np.int32))
 
 
+def test_seq_along_lane_writeback_segments_stop_at_page_boundaries():
+    compact_slots = jnp.arange(256, dtype=jnp.int32)
+    descriptors, num_segments = \
+        pcp_wrapper._build_writeback_segment_descriptors(
+            compact_slots,
+            jnp.asarray(256),
+            kv_layout=pcp_wrapper.KVLayout.SEQ_ALONG_LANE,
+            page_size=128,
+        )
+
+    assert int(num_segments) == 2
+    np.testing.assert_array_equal(
+        np.asarray(descriptors[:, :2]),
+        np.asarray([[0, 128], [0, 128], [128, 128]], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(descriptors[:, 2:]), 0)
+
+
 def test_metadata_reconstruction_preserves_query_row_coordinates():
     kv_lens = jnp.asarray([8], dtype=jnp.int32)
     cu_q_lens = jnp.asarray([0, 5], dtype=jnp.int32)
@@ -248,14 +278,14 @@ def test_metadata_reconstruction_preserves_query_row_coordinates():
 
 
 def test_query_row_mapping_separates_owner_and_request_absolute_starts():
-    common_kwargs = dict(
-        q_lens=jnp.asarray([3, 4], dtype=jnp.int32),
-        token_owner_starts=jnp.asarray([0, 3], dtype=jnp.int32),
-        request_absolute_starts=jnp.asarray([5, 100], dtype=jnp.int32),
-        local_padded_tokens=4,
-        pcp_size=2,
-        interleave_size=2,
-    )
+    common_kwargs = {
+        "q_lens": jnp.asarray([3, 4], dtype=jnp.int32),
+        "token_owner_starts": jnp.asarray([0, 3], dtype=jnp.int32),
+        "request_absolute_starts": jnp.asarray([5, 100], dtype=jnp.int32),
+        "local_padded_tokens": 4,
+        "pcp_size": 2,
+        "interleave_size": 2,
+    }
 
     rank_0 = pcp_wrapper._compute_pcp_local_query_row_mapping(pcp_rank=0,
                                                               **common_kwargs)
@@ -521,7 +551,7 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
         captured["num_segments"] = num_segments
         return jnp.full_like(q_streaming, 5), kv_cache
 
-    def fake_prepare_current(k_local, _v_local, cache):
+    def fake_prepare_current(k_local, _v_local, cache, **_kwargs):
         return jnp.zeros((k_local.shape[0], *cache.shape[2:]),
                          dtype=cache.dtype)
 
@@ -628,7 +658,7 @@ def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
         captured["writeback_called"] = True
         return jnp.full_like(q_streaming, 5), kv_cache
 
-    def fake_prepare_current(k_local, _v_local, cache):
+    def fake_prepare_current(k_local, _v_local, cache, **_kwargs):
         return jnp.zeros((k_local.shape[0], *cache.shape[2:]),
                          dtype=cache.dtype)
 
