@@ -40,12 +40,20 @@ def compute_batched_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
 
+    p_id_to_r_base = all_valid_seqs
+    p_id_to_r_size = jnp.where(is_valid_seqs, 1, 0)
+    r_end = p_id_to_r_base + p_id_to_r_size
+    p_id_to_u32_r_base = p_id_to_r_base // 2
+    p_id_to_u32_r_size = ((r_end + 1) // 2) - p_id_to_u32_r_base
+
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
         num_tiles=pl.cdiv(end_seq, cfg.tile_size),
         p_id_to_s_idx=all_valid_seqs,
-        p_id_to_r_base=all_valid_seqs,
-        p_id_to_r_size=jnp.where(is_valid_seqs, 1, 0),
+        p_id_to_r_base=p_id_to_r_base,
+        p_id_to_r_size=p_id_to_r_size,
+        p_id_to_u32_r_base=p_id_to_u32_r_base,
+        p_id_to_u32_r_size=p_id_to_u32_r_size,
         p_id_is_first_tile=is_valid_seqs,
         p_id_is_last_tile=is_valid_seqs,
         s_idx_has_initial_state=has_initial_state,
@@ -110,6 +118,9 @@ def compute_per_seq_metadata(
         query_start_loc[p_id_to_s_idx + 1] - p_id_to_r_base,
         cfg.tile_size,
     )
+    r_end = p_id_to_r_base + p_id_to_r_size
+    p_id_to_u32_r_base = p_id_to_r_base // 2
+    p_id_to_u32_r_size = ((r_end + 1) // 2) - p_id_to_u32_r_base
 
     # Calculate predicate used for state DMA. State is read if program id (p_id)
     # is the first tile of a sequence and the sequence had been computed before
@@ -130,6 +141,8 @@ def compute_per_seq_metadata(
         p_id_to_s_idx=p_id_to_s_idx,
         p_id_to_r_base=p_id_to_r_base,
         p_id_to_r_size=p_id_to_r_size,
+        p_id_to_u32_r_base=p_id_to_u32_r_base,
+        p_id_to_u32_r_size=p_id_to_u32_r_size,
         p_id_is_first_tile=p_id_is_first_tile,
         p_id_is_last_tile=p_id_is_last_tile,
         s_idx_has_initial_state=has_initial_state,

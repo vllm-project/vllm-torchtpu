@@ -29,18 +29,19 @@ from vllm_torchtpu.kernels.experimental.gdn_dynamic import (compute_conv1d,
 
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
+    qkv_slot_ref: jax.Ref,  # [seq, num_u32_rows, 1, dim_size]
     b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     conv_state_slot_ref: jax.Ref,  # [seq, prev_kernel_size, 1, dim_size]
     recurrent_slot_ref: jax.Ref,  # [seq, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
+    out_slot_ref: jax.Ref,  # [seq, chunk, num_v_heads, v_head]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    qkv_out_scratch_ref: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
 ) -> None:
@@ -66,6 +67,8 @@ def inner_kernel(
       convolution carry.
     carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
       recurrent state carry.
+    qkv_out_scratch_ref: Optional VMEM scratch reference for storing intermediate
+      qkv Conv1D output in large layout mode.
     cfg: GDN configuration object.
   """
 
@@ -88,7 +91,12 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+    qkv_in_compact = vmem_ldst.load_qkv_as_fp32(
+        qkv_slot_ref=qkv_slot_ref,
+        metadata_ref=metadata_ref,
+        p_id=p_id,
+        cfg=cfg,
+    )
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
@@ -122,11 +130,13 @@ def inner_kernel(
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
+    qkv_scratch = (qkv_out_scratch_ref if qkv_out_scratch_ref is not None else
+                   qkv_slot_ref.bitcast(jnp.float32))
     if cfg.chunk_size == 1:
         q_compact, k_compact, v_compact, b_compact, a_compact = (
             vmem_ldst.load_activation_as_compact(
                 qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vmem_ref=qkv_scratch,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -149,7 +159,7 @@ def inner_kernel(
         q_large, k_large, v_large, b_large, a_large = (
             vmem_ldst.load_activation_as_large(
                 qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vmem_ref=qkv_scratch,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -194,6 +204,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    qkv_out_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
 ) -> None:
@@ -251,6 +262,7 @@ def outer_kernel(
                 weights_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
+                qkv_out_scratch_ref,
             ),
             allocations=allocations,
         )
@@ -266,6 +278,7 @@ def outer_kernel(
         "d_k",
         "d_v",
         "kernel_size",
+        "num_spec_tokens",
         "decode_tile_size",
         "mixed_tile_size",
         "zero_initialize_out",
@@ -342,14 +355,11 @@ def fused_conv1d_gdn(
       recurrent state cache tensors.
     out: Fused output tensor.
   """
-    # TODO(b/534537779): Support bf16
     act_in_dtype = qkv.dtype
     act_out_dtype = qkv.dtype
     conv_out_dtype = conv_state.dtype
     recurrent_out_dtype = recurrent_state.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
-    qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
     conv_state = conv_state.astype(jnp.float32)
@@ -365,8 +375,8 @@ def fused_conv1d_gdn(
     assert distribution.shape == (3, )
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    packing = 4 // act_in_dtype.itemsize
-    padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    act_in_packing = 4 // act_in_dtype.itemsize
+    padded_batch_size = pl.cdiv(batch_size, act_in_packing) * act_in_packing
     conv_state_dim_size = conv_state.shape[-1]
 
     decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
@@ -395,7 +405,7 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, num_v_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
+    qkv = qkv.reshape(padded_batch_size // act_in_packing, act_in_packing, dim)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
@@ -518,6 +528,9 @@ def fused_conv1d_gdn(
             in_act,
             weights,
         )
+
+    qkv = pltpu.with_memory_space_constraint(qkv, pltpu.HBM)
+    conv_state = pltpu.with_memory_space_constraint(conv_state, pltpu.HBM)
 
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         conv_state, recurrent_state, None, config.GDNMode.BATCHED)

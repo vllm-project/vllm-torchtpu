@@ -74,6 +74,8 @@ class MetadataRef:
     p_id_to_s_idx: SmemWrapper
     p_id_to_r_base: SmemWrapper
     p_id_to_r_size: SmemWrapper
+    p_id_to_u32_r_base: SmemWrapper
+    p_id_to_u32_r_size: SmemWrapper
     p_id_is_first_tile: SmemWrapper
     p_id_is_last_tile: SmemWrapper
     s_idx_has_initial_state: Any
@@ -87,6 +89,8 @@ class MetadataRef:
         p_id_to_s_idx: jax.Array,
         p_id_to_r_base: jax.Array,
         p_id_to_r_size: jax.Array,
+        p_id_to_u32_r_base: jax.Array,
+        p_id_to_u32_r_size: jax.Array,
         p_id_is_first_tile: jax.Array,
         p_id_is_last_tile: jax.Array,
         s_idx_has_initial_state: jax.Array,
@@ -99,6 +103,8 @@ class MetadataRef:
             p_id_to_s_idx=SmemWrapper(p_id_to_s_idx, shape),
             p_id_to_r_base=SmemWrapper(p_id_to_r_base, shape),
             p_id_to_r_size=SmemWrapper(p_id_to_r_size, shape),
+            p_id_to_u32_r_base=SmemWrapper(p_id_to_u32_r_base, shape),
+            p_id_to_u32_r_size=SmemWrapper(p_id_to_u32_r_size, shape),
             p_id_is_first_tile=SmemWrapper(p_id_is_first_tile, shape),
             p_id_is_last_tile=SmemWrapper(p_id_is_last_tile, shape),
             s_idx_has_initial_state=s_idx_has_initial_state,
@@ -158,17 +164,40 @@ class InBufferedRef(BaseBufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
+        is_qkv = vmem_ref.dtype == jnp.uint32
 
         for idx in range(self.cfg.seq_tile_size):
-            r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
-            dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            pltpu.make_async_copy(
-                src_ref.at[pl.ds(r_base, dma_size)],
-                vmem_ref.at[
-                    idx,
-                    pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-                sem,
-            ).start()
+            if is_qkv:
+                if self.cfg.dtypes.act_in_packing > 1:
+                    u32_r_base = self.metadata_ref.p_id_to_u32_r_base[p_id,
+                                                                      idx]
+                    u32_dma_size = self.metadata_ref.p_id_to_u32_r_size[p_id,
+                                                                        idx]
+                    uint32_src_ref = src_ref.bitcast(jnp.uint32)
+                    pltpu.make_async_copy(
+                        uint32_src_ref.at[pl.ds(u32_r_base, u32_dma_size)],
+                        vmem_ref.at[idx, pl.ds(0, u32_dma_size)],
+                        sem,
+                    ).start()
+                else:
+                    r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
+                    dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                    fp32_vmem_ref = vmem_ref.bitcast(jnp.float32)
+                    pltpu.make_async_copy(
+                        src_ref.at[pl.ds(r_base, dma_size)],
+                        fp32_vmem_ref.at[idx, pl.ds(0, dma_size)],
+                        sem,
+                    ).start()
+            else:
+                r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
+                dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                pltpu.make_async_copy(
+                    src_ref.at[pl.ds(r_base, dma_size)],
+                    vmem_ref.at[idx,
+                                pl.ds(0, dma_size
+                                      )],  # pyrefly: ignore[missing-attribute]
+                    sem,
+                ).start()
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -177,18 +206,44 @@ class InBufferedRef(BaseBufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
+        is_qkv = vmem_ref.dtype == jnp.uint32
 
-        dma_size = 0
-        for idx in range(self.cfg.seq_tile_size):
-            dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
+        if is_qkv:
+            if self.cfg.dtypes.act_in_packing > 1:
+                total_u32_dma_size = 0
+                for idx in range(self.cfg.seq_tile_size):
+                    total_u32_dma_size += self.metadata_ref.p_id_to_u32_r_size[
+                        p_id, idx]
 
-        pltpu.make_async_copy(
-            vmem_ref.at[
-                0, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-            vmem_ref.at[
-                0, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-            sem,
-        ).wait()
+                pltpu.make_async_copy(
+                    vmem_ref.at[0, pl.ds(0, total_u32_dma_size)],
+                    vmem_ref.at[0, pl.ds(0, total_u32_dma_size)],
+                    sem,
+                ).wait()
+            else:
+                dma_size = 0
+                for idx in range(self.cfg.seq_tile_size):
+                    dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
+
+                pltpu.make_async_copy(
+                    vmem_ref.at[0, pl.ds(0, dma_size)],
+                    vmem_ref.at[0, pl.ds(0, dma_size)],
+                    sem,
+                ).wait()
+        else:
+            dma_size = 0
+            for idx in range(self.cfg.seq_tile_size):
+                dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
+
+            pltpu.make_async_copy(
+                vmem_ref.at[
+                    0,
+                    pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
+                vmem_ref.at[
+                    0,
+                    pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
+                sem,
+            ).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -350,7 +405,7 @@ def create_allocs(
         StateBufferedRef,
         OutBufferedRef,
 ]:
-    qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
+    qkv_shape = (cfg.seq_tile_size, cfg.num_qkv_rows, 1, cfg.dim_size)
     ba_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
 
     out_shape = (
@@ -386,7 +441,8 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
+    qkv_alloc = in_buffered_partial(spec=qkv_spec,
+                                    dtype_or_type=cfg.qkv_vmem_dtype)
     b_alloc = in_buffered_partial(spec=ba_spec, dtype_or_type=b_ref)
     a_alloc = in_buffered_partial(spec=ba_spec, dtype_or_type=a_ref)
 

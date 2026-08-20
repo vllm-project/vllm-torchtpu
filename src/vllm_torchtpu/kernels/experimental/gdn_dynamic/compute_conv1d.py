@@ -22,7 +22,7 @@ from vllm_torchtpu.kernels.experimental.gdn_dynamic import config
 def causal_conv1d(
     real_sizes: jax.Array,  # [seq]
     lhs: jax.Array,  # [seq, chunk, q, dim_size]
-    conv_weight: jax.Array,  # [prev_kernel_size, 1, dim_size]
+    conv_weight: jax.Array,  # [kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:

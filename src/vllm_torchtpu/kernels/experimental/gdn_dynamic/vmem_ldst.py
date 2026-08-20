@@ -20,6 +20,66 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.gdn_dynamic import config, memory_ref
 
 
+def load_qkv_as_fp32(
+    qkv_slot_ref: jax.Ref,  # [seq_tile_size, chunk_size, 1, dim_size]
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Loads / unpacks QKV VMEM rows into FP32 [seq_tile_size, chunk_size, 1, dim_size]."""
+    if cfg.dtypes.act_in_packing == 1:
+        fp32_qkv_vmem = qkv_slot_ref.bitcast(jnp.float32)
+        return fp32_qkv_vmem[...]
+
+    tokens_per_seq = []
+
+    for idx in range(cfg.seq_tile_size):
+        r_base = metadata_ref.p_id_to_r_base[p_id, idx]
+        is_odd_base = (r_base % 2) != 0
+
+        if cfg.chunk_size == 1:
+            # Decode: 1D load [D]
+            u32_1d = qkv_slot_ref[idx, 0, 0, :]
+            token_even = pltpu.unpack_elementwise(u32_1d,
+                                                  index=0,
+                                                  packed_dtype=jnp.bfloat16,
+                                                  unpacked_dtype=jnp.float32)
+            token_odd = pltpu.unpack_elementwise(u32_1d,
+                                                 index=1,
+                                                 packed_dtype=jnp.bfloat16,
+                                                 unpacked_dtype=jnp.float32)
+            token_1d = jnp.where(is_odd_base, token_odd, token_even)
+            tokens_per_seq.append(token_1d.reshape(1, 1, cfg.dim_size))
+
+        else:
+            # Prefill: (chunk // 2) + 1 uint32 rows
+            num_u32_rows = (cfg.chunk_size // 2) + 1
+            unpacked_tokens = []
+            for row in range(num_u32_rows):
+                u32_1d = qkv_slot_ref[idx, row, 0, :]
+                token_even = pltpu.unpack_elementwise(
+                    u32_1d,
+                    index=0,
+                    packed_dtype=jnp.bfloat16,
+                    unpacked_dtype=jnp.float32).reshape(1, cfg.dim_size)
+                token_odd = pltpu.unpack_elementwise(
+                    u32_1d,
+                    index=1,
+                    packed_dtype=jnp.bfloat16,
+                    unpacked_dtype=jnp.float32).reshape(1, cfg.dim_size)
+                unpacked_tokens.extend([token_even, token_odd])
+
+            all_unpacked = jnp.stack(unpacked_tokens, axis=0)
+            tokens = jnp.where(
+                is_odd_base,
+                all_unpacked[1:cfg.chunk_size + 1],
+                all_unpacked[:cfg.chunk_size],
+            )
+            tokens_per_seq.append(tokens)
+
+    return jnp.stack(tokens_per_seq, axis=0)
+
+
 def load_as_qkv_large(
         qkv_vmem_ref: jax.Ref,
         cfgs: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:

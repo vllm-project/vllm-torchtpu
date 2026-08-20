@@ -49,6 +49,10 @@ class Dtypes:
     recurrent_state: jnp.dtype
     conv_state: jnp.dtype
 
+    @property
+    def act_in_packing(self) -> int:
+        return 4 // self.act_in.itemsize
+
 
 def get_vmem_limit_bytes(
     vmem_limit_factor: float = DEFAULT_VMEM_LIMIT_FACTOR, ) -> int:
@@ -110,6 +114,16 @@ class GDNConfig:
         num_lanes = tpu_info.num_lanes
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
+    @property
+    def num_qkv_rows(self) -> int:
+        if self.dtypes.act_in_packing > 1:
+            return (self.chunk_size // self.dtypes.act_in_packing) + 1
+        return self.chunk_size
+
+    @property
+    def qkv_vmem_dtype(self) -> jnp.dtype:
+        return jnp.uint32
+
     def get_kernel_name(self) -> str:
         return (f"fused_conv1d_gdn_{self.mode.value}_b{self.seq_tile_size}"
                 f"_c{self.chunk_size}")
@@ -139,6 +153,12 @@ class GDNConfig:
             self.kq_head_dim,
             self.v_head_dim,
         )
+        qkv_out_shape = (
+            self.seq_tile_size,
+            self.chunk_size,
+            1,
+            self.dim_size,
+        )
 
         carry_conv_scratch = carry_recurrent_scratch = None
         # NOTE: Currently, batched mode only supports case where 1 seq = 1 tile.
@@ -147,7 +167,12 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        qkv_out_scratch = None
+        if self.dtypes.act_in_packing > 1:
+            qkv_out_scratch = pltpu.VMEM(qkv_out_shape, jnp.float32)
+
         return {
             "carry_conv_scratch_ref": carry_conv_scratch,
             "carry_recurrent_scratch_ref": carry_recurrent_scratch,
+            "qkv_out_scratch_ref": qkv_out_scratch,
         }

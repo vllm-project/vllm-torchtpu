@@ -131,8 +131,9 @@ def run_jax_gdn_attention(
     )
 
     tp_size = get_mesh_shape_product(mesh, "model")
-    wrapper = (gdn_dynamic_wrapper
-               if tpu_envs.TPU_ENABLE_GDN_DYNAMIC_TILING else gdn_v3_wrapper)
+    # wrapper = (gdn_dynamic_wrapper
+    #            if tpu_envs.TPU_ENABLE_GDN_DYNAMIC_TILING else gdn_v3_wrapper)
+    wrapper = gdn_dynamic_wrapper
 
     p_run_jax_gdn_attention_local = functools.partial(
         wrapper.fused_conv1d_gdn,
