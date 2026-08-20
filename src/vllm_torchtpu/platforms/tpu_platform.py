@@ -629,6 +629,21 @@ class TpuPlatform(Platform):
         return
 
     @classmethod
+    def device_id_to_physical_device_id(cls, device_id: int) -> int:
+        """Map logical DP/TP device id to a local physical TPU device.
+
+        Under multi-core TPU (e.g. v7x with 2 cores per chip), the logical
+        rank/device_id may exceed the physical chip count in TPU_VISIBLE_CHIPS.
+        Wrap with modulo so every rank resolves to a valid local physical chip.
+        """
+        device_control_env = os.environ.get(cls.device_control_env_var, "")
+        if device_control_env:
+            device_ids = [s.strip() for s in device_control_env.split(",") if s.strip()]
+            if device_ids:
+                return int(device_ids[device_id % len(device_ids)])
+        return int(device_id % max(1, cls.device_count()))
+
+    @classmethod
     def device_count(cls) -> int:
         """Local physical chip count on this host, stable across contexts.
 

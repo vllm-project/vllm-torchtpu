@@ -1775,24 +1775,24 @@ class TPURaidenConnectorWorker:
         if self.is_producer:
             if tp_size == 1 and pcp_size in (4, 8) and dp_size == 1:
                 return f"pcp{pcp_size}_prefill"
-            if tp_size == 1 and pcp_size == 1 and dp_size in (4, 8):
+            if tp_size == 1 and pcp_size == 1 and dp_size in (4, 8, 16):
                 return f"dp{dp_size}_prefill"
             raise ValueError(
                 "Raiden Qwen3.5 admission topology pcp8_prefill, "
-                "pcp4_prefill, dp8_prefill, or dp4_prefill requires "
+                "pcp4_prefill, dp8_prefill, dp4_prefill, or dp16_prefill requires "
                 "kv_producer with tensor_parallel_size=1 and either "
                 "prefill_context_parallel_size in (4, 8), "
                 "data_parallel_size=1 or "
                 "prefill_context_parallel_size=1, "
-                "data_parallel_size in (4, 8); got "
+                "data_parallel_size in (4, 8, 16); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}")
-        if pcp_size != 1 or tp_size != 1 or dp_size not in (4, 8):
+        if pcp_size != 1 or tp_size != 1 or dp_size not in (4, 8, 16):
             raise ValueError(
-                "Raiden Qwen3.5 admission topology dp8_decode or dp4_decode requires "
+                "Raiden Qwen3.5 admission topology dp8_decode, dp4_decode, or dp16_decode requires "
                 "kv_consumer with prefill_context_parallel_size=1, "
-                "tensor_parallel_size=1, data_parallel_size in (4, 8); got "
+                "tensor_parallel_size=1, data_parallel_size in (4, 8, 16); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}")
