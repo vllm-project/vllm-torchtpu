@@ -423,18 +423,14 @@ class TestTpuRayDistributedExecutorV2:
         executor.parallel_config = self.parallel_config
         executor._initialize_ray_cluster()
 
-        # Two bundles for this engine. Bundle 0 is pinned to the target host
-        # (node_1, 10.0.0.1) based on (dp_rank * world_size) // chips_per_host
-        # = (3 * 2) // 8 = 0, ensuring deterministic DP placement and packing
-        # this engine's TP group onto a single node.
-        mock_ray.util.placement_group.assert_called_once_with(
-            [{
-                "TPU": 1.0,
-                "node:10.0.0.1": 0.001,
-            }, {
-                "TPU": 1.0
-            }],
-            strategy="PACK")
+        # Two bundles for this engine, and no node pin: pinning would crowd
+        # every DP engine onto the head node and split their TP groups.
+        mock_ray.util.placement_group.assert_called_once_with([{
+            "TPU": 1.0
+        }, {
+            "TPU": 1.0
+        }],
+                                                              strategy="PACK")
         assert executor.parallel_config.placement_group is created_pg
 
     @patch(

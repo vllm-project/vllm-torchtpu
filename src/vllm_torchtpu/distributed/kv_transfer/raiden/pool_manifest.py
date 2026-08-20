@@ -285,8 +285,6 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
     # it away rather than duplicating the derivation below.
     if len(conv_shape) == 4 and conv_shape[2] == 1:
         conv_shape = (conv_shape[0], conv_shape[1], conv_shape[3])
-    elif len(conv_shape) == 4 and conv_shape[1] == 1:
-        conv_shape = (conv_shape[0], conv_shape[2], conv_shape[3])
     if len(conv_shape) != 3:
         raise ManifestError("GDN conv state must be (blocks, taps, dim) or "
                             f"(blocks, taps, 1, dim): got {conv_shape}")
