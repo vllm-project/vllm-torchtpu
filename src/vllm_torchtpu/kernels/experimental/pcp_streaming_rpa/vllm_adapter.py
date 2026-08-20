@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 """vLLM custom-op adapter for PCP streaming RPA."""
 
+import hashlib
 import inspect
 from collections.abc import Callable, Sequence
 
@@ -65,8 +66,12 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
             self.trace_key, args, kwargs, self.static_argnums)
         output_shapes, out_tree = self.output_shapes.get(
             kernel_key, (None, None))
-        kernel_exists = pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
-            self.name, kernel_key)
+        mlir_fingerprint = self.kernel_key_to_mlir_fingerprint.get(kernel_key)
+        kernel_exists = (
+            mlir_fingerprint is not None
+            and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
+                self.name, mlir_fingerprint)
+        )
         if not output_shapes or not kernel_exists:
             jax_args = pallas_impl.jax_placeholders(
                 args,
@@ -75,9 +80,26 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
             )
             with jax._src.config.export_ignore_forward_compatibility(True):
                 lowered = self.exported(*jax_args, **kwargs)
+            # Normalize the MLIR module without location debug info so that
+            # differing caller stack frames produce the same deterministic fingerprint
+            # and reuse the compiled executable cache.
+            with jax.interpreters.mlir.make_ir_context():
+                ir_module = jax.interpreters.mlir.ir.Module.parse(
+                    lowered.mlir_module())
+                normalized_mlir = str(
+                    ir_module.operation.get_asm(enable_debug_info=False))
+            # BLAKE2 is significantly faster than SHA-256, and 128 bits (16 bytes)
+            # provides enough collision resistance before being fingerprinted down to
+            # 64 bits in lower layers.
+            mlir_fingerprint = hashlib.blake2b(
+                normalized_mlir.encode("utf-8"),
+                digest_size=16,
+            ).hexdigest()
+            self.kernel_key_to_mlir_fingerprint[kernel_key] = mlir_fingerprint
+
             pallas_impl.tpu_torch_pallas.register_custom_kernel(
                 self.name,
-                kernel_key,
+                mlir_fingerprint,
                 serialized_mlir_module=lowered.mlir_module_serialized,
             )
             out_shardings = getattr(lowered, "_out_named_shardings", None)
@@ -97,7 +119,7 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
         ]
         results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
             self.name,
-            kernel_key,
+            mlir_fingerprint,
             inputs=tensor_args,
             output_shapes=output_shapes,
             donate_argnums=self.donate_argnums,
