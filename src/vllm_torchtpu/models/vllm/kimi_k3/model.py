@@ -59,6 +59,37 @@ from .moe import KimiMoE
 
 logger = init_logger(__name__)
 
+_CPU = torch.device("cpu")
+
+
+class _HostMirror:
+    """A module stand-in that answers a few attribute reads from the host.
+
+    Used to run a model method against CPU copies of the tables it reads,
+    without touching the real module or reimplementing the method. Reads that
+    are not overridden fall through to the wrapped module, and a method reached
+    that way is rebound to the mirror so that nested ``self.`` reads inside it
+    see the overrides too.
+
+    A mirror rather than a clone because the tables in question hang off
+    ``vision_tower.encoder``, which is far too large to copy; a reimplementation
+    rather than a mirror would have to stay numerically identical to the model
+    it feeds, which is exactly the kind of thing that drifts silently.
+    """
+
+    def __init__(self, module: object, **overrides: object) -> None:
+        self.__dict__["_module"] = module
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name: str) -> object:
+        value = getattr(self._module, name)
+        func = getattr(value, "__func__", None)
+        if func is not None and getattr(value, "__self__",
+                                        None) is self._module:
+            return func.__get__(
+                self)  # so its own self.<override> reads hit us
+        return value
+
 
 class KimiDecoderLayer(nn.Module):
 
@@ -751,6 +782,54 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
         values["pixel_values"] = dummy_pixel_values
         return EncoderCudaGraphCaptureInputs(values=values)
 
+    def _host_vision_tower(self):
+        """The vision tower with its two per-image tables mirrored on the host.
+
+        ``prepare_encoder_cudagraph_metadata`` computes two of its outputs from
+        tables that live on the TPU: ``rope_freqs_cis`` slices the rope table to
+        ``[:h, :w]``, and ``pos_embeds`` bicubic-interpolates the learned
+        position embedding to the image's exact ``(h, w)``. Both are device
+        arithmetic keyed on the image size, so each distinct image compiles a
+        fresh XLA program -- measured at exactly one per distinct image over the
+        first 40 images of an MMMU run. They are created inside
+        ``_run_budget_graph``, downstream of the budget padding, so no amount of
+        boot-time per-budget precompilation covers them.
+
+        Neither table depends on anything the device produced -- the rope table
+        is a deterministic function of the config and the position embedding is
+        a frozen weight -- so mirroring both on the host turns the whole
+        computation into plain CPU work. The result then reaches the device
+        through ``_pad_to_template``, at the static budget shape.
+        """
+        mirror = getattr(self, "_host_vision_tower_mirror", None)
+        if mirror is None:
+            tower = self.vision_tower
+            pos_emb = tower.patch_embed.pos_emb
+            rope_2d = tower.encoder.rope_2d
+            mirror = _HostMirror(
+                tower,
+                patch_embed=_HostMirror(
+                    tower.patch_embed,
+                    pos_emb=_HostMirror(
+                        pos_emb,
+                        weight=pos_emb.weight.detach().to(_CPU),
+                        time_weight=pos_emb.time_weight.detach().to(_CPU),
+                    ),
+                ),
+                encoder=_HostMirror(
+                    tower.encoder,
+                    rope_2d=_HostMirror(
+                        rope_2d,
+                        # Built here rather than copied off the module: the
+                        # device buffer is created lazily by whichever call
+                        # comes first, so it may not exist yet.
+                        freqs_cis=rope_2d._precompute_freqs_cis(_CPU),
+                    ),
+                ),
+            )
+            self._host_vision_tower_mirror = mirror
+        return mirror
+
     def prepare_encoder_cudagraph_replay_buffers(
         self,
         mm_kwargs: dict[str, object],
@@ -763,10 +842,16 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
         del max_frames_per_batch
         pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
         grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
-        metadata = self.vision_tower.prepare_encoder_cudagraph_metadata(
+        if envs.TPU_MM_HOST_ENCODER_METADATA:
+            tower = self._host_vision_tower()
+            device = _CPU
+        else:
+            tower = self.vision_tower
+            device = pixel_values.device
+        metadata = tower.prepare_encoder_cudagraph_metadata(
             grid_thw_list,
             max_batch_size=max_batch_size,
-            device=pixel_values.device,
+            device=device,
         )
         values = dict(metadata)
         values["pixel_values"] = pixel_values

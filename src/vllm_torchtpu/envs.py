@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     KDA_PACKED_METADATA: bool = True
     KDA_FWD_MB: int | None = None
     TPU_MM_BUCKET_SCATTER: bool = True
+    TPU_MM_HOST_ENCODER_METADATA: bool = True
 
 
 def env_with_choices(
@@ -692,6 +693,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # concat + masked-scatter, which recompiles once per distinct image size.
     "TPU_MM_BUCKET_SCATTER":
     env_bool("TPU_MM_BUCKET_SCATTER", default=True),
+    # Build the vision encoder's replay metadata (rope frequencies, position
+    # embeddings) from host copies of the tables they read. Computing them from
+    # the device-resident tables is arithmetic keyed on the image's exact grid,
+    # so it compiles one XLA program per distinct image, downstream of the
+    # budget padding where no boot-time precompile can reach it. Set to 0 to
+    # restore the device path.
+    "TPU_MM_HOST_ENCODER_METADATA":
+    env_bool("TPU_MM_HOST_ENCODER_METADATA", default=True),
 }
 
 
