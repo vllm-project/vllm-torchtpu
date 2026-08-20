@@ -47,6 +47,11 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${CACHE_DIR}/torch_tpu_tier3"
 export VLLM_CACHE_ROOT="${CACHE_DIR}/vllm_cache"
 export VLLM_TARGET_DEVICE="tpu"
 export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
+# Log which graphs each run compiled, so the warm-run log of Test 3 names
+# anything that was recompiled instead of loaded. The flag is in the compiler's
+# _TPU_COMPILE_ENV_IGNORED set, so it does not perturb the Tier-3 binaries that
+# Test 5 checksums.
+export VLLM_XLA_CHECK_RECOMPILATION="${VLLM_XLA_CHECK_RECOMPILATION:-1}"
 
 MODEL="${1:-${MODEL:-Qwen/Qwen3-0.6B}}"
 TIER3_DIR="${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}"
