@@ -8,7 +8,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.mla.sparse import csa_gather
+from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -36,8 +36,10 @@ def get_kv_cache_shape(
     page_size,
     kv_dim,
     kv_dtype,
+    kv_packing: int | None = None,
 ):
-    kv_packing = get_dtype_packing(kv_dtype)
+    if kv_packing is None:
+        kv_packing = get_dtype_packing(kv_dtype)
     return (
         total_num_pages,
         align_to(page_size, kv_packing) // kv_packing,
@@ -141,9 +143,9 @@ def _attention_kernel(
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
-    nope_dim = csa_gather.TILE_SUBROWS * csa_gather.TILE_LANE_BYTES
+    nope_dim = dsa_gather.TILE_SUBROWS * dsa_gather.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
-    bkv_sz = cache_kv_nope_hbm_ref.shape[1] // csa_gather.TILE_SUBROWS
+    bkv_sz = cache_kv_nope_hbm_ref.shape[1] // dsa_gather.TILE_SUBROWS
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -481,7 +483,7 @@ def sparse_ragged_paged_attention(
   Returns:
     The output of attention.
   """
-    # Opaque uint8 tiles (see csa_gather.py): nope encodes 512 fp8 values
+    # Opaque uint8 tiles (see dsa_gather.py): nope encodes 512 fp8 values
     # (gathered as raw (4, 128) tiles, then folded to 512 lanes and dequantized
     # in-kernel with the per-tensor k_scale), rope encodes 64 bf16 as high/low
     # byte planes (dequantized by the shim).
@@ -644,15 +646,15 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
+        gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
             cache_kv_nope,
             cache_kv_rope,
             indices,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             gather_and_attention_chunk_size,
-            topk * csa_gather.TILE_SUBROWS,
-            csa_gather.TILE_LANE_BYTES,
+            topk * dsa_gather.TILE_SUBROWS,
+            dsa_gather.TILE_LANE_BYTES,
         )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             gather_and_attention_chunk_size, topk, -1)

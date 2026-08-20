@@ -306,6 +306,11 @@ def test_mla_forward_sparse_dispatch_and_quantization():
     k_scale = 2.0
     impl, layer, inputs, op_out = _make_impl_and_layer(k_scale)
     topk_indices = torch.zeros((4, 8), dtype=torch.int32)
+    # Sparse layers hold a native (nope, rope) split cache.
+    inputs["kv_cache"] = tuple(
+        torch.zeros(shape, dtype=torch.uint8)
+        for shape in PallasMLAttentionBackend.get_sparse_kv_cache_shapes(
+            2, 8, 576, torch.float8_e4m3fn))
 
     out = impl.forward(layer=layer, **inputs, topk_indices=topk_indices)
 

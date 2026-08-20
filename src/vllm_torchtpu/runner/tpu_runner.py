@@ -6029,6 +6029,22 @@ class TPUModelRunner(GPUModelRunner):
                                         dtype=dtype).to(self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
+                    attn_module = (self.vllm_config.compilation_config.
+                                   static_forward_context.get(layer_name))
+                    if getattr(attn_module, "use_sparse", False):
+                        # Split (nope, rope) cache in dsa_gather's tiled
+                        # layouts; uint8 bytes of the fp8 latents.
+                        shapes = (PallasMLAttentionBackend.
+                                  get_sparse_kv_cache_shapes(
+                                      num_blocks,
+                                      kv_cache_spec.block_size,
+                                      kv_cache_spec.head_size,
+                                      kv_cache_spec.dtype,
+                                  ))
+                        kv_caches[layer_name] = tuple(
+                            torch.zeros(shape, dtype=torch.uint8).to(
+                                self.device) for shape in shapes)
+                        continue
                     # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
                     # Because MLA maps all attention heads onto a single joint compressed latent key-value
                     # representation (`num_kv_heads=1`), the physical KV cache dimension never splits

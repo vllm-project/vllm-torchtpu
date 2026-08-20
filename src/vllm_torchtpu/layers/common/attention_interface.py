@@ -22,8 +22,7 @@ from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.utils import (split_sparse_mla_cache,
-                                               update_sparse_mla_kv_cache)
+from vllm_torchtpu.layers.common.utils import update_sparse_mla_kv_cache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
 
@@ -630,7 +629,8 @@ def sparse_mla_attention(
         q_pe: jax.Array,
         kv_c_normed: jax.Array,
         k_pe: jax.Array,
-        kv_cache: jax.Array,
+        kv_cache_nope: jax.Array,
+        kv_cache_rope: jax.Array,
         topk_indices: jax.Array,
         seq_lens: jax.Array,
         block_tables: jax.Array,
@@ -638,7 +638,8 @@ def sparse_mla_attention(
         request_distribution: jax.Array,
         mesh: Mesh,
         sm_scale: float | None = None,
-        k_scale: float | None = None) -> tuple[jax.Array, jax.Array]:
+        k_scale: float | None = None
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
     Args:
@@ -646,7 +647,8 @@ def sparse_mla_attention(
       q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      kv_cache: Paged MLA latent cache (`[num_blocks, block_size // kv_packing, kv_packing, padded_row]`).
+      kv_cache_nope: Paged uint8 nope cache in dsa_gather's tiled layout (`[num_blocks, block_size, tile_subrows, lane_bytes]`)
+      kv_cache_rope: Paged uint8 rope cache in dsa_gather's tiled layout (`[num_blocks, block_size // tile_subrows, tile_subrows, lane_bytes]`)
       topk_indices: Indexer output specifying tokens to gather (`[num_tokens, topk]`).
       seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
       block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
@@ -658,7 +660,8 @@ def sparse_mla_attention(
 
     Returns:
       A tuple containing:
-        - The updated `kv_cache`.
+        - The updated `kv_cache_nope`.
+        - The updated `kv_cache_rope`.
         - The sparse attention output (`[num_tokens, num_heads, lkv_dim]`).
 
     Contract notes:
@@ -677,7 +680,8 @@ def sparse_mla_attention(
         P(None, None, None),  # q_pe
         P(None, None),  # kv_c_normed
         P(None, None),  # k_pe
-        P(None),  # kv_cache
+        P(None),  # kv_cache_nope
+        P(None),  # kv_cache_rope
         P(None),  # topk_indices
         P(None),  # seq_lens
         P(None),  # block_tables
@@ -686,29 +690,26 @@ def sparse_mla_attention(
     )
     out_specs = (
         P(None, None, None),  # attn output (T, N, D)
-        P(None),  # updated kv cache
+        P(None),  # updated nope cache
+        P(None),  # updated rope cache
     )
 
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
 
     def _sparse_mla_ragged_paged_attention(ql_nope, q_pe, kv_c_normed, k_pe,
-                                           kv_cache, topk_idx, seq_lens_,
-                                           block_tables_, query_start_loc_,
+                                           kv_cache_nope, kv_cache_rope,
+                                           topk_idx, seq_lens_, block_tables_,
+                                           query_start_loc_,
                                            request_distribution_):
-        kv_cache = update_sparse_mla_kv_cache(kv_cache, kv_c_normed, k_pe,
-                                              seq_lens_, block_tables_,
-                                              query_start_loc_)
+        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
+            kv_cache_nope, kv_cache_rope, kv_c_normed, k_pe, seq_lens_,
+            block_tables_, query_start_loc_)
 
-        lkv_dim = ql_nope.shape[-1]
-        rope_dim = q_pe.shape[-1]
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        nope_u8, rope_u8 = split_sparse_mla_cache(kv_cache, lkv_dim, rope_dim,
-                                                  dequant_scale)
-
         output = sparse_mla_ragged_paged_attention(
             q,
-            nope_u8,
-            rope_u8,
+            kv_cache_nope,
+            kv_cache_rope,
             topk_idx,
             block_tables_,
             query_start_loc_,
@@ -716,18 +717,21 @@ def sparse_mla_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
         )
+
+        lkv_dim = ql_nope.shape[-1]
         # The kernel's output is lkv_dim + rope_dim wide because it attends
         # over concatenated (nope + rope) keys. Only the nope part is the MLA
         # value (P @ latent); drop the rope tail before the W_UV projection.
-        return output[..., :lkv_dim], kv_cache
+        return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
 
-    output, updated_kv_cache = jax.jit(
+    output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
         shard_map.shard_map(_sparse_mla_ragged_paged_attention,
                             mesh=mesh,
                             in_specs=in_specs,
                             out_specs=out_specs,
                             check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
-                                              kv_cache, topk_indices, seq_lens,
+                                              kv_cache_nope, kv_cache_rope,
+                                              topk_indices, seq_lens,
                                               block_tables, query_start_loc,
                                               request_distribution)
-    return updated_kv_cache, output
+    return new_kv_cache_nope, new_kv_cache_rope, output

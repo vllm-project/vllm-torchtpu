@@ -166,7 +166,7 @@ def main_kernel(
 
 
 @functools.partial(jax.jit)
-def csa_gather(
+def dsa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
@@ -254,7 +254,7 @@ def csa_gather(
             disable_bounds_checks=True,
         ),
         mesh=vector_mesh,
-        name="sc_csa_gather",
+        name="sc_dsa_gather",
     )(nope_cache, rope_cache, indices)
     return (
         nope_out.reshape(-1, TILE_SUBROWS, TILE_LANE_BYTES)[:out_size],

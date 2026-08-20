@@ -21,6 +21,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
+from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, mla_attention, ragged_paged_attention,
@@ -1049,6 +1050,29 @@ class PallasMLAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
+    def get_sparse_kv_cache_shapes(
+        num_blocks: int,
+        block_size: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Native (nope, rope) cache shapes: the kernel's paged fp8 shapes,
+        nope regrouped into dsa_gather's lane-row tiles."""
+        from vllm_torchtpu.kernels.mla.sparse import dsa_gather
+
+        rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
+        lane_bytes = dsa_gather.TILE_LANE_BYTES
+        kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        kv_packing = get_dtype_packing(kv_dtype)
+        rope_shape = sparse_mla_kernel.get_kv_cache_shape(
+            num_blocks, block_size, rope_dim, kv_dtype, kv_packing)
+        nope_shape = sparse_mla_kernel.get_kv_cache_shape(
+            num_blocks, block_size, head_size - rope_dim, kv_dtype, kv_packing)
+        num_pages, page_size_div, kv_packing, nope_dim = nope_shape
+        return ((num_pages, page_size_div * kv_packing, nope_dim // lane_bytes,
+                 lane_bytes), rope_shape)
+
+    @staticmethod
     def get_kv_cache_page_size_bytes(
         block_size: int,
         num_kv_heads: int,
@@ -1279,7 +1303,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             _, k_scale, _ = self._get_kv_scales(layer)
 
         def sparse_mla_attention_core_tpu(
-            kv_cache: jax.Array,
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
             ql_nope: jax.Array,
             q_pe: jax.Array,
             kv_c_normed: jax.Array,
@@ -1289,13 +1314,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: jax.Array,
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
                 kv_c_normed,
                 k_pe,
-                kv_cache,
+                kv_cache_nope,
+                kv_cache_rope,
                 topk_indices,
                 seq_lens,
                 block_tables,
@@ -1310,30 +1336,34 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                    f"{layer.layer_name.replace('.', '_')}")
         sparse_mla_jax_op = pallas.jax_op(op_name,
                                           sparse_mla_attention_core_tpu,
-                                          donate_argnums=(0, ))
+                                          donate_argnums=(0, 1))
 
-        def _fake_sparse_mla(kv_cache, ql_nope, q_pe, kv_c_normed, k_pe,
-                             topk_indices, *args, **kwargs):
+        def _fake_sparse_mla(kv_cache_nope, kv_cache_rope, ql_nope, q_pe,
+                             kv_c_normed, k_pe, topk_indices, *args, **kwargs):
             num_tokens = ql_nope.size(0)
             out_shape = (num_tokens, layer.num_heads, layer.kv_lora_rank)
-            return torch.empty_like(kv_cache), torch.empty(
-                out_shape, dtype=ql_nope.dtype, device=ql_nope.device)
+            return (torch.empty_like(kv_cache_nope),
+                    torch.empty_like(kv_cache_rope),
+                    torch.empty(out_shape,
+                                dtype=ql_nope.dtype,
+                                device=ql_nope.device))
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla)
 
         def sparse_mla_impl(
-                kv_cache: torch.Tensor, ql_nope: torch.Tensor,
-                q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
-                k_pe: torch.Tensor, topk_indices: torch.Tensor,
-                seq_lens: torch.Tensor, block_tables: torch.Tensor,
-                query_start_loc: torch.Tensor,
+                kv_cache: tuple[torch.Tensor, torch.Tensor],
+                ql_nope: torch.Tensor, q_pe: torch.Tensor,
+                kv_c_normed: torch.Tensor, k_pe: torch.Tensor,
+                topk_indices: torch.Tensor, seq_lens: torch.Tensor,
+                block_tables: torch.Tensor, query_start_loc: torch.Tensor,
                 request_distribution: torch.Tensor) -> torch.Tensor:
-            new_kv, outputs = sparse_mla_jax_op(kv_cache, ql_nope, q_pe,
-                                                kv_c_normed, k_pe,
-                                                topk_indices, seq_lens,
-                                                block_tables, query_start_loc,
-                                                request_distribution)
-            kv_cache.copy_(new_kv)
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope, outputs = sparse_mla_jax_op(
+                nope_cache, rope_cache, ql_nope, q_pe, kv_c_normed, k_pe,
+                topk_indices, seq_lens, block_tables, query_start_loc,
+                request_distribution)
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
             return outputs
 
         return sparse_mla_impl
@@ -1358,7 +1388,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         input_dtype = q_nope.dtype
 
         # For determine_available_memory when cache memory buffer is empty right during probe
-        if kv_cache.numel() == 0:
+        # (before binding, `layer.kv_cache` is the layer's default empty
+        # tensor; after binding, sparse layers hold a (nope, rope) pair).
+        if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             out_shape = (q_nope.shape[0], layer.num_heads * layer.v_head_dim)
             if output is None:
                 return torch.ones(out_shape,
@@ -1397,6 +1429,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         if topk_indices is not None:
+            assert (isinstance(kv_cache, (tuple, list))
+                    and len(kv_cache) == 2), (
+                        "sparse MLA layers use a native (nope, rope) split "
+                        f"cache; got {type(kv_cache)}")
             if (not hasattr(layer, "sparse_mla_op")
                     or layer.sparse_mla_op is None):
                 layer.sparse_mla_op = self._build_sparse_mla_op(layer)
