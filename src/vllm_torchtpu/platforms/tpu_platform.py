@@ -638,7 +638,9 @@ class TpuPlatform(Platform):
         """
         device_control_env = os.environ.get(cls.device_control_env_var, "")
         if device_control_env:
-            device_ids = [s.strip() for s in device_control_env.split(",") if s.strip()]
+            device_ids = [
+                s.strip() for s in device_control_env.split(",") if s.strip()
+            ]
             if device_ids:
                 return int(device_ids[device_id % len(device_ids)])
         return int(device_id % max(1, cls.device_count()))
