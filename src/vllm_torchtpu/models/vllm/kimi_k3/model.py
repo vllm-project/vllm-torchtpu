@@ -696,6 +696,15 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
             src_idx = torch.arange(offset, offset + padded, dtype=torch.long)
             src_idx.clamp_(max=last_row)
             dest[idx] = output.index_select(0, src_idx.to(output.device))
+            # Cut the lazy graph here, one item at a time, so this gather is
+            # its own program keyed on (packed rows, bucket) -- the pair
+            # _capture_budget_glue already primes at boot. Left pending it
+            # instead fuses into whatever traces next: the caller caches this
+            # tensor and the decoder scatters it into the token buffer, so the
+            # program that finally gets built is keyed on the *product* of the
+            # two shape sets, plus the batch's bucket multiset. wait=False
+            # enqueues the gather without blocking on it.
+            synchronize_tensors(dest[idx], wait=False)
             offset += num_tokens
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, object]):
