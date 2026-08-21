@@ -317,3 +317,68 @@ def test_pooled_kda_manager_block_split():
     for block in range(NUM_BLOCKS):
         if block not in block_ids:
             np.testing.assert_array_equal(after[block], seed[block])
+
+
+def test_pooled_kda_multistep_state_evolution():
+    """State must round-trip the pool across a chunked prefill and decodes.
+
+    One request: two prefill chunks followed by three decode steps. The dense
+    path threads its buffers; the pooled path threads only the pool, so every
+    step's state goes through the gather/scatter seam. Outputs are compared
+    per step and the final states at the end.
+    """
+    rng = np.random.default_rng(0)
+    steps = [(128, 128, 0), (96, 224, 0), (1, 225, 1), (1, 226, 1),
+             (1, 227, 1)]  # (query_len, seq_len_after, decode_end)
+
+    conv_init, ssm_init = _initial_states(rng, 1)
+    # Dense: null slot 0 + the request's slot 1, threaded across steps.
+    conv_buf = jnp.concatenate([jnp.zeros_like(conv_init[:1]), conv_init],
+                               axis=0)
+    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_init[:1]), ssm_init], axis=0)
+    # Pooled: the request's state lives in pool block 1.
+    pool = _pack_pool(conv_init, ssm_init, [1])
+    identity = jnp.asarray([1], dtype=jnp.int32)
+
+    for step_idx, (query_len, seq_len, decode_end) in enumerate(steps):
+        inputs = _inputs(rng, [query_len], [seq_len])
+        distribution = jnp.asarray([decode_end, 1, 1], dtype=jnp.int32)
+
+        out_dense, conv_buf, ssm_buf = _dispatched_kda_core(
+            inputs["mixed_qkv"],
+            inputs["raw_gate"],
+            inputs["beta"],
+            inputs["output_gate"],
+            conv_buf,
+            ssm_buf,
+            inputs["conv_weight"],
+            inputs["a_log"],
+            inputs["dt_bias"],
+            inputs["norm_weight"],
+            inputs["query_start_loc"],
+            identity,
+            inputs["seq_lens"],
+            distribution,
+            lower_bound=LOWER_BOUND,
+            eps=EPS,
+        )
+        out_pool, pool = _run_pooled(inputs,
+                                     pool, [1],
+                                     distribution,
+                                     pool_block_tokens=BLOCK_SIZE * PACK)
+
+        np.testing.assert_allclose(np.asarray(out_pool, np.float32),
+                                   np.asarray(out_dense, np.float32),
+                                   rtol=5e-2,
+                                   atol=4e-3,
+                                   err_msg=f"output diverged at step "
+                                   f"{step_idx} {steps[step_idx]}")
+
+    conv_back, ssm_back = _unpack_pool(pool, [1])
+    # Conv state is pure data movement through the seam: bitwise equal.
+    np.testing.assert_array_equal(np.asarray(conv_back.view(jnp.uint16)),
+                                  np.asarray(conv_buf[1:].view(jnp.uint16)))
+    np.testing.assert_allclose(np.asarray(ssm_back, np.float32),
+                               np.asarray(ssm_buf[1:], np.float32),
+                               rtol=1e-2,
+                               atol=5e-4)
