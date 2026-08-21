@@ -47,6 +47,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -614,6 +615,58 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
         return (grid_thws.tolist()
                 if isinstance(grid_thws, torch.Tensor) else grid_thws)
 
+    # Smallest per-item vision-token bucket; matches the 64-token floor used
+    # by get_encoder_cudagraph_budget_range.
+    MM_EMBED_BUCKET_MIN = 64
+
+    @classmethod
+    def mm_embed_bucket(cls, num_tokens: int) -> int:
+        """Round a per-item vision token count up to a power of two."""
+        bucket = cls.MM_EMBED_BUCKET_MIN
+        while bucket < num_tokens:
+            bucket *= 2
+        return bucket
+
+    def postprocess_encoder_output(
+        self,
+        outputs: dict[str, torch.Tensor],
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, object] | None = None,
+    ) -> None:
+        """Split the packed encoder output into bucket-padded per-item slices.
+
+        The default ``scatter_output_slices`` cuts exact-length slices
+        (``output[off:off + n]``). On TPU both bounds are image-dependent, so
+        every distinct image size compiles a fresh XLA program -- and so does
+        everything downstream that consumes the odd-sized result. Gathering a
+        power-of-two number of rows instead keeps the shape set logarithmic
+        in the image size. The extra rows are junk (they repeat the last row
+        of the packed buffer); callers bound reads by the true token count,
+        which they already know host-side from ``mm_position.length``.
+        """
+        if not envs.TPU_MM_BUCKET_SCATTER:
+            from vllm.model_executor.models.utils import scatter_output_slices
+            scatter_output_slices(outputs["default"], indices,
+                                  per_item_out_tokens, dest, clone)
+            return
+
+        del clone, batch_mm_kwargs  # index_select already returns a new tensor
+        output = outputs["default"]
+        last_row = output.shape[0] - 1
+        offset = 0
+        for idx in indices:
+            num_tokens = per_item_out_tokens[idx]
+            padded = self.mm_embed_bucket(num_tokens)
+            # Host-built and fixed-length, so the gather is keyed on
+            # (packed budget, bucket) rather than on the image size.
+            src_idx = torch.arange(offset, offset + padded, dtype=torch.long)
+            src_idx.clamp_(max=last_row)
+            dest[idx] = output.index_select(0, src_idx.to(output.device))
+            offset += num_tokens
+
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, object]):
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
         merge_h, merge_w = self.vision_tower.merge_kernel_size
@@ -754,6 +807,11 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
         # workers idle). Process only this rank's own subset: the runner
         # gathers the per-rank outputs at the DP level afterwards.
         pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
+        # MMEncoderManager.execute lands the batch on the host so the budget
+        # path stays free of image-shape-keyed XLA programs. This fallback
+        # runs the tower directly, so it has to put the batch back.
+        if pixel_values.device.type == "cpu":
+            pixel_values = pixel_values.to(self.device)
         grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
         encoder_metadata = self.vision_tower.encoder.prepare_encoder_metadata(
             grid_thw_list, device=pixel_values.device)
