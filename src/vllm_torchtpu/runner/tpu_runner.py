@@ -2124,6 +2124,7 @@ class TPUModelRunner(GPUModelRunner):
                 layer_to_raw[layer_name] = raw
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
+        manager_page_bytes: int | None = None
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, MambaSpec):
                 continue
@@ -2137,14 +2138,29 @@ class TPUModelRunner(GPUModelRunner):
             if raws:
                 plan.append((gid, raws))
                 state_block_size = group.kv_cache_spec.block_size
+                manager_page_bytes = group.kv_cache_spec.page_size_bytes
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
         for raw in raw_tensors:
             if raw.dim() > 1:
-                kernel_block_size = (raw.shape[-1] if get_kv_cache_layout()
-                                     == "HND" else raw.shape[1])
-                self._pool_block_split = (self.cache_config.block_size //
-                                          kernel_block_size)
+                # Manager blocks span whole pool pages. Which axis of the
+                # pool tensor carries tokens is backend-dependent — shape[1]
+                # for RPA pools, the last axis for the seq-on-lane (HND)
+                # layout, and for token-axis-packed caches (MLA) no single
+                # axis IS the kernel block's token count — so derive the
+                # manager-to-pool-block split from bytes, which is
+                # layout-agnostic: per-kernel-block bytes are
+                # prod(shape[1:]) * element_size in every layout, and the
+                # manager page comes from the mamba spec the platform
+                # derivation already sized against the backend's own
+                # page-size function. The divisibility assert is the guard.
+                pool_block_bytes = math.prod(
+                    raw.shape[1:]) * raw.element_size()
+                assert manager_page_bytes is not None
+                assert manager_page_bytes % pool_block_bytes == 0, (
+                    manager_page_bytes, pool_block_bytes)
+                self._pool_block_split = (manager_page_bytes //
+                                          pool_block_bytes)
                 break
 
     def _collect_mamba_state_seed_copies(self, scheduler_output,
