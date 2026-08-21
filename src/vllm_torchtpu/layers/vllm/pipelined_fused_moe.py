@@ -24,7 +24,6 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.pcp import get_pcp_world_size
 from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
 
 
@@ -34,18 +33,8 @@ def enable_pipelined_collective_and_compute() -> bool:
     Returns:
         bool: True if `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
 
-    Raises:
-        NotImplementedError: If `pcp_size > 1` when `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`.
     """
-    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
-        pcp_size = get_pcp_world_size()
-        if pcp_size > 1:
-            raise NotImplementedError(
-                "Pipelined MoE chunking currently only supports Data Parallelism (DP) "
-                f"and does not support Prefill Context Parallelism (PCP size {pcp_size} > 1)."
-            )
-        return True
-    return False
+    return envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0
 
 
 # Alias for alternative naming convention

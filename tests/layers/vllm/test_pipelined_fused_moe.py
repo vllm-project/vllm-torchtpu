@@ -62,24 +62,14 @@ def test_enable_pipelined_collective_and_compute():
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
         assert enable_pipelined_collective_and_compute() is False
 
-    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
-         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_world_size", return_value=1):
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384):
         assert enable_pipelined_collective_and_compute() is True
 
 
-def test_enable_pipelined_collective_raises_on_pcp():
-    """Verify enable_pipelined_collective_and_compute raises NotImplementedError when pcp_size > 1."""
-    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
-         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_world_size", return_value=2):
-        with pytest.raises(
-                NotImplementedError,
-                match="does not support Prefill Context Parallelism"):
-            enable_pipelined_collective_and_compute()
-
-    # When chunk_size == 0, pipelining is disabled so pcp_size > 1 does not raise
-    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0), \
-         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_world_size", return_value=2):
-        assert enable_pipelined_collective_and_compute() is False
+def test_enable_pipelined_collective_allows_pcp():
+    """Verify PCP does not disable MoE collective chunking."""
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384):
+        assert enable_pipelined_collective_and_compute() is True
 
 
 @pytest.mark.parametrize(
