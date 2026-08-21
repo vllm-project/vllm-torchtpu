@@ -19,6 +19,7 @@ from jax import numpy as jnp
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2_fused import can_fuse, gmm_v2_fused
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
@@ -114,6 +115,14 @@ def quantize_to_native_fp4_kmajor(w: jax.Array,
     return packed, scale
 
 
+def _is_fp4_weight(rhs: jax.Array) -> bool:
+    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
+    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
+    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
+    return (jnp.issubdtype(rhs.dtype, jnp.floating)
+            and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -124,11 +133,7 @@ def gmm_wrapper(lhs,
                 fuse_act=None,
                 preferred_element_type=None,
                 rhs_quant_dtype=None):
-    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
-    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
-    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
-                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -244,32 +249,51 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
+    # can_fuse is pure shape arithmetic over the same GmmConfigs the kernels
+    # would build, so this costs a few microseconds per trace and never traces
+    # a kernel. Shapes whose whole-expert weight slabs do not fit in VMEM
+    # (Qwen3-coder-480B, for one) keep the two-call path below.
+    fused_kwargs = dict(
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        preferred_element_type=x.dtype,
     )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
+    use_fused = envs.USE_FUSED_MOE_GMM and w1.dtype == w2.dtype and can_fuse(
+        x, w1, w2, group_sizes, w1_scale, w2_scale, w1_bias, w2_bias,
+        group_offset, **fused_kwargs)
+
+    if use_fused:
+        gmm2_res = gmm_v2_fused(x, w1, w2, group_sizes, w1_scale, w2_scale,
+                                w1_bias, w2_bias, group_offset, **fused_kwargs)
+    else:
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
+
+        gmm2_res = gmm_wrapper(gmm1_res,
+                               w2,
+                               w2_scale,
+                               w2_bias,
+                               group_sizes,
+                               group_offset,
+                               zero_initialize=False,
+                               preferred_element_type=x.dtype,
+                               rhs_quant_dtype=rhs_quant_dtype)
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    gmm2_res = gmm_wrapper(gmm1_res,
-                           w2,
-                           w2_scale,
-                           w2_bias,
-                           group_sizes,
-                           group_offset,
-                           zero_initialize=False,
-                           preferred_element_type=x.dtype,
-                           rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster

@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    USE_FUSED_MOE_GMM: bool = False
 
 
 def env_with_choices(
@@ -310,6 +311,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    # Run the MoE grouped GEMMs as one gmm_v2_fused call, keeping the
+    # post-activation intermediate in VMEM instead of writing it to HBM. Only
+    # applies to shapes whose whole-expert weight slabs fit in VMEM;
+    # fused_moe_gmm.moe_gmm checks that per shape and otherwise keeps the
+    # two-call path, so enabling this cannot change which models run.
+    "USE_FUSED_MOE_GMM":
+    env_bool("USE_FUSED_MOE_GMM"),
 }
 
 
