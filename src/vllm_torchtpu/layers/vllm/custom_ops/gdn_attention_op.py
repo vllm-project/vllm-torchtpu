@@ -323,6 +323,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # prefill-only path admitted at the platform boundary; its widened
         # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
         num_spec_tokens = self.num_spec
+
+        def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state, *args,
+                      **kwargs):
+            num_tokens = mixed_qkv.size(0)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            return torch.empty_like(conv_state), torch.empty_like(
+                recurrent_state), torch.empty(out_shape,
+                                              dtype=mixed_qkv.dtype,
+                                              device=mixed_qkv.device)
+
         if pcp_streaming:
             interleave_size = getattr(parallel_config,
                                       "cp_kv_cache_interleave_size", 0)
@@ -384,17 +394,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 input_partition_specs=input_partition_specs,
                 output_partition_specs=output_partition_specs,
             )
-
-            def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
-                          *args, **kwargs):
-                num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-                return torch.empty_like(conv_state), torch.empty_like(
-                    recurrent_state), torch.empty(out_shape,
-                                                  dtype=mixed_qkv.dtype,
-                                                  device=mixed_qkv.device)
-
-            gdn_jax_op.register_fake(_fake_gdn)
         else:
             op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"
             wrapped_fn = functools.partial(
@@ -411,16 +410,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                        wrapped_fn,
                                        donate_argnums=(3, 4))
 
-            def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
-                          *args, **kwargs):
-                num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-                return torch.empty_like(conv_state), torch.empty_like(
-                    recurrent_state), torch.empty(out_shape,
-                                                  dtype=mixed_qkv.dtype,
-                                                  device=mixed_qkv.device)
-
-            gdn_jax_op.register_fake(_fake_gdn)
+        gdn_jax_op.register_fake(_fake_gdn)
 
         def gdn_impl(
             mixed_qkv: torch.Tensor,
