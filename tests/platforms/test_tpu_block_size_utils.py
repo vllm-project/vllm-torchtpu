@@ -86,6 +86,13 @@ class FakeCompactMambaModel:
         return (torch.bfloat16, torch.float32)
 
 
+class FakeNonShardingMambaModel(FakeQwenMambaModel):
+
+    @staticmethod
+    def get_mamba_state_shape_from_config(_):
+        return ((3, 4096), (16, 128, 128))
+
+
 @pytest.fixture
 def vllm_config():
     vllm_config = MagicMock(spec=VllmConfig)
@@ -211,14 +218,15 @@ def test_disagg_uses_same_fit_as_single_server(vllm_config):
     assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
 
 
-def test_pcp_uses_full_tp_local_mamba_state(vllm_config):
+def test_pcp_uses_effective_tp_mamba_state(vllm_config):
     _configure_hybrid(vllm_config, kv_transfer_config=object())
     vllm_config.parallel_config.prefill_context_parallel_size = 4
 
     _update(vllm_config)
 
-    assert vllm_config.cache_config.block_size == 1280
-    assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+    # Effective TP = 1 * 4 = 4. Fit = 272 -> aligned to 256 kernel block is 512.
+    assert vllm_config.cache_config.block_size == 512
+    assert vllm_config.cache_config.mamba_page_size_padded == 512 * 1024
 
 
 def test_backend_minimum_is_part_of_the_block_floor(vllm_config):
@@ -282,3 +290,19 @@ def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):
     assert vllm_config.cache_config.block_size == 1280
     assert vllm_config.cache_config.mamba_block_size == 256
     assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+
+
+def test_hybrid_gdn_pcp_rejects_non_sharding_shape_calculator(vllm_config):
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = "FutureHybridForCausalLM"
+    vllm_config.cache_config.block_size = 256
+    vllm_config.cache_config.mamba_block_size = 256
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.parallel_config.prefill_context_parallel_size = 4
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeNonShardingMambaModel, None)), pytest.raises(
+                   ValueError,
+                   match="PCP-local Mamba state size must be exactly"):
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakeBatchedRPAAttentionBackend)
