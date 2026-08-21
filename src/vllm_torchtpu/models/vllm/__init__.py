@@ -4,6 +4,8 @@ _KIMI_MODEL = ("vllm_torchtpu.models.vllm.kimi_k3:"
                "KimiLinearForCausalLM")
 _KIMI_K3_MODEL = ("vllm_torchtpu.models.vllm.kimi_k3:"
                   "KimiK3ForConditionalGeneration")
+_DSV4_MODEL = ("vllm_torchtpu.models.vllm.deepseek_v4:"
+               "DeepseekV4ForCausalLM")
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -17,4 +19,5 @@ def register_models() -> None:
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration",
                                  _KIMI_K3_MODEL)
+    ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config

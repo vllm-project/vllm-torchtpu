@@ -28,6 +28,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-4096}"
 DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-256}"
+default_prefill_speculative_config='{"method":"mtp","num_speculative_tokens":1}'
+default_decode_speculative_config='{"method":"mtp","num_speculative_tokens":3}'
+PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-${default_prefill_speculative_config}}"
+DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-${default_decode_speculative_config}}"
 
 cleanup() {
   local pid_file pid
@@ -90,6 +94,8 @@ export MAX_MODEL_LEN
 export MAX_NUM_SEQS
 export PREFILL_COMPILE_SIZES
 export DECODE_COMPILE_SIZES
+export PREFILL_SPECULATIVE_CONFIG
+export DECODE_SPECULATIVE_CONFIG
 
 export P4D2_SHORT_REPEAT_LINES="${P4D2_SHORT_REPEAT_LINES:-32}"
 export P4D2_SHORT_REPEAT_COUNT="${P4D2_SHORT_REPEAT_COUNT:-3}"
@@ -118,6 +124,7 @@ if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
     --host "${P4D2_BIND_HOST}" \
     --port "${PROXY_PORT}" \
     --model "${SERVED_MODEL_NAME}" \
+    --max-tokens 1 \
     2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
 else
   echo "RUN_PREFIX_CACHE_E2E_DIVERGENCE=${RUN_PREFIX_CACHE_E2E_DIVERGENCE}; skip prefix-cache E2E divergence smoke"

@@ -60,8 +60,7 @@ from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.common.quant_methods import (DEEPSEEK_V4_FP8, FP8,
-                                                       get_tpu_quant_method)
+from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
 from vllm_torchtpu.layers.vllm import moe_routing, token_padding
@@ -69,6 +68,8 @@ from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.linear_common import quantized_matmul
+from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
 from vllm_torchtpu.logger import init_logger
@@ -632,6 +633,12 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                                   if self.block_quant else "weight_scale")
         self.fp8_backend = None
 
+    @property
+    def supports_internal_mk(self) -> bool:
+        # We need to take control of collective communication (AllGather/ReduceScatter)
+        # to pipeline them with MoE computation when chunking is enabled.
+        return enable_pipelined_collective_and_compute()
+
     def maybe_roundup_sizes(
         self,
         hidden_size: int,
@@ -822,24 +829,30 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                topk_ids, topk_weights)
+                topk_ids,
+                topk_weights,
+                is_local_tensor=enable_pipelined_collective_and_compute())
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
-        return fused_moe_gmm(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale_inv,
-            w2_scale=layer.w2_weight_scale_inv,
-            w1_bias=getattr(layer, 'w13_bias', None),
-            w2_bias=getattr(layer, 'w2_bias', None),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            experts_start=layer._experts_start,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-        )
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale_inv,
+            "w2_scale": layer.w2_weight_scale_inv,
+            "w1_bias": getattr(layer, 'w13_bias', None),
+            "w2_bias": getattr(layer, 'w2_bias', None),
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+        }
+        if enable_pipelined_collective_and_compute():
+            return pipelined_fused_moe_gmm(**kwargs)
+
+        return fused_moe_gmm(**kwargs)
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
@@ -905,22 +918,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
 
-        # For DSV4, non-expert dense linears use per-channel FP8 rather than block-quantized FP8.
-        # Gated on config name so generic FP8 models/tests without 'experts' prefixes are unaffected.
-        is_dsv4 = getattr(quant_config, "get_name", lambda: None)() == \
-            DEEPSEEK_V4_FP8
-        is_routed_expert = bool(prefix and ("experts" in prefix)
-                                and ("shared_experts" not in prefix))
-        if is_dsv4 and not is_routed_expert:
-            # Non-expert dense linear layers (attention and shared experts) use per-channel FP8
-            self.weight_block_size = None
-            self.block_quant = False
-            self._linear_quant_config = ("fp8", torch.float8_e4m3fn, None,
-                                         False)
-            self.is_channel_quant = True
-        else:
-            self._linear_quant_config = _get_linear_quant_config(
-                self.linear_config)
+        self._linear_quant_config = _get_linear_quant_config(
+            self.linear_config)
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,

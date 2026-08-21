@@ -26,7 +26,9 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
+                                           pooled_gdn_conv_state_bytes,
+                                           pooled_gdn_ssm_state_bytes)
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
@@ -733,8 +735,11 @@ def _build_v3_pool_state_plan(
     per_tok_elems = math.prod(pool.shape[2:])
     tok_bytes = per_tok_elems * jnp.dtype(pool.dtype).itemsize
     state_layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=n_v * d_k * d_v * 4,
-        conv_bytes=(kernel_size - 1) * conv_dim * 2,
+        ssm_bytes=pooled_gdn_ssm_state_bytes(num_v_heads=n_v,
+                                             head_k_dim=d_k,
+                                             head_v_dim=d_v),
+        conv_bytes=pooled_gdn_conv_state_bytes(kernel_size=kernel_size,
+                                               conv_dim=conv_dim),
         token_bytes=tok_bytes,
     )
     if state_layout.required_tokens > pool_block_tokens:

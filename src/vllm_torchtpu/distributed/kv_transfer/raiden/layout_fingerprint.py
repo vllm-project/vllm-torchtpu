@@ -22,6 +22,8 @@ from .pool_manifest import TAG_FA, PoolManifest
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
+GLM_EXPECTED_MINOR_TO_MAJOR = (3, 2, 1, 0)
+GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -143,7 +145,90 @@ __all__ = [
     "EXPECTED_FA_MINOR_TO_MAJOR",
     "EXPECTED_FA_TILES",
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
+    "GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
     "fa_page_tokens",
     "measured_fa_layout_fingerprint",
+    "measured_glm_layout_fingerprint",
 ]
+
+
+def measured_glm_layout_fingerprint(
+    manifest: PoolManifest,
+    *,
+    page_tokens: int,
+    layout_getter: Callable[[Any], Any] | None = None,
+    package_version: Callable[[str], str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Fingerprint of the admitted GLM cache layout, compared across peers.
+
+    The transfer copies raw bytes, so a prefix of rows must also be a byte
+    prefix of the page. That only holds for the natural
+    [blocks, rows, packing, width] physical order, so reject anything else --
+    for every pool, since one odd layer would corrupt just that layer.
+
+    Hash per-page geometry only: both peers must agree on it, but they size
+    their pools independently.
+    """
+    if not isinstance(manifest, PoolManifest):
+        raise TypeError("manifest must be a PoolManifest")
+    if page_tokens <= 0:
+        raise ValueError("page_tokens must be positive")
+    getter = layout_getter or _default_layout_getter
+    version = package_version or importlib.metadata.version
+
+    per_tag: dict[str, Any] = {}
+    shape_by_tag: dict[str, tuple[int, ...]] = {}
+    for pool in manifest.pools:
+        tensor = manifest.storages[pool.storage_index]
+        shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
+        if len(shape) != 4:
+            raise RuntimeError(
+                f"admitted {pool.tag} storage must be rank-4: shape={shape}")
+        known = shape_by_tag.setdefault(pool.tag, shape)
+        if known != shape:
+            raise RuntimeError(
+                f"admitted {pool.tag} storages disagree on shape: "
+                f"{known} vs {shape}")
+        layout = getter(tensor)
+        if layout is None:
+            raise RuntimeError(
+                f"admitted {pool.tag} storage has no materialized TPU layout")
+        raw_minor_to_major, raw_tiles, _ = layout
+        minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
+        tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
+        # The measured element bits are unreliable (0 for these tensors);
+        # the dtype is authoritative.
+        element_bits = 8 * int(tensor.element_size())
+        _, rows, packing, width = shape
+        if rows * packing != page_tokens:
+            raise RuntimeError(
+                f"{pool.tag} page geometry {rows}x{packing} does not match "
+                f"page_tokens {page_tokens}")
+        if minor_to_major != GLM_EXPECTED_MINOR_TO_MAJOR:
+            raise RuntimeError(
+                "GLM row transfers require the natural physical order: "
+                f"tag={pool.tag}, layer={pool.layer_name}, "
+                f"minor_to_major={minor_to_major}")
+        if tiles != ((packing, 128), (packing, 1)):
+            raise RuntimeError(
+                "GLM row transfers require the packed tile shape "
+                f"(({packing},128),({packing},1)): tag={pool.tag}, "
+                f"layer={pool.layer_name}, tiles={tiles}")
+        per_tag.setdefault(
+            pool.tag, {
+                "page_shape": [rows, packing, width],
+                "row_bytes": packing * width * element_bits // 8,
+                "minor_to_major": list(minor_to_major),
+                "tiles": [list(tile) for tile in tiles],
+                "element_size_in_bits": element_bits,
+            })
+
+    payload = {
+        "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": version("libtpu"),
+        "page_tokens": int(page_tokens),
+        "layouts": per_tag,
+    }
+    return canonical_layout_fingerprint(payload), payload

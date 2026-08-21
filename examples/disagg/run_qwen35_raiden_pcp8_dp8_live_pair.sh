@@ -344,11 +344,11 @@ role, role_dir, expected, api_port, controller_port, kv_port, transfer_port, sid
 with contextlib.redirect_stdout(sys.stderr):
     import torch
     import torch_tpu
-    import tpu_raiden
+    import tpu_sync
     import vllm
     import vllm_torchtpu
-    from tpu_raiden.api.torch.kv_cache_manager import _torch_impl
-    from tpu_raiden.rpc.raiden_controller import RaidenController, RaidenControllerServer
+    from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+    from tpu_sync.rpc.raiden_controller import RaidenController, RaidenControllerServer
     from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnector
 
     _tpu_raiden_torch = _torch_impl()
@@ -428,7 +428,7 @@ print(json.dumps({
     "tpu_raiden_torch_version": dist_version("tpu-raiden-torch"),
     "raiden_native_file": _tpu_raiden_torch.__file__,
     "vllm_torchtpu_fingerprint": package_fingerprint(vllm_torchtpu, {".py", ".so"}),
-    "tpu_raiden_fingerprint": package_fingerprint(tpu_raiden, {".py", ".so"}),
+    "tpu_raiden_fingerprint": package_fingerprint(tpu_sync, {".py", ".so"}),
     "has_timing_overlay": all(name in connector_text for name in (
         "controller_submit_ms", "reshard_e2e_latency_ms")),
     "tpu_premapped_buffer_size": premapped,
@@ -691,7 +691,7 @@ import threading
 import time
 from pathlib import Path
 
-from tpu_raiden.rpc.raiden_controller import RaidenController, RaidenControllerServer
+from tpu_sync.rpc.raiden_controller import RaidenController, RaidenControllerServer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--port", type=int, required=True)

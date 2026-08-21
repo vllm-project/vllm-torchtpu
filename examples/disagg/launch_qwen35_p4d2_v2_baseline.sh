@@ -123,6 +123,8 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 COMPILE_SIZES="${COMPILE_SIZES:-16384}"
 PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-${COMPILE_SIZES}}"
 DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-${COMPILE_SIZES}}"
+PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-}"
+DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
@@ -279,6 +281,8 @@ DECODE_TP=${DECODE_TP}
 DECODE_DP=${DECODE_DP}
 PREFILL_COMPILE_SIZES=${PREFILL_COMPILE_SIZES}
 DECODE_COMPILE_SIZES=${DECODE_COMPILE_SIZES}
+PREFILL_SPECULATIVE_CONFIG=${PREFILL_SPECULATIVE_CONFIG}
+DECODE_SPECULATIVE_CONFIG=${DECODE_SPECULATIVE_CONFIG}
 PREFILL_BLOCK_SIZE=${prefill_block_size_label}
 DECODE_BLOCK_SIZE=${decode_block_size_label}
 NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE}
@@ -344,6 +348,12 @@ fi
 decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "${decode_compilation_config}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --kv-transfer-config "${d_kv}")
 if [[ "${DECODE_DP}" -gt 1 ]]; then
   decode_args+=(--data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}")
+fi
+if [[ -n "${PREFILL_SPECULATIVE_CONFIG}" ]]; then
+  prefill_args+=(--speculative-config "${PREFILL_SPECULATIVE_CONFIG}")
+fi
+if [[ -n "${DECODE_SPECULATIVE_CONFIG}" ]]; then
+  decode_args+=(--speculative-config "${DECODE_SPECULATIVE_CONFIG}")
 fi
 if [[ -n "${PREFILL_BLOCK_SIZE}" ]]; then
   prefill_args+=(--block-size "${PREFILL_BLOCK_SIZE}")

@@ -1377,7 +1377,7 @@ class CpuTpuOffloadingHandlers:
             # CPU pool sized in kernel blocks, so CPU block IDs map 1:1 to
             # raiden host slots after _expand_transfer_ids (hybrid pool rows
             # stay uniform, so raiden's per-slot byte accounting is unchanged).
-            from tpu_raiden.api.torch import kv_cache_manager as _kcm
+            from tpu_sync.api.torch import kv_cache_manager as _kcm
             device_tensors = [[t] for t in tpu_tensors]
             # raiden holds raw pointers / PJRT aliases to these device buffers
             # for its lifetime. Keep the tensors (and thus the underlying

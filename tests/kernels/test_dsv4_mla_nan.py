@@ -13,11 +13,6 @@
 # limitations under the License.
 
 import os
-
-# Set up VMEM limit for TPU
-os.environ["LIBTPU_INIT_ARGS"] = (os.environ.get("LIBTPU_INIT_ARGS", "") +
-                                  " --xla_tpu_scoped_vmem_limit_kib=65536")
-
 import traceback
 
 import jax
@@ -30,6 +25,14 @@ mla_ragged_paged_attention = mla_module.mla_ragged_paged_attention
 
 
 def main():
+    # Set up VMEM limit for TPU. This must stay inside `main()`: this module is
+    # collected by the CI pytest session (which imports it even though it holds
+    # no tests), and LIBTPU_INIT_ARGS is read once when libtpu initializes, so
+    # setting it at import time silently reconfigures VMEM for every other test
+    # in the process and makes their numerics collection-order dependent.
+    os.environ["LIBTPU_INIT_ARGS"] = (os.environ.get("LIBTPU_INIT_ARGS", "") +
+                                      " --xla_tpu_scoped_vmem_limit_kib=65536")
+
     print("Imported mla from:", mla_module.__file__)
     # Initialize JAX TPU
     print("JAX devices:", jax.devices())

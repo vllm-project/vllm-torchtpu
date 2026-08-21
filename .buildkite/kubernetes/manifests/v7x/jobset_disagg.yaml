@@ -25,7 +25,7 @@
 #
 # Requires an image whose torch-tpu and tpu-raiden-torch were built
 # against the same XLA revision: a mismatched pair segfaults in
-# tpu_raiden's KVCacheManager at startup. Use a DOCKER_IMAGE override if
+# tpu_sync's KVCacheManager at startup. Use a DOCKER_IMAGE override if
 # the default prod:latest carries a mismatch.
 
 apiVersion: v1

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
+    TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
 
 
 def env_with_choices(
@@ -211,6 +213,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
     "TPU_RAIDEN_QWEN35_ADMISSION":
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
+    "TPU_RAIDEN_GLM_ADMISSION":
+    env_bool("TPU_RAIDEN_GLM_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
     # the existing v1 connector protocol; selecting ``raiden`` enables
     # the fail-closed controller path.
@@ -289,10 +293,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
 
-    # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
-    # chunked kernel.
-    "VLLM_TPU_USE_NAIVE_KDA":
-    env_bool("VLLM_TPU_USE_NAIVE_KDA"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE":
@@ -306,6 +306,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Post-gather MoE token chunk size for communication-computation pipelining.
+    # When set to 0, chunking and communication pipelining are disabled.
+    "TPU_MOE_COLLECTION_CHUNK_SIZE":
+    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
 }
 
 

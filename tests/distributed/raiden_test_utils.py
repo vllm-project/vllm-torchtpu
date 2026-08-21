@@ -50,3 +50,27 @@ class FakeTensor:
 
     def storage_offset(self):
         return self._storage_offset
+
+
+def glm_named_kv_caches(*,
+                        num_blocks=16,
+                        fa_shape=None,
+                        fa_esz=1,
+                        fa_dtype="torch.float8_e5m2",
+                        idx_shape=None):
+    """Named per-layer caches shaped like a GLM-5.2 materialization.
+
+    Two MLA latent caches plus one uint8 DSA indexer cache, all packed
+    [blocks, rows, packing, width].
+    """
+    fa_shape = fa_shape or (num_blocks, 256, 4, 640)
+    idx_shape = idx_shape or (num_blocks, 256, 4, 256)
+    named = {
+        f"model.layers.{idx}.self_attn.mla_attn":
+        FakeTensor(fa_shape, fa_esz, dtype=fa_dtype)
+        for idx in range(2)
+    }
+    named["model.layers.0.self_attn.indexer"] = FakeTensor(idx_shape,
+                                                           1,
+                                                           dtype="torch.uint8")
+    return named

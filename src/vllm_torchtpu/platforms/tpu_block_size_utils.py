@@ -118,10 +118,25 @@ def _hybrid_mamba_state_layout(
         model_config.architecture,
         model_config=model_config,
     )
-    # The pooled GDN op reads and writes the full TP-local state from one
-    # attention-shaped page, even when attention prefill is context-parallel.
-    shapes = tuple(model_cls.get_mamba_state_shape_from_config(vllm_config))
     dtypes = tuple(model_cls.get_mamba_state_dtype_from_config(vllm_config))
+    full_shapes = tuple(
+        model_cls.get_mamba_state_shape_from_config(vllm_config))
+    parallel_config = vllm_config.parallel_config
+    pcp_size = parallel_config.prefill_context_parallel_size
+    if pcp_size > 1:
+        # PCP-local GDN state is equivalent to adding PCP to the model's
+        # head-sharding factor. Shape calculators used here must therefore
+        # derive their sharded state dimensions from tensor_parallel_size.
+        orig_tp = parallel_config.tensor_parallel_size
+        try:
+            parallel_config.tensor_parallel_size = orig_tp * pcp_size
+            shapes = tuple(
+                model_cls.get_mamba_state_shape_from_config(vllm_config))
+        finally:
+            parallel_config.tensor_parallel_size = orig_tp
+    else:
+        shapes = full_shapes
+
     if len(shapes) != 2 or len(dtypes) != 2:
         raise ValueError(
             "TPU unified hybrid KV pool requires two GDN state regions "
@@ -131,6 +146,22 @@ def _hybrid_mamba_state_layout(
         (), dtype=dtypes[0]).element_size()
     ssm_bytes = math.prod(shapes[1]) * torch.empty(
         (), dtype=dtypes[1]).element_size()
+
+    if pcp_size > 1:
+        full_conv_bytes = math.prod(full_shapes[0]) * torch.empty(
+            (), dtype=dtypes[0]).element_size()
+        full_ssm_bytes = math.prod(full_shapes[1]) * torch.empty(
+            (), dtype=dtypes[1]).element_size()
+        if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes +
+                                                   full_ssm_bytes):
+            raise ValueError(
+                "PCP-local Mamba state size must be exactly 1/pcp_size of "
+                "the TP-local state: "
+                f"architecture={model_config.architecture!r}, "
+                f"pcp_size={pcp_size}, full_page_size_bytes="
+                f"{full_conv_bytes + full_ssm_bytes}, local_page_size_bytes="
+                f"{conv_bytes + ssm_bytes}")
+
     return derive_pooled_gdn_state_layout(
         ssm_bytes=ssm_bytes,
         conv_bytes=conv_bytes,

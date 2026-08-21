@@ -97,7 +97,6 @@ class PcpSequenceLayoutEligibility:
         dcp_size: int = 1,
         pipeline_parallel_size: int = 1,
         async_scheduling: bool = False,
-        speculative_enabled: bool = False,
         is_kv_producer: bool | None = None,
     ):
         self.pcp_size = pcp_size
@@ -105,7 +104,6 @@ class PcpSequenceLayoutEligibility:
         self.dcp_size = dcp_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
-        self.speculative_enabled = bool(speculative_enabled)
         self.is_kv_producer = is_kv_producer
 
     @classmethod
@@ -128,7 +126,6 @@ class PcpSequenceLayoutEligibility:
             dcp_size=parallel_config.decode_context_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             async_scheduling=bool(scheduler_config.async_scheduling),
-            speculative_enabled=vllm_config.speculative_config is not None,
             is_kv_producer=is_kv_producer,
         )
 
@@ -256,10 +253,6 @@ class PcpSequenceLayoutEligibility:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support pipeline "
                 "parallelism yet.")
-        if self.speculative_enabled:
-            raise NotImplementedError(
-                "PCP partial sequence layout does not support speculative "
-                "decoding yet.")
         if self.interleave_size <= 0:
             raise ValueError("PCP partial sequence layout requires "
                              "cp_kv_cache_interleave_size > 0.")
@@ -344,6 +337,7 @@ class PcpPreparedBatch:
     logits_indices_cpu: torch.Tensor
     logits_local_indices_cpu: torch.Tensor
     logits_owner_mask_cpu: torch.Tensor
+    packed_to_request_major_token_indices: np.ndarray
     request_major_to_packed_token_indices: np.ndarray
 
 
@@ -438,6 +432,8 @@ class PcpSequenceLayoutPlanner:
             logits_local_indices_cpu=prepared.logits_local_indices_cpu,
             logits_owner_mask_cpu=prepared.logits_owner_mask_cpu,
             requires_hidden_state_gather=True,
+            _packed_to_request_major_token_indices=(
+                prepared.packed_to_request_major_token_indices),
             _request_major_to_packed_token_indices=(
                 prepared.request_major_to_packed_token_indices),
         )
@@ -666,6 +662,11 @@ def prepare_pcp_sequence_layout(
         mrope_slice,
         token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
     )
+    packed_to_request_major_token_indices = np.full(
+        padded_total_num_scheduled_tokens, -1, dtype=np.int64)
+    packed_to_request_major_token_indices[
+        request_major_to_packed_token_indices] = np.arange(
+            request_major_to_packed_token_indices.size, dtype=np.int64)
 
     local_padded_total_num_scheduled_tokens = (
         padded_total_num_scheduled_tokens // pcp_size)
@@ -739,6 +740,8 @@ def prepare_pcp_sequence_layout(
         logits_indices_cpu=logits_indices_cpu,
         logits_local_indices_cpu=logits_local_indices_cpu,
         logits_owner_mask_cpu=logits_owner_mask_cpu,
+        packed_to_request_major_token_indices=(
+            packed_to_request_major_token_indices),
         request_major_to_packed_token_indices=(
             request_major_to_packed_token_indices),
     )

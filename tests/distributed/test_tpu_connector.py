@@ -3392,3 +3392,46 @@ class TestTPUConnectorStats(unittest.TestCase):
         stats = TPUConnectorWorker.get_kv_connector_stats(worker)
         assert stats is not None
         assert stats.data["prefill_queue_length"] == [1]
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.2 admission topology: prefill tp{N}/dp1 -> decode tp1/dp{M} only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("is_producer", "tp_size", "dp_size", "expected"), [
+    (True, 8, 1, "tp8_prefill"),
+    (False, 1, 8, "dp8_decode"),
+    (False, 1, 1, "dp1_decode"),
+])
+def test_glm_admission_topology_accepts_supported_shapes(
+        is_producer, tp_size, dp_size, expected):
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=tp_size,
+                                 is_producer=is_producer,
+                                 dp_size=dp_size,
+                                 pcp_size=1)
+
+    assert worker._raiden_glm_admission_topology() == expected
+
+
+@pytest.mark.parametrize(
+    ("is_producer", "tp_size", "dp_size", "pcp_size", "message"),
+    [
+        # A TP>1 decode engine would need one plan per destination worker
+        (False, 4, 2, 1, "consumer tensor_parallel_size=4"),
+        # A DP>1 prefill engine has no single source unit set.
+        (True, 8, 2, 1, "producer tensor_parallel_size=8"),
+        # PCP is not supported on either role.
+        (False, 1, 8, 2, "prefill_context_parallel_size=2"),
+    ])
+def test_glm_admission_topology_rejects_unsupported_shapes(
+        is_producer, tp_size, dp_size, pcp_size, message):
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=tp_size,
+                                 is_producer=is_producer,
+                                 dp_size=dp_size,
+                                 pcp_size=pcp_size)
+
+    with pytest.raises(ValueError, match=message):
+        worker._raiden_glm_admission_topology()

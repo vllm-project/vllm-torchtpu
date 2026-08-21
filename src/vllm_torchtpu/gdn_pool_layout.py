@@ -15,6 +15,40 @@ POOLED_GDN_ARCHITECTURES = frozenset({
     "Qwen3_5MoeForConditionalGeneration",
 })
 
+# The pooled GDN kernel's state dtypes inside the unified pool are fixed:
+# conv rows are bf16 and the SSM region is fp32, independent of the layer's
+# declared MambaSpec dtypes (which only drive vLLM's page-size accounting).
+# Everything that describes pool bytes — the kernel's state plan and the
+# Raiden reshard manifest — must take its dtypes and sizes from here, so no
+# two consumers can disagree about the physical layout.
+#
+# These are torch dtype *names*, not torch.dtype objects: this module is
+# imported by the JAX kernel path and by deviceless tests, so it must stay
+# importable without torch.
+POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
+POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
+
+# Derived from the dtypes above rather than declared separately, so changing
+# a state dtype cannot leave a stale byte width behind.
+_ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
+POOLED_GDN_CONV_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[
+    POOLED_GDN_CONV_STATE_DTYPE]
+POOLED_GDN_SSM_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[POOLED_GDN_SSM_STATE_DTYPE]
+
+
+def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
+    """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
+    rows of conv_dim channels. The kernel keeps no spec-decode widening in
+    the pool (verify windows roll back via per-slot checkpoints instead)."""
+    return (kernel_size - 1) * conv_dim * POOLED_GDN_CONV_STATE_ITEMSIZE
+
+
+def pooled_gdn_ssm_state_bytes(*, num_v_heads: int, head_k_dim: int,
+                               head_v_dim: int) -> int:
+    """Live bytes of one slot's SSM region: fp32, head-major and dense."""
+    return (num_v_heads * head_k_dim * head_v_dim *
+            POOLED_GDN_SSM_STATE_ITEMSIZE)
+
 
 @dataclass(frozen=True)
 class PooledGDNStateLayout:

@@ -349,17 +349,17 @@ def apply_tpu_patches() -> None:
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
-    from vllm_torchtpu import (_patch_dflash_bypass_v2_runner_check,
-                               _patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env,
-                               _patch_vllm_compile_prefix_isolation,
-                               _patch_vllm_config_triton_tpu,
-                               _patch_vllm_piecewise_backend)
+    from vllm_torchtpu import (  # isort: skip
+        _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
+        _patch_multiproc_worker_global_rank_env,
+        _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
+        _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_vllm_reset_compile_wrapper()
     _patch_vllm_piecewise_backend()
     _patch_vllm_compile_prefix_isolation()
+    _patch_vllm_merge_multimodal_embeddings()
     _patch_dflash_bypass_v2_runner_check()
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import \
@@ -629,6 +629,23 @@ class TpuPlatform(Platform):
         return
 
     @classmethod
+    def device_id_to_physical_device_id(cls, device_id: int) -> int:
+        """Map logical DP/TP device id to a local physical TPU device.
+
+        Under multi-core TPU (e.g. v7x with 2 cores per chip), the logical
+        rank/device_id may exceed the physical chip count in TPU_VISIBLE_CHIPS.
+        Wrap with modulo so every rank resolves to a valid local physical chip.
+        """
+        device_control_env = os.environ.get(cls.device_control_env_var, "")
+        if device_control_env:
+            device_ids = [
+                s.strip() for s in device_control_env.split(",") if s.strip()
+            ]
+            if device_ids:
+                return int(device_ids[device_id % len(device_ids)])
+        return int(device_id % max(1, cls.device_count()))
+
+    @classmethod
     def device_count(cls) -> int:
         """Local physical chip count on this host, stable across contexts.
 
@@ -887,18 +904,13 @@ class TpuPlatform(Platform):
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
         # the pool's align-mode mamba state seed copies; other cache modes
-        # and speculative decoding must be rejected up front instead of
-        # failing partway through warmup.
+        # must be rejected up front instead of failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
                     "mamba_cache_mode='align' (got "
                     f"{cache_config.mamba_cache_mode!r}).")
-            if vllm_config.speculative_config is not None:
-                raise NotImplementedError(
-                    "Speculative decoding is not yet supported with hybrid "
-                    "Mamba prefix caching (mamba_cache_mode='align').")
             if not unified_kv_layout_enabled(vllm_config):
                 # Seed copies live on the pooled path only, so the per-layer
                 # layout restores no Mamba state on a prefix-cache hit and

@@ -288,7 +288,8 @@ def test_hybrid_materialization_builds_raiden_logical_regions():
         gdn_geometry=rpm.GdnHeadGeometry(local_key_heads=1,
                                          local_value_heads=1,
                                          key_head_dim=2,
-                                         value_head_dim=4),
+                                         value_head_dim=4,
+                                         conv_kernel_size=3),
         mamba_group_ordinal_by_layer={"model.layers.1.mamba": 0},
     )
 
@@ -305,7 +306,9 @@ def test_hybrid_materialization_builds_raiden_logical_regions():
     assert all(pool.num_blocks == 4 for pool in manifest.pools)
     assert all(pool.block_stride_bytes == 1024 for pool in manifest.pools)
     assert ssm.base_offset_bytes == 0
-    assert conv.base_offset_bytes == 2 * 4 * 8 * torch.float32.itemsize
+    # Kernel-tied SSM bytes from the geometry (1 V head × 4 × 2 fp32), not
+    # from the declared MambaSpec ssm shape.
+    assert conv.base_offset_bytes == 1 * 4 * 2 * torch.float32.itemsize
     rpm.verify_storage_binding(manifest, materialized.kv_caches,
                                materialized.raw_tensors)
 

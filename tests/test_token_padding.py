@@ -77,3 +77,30 @@ def test_zero_routing_weights_for_padding_dp_gather_rank_order(monkeypatch):
         assert w2[3].tolist() == [0.5, 0.5]
     finally:
         token_padding.set_padding_state(None)
+
+
+def test_zero_routing_weights_for_padding_is_local_tensor(monkeypatch):
+    provider = TokenPaddingState(
+        local_padding_mask=torch.tensor([False, True]))
+    token_padding.set_padding_state(provider)
+
+    class _FakeGroup:
+        world_size = 2
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            raise AssertionError(
+                "all_gather should not be called when is_local_tensor=True")
+
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_dp_group",
+                        lambda: _FakeGroup())
+    try:
+        ids = torch.arange(4, dtype=torch.int32).reshape(2, 2)
+        weights = torch.full((2, 2), 0.5)
+        ids2, w2 = token_padding.zero_routing_weights_for_padding(
+            ids, weights, is_local_tensor=True)
+        assert torch.equal(ids2, ids)
+        assert w2[0].tolist() == [0.5, 0.5]
+        assert float(w2[1].abs().sum()) == 0.0
+    finally:
+        token_padding.set_padding_state(None)

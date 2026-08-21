@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Focused tests for native Stage-3 byte-span lowering.
 
-Raw GDN spans move physical pool bytes, so every extent the lowering
-emits must be a whole multiple of the 1024-byte physical pool token.
-Fixtures therefore use real token-scaled geometries: the Qwen3.5-35B
-TP8 shard for the QK pair-blocked vocabulary and a TP4 shard for the
-legacy segment-major vocabulary (whose per-segment extents are already
-token multiples at that degree).
+Every extent the lowering emits must be a whole multiple of its class's
+physical granule. For raw GDN spans that granule is the 1024-byte pool
+token, so those fixtures use real token-scaled geometries: the
+Qwen3.5-35B TP8 shard for the QK pair-blocked vocabulary and a TP4 shard
+for the legacy segment-major vocabulary. For GLM-5.2 the granule is the
+packed row (4 tokens: 2560 B of latent, 1024 B of indexer).
 """
 
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
-    PoolByteSpan, lower_gdn_state_shard_spans)
+    PoolByteSpan, lower_gdn_state_shard_spans, lower_glm_row_spans)
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
     RegionSpec
 
@@ -306,3 +306,128 @@ def test_gdn_lowering_rejects_non_dense_conv_layout():
         assert "dense tap-major" in str(exc)
     else:
         raise AssertionError("non-dense conv layout was accepted")
+
+
+# ---------------------------------------------------------------------------
+# GLM row-granular span lowering (TP-replicated caches, striped pages).
+# ---------------------------------------------------------------------------
+
+_GLM_PAGE_TOKENS = 1024
+_GLM_FA_ROW_BYTES = 2560  # 4 tokens x 640 B
+_GLM_FA_LIVE = 256 * _GLM_FA_ROW_BYTES
+_GLM_IDX_ROW_BYTES = 1024  # 4 tokens x 256 B
+_GLM_IDX_LIVE = 256 * _GLM_IDX_ROW_BYTES
+
+
+def _glm_row_spans(**overrides):
+    kwargs = dict(
+        tag="fa",
+        num_tokens=3 * _GLM_PAGE_TOKENS,
+        transfer_rank=0,
+        parallelism=2,
+        page_tokens=_GLM_PAGE_TOKENS,
+        live_bytes_per_block=_GLM_FA_LIVE,
+        row_bytes=_GLM_FA_ROW_BYTES,
+        block_ids=[10, 11, 12],
+    )
+    kwargs.update(overrides)
+    return lower_glm_row_spans(**kwargs)
+
+
+def test_glm_row_spans_round_robin_full_pages():
+    rank0 = _glm_row_spans(transfer_rank=0)
+    rank1 = _glm_row_spans(transfer_rank=1)
+
+    assert rank0.dst_space_version == 1
+    assert rank0.block_ids == (10, 11, 12)
+    assert rank0.spans == (
+        PoolByteSpan(src_block_ordinal=0,
+                     src_offset_bytes=0,
+                     dst_block_index=0,
+                     dst_offset_bytes=0,
+                     size_bytes=_GLM_FA_LIVE),
+        PoolByteSpan(src_block_ordinal=2,
+                     src_offset_bytes=0,
+                     dst_block_index=0,
+                     dst_offset_bytes=2 * _GLM_FA_LIVE,
+                     size_bytes=_GLM_FA_LIVE),
+    )
+    assert rank1.spans == (PoolByteSpan(src_block_ordinal=1,
+                                        src_offset_bytes=0,
+                                        dst_block_index=0,
+                                        dst_offset_bytes=_GLM_FA_LIVE,
+                                        size_bytes=_GLM_FA_LIVE), )
+    assert rank0.declared_bytes == 2 * _GLM_FA_LIVE
+    assert rank1.declared_bytes == _GLM_FA_LIVE
+
+
+def test_glm_row_spans_trim_partial_tail_to_rows():
+    for tag, live, row_bytes in (("fa", _GLM_FA_LIVE, _GLM_FA_ROW_BYTES),
+                                 ("dsa.idx", _GLM_IDX_LIVE,
+                                  _GLM_IDX_ROW_BYTES)):
+        registration = _glm_row_spans(
+            tag=tag,
+            num_tokens=2 * _GLM_PAGE_TOKENS + 5,
+            live_bytes_per_block=live,
+            row_bytes=row_bytes,
+        )
+        # Rank 0 of 2 owns pages {0, 2}; 5 tail tokens round up to 2 rows.
+        assert [span.size_bytes
+                for span in registration.spans] == [live, 2 * row_bytes]
+        assert registration.spans[-1].dst_offset_bytes == 2 * live
+        assert registration.declared_bytes == live + 2 * row_bytes
+
+
+def test_glm_row_spans_parallelism_one_owns_every_page():
+    registration = _glm_row_spans(num_tokens=2 * _GLM_PAGE_TOKENS,
+                                  parallelism=1,
+                                  block_ids=[7, 9])
+    assert [span.src_block_ordinal for span in registration.spans] == [0, 1]
+    assert [span.size_bytes
+            for span in registration.spans] == [_GLM_FA_LIVE, _GLM_FA_LIVE]
+
+
+def test_glm_row_spans_rank_owning_no_pages_keeps_block_ids():
+    registration = _glm_row_spans(num_tokens=100,
+                                  transfer_rank=5,
+                                  parallelism=8,
+                                  block_ids=[3])
+    assert registration.spans == ()
+    assert registration.declared_bytes == 0
+    assert registration.block_ids == (3, )
+
+
+def test_glm_row_spans_union_partitions_request_bytes():
+    num_pages, parallelism = 11, 8
+    num_tokens = (num_pages - 1) * _GLM_PAGE_TOKENS + 7
+    owners: dict[int, int] = {}
+    total = 0
+    for rank in range(parallelism):
+        registration = _glm_row_spans(num_tokens=num_tokens,
+                                      transfer_rank=rank,
+                                      parallelism=parallelism,
+                                      block_ids=list(range(num_pages)))
+        for span in registration.spans:
+            assert span.src_block_ordinal not in owners
+            owners[span.src_block_ordinal] = rank
+        total += registration.declared_bytes
+    assert sorted(owners) == list(range(num_pages))
+    assert total == (num_pages - 1) * _GLM_FA_LIVE + 2 * _GLM_FA_ROW_BYTES
+
+
+def test_glm_row_spans_validation_failures():
+    cases = (
+        (dict(block_ids=[10, 11]), "complete request page set"),
+        (dict(live_bytes_per_block=_GLM_FA_LIVE + 1), "whole rows"),
+        (dict(page_tokens=1000), "spread evenly"),
+        (dict(transfer_rank=2), "outside parallelism"),
+        (dict(num_tokens=0), "num_tokens must be positive"),
+        (dict(row_bytes=0), "row_bytes and live_bytes_per_block"),
+    )
+    for overrides, message in cases:
+        try:
+            _glm_row_spans(**overrides)
+        except ValueError as exc:
+            assert message in str(exc), (overrides, exc)
+        else:
+            raise AssertionError(f"accepted invalid input: {overrides}")

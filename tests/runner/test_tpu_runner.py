@@ -76,6 +76,77 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
         assert kv_transfer_state._KV_CONNECTOR_AGENT is connector
 
 
+@pytest.mark.parametrize(
+    ("outcomes", "raises_after_retry"),
+    [
+        ([False, True], False),
+        ([False, False], True),
+    ],
+)
+def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
+    attempts = MagicMock(side_effect=outcomes)
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[4096],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_pcp_mtp_prefill=attempts,
+    )
+
+    expectation = (pytest.raises(
+        RuntimeError, match="PCP MTP prefill warmup failed after retry")
+                   if raises_after_retry else contextlib.nullcontext())
+    with patch.object(tpu_runner,
+                      "_suspend_kv_transfer_group",
+                      return_value=contextlib.nullcontext()), expectation:
+        TPUModelRunner._warmup_pcp_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [
+        ((4096, ), {
+            "quiet": True
+        }),
+        ((4096, ), {}),
+    ]
+
+
+def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
+    executed = []
+    runner = SimpleNamespace(
+        max_model_len=64,
+        kv_cache_config=SimpleNamespace(
+            num_blocks=100,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8)),
+            ],
+        ),
+        execute_model=MagicMock(side_effect=lambda so: executed.append(so)),
+        sample_tokens=MagicMock(),
+        take_draft_token_ids=MagicMock(),
+        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+    )
+
+    assert TPUModelRunner._warmup_one_pcp_mtp_prefill(runner, 31) is True
+
+    assert len(executed) == 1
+    scheduler_output = executed[0]
+    assert scheduler_output.total_num_scheduled_tokens == 31
+    assert scheduler_output.num_scheduled_tokens == {"__pcp_mtp_warmup__": 31}
+    assert len(scheduler_output.scheduled_new_reqs) == 1
+    request = scheduler_output.scheduled_new_reqs[0]
+    assert request.req_id == "__pcp_mtp_warmup__"
+    assert len(request.prompt_token_ids) == 31
+    assert request.block_ids == ([98, 99], [96, 97, 98, 99])
+    assert scheduler_output.scheduled_cached_reqs.req_ids == []
+    runner.sample_tokens.assert_called_once_with(None)
+    runner.take_draft_token_ids.assert_called_once_with()
+    runner._warmup_spec_decode_cleanup.assert_called_once_with(
+        "__pcp_mtp_warmup__")
+
+
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     """Run _prepare_async_token_substitution_indices with a minimal fake self.
     req_id_to_index_copy holds each request's *position*; with spec_k set the

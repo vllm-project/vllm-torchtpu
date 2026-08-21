@@ -34,9 +34,15 @@ Key components and mechanisms:
   Prefill Context Parallelism (PCP) across ranks and Data Parallelism (DP)
   with independent per-engine controller ports and job names.
 
-- Two-phase admission: `insert_and_lock` atomically pins the whole batch, then
-  a post-admission `lookup` (stable under the job's own pins) picks out the
+- Two-phase admission: `insert` atomically pins the whole batch, then a
+  post-admission `lookup` (stable under the job's own pins) picks out the
   entries this admission inserted, and issues a DMA save for exactly those.
+
+- Pin lifecycle: the store hands out a pin with the answer — `lookup` pins what
+  it found, `insert` pins what it admitted — and a successful `save` or local
+  `load` spends that pin. Only the pins no transfer consumed are given back by
+  hand, which is what a job's terminal cleanup does. Bytes read from a peer are
+  never pinned here and never released.
 
 - Directory as the single source of truth: `prepare_store` probes Raiden per
   key to decide what to offer, so a key displaced from the LRU is re-offered
@@ -47,9 +53,10 @@ Key components and mechanisms:
   poison in-flight jobs to prevent committing torn bytes from reused blocks.
 
 - Cross-instance KV sharing: Saved blocks are published to the global registry
-  for cluster-wide reuse. Lookups resolve `REMOTE` hits, reserve host landing
-  capacity, and issue `read_remote` directly into HBM, promoting successful
-  fetches to `HOST_AND_HBM`.
+  for cluster-wide reuse. Lookups resolve `REMOTE` hits and issue `read_remote`
+  straight into HBM. A peer read borrows nothing from the local store: it
+  reserves no capacity, keeps no host copy, and leaves no directory entry, so
+  the same key is fetched again on every miss until a local store admits it.
 
 See `raiden_connector.py` for connector wiring, device fencing, and echo channels.
 """
@@ -122,9 +129,10 @@ class Admission:
     """Exact-batch record of one launched store/load job.
 
     Raiden keys its candidate-restoration state by the sorted hash batch
-    passed to `insert_and_lock`, so release / rollback must use exactly the
-    admitted batch, exactly once. This record is the single source of truth
-    for that batch and for which cleanup the job's terminal state owes.
+    passed to `insert`, so release / rollback must use exactly the admitted
+    batch, exactly once. This record is the single source of truth for that
+    batch, for which of its pins are still held, and for which cleanup the
+    job's terminal state owes.
     """
     job_id: int
     op: AdmissionOp
@@ -142,9 +150,14 @@ class Admission:
     # through get_block_ids_with_load_errors on failure.
     req_id: str | None = None
     dst_device_block_ids: list[int] = field(default_factory=list)
-    # Loads only: the sub-hashes fetched from a peer via read_remote
-    # rather than the local host pool. Drives the remote poll.
+    # Loads only: the sub-hashes fetched from a peer via read_remote rather
+    # than the local host pool. Drives the remote poll, and marks the
+    # sub-hashes this job holds no pin for — a peer read neither takes one nor
+    # spends one.
     remote_sub_hashes: set[bytes] = field(default_factory=set)
+    # Sub-hashes whose pin a completed transfer already spent. Releasing one of
+    # these again would drop a pin the job no longer holds.
+    consumed_sub_hashes: set[bytes] = field(default_factory=set)
     # Stores only: the sub-hashes actually saved (newly admitted HBM entries;
     # pre-existing HOST entries were pinned, not re-saved) and the remaining
     # retry budget for the failed subset.
@@ -218,7 +231,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 "and cross-instance lookups can never hit.")
 
         if store is None:
-            from tpu_raiden.api.torch.kv_cache_manager import _torch_impl
+            from tpu_sync.api.torch.kv_cache_manager import _torch_impl
             store_types = _torch_impl()
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
@@ -252,24 +265,33 @@ class RaidenOffloadingManager(OffloadingManager):
                  if self._enable_global else ""))
         else:
             # Injected store (tests): the caller supplies the module holding
-            # BlockStatus / RaidenBlockID so tpu_raiden isn't imported.
+            # BlockStatus / RaidenBlockId so tpu_sync isn't imported.
             assert store_types is not None
         self._store = store
         self._block_status = store_types.BlockStatus
-        self._block_id_cls = store_types.RaidenBlockID
+        self._block_id_cls = store_types.RaidenBlockId
         self._raiden_id = self._store.raiden_id
 
         # The connector's only cache-state bookkeeping, and it is
         # load-bearing: it bars a second admission of a key whose store job is
         # in flight (fence-parked or launched), covering the window between
-        # `prepare_store` and `insert_and_lock` where the Raiden directory
+        # `prepare_store` and `insert` where the Raiden directory
         # holds nothing for the key. Every other store/skip/touch decision
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
 
         # Peer location slices cached from global lookups and consumed during
-        # `prepare_load` to reserve local host landing slots.
+        # `prepare_load`.
         self._remote_slices: dict[bytes, object] = {}
+
+        # Peer location slices `prepare_load` accepted, held until
+        # `submit_load_job` hands them to read_remote. A peer read leaves no
+        # local directory entry, so the slice is the only record that a
+        # sub-hash lives elsewhere, and it must outlive the scheduler step that
+        # found it. An entry a job never claims is harmless: the next lookup
+        # re-resolves the hash, and a slice that has gone stale simply fails
+        # its read and recomputes.
+        self._pending_remote_slices: dict[bytes, object] = {}
 
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
@@ -295,13 +317,44 @@ class RaidenOffloadingManager(OffloadingManager):
         f = self._device_block_size_factor
         return [b * f + i for b in device_block_ids for i in range(f)]
 
+    # -- pin bookkeeping -------------------------------------------------
+
+    def _probe(self,
+               sub_hashes: list[bytes],
+               *,
+               enable_global: bool = False) -> list[tuple[bytes, object]]:
+        """Read the directory without laying claim to what it reports.
+
+        `lookup` pins its hits by default so the answer cannot be evicted
+        before the caller uses it. A probe uses the answer to make a decision
+        and transfers nothing, so it asks for no pin: taking one and handing it
+        straight back would drop the entry at the Most Recently Used position
+        and quietly reorder eviction, which is `touch`'s job to do on purpose.
+        """
+        return self._store.lookup(sub_hashes,
+                                  enable_global=enable_global,
+                                  pin_found=False)
+
+    def _pins_still_held(self, admission: Admission) -> list[bytes]:
+        """The job's sub-hashes whose pin nothing has spent yet.
+
+        A successful save or local load consumes the pin it was handed, and a
+        peer read never took one; releasing either would drop a pin the job
+        does not hold. What is left is what a terminal job owes back.
+        """
+        return [
+            sub_hash for sub_hash in admission.sub_hashes
+            if sub_hash not in admission.consumed_sub_hashes
+            and sub_hash not in admission.remote_sub_hashes
+        ]
+
     def _newly_inserted_sub_hashes(
             self, sub_hashes: list[bytes],
             device_ids: list[int]) -> list[bytes] | None:
         """Return the sub-hashes this admission itself inserted — the ones a
         DMA save must copy to host.
 
-        Called immediately after `insert_and_lock` pinned the whole batch,
+        Called immediately after `insert` pinned the whole batch,
         `sub_hashes[i]` having been admitted with device block `device_ids[i]`.
         The pins hold the directory still, so a single lookup decides every
         sub-hash:
@@ -313,13 +366,19 @@ class RaidenOffloadingManager(OffloadingManager):
         - REMOTE: the bytes live on a peer; nothing to transfer locally.
 
         Returns None when a sub-hash is missing, or sits in a state none of
-        the above covers (an HBM entry bound to a device block this job never
-        supplied). Sub-hashes are per-key unique and `_inflight_store_keys`
-        bars same-key concurrent jobs, so neither is reachable while the
-        connector's invariants hold; the caller fails the job closed rather
-        than guess which bytes are live.
+        the above covers: an HBM entry bound to a device block this job never
+        supplied. That entry is the residue of an earlier save that failed and
+        exhausted its retries — the store has no removal API, so a dead device
+        binding outlives the job that made it and an insert pins such an entry
+        in place rather than rebinding it. Its recorded device block has since
+        been reused, so the bytes behind it are not this key's; the caller
+        fails the job closed rather than ship them. The entry is unpinned and
+        evictable, so the key stores normally again once the store reclaims
+        the slot.
         """
-        matched = self._store.lookup(sub_hashes)
+        # The admission already holds one pin per sub-hash, and that is the
+        # pin the save spends; this only needs to read their status.
+        matched = self._probe(sub_hashes)
         if len(matched) < len(sub_hashes):
             logger.error(
                 "TPURaidenOffloadingConnector: admitted sub-hash vanished under its own "
@@ -354,12 +413,14 @@ class RaidenOffloadingManager(OffloadingManager):
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
-        # Non-mutating peek across all sub-hashes (no LRU recency update).
+        # A probe across all sub-hashes, not a claim: the store pins every
+        # local hit it reports, and those pins go straight back below.
+        # `prepare_load` takes them again when the scheduler commits to a load.
         # With the global registry enabled, local misses query remote peer slices.
         # If the registry is unreachable or times out, the error is swallowed and
         # lookup safely falls back to local-only caching without failing requests.
         allow_remote = self._enable_global
-        matches = self._store.lookup(sub_hashes, enable_global=allow_remote)
+        matches = self._probe(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
             return LookupResult.MISS
         all_local = True
@@ -387,67 +448,64 @@ class RaidenOffloadingManager(OffloadingManager):
         return LookupResult.HIT
 
     def touch(self, keys, req_context: ReqContext) -> None:
-        # Pin and immediate release moves entries to the Most Recently Used
-        # (MRU) position, refreshing their LRU order. Every key is probed
-        # first, because that probe guards the pin: Raiden's Pin() resurrects
-        # entries sitting in the eviction-candidate list back into the active
-        # set without a compensating eviction, so a key whose chain is no
-        # longer fully visible must not be touched — it is skipped and left
-        # for prepare_store to re-offer. (Scheduler calls are single-threaded,
-        # so nothing can displace an entry between this probe and the pin.)
+        # A lookup pins what it finds and releasing drops the entry back at
+        # the Most Recently Used position, so probe-then-release is the touch:
+        # it refreshes LRU order and leaves the entry evictable again, holding
+        # nothing. A partially resident chain needs no special case — only the
+        # entries that were actually found move, and prepare_store re-offers
+        # the key on its next appearance.
         for key in keys:
             sub_hashes = self._sub_hashes(key)
-            if len(self._store.lookup(sub_hashes)) < len(sub_hashes):
-                continue
-            if self._store.pin(sub_hashes):
-                self._store.release(sub_hashes)
+            held = [
+                sub_hash for sub_hash, block in self._store.lookup(sub_hashes)
+                if block.status != self._block_status.REMOTE
+            ]
+            if held:
+                self._store.release(held)
 
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
         sub_hashes = self._expand_keys(keys)
-        # Install and pin remote sub-hashes via insert_and_lock(on_host=True),
-        # which records peer mappings and reserves host landing capacity.
-        # Entries that became local in the interim are pinned in-place;
-        # submit_load_job partitions by live status and loads them locally.
-        remote_hashes: list[bytes] = []
-        remote_slices: list[object] = []
+        # Split the batch by where the bytes are. A local sub-hash is pinned
+        # here so it survives until the load runs; a peer sub-hash carries its
+        # slice forward to submit_load_job instead, because a peer read borrows
+        # nothing from this store — there is no landing capacity to reserve and
+        # no local entry to pin.
+        #
+        # Residency decides, not the stash: a sub-hash the stash calls remote
+        # but that is resident here — a concurrent fetch landed it, or another
+        # request stored it — is loaded locally, which is both cheaper and the
+        # only option once the peer stops advertising it. That is why the batch
+        # is walked rather than partitioned in one pass: a lookup answers with
+        # the resident PREFIX of what it was asked, stopping at the first hash
+        # it cannot find, so each miss is resolved against the stash and the
+        # walk resumes after it.
+        remote_slices: dict[bytes, object] = {}
         local_hashes: list[bytes] = []
-        for sub_hash in sub_hashes:
-            block = self._remote_slices.pop(sub_hash, None)
-            if block is not None:
-                remote_hashes.append(sub_hash)
-                remote_slices.append(block)
-            else:
-                local_hashes.append(sub_hash)
-        if local_hashes and not self._store.pin(local_hashes):
-            # Lost race against eviction between lookup and pin (Raiden's pin is
-            # all-or-nothing, so no entries are held). Return an unpinned spec
-            # so submit_load_job fails the job cleanly and triggers recomputation.
-            logger.warning(
-                "TPURaidenOffloadingConnector: prepare_load lost %d sub-blocks for request "
-                "%s to eviction between lookup and pin; the load job will "
-                "fail cleanly and the blocks recompute", len(local_hashes),
-                req_context.req_id)
-            return RaidenLoadStoreSpec(keys, pinned=False)
-        if remote_hashes:
-            # Reserving host landing capacity may displace older LRU entries;
-            # a displaced key misses `prepare_store`'s next probe and is
-            # re-offered there.
-            installed = self._store.insert_and_lock(remote_hashes,
-                                                    remote_slices,
-                                                    on_host=True)
-            if not installed:
-                # Host landing capacity is exhausted under active pin pressure.
-                # Unwind pre-existing local pins and return an unpinned spec to
-                # fail the job cleanly, allowing the blocks to recompute.
+        idx = 0
+        while idx < len(sub_hashes):
+            matched = self._store.lookup(sub_hashes[idx:])
+            local_hashes.extend(sub_hash for sub_hash, _ in matched)
+            idx += len(matched)
+            if idx == len(sub_hashes):
+                break
+            block = self._remote_slices.pop(sub_hashes[idx], None)
+            if block is None:
+                # Neither resident nor a peer's: the entry the lookup promised
+                # is gone. Give back the pins taken so far and return an
+                # unpinned spec so submit_load_job fails the job cleanly and
+                # the blocks recompute.
                 if local_hashes:
                     self._store.release(local_hashes)
                 logger.warning(
-                    "TPURaidenOffloadingConnector: prepare_load could not reserve landing "
-                    "capacity for %d remote sub-blocks (request %s); the "
-                    "load job will fail cleanly and the blocks recompute",
-                    len(remote_hashes), req_context.req_id)
+                    "TPURaidenOffloadingConnector: prepare_load lost sub-block %d of %d "
+                    "for request %s to eviction; the load job will fail "
+                    "cleanly and the blocks recompute", idx + 1,
+                    len(sub_hashes), req_context.req_id)
                 return RaidenLoadStoreSpec(keys, pinned=False)
+            remote_slices[sub_hashes[idx]] = block
+            idx += 1
+        self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
     def prepare_store(self, keys,
@@ -466,16 +524,16 @@ class RaidenOffloadingManager(OffloadingManager):
             if key in self._inflight_store_keys:
                 continue
             sub_hashes = self._sub_hashes(key)
-            matches = self._store.lookup(sub_hashes)
+            matches = self._probe(sub_hashes)
             if len(matches) == len(sub_hashes) and all(
                     block.status in resident_statuses for _, block in matches):
                 continue
             keys_to_store.append(key)
         if len(keys_to_store) > self._capacity_keys:
             return None
-        # Atomic admission happens at job-submit time via insert_and_lock;
-        # in-flight tracking here only stops duplicate admission of the same
-        # key from a concurrent request.
+        # Atomic admission happens at job-submit time via insert; in-flight
+        # tracking here only stops duplicate admission of the same key from a
+        # concurrent request.
         self._inflight_store_keys.update(keys_to_store)
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
@@ -497,7 +555,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # prepare_load (request aborted, or the scheduler declined it under
         # HBM pressure) would otherwise leave its entries behind forever —
         # and a stale slice popped by a later request could be handed to
-        # insert_and_lock. Drop the leftovers each step; a request retried
+        # read_remote. Drop the leftovers each step; a request retried
         # next step re-runs lookup() and repopulates the stash.
         self._remote_slices.clear()
 
@@ -525,8 +583,8 @@ class RaidenOffloadingManager(OffloadingManager):
                          device_block_ids: list[int]) -> None:
         """Admit and launch a store job after all worker ranks acknowledge the save fence.
 
-        Atomically admits the batch via insert_and_lock (pinning pre-existing
-        entries in-place, reserving capacity, rolling back on failure), then a
+        Atomically admits the batch via insert (pinning pre-existing entries
+        in-place, reserving capacity, rolling back on failure), then a
         post-admission lookup picks out the entries this admission inserted
         and dispatches save() for exactly those; completion is tracked
         asynchronously by the finalizer. A directory state that lookup cannot
@@ -544,10 +602,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 status=self._block_status.HBM,
             ) for dev_id in device_ids
         ]
-        if not self._store.insert_and_lock(sub_hashes, slices, on_host=False):
+        if not self._store.insert(sub_hashes, slices, on_host=False):
             # Atomically rolled back inside Raiden; no DMA save was issued.
             logger.warning(
-                "TPURaidenOffloadingConnector: store job %d: insert_and_lock rejected %d "
+                "TPURaidenOffloadingConnector: store job %d: insert rejected %d "
                 "sub-blocks (capacity pressure with pinned entries)", job_id,
                 len(sub_hashes))
             self._inflight_store_keys.difference_update(keys)
@@ -559,7 +617,7 @@ class RaidenOffloadingManager(OffloadingManager):
         if to_save is None:
             # Broken invariant: unwind the admission and fail the job; the
             # blocks recompute and the key is re-offered on its next miss.
-            self._store.release_and_delete(sub_hashes)
+            self._store.release(sub_hashes)
             self._inflight_store_keys.difference_update(keys)
             self._finished.append(
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE,
@@ -624,28 +682,25 @@ class RaidenOffloadingManager(OffloadingManager):
             return
         sub_hashes = self._expand_keys(keys)
         device_ids = self._expand_device_blocks(device_block_ids)
-        # Partition by live directory status: REMOTE sub-hashes (installed by
-        # prepare_load's insert_and_lock) are fetched from their peer with
-        # read_remote, everything else comes from the local host pool. The
-        # live peek — not the lookup-time stash — decides, so a sub-hash that
-        # became local in between is simply loaded. Only the BYTES are remote:
-        # every destination is one of this instance's HBM blocks, and a peer's
-        # HBM is never involved (read_remote copies peer host DRAM to local
-        # host DRAM to local HBM). The two destination lists are disjoint
-        # subsequences of `device_ids`, each preserving its batch's
+        # Partition by where prepare_load found each sub-hash: one that came
+        # with a peer slice is read from that peer, everything else is pinned
+        # in the local host pool. The slice is the only record of a peer block
+        # — read_remote writes nothing to the local directory, so no live probe
+        # could rediscover it. Only the BYTES are remote: every destination is
+        # one of this instance's HBM blocks. The two destination lists are
+        # disjoint subsequences of `device_ids`, each preserving its batch's
         # hash-to-block pairing, because load() and read_remote() both require
         # block_hashes[i] to line up with device_block_ids[i].
         remote_hashes: list[bytes] = []
+        remote_slices: list[object] = []
         dst_device_ids_for_remote: list[int] = []
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
-        statuses = {
-            sub_hash: block.status
-            for sub_hash, block in self._store.lookup(sub_hashes)
-        }
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
-            if statuses.get(sub_hash) == self._block_status.REMOTE:
+            block = self._pending_remote_slices.pop(sub_hash, None)
+            if block is not None:
                 remote_hashes.append(sub_hash)
+                remote_slices.append(block)
                 dst_device_ids_for_remote.append(dev_id)
             else:
                 local_hashes.append(sub_hash)
@@ -689,7 +744,7 @@ class RaidenOffloadingManager(OffloadingManager):
             _fail_launch("load()", local_hashes, [])
             return
         if remote_hashes and not self._store.read_remote(
-                remote_hashes, dst_device_ids_for_remote):
+                remote_hashes, remote_slices, dst_device_ids_for_remote):
             _fail_launch("read_remote()", remote_hashes, local_hashes)
             return
         admission = Admission(
@@ -724,29 +779,21 @@ class RaidenOffloadingManager(OffloadingManager):
         for sub_hash in admission.sub_hashes:
             self._hash_to_admission.pop(sub_hash, None)
         success = not (admission.failed or admission.poisoned)
+        # Give back only what the job still holds. A transfer that landed
+        # already spent its pin and a peer read never took one, so the release
+        # covers the admitted entries no transfer accounted for: on a store,
+        # the sub-hashes that were pinned in place rather than saved; on any
+        # failure, the whole unspent remainder.
+        held = self._pins_still_held(admission)
+        if held:
+            self._store.release(held)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
-            if success:
-                # Unpin the exact admitted batch; entries become evictable.
-                self._store.release(admission.sub_hashes)
-            else:
-                # Unpin and delete the newly admitted HBM entries, restoring
-                # displaced candidates.
-                self._store.release_and_delete(admission.sub_hashes)
             self._finished.append(
                 FinishedJob(job_id=admission.job_id,
                             op=AdmissionOp.STORE,
                             success=success))
         else:
-            # Release pins acquired in prepare_load:
-            # - On success: release() unpins entries (remote fetches are now
-            #   HOST_AND_HBM).
-            # - On failure: release_and_delete() frees unlanded REMOTE buffers
-            #   while preserving valid HOST entries; destination blocks recompute.
-            if success:
-                self._store.release(admission.sub_hashes)
-            else:
-                self._store.release_and_delete(admission.sub_hashes)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -772,7 +819,11 @@ class RaidenOffloadingManager(OffloadingManager):
                          for admission in self._admissions.values())
         results: list[tuple[list[bytes], list[bytes]]] = []
         if has_stores:
-            done, failed, _pending = self._store.poll_save_status()
+            # Save polls carry two extra lists that annotate why a REMOTE save
+            # failed; a hash in either is already in `failed`, and both are
+            # empty for the local saves this connector issues.
+            done, failed, _pending, _existing, _unregistered = (
+                self._store.poll_save_status())
             results.append((done, failed))
         if has_loads:
             done, failed, _pending = self._store.poll_load_status()
@@ -797,6 +848,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 admission = self._hash_to_admission.get(sub_hash)
                 if admission is None:
                     continue
+                if sub_hash not in admission.remote_sub_hashes:
+                    # A save or a local load that landed spends the pin the
+                    # job was holding for that sub-hash.
+                    admission.consumed_sub_hashes.add(sub_hash)
                 admission.pending.discard(sub_hash)
                 if not admission.pending:
                     newly_terminal[admission.job_id] = admission
@@ -1126,7 +1181,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         while not self._stop_registration.is_set():
             if self._controller_reachable():
                 try:
-                    from tpu_raiden.api.torch import kv_cache_manager as _kcm
+                    from tpu_sync.api.torch import kv_cache_manager as _kcm
                     self._mgr = _kcm.KVCacheManager(
                         kv_caches=self._device_tensors,
                         local_control_port=0,

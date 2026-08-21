@@ -536,7 +536,7 @@ def mla_attention(
             x in str(cache.dtype).lower()
             for x in ("fp8", "e4m3")) else "bfloat16"
 
-        tuning_key = TuningKey(
+        decode_key = TuningKey(
             case="batched_decode",
             max_num_tokens=max_num_tokens,
             actual_num_q_heads=num_attention_heads,
@@ -544,12 +544,35 @@ def mla_attention(
             actual_r_dim=actual_r_dim,
             kv_dtype=kv_dtype_str,
         )
-        tuned = get_tuned_params(tuning_key)
-        decode_batch_size = tuned.decode_batch_size
+        decode_tuned = get_tuned_params(decode_key)
 
-        # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
-        num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block, 1, 1)
-        num_queries_per_blocks = (tuned.num_queries_per_block, 16, 16)
+        _, page_size_per_kv_packing, kv_packing, _ = cache.shape
+        max_num_seqs = seq_lens.shape[0]
+        mixed_key = TuningKey(
+            case="mixed",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=q.shape[1],
+            actual_lkv_dim=q.shape[-1],
+            actual_r_dim=actual_r_dim,
+            q_dtype=jnp.dtype(q.dtype).name,
+            kv_dtype=kv_dtype_str,
+            page_size_per_kv_packing=page_size_per_kv_packing,
+            kv_packing=kv_packing,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=block_tables.shape[0] // max_num_seqs,
+        )
+        mixed_tuned = get_tuned_params(mixed_key)
+
+        num_kv_pages_per_blocks = (
+            decode_tuned.num_kv_pages_per_block,
+            1,
+            mixed_tuned.num_kv_pages_per_block,
+        )
+        num_queries_per_blocks = (
+            decode_tuned.num_queries_per_block,
+            16,
+            mixed_tuned.num_queries_per_block,
+        )
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
         q = q.transpose((1, 0, 2))
@@ -567,7 +590,10 @@ def mla_attention(
             sm_scale=sm_scale or 1.0,
             num_kv_pages_per_block=num_kv_pages_per_blocks,
             num_queries_per_block=num_queries_per_blocks,
-            decode_batch_size=decode_batch_size,
+            vmem_limit_bytes=min(decode_tuned.vmem_limit_bytes,
+                                 mixed_tuned.vmem_limit_bytes),
+            decode_batch_size=decode_tuned.decode_batch_size,
+            mixed_q_split=mixed_tuned.q_split,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale)

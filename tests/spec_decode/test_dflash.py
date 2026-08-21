@@ -20,11 +20,13 @@ import pytest
 import torch
 import torch._dynamo
 
+from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
-def _make_proposer(draft_tp: int | None = 1) -> DFlashProposer:
+def _make_proposer(draft_tp: int | None = 1,
+                   target_tp: int = 1) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
@@ -47,7 +49,7 @@ def _make_proposer(draft_tp: int | None = 1) -> DFlashProposer:
         ),
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
-            tensor_parallel_size=1,
+            tensor_parallel_size=target_tp,
             is_moe_model=False,
             use_sequence_parallel_moe=False,
         ),
@@ -55,6 +57,62 @@ def _make_proposer(draft_tp: int | None = 1) -> DFlashProposer:
     runner = mock.MagicMock()
     runner.device = torch.device("cpu")
     return DFlashProposer(runner=runner, vllm_config=vllm_config)
+
+
+def _make_vocab_models():
+    target_embed = torch.nn.Embedding(3, 2)
+    target_embed.org_vocab_size = 3
+    draft_embed = torch.nn.Embedding(3, 2)
+    draft_embed.org_vocab_size = 3
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed),
+        lm_head=torch.nn.Linear(2, 3, bias=False),
+        set_aux_hidden_state_layers=lambda _: None,
+    )
+    draft = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=draft_embed, layers=[]),
+        lm_head=torch.nn.Linear(2, 3, bias=False),
+        get_draft_attn_causal=lambda: [],
+        logits_processor=SimpleNamespace(
+            _gather_logits=lambda logits: logits.clone()),
+        has_own_embed_tokens=False,
+        has_own_lm_head=False,
+    )
+    return draft, target
+
+
+def _fake_gather_sharded_weight(module):
+    weight = module.weight.detach().clone()
+    return weight, weight.shape[0], weight.shape[1], weight.device
+
+
+@pytest.mark.parametrize("draft_tp,target_tp", [(1, 1), (1, 8), (8, 8)])
+def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp,
+                                                   monkeypatch):
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
+    draft, target = _make_vocab_models()
+
+    def load_draft_model():
+        proposer.draft_model = draft
+
+    proposer._load_draft_model = load_draft_model
+    monkeypatch.setattr(spec_decode_utils, "gather_sharded_weight",
+                        _fake_gather_sharded_weight)
+
+    with mock.patch(
+            "vllm_torchtpu.spec_decode.dflash.get_layers_from_vllm_config",
+            return_value={}):
+        proposer.load_model(target)
+
+    if draft_tp == target_tp:
+        assert draft.model.embed_tokens is target.model.embed_tokens
+        assert draft.lm_head is target.lm_head
+    else:
+        assert draft.model.embed_tokens is not target.model.embed_tokens
+        assert torch.equal(draft.model.embed_tokens.weight,
+                           target.model.embed_tokens.weight)
+        assert draft.lm_head is not target.lm_head
+        assert torch.equal(draft.lm_head.weight, target.lm_head.weight)
 
 
 def test_propose_empty_batch():

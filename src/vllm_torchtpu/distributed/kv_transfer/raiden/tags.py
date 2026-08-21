@@ -9,3 +9,4 @@ one is a coupled two-repo protocol change, not a refactor.
 TAG_FA = "fa"
 TAG_GDN_CONV = "gdn.conv"
 TAG_GDN_SSM = "gdn.ssm"
+TAG_DSA_IDX = "dsa.idx"

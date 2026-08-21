@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
+import numpy as np
 import torch
+
+from vllm_torchtpu.distributed.pcp import all_reduce_sum as _pcp_all_reduce_sum
 
 
 class SequenceLayoutKind(str, Enum):
@@ -31,6 +34,15 @@ class SequenceLayoutDescriptor:
 DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR = SequenceLayoutDescriptor()
 
 
+def is_pcp_streaming_sequence_layout_descriptor(
+    descriptor: SequenceLayoutDescriptor, ) -> bool:
+    return descriptor.cache_key == (
+        SequenceLayoutKind.PARTIAL.value,
+        PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+        1,
+    )
+
+
 @dataclass(frozen=True)
 class SequenceLayoutPlan:
     descriptor: SequenceLayoutDescriptor
@@ -43,10 +55,13 @@ class SequenceLayoutPlan:
     logits_local_indices_cpu: torch.Tensor | None = None
     logits_owner_mask_cpu: torch.Tensor | None = None
     requires_hidden_state_gather: bool = False
+    # Optional packed-global to request-major token order. Padding rows use
+    # -1. Real PCP plans carry both mapping directions.
+    _packed_to_request_major_token_indices: np.ndarray | None = None
     # Optional layout-owned remap from the runner's per-chunk request-major
     # token order to the layout's packed global token order. Default layouts
     # keep the same order and leave this as None.
-    _request_major_to_packed_token_indices: Any | None = None
+    _request_major_to_packed_token_indices: np.ndarray | None = None
 
     @property
     def kind(self) -> SequenceLayoutKind:
@@ -80,6 +95,93 @@ class SequenceLayoutPlan:
         if not local_start <= packed_index < local_end:
             return None
         return packed_index - local_start
+
+    def localize_token_tensor_and_gather_indices(
+        self,
+        request_major_token_tensor: torch.Tensor,
+        request_major_gather_indices: torch.Tensor,
+        *,
+        num_valid_gathers: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Localize request-major tokens and request-aligned gather values."""
+        if self.kind is SequenceLayoutKind.ALL:
+            return request_major_token_tensor, request_major_gather_indices
+
+        num_gathers = request_major_gather_indices.shape[0]
+        request_major_gather_indices = torch.nn.functional.pad(
+            request_major_gather_indices[:num_valid_gathers],
+            (0, num_gathers - num_valid_gathers),
+            value=-1,
+        )
+
+        packed_to_request = self._packed_to_request_major_token_indices
+        request_to_packed = self._request_major_to_packed_token_indices
+        local_start = int(self.token_slice.start or 0)
+        local_end = int(self.token_slice.stop)
+
+        return _localize_token_tensor_and_gather_indices(
+            request_major_token_tensor,
+            request_major_gather_indices,
+            packed_to_request[local_start:local_end],
+            request_to_packed,
+            local_start,
+            local_end,
+        )
+
+    def aggregate_request_aligned_tensor(
+        self,
+        local_tensor: torch.Tensor,
+        owner_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Aggregate request-aligned owner rows for this sequence layout."""
+        descriptor = self.descriptor
+        if descriptor == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR:
+            return local_tensor
+        if is_pcp_streaming_sequence_layout_descriptor(descriptor):
+            local_tensor = torch.where(owner_mask.unsqueeze(-1), local_tensor,
+                                       torch.zeros_like(local_tensor))
+            return _pcp_all_reduce_sum(local_tensor)
+        raise RuntimeError("Unsupported draft sequence layout descriptor: "
+                           f"{descriptor.cache_key}")
+
+
+def _localize_token_tensor_and_gather_indices(
+    request_major_token_tensor: torch.Tensor,
+    request_major_gather_indices: torch.Tensor,
+    local_packed_to_request: np.ndarray,
+    request_to_packed: np.ndarray,
+    local_start: int,
+    local_end: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure tensor transform shared by all partial sequence layout plans."""
+    source_indices = torch.tensor(local_packed_to_request,
+                                  dtype=torch.long,
+                                  device=request_major_token_tensor.device)
+    source_valid = source_indices.ge(0)
+    safe_source_indices = source_indices.clamp_min(0)
+    local_tokens = torch.index_select(request_major_token_tensor, 0,
+                                      safe_source_indices)
+    source_mask_shape = (
+        source_valid.shape[0], ) + (1, ) * (local_tokens.ndim - 1)
+    local_tokens = torch.where(source_valid.reshape(source_mask_shape),
+                               local_tokens, torch.zeros_like(local_tokens))
+
+    request_to_packed_tensor = torch.tensor(
+        request_to_packed,
+        dtype=torch.long,
+        device=request_major_gather_indices.device,
+    )
+    request_gathers = request_major_gather_indices.to(torch.long)
+    gather_valid = request_gathers.ge(0)
+    safe_request_gathers = request_gathers.clamp_min(0)
+    packed_gathers = torch.index_select(
+        request_to_packed_tensor, 0,
+        safe_request_gathers.reshape(-1)).reshape(request_gathers.shape)
+    owner_mask = (gather_valid & packed_gathers.ge(local_start)
+                  & packed_gathers.lt(local_end))
+    local_gathers = torch.where(owner_mask, packed_gathers - local_start,
+                                torch.full_like(packed_gathers, -1))
+    return local_tokens, local_gathers.to(request_major_gather_indices.dtype)
 
 
 class SequenceLayoutPlanner(Protocol):

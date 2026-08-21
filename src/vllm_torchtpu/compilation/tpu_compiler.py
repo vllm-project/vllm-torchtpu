@@ -37,7 +37,6 @@ logger = init_logger(__name__)
 class TpuCompilationHandle:
     """Metadata handle saved to vLLM's compilation cache directory."""
     key: str
-    tier3_cache_active: bool = False
     executable: Any | None = None
 
 
@@ -81,6 +80,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/vllm/linear_common.py",
     "vllm_torchtpu/layers/vllm/quantization",
     "vllm_torchtpu/layers/vllm/vision_attention.py",
+    "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
 )
 
 
@@ -349,17 +349,10 @@ class TpuCompilerAdaptor(CompilerInterface):
                 inner_exe = _tpu_backend._compiled_executables[-1]
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=True,
-                    )
-                else:
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=False,
-                        executable=inner_exe,
-                    )
+                handle_data = TpuCompilationHandle(
+                    key=key,
+                    executable=inner_exe,
+                )
                 with open(save_path, "wb") as f:
                     pickle.dump(handle_data, f)
                 handle = (key, save_path, was_wrapped)
@@ -409,18 +402,19 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        tier3_active = False
         inner_exe = None
         if isinstance(loaded_data, TpuCompilationHandle):
-            tier3_active = loaded_data.tier3_cache_active
             inner_exe = loaded_data.executable
         elif isinstance(loaded_data, dict):
-            tier3_active = loaded_data.get("tier3_cache_active", False)
             inner_exe = loaded_data.get("executable")
         else:
             inner_exe = loaded_data
 
-        if tier3_active:
+        if inner_exe is not None:
+
+            def _cached_compiler(*_args, **_kwargs):
+                return inner_exe
+        else:
             # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
             def _cached_compiler(g, example_inputs):
                 clean_inputs = [
@@ -428,10 +422,6 @@ class TpuCompilerAdaptor(CompilerInterface):
                     for x in example_inputs
                 ]
                 return _tpu_backend(g, clean_inputs)
-        else:
-
-            def _cached_compiler(*_args, **_kwargs):
-                return inner_exe
 
         # The tracing context has a FakeTensorMode from Dynamo, but the example
         # inputs have fake tensors from a different FakeTensorMode.

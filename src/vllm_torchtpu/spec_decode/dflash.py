@@ -75,6 +75,8 @@ class DFlashProposer:
                 f"on TPU: it must be 1 (replicated draft) or {target_tp} "
                 f"(== target tensor_parallel_size, sharded draft).")
         self._draft_replicated = (draft_tp == 1)
+        # Independent from replication: target TP1 / draft TP1 can alias.
+        self._draft_tp_matches_target = (draft_tp == target_tp)
         logger.info(
             "DFlash draft parallelism: %s (draft_tp=%s).",
             "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
@@ -136,11 +138,12 @@ class DFlashProposer:
         # Share Embeddings and LM Head
         maybe_share_embeddings(self.draft_model,
                                target_model,
-                               self._draft_replicated,
+                               self._draft_tp_matches_target,
                                force_share=True)
         maybe_share_lm_head(self.draft_model,
                             target_model,
                             self._draft_replicated,
+                            self._draft_tp_matches_target,
                             force_share=True)
 
         if hasattr(self.draft_model, "get_draft_attn_causal"):

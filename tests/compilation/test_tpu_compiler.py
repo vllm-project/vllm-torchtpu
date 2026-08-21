@@ -239,27 +239,22 @@ class TestTpuCompilerCache:
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilationHandle
 
         # 1. Test dataclass handle serialization
-        handle = TpuCompilationHandle(key="test_key_123",
-                                      tier3_cache_active=True)
+        handle = TpuCompilationHandle(key="test_key_123")
         dumped = pickle.dumps(handle)
         loaded = pickle.loads(dumped)
         assert isinstance(loaded, TpuCompilationHandle)
         assert loaded.key == "test_key_123"
-        assert loaded.tier3_cache_active is True
         assert loaded.executable is None
 
         # 2. Test legacy dict deserialization fallback
-        legacy_dict = {"tier3_cache_active": True, "key": "test_key_dict"}
+        legacy_dict = {"key": "test_key_dict"}
         loaded_dict = pickle.loads(pickle.dumps(legacy_dict))
         assert isinstance(loaded_dict, dict)
-        assert loaded_dict.get("tier3_cache_active") is True
 
         # 3. Test non-tier3 handle with executable
         handle_with_exe = TpuCompilationHandle(key="test_key_456",
-                                               tier3_cache_active=False,
                                                executable="mock_exe")
         loaded_exe_handle = pickle.loads(pickle.dumps(handle_with_exe))
-        assert loaded_exe_handle.tier3_cache_active is False
         assert loaded_exe_handle.executable == "mock_exe"
 
     def test_compiler_initialize_cache(self):

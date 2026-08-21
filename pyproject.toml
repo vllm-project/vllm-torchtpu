@@ -38,7 +38,7 @@ dependencies = [
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260813160135",
+    "tpu-raiden-torch==0.0.1.dev20260819190323",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -133,7 +133,7 @@ ignore-missing-imports = [
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",
-    "tpu_raiden", "tpu_raiden.*",
+    "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",
     "transformers", "transformers.*",
     "vllm", "vllm.*",

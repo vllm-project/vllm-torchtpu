@@ -48,18 +48,18 @@ def _int32_bsearch(
       For each element of the batch, the largest int32 for which the predicate
       returns False. Shape: batch_shape.
     """
-    zero = torch.tensor(0, dtype=torch.int32, device=device)
-    sign_bit = torch.tensor(-(1 << 31), dtype=torch.int32, device=device)
+    current_bits = torch.zeros(batch_shape, dtype=torch.int32, device=device)
+    zero = torch.zeros_like(current_bits)
+    sign_bit = torch.full_like(current_bits, -(1 << 31))
 
     # bit 31 is special, because it compares in the opposite order of all other
     # bits.
-    current_bits = torch.zeros(batch_shape, dtype=torch.int32, device=device)
     current_bits = current_bits | torch.where(predicate(current_bits),
                                               sign_bit, zero)
 
     for i in range(31):
         bit = 1 << (30 - i)
-        bit_t = torch.tensor(bit, dtype=torch.int32, device=device)
+        bit_t = torch.full_like(current_bits, bit)
         midpoint = current_bits | bit
         current_bits = current_bits | torch.where(predicate(midpoint), zero,
                                                   bit_t)
@@ -81,10 +81,8 @@ def _monotonic_int32_to_float32_bit_pattern(x: torch.Tensor) -> torch.Tensor:
     Returns:
       int32 bit pattern of a float32 number.
     """
-    non_sign_bits = torch.tensor((1 << 31) - 1,
-                                 dtype=torch.int32,
-                                 device=x.device)
-    zero = torch.tensor(0, dtype=torch.int32, device=x.device)
+    non_sign_bits = torch.full_like(x, (1 << 31) - 1)
+    zero = torch.zeros_like(x)
     # See
     # https://stackoverflow.com/questions/20097380/iee-754-total-order-in-standard-c11
     # for the relationship between int32 order and f32 total order, including
@@ -136,11 +134,9 @@ def _float32_bsearch(
       For each element of the batch, the largest float32 for which the predicate
       returns False. Shape: f32[batch_shape].
     """
-    exponent_bits = torch.tensor((1 << 31) - (1 << 23),
-                                 dtype=torch.int32,
-                                 device=device)
 
     def int32_predicate(x: torch.Tensor) -> torch.Tensor:
+        exponent_bits = torch.full_like(x, (1 << 31) - (1 << 23))
         x = _monotonic_int32_to_float32_bit_pattern(x)
         is_finite = (x & exponent_bits) != exponent_bits
 
@@ -195,9 +191,8 @@ def topk_mask(logits: torch.Tensor,
 
     cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device)
     cutoff = cutoff.unsqueeze(-1)
-    return torch.where(
-        logits >= cutoff, logits,
-        torch.tensor(replace_val, dtype=logits.dtype, device=logits.device))
+    replace_tensor = torch.full_like(logits, replace_val)
+    return torch.where(logits >= cutoff, logits, replace_tensor)
 
 
 def topp_mask(logits: torch.Tensor,
@@ -229,22 +224,20 @@ def topp_mask(logits: torch.Tensor,
     """
     p = p.squeeze(-1)
     probs = torch.softmax(logits, dim=-1)
+    zero_val = torch.zeros_like(probs)
+    replace_tensor = torch.full_like(logits, replace_val)
 
     def predicate(threshold: torch.Tensor) -> torch.Tensor:
         threshold = threshold.unsqueeze(-1)
         probability_mass = torch.sum(
-            torch.where(
-                probs >= threshold, probs,
-                torch.tensor(0.0, dtype=probs.dtype, device=probs.device)),
+            torch.where(probs >= threshold, probs, zero_val),
             dim=-1,
         )
         return probability_mass < p
 
     threshold = _float32_bsearch(logits.shape[:-1], predicate, logits.device)
     threshold = threshold.unsqueeze(-1)
-    return torch.where(
-        probs >= threshold, logits,
-        torch.tensor(replace_val, dtype=logits.dtype, device=logits.device))
+    return torch.where(probs >= threshold, logits, replace_tensor)
 
 
 def apply_top_k_top_p(logits: torch.Tensor, top_k: torch.Tensor,

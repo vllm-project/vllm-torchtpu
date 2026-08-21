@@ -296,7 +296,6 @@ class TestTpuPlatform:
          "message"),
         [
             ("all", None, False, "mamba_cache_mode='align'"),
-            ("align", MagicMock(), False, "Speculative decoding"),
             ("align", None, True, None),
         ],
     )

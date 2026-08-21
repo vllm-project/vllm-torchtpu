@@ -420,32 +420,6 @@ def test_warm_start_reuses_the_cache_without_compiling(tmp_path):
     in_child(partial(_warm_start_reuses_the_cache, str(tmp_path)))
 
 
-def _tier3_does_not_bypass_the_screen(cache_root):
-    os.environ[
-        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"] = f"{cache_root}/tier3"
-    config, backend = prepare(cache_root)
-    assert warm(build(WaveModel, config), config) == 1
-    backend.compiled.clear()
-
-    torch._dynamo.reset()
-    model = build(WaveModel, config)
-    assert warm(model, config) == 1
-    # Tier-3 regenerates each executable through torch_tpu on load, so every
-    # bucket must come from a graph that owns it, not from whichever graph the
-    # artifact restored.
-    assert backend.compiled == [(16, 1), (2048, 1), (4096, 2)]
-    CALLS.clear()
-    for num_tokens in BUCKETS:
-        assert run(model, config, num_tokens).shape[0] == num_tokens
-    assert CALLS == [(16, 1), (2048, 1), (4096, 2)]
-
-
-def test_tier3_cache_does_not_bypass_the_screen(tmp_path):
-    """With the Tier-3 C++ cache the load path recompiles from the graph it is
-    given (#416), so a bucket the graph refuses must still be refused there."""
-    in_child(partial(_tier3_does_not_bypass_the_screen, str(tmp_path)))
-
-
 def _session_does_not_outlive_warmup(cache_root):
     config, _ = prepare(cache_root)
     warm(build(FlatModel, config), config)

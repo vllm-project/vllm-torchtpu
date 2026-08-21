@@ -1,40 +1,28 @@
-"""Unit tests for DeepSeek-V4 CUDA stream stubs and model architecture patching."""
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Unit tests for DeepSeek-V4 model registration."""
 
-from types import SimpleNamespace
+from vllm.model_executor.models import ModelRegistry
 
-import torch
-
-from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
-    _maybe_patch_for_deepseek_v4
-from vllm_torchtpu.models.vllm.deepseek_v4_stubs import patch_cuda_stubs
-
-
-def test_deepseek_v4_cuda_stubs_patching():
-    """Verify patch_cuda_stubs installs working dummy CUDA stream and event objects on TPU."""
-    patch_cuda_stubs()
-    stream = torch.cuda.Stream()
-    assert stream is not None
-    assert hasattr(stream, "synchronize")
-    assert hasattr(stream, "wait")
-
-    event = torch.cuda.Event()
-    assert event is not None
-    assert hasattr(event, "record")
-    assert hasattr(event, "wait")
+from vllm_torchtpu.models.vllm import register_models
+from vllm_torchtpu.models.vllm.deepseek_v4 import DeepseekV4ForCausalLM
 
 
-def test_deepseek_v4_context_manager_patching():
-    """Verify _maybe_patch_for_deepseek_v4 activates for DeepseekV4ForCausalLM architecture."""
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(
-            architectures=["DeepseekV4ForCausalLM"])),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-        ),
-        compilation_config=SimpleNamespace(static_forward_context={}, ),
-    )
-
-    with _maybe_patch_for_deepseek_v4(vllm_config):
-        # DeepSeek-V4 patches are active within context
-        pass
+def test_deepseek_v4_model_registration():
+    """Verify DeepseekV4ForCausalLM resolves from the vLLM ModelRegistry."""
+    register_models()
+    entry = ModelRegistry.models.get("DeepseekV4ForCausalLM")
+    assert entry is not None, "DeepseekV4ForCausalLM is not registered"
+    model_cls = entry.load_model_cls()
+    assert model_cls is DeepseekV4ForCausalLM
