@@ -3844,12 +3844,6 @@ class TPUModelRunner(GPUModelRunner):
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk.
         """
-        # TODO(haotianx): Remove once structured output + spec decoding + async
-        # scheduling is supported.
-        if grammar_output is not None and self.scheduler_config.async_scheduling:
-            raise NotImplementedError(
-                "Structured output with speculative decoding is not "
-                "supported with async scheduling yet.")
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = (
                 self.spec_bonus_and_target_logits(logits,
@@ -4213,6 +4207,15 @@ class TPUModelRunner(GPUModelRunner):
             # rank 0's proposal; sharded drafters skip this.
             eagle3_drafts = self._sync_replicated_drafts_across_tp(
                 eagle3_drafts)
+
+            if (eagle3_drafts is not None
+                    and scheduler_output.has_structured_output_requests):
+                # The deferred grammar-bitmask will fetch these drafts via
+                # take_draft_token_ids() to replace the async scheduler's -1
+                # splaceholders. Stage after the TP pin above so the host
+                # copy matches what gets substituted on device.
+                self.spec_decode_manager.stage_draft_token_ids_for_host(
+                    eagle3_drafts)
 
             # Build the async substitution source from the drafts proposed
             # above: the [bonus, draft_1..K] source + 1+K next_token_indices,
