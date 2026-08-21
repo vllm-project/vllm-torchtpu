@@ -2695,6 +2695,18 @@ class TPUModelRunner(GPUModelRunner):
                     is_mm_embed = torch.cat([is_mm_embed, pad])
                 is_mm_embed = is_mm_embed.to(input_ids.device)
 
+            # Pin the program boundary around the vision glue. Under
+            # DEFER_AND_FUSE a program is built at the sync, not at the trace,
+            # so whatever the step happens to have left pending is fused into
+            # the embedding lookup and the scatter and keys the result along
+            # with them. That combination varies step to step, which is why
+            # the shapes _precompile_mm_input_embeds sweeps still compiled at
+            # runtime. Flushing on both sides leaves a program keyed on
+            # (token bucket, embedding bucket) alone -- exactly the pairs the
+            # sweep compiles. wait=False enqueues without blocking the host.
+            if mm_scatter_ops:
+                synchronize_tensors(wait=False)
+
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
@@ -2705,8 +2717,24 @@ class TPUModelRunner(GPUModelRunner):
             )
 
             if mm_scatter_ops:
+                # Cut between the token embedding and the vision scatter.
+                #
+                # Flushing only at the ends of the region is not enough: the
+                # fuser is free to partition what is pending in between, and
+                # for this region it does not partition it the same way every
+                # time, so a pair the boot sweep covered still compiled again
+                # on its first real request. The mask cut above pins the one
+                # partitioning choice the fuser was making inside the lookup;
+                # this cut pins the other, between the lookup and the scatter.
+                #
+                # It also shrinks the sweep's product: one embedding program
+                # per token bucket plus one small scatter per (token,
+                # embedding) pair, instead of a full embedding lookup per pair.
+                synchronize_tensors(inputs_embeds, wait=False)
+
                 inputs_embeds = self._scatter_mm_embeds(
                     inputs_embeds, mm_scatter_ops)
+                synchronize_tensors(inputs_embeds, wait=False)
 
             return None, inputs_embeds
         else:
@@ -2898,7 +2926,16 @@ class TPUModelRunner(GPUModelRunner):
             mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
                 scheduler_output)
             mm_scatter_plan = self._build_mm_scatter_plan(scheduler_output)
-            if mm_embeds_list and mm_scatter_plan is None:
+            if mm_scatter_plan is not None:
+                # Those views are sliced at each image's exact token count, and
+                # the bucketed path never reads them -- but they were traced,
+                # and a lazy op stays in the pending graph until either a sync
+                # builds it or its last reference goes away. Built, it is a
+                # program keyed on the raw image size: a fresh compile for
+                # every new image, which is the cost the bucketing exists to
+                # avoid. Dropping them here takes the second exit.
+                mm_embeds_list = None
+            elif mm_embeds_list:
                 mm_embeds_flat = torch.cat(mm_embeds_list)
             req_tok = np.array([
                 scheduler_output.num_scheduled_tokens[r]
@@ -4032,13 +4069,71 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
+    def _dummy_embed_inputs(self, num_tokens: int,
+                            mm_embed_bucket: int | None) -> torch.Tensor:
+        """The ``inputs_embeds`` a dummy step feeds the backbone.
+
+        Fabricating zeros is enough to compile the backbone, but it skips the
+        embedding lookup and the vision scatter entirely, so a multimodal
+        server compiles both on its first real request -- and compiles them
+        again for every ``(token bucket, embedding bucket)`` pair that turns
+        up, since the scatter's index length is the embedding bucket. Passing
+        a bucket here routes the dummy step through the real
+        ``_get_model_inputs`` instead, which is what puts those programs in
+        the cache before serving starts.
+        """
+        if mm_embed_bucket is None:
+            return torch.zeros(
+                (num_tokens, self.inputs_embeds_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        # One image covering the head of the chunk: the op shapes depend on
+        # the bucket and the token count, not on where the run sits or what
+        # is in it.
+        #
+        # The encoder output is staged on the host and copied over, then
+        # drained, because a real step reaches _get_model_inputs with it
+        # already resolved to a device buffer -- postprocess_encoder_output
+        # cuts each item loose. Allocating it with ``device=`` instead leaves
+        # it a constant in the traced graph, which compiles a program the real
+        # step never asks for.
+        encoder_output = torch.zeros(
+            (mm_embed_bucket, self.inputs_embeds_size),
+            dtype=self.dtype).to(self.device)
+        synchronize_tensors(encoder_output, wait=True)
+        # Stage input_ids the way _prepare_inputs does -- a non-blocking copy
+        # of a slice of the persistent host buffer. Allocating a fresh host
+        # tensor instead leaves the copy pending, and the fuser then folds the
+        # whole embedding into the copy's program and hands the sweep an
+        # identity function to compile: shapes swept, nothing cached.
+        self.input_ids_cpu[:num_tokens].zero_()
+        input_ids = self.input_ids_cpu[:num_tokens].to(self.device,
+                                                       non_blocking=True)
+        ops = self._mm_chunk_scatter_ops(
+            [(encoder_output, 0, mm_embed_bucket, 0)],
+            0,
+            num_tokens,
+            num_tokens,
+            self.get_model().mm_embed_bucket,
+            self.device,
+        )
+        # _gather_mm_embeddings hands back a host-side mask covering only the
+        # scheduled tokens; the padding to the bucket happens in
+        # _get_model_inputs, so pass the short one it would really see.
+        is_mm_embed = torch.ones((mm_embed_bucket, ), dtype=torch.bool)
+        _, inputs_embeds = self._get_model_inputs(input_ids, ([], is_mm_embed),
+                                                  ops)
+        return inputs_embeds
+
     def _dummy_run(self,
                    num_tokens: int,
                    num_reqs: int,
                    num_blocks: int,
                    use_max_model_len: bool = True,
                    dp_lockstep: bool = False,
-                   profile_prefix: int | None = None) -> float | None:
+                   profile_prefix: int | None = None,
+                   mm_embed_bucket: int | None = None) -> float | None:
         """Run the forward at one bucket shape.
 
         With ``profile_prefix`` the batch is one prefill request of
@@ -4058,11 +4153,8 @@ class TPUModelRunner(GPUModelRunner):
                     "embeds", (self.max_num_tokens, self.inputs_embeds_size),
                     self.dtype)[:num_tokens].to(self.device)
             else:
-                inputs_embeds = torch.zeros(
-                    (num_tokens, self.inputs_embeds_size),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+                inputs_embeds = self._dummy_embed_inputs(num_tokens,
+                                                         mm_embed_bucket)
         else:
             if profiling:
                 input_ids = self._profile_input("ids", (self.max_num_tokens, ),
@@ -4722,6 +4814,12 @@ class TPUModelRunner(GPUModelRunner):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
 
+            # After the backbone, so each of these steps runs a compiled
+            # program and pays only for the glue around it.
+            if self.supports_mm_inputs and envs.TPU_MM_BUCKET_SCATTER:
+                with self._precompile_timed("multimodal input embeds"):
+                    self._precompile_mm_input_embeds()
+
             self._precompile_sampling_subgraphs()
             self._precompile_mamba_rollback_helpers()
 
@@ -4926,6 +5024,53 @@ class TPUModelRunner(GPUModelRunner):
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4
+
+    def _mm_embed_buckets(self) -> list[int]:
+        """Every embedding bucket a vision item can round up to, ascending."""
+        bucket_fn = getattr(self.get_model(), "mm_embed_bucket", None)
+        if bucket_fn is None:
+            return []
+        buckets, bucket = [], bucket_fn(1)
+        limit = max(self.num_tokens_paddings)
+        while bucket <= limit:
+            buckets.append(bucket)
+            bucket = bucket_fn(bucket + 1)
+        return buckets
+
+    def _precompile_mm_input_embeds(self) -> None:
+        """Compile the embedding lookup and vision scatter for every pair.
+
+        ``_precompile_backbone`` sweeps token buckets with a fabricated
+        ``inputs_embeds``, which leaves the step's multimodal glue -- the
+        embedding lookup and the bucketed scatter that writes vision
+        embeddings into their token slots -- untraced. Both then compile
+        during serving, once per ``(token bucket, embedding bucket)`` pair
+        that arrives, because the scatter's index tensors are as long as the
+        embedding bucket. That is a couple of dozen compilations spread across
+        the first requests to use each pair, and it is what a cold server's
+        tail latency is made of.
+
+        The sweep is cheap next to the backbone's: the backbone executables
+        already exist by the time this runs, so each step here executes a
+        compiled program and compiles only the small glue around it.
+        """
+        buckets = self._mm_embed_buckets()
+        if not buckets:
+            return
+        for num_tokens in self.num_tokens_paddings:
+            # A run longer than the chunk cannot occur: the scatter is
+            # clipped to the tokens the chunk actually holds.
+            fits = [b for b in buckets if b <= num_tokens]
+            if not fits:
+                continue
+            logger.info("  -- num_tokens: %d, mm buckets: %s", num_tokens,
+                        fits)
+            for bucket in fits:
+                self._dummy_run(num_tokens,
+                                self.num_reqs_max_model_len,
+                                self.max_num_blocks_per_req,
+                                use_max_model_len=True,
+                                mm_embed_bucket=bucket)
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
