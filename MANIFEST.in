@@ -1,2 +1,3 @@
 include README.md
 include src/vllm_torchtpu/models/jax/utils/quantization/configs/*.yaml
+include src/vllm_torchtpu/tools/*.proto

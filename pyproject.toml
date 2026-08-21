@@ -129,6 +129,7 @@ preset = "basic"
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
+    "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
     "numpy", "numpy.*",
