@@ -1259,7 +1259,7 @@ class TPURaidenConnectorWorker:
             self.host_ip, self.kv_transfer_port, self.is_producer,
             self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+    def _get_raiden_stats(self):
         # Get metrics from raiden library
         try:
             telemetry = dist_utils.get_raiden_telemetry_module()
@@ -1274,6 +1274,9 @@ class TPURaidenConnectorWorker:
                     self.transfer_stats.data[metric_name].extend(values)
         except Exception as e:
             logger.warning("Failed to collect TPU Raiden C++ telemetry: %s", e)
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        self._get_raiden_stats()
 
         # Instrument corresponding queue lengths
         if self.tp_rank == 0:

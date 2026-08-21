@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import \
     TPURaidenConnectorWorker
@@ -361,6 +360,8 @@ class TestTPURaidenConnectorWorkerTelemetry:
 
     def _create_mock_worker(self, is_producer=True, tp_rank=0):
         worker = MagicMock(spec=TPURaidenConnectorWorker)
+        worker._get_raiden_stats = TPURaidenConnectorWorker._get_raiden_stats.__get__(
+            worker)
         worker.tp_rank = tp_rank
         worker.tp_size = 1
         worker.dp_rank = 0
