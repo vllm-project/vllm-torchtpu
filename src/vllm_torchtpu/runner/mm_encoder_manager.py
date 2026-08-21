@@ -76,6 +76,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 for path, budgets in self.path_token_budgets.items()
             }
 
+        # Pinned host staging buffers for _pad_to_template, keyed by
+        # (path, budget, key), plus how far each was last dirtied.
+        self._host_stage: Dict[tuple, torch.Tensor] = {}
+        self._host_stage_dirty: Dict[tuple, int] = {}
+
         # We compile the forward pass function using the TPU backend.
         # This acts as our XLA cache. We compile it once, and it will generate
         # separate XLA graphs for each unique budget size passed to it.
@@ -89,13 +94,67 @@ class MMEncoderManager(EncoderCudaGraphManager):
             f"[mm_encoder_manager] Initialized XLA path_budgets={self.path_token_budgets} "
             f"max_batch_size={self.max_batch_size}")
 
+    # Keys whose leading dim scales with the image and which are therefore
+    # sliced/concatenated per item before any budget padding happens.
+    _HOST_STAGED_KEYS = ("pixel_values", "grid_thws")
+
+    def execute(self, mm_kwargs: Dict[str, Any]) -> Any:
+        """Land the batch on the host, then run the normal budget path.
+
+        ``_execute_local`` slices and re-concatenates ``pixel_values`` per
+        item (``select_encoder_cudagraph_items``) and ``_pad_to_template``
+        then pads it to a budget. On TPU a device tensor whose leading dim
+        depends on the image size keys every XLA program it feeds, so doing
+        either of those on-device compiles a fresh program for every new
+        image shape. Moving the batch to the host once, up front, makes all
+        of that plain CPU work and leaves exactly one device transfer -- the
+        static budget-shaped H2D in ``_pad_to_template``.
+        """
+        staged = None
+        for key in self._HOST_STAGED_KEYS:
+            val = mm_kwargs.get(key)
+            if isinstance(val, torch.Tensor) and val.device.type != "cpu":
+                if staged is None:
+                    staged = dict(mm_kwargs)
+                staged[key] = val.cpu()
+        return super().execute(staged if staged is not None else mm_kwargs)
+
+    def _host_stage_buffer(self, path: str, budget: int, key: str,
+                           tmpl: torch.Tensor) -> torch.Tensor:
+        """Reusable pinned host buffer shaped like ``tmpl``.
+
+        One per (path, budget, key); the shape is static, so allocating it
+        once keeps the padding path allocation-free after the first call.
+        """
+        cache_key = (path, budget, key)
+        buf = self._host_stage.get(cache_key)
+        if buf is None:
+            buf = torch.zeros(tmpl.shape, dtype=tmpl.dtype)
+            try:
+                buf = buf.pin_memory()
+            except (RuntimeError, NotImplementedError):
+                pass  # pinning is an optimization, not a requirement
+            self._host_stage[cache_key] = buf
+            self._host_stage_dirty[cache_key] = 0
+        return buf
+
     def _pad_to_template(
         self,
         replay_values: Dict[str, torch.Tensor],
         budget: int,
         path: str = "default",
     ) -> Dict[str, torch.Tensor]:
-        """Zero-pads dynamic multimodal inputs up to the static budget template."""
+        """Zero-pads dynamic multimodal inputs up to the static budget template.
+
+        The padding is staged on the *host* rather than on the TPU. A device
+        tensor whose leading dim varies with the image size keys every XLA
+        program that takes it as an input, so the obvious device-side
+        ``dst[:n].copy_(src)`` recompiles once per distinct image size --
+        measured at 2 new XLA programs and seconds of stall per new size,
+        which is the bulk of multimodal TTFT. Padding on the host means the
+        only device-visible transfer happens at the static template shape, so
+        the program set is keyed on the budget alone.
+        """
         template = self.budget_templates[path][budget]
         padded: Dict[str, torch.Tensor] = {}
 
@@ -116,10 +175,27 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 padded[key] = src.to(device=tmpl.device)
                 continue
 
-            padding_logic = self.config.padding_logics.get(
-                key, self._copy_padded_buffer)
-            padding_logic(tmpl, src)
-            padded[key] = tmpl
+            padding_logic = self.config.padding_logics.get(key)
+            if padding_logic is not None:
+                # Model-supplied logic owns its own shape discipline.
+                padding_logic(tmpl, src)
+                padded[key] = tmpl
+                continue
+
+            stage = self._host_stage_buffer(path, budget, key, tmpl)
+            cache_key = (path, budget, key)
+            n = src.shape[0]
+            # Re-zero only the region a previous call dirtied; the rest of the
+            # staging buffer is already zero.
+            prev = self._host_stage_dirty[cache_key]
+            if prev > n:
+                stage[n:prev].zero_()
+            self._host_stage_dirty[cache_key] = n
+            stage[:n].copy_(src if src.device.type == "cpu" else src.cpu())
+            # Static-shape H2D: this is the only device op keyed on `budget`.
+            # Blocking on purpose -- `stage` is reused across calls, so an
+            # in-flight async copy could be overwritten by the next batch.
+            padded[key] = stage.to(tmpl.device)
 
         return padded
 

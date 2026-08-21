@@ -2512,13 +2512,172 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
+    def _build_mm_scatter_plan(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[tuple[torch.Tensor, int, int, int]] | None:
+        """Locate each image's embeddings without touching the device.
+
+        Returns one ``(encoder_output, src_start, count, dst_start)`` per
+        contributing image, where ``dst_start`` is the token position (within
+        this step's scheduled tokens) that the image's first embedding row
+        occupies. The copy itself is deferred to ``_get_model_inputs``, which
+        issues it as a bucketed ``index_copy_``.
+
+        This exists because the straightforward alternative -- slicing each
+        cached encoder output to its exact token count, concatenating, and
+        masked-scattering the result -- is three variable-shape device ops in
+        a row. On TPU each distinct image size then compiles its own XLA
+        programs, which never stops happening because image sizes never
+        repeat. Doing the arithmetic on the host keeps the device-side shape
+        set bounded by the bucket count.
+
+        A placeholder range need not be solid: Kimi K3 wraps its pads in
+        ``<|media_begin|>image {w}x{h}<|media_content|>...<|media_end|>`` and
+        marks only the pad positions in ``pos_info.is_embed``, so every image
+        has a mask. ``extract_embeds_range`` hands back the contiguous embed
+        runs, and one plan entry per run reproduces the mask exactly.
+
+        Returns None if the model does not expose the bucketing hook, in
+        which case the caller falls back to the concat + masked-scatter path.
+        """
+        model = self.get_model()
+        if not envs.TPU_MM_BUCKET_SCATTER or not hasattr(
+                model, "mm_embed_bucket"):
+            return None
+
+        plan: list[tuple[torch.Tensor, int, int, int]] = []
+        req_start_idx = 0
+        for req_id in self.input_batch.req_ids:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
+                req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens
+
+            for mm_feature in (req_state.mm_features or ()):
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    continue
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    continue
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                if start_idx >= end_idx:
+                    continue
+
+                encoder_output = self._get_encoder_output_from_cache(
+                    mm_feature.identifier)
+                if encoder_output is None:
+                    return None
+
+                req_start_pos = req_start_idx + start_pos - num_computed_tokens
+                # Placeholder-local, half-open runs of embedding positions,
+                # paired with the encoder row each run starts at.
+                if pos_info.is_embed is None:
+                    runs = [(0, num_encoder_tokens, 0)]
+                else:
+                    runs = []
+                    src_cursor = 0
+                    for abs_lo, abs_hi in pos_info.extract_embeds_range():
+                        run_lo = abs_lo - start_pos
+                        run_len = abs_hi - abs_lo + 1  # inclusive bounds
+                        runs.append((run_lo, run_lo + run_len, src_cursor))
+                        src_cursor += run_len
+
+                for run_lo, run_hi, src_cursor in runs:
+                    lo = max(run_lo, start_idx)
+                    hi = min(run_hi, end_idx)
+                    if hi <= lo:
+                        continue
+                    plan.append((encoder_output, src_cursor + (lo - run_lo),
+                                 hi - lo, req_start_pos + lo))
+
+            req_start_idx += num_scheduled_tokens
+
+        return plan
+
+    @staticmethod
+    def _mm_chunk_scatter_ops(
+        plan: list[tuple[torch.Tensor, int, int, int]],
+        tok_start: int,
+        tok_end: int,
+        num_padded_tokens: int,
+        bucket_fn,
+        device: torch.device,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Turn the step-level plan into this chunk's bucketed index pairs.
+
+        Row ``num_padded_tokens`` of the destination is a scratch row: index
+        entries past the real count point at it, so a fixed-length copy can
+        write a bucket's worth of rows without disturbing real tokens.
+        """
+        ops = []
+        for encoder_output, src_start, count, dst_start in plan:
+            lo = max(dst_start, tok_start)
+            hi = min(dst_start + count, tok_end)
+            if hi <= lo:
+                continue
+            n = hi - lo
+            padded = bucket_fn(n)
+            local_src = src_start + (lo - dst_start)
+            local_dst = lo - tok_start
+
+            src_idx = torch.arange(local_src,
+                                   local_src + padded,
+                                   dtype=torch.long)
+            src_idx.clamp_(max=encoder_output.shape[0] - 1)
+            dst_idx = torch.full((padded, ),
+                                 num_padded_tokens,
+                                 dtype=torch.long)
+            dst_idx[:n] = torch.arange(local_dst,
+                                       local_dst + n,
+                                       dtype=torch.long)
+            ops.append(
+                (encoder_output, src_idx.to(device), dst_idx.to(device)))
+        return ops
+
+    @staticmethod
+    def _scatter_mm_embeds(
+        inputs_embeds: torch.Tensor,
+        ops: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Write each image's embeddings into their token slots.
+
+        Every shape here is either a token bucket or an embedding bucket, so
+        the program set is bounded no matter what image sizes arrive. The
+        appended scratch row absorbs the padding entries of each index
+        tensor, which is what lets the copies be fixed-length.
+        """
+        num_tokens, hidden = inputs_embeds.shape
+        scratch = torch.zeros(1,
+                              hidden,
+                              dtype=inputs_embeds.dtype,
+                              device=inputs_embeds.device)
+        extended = torch.cat([inputs_embeds, scratch])
+        for encoder_output, src_idx, dst_idx in ops:
+            rows = encoder_output.index_select(0, src_idx)
+            extended.index_copy_(0, dst_idx, rows.to(extended.dtype))
+        return extended[:num_tokens]
+
     def _get_model_inputs(
         self,
         input_ids: torch.Tensor,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        mm_scatter_ops: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        | None = None,
     ):
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+            if mm_scatter_ops is not None:
+                # Bucketed path: the placement is already resolved to index
+                # tensors, so the embeddings are copied in directly instead
+                # of being concatenated and masked-scattered.
+                mm_embeds = None
 
             # _gather_mm_embeddings returns is_mm_embed sized to the number
             # of scheduled tokens, but TPU pads input_ids to a fixed bucket.
@@ -2544,6 +2703,10 @@ class TPUModelRunner(GPUModelRunner):
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
             )
+
+            if mm_scatter_ops:
+                inputs_embeds = self._scatter_mm_embeds(
+                    inputs_embeds, mm_scatter_ops)
 
             return None, inputs_embeds
         else:
@@ -2726,10 +2889,16 @@ class TPUModelRunner(GPUModelRunner):
         is_mm_embed_full = None
         mm_tok_cumsum = None
         mm_cumsum_np = None
+        mm_scatter_plan = None
         if self.supports_mm_inputs and self._pp_is_first:
+            # The returned per-item tensors are lazy views; when the bucketed
+            # scatter path is active we never consume them (and so never
+            # compile a program for them), we only want is_mm_embed_full and
+            # this call's mrope side effects.
             mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
                 scheduler_output)
-            if mm_embeds_list:
+            mm_scatter_plan = self._build_mm_scatter_plan(scheduler_output)
+            if mm_embeds_list and mm_scatter_plan is None:
                 mm_embeds_flat = torch.cat(mm_embeds_list)
             req_tok = np.array([
                 scheduler_output.num_scheduled_tokens[r]
@@ -2823,11 +2992,22 @@ class TPUModelRunner(GPUModelRunner):
             # covers requests [start_index, end_index) in req order). Offsets
             # come from the host-side cumsum, so no per-chunk device sync.
             chunk_mm_inputs = None
+            chunk_scatter_ops = None
             if is_mm_embed_full is not None:
                 tok_start = int(mm_tok_cumsum[start_index])
                 tok_end = int(mm_tok_cumsum[end_index])
                 is_mm_chunk = is_mm_embed_full[tok_start:tok_end]
-                if mm_cumsum_np is not None:
+                if mm_scatter_plan is not None:
+                    chunk_scatter_ops = self._mm_chunk_scatter_ops(
+                        mm_scatter_plan,
+                        tok_start,
+                        tok_end,
+                        input_ids.shape[0],
+                        self.get_model().mm_embed_bucket,
+                        input_ids.device,
+                    )
+                    chunk_embeds = []
+                elif mm_cumsum_np is not None:
                     mm_start = int(mm_cumsum_np[tok_start])
                     mm_cnt = int(mm_cumsum_np[tok_end]) - mm_start
                     chunk_embeds = (
@@ -2840,7 +3020,7 @@ class TPUModelRunner(GPUModelRunner):
             self._record_input_staging_fence()
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
-                    input_ids, chunk_mm_inputs)
+                    input_ids, chunk_mm_inputs, chunk_scatter_ops)
             else:
                 # Later stages start from the previous stage's hidden
                 # states; the token ids only size the forward.

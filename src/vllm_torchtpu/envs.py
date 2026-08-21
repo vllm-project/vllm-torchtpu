@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     KDA_PACK_HEAD_INV: bool = True
     KDA_PACKED_METADATA: bool = True
     KDA_FWD_MB: int | None = None
+    TPU_MM_BUCKET_SCATTER: bool = True
 
 
 def env_with_choices(
@@ -684,6 +685,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("KDA_PACKED_METADATA", default=True),
     "KDA_FWD_MB":
     env_optional_int("KDA_FWD_MB"),
+    # Keep vision embeddings padded to a power-of-two bucket from the encoder
+    # output all the way into the token stream, so the glue ops around the
+    # compiled regions are keyed on the bucket instead of on the image's exact
+    # token count. Set to 0 to fall back to vLLM's exact-length slice +
+    # concat + masked-scatter, which recompiles once per distinct image size.
+    "TPU_MM_BUCKET_SCATTER":
+    env_bool("TPU_MM_BUCKET_SCATTER", default=True),
 }
 
 
