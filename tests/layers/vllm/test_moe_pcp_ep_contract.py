@@ -14,11 +14,14 @@
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.runner import \
     moe_runner as moe_runner_mod
+
+import vllm_torchtpu.envs as envs
 
 
 class _LocalExpertQuantMethod:
@@ -154,9 +157,20 @@ def test_tpu_pcp_patch_preserves_non_pcp_all2all_triggers():
 
     _patch_moe_explicit_pcp_collectives()
 
-    assert not _make_parallel_config().use_all2all_kernels
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
+        assert not _make_parallel_config().use_all2all_kernels
     assert _make_parallel_config(pcp_size=1, dp_size=2).use_all2all_kernels
     assert _make_parallel_config(pcp_size=1, sp_size=2).use_all2all_kernels
+
+
+def test_tpu_pcp_chunk_pipeline_owns_dispatch_combine():
+    """PCP skips outer collectives when the chunk kernel owns them."""
+    from vllm_torchtpu import _patch_moe_explicit_pcp_collectives
+
+    _patch_moe_explicit_pcp_collectives()
+
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384):
+        assert _make_parallel_config().use_all2all_kernels
 
 
 def test_vllm_moe_pcp_ep_combines_remote_expert_contributions(monkeypatch):

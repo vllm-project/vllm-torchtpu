@@ -14,7 +14,7 @@
 """Pipelined Fused MoE wrapper with collective communication chunking.
 
 This module provides `pipelined_fused_moe_gmm`, which acts as a wrapper around
-`fused_moe_gmm` (or a custom MoE kernel) to manage and overlap Data Parallel
+`fused_moe_gmm` (or a custom MoE kernel) to manage and overlap DP or PCP
 collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
@@ -24,7 +24,11 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def enable_pipelined_collective_and_compute() -> bool:
@@ -41,17 +45,17 @@ def enable_pipelined_collective_and_compute() -> bool:
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
 
 
-def calculate_moe_chunks(seq_len: int, dp_size: int,
+def calculate_moe_chunks(seq_len: int, parallel_size: int,
                          chunk_size: int) -> tuple[int, int]:
     """Calculate the number of chunks and local chunk size for MoE chunk pipelining.
 
     Uses ceiling division so `chunk_size` acts as a maximum global chunk threshold:
-        num_chunks = ceil((seq_len * dp_size) / chunk_size)
+        num_chunks = ceil((seq_len * parallel_size) / chunk_size)
         chunk_size_local = seq_len // num_chunks
 
     Args:
         seq_len: Number of local tokens on this rank (S).
-        dp_size: Data Parallel world size (DP).
+        parallel_size: World size of the active DP or PCP collective group.
         chunk_size: Maximum post-gather chunk size threshold in tokens (C).
 
     Returns:
@@ -60,10 +64,10 @@ def calculate_moe_chunks(seq_len: int, dp_size: int,
     Raises:
         ValueError: If local sequence length is not divisible by chunk count.
     """
-    if chunk_size <= 0 or dp_size <= 1 or seq_len <= 0:
+    if chunk_size <= 0 or parallel_size <= 1 or seq_len <= 0:
         return 1, seq_len
 
-    total_tokens = seq_len * dp_size
+    total_tokens = seq_len * parallel_size
     num_chunks = (total_tokens + chunk_size - 1) // chunk_size
     if seq_len % num_chunks != 0:
         raise ValueError(
@@ -72,6 +76,34 @@ def calculate_moe_chunks(seq_len: int, dp_size: int,
 
     chunk_size_local = seq_len // num_chunks
     return num_chunks, chunk_size_local
+
+
+def _get_moe_collective_group():
+    """Select the collective group whose expert shards the kernel combines."""
+    pcp_group = get_pcp_group()
+    dp_group = get_dp_group()
+    pcp_size = int(pcp_group.world_size) if pcp_group is not None else 1
+    dp_size = int(dp_group.world_size) if dp_group is not None else 1
+
+    if pcp_size > 1 and dp_size > 1:
+        raise NotImplementedError(
+            "MoE collective chunking does not yet support simultaneous "
+            f"PCP ({pcp_size}) and DP ({dp_size}).")
+    if pcp_size > 1:
+        return pcp_group, "PCP"
+    return dp_group, "DP"
+
+
+@torch.compiler.assume_constant_result
+def _log_active_chunk_pipeline(collective_kind: str, parallel_size: int,
+                               seq_len: int, num_chunks: int,
+                               chunk_size_local: int, chunk_size: int) -> None:
+    """Emit trace-time evidence without adding logging ops to the graph."""
+    logger.info_once(
+        "MoE chunk pipeline active: group=%s, world_size=%d, "
+        "local_tokens=%d, chunks=%d, local_chunk_tokens=%d, threshold=%d",
+        collective_kind, parallel_size, seq_len, num_chunks, chunk_size_local,
+        chunk_size)
 
 
 def pipelined_fused_moe_gmm(
@@ -90,16 +122,16 @@ def pipelined_fused_moe_gmm(
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Wrapper around fused_moe_gmm to pipeline DP collectives and compute.
+    """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
-    This function wraps `fused_moe_gmm` by taking control of Data Parallel
-    collective communications (AllGather of activations/routing tensors and
-    ReduceScatter of outputs) and staging them in chunks to overlap network
+    This function wraps `fused_moe_gmm` by taking control of the active DP or
+    PCP collective communications (AllGather of activations/routing tensors
+    and ReduceScatter of outputs) and staging them in chunks to overlap network
     communication with TPU matrix multiplication compute.
 
-    When `enable_pipelined_collective_and_compute()` is True and DP world size > 1,
-    the sequence is partitioned into balanced chunks and executed via a 3-stage
-    pipelined schedule:
+    When `enable_pipelined_collective_and_compute()` is True and the collective
+    world size is greater than one, the sequence is partitioned into balanced
+    chunks and executed via a 3-stage pipelined schedule:
       ag0_start -> ag1_start || moe0(ag0_done) -> rs0_start || moe1(ag1_done) -> rs1_start || rs0_done -> rs1_done -> concat
 
     Args:
@@ -125,19 +157,21 @@ def pipelined_fused_moe_gmm(
         torch.Tensor: Reduced local output activations [S, H].
     """
     chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
-    dp_group = get_dp_group()
+    collective_group, collective_kind = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
-    dp_size = dp_group.world_size if dp_group is not None else 1
+    parallel_size = (int(collective_group.world_size)
+                     if collective_group is not None else 1)
     num_chunks, chunk_size_local = calculate_moe_chunks(
-        seq_len, dp_size, chunk_size)
+        seq_len, parallel_size, chunk_size)
 
-    if num_chunks == 1 or dp_size == 1:
-        if dp_size > 1:
-            ag_hidden_states = dp_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (dp_group.all_gather(topk_weights, dim=0)
+    if num_chunks == 1 or parallel_size == 1:
+        if parallel_size > 1:
+            ag_hidden_states = collective_group.all_gather(hidden_states,
+                                                           dim=0)
+            ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
                                if topk_weights is not None else None)
-            ag_topk_ids = (dp_group.all_gather(topk_ids, dim=0)
+            ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
                            if topk_ids is not None else None)
         else:
             ag_hidden_states = hidden_states
@@ -161,9 +195,12 @@ def pipelined_fused_moe_gmm(
             skip_padded_tokens=skip_padded_tokens,
         )
 
-        if dp_size > 1:
-            return dp_group.reduce_scatter(out, dim=0)
+        if parallel_size > 1:
+            return collective_group.reduce_scatter(out, dim=0)
         return out
+
+    _log_active_chunk_pipeline(collective_kind, parallel_size, seq_len,
+                               num_chunks, chunk_size_local, chunk_size)
 
     # Slice local inputs into num_chunks chunks along dim 0
     hs_slices = [
@@ -180,10 +217,10 @@ def pipelined_fused_moe_gmm(
     ] if topk_ids is not None else [None] * num_chunks
 
     # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = dp_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (dp_group.all_gather(weights_slices[0], dim=0)
+    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
+    ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
                   if weights_slices[0] is not None else None)
-    ag_ti_curr = (dp_group.all_gather(ids_slices[0], dim=0)
+    ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
                   if ids_slices[0] is not None else None)
 
     rs_outputs = []
@@ -191,10 +228,11 @@ def pipelined_fused_moe_gmm(
     for i in range(num_chunks):
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = dp_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (dp_group.all_gather(weights_slices[i + 1], dim=0)
+            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
+                                                      dim=0)
                           if weights_slices[i + 1] is not None else None)
-            ag_ti_next = (dp_group.all_gather(ids_slices[i + 1], dim=0)
+            ag_ti_next = (collective_group.all_gather(ids_slices[i + 1], dim=0)
                           if ids_slices[i + 1] is not None else None)
 
         # Compute MoE kernel for current gathered chunk
@@ -216,7 +254,7 @@ def pipelined_fused_moe_gmm(
         )
 
         # Reduce-scatter partial output for current chunk
-        rs_i = dp_group.reduce_scatter(out_i, dim=0)
+        rs_i = collective_group.reduce_scatter(out_i, dim=0)
         rs_outputs.append(rs_i)
 
         if i + 1 < num_chunks:

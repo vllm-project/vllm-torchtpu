@@ -99,49 +99,49 @@ def test_calculate_moe_chunks_math():
     """Verify chunk calculation: N_chunk = ceil((DP * S) / C), S_chunk = S // N_chunk."""
     # S=8192, DP=4, C=16384 -> T_global=32768 -> N_chunk=2, S_chunk=4096
     num_chunks, chunk_size_local = calculate_moe_chunks(seq_len=8192,
-                                                        dp_size=4,
+                                                        parallel_size=4,
                                                         chunk_size=16384)
     assert num_chunks == 2
     assert chunk_size_local == 4096
 
     # S=4096, DP=4, C=16384 -> T_global=16384 -> N_chunk=1, S_chunk=4096
     num_chunks, chunk_size_local = calculate_moe_chunks(seq_len=4096,
-                                                        dp_size=4,
+                                                        parallel_size=4,
                                                         chunk_size=16384)
     assert num_chunks == 1
     assert chunk_size_local == 4096
 
     # S=4096, DP=8, C=16384 -> T_global=32768 -> N_chunk=2, S_chunk=2048
     num_chunks, chunk_size_local = calculate_moe_chunks(seq_len=4096,
-                                                        dp_size=8,
+                                                        parallel_size=8,
                                                         chunk_size=16384)
     assert num_chunks == 2
     assert chunk_size_local == 2048
 
     # Sub-threshold: S=1024, DP=4, C=16384 -> T_global=4096 -> N_chunk=1, S_chunk=1024
     num_chunks, chunk_size_local = calculate_moe_chunks(seq_len=1024,
-                                                        dp_size=4,
+                                                        parallel_size=4,
                                                         chunk_size=16384)
     assert num_chunks == 1
     assert chunk_size_local == 1024
 
     # Non-multiple global: S=3072, DP=8, C=16384 -> T_global=24576 -> N_chunk=2, S_chunk=1536
     num_chunks, chunk_size_local = calculate_moe_chunks(seq_len=3072,
-                                                        dp_size=8,
+                                                        parallel_size=8,
                                                         chunk_size=16384)
     assert num_chunks == 2
     assert chunk_size_local == 1536
 
     # Non-multiple global: S=8000, DP=4, C=16384 -> T_global=32000 -> N_chunk=2, S_chunk=4000
     num_chunks, chunk_size_local = calculate_moe_chunks(seq_len=8000,
-                                                        dp_size=4,
+                                                        parallel_size=4,
                                                         chunk_size=16384)
     assert num_chunks == 2
     assert chunk_size_local == 4000
 
     # Zero/Empty sequence length guard
     num_chunks, chunk_size_local = calculate_moe_chunks(seq_len=0,
-                                                        dp_size=4,
+                                                        parallel_size=4,
                                                         chunk_size=16384)
     assert num_chunks == 1
     assert chunk_size_local == 0
@@ -151,15 +151,15 @@ def test_calculate_moe_chunks_validation_errors():
     """Verify invalid token/chunk geometries raise clear ValueErrors."""
     # Local tokens (5001) with DP=4, C=16384 -> T=20004 -> N_chunk=2, but 5001 % 2 != 0
     with pytest.raises(ValueError, match="not divisible by chunk count"):
-        calculate_moe_chunks(seq_len=5001, dp_size=4, chunk_size=16384)
+        calculate_moe_chunks(seq_len=5001, parallel_size=4, chunk_size=16384)
 
     # Local tokens (3) with DP=4, C=6 -> T=12 -> N_chunk=2, but 3 % 2 != 0
     with pytest.raises(ValueError, match="not divisible by chunk count"):
-        calculate_moe_chunks(seq_len=3, dp_size=4, chunk_size=6)
+        calculate_moe_chunks(seq_len=3, parallel_size=4, chunk_size=6)
 
 
-class _MockDPGroup:
-    """Mock DP group tracking collective calls and verifying order."""
+class _MockCollectiveGroup:
+    """Mock collective group tracking calls and verifying order."""
 
     def __init__(self, world_size=4, rank=0):
         self.world_size = world_size
@@ -181,7 +181,7 @@ class _MockDPGroup:
 
 def test_pipelined_moe_execution_flow_and_numerical_parity():
     """Verify pipelined execution interleaving collectives and compute with numerical parity."""
-    dp_group = _MockDPGroup(world_size=4, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=4, rank=0)
     seq_len = 8192
     hidden_dim = 128
     topk = 2
@@ -207,6 +207,7 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
         return hidden_states * 2.0
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_group", return_value=None), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
         out = pipelined_fused_moe_gmm(
@@ -237,6 +238,46 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
     assert len(ag_calls) == 6
     # 1 tensor reduce-scattered per chunk * 2 chunks = 2 reduce_scatter calls
     assert len(rs_calls) == 2
+
+
+def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
+    """Verify PCP selects its own group and executes multiple MoE chunks."""
+    pcp_group = _MockCollectiveGroup(world_size=4, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=1, rank=0)
+    seq_len = 8192
+    hidden_dim = 16
+    topk = 2
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    topk_weights = torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk
+    topk_ids = torch.zeros(seq_len, topk, dtype=torch.int32)
+
+    def mock_kernel_fn(hidden_states, *args, **kwargs):
+        return hidden_states * 2.0
+
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_group", return_value=pcp_group), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+        )
+
+    torch.testing.assert_close(out, hidden_states * 2.0)
+    assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 6
+    assert len([c for c in pcp_group.call_log
+                if c[0] == "reduce_scatter"]) == 2
+    assert dp_group.call_log == []
 
 
 class TestMoEForwardPrecisionBranches:
@@ -557,7 +598,7 @@ class TestMoEForwardPrecisionBranches:
 
 def test_pipelined_moe_single_chunk_dp_greater_than_one():
     """Verify pipelined MoE execution when num_chunks == 1 with DP > 1."""
-    dp_group = _MockDPGroup(world_size=4, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=4, rank=0)
     seq_len = 1024
     hidden_dim = 64
     topk = 2
@@ -650,7 +691,7 @@ def test_pipelined_moe_dp_size_one_no_collectives():
     torch.testing.assert_close(out, hidden_states * 1.5)
 
     # Case 2: dp_group world_size == 1
-    dp_group_1 = _MockDPGroup(world_size=1, rank=0)
+    dp_group_1 = _MockCollectiveGroup(world_size=1, rank=0)
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group_1), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
@@ -675,7 +716,7 @@ def test_pipelined_moe_dp_size_one_no_collectives():
 
 def test_pipelined_moe_with_none_routing_tensors():
     """Verify pipelining works cleanly when topk_weights or topk_ids are None."""
-    dp_group = _MockDPGroup(world_size=4, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=4, rank=0)
     seq_len = 8192
     hidden_dim = 64
     num_experts = 4
@@ -728,7 +769,7 @@ def test_pipelined_moe_with_none_routing_tensors():
 
 def test_pipelined_moe_four_stage_pipeline():
     """Verify pipelining with 4 chunks exercises multi-iteration pipeline steady state."""
-    dp_group = _MockDPGroup(world_size=4, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=4, rank=0)
     # S=16384, DP=4, C=16384 -> T_global=65536 -> N_chunk=4, S_chunk=4096
     seq_len = 16384
     hidden_dim = 64
