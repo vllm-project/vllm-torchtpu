@@ -95,15 +95,15 @@ def _get_moe_collective_group():
 
 
 @torch.compiler.assume_constant_result
-def _log_active_chunk_pipeline(collective_kind: str, parallel_size: int,
-                               seq_len: int, num_chunks: int,
-                               chunk_size_local: int, chunk_size: int) -> None:
-    """Emit trace-time evidence without adding logging ops to the graph."""
+def _log_active_chunk_pipeline() -> None:
+    """Emit trace-time evidence without passing symbolic values to logging."""
+    collective_group, collective_kind = _get_moe_collective_group()
+    parallel_size = (int(collective_group.world_size)
+                     if collective_group is not None else 1)
     logger.info_once(
-        "MoE chunk pipeline active: group=%s, world_size=%d, "
-        "local_tokens=%d, chunks=%d, local_chunk_tokens=%d, threshold=%d",
-        collective_kind, parallel_size, seq_len, num_chunks, chunk_size_local,
-        chunk_size)
+        "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, "
+        "threshold=%d", collective_kind, parallel_size,
+        envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
 
 
 def pipelined_fused_moe_gmm(
@@ -157,7 +157,7 @@ def pipelined_fused_moe_gmm(
         torch.Tensor: Reduced local output activations [S, H].
     """
     chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
-    collective_group, collective_kind = _get_moe_collective_group()
+    collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
     parallel_size = (int(collective_group.world_size)
@@ -199,8 +199,7 @@ def pipelined_fused_moe_gmm(
             return collective_group.reduce_scatter(out, dim=0)
         return out
 
-    _log_active_chunk_pipeline(collective_kind, parallel_size, seq_len,
-                               num_chunks, chunk_size_local, chunk_size)
+    _log_active_chunk_pipeline()
 
     # Slice local inputs into num_chunks chunks along dim 0
     hs_slices = [
