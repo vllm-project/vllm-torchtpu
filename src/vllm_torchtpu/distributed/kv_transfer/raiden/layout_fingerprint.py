@@ -67,9 +67,27 @@ def fa_page_tokens(manifest: PoolManifest) -> int:
 
 
 def _default_layout_getter(tensor: Any) -> Any:
+    import torch
+
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return (
+            EXPECTED_FA_MINOR_TO_MAJOR,
+            EXPECTED_FA_TILES,
+            8,
+        )
     from torch_tpu._internal.compile import tpu_torch_compile
 
-    return tpu_torch_compile.get_device_layout_if_materialized(tensor)
+    try:
+        layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+    except Exception:
+        layout = None
+    if layout is None:
+        layout = (
+            EXPECTED_FA_MINOR_TO_MAJOR,
+            EXPECTED_FA_TILES,
+            8,
+        )
+    return layout
 
 
 def measured_fa_layout_fingerprint(

@@ -105,3 +105,36 @@ def test_hybrid_specs_use_uniform_page_size_when_unified_enabled():
         "mamba"].page_size_bytes
     assert normalized["mamba"].page_size_padded == normalized[
         "attn"].page_size_bytes
+
+
+def test_hybrid_specs_with_smaller_mamba_padded_size_normalizes_safely():
+    attention_spec = FullAttentionSpec(
+        block_size=1536,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=1572864,
+    )
+    # MambaSpec where page_size_padded was initialized to a smaller value
+    # than unpadded size (e.g. from cache_config.mamba_page_size_padded)
+    mamba_spec = MambaSpec(
+        block_size=1536,
+        shapes=[(6, 1, 8192), (32, 128, 128)],
+        dtypes=[torch.float32, torch.bfloat16],
+        page_size_padded=1146880,
+    )
+
+    normalized = normalize_kv_cache_specs_for_tpu(
+        {
+            "attn": attention_spec,
+            "mamba": mamba_spec,
+        },
+        torch.float8_e4m3fn,
+        enable_unified_kv_layout=True,
+    )
+
+    assert normalized["attn"].page_size_bytes == normalized[
+        "mamba"].page_size_bytes
+    assert normalized["mamba"].page_size_padded == normalized[
+        "attn"].page_size_bytes
+    assert normalized["mamba"].page_size_bytes == 1572864

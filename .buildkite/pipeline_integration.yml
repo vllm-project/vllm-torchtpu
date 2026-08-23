@@ -18,13 +18,6 @@ steps:
     steps:
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
-        # The KV transfer library moved the per-request block registration used
-        # by disaggregated serving out of its Python control plane, and the
-        # controller this test starts now refuses those calls. Serving cannot
-        # work again until the engine hosts the replacement control plane, so
-        # the test is skipped rather than left failing. Remove this once that
-        # migration lands; nothing else about the step changes.
-        skip: "migrating disaggregated serving to the new KV transfer control plane"
         agents:
           queue: "tpu_v7x_8_queue"
         env:

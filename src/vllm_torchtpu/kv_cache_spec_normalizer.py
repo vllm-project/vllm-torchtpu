@@ -29,7 +29,8 @@ def normalize_kv_cache_specs_for_tpu(
         normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
     if (enable_unified_kv_layout
             and _has_hybrid_attention_and_mamba(normalized)):
-        page_size = max(spec.page_size_bytes for spec in normalized.values())
+        page_size = max(
+            _unpadded_page_size_bytes(spec) for spec in normalized.values())
         normalized = {
             layer_name:
             (spec if layer_name in exempt else _pad_page_size(spec, page_size))
@@ -84,9 +85,17 @@ def _has_hybrid_attention_and_mamba(
     return has_attention and has_mamba
 
 
+def _unpadded_page_size_bytes(spec: KVCacheSpec) -> int:
+    if hasattr(spec, "page_size_padded") and spec.page_size_padded is not None:
+        return replace(spec, page_size_padded=None).page_size_bytes
+    return spec.page_size_bytes
+
+
 def _pad_page_size(spec: KVCacheSpec, page_size: int) -> KVCacheSpec:
     if not isinstance(spec, (AttentionSpec, MambaSpec)):
         return spec
-    if spec.page_size_bytes == page_size:
+    unpadded_size = _unpadded_page_size_bytes(spec)
+    padded_size = max(page_size, unpadded_size)
+    if spec.page_size_padded == padded_size:
         return spec
-    return replace(spec, page_size_padded=page_size)
+    return replace(spec, page_size_padded=padded_size)
