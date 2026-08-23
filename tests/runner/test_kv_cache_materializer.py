@@ -9,6 +9,9 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
     format_kv_cache_layout_summary, materialize_kv_cache_tensors)
+from vllm_torchtpu.kv_cache_spec_normalizer import \
+    normalize_kv_cache_specs_for_tpu
+from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
 
 
 class FakeAttentionBackend:
@@ -425,3 +428,90 @@ def test_pool_layout_summary_shows_single_pool_state():
     assert "state[0]: shape=(4, 16, 2, 2, 8)" in summary
     assert "contiguous=True" in summary
     assert "storage_offset_bytes=0" in summary
+
+
+def test_hybrid_materialization_workload_a_geometry() -> None:
+    attn_spec = FullAttentionSpec(
+        block_size=1536,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=None,
+    )
+    mamba_spec = MambaSpec(
+        block_size=1536,
+        shapes=[(274432, )],
+        dtypes=[torch.bfloat16],
+        page_size_padded=None,
+    )
+
+    norm_specs = normalize_kv_cache_specs_for_tpu(
+        {
+            "model.layers.0.self_attn": attn_spec,
+            "model.layers.1.mamba": mamba_spec,
+        },
+        torch.float8_e4m3fn,
+        enable_unified_kv_layout=True,
+    )
+    norm_attn = norm_specs["model.layers.0.self_attn"]
+    norm_mamba = norm_specs["model.layers.1.mamba"]
+    assert norm_attn.page_size_bytes == 786432
+    assert norm_mamba.page_size_bytes == 786432
+
+    num_blocks = 2
+    pool_page_bytes = norm_attn.page_size_bytes
+    cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=pool_page_bytes * num_blocks,
+                shared_by=[
+                    "model.layers.0.self_attn",
+                    "model.layers.1.mamba",
+                ],
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn"],
+                kv_cache_spec=norm_attn,
+            ),
+            KVCacheGroupSpec(
+                layer_names=["model.layers.1.mamba"],
+                kv_cache_spec=norm_mamba,
+            ),
+        ],
+    )
+
+    attn_groups = [
+        [
+            AttentionGroup(
+                backend=PallasAttentionBackend,
+                layer_names=["model.layers.0.self_attn"],
+                kv_cache_spec=norm_attn,
+                kv_cache_group_id=0,
+            )
+        ],
+        [
+            AttentionGroup(
+                backend=PallasAttentionBackend,
+                layer_names=["model.layers.1.mamba"],
+                kv_cache_spec=norm_mamba,
+                kv_cache_group_id=1,
+            )
+        ],
+    ]
+
+    materialized = materialize_kv_cache_tensors(
+        kv_cache_config=cfg,
+        attn_groups=attn_groups,
+        kernel_block_sizes=[512, 512],
+        device=torch.device("cpu"),
+        cache_dtype="fp8",
+    )
+
+    assert len(materialized.raw_tensors) == 1
+    pool = materialized.raw_tensors[0]
+    assert pool.dtype == torch.float8_e4m3fn
+    assert materialized.kv_caches["model.layers.0.self_attn"] is pool
+    assert materialized.kv_caches["model.layers.1.mamba"] == [pool]
