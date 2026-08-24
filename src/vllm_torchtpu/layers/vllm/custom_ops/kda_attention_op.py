@@ -30,8 +30,10 @@ def _use_fused_kda() -> bool:
     """Whether to route KDA through the fused conv1d + GDN v3 kernel.
 
     Read per build rather than at import so it can be flipped between
-    builds. Off until the fused path has an accuracy number on a trained
-    model; k3-tiny is untrained and its logits cannot separate the two.
+    builds. Off by default here only to keep this change inert: the fused
+    path matches the manual one on gsm8k with Kimi-Linear-48B (0.8969 vs
+    0.8886 flexible-extract, against a stderr of 0.0087), so switching the
+    default is a follow-up rather than a blocked item.
     """
     return os.environ.get("VLLM_TORCHTPU_KDA_FUSED", "0") == "1"
 
