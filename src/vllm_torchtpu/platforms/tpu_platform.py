@@ -51,6 +51,8 @@ logger = init_logger(__name__)
 #     as a single device, so key == X*Y*Z and the trailing T=2 is not counted.
 #   - 3D Torus (v7x / Ironwood): two cores per chip exposed as two separate
 #     devices, so key == X*Y*Z*T, twice the chip count.
+#   - Hierarchical BoardFly (TPU v8i): 4 chips per board,
+#     up to 8 boards per group, up to 32 groups per slice, so key == C*B*G.
 #
 # Multi-host TPU slice mesh topologies for 2D Torus architectures.
 TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
@@ -85,6 +87,25 @@ TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
     512: "4,8,8,2",
 }
 
+# Multi-host TPU slice mesh topologies for TPU v8i, which uses a hierarchical
+# BoardFly topology: (Chips per Board) x (Boards per Group) x (Groups per Slice),
+# noted as C x B x G (4 chips per board, up to 8 boards per group, up to 32 groups per slice).
+TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
+    4: "4,1,1",
+    8: "4,2,1",
+    12: "4,3,1",
+    16: "4,4,1",
+    20: "4,5,1",
+    24: "4,6,1",
+    28: "4,7,1",
+    32: "4,8,1",
+    64: "4,8,2",
+    128: "4,8,4",
+    256: "4,8,8",
+    512: "4,8,16",
+    1024: "4,8,32",
+}
+
 # TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
 # TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
 _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
@@ -93,6 +114,9 @@ _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
 # surfaces as "TPU v7" from get_tpu_device_name() and as "TPU7x" from the
 # device-kind path, so both spellings have to match.
 _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
+
+# TPU v8i / TPU8i generations.
+_TPU_8I_GENERATIONS = ("v8i", "tpu8i")
 
 
 def get_tpu_multihost_topology(
@@ -123,6 +147,8 @@ def get_tpu_multihost_topology(
     device_name = device_name.lower()
     if any(gen in device_name for gen in _TPU_2D_TORUS_GENERATIONS):
         topo_map = TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
+    elif any(gen in device_name for gen in _TPU_8I_GENERATIONS):
+        topo_map = TPU_8I_MULTIHOST_TOPOLOGY_MAP
     elif any(gen in device_name for gen in _TPU_DUAL_DEVICE_GENERATIONS):
         topo_map = TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP
     else:
