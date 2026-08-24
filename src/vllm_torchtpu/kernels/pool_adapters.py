@@ -17,7 +17,7 @@ The pool is the stock attention-shaped KV cache
 `(num_blocks, block_size, num_kv_heads * 2, head_size)` in the KV dtype —
 the one tensor per physical buffer that every sharing layer receives.
 Attention consumes it natively. Consumers that pack other element types
-into a block's byte-region (the GDN f32 ssm state, the conv slot) go
+into a block's byte-region (the GDN SSM and Conv states) go
 through these adapters: per-request gather/scatter of a token-range,
 reinterpreted in VMEM via Mosaic `ref.bitcast` when the element type
 differs — the only place a cross-dtype view is free on TPU (an XLA-level
@@ -446,16 +446,19 @@ def v3_state_source(
         d_k: int,
         d_v: int,
         kernel_size: int,
+        recurrent_state_dtype: jnp.dtype = jnp.float32,
         qk_pair_layout: bool = False) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
     for these regions, without the external round trip.
 
-    The ssm region is the whole kernel blocks at the start of the manager
-    window (one contiguous DMA per slot), viewed f32 with the ``d_v``
-    lane split; the conv region is ``conv_ntok`` token rows inside a
-    single kernel block, viewed bf16 with the tail rows zero-padded.
+    The SSM region is the whole kernel blocks at the start of the manager
+    window (one contiguous DMA per slot), viewed in the configured storage
+    dtype. FP32 uses a ``d_v``-wide typed view; BF16 preserves the raw pool
+    ref's full minormost width. The Conv region is ``conv_ntok`` token rows
+    inside a single kernel block, viewed as BF16 with the tail rows
+    zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
     caller; ``pool`` contributes only its shape and dtype.
 
@@ -468,29 +471,46 @@ def v3_state_source(
     """
     block_size, payload, lanes = _pool_geometry(pool)
     tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+    recurrent_state_dtype = jnp.dtype(recurrent_state_dtype)
 
-    assert lanes % d_v == 0, (lanes, d_v)
     ssm_rows = n_v * d_k
-    # The ssm region may extend past the f32 state bytes when the state does
-    # not divide the pool token row; the kernel truncates loads to
-    # rows_used and zero-fills the padding rows on store.
-    assert ssm_ntok * tok_bytes >= ssm_rows * d_v * 4, (ssm_ntok, tok_bytes,
-                                                        n_v, d_k, d_v)
-    # Each pool token must hold a whole number of typed f32 rows.
-    assert tok_bytes % (d_v * 4) == 0, (tok_bytes, d_v)
+    ssm_elements = ssm_rows * d_v
+    # The SSM region may extend past the typed state bytes when the state does
+    # not divide the pool token row; the kernel truncates loads to rows_used
+    # and zero-fills the padding rows on store.
+    assert ssm_ntok * tok_bytes >= (
+        ssm_elements * recurrent_state_dtype.itemsize), (ssm_ntok, tok_bytes,
+                                                         n_v, d_k, d_v,
+                                                         recurrent_state_dtype)
     if ssm_ntok % block_size == 0:
         ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
     else:
         assert ssm_ntok < block_size, (ssm_ntok, block_size)
         ssm_nblocks, ssm_nrows = 1, ssm_ntok
+    # Mosaic requires a BF16 typed ref to preserve the raw pool ref's minormost
+    # dimension, so load full-width and reshape the resulting array. FP32
+    # supports the d_v-wide ref view, avoiding a post-load lane-crossing
+    # relayout.
+    if recurrent_state_dtype.itemsize == 2:
+        ssm_lane_split = 1
+    else:
+        assert lanes % d_v == 0, (lanes, d_v)
+        ssm_lane_split = lanes // d_v
+    ssm_out_lanes = lanes // ssm_lane_split
+    # load_state_region treats these rows as one contiguous element stream and
+    # reshapes it to (n_v, d_k, d_v); store_state_region reverses that reshape.
+    # FP32 uses d_v-wide rows, while BF16 may pack multiple logical rows into
+    # one full-width carrier row. The logical state must contain a whole number
+    # of carrier rows.
+    assert ssm_elements % ssm_out_lanes == 0, (ssm_elements, ssm_out_lanes)
     ssm = gdn_v3_config.StateRegion(
         kb0=0,
         nblocks=ssm_nblocks,
         row0=0,
         nrows=ssm_nrows,
-        view_dtype=jnp.dtype(jnp.float32),
-        lane_split=lanes // d_v,
-        rows_used=ssm_rows,
+        view_dtype=recurrent_state_dtype,
+        lane_split=ssm_lane_split,
+        rows_used=ssm_elements // ssm_out_lanes,
     )
 
     kb0, row0 = divmod(conv_tok0, block_size)

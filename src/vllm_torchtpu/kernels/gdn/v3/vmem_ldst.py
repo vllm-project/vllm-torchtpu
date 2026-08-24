@@ -117,8 +117,10 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
             region.nrows, *source payload dims, source lanes] in the
             source dtype.
         region: The region's copy-plan (typed view parameters).
-        shape: Logical state shape; its last dim must be a multiple of
-            the typed view's lane count.
+        shape: Logical state shape; its element count must equal
+            ``region.rows_used`` times the typed view's lane count. The FP32
+            path narrows the ref to the logical minor dimension; BF16 keeps
+            the full carrier width and reshapes the loaded array here.
 
     Returns:
         The logical state of ``shape`` in ``region.view_dtype``.
@@ -177,12 +179,12 @@ def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
 
 def _load_recurrent_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
                           idx: int) -> jax.Array:
-    """One slot's recurrent state, decoded through the plan when there is one."""
+    """One slot's recurrent state, converted to FP32 for compute."""
     if cfg.state_plan is None:
-        return slot_ref[idx, 0]
+        return slot_ref[idx, 0].astype(jnp.float32)
     return load_state_region(
         slot_ref.at[idx, 0], cfg.state_plan.recurrent,
-        (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
+        (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim)).astype(jnp.float32)
 
 
 def load_and_select_states(

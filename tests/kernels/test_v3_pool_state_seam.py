@@ -562,6 +562,75 @@ class TestPooledSpecWindows:
 
 class TestPooledCallerV3:
 
+    def test_bf16_ssm_round_trips_through_fp8_pool(self):
+        gdn_attention = pytest.importorskip(
+            "vllm_torchtpu.layers.common.gdn_attention")
+        n = 4
+        pool_idx = jnp.arange(1, n + 1, dtype=jnp.int32)
+        dense_idx = jnp.arange(n, dtype=jnp.int32)
+        recurrent_bf16 = jax.random.normal(
+            jax.random.key(41), (n, N_V, D_K, D_V)).astype(jnp.bfloat16)
+        conv = jnp.zeros((n, KERNEL_SIZE - 1, DIM), dtype=jnp.float32)
+        pool = jnp.zeros((NUM_MGR * SPLIT, KBS, 1, 4, LANES),
+                         dtype=jnp.float8_e4m3fn)
+        ssm_ntok = N_V * D_K * D_V * 2 // (4 * LANES)
+        pool = pool_adapters.scatter_region(pool,
+                                            recurrent_bf16.reshape(
+                                                n, -1, LANES),
+                                            pool_idx,
+                                            tok0=0,
+                                            ntok=ssm_ntok,
+                                            split=SPLIT)
+        kwargs = _rand_inputs(42, n) | dict(
+            query_start_loc=jnp.arange(n + 1),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+        )
+
+        (_, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
+            conv_state=conv,
+            recurrent_state=recurrent_bf16.astype(jnp.float32),
+            state_indices=dense_idx,
+            **kwargs)
+        new_pool, pooled_out = gdn_attention.run_jax_gdn_attention_pooled_local(
+            mixed_qkv=kwargs["qkv"],
+            b=kwargs["b"],
+            a=kwargs["a"],
+            recurrent_state=pool,
+            conv_weight=kwargs["conv_weight"],
+            conv_bias=kwargs["conv_bias"],
+            A_log=kwargs["a_log"],
+            dt_bias=kwargs["dt_bias"],
+            query_start_loc=kwargs["query_start_loc"],
+            state_indices=pool_idx,
+            distribution=kwargs["distribution"],
+            seq_lens=kwargs["seq_lens"],
+            n_kq=N_KQ,
+            n_v=N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+            pool_block_tokens=SPLIT * KBS,
+            recurrent_state_dtype=jnp.bfloat16,
+        )
+        pooled_ssm = pool_adapters.gather_region(new_pool,
+                                                 pool_idx,
+                                                 tok0=0,
+                                                 ntok=ssm_ntok,
+                                                 split=SPLIT,
+                                                 out_dtype=jnp.bfloat16,
+                                                 out_lanes=LANES).reshape(
+                                                     n, N_V, D_K, D_V)
+
+        np.testing.assert_allclose(np.asarray(pooled_out),
+                                   np.asarray(dense_out),
+                                   rtol=5e-2,
+                                   atol=5e-2)
+        np.testing.assert_allclose(np.asarray(pooled_ssm, dtype=np.float32),
+                                   np.asarray(dense_ssm, dtype=np.float32),
+                                   rtol=5e-2,
+                                   atol=5e-2)
+
     def test_caller_matches_roundtrip(self):
         gdn_attention = pytest.importorskip(
             "vllm_torchtpu.layers.common.gdn_attention")

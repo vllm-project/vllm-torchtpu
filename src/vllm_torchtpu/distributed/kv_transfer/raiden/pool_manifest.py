@@ -32,12 +32,10 @@ import dataclasses
 from typing import Any, Mapping, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_CONV_STATE_DTYPE,
-                                           POOLED_GDN_CONV_STATE_ITEMSIZE,
-                                           POOLED_GDN_SSM_STATE_DTYPE,
-                                           POOLED_GDN_SSM_STATE_ITEMSIZE,
-                                           pooled_gdn_conv_state_bytes,
-                                           pooled_gdn_ssm_state_bytes)
+from vllm_torchtpu.gdn_pool_layout import (pooled_gdn_conv_state_bytes,
+                                           pooled_gdn_ssm_state_bytes,
+                                           pooled_gdn_state_dtypes,
+                                           pooled_gdn_state_itemsize)
 
 from .tags import TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
@@ -384,12 +382,13 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
 
     The state geometry is tied to the pooled GDN kernel's byte model
     (``gdn_pool_layout`` — the same helpers ``_build_v3_pool_state_plan``
-    uses), NOT to the layer's declared MambaSpec shapes/dtypes.  The pooled
-    kernel never reads that declaration, so only the kernel model describes
-    the bytes that actually move; a declaration that drifts from it (e.g. a
-    dtype/shape override made for the typed materialization path) must not
-    leak into transfer spans.  The spec contributes only the manager page
-    pitch, plus the identity check that this is a two-state GDN layer.
+    uses), NOT to the layer's declared MambaSpec shapes or Conv dtype.  The
+    pooled kernel never reads those declarations, so only the kernel model
+    describes the geometry and Conv bytes that actually move; a declaration
+    that drifts from it (e.g. a Conv-dtype/shape override made for the typed
+    materialization path) must not leak into transfer spans.  The spec
+    contributes the SSM dtype and manager page pitch, plus the identity check
+    that this is a two-state GDN layer.
     """
     raw_index = _raw_index_for(pool, raw_tensors)
     if raw_index is None:
@@ -416,19 +415,22 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
             f"pooled GDN cache {layer_name} has no conv taps: "
             f"conv_kernel_size={gdn_geometry.conv_kernel_size}")
     conv_shape = (taps, gdn_geometry.conv_dim)
-    conv_dtype = POOLED_GDN_CONV_STATE_DTYPE
-    conv_itemsize = POOLED_GDN_CONV_STATE_ITEMSIZE
+    conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    try:
+        conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
+        ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
     conv_bytes = pooled_gdn_conv_state_bytes(
         kernel_size=gdn_geometry.conv_kernel_size,
         conv_dim=gdn_geometry.conv_dim)
     ssm_shape = (gdn_geometry.local_value_heads, gdn_geometry.value_head_dim,
                  gdn_geometry.key_head_dim)
-    ssm_dtype = POOLED_GDN_SSM_STATE_DTYPE
-    ssm_itemsize = POOLED_GDN_SSM_STATE_ITEMSIZE
     ssm_bytes = pooled_gdn_ssm_state_bytes(
         num_v_heads=gdn_geometry.local_value_heads,
         head_k_dim=gdn_geometry.key_head_dim,
-        head_v_dim=gdn_geometry.value_head_dim)
+        head_v_dim=gdn_geometry.value_head_dim,
+        dtype=ssm_dtype)
 
     try:
         manager_page_bytes = int(spec.page_size_bytes)

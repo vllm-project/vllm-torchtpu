@@ -349,7 +349,12 @@ def test_aliased_binding_resolves_raw_storage_offsets():
     rpm.verify_storage_binding(manifest, named, raw_tensors=(raw, ))
 
 
-def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
+@pytest.mark.parametrize(("ssm_dtype", "ssm_itemsize"), [
+    ("torch.float32", 4),
+    ("torch.bfloat16", 2),
+])
+def test_unified_pool_derives_logical_gdn_views_without_torch_ops(
+        ssm_dtype, ssm_itemsize):
     geometry = rpm.GdnHeadGeometry(local_key_heads=4,
                                    local_value_heads=8,
                                    key_head_dim=64,
@@ -368,7 +373,7 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
     groups = (
         _pooled_gdn_group(["model.layers.0.linear_attn"],
                           shapes=(conv_shape, ssm_shape),
-                          dtypes=("torch.bfloat16", "torch.float32"),
+                          dtypes=("torch.bfloat16", ssm_dtype),
                           page_size_bytes=manager_page_bytes),
         _fa_group(["model.layers.1.self_attn.attn"],
                   block_size=128,
@@ -396,11 +401,12 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
     assert all(entry.num_blocks == 4 for entry in manifest.pools)
     assert all(entry.block_stride_bytes == manager_page_bytes
                for entry in manifest.pools)
-    ssm_bytes = 8 * 64 * 32 * 4
+    ssm_bytes = 8 * 64 * 32 * ssm_itemsize
     assert (conv.base_offset_bytes, conv.dtype_tag,
             conv.live_bytes_per_block) == (ssm_bytes, "bfloat16", 2 * 768 * 2)
     assert (ssm.base_offset_bytes, ssm.dtype_tag,
-            ssm.live_bytes_per_block) == (0, "float32", ssm_bytes)
+            ssm.live_bytes_per_block) == (0, ssm_dtype.removeprefix("torch."),
+                                          ssm_bytes)
     assert (fa.base_offset_bytes, fa.dtype_tag,
             fa.live_bytes_per_block) == (0, "float8_e4m3fn",
                                          manager_page_bytes)
@@ -411,13 +417,14 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
 
 
 def test_unified_pool_views_are_kernel_tied_not_spec_tied():
-    """A drifted MambaSpec declaration must not leak into the manifest.
+    """A drifted Conv MambaSpec declaration must not leak into the manifest.
 
     The layer-level ``get_state_shape``/``get_state_dtype`` overrides can
-    diverge from the pooled kernel's fixed byte model (PR #437 declared the
-    conv state fp32 with an extra singleton dim).  The manifest describes
-    the bytes the kernel actually moves, so two manifests built from the
-    drifted and the kernel-matching declarations must be identical.
+    diverge from the pooled kernel's fixed Conv byte model (PR #437 declared
+    the Conv state FP32 with an extra singleton dim). The manifest describes
+    the Conv bytes the kernel actually moves, so manifests built from drifted
+    and kernel-matching Conv declarations must be identical. SSM storage dtype
+    remains spec-defined.
     """
     geometry = rpm.GdnHeadGeometry(local_key_heads=4,
                                    local_value_heads=8,
