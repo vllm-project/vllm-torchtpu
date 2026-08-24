@@ -48,8 +48,9 @@ class SpeculativeDecodingManager:
         # For async-scheduling: in-flight D2H copy of drafts on device,
         # as (cpu_tensor, ready_event, req_ids snapshot). See
         # stage_draft_token_ids_for_host.
-        self._staged_draft_copy: Optional[tuple[torch.Tensor, Optional[
-            torch.Event], list[str]]] = None
+        self._staged_draft_copy: Optional[tuple[torch.Tensor,
+                                                Optional[torch.Event],
+                                                list[str]]] = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
         # tensors are pure functions of (num_draft_tokens,
