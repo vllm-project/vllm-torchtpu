@@ -20,6 +20,11 @@ def create_parser():
 
     # Add sampling params
     sampling_group = parser.add_argument_group("Sampling parameters")
+    sampling_group.add_argument("--prompt",
+                                type=str,
+                                nargs="+",
+                                default=None,
+                                help="Custom prompt(s) for offline inference.")
     sampling_group.add_argument("--max-tokens", type=int)
     sampling_group.add_argument("--temperature", type=float, default=0.0)
     sampling_group.add_argument("--top-p", type=float)
@@ -39,6 +44,7 @@ def create_parser():
 
 def main(args: dict):
     # Pop arguments not used by LLM
+    custom_prompts = args.pop("prompt")
     max_tokens = args.pop("max_tokens")
     temperature = args.pop("temperature")
     top_p = args.pop("top_p")
@@ -67,7 +73,7 @@ def main(args: dict):
 
     # Generate texts from the prompts. The output is a list of RequestOutput
     # objects that contain the prompt, generated text, and other information.
-    prompts = [
+    prompts = custom_prompts or [
         "Hello, my name is",
         "The capital of France is",
         "The colors of the rainbow are",

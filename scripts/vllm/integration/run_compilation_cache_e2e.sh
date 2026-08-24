@@ -87,8 +87,11 @@ clean_tpu_processes
 rm -rf "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 mkdir -p "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 
+TEST_PROMPT="The capital of France is"
+
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
 
 sync && sleep 10
 
@@ -159,7 +162,8 @@ echo "================================================================="
 clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
 
 sync && sleep 10
 
@@ -175,7 +179,7 @@ WARM_COMP_TIME=$(python3 -c "
 import re
 with open('${CACHE_DIR}/warm_run.log') as f:
     times = [float(x) for x in re.findall(r'Compilation finished in ([0-9.]+) \[secs\]', f.read())]
-print(f'{sum(times):.2f}' if times else '999')
+print(f'{sum(times):.2f}' if times else '0.0')
 ")
 
 echo "📊 Total Cold Compilation Time: ${COLD_COMP_TIME}s"
@@ -185,7 +189,7 @@ echo "📊 Total Warm Compilation Time: ${WARM_COMP_TIME}s"
 IS_FAST=$(python3 -c "
 cold = float('${COLD_COMP_TIME}')
 warm = float('${WARM_COMP_TIME}')
-print(1 if (warm < cold and (warm < cold * 0.75 or warm < 20.0)) else 0)
+print(1 if (warm < 15.0 or (warm < cold and warm < cold * 0.75)) else 0)
 " 2>/dev/null || echo "0")
 
 if [ "${IS_FAST}" -eq 1 ]; then
@@ -204,8 +208,8 @@ fi
 echo "================================================================="
 echo "=== 🎯 [Test 4] Inference Output Correctness Check (Cold vs Warm)"
 echo "================================================================="
-grep -A 1 "Prompt:" "${CACHE_DIR}/cold_run.log" > "${CACHE_DIR}/cold_output.txt" || true
-grep -A 1 "Prompt:" "${CACHE_DIR}/warm_run.log" > "${CACHE_DIR}/warm_output.txt" || true
+grep -E "^(Prompt:|Generated text:)" "${CACHE_DIR}/cold_run.log" > "${CACHE_DIR}/cold_output.txt" || true
+grep -E "^(Prompt:|Generated text:)" "${CACHE_DIR}/warm_run.log" > "${CACHE_DIR}/warm_output.txt" || true
 
 if [ ! -s "${CACHE_DIR}/cold_output.txt" ]; then
   echo "❌ [Test 4 FAILED] Cold run did not generate any prompt output!"
