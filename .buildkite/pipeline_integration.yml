@@ -56,6 +56,18 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: qwen35-gpc-global-dram-pool"
+        key: "integration_qwen35_gpc_global_dram_pool"
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          RUN_ROOT: "/perf_eval_results/qwen35_gpc_dram_pool_ci"
+        commands:
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
         key: "vllm_torchtpu_multihost_presubmit"
         agents:
