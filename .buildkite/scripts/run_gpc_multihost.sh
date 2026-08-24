@@ -130,7 +130,6 @@ echo "Model URI: ${MODEL_URI}"
 PERSIST_ROOT="${HOME}/persist"
 rm -rf "${PERSIST_ROOT}/perf_eval_results"
 mkdir -p "${PERSIST_ROOT}/perf_eval_results"
-chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 rm -rf perf_eval_results
 mkdir -p perf_eval_results
 # The agents' disks persist across jobs, and a stale staged model
@@ -160,12 +159,12 @@ echo "--- Pulling Docker image on the head host: ${IMAGE_TAG}"
 docker pull "${IMAGE_TAG}"
 
 echo "--- Preparing the worker host"
-base64 < "${SCRIPT_DIR}/cleanup_docker.sh" > /tmp/cleanup_docker.b64
+# The cleanup script rides inside the command string so every ssh retry
+# resends it; a stdin redirect would be consumed by a failed first attempt.
 ssh_retry "${SSH_USER}@${WORKER_IP}" \
-  "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; mkdir -p ~/gpc_ci"
-ssh_retry "${SSH_USER}@${WORKER_IP}" "base64 -d > ~/gpc_ci/cleanup_docker.sh" < /tmp/cleanup_docker.b64
-ssh_retry "${SSH_USER}@${WORKER_IP}" \
-  "rm -rf ~/persist/models; bash ~/gpc_ci/cleanup_docker.sh || true; \
+  "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; \
+   printf %s '$(base64 -w0 "${SCRIPT_DIR}/cleanup_docker.sh")' | base64 -d | bash || true; \
+   rm -rf ~/persist/models; \
    echo \"Worker boot disk after cleanup: \$(df -h / | tail -1)\"; \
    docker pull '${IMAGE_TAG}'"
 
@@ -174,11 +173,7 @@ docker run -d --name gpc-registry \
   --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   -p "${REGISTRY_PORT}:${REGISTRY_PORT}" \
   "${IMAGE_TAG}" \
-  bash -c 'command -v global_registry_server >/dev/null || { \
-     echo "global_registry_server not found: the tpu-raiden-torch pin \
-predates the bundled GPC control plane; bump it in pyproject.toml"; \
-     exit 1; }; \
-   exec global_registry_server --port='"${REGISTRY_PORT}"
+  global_registry_server --port="${REGISTRY_PORT}"
 
 echo "--- Starting replica B on the worker host"
 # Detached, so an interrupted ssh session cannot take the engine with it;
@@ -209,7 +204,7 @@ docker run -d --name gpc-head --privileged --net=host --shm-size=64g \
   -e GPC_PEER_IP="${WORKER_IP}" \
   -w /root/torchtpu-vllm \
   "${IMAGE_TAG}" \
-  bash -c 'umask 000; rm -rf /perf_eval_results/*; bash scripts/vllm/integration/run_qwen35_gpc_correctness.sh'
+  bash -c 'umask 000; bash scripts/vllm/integration/run_qwen35_gpc_correctness.sh'
 docker logs -f gpc-head &
 HEAD_LOGS_PID=$!
 
@@ -226,7 +221,6 @@ while :; do
   fi
   if [ "$(docker inspect -f '{{.State.Running}}' gpc-registry 2>/dev/null)" != "true" ]; then
     echo "ERROR: the registry container exited; aborting the head test."
-    docker rm -f gpc-head >/dev/null 2>&1 || true
     EXIT_CODE=1
     break
   fi
@@ -237,7 +231,6 @@ while :; do
     2>/dev/null || echo unknown)"
   if [ "${worker_running}" = "false" ]; then
     echo "ERROR: replica B's container exited; aborting the head test."
-    docker rm -f gpc-head >/dev/null 2>&1 || true
     EXIT_CODE=1
     break
   fi
@@ -245,13 +238,12 @@ while :; do
 done
 
 echo "--- Collecting the registry and replica B logs"
-docker logs gpc-registry --tail 2000 \
+docker logs gpc-registry \
   > "${PERSIST_ROOT}/perf_eval_results/registry.log" 2>&1 || true
-ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "docker logs gpc-worker --tail 5000" \
+ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "docker logs gpc-worker" \
   > "${PERSIST_ROOT}/perf_eval_results/worker_server_b.log" 2>&1 || true
 
 echo "--- Copying results back for artifact upload"
 cp -r "${PERSIST_ROOT}/perf_eval_results"/* perf_eval_results/ 2>/dev/null || true
-find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 
 exit "${EXIT_CODE}"

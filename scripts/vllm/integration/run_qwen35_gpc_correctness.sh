@@ -51,7 +51,7 @@ if [[ "${MODEL}" == gs://* ]]; then
   LOAD_FORMAT_ARGS=(--load-format runai_streamer)
 fi
 RUN_ROOT="${RUN_ROOT:-/tmp/qwen35_gpc_ci}"
-RUN_DIR="${RUN_DIR:-${RUN_ROOT}/run}"
+LOG_DIR="${RUN_ROOT}/logs"
 PORT_A="${PORT_A:-8100}"
 PORT_B="${PORT_B:-8200}"
 # Listen ports stay below the kernel's ephemeral range (32768+): the
@@ -81,9 +81,7 @@ NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-128}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-68719476736}"
 
-GPC_PUBLISH_WAIT_S="${GPC_PUBLISH_WAIT_S:-15}"
-
-mkdir -p "${RUN_DIR}/logs"
+mkdir -p "${LOG_DIR}"
 
 fail() {
   echo "GPC_CI_FAIL: $*" >&2
@@ -97,7 +95,6 @@ fail() {
 wait_for_registry() {
   local timeout_s="$1" waited=0
   until (exec 3<>"/dev/tcp/${GPC_HEAD_IP}/${REGISTRY_PORT}") 2>/dev/null; do
-    exec 3>&- 2>/dev/null || true
     if [[ "${waited}" -ge "${timeout_s}" ]]; then
       fail "registry ${GPC_HEAD_IP}:${REGISTRY_PORT} not reachable after \
 ${waited}s"
@@ -105,7 +102,6 @@ ${waited}s"
     sleep 5
     waited=$((waited + 5))
   done
-  exec 3>&- 2>/dev/null || true
   echo "registry ${GPC_HEAD_IP}:${REGISTRY_PORT} reachable"
 }
 
@@ -171,7 +167,7 @@ launch_replica() {
       --host 0.0.0.0 \
       --port "${port}" \
       --kv-transfer-config "$(kv_transfer_config "gpc-ci-${name}")"
-  ) >"${RUN_DIR}/logs/server_${name}.log" 2>&1 &
+  ) >"${LOG_DIR}/server_${name}.log" 2>&1 &
   printf -v "${pid_var}" '%s' "$!"
 }
 
@@ -179,7 +175,7 @@ wait_healthy() {
   local name="$1" url="$2" pid="$3" deadline="$4"
   until curl -sf --max-time 10 "${url}/health" >/dev/null; do
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
-      tail -80 "${RUN_DIR}/logs/server_${name}.log" >&2 || true
+      tail -80 "${LOG_DIR}/server_${name}.log" >&2 || true
       fail "replica ${name} exited during startup"
     fi
     if [[ "${SECONDS}" -ge "${deadline}" ]]; then
@@ -210,27 +206,27 @@ warm_up() {
   echo "replica ${name} engine is ready"
 }
 
-if [[ "${GPC_ROLE}" == "worker" ]]; then
-  SERVER_PID_B=""
-  # shellcheck disable=SC2317  # invoked via the EXIT trap
-  cleanup_worker() {
-    if [[ -n "${SERVER_PID_B}" ]]; then
-      kill -TERM "${SERVER_PID_B}" 2>/dev/null || true
-      sleep 2
-      kill -KILL "${SERVER_PID_B}" 2>/dev/null || true
-    fi
-  }
-  trap cleanup_worker EXIT
+SERVER_PID=""
+# shellcheck disable=SC2317  # invoked via the EXIT trap
+cleanup() {
+  if [[ -n "${SERVER_PID}" ]]; then
+    kill -TERM "${SERVER_PID}" 2>/dev/null || true
+    sleep 2
+    kill -KILL "${SERVER_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
+if [[ "${GPC_ROLE}" == "worker" ]]; then
   # The head's container may still be pulling its image; give the
   # registry longer than a local startup would need.
   wait_for_registry 1200
   echo "===== Starting replica B (${GPC_MY_IP}, full host, PCP${PCP}) ====="
-  launch_replica b "${PORT_B}" SERVER_PID_B
+  launch_replica b "${PORT_B}" SERVER_PID
   # The engine log is the only view the orchestrator has into this
   # container, so mirror it to stdout for docker logs.
-  tail -n +1 -F "${RUN_DIR}/logs/server_b.log" &
-  wait "${SERVER_PID_B}" || true
+  tail -n +1 -F "${LOG_DIR}/server_b.log" &
+  wait "${SERVER_PID}" || true
   fail "replica b exited"
 fi
 
@@ -238,26 +234,16 @@ fi
 # Head role: replica A, then the smoke gates against both replicas. The
 # registry is the orchestrator's own container on this host.
 # ---------------------------------------------------------------------------
-SERVER_PID_A=""
-cleanup_head() {
-  if [[ -n "${SERVER_PID_A}" ]]; then
-    kill -TERM "${SERVER_PID_A}" 2>/dev/null || true
-    sleep 2
-    kill -KILL "${SERVER_PID_A}" 2>/dev/null || true
-  fi
-}
-trap cleanup_head EXIT
-
 wait_for_registry 300
 
 echo "===== Starting replica A (${GPC_MY_IP}, full host, PCP${PCP}) ====="
-launch_replica a "${PORT_A}" SERVER_PID_A
+launch_replica a "${PORT_A}" SERVER_PID
 
 BASE_A="http://127.0.0.1:${PORT_A}"
 BASE_B="http://${GPC_PEER_IP}:${PORT_B}"
 
 deadline=$((SECONDS + STARTUP_TIMEOUT_S))
-wait_healthy a "${BASE_A}" "${SERVER_PID_A}" "${deadline}"
+wait_healthy a "${BASE_A}" "${SERVER_PID}" "${deadline}"
 # Replica B runs on the other host; its failures surface through the
 # orchestrator's docker-logs collection rather than a local pid.
 wait_healthy b "${BASE_B}" "" "${deadline}"
@@ -274,7 +260,6 @@ python3 "${script_dir}/smoke_gpc_global_offloading.py" \
   --base-b "${BASE_B}" \
   --model "${SERVED_MODEL_NAME}" \
   --min-prompt-tokens "$((BLOCK_SIZE * PCP + 1))" \
-  --publish-wait-s "${GPC_PUBLISH_WAIT_S}" \
-  2>&1 | tee "${RUN_DIR}/logs/smoke.log"
+  2>&1 | tee "${LOG_DIR}/smoke.log"
 
 echo "GPC_CI_OK"
