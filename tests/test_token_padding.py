@@ -1,18 +1,44 @@
 import torch
 
-from vllm_torchtpu.layers.vllm import token_padding
+from vllm_torchtpu.layers.vllm import fused_moe_ep, token_padding
 from vllm_torchtpu.layers.vllm.token_padding import TokenPaddingState
 
 
 def test_local_suffix_update():
     mask = TokenPaddingState(
-        local_padding_mask=torch.zeros(8, dtype=torch.bool))
+        local_padding_mask=torch.zeros(8, dtype=torch.bool),
+        local_valid_tokens=torch.zeros(1, dtype=torch.int32))
     mask.update(3, 6)
     assert mask.get_local_padding_mask(6).tolist() == [
         False, False, False, True, True, True
     ]
+    assert mask.get_local_valid_tokens().tolist() == [3]
     mask.update(2, 2)
     assert mask.get_local_padding_mask(8).sum().item() == 0
+    assert mask.get_local_valid_tokens().tolist() == [2]
+
+
+def test_gmm_graph_retains_fused_ep_valid_token_buffer(monkeypatch):
+    valid_tokens = torch.tensor([3], dtype=torch.int32)
+    calls = 0
+
+    def get_local_valid_tokens():
+        nonlocal calls
+        calls += 1
+        return valid_tokens
+
+    monkeypatch.setattr(fused_moe_ep, "_SKIP_PADDED_TOKENS", True)
+    monkeypatch.setattr(fused_moe_ep, "_RANK_BUFFER",
+                        torch.tensor([[0]], dtype=torch.int32))
+    monkeypatch.setattr(fused_moe_ep, "_EXPERT_ORDER", None)
+    monkeypatch.setattr(token_padding, "get_local_valid_tokens",
+                        get_local_valid_tokens)
+
+    output = torch.ones(2, dtype=torch.float32)
+    retained = fused_moe_ep.retain_fused_ep_graph_inputs(output)
+
+    assert calls == 1
+    assert torch.equal(retained, output)
 
 
 def test_dummy_batch_is_all_padding():

@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat,
     act_scale_slab_rows, align_up, build_routing_tables, expert_visit_list,
@@ -107,7 +108,8 @@ def fused_ep_moe_v2(x,
                     weight_format=WeightFormat.FP8,
                     rhs_qb=None,
                     act_fn="silu",
-                    rank=None):
+                    rank=None,
+                    valid_tokens=None):
     """Run one MoE layer through the fused expert-parallel kernel.
 
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
@@ -136,12 +138,16 @@ def fused_ep_moe_v2(x,
     the combine then weights it by that row's router weight, which is the
     per-selected-expert weighting the sum wants.
 
+    valid_tokens, when present, is an int32 [ep] vector sharded over the mesh:
+    each rank contributes the length of its valid token prefix. Rows beyond it
+    are excluded from routing, transport, and expert work, and return zero.
     block and ragged_stride default to the values this function derives;
     an explicitly passed one still has to divide tokens // ep * topk and to
     reach the no-drop bound respectively. act_fn selects the fused FFN
     activation from the kernel's ACT_FNS and is a build-time constant.
     """
     form = weight_form(weight_format)
+    async_row_gather = envs.TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
     # The weights themselves, against the format they were named as. This
     # validated only that the SCALES matched, which was largely
@@ -191,6 +197,10 @@ def fused_ep_moe_v2(x,
     ep = mesh.shape[ax]
     g_local = e_total // ep
     t_local = T // ep
+    if valid_tokens is not None and valid_tokens.shape != (ep, ):
+        raise ValueError(
+            f"valid_tokens must have one value per EP rank ({ep},), got "
+            f"{valid_tokens.shape}")
     P = jax.sharding.PartitionSpec
     stride_bound = ragged_stride_bound(T, topk, e_total, capacity)
     if ragged_stride is None:
@@ -230,22 +240,30 @@ def fused_ep_moe_v2(x,
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
         gate_l = next(operands)
+        valid_l = next(operands) if valid_tokens is not None else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
         me = rank_l[0, 0]
-        rows_bf16 = x_l.astype(jnp.bfloat16)
+        valid_rows = (jnp.arange(t_local, dtype=jnp.int32) < valid_l[0]
+                      if valid_l is not None else
+                      jnp.ones((t_local, ), dtype=jnp.bool_))
+        rows_bf16 = jnp.where(valid_rows[:, None], x_l,
+                              jnp.zeros_like(x_l)).astype(jnp.bfloat16)
         if form.quantized_activations:
             q_l, row_scale_l = rowquant_fp8(rows_bf16)
         else:
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
-        q_g = lax.all_gather(q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK,
-                                         HIDDEN_LANE_BLOCK),
-                             ax,
-                             axis=0,
-                             tiled=True)
+        q_wire = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK,
+                             HIDDEN_LANE_BLOCK)
+        if async_row_gather:
+            # Preserve sharding while allowing routing overlap.
+            with jax.named_scope("fused_ep_row_all_gather_overlap"):
+                q_g = lax.all_gather(q_wire, ax, axis=0, tiled=True)
+        else:
+            q_g = lax.all_gather(q_wire, ax, axis=0, tiled=True)
 
         scores = jax.nn.softmax(gate_l, axis=-1)
         select_rows = MAX_ROUTING_BLOCK
@@ -263,7 +281,8 @@ def fused_ep_moe_v2(x,
         # a wider accumulator, a reassociating compiler pass, or a different
         # renormalization would silently turn such a row from dropped into
         # routed at full weight to expert zero. Mask it explicitly instead.
-        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+        row_routes = (jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+                      & valid_rows[:, None])
         if renormalize:
             denom = topk_weights.sum(axis=-1, keepdims=True)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
@@ -275,6 +294,9 @@ def fused_ep_moe_v2(x,
         # host, which is how this repository verifies that a change served
         # the same program. A counter belongs in a metrics channel outside
         # the trace.
+        # Exclude invalid rows from routing tables.
+        topk_idx = jnp.where(valid_rows[:, None], topk_idx,
+                             jnp.int32(e_total))
         # One all-gather carries the indices and, where the rows were
         # quantized, their row scales, packed into one integer blob.
         blob_g = lax.all_gather(_pack_routing_blob(topk_idx, row_scale_l),
@@ -384,8 +406,11 @@ def fused_ep_moe_v2(x,
         # The destination's own table: one arrival row per selection slot.
         pos = lax.dynamic_slice(routing.arrival_row, (me * t_local, 0),
                                 (t_local, topk))
-        return _combine_arrivals(arrivals, arrival_scales, pos, topk_weights,
-                                 x_l.dtype)
+        combined = _combine_arrivals(arrivals, arrival_scales, pos,
+                                     topk_weights, x_l.dtype)
+        # Mask invalid arrivals before combining.
+        return jnp.where(valid_rows[:, None], combined,
+                         jnp.zeros_like(combined))
 
     # The biases ride the same expert-axis sharding as the weights they
     # belong to, so no shard ever holds a bias for an expert it does not own.
@@ -401,15 +426,21 @@ def fused_ep_moe_v2(x,
     # default keeps the device tests and any JAX-native caller working.
     if rank is None:
         rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
-    in_specs = (P(ax), ) * (5 + len(scale_args) + len(bias_args))
-    args = (x, rank, w1, w2) + scale_args + (gating, ) + bias_args
+    valid_args = (valid_tokens, ) if valid_tokens is not None else ()
+    in_specs = (P(ax), ) * (5 + len(scale_args) + len(valid_args) +
+                            len(bias_args))
+    args = ((x, rank, w1, w2) + scale_args + (gating, ) + valid_args +
+            bias_args)
     NS = jax.sharding.NamedSharding
     args = tuple(
         jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (mesh, T, hidden, e_total, inter, topk, bool(renormalize), capacity,
-           block, ragged_stride, weight_format, rhs_qb, act_fn, x.dtype,
+           async_row_gather, block, ragged_stride, weight_format, rhs_qb,
+           act_fn, x.dtype,
+           bool(valid_tokens is not None),
+           valid_tokens.dtype if valid_tokens is not None else None,
            w1.dtype, w2.dtype, form.has_scales
            and w1_scale.dtype, gating.dtype, has_w1_bias
            and w1_bias.dtype, has_w2_bias and w2_bias.dtype)
