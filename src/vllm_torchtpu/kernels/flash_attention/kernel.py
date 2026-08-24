@@ -13,6 +13,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.flash_attention.tuned_params import (
+    get_tuned_params, make_tuning_key)
+from vllm_torchtpu.utils import align_to
+
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
@@ -72,6 +76,44 @@ class BlockSizes:
         )
 
 
+def calculate_vmem_usage_bytes(block_sizes: BlockSizes,
+                               q_dtype,
+                               kv_dtype,
+                               head_dim: int,
+                               kv_seq_len: int,
+                               ab=None,
+                               segment_ids=None) -> int:
+    """Estimate VMEM needed by the whole-KV single-step kernel."""
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    num_sublanes = tpu_info.num_sublanes
+    aligned_head_dim = align_to(head_dim, num_lanes)
+
+    q_elements = block_sizes.block_b * block_sizes.block_q * aligned_head_dim
+    kv_elements = block_sizes.block_b * kv_seq_len * aligned_head_dim
+    logits_elements = block_sizes.block_q * kv_seq_len
+
+    q_and_output = q_elements * jnp.dtype(q_dtype).itemsize * 2
+    k_and_v = kv_elements * jnp.dtype(kv_dtype).itemsize * 2
+    logits_and_probs = logits_elements * jnp.dtype(jnp.float32).itemsize * 2
+
+    attention_bias = 0
+    if ab is not None:
+        attention_bias = (block_sizes.block_b * block_sizes.block_q *
+                          kv_seq_len * jnp.dtype(ab.dtype).itemsize)
+
+    segments = 0
+    if segment_ids is not None:
+        segment_bytes = jnp.dtype(jnp.int32).itemsize
+        segments = (
+            block_sizes.block_b * block_sizes.block_q * num_lanes *
+            segment_bytes +
+            block_sizes.block_b * num_sublanes * kv_seq_len * segment_bytes)
+
+    return (q_and_output + k_and_v + logits_and_probs + attention_bias +
+            segments)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -92,7 +134,7 @@ def flash_attention(
     causal: bool = False,
     sm_scale: float = 1.0,
     block_sizes: BlockSizes | None = None,
-    vmem_limit_bytes: int,
+    vmem_limit_bytes: int | None,
     debug: bool = False,
 ):
     batch_size, num_heads, q_seq_len, d_model = q.shape
@@ -132,17 +174,37 @@ def flash_attention(
                 f"KV segment ids shape mismatch: expected ({batch_size=},"
                 f" {kv_seq_len=},), got {segment_ids.kv.shape}")
     if block_sizes is None:
-        block_sizes = BlockSizes.get_default(batch_size, num_heads, q_seq_len,
-                                             kv_seq_len, d_model)
-        # TODO: Port the flash-attention kernel tuner and tuned-parameter
-        # lookup from:
-        # https://github.com/vllm-project/tpu-inference/commit/24c67fa778d040fe7cd7bd6bbbee00327c0876b9
-        if kv_seq_len <= 21760:
-            # Override block_k/block_k_major to use `_flash_attention_kernel_single_batch_single_step`.
-            block_sizes = BlockSizes(block_q=block_sizes.block_q,
-                                     block_b=block_sizes.block_b,
-                                     block_k_major=kv_seq_len,
-                                     block_k=kv_seq_len)
+        tuning_key = make_tuning_key(
+            q,
+            k,
+            v,
+            causal=causal,
+            has_segment_ids=segment_ids is not None,
+            has_attention_bias=ab is not None,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        tuned_params = get_tuned_params(tuning_key)
+        if tuned_params is None:
+            block_sizes = BlockSizes.get_default(batch_size, num_heads,
+                                                 q_seq_len, kv_seq_len,
+                                                 d_model)
+            estimated_vmem = calculate_vmem_usage_bytes(
+                block_sizes, q.dtype, k.dtype, d_model, kv_seq_len, ab,
+                segment_ids)
+            vmem_limit = (pltpu.get_tpu_info().vmem_capacity_bytes
+                          if vmem_limit_bytes is None else vmem_limit_bytes)
+            if estimated_vmem <= vmem_limit * 0.9:
+                block_sizes = BlockSizes(block_q=block_sizes.block_q,
+                                         block_b=block_sizes.block_b,
+                                         block_k_major=kv_seq_len,
+                                         block_k=kv_seq_len)
+        else:
+            block_sizes = BlockSizes(
+                block_q=tuned_params.block_q,
+                block_k_major=tuned_params.block_k_major,
+                block_k=tuned_params.block_k,
+                block_b=tuned_params.block_b,
+            )
     return _flash_attention(q, k, v, ab, segment_ids, False, causal, sm_scale,
                             block_sizes, vmem_limit_bytes, debug)
 

@@ -471,9 +471,11 @@ def _compact_writeback_slot_ids_for_cache_rank(
 def _build_writeback_segment_descriptors(
     compact_slot_ids: jax.Array,
     writeback_count: jax.Array,
+    max_segments: int = 4096,
 ) -> tuple[jax.Array, jax.Array]:
     """Coalesce dense captured rows into contiguous cache-copy segments."""
     capacity = int(compact_slot_ids.shape[0])
+    num_descriptor_slots = min(capacity, max_segments)
     rows = jnp.arange(capacity, dtype=jnp.int32)
     writeback_count = jnp.clip(jnp.asarray(writeback_count, dtype=jnp.int32),
                                0, capacity)
@@ -489,17 +491,25 @@ def _build_writeback_segment_descriptors(
     )
     segment_ids = jnp.cumsum(segment_starts.astype(jnp.int32)) - 1
     num_segments = jnp.sum(segment_starts, dtype=jnp.int32)
-    drop_index = jnp.asarray(capacity, dtype=jnp.int32)
+    drop_index = jnp.asarray(num_descriptor_slots, dtype=jnp.int32)
 
-    start_indices = jnp.where(segment_starts, segment_ids, drop_index)
-    source_starts = jnp.zeros((capacity, ), dtype=jnp.int32)
+    start_indices = jnp.where(
+        jnp.logical_and(segment_starts, segment_ids < num_descriptor_slots),
+        segment_ids,
+        drop_index,
+    )
+    source_starts = jnp.zeros((num_descriptor_slots, ), dtype=jnp.int32)
     source_starts = source_starts.at[start_indices].set(rows, mode="drop")
-    destination_starts = jnp.zeros((capacity, ), dtype=jnp.int32)
+    destination_starts = jnp.zeros((num_descriptor_slots, ), dtype=jnp.int32)
     destination_starts = destination_starts.at[start_indices].set(
         compact_slot_ids, mode="drop")
 
-    active_segment_ids = jnp.where(active, segment_ids, drop_index)
-    lengths = jnp.zeros((capacity, ), dtype=jnp.int32)
+    active_segment_ids = jnp.where(
+        jnp.logical_and(active, segment_ids < num_descriptor_slots),
+        segment_ids,
+        drop_index,
+    )
+    lengths = jnp.zeros((num_descriptor_slots, ), dtype=jnp.int32)
     lengths = lengths.at[active_segment_ids].add(active.astype(jnp.int32),
                                                  mode="drop")
     descriptors = jnp.stack((source_starts, destination_starts, lengths),

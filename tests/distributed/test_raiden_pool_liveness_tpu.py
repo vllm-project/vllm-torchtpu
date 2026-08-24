@@ -54,7 +54,7 @@ def _require_tpu_and_raiden():
     ok, detail = _can_allocate_tpu_tensor()
     if not ok:
         pytest.skip(f"real TPU tensor allocation is unavailable: {detail}")
-    pytest.importorskip("tpu_raiden.api.torch.kv_cache_manager")
+    pytest.importorskip("tpu_sync.api.torch.kv_cache_manager")
 
 
 def _pattern_bytes(seed: int, nbytes: int) -> bytes:
@@ -152,7 +152,7 @@ def _small_hybrid_materialization(device):
 def _run_pool_bytes_live_in_both_directions():
     _require_tpu_and_raiden()
     import torch
-    from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+    from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
     device = torch.device("tpu")
     named, groups, geometry = _small_hybrid_materialization(device)

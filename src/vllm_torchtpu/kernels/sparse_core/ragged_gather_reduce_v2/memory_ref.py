@@ -18,8 +18,17 @@ class IndexRef:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class DataRef:
+    source: Any
+    topk_weights: Any
+    out: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class ScratchRef:
     num_rows_per_row_partition_vmem: Any
+    next_window_first_row_vmem: Any
     prev_iter_last_row_vmem: Any
     prev_dst_row_smem: Any
     sorted_by_validity_vmem: Any
@@ -39,13 +48,14 @@ class ScratchRef:
         return cls(
             num_rows_per_row_partition_vmem=pltpu.VMEM((num_simd_lanes, ),
                                                        jnp.int32),
+            next_window_first_row_vmem=pltpu.VMEM((num_simd_lanes, ),
+                                                  jnp.int32),
             prev_iter_last_row_vmem=pltpu.VMEM(
                 (cfg.col_size // cfg.col_chunk_size, cfg.col_chunk_size),
                 jnp.float32,
             ),
             prev_dst_row_smem=pltpu.SMEM((1, ), jnp.int32),
-            sorted_by_validity_vmem=pltpu.VMEM(
-                (cfg.row_partition_size_padded, ), jnp.int32),
+            sorted_by_validity_vmem=pltpu.VMEM((cfg.window_size, ), jnp.int32),
             src_indices_vmem=indices_vmem,
             dst_indices_vmem=indices_vmem,
             dma_src_row_vmem=indices_vmem,
@@ -55,4 +65,31 @@ class ScratchRef:
             out_vmem=pltpu.VMEM((num_simd_lanes, cfg.col_chunk_size),
                                 jnp.float32),
             sem=pltpu.SemaphoreType.DMA((2, )),
+        )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class KernelRefs:
+    index: IndexRef
+    data: DataRef
+    scratch: ScratchRef
+
+    @classmethod
+    def create(
+        cls,
+        scalar_ref: IndexRef,
+        in_hbm_ref: Any,
+        topk_weights_hbm_ref: Any,
+        out_hbm_ref: Any,
+        scratch_ref: ScratchRef,
+    ) -> "KernelRefs":
+        return cls(
+            index=scalar_ref,
+            data=DataRef(
+                source=in_hbm_ref,
+                topk_weights=topk_weights_hbm_ref,
+                out=out_hbm_ref,
+            ),
+            scratch=scratch_ref,
         )

@@ -111,6 +111,17 @@ class DeepseekV4MoE(nn.Module):
             apply_routed_scale_to_output=True,
         )
 
+        # The monolithic TPU MoE path never consults the router: MoERunner
+        # calls `routed_experts.forward_monolithic`, which hands the
+        # `RoutedExperts` layer straight to `quant_method.apply_monolithic`,
+        # and `moe_routing.route` looks the table up as
+        # `layer.hash_indices_table`. Passing `hash_indices_table` to
+        # `FusedMoEFactory` above only reaches the router object, so mirror it
+        # onto the experts layer.
+        if self.gate.tid2eid is not None:
+            object.__setattr__(self.experts.routed_experts,
+                               "hash_indices_table", self.gate.tid2eid)
+
     def forward(self,
                 hidden_states: torch.Tensor,
                 input_ids: torch.Tensor | None = None) -> torch.Tensor:

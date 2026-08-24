@@ -16,9 +16,23 @@
 import torch
 import vllm.envs as vllm_envs
 
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.vllm.router_topk import rowmax_select
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Resolved once, at import, so the compiled forward never reads the
+# environment.
+_ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
+
+
+def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k over the expert axis, by the configured implementation."""
+    if _ROUTER_TOPK == "rowmax":
+        return rowmax_select(scores, k)
+    return torch.topk(scores, k=k, dim=-1)
+
 
 # Resolve the routing-simulation strategy once, at import, outside the compiled
 # forward pass. Doing the validation and the (test-only) warning here keeps them
@@ -266,10 +280,10 @@ def select_experts(
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
-        _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
-        topk_weights = scores.gather(-1, topk_ids)
+        _, topk_ids = _topk(scores_for_choice, topk)
+        topk_weights = scores.gather(-1, topk_ids.long())
     else:
-        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+        topk_weights, topk_ids = _topk(scores, topk)
 
     if renormalize:
         topk_weights = topk_weights / torch.clamp(

@@ -23,45 +23,57 @@ from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor imp
     VllmCompressorStateCache, VllmDeepseekCompressor)
 
 
-def _state_cache(compress_ratio: int, state_dim: int = 1024):
+def _state_cache(compress_ratio: int, head_dim: int = 512):
     """A state cache with the attributes its geometry depends on.
 
     The base `__init__` registers into the vLLM forward context, which needs a
-    live config; the geometry under test does not.
+    live config; the geometry under test does not. `state_dim` follows vLLM's
+    own `2 * coff * head_dim` (kv_state + score_state).
     """
     cache = VllmCompressorStateCache.__new__(VllmCompressorStateCache)
     coff = 1 + (compress_ratio == 4)
     cache.prefix = "model.layers.0.self_attn.compressor.state_cache"
     cache.compress_ratio = compress_ratio
-    cache._state_coff = coff
-    cache.state_dim = state_dim
+    cache.head_dim = head_dim
+    cache.state_dim = 2 * coff * head_dim
     cache.sliding_window = coff * compress_ratio
     cache.block_size = 0
     return cache
 
 
 @pytest.mark.parametrize(
-    "compress_ratio, cache_block_size, expected",
+    "compress_ratio, head_dim, cache_block_size, expected",
     [
-        # A CSA host page holds 256 compressed rows; each state row is
-        # 2 (kv + score) x 2 (coff) f32 words wide, so 16 rows fit.
-        (4, 1024, 16),
-        (4, 512, 8),
-        # HCA compresses 128:1, leaving an 8-row page and a single state row.
-        (128, 1024, 1),
+        # CSA: its state overlays its own compressed-KV page.
+        (4, 512, 1024, 16),
+        (4, 512, 512, 8),
+        # HCA state rows are hosted on a *CSA* page, not on HCA's own (which
+        # holds two token states), so the page is far larger than HCA's
+        # compression ratio alone would suggest.
+        (128, 512, 1024, 32),
+        (128, 512, 512, 16),
+        # The lightning indexer: 256-lane records.
+        (4, 128, 1024, 32),
     ],
 )
-def test_state_block_size_follows_the_host_page(compress_ratio,
+def test_state_block_size_follows_the_host_page(compress_ratio, head_dim,
                                                 cache_block_size, expected):
-    cache = _state_cache(compress_ratio)
-    assert cache._state_block_size(cache_block_size) == expected
+    """Block size must come from the kernel's own layout model.
+
+    It is not a closed form -- HCA writes two rows per record, the indexer
+    array is 256 lanes wide, and HCA's state is hosted on a CSA page -- so
+    this pins the values `compress_and_store.config` actually produces, which
+    is what the compressor kernel indexes the block table with.
+    """
+    cache = _state_cache(compress_ratio, head_dim)
+    assert cache._derive_block_size(cache_block_size) == expected
 
 
-def test_state_block_size_refuses_a_zero_sized_page():
-    """Below 1024 an HCA page floors to zero rows; that must not be emitted."""
+def test_state_block_size_refuses_a_page_holding_no_row():
+    """A page too small to hold one compressed row must not be emitted."""
     cache = _state_cache(128)
-    with pytest.raises(ValueError, match="too small to pack"):
-        cache._state_block_size(512)
+    with pytest.raises(ValueError, match="cannot be paged"):
+        cache._derive_block_size(64)
 
 
 def test_state_cache_spec_is_raw_uint8_at_the_host_page_size():
@@ -71,15 +83,17 @@ def test_state_cache_spec_is_raw_uint8_at_the_host_page_size():
     the raw f32 state; the block size must come from the final cache config,
     not the base class's CUDA constant.
     """
-    cache = _state_cache(4, state_dim=1024)
+    cache = _state_cache(4)
+    assert cache.block_size == 0, "fixture starts unset"
     spec = cache.get_kv_cache_spec(
         SimpleNamespace(cache_config=SimpleNamespace(block_size=1024)))
 
     assert spec.dtype == torch.uint8
     assert spec.block_size == 16
+    # `_build_compressor_op` bakes this in, so the object must be updated too.
     assert cache.block_size == 16
-    # 1024 f32 words, already a multiple of 128.
-    assert spec.head_size == 4096
+    # 2048 f32 words = 8192 B, already a multiple of 128.
+    assert spec.head_size == 8192
     assert spec.num_kv_heads == 1
     assert spec.sliding_window == 8
     # vLLM's DSv4 grouping is isinstance-based, so the base type is load-bearing.

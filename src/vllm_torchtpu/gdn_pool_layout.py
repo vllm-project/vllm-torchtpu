@@ -36,6 +36,22 @@ POOLED_GDN_CONV_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[
 POOLED_GDN_SSM_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[POOLED_GDN_SSM_STATE_DTYPE]
 
 
+def unified_kv_layout_enabled_for_architecture(
+        architecture: str | None) -> bool:
+    """Whether `architecture` runs on the attention-shaped unified KV pool.
+
+    Split out of `platforms.tpu_block_size_utils.unified_kv_layout_enabled`
+    (which delegates here) so the GDN layer can ask the same question without
+    importing `vllm_torchtpu.platforms` -- that package's __init__ pulls in
+    TpuPlatform, which imports the layers back.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    override = tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+    if override is not None:
+        return override
+    return architecture in POOLED_GDN_ARCHITECTURES
+
+
 def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
     rows of conv_dim channels. The kernel keeps no spec-decode widening in
@@ -73,21 +89,18 @@ def derive_pooled_gdn_state_layout(
     conv_bytes: int,
     token_bytes: int,
 ) -> PooledGDNStateLayout:
-    """Derive the physical token extent of pooled GDN state regions."""
+    """Derive the physical token extent of pooled GDN state regions.
+
+    If ssm_bytes cannot be evenly divided into FA token rows, its last row
+    is padded.
+    """
     if min(ssm_bytes, conv_bytes, token_bytes) <= 0:
         raise ValueError("pooled GDN byte sizes must be positive")
-    if ssm_bytes % token_bytes:
-        raise ValueError(
-            "pooled GDN SSM state must occupy complete FA token rows")
 
-    ssm_tokens = ssm_bytes // token_bytes
+    ssm_tokens = (ssm_bytes + token_bytes - 1) // token_bytes
     conv_tokens = 1
-    while (conv_tokens * token_bytes < conv_bytes
-           or ssm_tokens % conv_tokens != 0):
+    while conv_tokens * token_bytes < conv_bytes:
         conv_tokens *= 2
-        if conv_tokens > ssm_tokens:
-            raise ValueError(
-                "pooled GDN conv tile cannot be placed after the SSM region")
 
     return PooledGDNStateLayout(
         ssm_bytes=ssm_bytes,

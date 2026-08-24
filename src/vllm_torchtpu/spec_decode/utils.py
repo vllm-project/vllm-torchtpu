@@ -9,6 +9,8 @@ from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from vllm_torchtpu.layers.common.sequence_layout import (
+    AllSequenceLayoutPlanner, SequenceLayoutPlan)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -18,11 +20,18 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.common.attention_metadata import \
         AttentionMetadataBuilderContext
 
+_DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = (
+    AllSequenceLayoutPlanner().prepare_dummy(
+        num_tokens=0,
+        num_reqs=0,
+        kv_cache_initialized=False,
+    ))
+
 
 @dataclass
 class DraftChunkInputs:
-    # Token ids the target consumed (post async-token-substitution).
-    # Device tensor, [padded_chunk_tokens].
+    # Full padded request-major token ids for this draft chunk, captured before a
+    # partial sequence layout packs or slices the target input.
     input_ids: torch.Tensor
     # Device tensor, [padded_chunk_tokens].
     position_ids: torch.Tensor
@@ -40,6 +49,10 @@ class DraftChunkInputs:
     # [padded_chunk_tokens, aux_hidden]. Only consumed when the draft
     # checkpoint wants them.
     aux_hidden_states: list[torch.Tensor]
+    # Production supplies the exact chunk-local plan. Dummy/default consumers
+    # share this immutable ALL-layout no-op plan and PCP callers override it.
+    sequence_layout_plan: SequenceLayoutPlan = \
+        _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN
     # Chunk-local per-request draft count (device tensor, padded), a snapshot
     # of the chunk's spec_decode_metadata.draft_lengths. Lets the async draft
     # path read num_draft on-device instead of re-scanning the scheduler dict
@@ -133,7 +146,7 @@ def populate_draft_embed_from_target(draft_model: torch.nn.Module,
 
 def maybe_share_embeddings(draft_model: torch.nn.Module,
                            target_model: torch.nn.Module,
-                           draft_replicated: bool,
+                           tp_layout_matches: bool,
                            force_share: bool = False) -> None:
     target_lm = target_model.get_language_model() if hasattr(
         target_model, "get_language_model") else target_model
@@ -155,16 +168,16 @@ def maybe_share_embeddings(draft_model: torch.nn.Module,
             raise RuntimeError(
                 "Draft embedding sharing requires target_lm.model.embed_tokens"
             )
-        if draft_replicated:
+        if tp_layout_matches:
+            logger.info(
+                "Sharing the target's embed_tokens with the draft using the same TP layout."
+            )
+            draft_model.model.embed_tokens = target_embed
+        else:
             logger.info(
                 "Populating draft's own embed_tokens with a host-gathered copy of target embedding."
             )
             populate_draft_embed_from_target(draft_model, target_embed)
-        else:
-            logger.info(
-                "Sharing the target's sharded embed_tokens with the sharded draft."
-            )
-            draft_model.model.embed_tokens = target_embed
 
 
 def populate_draft_lm_head_from_target(
@@ -193,7 +206,9 @@ def populate_draft_lm_head_from_target(
 def maybe_share_lm_head(draft_model: torch.nn.Module,
                         target_model: torch.nn.Module,
                         draft_replicated: bool,
-                        force_share: bool = False) -> None:
+                        tp_layout_matches: bool,
+                        force_share: bool = False,
+                        materialize_if_mismatched: bool = True) -> None:
     target_lm = target_model.get_language_model() if hasattr(
         target_model, "get_language_model") else target_model
     target_lm_head = getattr(target_lm, "lm_head", None)
@@ -212,13 +227,10 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
         share_lm_head = True
 
     if share_lm_head:
-        if draft_replicated:
-            logger.info("Populating draft's own lm_head with a host-gathered, "
-                        "per-worker replicated copy of the target lm_head.")
-            populate_draft_lm_head_from_target(draft_model, target_lm_head)
-        else:
+        if tp_layout_matches:
             logger.info(
-                "Sharing the target's sharded lm_head with the sharded draft.")
+                "Sharing the target's lm_head with the draft using the same TP layout."
+            )
             if hasattr(draft_model, "lm_head"):
                 draft_model.lm_head = target_lm_head
             elif hasattr(draft_model, "model") and hasattr(
@@ -226,6 +238,10 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
                 draft_model.model.lm_head = target_lm_head
             else:
                 draft_model.lm_head = target_lm_head
+        elif materialize_if_mismatched:
+            logger.info("Populating draft's own lm_head with a host-gathered, "
+                        "per-worker replicated copy of the target lm_head.")
+            populate_draft_lm_head_from_target(draft_model, target_lm_head)
 
     # We must override _gather_logits for replicated draft models even if we don't share the lm_head,
     # because the draft model's logits_processor will still try to gather logits across TP=1.

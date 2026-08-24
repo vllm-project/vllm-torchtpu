@@ -233,34 +233,58 @@ class TestTpuCompilerCache:
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "custom_tier2"
 
     def test_tpu_compilation_handle_serialization(self):
-        """Verify serialization and deserialization of TpuCompilationHandle and legacy fallbacks."""
+        """Round-trip the artifact payload TpuCompilerAdaptor.compile writes."""
         import pickle
 
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilationHandle
 
-        # 1. Test dataclass handle serialization
-        handle = TpuCompilationHandle(key="test_key_123",
-                                      tier3_cache_active=True)
-        dumped = pickle.dumps(handle)
-        loaded = pickle.loads(dumped)
+        handle = TpuCompilationHandle(
+            key="test_key_123",
+            entry="mock_entry",
+            signature=(("torch.int32", (16, )), ),
+            was_wrapped=True,
+        )
+        loaded = pickle.loads(pickle.dumps(handle))
         assert isinstance(loaded, TpuCompilationHandle)
         assert loaded.key == "test_key_123"
-        assert loaded.tier3_cache_active is True
-        assert loaded.executable is None
+        assert loaded.entry == "mock_entry"
+        assert loaded.signature == (("torch.int32", (16, )), )
+        assert loaded.was_wrapped is True
 
-        # 2. Test legacy dict deserialization fallback
-        legacy_dict = {"tier3_cache_active": True, "key": "test_key_dict"}
-        loaded_dict = pickle.loads(pickle.dumps(legacy_dict))
-        assert isinstance(loaded_dict, dict)
-        assert loaded_dict.get("tier3_cache_active") is True
+    def test_replay_refuses_artifacts_it_cannot_vouch_for(self, tmp_path):
+        """Stale or damaged artifacts recompile instead of being replayed.
 
-        # 3. Test non-tier3 handle with executable
-        handle_with_exe = TpuCompilationHandle(key="test_key_456",
-                                               tier3_cache_active=False,
-                                               executable="mock_exe")
-        loaded_exe_handle = pickle.loads(pickle.dumps(handle_with_exe))
-        assert loaded_exe_handle.tier3_cache_active is False
-        assert loaded_exe_handle.executable == "mock_exe"
+        The older format stored a bare executable picked off a shared list by
+        index, with nothing tying it to the graph it was saved under, so
+        replaying one can run the wrong program. Restoring such a pickle leaves
+        `entry` at its class default of None, and it is refused on that basis.
+        """
+        import pickle
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilationHandle, TpuCompilerAdaptor)
+
+        compiler = TpuCompilerAdaptor()
+        path = tmp_path / "artifact"
+
+        legacy = object.__new__(TpuCompilationHandle)
+        legacy.__dict__.update(key="k", executable="mock_exe")
+        assert legacy.entry is None
+        path.write_bytes(pickle.dumps(legacy))
+        assert compiler._replay(str(path), graph=None,
+                                was_wrapped=False) is None
+
+        path.write_bytes(pickle.dumps({"key": "k", "executable": "mock_exe"}))
+        assert compiler._replay(str(path), graph=None,
+                                was_wrapped=False) is None
+
+        path.write_bytes(b"not a pickle")
+        assert compiler._replay(str(path), graph=None,
+                                was_wrapped=False) is None
+
+        assert compiler._replay(str(tmp_path / "missing"),
+                                graph=None,
+                                was_wrapped=False) is None
 
     def test_compiler_initialize_cache(self):
         """Verify that TpuCompilerAdaptor sets cache_dir accurately."""

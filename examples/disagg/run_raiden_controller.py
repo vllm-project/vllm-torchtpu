@@ -1,8 +1,8 @@
 import argparse
 import time
 
-from tpu_raiden.rpc.raiden_controller import (RaidenController,
-                                              RaidenControllerServer)
+from tpu_sync.rpc.raiden_controller import (RaidenController,
+                                            RaidenControllerServer)
 
 
 def main():

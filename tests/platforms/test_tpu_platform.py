@@ -21,14 +21,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
-    TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TpuPlatform,
-    _validate_phased_profiling_config, get_tpu_multihost_topology)
+    TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_8I_MULTIHOST_TOPOLOGY_MAP,
+    TpuPlatform, _validate_phased_profiling_config, get_tpu_multihost_topology)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
 
@@ -296,7 +297,6 @@ class TestTpuPlatform:
          "message"),
         [
             ("all", None, False, "mamba_cache_mode='align'"),
-            ("align", MagicMock(), False, "Speculative decoding"),
             ("align", None, True, None),
         ],
     )
@@ -366,6 +366,32 @@ class TestTpuPlatform:
         vllm_config.cache_config.block_size = 16
 
         TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("compile_sizes", "shapes_type", "expected_type"),
+        [
+            # Size 1 under backed shapes would crash in PiecewiseBackend.
+            ([1, 16], DynamicShapesType.BACKED,
+             DynamicShapesType.BACKED_SIZE_OBLIVIOUS),
+            ([16, 32], DynamicShapesType.BACKED, DynamicShapesType.BACKED),
+            # A user-chosen non-backed type is never overridden.
+            ([1, 16], DynamicShapesType.UNBACKED, DynamicShapesType.UNBACKED),
+        ],
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_dynamic_shapes_for_compile_size_1(
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
+            compile_sizes, shapes_type, expected_type):
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+        vllm_config.compilation_config.dynamic_shapes_config.type = shapes_type
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert (vllm_config.compilation_config.dynamic_shapes_config.type ==
+                expected_type)
 
     @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
@@ -486,6 +512,15 @@ class TestTpuPlatform:
         assert get_tpu_multihost_topology(512,
                                           device_name="TPU v7") == "4,8,8,2"
 
+        # Test TPU v8i / BoardFly lookup.
+        assert get_tpu_multihost_topology(4, device_name="TPU v8i") == "4,1,1"
+        assert get_tpu_multihost_topology(8, device_name="TPU8i") == "4,2,1"
+        assert get_tpu_multihost_topology(16, device_name="TPU v8i") == "4,4,1"
+        assert get_tpu_multihost_topology(32, device_name="TPU v8i") == "4,8,1"
+        assert get_tpu_multihost_topology(64, device_name="TPU8i") == "4,8,2"
+        assert get_tpu_multihost_topology(1024,
+                                          device_name="TPU v8i") == "4,8,32"
+
         # A mesh must describe exactly as many devices as were asked for,
         # otherwise the slice builder sizes its worker address list against a
         # world that does not exist. Devices per chip is what separates the
@@ -494,17 +529,42 @@ class TestTpuPlatform:
             (TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, 1),
             (TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, 1),
             (TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP, 2),
+            (TPU_8I_MULTIHOST_TOPOLOGY_MAP, 1),
         ):
             for world_size, topo in topo_map.items():
                 dims = [int(d) for d in topo.split(",")]
-                # The trailing T dimension is cores per chip, never devices.
-                chips = math.prod(dims[:-1])
+                # For 4D torus topologies, the trailing T dimension is cores per chip,
+                # never devices. For 3D topologies (2D Torus X,Y,T and TPU 8i C,B,G),
+                # total chips is the full product.
+                chips = math.prod(
+                    dims[:-1]) if len(dims) == 4 else math.prod(dims)
                 assert chips * devices_per_chip == world_size
 
         # Test ValueError on unsupported device counts
         with pytest.raises(ValueError,
                            match="Cannot find topology for 10 devices"):
             get_tpu_multihost_topology(10, device_name="TPU v6e")
+
+    @pytest.mark.parametrize(
+        "raw_kind,expected_name",
+        [
+            ("TPU v5p", "TPU v5p"),
+            ("TPU v5e", "TPU v5e"),
+            ("TPU v6e", "TPU v6e"),
+            ("TPU7x", "TPU v7"),
+            ("TPU8i", "TPU v8i"),
+            ("TPU v8i", "TPU v8i"),
+        ],
+    )
+    @patch("jax.devices")
+    def test_get_device_name(self, mock_devices, raw_kind, expected_name):
+        """Tests get_device_name across TPU generations."""
+        mock_dev = MagicMock()
+        mock_dev.device_kind = raw_kind
+        mock_devices.return_value = [mock_dev]
+
+        from vllm_torchtpu.utils import get_device_name
+        assert get_device_name() == expected_name
 
 
 class TestPhasedProfilingConfigValidation:

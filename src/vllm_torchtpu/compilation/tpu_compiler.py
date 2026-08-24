@@ -35,13 +35,46 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass
 class TpuCompilationHandle:
-    """Metadata handle saved to vLLM's compilation cache directory."""
+    """Metadata handle saved to vLLM's compilation cache directory.
+
+    `entry` is torch's bundled AOTAutograd cache entry: the aot_autograd
+    wrapper metadata and the compiled PjRt executable as a single serializable
+    object. Keeping them together is the point -- a wrapper rebuilt from a
+    fresh trace and an executable fetched separately can disagree, and the
+    disagreement is only observable once the program runs.
+
+    `signature` pins the graph the entry was built from, so a replay against a
+    structurally different graph is refused instead of silently executing.
+
+    Defaults are deliberately "unusable": an older pickle restored into this
+    class keeps its own __dict__ and picks up these class defaults for the
+    fields it lacks, so it fails the version check rather than being replayed.
+    """
     key: str
-    tier3_cache_active: bool = False
-    executable: Any | None = None
+    entry: Any | None = None
+    signature: tuple | None = None
+    was_wrapped: bool = False
 
 
 _tpu_backend = TpuBackend()
+
+
+def _deserialize_entry(entry: Any) -> Callable[..., Any]:
+    """Rebuild a runnable from a bundled AOTAutograd entry.
+
+    Restores the aot_autograd wrapper *and* the executable from the one entry,
+    and returns a varargs callable over the graph's placeholders -- the same
+    calling convention TpuBackend hands back, so `compile` and `load` produce
+    interchangeable runnables.
+
+    Module-level, and paired with `_tpu_backend`: a test that swaps the backend
+    for a fake has to swap this too, since the fake's "entry" never came from
+    torch and cannot go back through it.
+    """
+    from torch._functorch._aot_autograd.aot_autograd_result import \
+        deserialize_bundled_cache_entry
+    return deserialize_bundled_cache_entry(entry)
+
 
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
@@ -79,6 +112,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/vllm/custom_ops",
     "vllm_torchtpu/layers/vllm/fused_moe.py",
     "vllm_torchtpu/layers/vllm/linear_common.py",
+    "vllm_torchtpu/layers/vllm/router_topk.py",
     "vllm_torchtpu/layers/vllm/quantization",
     "vllm_torchtpu/layers/vllm/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
@@ -276,37 +310,33 @@ class TpuCompilerAdaptor(CompilerInterface):
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
         return compute_tpu_compilation_hash(vllm_config)
 
-    def compile(
+    @staticmethod
+    def _unwrap_compiled_fn(compiled_fn):
+        inner_fn = compiled_fn
+
+        def unwrap_fn(*args, **kwargs):
+            result = inner_fn(*args, **kwargs)
+            if isinstance(result, (tuple, list)) and len(result) == 1:
+                return result[0]
+            return result
+
+        return unwrap_fn
+
+    def _run_backend(
         self,
         graph: fx.GraphModule,
         example_inputs: list[Any],
-        compiler_config: dict[str, Any],
-        compile_range: Range,
-        key: str | None = None,
-    ) -> tuple[Callable[..., Any] | None, Any | None]:
-        """Compile a Dynamo-level FX graph to a TPU PjRt executable.
+    ) -> tuple[Callable[..., Any], Any | None]:
+        """Compile `graph` with TpuBackend, and grab its serializable entry.
 
-        Delegates to TpuBackend which handles aot_autograd + fx_to_mlir
-        + compile_mlir internally.
+        Shared by `compile` and by `load`'s fallback, so a cache miss and a
+        cold start reach the backend by exactly the same route.
+
+        Returns (runnable, entry). The runnable still returns a tuple -- the
+        caller applies the `_ensure_tuple_output` unwrap. `entry` is None when
+        the backend attached no `serialize`, which it skips for dynamic-symint
+        graphs and in debug mode (see TpuBackend.__call__).
         """
-        # A bucket this graph cannot serve, or one an earlier trace of the same
-        # model already built, is not compiled here (see shape_variants).
-        size = _single_size(compile_range)
-        if key is not None and size is not None:
-            elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph,
-                                                    size)
-            if elsewhere is not None:
-                return elsewhere, None
-
-        logger.info(
-            "[TpuCompilerAdaptor] Compiling FX graph for range %s",
-            compile_range,
-        )
-
-        # aot_autograd (inside TpuBackend) requires tuple outputs.
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-
         # `_tpu_backend` calls detect_fake_mode(), which asserts a single
         # FakeTensorMode. The Dynamo tracing context's mode differs from the
         # example inputs' mode, so run under a context built from the example
@@ -327,51 +357,183 @@ class TpuCompilerAdaptor(CompilerInterface):
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
-        if was_wrapped:
-            inner_fn = compiled_fn
-
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
-
-            compiled_fn = unwrap_fn
-
-        # Save the per-shape PjRt executable to disk.
-        # When Tier-3 C++ persistent cache is active, torch_tpu handles PJRT
-        # binary persistence natively in C++ (torch_tpu_tier3/*.bin).
-        # We store a lightweight metadata handle instead of duplicate compiled binary executables.
-        handle = None
-        if (key is not None and self.cache_dir is not None
-                and not self._disable_cache
-                and _tpu_backend._compiled_executables):
+        # Read `serialize` off the object TpuBackend returned, before any
+        # wrapping: the unwrap below replaces it with a plain closure that does
+        # not carry attributes, and the entry would be unreachable after that.
+        entry = None
+        serialize = getattr(compiled_fn, "serialize", None)
+        if serialize is not None:
             try:
-                inner_exe = _tpu_backend._compiled_executables[-1]
-                save_path = os.path.join(self.cache_dir, key)
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=True,
-                    )
-                else:
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=False,
-                        executable=inner_exe,
-                    )
-                with open(save_path, "wb") as f:
-                    pickle.dump(handle_data, f)
-                handle = (key, save_path, was_wrapped)
-                logger.info(
-                    "[TpuCompilerAdaptor] Saved compiled executable metadata to %s",
-                    save_path,
-                )
+                entry = serialize()
             except Exception as e:
                 logger.warning(
-                    "[TpuCompilerAdaptor] Failed to save executable: %s", e)
+                    "[TpuCompilerAdaptor] serialize() failed, this graph will "
+                    "not be cached: %s", e)
+        return compiled_fn, entry
 
+    def _save_handle(
+        self,
+        key: str,
+        path: str,
+        entry: Any,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+    ) -> bool:
+        """Write the bundled entry for `graph` to `path`. True if it landed."""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = TpuCompilationHandle(
+                key=key,
+                entry=entry,
+                signature=shape_variants.graph_signature(graph),
+                was_wrapped=was_wrapped,
+            )
+            # Write-then-rename: a crash or a full disk partway through
+            # pickling a 400 MB entry would otherwise leave a truncated file
+            # that the next run reads back as a corrupt artifact.
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(payload, f)
+            os.replace(tmp_path, path)
+            logger.info("[TpuCompilerAdaptor] Saved compiled artifact to %s",
+                        path)
+            return True
+        except Exception as e:
+            # Non-fatal by design: a failed save costs a recompile next run,
+            # which is strictly better than persisting something unloadable.
+            logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s",
+                           e)
+            return False
+
+    def _replay(
+        self,
+        path: str,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+    ) -> Callable[..., Any] | None:
+        """Rebuild the runnable saved at `path`, or None to recompile.
+
+        Every rejection here costs one recompile and nothing else, so this is
+        deliberately strict: an artifact is replayed only if it is the current
+        format and was built from a graph with this one's input signature.
+        """
+        try:
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+        except Exception as e:
+            logger.warning("[TpuCompilerAdaptor] Unreadable artifact %s: %s",
+                           path, e)
+            return None
+
+        reason = None
+        if not isinstance(payload, TpuCompilationHandle):
+            reason = f"unexpected payload type {type(payload).__name__}"
+        elif payload.entry is None:
+            reason = "no bundled entry"
+        elif payload.signature != shape_variants.graph_signature(graph):
+            # Not what makes the bundled entry safe -- that comes from wrapper
+            # and executable being one object, with no lookup left to drift.
+            # This is the same check BucketExecutables.get already applies to
+            # the in-memory hand-over, extended across processes, and it earns
+            # its place because nothing else validates the entry against the
+            # graph: torch_tpu injects a synthetic cache_info and stubs out
+            # generate_guards_expression, and replaying a pickle we wrote
+            # ourselves never goes through AOTAutogradCache.try_load.
+            # Placeholders only, so a changed graph *body* still passes -- that
+            # is compute_tpu_compilation_hash's job, not this one.
+            reason = (f"graph signature changed ({payload.signature} vs "
+                      f"{shape_variants.graph_signature(graph)})")
+        elif payload.was_wrapped != was_wrapped:
+            reason = "output-tuple wrapping differs from the saved graph"
+        if reason is not None:
+            logger.warning("[TpuCompilerAdaptor] Ignoring artifact %s: %s",
+                           path, reason)
+            return None
+
+        try:
+            return _deserialize_entry(payload.entry)
+        except Exception as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not replay artifact %s, "
+                "recompiling: %s", path, e)
+            return None
+
+    def compile(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        compiler_config: dict[str, Any],
+        compile_range: Range,
+        key: str | None = None,
+    ) -> tuple[Callable[..., Any] | None, Any | None]:
+        """Compile a Dynamo-level FX graph to a TPU PjRt executable.
+
+        Delegates to TpuBackend which handles aot_autograd + fx_to_mlir
+        + compile_mlir internally.
+
+        Called once per (subgraph, token bucket). vLLM keeps the returned
+        callable for this process and writes the returned handle into its
+        compilation cache directory, where a later process reads it back and
+        passes it to `load`. The handle is therefore an on-disk format.
+
+        Returning `(fn, None)` means "usable now, but nothing was persisted" --
+        vLLM will call `compile` again next run.
+        """
+        # A bucket this graph cannot serve, or one an earlier trace of the same
+        # model already built, is not compiled here (see shape_variants).
+        size = _single_size(compile_range)
+        if key is not None and size is not None:
+            elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph,
+                                                    size)
+            if elsewhere is not None:
+                return elsewhere, None
+
+        logger.info(
+            "[TpuCompilerAdaptor] Compiling FX graph for range %s",
+            compile_range,
+        )
+
+        # aot_autograd (inside TpuBackend) requires tuple outputs. Deep-copied
+        # first because _ensure_tuple_output rewrites the output node in place
+        # and vLLM keeps its own reference to `graph`. Only the output node
+        # moves, so the placeholder signature is unaffected.
+        graph = copy.deepcopy(graph)
+        graph, was_wrapped = _ensure_tuple_output(graph)
+
+        compiled_fn, entry = self._run_backend(graph, example_inputs)
+
+        if was_wrapped:
+            # Undo _ensure_tuple_output on the result side, so callers see the
+            # single tensor the original graph returned.
+            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+
+        # Persist torch's bundled AOTAutograd entry -- the aot_autograd wrapper
+        # metadata and the compiled executable as one object. It has to be one
+        # object: `load` cannot rebuild a wrapper from a fresh trace and pair
+        # it with a separately-fetched executable, because nothing at that
+        # point can check the two describe the same program, and a mismatch is
+        # only observable once the program runs -- as e0102
+        # RuntimeProgramInputMismatch if the padded input buffers differ in
+        # size, and as a silently wrong result if they happen not to.
+        #
+        # When the Tier-3 C++ persistent cache is active torch_tpu also keeps
+        # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
+        # recompile path in `load`, not this one.
+        handle = None
+        caching = (key is not None and self.cache_dir is not None
+                   and not self._disable_cache)
+        if caching and entry is not None:
+            save_path = os.path.join(self.cache_dir, key)
+            if self._save_handle(key, save_path, entry, graph, was_wrapped):
+                handle = (key, save_path, was_wrapped)
+        elif caching:
+            logger.info(
+                "[TpuCompilerAdaptor] No serializable artifact for range %s; "
+                "it will be recompiled on the next start", compile_range)
+
+        # Offer this bucket to later traces of the same model, so a graph that
+        # refuses it reuses this runnable instead of building a second
+        # executable for it (see shape_variants.BucketExecutables).
         if key is not None and size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn, handle
@@ -384,78 +546,54 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph_index: int,
         compile_range: Range,
     ) -> Callable[..., Any]:
-        """Load a compiled executable from disk.
+        """Rebuild a compiled runnable from the artifact `compile` saved.
 
-        Unpickles the _TorchTpuCompiledExecutable (or uses Tier-3 C++ cache),
-        then wraps it with aot_autograd (using the same graph) to reconstruct
-        the full callable.
+        This is the warm-start path, and the reason a warm start is minutes
+        rather than tens of minutes: FX->MLIR lowering and XLA compilation are
+        both skipped. Replaying torch's bundled AOTAutograd entry restores the
+        wrapper and the executable together, so there is no point at which a
+        freshly traced wrapper could be paired with the wrong program.
+
+        Falls back to a real compile whenever the artifact is missing, stale,
+        or built from a different graph. That is never wrong, only slower --
+        and with the Tier-3 C++ cache active it is not even much slower, since
+        torch_tpu serves the PJRT binary natively.
         """
         assert isinstance(handle, tuple) and len(handle) == 3
-        key, path, was_wrapped = handle
+        key, path, _saved_was_wrapped = handle
         size = _single_size(compile_range)
+        # Screened on the load path too, and for a second reason beyond
+        # "unsupported bucket": vLLM's key is (subgraph, bucket) with no graph
+        # identity, so without this a re-traced variant would adopt an artifact
+        # another trace compiled (see shape_variants.runnable_for).
         elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph,
                                                 size)
         if elsewhere is not None:
             return elsewhere
 
-        logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
+        logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s",
                     path)
 
-        with open(path, "rb") as f:
-            loaded_data = pickle.load(f)
-
-        # Re-create the aot_autograd wrapper around the cached executable.
-        from torch._dynamo.backends.common import aot_autograd
-
+        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
+        # artifact is checked against is shaped the way it was when saved.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        tier3_active = False
-        inner_exe = None
-        if isinstance(loaded_data, TpuCompilationHandle):
-            tier3_active = loaded_data.tier3_cache_active
-            inner_exe = loaded_data.executable
-        elif isinstance(loaded_data, dict):
-            tier3_active = loaded_data.get("tier3_cache_active", False)
-            inner_exe = loaded_data.get("executable")
-        else:
-            inner_exe = loaded_data
-
-        if tier3_active:
-            # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
-            def _cached_compiler(g, example_inputs):
-                clean_inputs = [
-                    int(x) if isinstance(x, torch.SymInt) else x
-                    for x in example_inputs
-                ]
-                return _tpu_backend(g, clean_inputs)
-        else:
-
-            def _cached_compiler(*_args, **_kwargs):
-                return inner_exe
-
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `aot_autograd` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None):
-            compiled_fn = aot_autograd(
-                fw_compiler=_cached_compiler,
-                keep_inference_input_mutations=False,
-            )(graph, example_inputs)
+        compiled_fn = self._replay(path, graph, was_wrapped)
+        if compiled_fn is None:
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
+            # Self-heal: overwrite the artifact vLLM will hand us again next
+            # run. Without this a single stale entry recompiles forever.
+            if (entry is not None and self.cache_dir is not None
+                    and not self._disable_cache):
+                self._save_handle(key, path, entry, graph, was_wrapped)
 
         if was_wrapped:
-            inner_fn = compiled_fn
+            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
 
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
-
-            compiled_fn = unwrap_fn
-
+        # A loaded bucket is offered to later traces exactly like a compiled
+        # one, so a graph that refuses this bucket reuses this runnable instead
+        # of replaying the artifact into a second HBM program region.
         if size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn

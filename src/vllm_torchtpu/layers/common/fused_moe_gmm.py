@@ -16,6 +16,7 @@ import functools
 
 import jax
 from jax import numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
@@ -41,6 +42,33 @@ def _select_ragged_gather_reduce(version: str):
 # set RAGGED_GATHER_REDUCE_VERSION=v3 to enable the destination-major kernel.
 ragged_gather_reduce = _select_ragged_gather_reduce(
     envs.RAGGED_GATHER_REDUCE_VERSION)
+
+_ONEHOT_AUTO_CAP = 512
+
+
+def resolve_onehot_permute_threshold() -> int:
+    """Routed-row count at/below which MoE permute+combine run as TensorCore
+    one-hot matmuls instead of the SparseCore gather/reduce kernels.
+
+    Auto (env unset/empty/negative) resolves to ``min(SC block rows - 1,
+    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
+    ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
+    positive value forces that threshold.
+    """
+    explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
+    if explicit is not None and explicit >= 0:
+        return explicit
+    try:
+        sc_info = pltpu.get_tpu_info().sparse_core
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return 0
+    if sc_info is None:
+        return 0
+    block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
+    threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
+
+    return threshold
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:

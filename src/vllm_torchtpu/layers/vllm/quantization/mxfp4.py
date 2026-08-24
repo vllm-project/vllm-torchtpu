@@ -75,6 +75,8 @@ from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel,
                                                  quantize_native_fp4_kmajor)
+from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -167,6 +169,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     @property
     def is_monolithic(self) -> bool:
         return True
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        # We need to take control of collective communication (AllGather/ReduceScatter)
+        # to pipeline them with MoE computation when chunking is enabled.
+        return enable_pipelined_collective_and_compute()
 
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
@@ -284,23 +292,25 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                                                    router_logits,
                                                    input_ids=input_ids)
 
-        # Step 2: EP global->local remap happens inside fused_moe_gmm via an
-        # elementwise subtract from `experts_start` (scalar).
-        return fused_moe_gmm(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w1_bias=getattr(layer, "w13_bias", None),
-            w2_bias=getattr(layer, "w2_bias", None),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            experts_start=layer._experts_start,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-            rhs_quant_dtype=self.rhs_quant_dtype,
-        )
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale,
+            "w2_scale": layer.w2_weight_scale,
+            "w1_bias": getattr(layer, "w13_bias", None),
+            "w2_bias": getattr(layer, "w2_bias", None),
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+            "rhs_quant_dtype": self.rhs_quant_dtype,
+        }
+        if enable_pipelined_collective_and_compute():
+            return pipelined_fused_moe_gmm(**kwargs)
+
+        return fused_moe_gmm(**kwargs)
 
 
 REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)

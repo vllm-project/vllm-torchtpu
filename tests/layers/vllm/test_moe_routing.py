@@ -86,3 +86,98 @@ def test_validate_linear_ep_placement_rejects_round_robin():
     with pytest.raises(NotImplementedError, match="linear EP placement"):
         moe_routing.validate_linear_ep_placement(
             SimpleNamespace(expert_placement_strategy="round_robin"))
+
+
+def _routing_layer(topk=10, renormalize=True):
+    return SimpleNamespace(use_grouped_topk=False,
+                           num_expert_group=None,
+                           topk_group=None,
+                           renormalize=renormalize,
+                           scoring_func="softmax",
+                           e_score_correction_bias=None,
+                           routed_scaling_factor=1.0,
+                           moe_config=SimpleNamespace(experts_per_token=topk))
+
+
+def test_router_topk_env_defaults_to_rowmax():
+    import vllm_torchtpu.envs as envs
+    assert envs.environment_variables["TPU_MOE_ROUTER_TOPK"]() == "rowmax"
+
+
+def test_router_topk_env_rejects_unknown_value(monkeypatch):
+    import vllm_torchtpu.envs as envs
+    monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "approx")
+    with pytest.raises(ValueError, match="TPU_MOE_ROUTER_TOPK"):
+        envs.environment_variables["TPU_MOE_ROUTER_TOPK"]()
+
+
+def test_select_experts_rowmax_matches_sort(monkeypatch):
+    """The gate is behaviour-preserving on tie-free data, end to end."""
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(0)
+    hidden = torch.randn(64, 8, dtype=torch.bfloat16)
+    logits = torch.randn(64, 512)
+    layer = _routing_layer()
+
+    def run():
+        return moe_routing.select_experts(hidden_states=hidden,
+                                          router_logits=logits,
+                                          topk=10,
+                                          renormalize=True,
+                                          scoring_fn="softmax",
+                                          layer=layer)
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    ref_w, ref_i = run()
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
+    got_w, got_i = run()
+
+    assert got_w.dtype == ref_w.dtype and got_i.dtype == torch.int32
+    assert torch.equal(got_w, ref_w)
+    assert torch.equal(got_i, ref_i.to(torch.int32))
+
+
+def test_router_topk_op_is_registered_at_import():
+    """The op must exist before the first call: a lazy, lock-guarded
+    registration is untraceable by Dynamo and aborts the MoE compile."""
+    import torch
+
+    from vllm_torchtpu.layers.vllm import router_topk
+    assert router_topk._op is not None
+    assert hasattr(torch.ops.pallas, "moe_router_topk")
+
+
+@pytest.mark.parametrize("impl", ["sort", "rowmax"])
+def test_routing_path_compiles_fullgraph(monkeypatch, impl):
+    """No graph break, no Dynamo error, on the path vLLM compiles.
+
+    The tensors have to be on device: torch_tpu owns the default compile
+    backend, so CPU inputs abort the compile before the router is reached.
+    """
+    torch = pytest.importorskip("torch")
+    torch._dynamo.reset()
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", impl)
+    layer = _routing_layer()
+    hidden = torch.randn(16, 8, dtype=torch.bfloat16).to("tpu")
+    logits = torch.randn(16, 512).to("tpu")
+
+    def run(h, r):
+        return moe_routing.select_experts(hidden_states=h,
+                                          router_logits=r,
+                                          topk=10,
+                                          renormalize=True,
+                                          scoring_fn="softmax",
+                                          layer=layer)
+
+    # backend="eager" on purpose: this test asserts the *Python* path traces
+    # without a graph break, which is device-independent. Leaving the backend
+    # unset makes _default_backend_selector pick the TPU backend on a TPU host
+    # and try to compile these synthetic CPU tensors for device, which fails
+    # for both impls and has nothing to do with what the test checks.
+    compiled = torch.compile(run,
+                             fullgraph=True,
+                             backend="eager",
+                             dynamic=False)
+    got_w, got_i = compiled(hidden, logits)
+    ref_w, ref_i = run(hidden, logits)
+    assert torch.equal(got_w, ref_w) and torch.equal(got_i, ref_i)

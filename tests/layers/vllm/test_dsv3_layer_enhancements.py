@@ -89,7 +89,9 @@ def test_pallas_attention_forward_2d_reshape():
     assert out.shape == query.shape
 
 
-@patch("vllm_torchtpu.layers.vllm.moe_routing.torch.topk")
+# The seam both top-k implementations go through: patching `torch.topk` here
+# would only exercise whichever one TPU_MOE_ROUTER_TOPK happens to select.
+@patch("vllm_torchtpu.layers.vllm.moe_routing._topk")
 def test_moe_routing_select_experts_grouped_topk(mock_topk):
     """Test that select_experts correctly delegates to grouped_topk when use_grouped_topk is True."""
     hidden_states = torch.ones(2, 1024, dtype=torch.bfloat16)

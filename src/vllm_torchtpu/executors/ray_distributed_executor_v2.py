@@ -526,8 +526,9 @@ class RayDistributedExecutorV2(RayExecutorV2):
             logger.info(
                 "Ray is already initialized. Skipping Ray initialization.")
         else:
-            logger.warning("Ray is not initialized, this is mainly for test.")
-            ray.init()
+            logger.info(
+                "Connecting to Ray cluster via ray.init(address='auto').")
+            ray.init(address="auto", ignore_reinit_error=True)
 
         device_str = current_platform.ray_device_key
         if not device_str:

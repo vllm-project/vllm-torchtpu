@@ -326,3 +326,64 @@ def test_skip_kv_update_batched(kv_len, q_len, distribution):
                                np.asarray(v3_out.astype(jnp.float32)),
                                atol=2e-2,
                                rtol=0)
+
+
+def test_batched_seq_along_lane_matches_head_along_sublane():
+    """`kv_layout=SEQ_ALONG_LANE` must be numerically equivalent to the default
+    `HEAD_ALONG_SUBLANE` layout for identical logical Q/K/V: layout only
+    changes how the cache is packed in memory, not the attention math.
+    """
+    _require_tpu()
+    rng = np.random.default_rng(0)
+    dtype = jnp.bfloat16
+    head_dim = 128
+    num_kv_heads, num_q_heads = 2, 4
+    # SEQ_ALONG_LANE requires page_size == 128 (RpaConfigs.validate_inputs).
+    page_size, total_pages = 128, 1
+    pages_per_seq = total_pages
+    sm_scale = head_dim**-0.5
+    page_indices = jnp.arange(pages_per_seq, dtype=jnp.int32)
+
+    kv_len = q_len = 32  # single MIXED sequence, full prefill from a zero cache
+    distribution = jnp.asarray((0, 0, 1), jnp.int32)
+    kv_lens = jnp.array([kv_len], jnp.int32)
+    cu_q_lens = jnp.array([0, q_len], jnp.int32)
+
+    def r(*shape):
+        return (rng.standard_normal(shape) * 0.5).astype(np.float32)
+
+    key = r(kv_len, num_kv_heads, head_dim)
+    value = r(kv_len, num_kv_heads, head_dim)
+    query = r(q_len, num_q_heads, head_dim)
+
+    def run(kv_layout):
+        cache_shape = KB.get_kv_cache_shape(total_pages,
+                                            page_size,
+                                            num_kv_heads,
+                                            head_dim,
+                                            dtype,
+                                            kv_layout=kv_layout)
+        out, _ = KB.ragged_paged_attention(
+            jnp.asarray(query, dtype),
+            jnp.asarray(key, dtype),
+            jnp.asarray(value, dtype),
+            jnp.zeros(cache_shape, dtype),
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+            decode_block_sizes=_BATCHED_DECODE_BLOCKS,
+            prefill_block_sizes=_BATCHED_PREFILL_BLOCKS,
+            kv_layout=kv_layout,
+        )
+        return np.asarray(out.astype(jnp.float32))
+
+    head_along_sublane_out = run(KBC.KVLayout.HEAD_ALONG_SUBLANE)
+    seq_along_lane_out = run(KBC.KVLayout.SEQ_ALONG_LANE)
+
+    tol = 2e-2  # bf16, cross-layout reduction order differs
+    np.testing.assert_allclose(seq_along_lane_out,
+                               head_along_sublane_out,
+                               atol=tol,
+                               rtol=0)

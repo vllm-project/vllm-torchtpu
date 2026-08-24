@@ -152,6 +152,16 @@ def _signature(graph: fx.GraphModule) -> tuple:
     return tuple(shape(value) for value in _placeholder_values(graph))
 
 
+def graph_signature(graph: fx.GraphModule) -> tuple:
+    """:func:`_signature`, for callers outside this module.
+
+    Stable across processes -- dtypes as strings, dims as ints or "?" -- so a
+    compile cache written by one run can check that the graph it is being
+    replayed against still takes the same inputs.
+    """
+    return _signature(graph)
+
+
 # ---------------------------------------------------------------------------
 # Handing a bucket from the trace that cannot serve it to the one that can
 # ---------------------------------------------------------------------------

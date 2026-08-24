@@ -73,7 +73,7 @@ def _indexer_jax(
     k: int,
     compression_ratio: int,
     softmax_scale: float,
-    head_dim: int,
+    n_head: int,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -86,8 +86,9 @@ def _indexer_jax(
                                                  q_rope,
                                                  axis=-1)
 
+        # Fold the query quantization scales into the weights.
         weights = (indexer_weights.astype(q_rope.dtype) * softmax_scale *
-                   (head_dim**-0.5) * q_scales)
+                   (n_head**-0.5) * q_scales)
 
         return streamindex_topk(
             q=q_quant,
@@ -99,8 +100,9 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
-            num_kv_pages_per_block=1,
-            num_queries_per_block=1,
+            # The following parameters are tuned based on microbenchmark results.
+            num_kv_pages_per_block=(3, 2, 2),
+            num_queries_per_block=(1, 128, 128),
         )
 
     res = _indexer_local(q_rope, indexer_weights, cache_kv, seq_lens,
@@ -151,13 +153,13 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             k=self.topk_tokens,
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
-            head_dim=self.head_dim,
+            n_head=self.n_head,
         )
 
         _scale = f"{self.softmax_scale:.6g}".replace(".", "p").replace(
             "-", "m").replace("+", "")
         op_name = (f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
-                   f"_c{self.compress_ratio}_d{self.head_dim}_s{_scale}")
+                   f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}")
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
             return _indexer_op_cache[op_name]
@@ -194,7 +196,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         self,
         hidden_states: torch.Tensor,
         query: torch.Tensor,
-        compressed_kv_score: torch.Tensor,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
@@ -205,7 +206,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
 
         q_rope, _ = rotary_emb(positions, q)
 
-        self.compressor(compressed_kv_score, positions, rotary_emb)
+        self.compressor(hidden_states, positions, rotary_emb)
 
         # No KV cache is bound during the profiling forward; the values are
         # unused, so return correctly-shaped dummies. vLLM binds a numel==0

@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
@@ -746,6 +747,308 @@ def test_sd_correctness_greedy_multi_chunk(
                 print(f"ref:  {ref.outputs[0].text}")
                 print(f"spec: {spec.outputs[0].text}")
         assert misses == 0
+
+        spec_llm.llm_engine.engine_core.shutdown()
+        del spec_llm
+        cleanup_dist_env_and_memory()
+
+
+# ---------------------------------------------------------------------------
+# Structured outputs + speculative decoding
+#
+# The scheduler emits 1 + s_r bitmask rows per structured request on verify
+# steps (one per draft position + the bonus row); the runner scatters them
+# onto the gathered target/bonus logits before rejection sampling. These
+# tests drive that path end to end. Structured decoding WITHOUT speculation
+# is covered separately in test_structured_output.py.
+# ---------------------------------------------------------------------------
+
+STRUCTURED_SPEC_JSON = '{"name": "Alice", "age": 30}'
+
+
+def get_structured_spec_prompts() -> list[str]:
+    # The expected JSON is embedded verbatim so ngram prompt-lookup proposes
+    # drafts inside the constrained generation, driving real (masked) verify
+    # traffic instead of degenerating to draft-free steps.
+    return [
+        f"Repeat exactly this JSON and nothing else: {STRUCTURED_SPEC_JSON}\n"
+        f"JSON: " for _ in range(8)
+    ]
+
+
+def _structured_spec_ngram_config() -> dict:
+    return {
+        "method": "ngram",
+        "prompt_lookup_max": 5,
+        "prompt_lookup_min": 3,
+        "num_speculative_tokens": 3,
+    }
+
+
+def _assert_valid_structured_json(text: str) -> None:
+    parsed = json.loads(text)
+    assert isinstance(parsed, dict), text
+    assert isinstance(parsed.get("name"), str), text
+    assert isinstance(parsed.get("age"), int), text
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize("multi_chunk", [
+    pytest.param(False, id="single_chunk"),
+    pytest.param(True, id="multi_chunk")
+])
+def test_structured_output_spec_decode_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    multi_chunk: bool,
+):
+    """Structured outputs under greedy speculative decoding.
+
+    Asserts three things on a mixed batch (structured + unconstrained
+    requests interleaved):
+      (a) every structured output satisfies its JSON schema (the grammar
+          bitmask actually reached the spec-verify logits);
+      (b) greedy output is identical to a no-spec run with the same
+          structured params (masking + rejection must not diverge);
+      (c) drafts were proposed and accepted (the masked verify path really
+          ran, rather than every step degenerating to draft-free sampling).
+    The multi_chunk variant shrinks the per-chunk request cap so the
+    chunk-local row mapping of both bitmask is exercised.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string"
+            },
+            "age": {
+                "type": "integer"
+            },
+        },
+        "required": ["name", "age"],
+    }
+    structured = SamplingParams(
+        temperature=0,
+        max_tokens=64,
+        structured_outputs=StructuredOutputsParams(json=schema),
+    )
+    unconstrained = SamplingParams(temperature=0, max_tokens=64)
+
+    with monkeypatch.context() as mp:
+        if multi_chunk:
+            # collective_rpc below ships a Python function to the TPU
+            # workers, which needs pickle fallback in vLLM's IPC encoder.
+            mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        test_prompts = get_structured_spec_prompts()
+        params = [
+            structured if i % 2 == 0 else unconstrained
+            for i in range(len(test_prompts))
+        ]
+        kwargs = dict(
+            max_model_len=256,
+            max_num_seqs=4,
+            tensor_parallel_size=_get_tensor_parallel_size(),
+            async_scheduling=False,
+            disable_log_stats=False,
+        )
+
+        # 1. Reference run: structured outputs, no speculation.
+        ref_llm = LLM(model=model_name, **kwargs)
+        ref_outputs = ref_llm.generate(test_prompts, params)
+        ref_llm.llm_engine.engine_core.shutdown()
+        del ref_llm
+        cleanup_dist_env_and_memory()
+        time.sleep(15)
+
+        # 2. Speculative run with the same structured params.
+        spec_llm = LLM(model=model_name,
+                       speculative_config=_structured_spec_ngram_config(),
+                       **kwargs)
+        if multi_chunk:
+            # Cap=2 with max_num_seqs=4: any batch with >2 reqs splits, so
+            # the bitmask scatter runs its chunk-local path.
+            spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap,
+                                               args=(2, ))
+        spec_outputs = spec_llm.generate(test_prompts, params)
+
+        # (a) Constraint holds on every structured request.
+        for i, spec in enumerate(spec_outputs):
+            if i % 2 == 0:
+                _assert_valid_structured_json(spec.outputs[0].text)
+
+        # (b) Speculation must not change greedy output.
+        misses = 0
+        for ref, spec in zip(ref_outputs, spec_outputs):
+            if ref.outputs[0].text != spec.outputs[0].text:
+                misses += 1
+                print(f"ref:  {ref.outputs[0].text}")
+                print(f"spec: {spec.outputs[0].text}")
+        assert misses == 0
+
+        # (c) The masked verify path actually saw draft traffic.
+        num_draft_tokens = num_accepted_tokens = 0
+        for metric in spec_llm.get_metrics():
+            if metric.name == SPEC_DRAFT_METRIC:
+                assert isinstance(metric, Counter)
+                num_draft_tokens += metric.value
+            elif metric.name == SPEC_ACCEPTED_METRIC:
+                assert isinstance(metric, Counter)
+                num_accepted_tokens += metric.value
+        print(f"structured+spec: accepted={num_accepted_tokens} "
+              f"drafted={num_draft_tokens}")
+        assert num_draft_tokens > 0, \
+            "no draft tokens proposed under structured outputs"
+        assert num_accepted_tokens > 0, \
+            "no draft tokens accepted under structured outputs"
+
+        spec_llm.llm_engine.engine_core.shutdown()
+        del spec_llm
+        cleanup_dist_env_and_memory()
+
+
+@pytest.mark.timeout(1800)
+def test_structured_output_spec_decode_non_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+):
+    """Non-greedy spec decode with a choice constraint.
+
+    Rejection sampling is stochastic, so no reference comparison; the mask
+    guarantee is absolute though: every output must be one of the choices
+    (bonus sampling, draft verification, and recovery sampling all happen
+    on masked distributions).
+    """
+    choices = ["Positive", "Negative"]
+    params = SamplingParams(
+        temperature=0.7,
+        max_tokens=8,
+        structured_outputs=StructuredOutputsParams(choice=choices),
+    )
+    # The choice words appear in the prompt so ngram lookup has material
+    # to draft from.
+    prompts = [
+        "Positive Positive Positive. The sentiment of 'great movie' is: "
+        for _ in range(8)
+    ]
+
+    with monkeypatch.context():
+        spec_llm = LLM(
+            model=model_name,
+            speculative_config=_structured_spec_ngram_config(),
+            max_model_len=256,
+            max_num_seqs=4,
+            tensor_parallel_size=_get_tensor_parallel_size(),
+            async_scheduling=False,
+        )
+        try:
+            outputs = spec_llm.generate(prompts, params)
+            assert len(outputs) == len(prompts)
+            for output in outputs:
+                assert output.outputs[0].text in choices, (
+                    f"constraint violated: {output.outputs[0].text!r}")
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.timeout(2400)
+def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch):
+    """Structured outputs under greedy eagle3 speculative decoding.
+
+    Same three assertions as the ngram combo test -- (a) every structured
+    output satisfies its schema, (b) greedy output matches a no-spec
+    reference, (c) drafts were proposed and accepted -- but with a
+    model-based drafter.
+
+    Sync scheduling only: eagle3 + async scheduling + structured output
+    raises NotImplementedError (the TPU async path keeps drafts on device,
+    so the engine cannot substitute them into the grammar bitmask).
+    """
+    async_scheduling = False
+    model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string"
+            },
+            "age": {
+                "type": "integer"
+            },
+        },
+        "required": ["name", "age"],
+    }
+    structured = SamplingParams(
+        temperature=0,
+        max_tokens=64,
+        structured_outputs=StructuredOutputsParams(json=schema),
+    )
+    unconstrained = SamplingParams(temperature=0, max_tokens=64)
+
+    with monkeypatch.context():
+        test_prompts = get_structured_spec_prompts()
+        params = [
+            structured if i % 2 == 0 else unconstrained
+            for i in range(len(test_prompts))
+        ]
+        kwargs = dict(
+            max_model_len=256,
+            max_num_seqs=4,
+            tensor_parallel_size=_get_tensor_parallel_size(),
+            async_scheduling=async_scheduling,
+            disable_log_stats=False,
+        )
+
+        # 1. Reference run: structured outputs, no speculation.
+        ref_llm = LLM(model=model_name, **kwargs)
+        ref_outputs = ref_llm.generate(test_prompts, params)
+        ref_llm.llm_engine.engine_core.shutdown()
+        del ref_llm
+        cleanup_dist_env_and_memory()
+        time.sleep(15)
+
+        # 2. eagle3 speculative run with the same structured params.
+        spec_llm = LLM(model=model_name,
+                       speculative_config={
+                           "method": "eagle3",
+                           "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+                           "num_speculative_tokens": 3,
+                           "draft_tensor_parallel_size": 1,
+                       },
+                       **kwargs)
+        spec_outputs = spec_llm.generate(test_prompts, params)
+
+        # (a) Constraint holds on every structured request.
+        for i, spec in enumerate(spec_outputs):
+            if i % 2 == 0:
+                _assert_valid_structured_json(spec.outputs[0].text)
+
+        # (b) Speculation must not change greedy output.
+        misses = 0
+        for ref, spec in zip(ref_outputs, spec_outputs):
+            if ref.outputs[0].text != spec.outputs[0].text:
+                misses += 1
+                print(f"ref:  {ref.outputs[0].text}")
+                print(f"spec: {spec.outputs[0].text}")
+        assert misses == 0
+
+        # (c) The masked verify path actually saw draft traffic.
+        num_draft_tokens = num_accepted_tokens = 0
+        for metric in spec_llm.get_metrics():
+            if metric.name == SPEC_DRAFT_METRIC:
+                assert isinstance(metric, Counter)
+                num_draft_tokens += metric.value
+            elif metric.name == SPEC_ACCEPTED_METRIC:
+                assert isinstance(metric, Counter)
+                num_accepted_tokens += metric.value
+        print(f"structured+eagle3({'async' if async_scheduling else 'sync'}): "
+              f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
+        assert num_draft_tokens > 0, \
+            "no draft tokens proposed under structured outputs"
+        assert num_accepted_tokens > 0, \
+            "no draft tokens accepted under structured outputs"
 
         spec_llm.llm_engine.engine_core.shutdown()
         del spec_llm

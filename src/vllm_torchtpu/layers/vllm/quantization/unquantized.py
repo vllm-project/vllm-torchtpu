@@ -54,6 +54,8 @@ from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
+from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -142,6 +144,12 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     @property
     def is_monolithic(self) -> bool:
         return True
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        # We need to take control of collective communication (AllGather/ReduceScatter)
+        # to pipeline them with MoE computation when chunking is enabled.
+        return enable_pipelined_collective_and_compute()
 
     def _select_monolithic(self):
         return self._forward_monolithic_tpu
@@ -245,19 +253,21 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
-        # Step 2: EP global->local remap happens inside fused_moe_gmm via an
-        # elementwise subtract from `experts_start` (scalar).
-        return fused_moe_gmm(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=None,
-            w2_scale=None,
-            w1_bias=getattr(layer, 'w13_bias', None),
-            w2_bias=getattr(layer, 'w2_bias', None),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            experts_start=layer._experts_start,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-        )
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": None,
+            "w2_scale": None,
+            "w1_bias": getattr(layer, 'w13_bias', None),
+            "w2_bias": getattr(layer, 'w2_bias', None),
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+        }
+        if enable_pipelined_collective_and_compute():
+            return pipelined_fused_moe_gmm(**kwargs)
+
+        return fused_moe_gmm(**kwargs)

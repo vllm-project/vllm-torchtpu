@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 
 # The real RPA v3 bf16 layout: (blocks, block_size, heads_x2 // packing,
@@ -550,3 +551,84 @@ class TestGatherScatterBlocksFp8:
         # pure roundtrip: bytes unchanged everywhere (incl. the
         # copied-through third kernel block of each manager block)
         assert jnp.array_equal(new_pool.view(jnp.uint8), pool.view(jnp.uint8))
+
+
+class TestKimiLinearMlaPoolGeometry:
+    """Kimi-Linear TP8 state packing on an MLA pool (token row = 2560 B).
+
+    The f32 KDA recurrent state (262,144 B = 2^18) does not divide the MLA
+    token row (2,560 B = 2^9 * 5), so its region pads up to 103 whole token
+    rows; the bf16 conv state (9,216 B) takes 4.
+    """
+
+    # Real MLA pool shape: (blocks, block_size, kv_packing, padded_kv_dim),
+    # bf16 — block_size 107 is what the block-size derivation picks.
+    NB, BS, PACK, LANES = 2, 107, 2, 640
+    TOK_BYTES = PACK * LANES * 2
+    # (heads, d_k, d_v) fp32 and (taps, qkv, heads, head_dim) bf16 per shard.
+    N_V, D_K, D_V, KERNEL_SIZE = 4, 128, 128, 4
+    SSM_BYTES = N_V * D_K * D_V * 4
+    CONV_DIM = 3 * N_V * D_V  # per-tap conv channels
+    CONV_BYTES = (KERNEL_SIZE - 1) * CONV_DIM * 2
+
+    def _pool(self):
+        return jnp.zeros((self.NB, self.BS, self.PACK, self.LANES),
+                         dtype=jnp.bfloat16)
+
+    def _layout(self):
+        return derive_pooled_gdn_state_layout(
+            ssm_bytes=self.SSM_BYTES,
+            conv_bytes=self.CONV_BYTES,
+            token_bytes=self.TOK_BYTES,
+        )
+
+    def test_padded_ssm_region_builds_plan(self):
+        # conv_dim placeholder: KDA's real conv layout needs its own pool
+        # view (see the rejection test below); here a GDN-compatible conv
+        # dim exercises the padded SSM region through the real plan builder.
+        layout = self._layout()
+        plan = pool_adapters.v3_state_source(
+            self._pool(),
+            split=1,
+            ssm_ntok=layout.ssm_tokens,
+            conv_tok0=layout.ssm_tokens,
+            conv_ntok=layout.conv_tokens,
+            conv_dim=1280,
+            n_v=self.N_V,
+            d_k=self.D_K,
+            d_v=self.D_V,
+            kernel_size=2,
+        )
+
+        ssm = plan.recurrent
+        # The padded region fits in the single kernel block (split=1), keeps
+        # the real state extent in rows_used, and tiles whole f32 rows.
+        assert (ssm.kb0, ssm.nblocks, ssm.row0, ssm.nrows) == (0, 1, 0, 103)
+        assert ssm.rows_used == self.N_V * self.D_K
+        assert ssm.nrows * self.TOK_BYTES >= self.SSM_BYTES
+        assert ssm.nrows * self.TOK_BYTES - self.SSM_BYTES == 1536
+        assert self.TOK_BYTES % (self.D_V * 4) == 0
+        # The conv region sits right after the padded SSM extent, inside the
+        # same kernel block.
+        conv = plan.conv
+        assert (conv.kb0, conv.row0) == (0, 103)
+        assert conv.row0 + conv.nrows <= self.BS
+
+    def test_kda_conv_dim_rejected_by_gdn_view(self):
+        # Phase 1.2 boundary: the MLA pool's 640 lanes do not divide KDA's
+        # per-tap conv dim (3 * 4 * 128 = 1536), so the GDN conv view cannot
+        # express the KDA conv region; KDA needs its own pool view.
+        layout = self._layout()
+        with pytest.raises(AssertionError):
+            pool_adapters.v3_state_source(
+                self._pool(),
+                split=1,
+                ssm_ntok=layout.ssm_tokens,
+                conv_tok0=layout.ssm_tokens,
+                conv_ntok=layout.conv_tokens,
+                conv_dim=self.CONV_DIM,
+                n_v=self.N_V,
+                d_k=self.D_K,
+                d_v=self.D_V,
+                kernel_size=self.KERNEL_SIZE,
+            )

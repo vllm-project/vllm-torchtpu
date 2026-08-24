@@ -13,7 +13,7 @@ set -e
 #    ./docker/build_image.sh -s /path/to/vllm/source
 
 # Default values
-IMAGE_TAG="torchtpu-vllm-local"
+IMAGE_TAG="vllm-torchtpu-local"
 BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
 VLLM_SOURCE=""
 TARGET="prod"
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "===> Building torchtpu-vllm image..."
+echo "===> Building vllm-torchtpu image..."
 echo "Image Tag: $IMAGE_TAG"
 echo "Base Image: $BASE_IMAGE"
 

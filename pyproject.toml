@@ -38,7 +38,7 @@ dependencies = [
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260813160135",
+    "tpu-raiden-torch==0.0.1.dev20260819190323",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -88,11 +88,19 @@ benchmarking = [
     "runai-model-streamer[gcs]",
 ]
 
+# vLLM-Omni optional dependency
+omni = [
+    "vllm-omni==0.27.0rc1",
+]
+
 [project.entry-points."vllm.platform_plugins"]
 # Standard vLLM out-of-tree platform plugin discovery. The function returns
 # the dotted class path when this platform should activate, else None. See
 # https://docs.vllm.ai/en/latest/design/plugin_system/
 torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
+
+[project.entry-points."vllm_omni.platform_plugins"]
+torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
@@ -133,10 +141,11 @@ ignore-missing-imports = [
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",
-    "tpu_raiden", "tpu_raiden.*",
+    "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",
     "transformers", "transformers.*",
     "vllm", "vllm.*",
+    "vllm_omni", "vllm_omni.*",
     "zmq", "zmq.*",
 ]
 

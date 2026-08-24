@@ -1,4 +1,4 @@
-"""TPU-Friendly MLA Ragged Paged Attention kernel."""
+"""TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
 
@@ -8,7 +8,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.mla.sparse import csa_gather
+from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -36,8 +36,10 @@ def get_kv_cache_shape(
     page_size,
     kv_dim,
     kv_dtype,
+    kv_packing: int | None = None,
 ):
-    kv_packing = get_dtype_packing(kv_dtype)
+    if kv_packing is None:
+        kv_packing = get_dtype_packing(kv_dtype)
     return (
         total_num_pages,
         align_to(page_size, kv_packing) // kv_packing,
@@ -115,16 +117,6 @@ def gather_page_ids(
     return out[:num_tokens]
 
 
-# GLM-5.2 FP8 nope layout: 512 e4m3 values quantized with a single
-# per-tensor scale (the checkpoint's k_scale); no inline scales.
-def _dequant_fp8_per_tensor(bkv_nope: jax.Array, k_scale: float):
-    """Dequantize per-tensor-scaled FP8 nope values to BF16."""
-    nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn).astype(jnp.bfloat16)
-    if k_scale != 1.0:
-        nope = (nope * jnp.bfloat16(k_scale)).astype(jnp.bfloat16)
-    return nope
-
-
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
@@ -132,12 +124,13 @@ def _attention_kernel(
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     # Input
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    cache_kv_nope_hbm_ref,  # [num_tokens, topk, nope_dim] (gathered)
+    # [num_tokens, topk * TILE_SUBROWS, TILE_LANE_BYTES] (gathered, raw tiles)
+    cache_kv_nope_hbm_ref,
     cache_kv_rope_hbm_ref,  # [num_tokens, topk, rope_dim] (gathered)
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     # Scratch
-    bkv_nope_x2_ref,  # [2, batch_size, topk, nope_dim]
+    bkv_nope_x2_ref,  # [2, batch_size, topk * TILE_SUBROWS, TILE_LANE_BYTES]
     bkv_rope_x2_ref,  # [2, batch_size, topk, rope_dim]
     bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
@@ -150,9 +143,9 @@ def _attention_kernel(
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
-    _, page_size, _ = cache_kv_nope_hbm_ref.shape
+    nope_dim = dsa_gather.TILE_SUBROWS * dsa_gather.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
-    bkv_sz = page_size
+    bkv_sz = cache_kv_nope_hbm_ref.shape[1] // dsa_gather.TILE_SUBROWS
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -185,12 +178,14 @@ def _attention_kernel(
         # and MXU work across batch entries.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
+        if k_scale != 1.0:
+            s *= k_scale
 
         # Mask scores past kv_len (the "-1" tail): zeroing the keys alone is
         # not enough -- a zeroed key still scores 0 and inflates the softmax
         # denominator whenever kv_len << topk.
         kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        s = jnp.where(kv_span < kv_len, s, jnp.finfo(s.dtype).min)
+        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
 
         m = jnp.max(s, axis=1, keepdims=True)
         p = jnp.exp(s - m)
@@ -204,6 +199,11 @@ def _attention_kernel(
         l_sum,
     ):
         pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+
+        # We use `k_scale` for the PV step as well since MLA uses a shared
+        # compressed latent for k/v and k_scale ~= v_scale.
+        if k_scale != 1.0:
+            pv *= k_scale
 
         out = (lax.div(pv, l_sum) if q_dtype == jnp.float32 else
                (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype))
@@ -296,15 +296,17 @@ def _attention_kernel(
         return q
 
     def load_bkv(bkv_sem_idx, batch_idx):
+        # The gather nope is (4, 128) fp8, reshape it to (1, 512) fp8.
         bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
-        bkv_nope = _dequant_fp8_per_tensor(bkv_nope, k_scale)
+        bkv_nope = bkv_nope.reshape(bkv_sz, nope_dim)
+        bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
 
         bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
+        bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
-        # Pad kv to match q's 128-aligned head_dim(refer to `prepare_q_inputs`).
-        # The padded dims are no-ops in the einsums since q's padded dims are
-        # also zero.
+        # Pad kv (576) to q's 128-aligned head_dim (640); the padded dims are
+        # no-ops in the einsums since q's padded dims are also zero.
         if bkv.shape[-1] < head_dim:
             bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
 
@@ -481,9 +483,10 @@ def sparse_ragged_paged_attention(
   Returns:
     The output of attention.
   """
-    # Opaque uint8 tiles (see csa_gather.py): nope encodes 512 fp8 values
-    # (dequantized in-kernel with the per-tensor k_scale), rope encodes
-    # 64 bf16 as high/low byte planes (dequantized by the shim).
+    # Opaque uint8 tiles (see dsa_gather.py): nope encodes 512 fp8 values
+    # (gathered as raw (4, 128) tiles, then folded to 512 lanes and dequantized
+    # in-kernel with the per-tensor k_scale), rope encodes 64 bf16 as high/low
+    # byte planes (dequantized by the shim).
     assert cache_kv_nope.dtype == jnp.uint8
     assert cache_kv_rope.dtype == jnp.uint8
     if gather_and_attention_chunk_size is None:
@@ -503,7 +506,8 @@ def sparse_ragged_paged_attention(
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
-        cache_kv_nope: jax.Array,  # [num_tokens, topk, nope_dim] (gathered)
+        # [num_tokens, topk * TILE_SUBROWS, TILE_LANE_BYTES] (gathered raw tiles)
+        cache_kv_nope: jax.Array,
         cache_kv_rope: jax.Array,  # [num_tokens, topk, rope_dim] (gathered)
         kv_lens: jax.Array,  # i32[max_num_tokens]
         start_seq_idx: jax.Array,  # i32
@@ -521,13 +525,13 @@ def sparse_ragged_paged_attention(
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
 
-        page_size = cache_kv_nope.shape[1]
+        # One batch entry's worth of gathered top-k rows, per cache.
         bkv_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, page_size, *cache_kv_nope.shape[2:]),
+            (2, batch_size, *cache_kv_nope.shape[1:]),
             cache_kv_nope.dtype,
         )
         bkv_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, page_size, *cache_kv_rope.shape[2:]),
+            (2, batch_size, *cache_kv_rope.shape[1:]),
             cache_kv_rope.dtype,
         )
 
@@ -554,7 +558,7 @@ def sparse_ragged_paged_attention(
             jnp.zeros((2, ), jnp.int32),
         )
 
-        scope_name = f"MLA-p_{page_size}"
+        scope_name = f"MLA-p_{cache_kv_rope.shape[1]}"
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -642,13 +646,16 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
+        gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
             cache_kv_nope,
             cache_kv_rope,
             indices,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
-            gather_and_attention_chunk_size, topk, -1)
+            gather_and_attention_chunk_size,
+            topk * dsa_gather.TILE_SUBROWS,
+            dsa_gather.TILE_LANE_BYTES,
+        )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             gather_and_attention_chunk_size, topk, -1)
         # We treat each query token as a one independent sequence, attend to their

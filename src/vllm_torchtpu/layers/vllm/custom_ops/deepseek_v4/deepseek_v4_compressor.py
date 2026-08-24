@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""TPU DeepSeek-V4 KV/score compressor, on the compress-and-store kernels."""
 
 import functools
 
 import jax
-import jax.numpy as jnp
 import torch
 import torch.nn as nn
 from jax.sharding import PartitionSpec as P
@@ -27,8 +27,10 @@ from vllm.models.deepseek_v4.compressor import (CompressorStateCache,
                                                 DeepseekCompressor)
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
-from vllm_torchtpu.kernels.deepseek_v4.compressor import (
-    compressor_forward, compressor_forward_indexer)
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import \
+    config as compressor_config
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import \
+    compressor_forward
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
@@ -43,120 +45,199 @@ _compressor_op_cache = {}
 BATCH_AXIS = None
 
 
-# Module-level so `pallas.jax_op` can trace and register it as a torch op.
-def _compressor_jax(
-    kv_score: jax.Array,
+def _run_compressor(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
     cos_sin_cache: jax.Array,
     positions: jax.Array,
-    request_distribution: jax.Array,
-    query_start_loc: jax.Array,
-    seq_lens: jax.Array,
-    state_input_positions: jax.Array,
     state_block_tables: jax.Array,
-    k_input_positions: jax.Array,
+    query_start_loc: jax.Array,
     k_block_tables: jax.Array,
+    request_distribution: jax.Array,
+    cache: jax.Array,
+    rope_cache: jax.Array | None,
+    state_cache: jax.Array | None,
+    *,
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
+    """Shared body of the three op variants, for CSA compressor, HCA compressor, and CSA indexer compressor respectively."""
+    return compressor_forward(
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        block_table=state_block_tables,
+        query_start_loc=query_start_loc,
+        kv_block_table=k_block_tables,
+        cache=cache,
+        rope_cache=rope_cache,
+        state_cache=state_cache,
+        distribution=request_distribution,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_eps=rms_eps,
+        quant_block=quant_block,
+    )
+
+
+# `pallas.jax_op` inspects the signature to split tensor from static args, so
+# each cache arity needs its own module-level function rather than varargs.
+def _compressor_jax_csa(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    norm_weight: jax.Array,
+    cos_sin_cache: jax.Array,
+    positions: jax.Array,
+    state_block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    k_block_tables: jax.Array,
+    request_distribution: jax.Array,
+    cache: jax.Array,
+    rope_cache: jax.Array,
+    *,
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+) -> tuple[jax.Array, jax.Array]:
+    """CSA: NoPE and RoPE in two arrays, state shares the NoPE buffer."""
+    if cache.shape[0] == 0:
+        return cache, rope_cache
+    new_cache, new_rope_cache, _ = _run_compressor(
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        state_block_tables=state_block_tables,
+        query_start_loc=query_start_loc,
+        k_block_tables=k_block_tables,
+        request_distribution=request_distribution,
+        cache=cache,
+        rope_cache=rope_cache,
+        state_cache=None,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_eps=rms_eps,
+        quant_block=quant_block,
+    )
+    return new_cache, new_rope_cache
+
+
+def _compressor_jax_hca(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    norm_weight: jax.Array,
+    cos_sin_cache: jax.Array,
+    positions: jax.Array,
+    state_block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    k_block_tables: jax.Array,
+    request_distribution: jax.Array,
+    cache: jax.Array,
+    state_cache: jax.Array,
+    *,
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+) -> tuple[jax.Array, jax.Array]:
+    """HCA: no RoPE array, and the state lives on a CSA NoPE array."""
+    if cache.shape[0] == 0 or state_cache.shape[0] == 0:
+        return cache, state_cache
+    new_cache, _, new_state_cache = _run_compressor(
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        state_block_tables=state_block_tables,
+        query_start_loc=query_start_loc,
+        k_block_tables=k_block_tables,
+        request_distribution=request_distribution,
+        cache=cache,
+        rope_cache=None,
+        state_cache=state_cache,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_eps=rms_eps,
+        quant_block=quant_block,
+    )
+    return new_cache, new_state_cache
+
+
+def _compressor_jax_indexer(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    norm_weight: jax.Array,
+    cos_sin_cache: jax.Array,
+    positions: jax.Array,
+    state_block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    k_block_tables: jax.Array,
+    request_distribution: jax.Array,
     cache: jax.Array,
     *,
     state_block_size: int,
     head_dim: int,
-    state_dim: int,
-    rope_head_dim: int,
     compress_ratio: int,
     overlap: bool,
     rms_eps: float,
     quant_block: int,
 ) -> jax.Array:
-
-    forward_fn = (compressor_forward
-                  if head_dim == 512 else compressor_forward_indexer)
-
-    def _compressor_local(kv_score, ape, norm_weight, cos_sin_cache, positions,
-                          request_distribution, query_start_loc, seq_lens,
-                          state_input_positions, state_block_tables,
-                          k_input_positions, k_block_tables, cache):
-        num_valid_reqs = request_distribution[2]
-        num_tokens = kv_score.shape[0]
-        num_valid_tokens = query_start_loc[num_valid_reqs]
-
-        q_per_req = query_start_loc[1:] - query_start_loc[:-1]
-        max_num_seqs = seq_lens.shape[0]
-        token_to_req_indices = jnp.repeat(jnp.arange(max_num_seqs),
-                                          q_per_req,
-                                          total_repeat_length=num_tokens)
-
-        # One buffer, two independent block tables at different granularity;
-        # vLLM's group allocator keeps their page-index ranges disjoint.
-        assert state_block_tables.shape[0] % max_num_seqs == 0
-        max_num_state_blocks_per_req = (state_block_tables.shape[0] //
-                                        max_num_seqs)
-        # Each cache uses its own metadata's `input_positions`: separate
-        # groups can number positions differently. The modulo guards against
-        # a stray absolute position aliasing into the next request.
-        state_cache_block_num = (state_input_positions // state_block_size
-                                 ) % max_num_state_blocks_per_req + (
-                                     token_to_req_indices *
-                                     max_num_state_blocks_per_req)
-        state_cache_block_offset = state_input_positions % state_block_size
-        slot_mapping = (
-            state_block_tables[state_cache_block_num] * state_block_size +
-            state_cache_block_offset)
-        slot_mapping = jnp.where(
-            jnp.arange(num_tokens) < num_valid_tokens, slot_mapping, -1)
-
-        assert k_block_tables.shape[0] % max_num_seqs == 0
-        max_num_k_blocks_per_req = k_block_tables.shape[0] // max_num_seqs
-        k_block_size = cache.shape[1] * cache.shape[2]
-        k_cache_block_num = (
-            (k_input_positions // compress_ratio) //
-            k_block_size) % max_num_k_blocks_per_req + (
-                token_to_req_indices * max_num_k_blocks_per_req)
-        k_cache_block_offset = ((k_input_positions // compress_ratio) %
-                                k_block_size)
-        kv_slot_mapping = (k_block_tables[k_cache_block_num] * k_block_size +
-                           k_cache_block_offset)
-        kv_slot_mapping = jnp.where(
-            jnp.arange(num_tokens) < num_valid_tokens, kv_slot_mapping, -1)
-
-        block_table = state_block_tables.reshape(max_num_seqs, -1)
-
-        out = forward_fn(
-            kv_score=kv_score,
-            ape=ape,
-            norm_weight=norm_weight,
-            cos_sin_cache=cos_sin_cache,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            block_table=block_table,
-            token_to_req_indices=token_to_req_indices,
-            kv_slot_mapping=kv_slot_mapping,
-            cache=cache,
-            state_block_size=state_block_size,
-            head_dim=head_dim,
-            rope_head_dim=rope_head_dim,
-            compress_ratio=compress_ratio,
-            overlap=overlap,
-            rms_eps=rms_eps,
-            quant_block=quant_block,
-        )
-
-        return out
-
+    """Lightning indexer: one array holds the records and the state."""
     if cache.shape[0] == 0:
-        # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
-        # the compiled signature because torch_tpu jits with keep_unused=True.
         return cache
-
-    return _compressor_local(kv_score, ape, norm_weight, cos_sin_cache,
-                             positions, request_distribution, query_start_loc,
-                             seq_lens, state_input_positions,
-                             state_block_tables, k_input_positions,
-                             k_block_tables, cache)
+    new_cache, _, _ = _run_compressor(
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        state_block_tables=state_block_tables,
+        query_start_loc=query_start_loc,
+        k_block_tables=k_block_tables,
+        request_distribution=request_distribution,
+        cache=cache,
+        rope_cache=None,
+        state_cache=None,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_eps=rms_eps,
+        quant_block=quant_block,
+    )
+    return new_cache
 
 
 class VllmCompressorStateCache(CompressorStateCache):
-    """Compressor state cache, paged to fit the host compressed-KV page."""
+    """Compressor state cache, paged to fit the array that hosts it."""
 
     def __init__(
         self,
@@ -173,33 +254,69 @@ class VllmCompressorStateCache(CompressorStateCache):
         )
         coff = 1 + (compress_ratio == 4)
         self.head_dim = state_dim // 2 // coff
-        # Block size follows the host page this state packs into, not the base
-        # class's CUDA constants; `get_kv_cache_spec` sets the final value.
         self.compress_ratio = compress_ratio
-        self._state_coff = coff
+        # `block_size` deliberately keeps the base class's value here.
+        # It cannot be derived yet: `cache_config.block_size` is still vLLM's
+        # small default at construction time -- the platform's DSv4 override
+        # is not visible on any config reachable from a submodule constructor
+        # -- and at that size every mode's state page floors to zero rows.
+        # `get_kv_cache_spec` recomputes it from the finalized config, which
+        # runs before `_build_compressor_op` bakes it into the kernel.
 
-    def _state_block_size(self, cache_block_size: int) -> int:
-        """Rows of compressor state packed into one host compressed-KV page."""
-        compressed_kv_cache_bz = cache_block_size // self.compress_ratio
-        # 4: bytes per f32. 2: kv-dim + score-dim.
-        block_size = compressed_kv_cache_bz // 4 // 2 // self._state_coff
-        if block_size <= 0:
-            # Floors to 0 below cache_block_size 1024 (an HCA page is 4 rows
-            # at 512), which would emit a zero-sized page.
-            raise ValueError(
-                f"{self.prefix!r}: a compressed-KV page of "
-                f"{compressed_kv_cache_bz} rows is too small to pack this "
-                f"layer's compressor state into (compress_ratio "
-                f"{self.compress_ratio}, cache block size {cache_block_size})."
+    def _derive_block_size(self, kv_cache_block_size: int) -> int:
+        """State tokens per page of the array that hosts this state.
+
+        `block_size` is the granularity of the block table vLLM builds and
+        that the compressor kernel indexes with, so it must be the number of
+        token states that physically fit in one page of the *hosting* array.
+        CSA's and the indexer's state caches overlay their own compressed-KV
+        array; HCA's overlays a *CSA NoPE* array, which is why the host page
+        size is asked for separately.
+
+        Not a closed form: HCA writes two rows per record, the indexer array
+        is 256 lanes wide, and HCA's state is hosted on a *CSA* page. Ask the
+        kernel's own layout model instead of guessing.
+        """
+        try:
+            if kv_cache_block_size // self.compress_ratio <= 0:
+                raise ValueError(
+                    f"a page of {kv_cache_block_size} tokens holds no "
+                    f"compressed row at compress_ratio {self.compress_ratio}")
+            mode = compressor_config.select_mode(self.head_dim,
+                                                 self.compress_ratio == 4)
+            cfgs = compressor_config.Configs.make(
+                mode,
+                size_n=0,
+                physical_page_size=compressor_config.physical_page_size(
+                    mode, kv_cache_block_size, self.compress_ratio),
+                state_physical_page_size=compressor_config.
+                state_host_page_size(mode, kv_cache_block_size,
+                                     self.compress_ratio),
+                head_dim=self.head_dim,
+                compress_ratio=self.compress_ratio,
             )
+            block_size = cfgs.state_block_size
+            if block_size <= 0:
+                raise ValueError(
+                    f"{mode.value} state rows do not fit in a page derived "
+                    f"from a {kv_cache_block_size}-token KV block")
+        except (ValueError, AssertionError, ZeroDivisionError) as exc:
+            raise ValueError(
+                f"DeepSeek-V4 compressor state cache {self.prefix!r} cannot "
+                f"be paged for cache block size {kv_cache_block_size} "
+                f"(head_dim {self.head_dim}, compress_ratio "
+                f"{self.compress_ratio}): {exc}") from exc
         return block_size
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # uint8 is the escape hatch: `kv_cache_spec_normalizer` retypes every
-        # other spec to the model's KV dtype, which would truncate raw state.
-        # The physical overlay onto the host tensor is done by the runner.
-        self.block_size = self._state_block_size(
+        # `_build_compressor_op` bakes this in as the kernel's
+        # `state_block_size`, so spec and kernel must not disagree.
+        self.block_size = self._derive_block_size(
             vllm_config.cache_config.block_size)
+        # uint8 is deliberate: the kernel writes raw f32 state bytes, and
+        # declaring the real dtype would make the byte budget disagree with
+        # the packed layout the host array actually uses. The physical overlay
+        # onto that host is done by the runner.
         bytes_per_row = self.state_dim * 4
         return SlidingWindowMLASpec(
             block_size=self.block_size,
@@ -212,7 +329,7 @@ class VllmCompressorStateCache(CompressorStateCache):
 
 
 class VllmDeepseekCompressor(DeepseekCompressor):
-    """TPU compressor: writes compressed KV rows and owns the state cache."""
+    """TPU compressor: projects, saves state, compresses and stores. """
 
     def __init__(self, *args, **kwargs) -> None:
         orig_state_cache = dsv4_compressor.CompressorStateCache
@@ -231,6 +348,34 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 "kernel only emits the FP8/UE8M0 cache layout.")
         self.num_layers = get_current_vllm_config(
         ).model_config.hf_config.num_hidden_layers
+        self._wkv_wgate_transposed = False
+
+    def transpose_wkv_wgate(self) -> None:
+        """Stores ``fused_wkv_wgate.weight`` transposed, once, at load time.
+
+        vLLM lays linear weights out as [out_features, in_features], but the
+        compress-and-store kernel consumes them as
+        [hidden_size, 2 * coff * head_dim]. Transposing in the forward pass
+        makes XLA materialize the transposed copy on every step; the weight is
+        only ever read by that kernel, so it can just be stored that way.
+        """
+        if self._wkv_wgate_transposed:
+            return
+        weight = self.fused_wkv_wgate.weight.data.t().contiguous()
+        self.fused_wkv_wgate.weight = torch.nn.Parameter(weight,
+                                                         requires_grad=False)
+        self._wkv_wgate_transposed = True
+
+    # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
+    # head_dim == 512 without:      HCA, whose state lives on a CSA array.
+    # head_dim == 128:              lightning indexer, one array for both.
+    @property
+    def _has_rope_cache(self) -> bool:
+        return self.head_dim == 512 and self.overlap
+
+    @property
+    def _separate_state(self) -> bool:
+        return not self.overlap
 
     @property
     def compressor_op(self):
@@ -250,22 +395,27 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         vllm_context = get_vllm_model_wrapper_context()
         mesh = vllm_context.mesh
 
-        state_dim = getattr(self.state_cache, "state_dim",
-                            getattr(self, "state_dim", 512))
+        assert self.head_dim in (512, 128), self.head_dim
+        if self._has_rope_cache:
+            variant, jax_fn = "csa", _compressor_jax_csa
+        elif self._separate_state:
+            variant, jax_fn = "hca", _compressor_jax_hca
+        else:
+            variant, jax_fn = "indexer", _compressor_jax_indexer
 
         wrapped_fn = functools.partial(
-            _compressor_jax,
+            jax_fn,
             state_block_size=self.state_cache.block_size,
             head_dim=self.head_dim,
-            state_dim=state_dim,
-            rope_head_dim=self.rope_head_dim,
             compress_ratio=self.compress_ratio,
             overlap=self.overlap,
             rms_eps=self.rms_norm_eps,
             quant_block=self._quant_block,
         )
 
-        op_name = f"pallas::deepseek_v4_compressor_{self.head_dim}_{self.compress_ratio}_{int(self.overlap)}_{self.state_cache.block_size}_{state_dim}"
+        op_name = (f"pallas::deepseek_v4_compressor_{variant}"
+                   f"_{self.head_dim}_{self.compress_ratio}"
+                   f"_{self.state_cache.block_size}")
 
         global _compressor_op_cache
         if op_name in _compressor_op_cache:
@@ -273,51 +423,72 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
         attn_data_axis = None
         batch_axis = BATCH_AXIS
-        # Donate the cache so XLA writes in place instead of allocating a
-        # second full-size buffer; `forward` copies the result back. The index
-        # counts torch_tpu's filtered tensor args, where `cache` is last.
+        input_partition_specs = (
+            P(attn_data_axis, None),  # hidden_states
+            P(),  # wkv_wgate
+            P(),  # ape
+            P(),  # norm_weight
+            P(),  # cos_sin_cache
+            P(attn_data_axis),  # positions
+            P(batch_axis),  # state_block_tables
+            P(),  # query_start_loc
+            P(batch_axis),  # k_block_tables
+            P(),  # request_distribution
+            P(),  # cache
+        )
+        donate_argnums = (len(input_partition_specs) - 1, )  # cache
+        if variant != "indexer":
+            input_partition_specs += (P(), )  # rope_cache / state_cache
+            donate_argnums += (len(input_partition_specs) - 1, )
+
         compressor_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
-            donate_argnums=(12, ),
-            input_partition_specs=(
-                P(attn_data_axis, None),  # kv_score
-                P(),  # ape
-                P(),  # norm_weight
-                P(),  # cos_sin_cache
-                P(attn_data_axis),  # positions
-                P(),  # request_distribution
-                P(),  # query_start_loc
-                P(batch_axis),  # seq_lens
-                P(attn_data_axis),  # state_input_positions
-                P(batch_axis),  # state_block_tables
-                P(attn_data_axis),  # k_input_positions
-                P(batch_axis),  # k_block_tables
-                P(),  # cache
-            ),
+            donate_argnums=donate_argnums,
+            input_partition_specs=input_partition_specs,
         )
 
-        def _fake_compressor(kv_score, ape, norm_weight, cos_sin_cache,
-                             positions, request_distribution, query_start_loc,
-                             seq_lens, state_input_positions,
-                             state_block_tables, k_input_positions,
-                             k_block_tables, cache, *args, **kwargs):
-            return torch.empty_like(cache)
+        if variant == "indexer":
+
+            def _fake_compressor(hidden_states, wkv_wgate, ape, norm_weight,
+                                 cos_sin_cache, positions, state_block_tables,
+                                 query_start_loc, k_block_tables,
+                                 request_distribution, cache, *args, **kwargs):
+                return torch.empty_like(cache)
+        else:
+
+            def _fake_compressor(hidden_states, wkv_wgate, ape, norm_weight,
+                                 cos_sin_cache, positions, state_block_tables,
+                                 query_start_loc, k_block_tables,
+                                 request_distribution, cache, second_cache,
+                                 *args, **kwargs):
+                return torch.empty_like(cache), torch.empty_like(second_cache)
 
         compressor_jax_op.register_fake(_fake_compressor)
 
         _compressor_op_cache[op_name] = compressor_jax_op
         return compressor_jax_op
 
+    @staticmethod
+    def _as_kernel_cache_view(
+            cache: torch.Tensor | None) -> torch.Tensor | None:
+        """The kernels require uint8; vLLM allocates as `kv_cache_dtype`.
+
+        Every candidate dtype is one byte wide, so `.view` is a lossless
+        bitcast that shares storage -- assigning would convert instead, and
+        the writes would not land in the real cache.
+        """
+        if cache is None or cache.numel() == 0:
+            return None
+        return cache if cache.dtype == torch.uint8 else cache.view(torch.uint8)
+
     def forward(
         self,
-        kv_score: torch.Tensor,
+        hidden_states: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> None:
-        kv_score = kv_score.to(torch.float32)
-
         attn_ctx = get_forward_context().attn_metadata
         if not isinstance(attn_ctx, dict):
             # As in the base class: without per-layer metadata there is
@@ -326,83 +497,85 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
         # Each cache must use its own layer's metadata: they are separate
         # groups with separate block tables, so borrowing another layer's
-        # would scatter state rows into that layer's pages.
-        prefix_key = getattr(getattr(self, "state_cache", None), "prefix",
-                             None)
+        # would scatter rows into that layer's pages.
+        state_prefix = self.state_cache.prefix
         _k_cache_obj = getattr(self, "k_cache", None)
-        k_cache_prefix_key = getattr(
-            _k_cache_obj, "prefix", getattr(_k_cache_obj, "custom_prefix",
-                                            None))
-        for _name, _key in (("state_cache", prefix_key), ("k_cache",
-                                                          k_cache_prefix_key)):
+        k_cache_prefix = getattr(_k_cache_obj, "prefix",
+                                 getattr(_k_cache_obj, "custom_prefix",
+                                         None)) or getattr(
+                                             self, "k_cache_prefix", None)
+        for _name, _key in (("state_cache", state_prefix), ("k_cache",
+                                                            k_cache_prefix)):
             if _key not in attn_ctx:
                 raise KeyError(
                     f"DeepSeek-V4 compressor {_name} prefix {_key!r} has no "
                     "attention metadata; using another layer's would corrupt "
                     f"its pages. Known: {sorted(attn_ctx)}")
-        state_metadata = attn_ctx[prefix_key]
-        k_cache_metadata = attn_ctx[k_cache_prefix_key]
-
-        if state_metadata is not None:
-            state_req_dist = state_metadata.request_distribution
-            state_q_start_loc = state_metadata.query_start_loc
-            state_seq_lens = state_metadata.seq_lens
-            state_block_tables = state_metadata.block_tables
-            if state_block_tables is not None:
-                state_block_tables = state_block_tables.flatten()
-            # Fall back to model-level positions only when this metadata has
-            # none; the two caches can number positions differently.
-            state_input_positions = getattr(state_metadata, "input_positions",
-                                            None)
-            if state_input_positions is None:
-                state_input_positions = positions
-        else:
-            state_req_dist = state_q_start_loc = state_seq_lens = state_block_tables = None
-            state_input_positions = positions
-
-        # `k_block_tables` addresses the shared compressed-KV buffer, so it
-        # must come from k_cache's metadata, not the state cache's.
-        if k_cache_metadata is not None:
-            k_block_tables = k_cache_metadata.block_tables
-            if k_block_tables is not None:
-                k_block_tables = k_block_tables.flatten()
-            k_input_positions = getattr(k_cache_metadata, "input_positions",
-                                        None)
-            if k_input_positions is None:
-                k_input_positions = positions
-        else:
-            k_block_tables = None
-            k_input_positions = positions
-
-        # vLLM binds `.kv_cache` to a numel==0 placeholder until
-        # initialize_kv_cache runs, so test emptiness, not None.
-        _k_cache_tensor = getattr(self.k_cache, "kv_cache", None)
-        if _k_cache_tensor is None or _k_cache_tensor.numel() == 0:
+        state_metadata = attn_ctx[state_prefix]
+        k_cache_metadata = attn_ctx[k_cache_prefix]
+        if state_metadata is None or k_cache_metadata is None:
             return
 
-        # vLLM allocates this as `kv_cache_dtype`, but the kernel writes raw
-        # bytes, and assigning uint8 into an fp8 array converts rather than
-        # bitcasts. `.view()` shares storage, so the writes still land.
-        orig_cache = self.k_cache.kv_cache
-        if orig_cache is not None and orig_cache.dtype != torch.uint8:
-            orig_cache = orig_cache.view(torch.uint8)
+        # For CSA the k_cache layer binds a `(nope, rope)` pair.
+        entry = getattr(self.k_cache, "kv_cache", None)
+        main, rope = entry if isinstance(entry, tuple) else (entry, None)
+        cache = self._as_kernel_cache_view(main)
+        if cache is None:
+            return
 
-        # Writes use the per-cache positions, reads use the model-level
-        # `positions`; the gather misses written rows if the two diverge.
-        updated_cache = self.compressor_op(
-            kv_score,
+        state_block_tables = state_metadata.block_tables
+        k_block_tables = k_cache_metadata.block_tables
+
+        rope_cache = None
+        state_cache = None
+        if self._has_rope_cache:
+            rope_cache = self._as_kernel_cache_view(rope)
+            if rope_cache is None:
+                raise RuntimeError(
+                    f"DeepSeek-V4 CSA compressor {state_prefix!r} has no "
+                    "companion RoPE KV array; the kernel writes the RoPE "
+                    "channels there, and without it they would be dropped. "
+                    "Expected the runner to have bound a (nope, rope) pair "
+                    f"onto layer {k_cache_prefix!r}.")
+        if self._separate_state:
+            state_cache = self._as_kernel_cache_view(
+                getattr(self.state_cache, "kv_cache", None))
+            if state_cache is None:
+                # `cache` is already real by here, so this is not the
+                # profiling pass: skipping the compressor would silently
+                # leave every later token's state unwritten.
+                raise RuntimeError(
+                    f"DeepSeek-V4 HCA compressor {state_prefix!r} has a live "
+                    "compressed-KV array but no state array; the kernel needs "
+                    "a separate buffer for the f32 state, an HCA page being "
+                    "far too small to host it. Expected the runner to have "
+                    "overlaid this state cache onto a CSA NoPE array.")
+
+        assert self._wkv_wgate_transposed, (
+            "fused_wkv_wgate must be transposed at load time; the model's "
+            "load_weights is expected to call transpose_wkv_wgate()")
+        operands = (
+            hidden_states,
+            self.fused_wkv_wgate.weight,
             self.ape.clone(),
             self.norm.weight.clone(),
             rotary_emb.cos_sin_cache,
             positions,
-            state_req_dist,
-            state_q_start_loc,
-            state_seq_lens,
-            state_input_positions,
             state_block_tables,
-            k_input_positions,
+            state_metadata.query_start_loc,
             k_block_tables,
-            orig_cache,
+            state_metadata.request_distribution,
+            cache,
         )
-
-        orig_cache.copy_(updated_cache)
+        if rope_cache is not None:
+            new_cache, new_rope_cache = self.compressor_op(
+                *operands, rope_cache)
+            cache.copy_(new_cache)
+            rope_cache.copy_(new_rope_cache)
+        elif state_cache is not None:
+            new_cache, new_state_cache = self.compressor_op(
+                *operands, state_cache)
+            cache.copy_(new_cache)
+            state_cache.copy_(new_state_cache)
+        else:
+            cache.copy_(self.compressor_op(*operands))

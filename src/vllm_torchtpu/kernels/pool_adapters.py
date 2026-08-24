@@ -471,10 +471,13 @@ def v3_state_source(
 
     assert lanes % d_v == 0, (lanes, d_v)
     ssm_rows = n_v * d_k
-    # The caller sizes the ssm region to exactly the f32 state bytes, so
-    # the kernel's write covers the whole region (no padding rows).
-    assert ssm_ntok * tok_bytes == ssm_rows * d_v * 4, (ssm_ntok, tok_bytes,
+    # The ssm region may extend past the f32 state bytes when the state does
+    # not divide the pool token row; the kernel truncates loads to
+    # rows_used and zero-fills the padding rows on store.
+    assert ssm_ntok * tok_bytes >= ssm_rows * d_v * 4, (ssm_ntok, tok_bytes,
                                                         n_v, d_k, d_v)
+    # Each pool token must hold a whole number of typed f32 rows.
+    assert tok_bytes % (d_v * 4) == 0, (tok_bytes, d_v)
     if ssm_ntok % block_size == 0:
         ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
     else:

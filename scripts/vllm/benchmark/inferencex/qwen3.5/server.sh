@@ -39,9 +39,8 @@ case "$SHARDING" in
     # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
     # New prefills are admitted every this many steps. Larger value trades
-    # TTFT for throughput. 256 was picked for maximizing 8k1k concurrency 256
-    # throughput. May need more tuning to work well across more concurrencies.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-256}"
+    # TTFT for throughput. Default 8 keeps TTFT low.
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-8}"
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
@@ -62,7 +61,9 @@ case "$SHARDING" in
     # Data-parallel attention across all 4 chips with tensor-parallel across 2 cores
     # on the same chip + expert-parallel MoE.
     DP_SIZE=4
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-256}"
+    # New prefills are admitted every this many steps. Larger value trades
+    # TTFT for throughput. Default 8 keeps TTFT low.
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-8}"
     SHARDING_ARGS=(
       --tensor-parallel-size=2
       --data-parallel-size=4
@@ -82,7 +83,7 @@ GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_
 
 MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
 
-MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
+MAX_NUM_SEQS=$((CONC / DP_SIZE))
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
 
 # Increase API-server frontend wait time since cold init may take long.
@@ -91,6 +92,9 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
+
+# Default to v3 which is a bit faster than v2.
+export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
 
 # Add extra padding
 # 4, 8 for low concurrency 4 and 8

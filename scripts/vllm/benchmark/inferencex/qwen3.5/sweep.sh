@@ -23,25 +23,18 @@ READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers a cold compile)
 
 # "ISL:OSL" pairs to sweep, and the concurrencies to run for each.
 # Both are overridable via env so per-point jobs can each own a slice.
-read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024 1024:1024}"
+read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024}"
 read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256}"
 # Sharding per swept point, keyed by "ISL,OSL,CONC" (every point listed).
-# Low concurrency runs TP8_EP, higher concurrency runs DP8_EP.
+# Low concurrency runs TP8_EP, higher concurrency runs DP4TP2_EP.
 declare -A SHARDING_TABLE=(
   [8192,1024,4]=TP8_EP
   [8192,1024,8]=TP8_EP
   [8192,1024,16]=TP8_EP
   [8192,1024,32]=DP4TP2_EP
   [8192,1024,64]=DP4TP2_EP
-  [8192,1024,128]=DP8_EP
-  [8192,1024,256]=DP8_EP
-  [1024,1024,4]=TP8_EP
-  [1024,1024,8]=TP8_EP
-  [1024,1024,16]=TP8_EP
-  [1024,1024,32]=TP8_EP
-  [1024,1024,64]=TP8_EP
-  [1024,1024,128]=TP8_EP
-  [1024,1024,256]=TP8_EP
+  [8192,1024,128]=DP4TP2_EP
+  [8192,1024,256]=DP4TP2_EP
 )
 
 VLLM_PROCS='vllm serve|VLLM::'

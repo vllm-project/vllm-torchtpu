@@ -2,7 +2,7 @@
 """Raiden pool-manifest builder for the Qwen3.5 hybrid KV cache.
 
 Raiden's admission surface is model-agnostic (storages / pools / regions, see
-``tpu_raiden.api.torch.pool_layout``). Everything model- and kernel-specific
+``tpu_sync.api.torch.pool_layout``). Everything model- and kernel-specific
 about the Qwen3.5 hybrid layout is derived HERE, on the vLLM side, from the
 **live materialization** (the typed KV cache tensors bound into the forward
 context plus their kv-cache-group specs) — never from pinned constants.
@@ -285,6 +285,8 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
     # it away rather than duplicating the derivation below.
     if len(conv_shape) == 4 and conv_shape[2] == 1:
         conv_shape = (conv_shape[0], conv_shape[1], conv_shape[3])
+    elif len(conv_shape) == 4 and conv_shape[1] == 1:
+        conv_shape = (conv_shape[0], conv_shape[2], conv_shape[3])
     if len(conv_shape) != 3:
         raise ManifestError("GDN conv state must be (blocks, taps, dim) or "
                             f"(blocks, taps, 1, dim): got {conv_shape}")

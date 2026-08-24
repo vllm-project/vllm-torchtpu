@@ -6,9 +6,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_ARCHITECTURES,
-                                           PooledGDNStateLayout,
-                                           derive_pooled_gdn_state_layout)
+from vllm_torchtpu.gdn_pool_layout import (
+    POOLED_GDN_CONV_STATE_ITEMSIZE, POOLED_GDN_SSM_STATE_ITEMSIZE,
+    PooledGDNStateLayout, derive_pooled_gdn_state_layout,
+    unified_kv_layout_enabled_for_architecture)
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -28,11 +29,8 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     caches, which is the only layout an attention-only model has and the only
     one the other hybrid families implement.
     """
-    from vllm_torchtpu import envs as tpu_envs
-    override = tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-    if override is not None:
-        return override
-    return vllm_config.model_config.architecture in POOLED_GDN_ARCHITECTURES
+    return unified_kv_layout_enabled_for_architecture(
+        vllm_config.model_config.architecture)
 
 
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
@@ -118,19 +116,64 @@ def _hybrid_mamba_state_layout(
         model_config.architecture,
         model_config=model_config,
     )
-    # The pooled GDN op reads and writes the full TP-local state from one
-    # attention-shaped page, even when attention prefill is context-parallel.
-    shapes = tuple(model_cls.get_mamba_state_shape_from_config(vllm_config))
-    dtypes = tuple(model_cls.get_mamba_state_dtype_from_config(vllm_config))
-    if len(shapes) != 2 or len(dtypes) != 2:
+    full_shapes = tuple(
+        model_cls.get_mamba_state_shape_from_config(vllm_config))
+    parallel_config = vllm_config.parallel_config
+    pcp_size = parallel_config.prefill_context_parallel_size
+    if pcp_size > 1:
+        # PCP-local GDN state is equivalent to adding PCP to the model's
+        # head-sharding factor. Shape calculators used here must therefore
+        # derive their sharded state dimensions from tensor_parallel_size.
+        orig_tp = parallel_config.tensor_parallel_size
+        try:
+            parallel_config.tensor_parallel_size = orig_tp * pcp_size
+            shapes = tuple(
+                model_cls.get_mamba_state_shape_from_config(vllm_config))
+        finally:
+            parallel_config.tensor_parallel_size = orig_tp
+    else:
+        shapes = full_shapes
+
+    if len(shapes) != 2:
         raise ValueError(
             "TPU unified hybrid KV pool requires two GDN state regions "
-            f"(conv, SSM), got shapes={shapes}, dtypes={dtypes}")
+            f"(conv, SSM), got shapes={shapes}")
 
-    conv_bytes = math.prod(shapes[0]) * torch.empty(
-        (), dtype=dtypes[0]).element_size()
-    ssm_bytes = math.prod(shapes[1]) * torch.empty(
-        (), dtype=dtypes[1]).element_size()
+    # Byte widths come from the pool's own constants, never from the model
+    # class's declared dtypes. The pool stores conv rows and the SSM region at
+    # fixed widths whatever --mamba-cache-dtype says, and every other reader of
+    # pool bytes (the kernel state plan, the Raiden manifest) is already
+    # sourced from there. Sizing the slot from the class view is exactly what
+    # let this slot be budgeted for bf16 while the layer declared fp32.
+    #
+    # Shapes still come from the model class, which is a different kind of
+    # fact: kernel taps and head counts are architecture, not layout. They do
+    # carry the spec-decode conv widening, so under spec decode this is wider
+    # than `pooled_gdn_conv_state_bytes()`, which drops that widening on
+    # purpose (the pool rolls back via per-slot checkpoints instead). Keep it:
+    # `VllmGatedDeltaNetAttention.get_state_shape()` still declares the widened
+    # conv to vLLM, and the padded page has to cover what vLLM accounts for.
+    # Narrowing here means narrowing there in the same change.
+    conv_bytes = math.prod(shapes[0]) * POOLED_GDN_CONV_STATE_ITEMSIZE
+    ssm_bytes = math.prod(shapes[1]) * POOLED_GDN_SSM_STATE_ITEMSIZE
+
+    if pcp_size > 1:
+        # Same constants on both sides of the ratio, so the check compares
+        # sharding rather than dtype bookkeeping.
+        full_conv_bytes = (math.prod(full_shapes[0]) *
+                           POOLED_GDN_CONV_STATE_ITEMSIZE)
+        full_ssm_bytes = (math.prod(full_shapes[1]) *
+                          POOLED_GDN_SSM_STATE_ITEMSIZE)
+        if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes +
+                                                   full_ssm_bytes):
+            raise ValueError(
+                "PCP-local Mamba state size must be exactly 1/pcp_size of "
+                "the TP-local state: "
+                f"architecture={model_config.architecture!r}, "
+                f"pcp_size={pcp_size}, full_page_size_bytes="
+                f"{full_conv_bytes + full_ssm_bytes}, local_page_size_bytes="
+                f"{conv_bytes + ssm_bytes}")
+
     return derive_pooled_gdn_state_layout(
         ssm_bytes=ssm_bytes,
         conv_bytes=conv_bytes,

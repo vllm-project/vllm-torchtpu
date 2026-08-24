@@ -36,7 +36,13 @@ When checking in a new feature, we expect that you add relevant unit tests as we
 
 ## Setting up linting, formatting, and static type checking
 
-```
+Make sure to activate the virtual environment created during [installation](README.md#2-install-vllm-torchtpu-and-dependencies) before installing and running `pre-commit`. Running `pre-commit` from a global installation or outside the virtual environment can cause hook version mismatches and missing dependency errors.
+
+```bash
+# Activate your virtual environment
+source ~/uv_venv/bin/activate  # Or `source ~/pip_venv/bin/activate` / `source .venv/bin/activate`
+
+# Install pre-commit in the active virtual environment
 pip install pre-commit
 
 # Linting, formatting and static type checking

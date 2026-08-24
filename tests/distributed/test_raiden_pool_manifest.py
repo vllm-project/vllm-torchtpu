@@ -645,7 +645,7 @@ def test_pool_dicts_round_trip():
 
 
 def test_pool_dicts_coerce_into_raiden_pool_specs():
-    pool_layout = pytest.importorskip("tpu_raiden.api.torch.pool_layout")
+    pool_layout = pytest.importorskip("tpu_sync.api.torch.pool_layout")
 
     _, manifest = _build_tp2dp4()
     for pool_dict, entry in zip(manifest.pool_dicts(), manifest.pools):

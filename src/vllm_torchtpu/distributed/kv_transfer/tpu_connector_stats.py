@@ -23,6 +23,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics, KVConnectorStats, PromMetric, PromMetricT)
 from vllm.v1.metrics.utils import create_metric_per_engine
 
+import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 @dataclass
 class TpuKVConnectorStats(KVConnectorStats):
@@ -139,13 +144,9 @@ class TpuKVConnectorStats(KVConnectorStats):
         }
 
     def is_empty(self) -> bool:
-        return (len(self.data["d2h_transfer_time"]) == 0
-                and len(self.data["h2d_transfer_time"]) == 0
-                and len(self.data["kv_pull_time"]) == 0
-                and len(self.data["mb_transferred"]) == 0
-                and len(self.data["num_failed_transfers"]) == 0
-                and len(self.data["prefill_queue_length"]) == 0
-                and len(self.data["decode_queue_length"]) == 0)
+        if not self.data:
+            return True
+        return not any(self.data.values())
 
     @property
     def num_successful_transfers(self) -> int:
@@ -253,6 +254,65 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.gauge_tpu_decode_queue_length = create_metric_per_engine(
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues)
 
+        self.dynamic_metrics: dict[str, tuple[
+            str, Any]] = self._get_raiden_metric_definitions(labelnames)
+
+    def _get_raiden_metric_definitions(self,
+                                       labelnames: list[str] | None = None):
+        if labelnames is None:
+            labelnames = self._labelnames
+        # Dynamically load TPU Raiden C++ metric schema descriptors
+        metric_defs = {}
+        try:
+            # Without this call, get_metric_metadata won't return the correct metrics definitions
+            dist_utils.configure_raiden_telemetry()
+            telemetry = dist_utils.get_raiden_telemetry_module()
+            descriptors = []
+            if telemetry is not None:
+                if hasattr(telemetry, "get_metric_metadata"):
+                    descriptors = telemetry.get_metric_metadata()
+        except Exception as e:
+            logger.warning(
+                "Failed to load TPU Raiden telemetry descriptors: %s", e)
+
+        for desc in descriptors:
+            # Construct prometheus metric objects based on the definition.
+            name = f"tpu_raiden_{desc.name}"
+            help_str = getattr(desc, "description", getattr(desc, "help", ""))
+            mtype = desc.type
+            mtype_str = getattr(mtype, "name",
+                                str(mtype)).split(".")[-1].lower()
+
+            if mtype_str == "histogram":
+                buckets_val = desc.buckets if desc.buckets else [
+                    1.0, 10.0, 100.0
+                ]
+                metric_obj = self._histogram_cls(
+                    name=name,
+                    documentation=help_str,
+                    buckets=buckets_val,
+                    labelnames=labelnames,
+                )
+            elif mtype_str == "counter":
+                metric_obj = self._counter_cls(
+                    name=name,
+                    documentation=help_str,
+                    labelnames=labelnames,
+                )
+            elif mtype_str == "gauge":
+                metric_obj = self._gauge_cls(
+                    name=name,
+                    documentation=help_str,
+                    labelnames=labelnames,
+                )
+            else:
+                continue
+
+            metric_defs[name] = (mtype_str,
+                                 create_metric_per_engine(
+                                     metric_obj, self.per_engine_labelvalues))
+        return metric_defs
+
     def observe(self,
                 transfer_stats_data: dict[str, Any],
                 engine_idx: int = 0):
@@ -296,3 +356,15 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                     gauge_item_key]:
                 for list_item in transfer_stats_data[gauge_item_key]:
                     gauge_obj[engine_idx].set(list_item)
+
+        # Dynamic metric observations
+        for name, (mtype, per_engine_obj) in self.dynamic_metrics.items():
+            values = transfer_stats_data.get(name)
+            if values:
+                for val in values:
+                    if mtype == "histogram":
+                        per_engine_obj[engine_idx].observe(val)
+                    elif mtype == "counter":
+                        per_engine_obj[engine_idx].inc(val)
+                    elif mtype == "gauge":
+                        per_engine_obj[engine_idx].set(val)
