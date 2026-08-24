@@ -552,6 +552,60 @@ class TestOnlineFp8Quantization:
 
         mock_routing.assert_called_once()
 
+    def test_fused_ep_step_threshold_selects_static_token_shape(
+            self, monkeypatch):
+        """Large buckets use fused EP while small buckets use GMM dispatch."""
+        from unittest.mock import MagicMock, patch
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import \
+            VllmFp8MoEMethodTPU
+
+        monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+        monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 256)
+        layer = MagicMock()
+        layer._tpu_activation_str = "silu"
+        method = object.__new__(VllmFp8MoEMethodTPU)
+
+        small_x = torch.randn(16, 64, dtype=torch.bfloat16)
+        small_logits = torch.randn(16, 8, dtype=torch.bfloat16)
+        large_x = torch.randn(256, 64, dtype=torch.bfloat16)
+        large_logits = torch.randn(256, 8, dtype=torch.bfloat16)
+
+        with patch.object(
+                method,
+                "_apply_owning_dispatch",
+                side_effect=(small_x, large_x),
+        ) as mock_dispatch:
+            small_actual = method.apply_monolithic(
+                layer, small_x, small_logits)
+            large_actual = method.apply_monolithic(
+                layer, large_x, large_logits)
+
+        torch.testing.assert_close(small_actual, small_x)
+        torch.testing.assert_close(large_actual, large_x)
+        assert [call.kwargs["use_fused_kernel"]
+                for call in mock_dispatch.call_args_list] == [False, True]
+
+    def test_fused_ep_step_threshold_rejects_negative_value(
+            self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import \
+            VllmFp8MoEMethodTPU
+
+        monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", -1)
+        layer = MagicMock()
+        layer._tpu_activation_str = "silu"
+        method = object.__new__(VllmFp8MoEMethodTPU)
+
+        with pytest.raises(
+                ValueError,
+                match="TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0"):
+            method.apply_monolithic(
+                layer, torch.randn(16, 64), torch.randn(16, 8))
+
 
 class FakeInt8MoEConfig:
     """The `moe_config` attributes `_process_fp8_moe_weights` actually reads."""

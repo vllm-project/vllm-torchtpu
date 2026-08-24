@@ -48,6 +48,14 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
+def retain_padding_graph_input(output: torch.Tensor) -> torch.Tensor:
+    """Keep the padding-state buffer in every shape-specialized MoE graph."""
+    if _padding_state is None:
+        return output
+    value = _padding_state.local_padding_mask.reshape(-1)[0].to(output.dtype)
+    return output + (value - value)
+
+
 def zero_routing_weights_for_padding(
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
