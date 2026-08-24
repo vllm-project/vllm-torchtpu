@@ -56,6 +56,15 @@ steps:
             LOG_DIR=/perf_eval_results/disagg_single_host
             bash ./examples/disagg/run_disagg_single_host.sh
 
+      - label: "Integration: qwen35-gpc-correctness"
+        key: "integration_qwen35_gpc_correctness"
+        agents:
+          queue: "tpu_v7x_16_queue"
+        commands:
+          - "bash .buildkite/scripts/run_gpc_multihost.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: qwen35-apc-correctness"
         key: "integration_qwen35_apc_correctness"
         agents:
