@@ -71,13 +71,17 @@ _GDN_PCP_DESCRIPTOR_CASES = (
 )
 
 _GDN_PCP_FUSED_PROJECTION_CASES = (
-    pytest.param((64, 64), (0, 64), None, id="batch-flat-fresh"),
+    pytest.param((64, 64), (0, 64), None, jnp.float32, id="batch-flat-fresh"),
     pytest.param(
         (17, 15, 32),
         (0, 17, 32),
         (5, 41, 9),
+        jnp.float32,
         id="batch-flat-owner-with-history",
     ),
+    pytest.param((17, 15, 32), (0, 17, 32), (5, 41, 9),
+                 jnp.bfloat16,
+                 id="batch-flat-owner-with-history-bf16-ssm-cache"),
 )
 
 
@@ -593,11 +597,13 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
 
 
 @pytest.mark.parametrize(
-    ("lengths", "token_owner_starts", "request_absolute_starts"),
+    ("lengths", "token_owner_starts", "request_absolute_starts",
+     "recurrent_state_dtype"),
     _GDN_PCP_FUSED_PROJECTION_CASES,
 )
 def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
-        lengths, token_owner_starts, request_absolute_starts):
+        lengths, token_owner_starts, request_absolute_starts,
+        recurrent_state_dtype):
     """Cover PCP stage metadata, FP8 projection, and pooled GDN."""
     pcp_size = 2
     lengths = np.asarray(lengths, dtype=np.int32)
@@ -773,6 +779,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             mesh=mesh,
+            recurrent_state_dtype=recurrent_state_dtype,
         ))
 
     def restore_request_order(tensor):

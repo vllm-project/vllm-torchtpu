@@ -65,6 +65,12 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
     attn.conv_kernel_size = 4
     attn.num_spec = 0
     attn.conv1d = SimpleNamespace(bias=torch.randn(64) if bias else None, )
+    attn.model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        architecture="Qwen3_5MoeForConditionalGeneration",
+    )
+    attn.cache_config = SimpleNamespace(mamba_cache_dtype="bfloat16",
+                                        mamba_ssm_cache_dtype="float32")
     return attn
 
 
@@ -110,6 +116,13 @@ class TestVllmGatedDeltaNetAttention:
         np.testing.assert_array_equal(np.asarray(returned_output),
                                       np.asarray(output))
 
+    @pytest.mark.parametrize(
+        ("ssm_cache_dtype", "expected_dtype"),
+        [
+            ("float32", jnp.float32),
+            ("bfloat16", jnp.bfloat16),
+        ],
+    )
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
         return_value=8)
@@ -117,8 +130,10 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
+            expected_dtype):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
+        attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
         pool = torch.zeros((4, 8), dtype=torch.float32)
         pool_alias = pool.view_as(pool)
@@ -135,8 +150,13 @@ class TestVllmGatedDeltaNetAttention:
                  "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
                  "pcp_streaming_jax_op",
                  return_value=fake_jax_op,
-             ) as mock_pcp_jax_op:
+             ) as mock_pcp_jax_op, \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+             ) as mock_run:
             pooled_pcp_impl = attn._build_pooled_pcp_gdn_op()
+            mock_pcp_jax_op.call_args.args[1](*([MagicMock()] * 14))
 
         output, z = pooled_pcp_impl(
             torch.zeros((2, 64)),
@@ -156,6 +176,8 @@ class TestVllmGatedDeltaNetAttention:
         )
 
         assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (5, )
+        assert mock_run.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
+            expected_dtype)
         assert pool.untyped_storage().data_ptr() == original_storage
         assert torch.all(pool_alias == 7)
         assert torch.all(output == 1)
@@ -268,7 +290,15 @@ class TestVllmGatedDeltaNetAttention:
         assert attn.gdn_pcp_op is pcp_op
         assert attn.gdn_pooled_pcp_op is pooled_pcp_op
 
-    def test_pooled_op_reads_block_size_at_call_time(self):
+    @pytest.mark.parametrize(
+        ("ssm_cache_dtype", "expected_dtype"),
+        [
+            ("float32", jnp.float32),
+            ("bfloat16", jnp.bfloat16),
+        ],
+    )
+    def test_pooled_op_reads_block_size_at_call_time(self, ssm_cache_dtype,
+                                                     expected_dtype):
         """The pooled op must not freeze cache_config.block_size at build.
 
         Hybrid models construct GDN layers during load_model(), but the
@@ -282,6 +312,7 @@ class TestVllmGatedDeltaNetAttention:
         """
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
+        attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         # Pre-adjustment value, i.e. what a GDN layer sees during load.
         vllm_config = _vllm_config(block_size=16)
         captured = {}
@@ -309,6 +340,8 @@ class TestVllmGatedDeltaNetAttention:
             captured["wrapped_fn"](*([MagicMock()] * 12))
 
         assert mock_core.call_args.kwargs["pool_block_tokens"] == 256
+        assert mock_core.call_args.kwargs[
+            "recurrent_state_dtype"] == jnp.dtype(expected_dtype)
 
     def test_pooled_impl_forwards_every_operand_the_forward_passes(self):
         """`gdn_impl` must accept exactly what `forward` calls it with.

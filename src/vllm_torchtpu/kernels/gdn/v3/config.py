@@ -47,9 +47,9 @@ class StateRegion:
     A slot's region spans ``nblocks`` consecutive source blocks starting
     ``kb0`` blocks into the slot's window, rows ``[row0, row0 + nrows)``
     of each — one contiguous DMA per slot. The raw bytes are accessed
-    through a typed view (``view_dtype`` elements, ``lane_split``-way
-    128-lane split); the leading ``rows_used`` typed rows carry the
-    state, the rest is zero padding.
+    through a typed view (``view_dtype`` elements, with the source's
+    minormost dimension divided by ``lane_split``); the leading
+    ``rows_used`` typed rows carry the state, the rest is zero padding.
     """
     kb0: int
     nblocks: int

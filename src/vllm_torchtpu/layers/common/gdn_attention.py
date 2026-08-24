@@ -725,6 +725,7 @@ def _build_v3_pool_state_plan(
     kernel_size: int,
     pool_block_tokens: int,
     qk_pair_layout: bool,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
 ):
     """Describe this rank's GDN state regions in the unified pool."""
     if pool_block_tokens % pool.shape[1] != 0:
@@ -735,9 +736,12 @@ def _build_v3_pool_state_plan(
     per_tok_elems = math.prod(pool.shape[2:])
     tok_bytes = per_tok_elems * jnp.dtype(pool.dtype).itemsize
     state_layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=pooled_gdn_ssm_state_bytes(num_v_heads=n_v,
-                                             head_k_dim=d_k,
-                                             head_v_dim=d_v),
+        ssm_bytes=pooled_gdn_ssm_state_bytes(
+            num_v_heads=n_v,
+            head_k_dim=d_k,
+            head_v_dim=d_v,
+            dtype=jnp.dtype(recurrent_state_dtype),
+        ),
         conv_bytes=pooled_gdn_conv_state_bytes(kernel_size=kernel_size,
                                                conv_dim=conv_dim),
         token_bytes=tok_bytes,
@@ -758,6 +762,7 @@ def _build_v3_pool_state_plan(
         d_v=d_v,
         kernel_size=kernel_size,
         qk_pair_layout=qk_pair_layout,
+        recurrent_state_dtype=recurrent_state_dtype,
     )
 
 
@@ -783,15 +788,17 @@ def run_jax_gdn_attention_pooled_local(
     d_v: int,
     kernel_size: int,
     pool_block_tokens: int,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
-    ``recurrent_state`` is the attention-shaped pool holding the f32 ssm
-    region at token offset 0 and the conv region in the tokens right after
-    it. All pool knowledge lives here: for the chunked impls, conv state
-    is gathered/scattered through `pool_adapters` around the stock conv
-    kernel and the ssm region is threaded into the stock delta-rule via
+    ``recurrent_state`` is the attention-shaped pool holding the SSM region
+    in ``recurrent_state_dtype`` at token offset 0 and the fixed-BF16 Conv
+    region in the following tokens. All pool knowledge lives here: for the
+    chunked impls, conv state is gathered/scattered through `pool_adapters`
+    around the stock conv kernel, and the SSM region is threaded into the
+    stock delta-rule via
     pluggable `StateOps`; the fused V3 kernel instead streams both regions
     in place through a `v3_state_source` copy-plan — the model kernels'
     math is unmodified either way.
@@ -813,6 +820,7 @@ def run_jax_gdn_attention_pooled_local(
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
         qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
+        recurrent_state_dtype=recurrent_state_dtype,
     )
     recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
@@ -865,6 +873,7 @@ def run_jax_gdn_attention_pooled(
     kernel_size: int,
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
@@ -875,9 +884,9 @@ def run_jax_gdn_attention_pooled(
         j_a: Input tensor of shape `(num_tokens, n_v)`.
         recurrent_state: The attention-shaped pool
           `(num_blocks, block_size, num_kv_heads * 2, head_size)` in the KV
-          dtype, carrying the f32 ssm region and the bf16 conv slot as
-          token-ranges of each state block. Block 0 is the null block, only
-          used for padded / invalid tokens.
+          dtype, carrying the SSM region in ``recurrent_state_dtype`` and the
+          fixed-BF16 Conv region as token-ranges of each state block. Block 0
+          is the null block, only used for padded / invalid tokens.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,
           kernel_size)`.
         j_conv_bias: Optional convolutional bias tensor of shape `(dim,)`.
@@ -947,6 +956,7 @@ def run_jax_gdn_attention_pooled(
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
+        recurrent_state_dtype=recurrent_state_dtype,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
@@ -1015,6 +1025,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
     pcp_axis = "pcp"
@@ -1141,6 +1152,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             kernel_size=kernel_size,
             pool_block_tokens=pool_block_tokens,
             qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
+            recurrent_state_dtype=recurrent_state_dtype,
         )
 
         return gdn_v3_pcp_wrapper.fused_qkvz_projection_pcp_gdn(
