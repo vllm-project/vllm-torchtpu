@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_RPA_FOLD_KV_HEAD_DIM: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS: int = 0
     USE_MOE_FUSED_EP_KERNEL: bool = False
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER: bool = False
@@ -316,6 +317,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Enable native hierarchical all-reduce above this token count.
+    "TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS":
+    lambda: int(os.getenv("TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS", "0")),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

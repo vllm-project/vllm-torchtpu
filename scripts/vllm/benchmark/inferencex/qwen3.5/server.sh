@@ -52,6 +52,10 @@ case "$SHARDING" in
       --enable-expert-parallel
     )
     export USE_MOE_FUSED_EP_KERNEL=0
+    export TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS="${TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS:-1024}"
+    case "$TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS" in
+      ''|*[!0-9]*) echo "ERROR: invalid hierarchical all-reduce threshold" >&2; exit 1 ;;
+    esac
     ;;
   *) echo "ERROR: unknown SHARDING=$SHARDING" >&2; exit 1 ;;
 esac
@@ -77,6 +81,12 @@ export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-2048}"
 
 DEFAULT_LIBTPU_INIT_ARGS=" --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false"
+
+# Use hierarchical all-reduce for large TP activations.
+if [ "$SHARDING" = "TP8_EP" ] && [ "$TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS" -gt 0 ]; then
+  TP_HIERARCHICAL_AR_MIN_BYTES=$((TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS * 4096 * 2))
+  DEFAULT_LIBTPU_INIT_ARGS+=" --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=$TP_HIERARCHICAL_AR_MIN_BYTES"
+fi
 
 # Allow the fused row gather to overlap routing.
 if [ "${TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER:-0}" = "1" ]; then
