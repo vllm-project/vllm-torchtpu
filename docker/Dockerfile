@@ -70,17 +70,23 @@ ENV VLLM_TARGET_DEVICE="empty"
 
 # Variant 3: Developer Image (Dev Variant with test/benchmark tools)
 # This variant contains all source code and is intended for active development.
-# It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
+
+# Pre-install test and benchmarking dependencies before copying full source tree
+# so that changes to folders like src/ or tests/ do not invalidate the
+# dependency installation layer cache.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
+      -r pyproject.toml \
+      --extra test \
+      --extra benchmarking
+
 COPY . .
 # Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
-# also applies to any other scm-versioned package built in this step. With a
-# cold uv cache, resolving ".[...]" rebuilds metadata for the vllm git
-# dependency, which then gets stamped 0.0.0 and reinstalled over the correctly
-# versioned wheel from the base stage.
+# also applies to any other scm-versioned package built in this step.
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
-    uv pip install --system -e ".[test,benchmarking]"
+    uv pip install --system --no-deps -e .
 
 # Install vLLM from source if requested.
 # If VLLM_SOURCE is provided, we build it in editable mode.
