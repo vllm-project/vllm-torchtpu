@@ -13,6 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Values: sharding, max sequences, global max tokens, prefill interval.
+server_config_for() {
+  case "$1,$2,$3" in
+    8192,1024,4) printf "%s" "TP8_EP 4 16384 1" ;;
+    8192,1024,8) printf "%s" "TP8_EP 8 16384 1" ;;
+    8192,1024,16) printf "%s" "TP8_EP 16 16384 1" ;;
+    8192,1024,32) printf "%s" "TP8_EP 32 16384 1" ;;
+    8192,1024,64) printf "%s" "TP8_EP 64 16384 1" ;;
+    8192,1024,128) printf "%s" "DP8_EP 16 2048 1" ;;
+    8192,1024,256) printf "%s" "DP8_EP 32 2560 2" ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "${1:-}" = "--point-config" ]; then
+  server_config_for "$2" "$3" "$4"
+  exit
+fi
+
 # Sweep 8k1k points and reuse servers with identical configurations.
 # Usage: bash sweep.sh
 set -uo pipefail
@@ -21,14 +40,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-8000}"
 READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers a cold compile)
 
-# "ISL:OSL" pairs to sweep, and the concurrencies to run for each.
-# Both are overridable via env so per-point jobs can each own a slice.
+# Select workloads and concurrencies.
 read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024}"
 read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256}"
-# Share sharding decisions with server.sh.
-# shellcheck source=./sharding_table.sh
-source "${SCRIPT_DIR}/sharding_table.sh"
-
 VLLM_PROCS='vllm serve|VLLM::'
 
 stop_server() {
@@ -57,34 +71,24 @@ stop_server() {
 # Build the environment used to resolve and start a point.
 build_server_env() {
   local sharding="$1"
-  local max_batched_tokens="$2"
-  local max_seqs="$3"
+  local max_seqs="$2"
+  local global_max_tokens="$3"
   local prefill_interval="$4"
-  local fused_ep="$5"
-  SERVER_ENV=(SHARDING="$sharding" CONC="$CONC")
-  [ -n "$max_batched_tokens" ] && SERVER_ENV+=(MAX_NUM_BATCHED_TOKENS="$max_batched_tokens")
-  [ -n "$max_seqs" ] && SERVER_ENV+=(MAX_NUM_SEQS="$max_seqs")
-  [ -n "$prefill_interval" ] && SERVER_ENV+=(PREFILL_SCHEDULE_INTERVAL="$prefill_interval")
-  [ -n "$fused_ep" ] && SERVER_ENV+=(USE_MOE_FUSED_EP_KERNEL="$fused_ep")
-  return 0
-}
-
-# Resolve a point configuration without starting the server.
-server_config() {
-  build_server_env "$@"
-  env "${SERVER_ENV[@]}" PRINT_CONFIG=1 bash "${SCRIPT_DIR}/server.sh"
+  SERVER_ENV=(
+    SHARDING="$sharding"
+    CONC="$CONC"
+    MAX_NUM_SEQS="$max_seqs"
+    GLOBAL_MAX_NUM_BATCHED_TOKENS="$global_max_tokens"
+    PREFILL_SCHEDULE_INTERVAL="$prefill_interval"
+  )
 }
 
 start_server() {
   local sharding="$1"
-  local max_batched_tokens="$2"
-  local max_seqs="$3"
-  local prefill_interval="$4"
-  local fused_ep="$5"
   build_server_env "$@"
 
   SERVER_LOG="/tmp/qwen3.5_sweep_server_isl${ISL}_osl${OSL}_${sharding}_conc${CONC}_$(date +%m%d-%H%M%S)_$$.log"
-  echo "--- starting server SHARDING=$sharding ISL=$ISL OSL=$OSL CONC=$CONC MAX_NUM_BATCHED_TOKENS=${max_batched_tokens:-default} MAX_NUM_SEQS=${max_seqs:-default} PREFILL_SCHEDULE_INTERVAL=${prefill_interval:-default} USE_MOE_FUSED_EP_KERNEL=${fused_ep:-default} (log: $SERVER_LOG) ---"
+  echo "--- starting server SHARDING=$sharding ISL=$ISL OSL=$OSL CONC=$CONC (log: $SERVER_LOG) ---"
   env "${SERVER_ENV[@]}" bash "${SCRIPT_DIR}/server.sh" > >(tee "$SERVER_LOG") 2>&1 &
   SERVER_PID=$!
   local waited=0
@@ -107,44 +111,25 @@ for wl in "${WORKLOADS[@]}"; do
     if [ -n "${SHARDING_OVERRIDE:-}" ]; then
       # Restart each point when using an explicit sharding override.
       sharding="$SHARDING_OVERRIDE"
-      max_batched_tokens=""
       max_seqs=""
+      global_max_tokens=""
       prefill_interval=""
-      fused_ep=""
       server_key="override:$sharding:$point"
     else
-      sharding="${SHARDING_TABLE[$point]:-}"
-      case "$sharding" in
-        TP8_EP)
-          dp_size=1
-          fused_ep=0
-          ;;
-        DP8_EP)
-          dp_size=8
-          fused_ep=1
-          ;;
-        DP4TP2_EP)
-          dp_size=4
-          fused_ep=0
-          ;;
-        *) echo "ERROR: cannot derive DP_SIZE for SHARDING='$sharding'" >&2; exit 1 ;;
-      esac
-      max_batched_tokens=""
-      max_seqs=""
-      prefill_interval=""
-      # Reuse only servers with the same resolved configuration.
-      config="$(server_config "$sharding" "$max_batched_tokens" "$max_seqs" "$prefill_interval" "$fused_ep")" || {
-        echo "ERROR: server.sh could not resolve a config for $point" >&2
+      if ! point_config="$(server_config_for "$ISL" "$OSL" "$CONC")"; then
+        echo "ERROR: no server config for $point" >&2
         exit 1
-      }
-      server_key="$ISL:$OSL:$config"
+      fi
+      read -r sharding max_seqs global_max_tokens prefill_interval <<<"$point_config"
+      # Reuse only identical point configurations.
+      server_key="$ISL:$OSL:$point_config"
     fi
-    [ -n "$sharding" ] || { echo "ERROR: no sharding in SHARDING_TABLE for ISL=$ISL OSL=$OSL CONC=$CONC" >&2; exit 1; }
+    [ -n "$sharding" ] || { echo "ERROR: no sharding for ISL=$ISL OSL=$OSL CONC=$CONC" >&2; exit 1; }
     if [ "$server_key" != "$current_server_key" ]; then
       stop_server
       started=0
       for attempt in 1 2; do
-        if start_server "$sharding" "$max_batched_tokens" "$max_seqs" "$prefill_interval" "$fused_ep"; then
+        if start_server "$sharding" "$max_seqs" "$global_max_tokens" "$prefill_interval"; then
           started=1
           break
         fi
