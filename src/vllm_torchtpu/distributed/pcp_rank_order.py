@@ -77,14 +77,6 @@ def resolve_pcp_topology_order(
     if pcp_size <= 1:
         return None
 
-    # Not applicable: the P/D reshard planner and the Raiden work-unit names
-    # both recompute a rank from pcp_rank rather than being told it, so they
-    # would mis-address against any layout but the arithmetic one.
-    if getattr(vllm_config, "kv_transfer_config", None) is not None:
-        logger.info("Topology aware mesh not applied. Topology aware mesh is "
-                    "currently not supported for disaggregated hosts.")
-        return None
-
     # Not applicable: a ring crossing hosts needs multi-slice ordering over
     # DCN, not the single-slice mesh this asks for. PcpStaticSupportValidator
     # already rejects PCP with TPU_MULTIHOST_BACKEND, so only nnodes is

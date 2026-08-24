@@ -42,13 +42,6 @@ def test_no_order_when_pcp_is_disabled():
     assert order_mod.resolve_pcp_topology_order(_config(pcp=1)) is None
 
 
-def test_no_order_when_a_kv_transfer_config_is_present():
-    """P/D recomputes prefill ranks from pcp_rank arithmetic."""
-    config = _config(kv_transfer_config=SimpleNamespace())
-
-    assert order_mod.resolve_pcp_topology_order(config) is None
-
-
 def test_no_order_when_multiple_nodes():
     """A ring crossing hosts needs multi-slice ordering over DCN."""
     assert order_mod.resolve_pcp_topology_order(_config(nnodes=2)) is None
