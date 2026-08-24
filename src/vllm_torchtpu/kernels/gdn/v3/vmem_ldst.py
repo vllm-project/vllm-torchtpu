@@ -23,99 +23,58 @@ from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
-def load_as_qkv_large(
-        qkv_vmem_ref: jax.Ref,
-        cfgs: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Split qkv and transpose by performing 1 load per chunk for large layout.
+def load_strided_heads(vmem_ref: jax.Ref,
+                       num_heads: int,
+                       head_dim: int,
+                       lane_offset: int = 0) -> jax.Array:
+    """Use strided LDST to split heads along the last dim and transpose.
 
     Args:
-        qkv_vmem_ref: qkv reference in VMEM containing concatenated values of q, k,
-            and v of shape [seq_tile_size, chunk_size, 1, num_kq_heads * kq_head_dim *
-            2 + num_v_heads * v_head_dim].
-        cfgs: GDN configuration object.
+        vmem_ref: One slot's VMEM reference of shape [chunk_size, 1, cols].
+        num_heads: Number of heads to split out.
+        head_dim: Width of one head, in elements.
+        lane_offset: Lane the first head starts at, for a region that is part
+            of a larger tensor (k and v within the fused qkv).
 
     Returns:
-        q, k: [seq_tile_size, num_kq_heads, chunk_size, kq_head_dim]
-        v: [seq_tile_size, num_v_heads, chunk_size, v_head_dim]
+        [num_heads, chunk_size, head_dim]
     """
-
     num_lanes = pltpu.get_tpu_info().num_lanes
-    lanes_per_col = qkv_vmem_ref.shape[-1] // num_lanes
-    kq_lanes_per_head = cfgs.kq_head_dim // num_lanes
-    k_offset = cfgs.num_kq_heads * kq_lanes_per_head
+    lanes_per_col = vmem_ref.shape[-1] // num_lanes
+    lanes_per_head = head_dim // num_lanes
 
-    q_large_list = []
-    k_large_list = []
-    v_large_list = []
-
-    qkv_slot_flat_ref = qkv_vmem_ref.reshape(-1, num_lanes)
-    for kq_head in range(cfgs.num_kq_heads):
-        q_head_list = []
-        k_head_list = []
-        for lane in range(kq_lanes_per_head):
-            q_lane = kq_head * kq_lanes_per_head + lane
-            k_lane = k_offset + q_lane
-
-            q_head_list.append(qkv_slot_flat_ref[q_lane::lanes_per_col])
-            k_head_list.append(qkv_slot_flat_ref[k_lane::lanes_per_col])
-        q_large_list.append(jnp.concat(q_head_list, axis=-1))
-        k_large_list.append(jnp.concat(k_head_list, axis=-1))
-    v_offset = kq_lanes_per_head * cfgs.num_kq_heads * 2
-    v_lanes_per_head = cfgs.v_head_dim // num_lanes
-    for v_head in range(cfgs.num_v_heads):
-        v_head_list = []
-        for lane in range(v_lanes_per_head):
-            v_lane = v_offset + v_head * v_lanes_per_head + lane
-            v_head_list.append(qkv_slot_flat_ref[v_lane::lanes_per_col])
-        v_large_list.append(jnp.concat(v_head_list, axis=-1))
-
-    q_large = jnp.stack(q_large_list, axis=0)
-    k_large = jnp.stack(k_large_list, axis=0)
-    v_large = jnp.stack(v_large_list, axis=0)
-
-    return q_large, k_large, v_large
+    flat_ref = vmem_ref.reshape(-1, num_lanes)
+    head_list = []
+    for head in range(num_heads):
+        head_lanes = [
+            flat_ref[lane_offset + head * lanes_per_head + lane::lanes_per_col]
+            for lane in range(lanes_per_head)
+        ]
+        head_list.append(jnp.concat(head_lanes, axis=-1))
+    return jnp.stack(head_list, axis=0)
 
 
-def load_as_qkv_compact(
-        qkv_vmem_ref: jax.Ref,
-        cfg: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Split qkv and transpose by performing 1 load per head for compact layout.
+def load_compact_heads(vmem_ref: jax.Ref,
+                       num_heads: int,
+                       head_dim: int,
+                       dim_offset: int = 0) -> jax.Array:
+    """Use contiguous slices to split heads along the last dim and stack.
 
     Args:
-        qkv_vmem_ref: qkv reference in VMEM containing concatenated values of q, k,
-            and v of shape [seq_tile_size, chunk_size, 1, num_kq_heads * kq_head_dim *
-            2 + num_v_heads * v_head_dim].
-        cfg: GDN configuration object.
+        vmem_ref: VMEM reference of shape [seq_tile_size, chunk_size, 1, cols].
+        num_heads: Number of heads to split out.
+        head_dim: Width of one head, in elements.
+        dim_offset: Element the first head starts at, for a region that is
+            part of a larger tensor (k and v within the fused qkv).
 
     Returns:
-        q, k: [seq_tile_size, num_kq_heads, chunk_size, 1, kq_head_dim]
-        v: [seq_tile_size, num_v_heads, chunk_size, 1, v_head_dim]
+        [seq_tile_size, num_heads, chunk_size, 1, head_dim]
     """
-
-    k_offset = cfg.num_kq_heads * cfg.kq_head_dim
-    v_offset = cfg.num_kq_heads * 2 * cfg.kq_head_dim
-
-    q_compact_list = []
-    k_compact_list = []
-    v_compact_list = []
-
-    for kq_head in range(cfg.num_kq_heads):
-        q_start = kq_head * cfg.kq_head_dim
-        q_end = q_start + cfg.kq_head_dim
-        k_start = k_offset + q_start
-        k_end = k_start + cfg.kq_head_dim
-        q_compact_list.append(qkv_vmem_ref[..., q_start:q_end])
-        k_compact_list.append(qkv_vmem_ref[..., k_start:k_end])
-    for v_head in range(cfg.num_v_heads):
-        v_start = v_offset + v_head * cfg.v_head_dim
-        v_end = v_start + cfg.v_head_dim
-        v_compact_list.append(qkv_vmem_ref[..., v_start:v_end])
-
-    q_compact = jnp.stack(q_compact_list, axis=1)
-    k_compact = jnp.stack(k_compact_list, axis=1)
-    v_compact = jnp.stack(v_compact_list, axis=1)
-
-    return q_compact, k_compact, v_compact
+    head_list = []
+    for head in range(num_heads):
+        start = dim_offset + head * head_dim
+        head_list.append(vmem_ref[..., start:start + head_dim])
+    return jnp.stack(head_list, axis=1)
 
 
 def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
@@ -332,9 +291,24 @@ def load_activation_as_compact(
     """Load activations from VMEM as a compact layout."""
 
     qkv_vmem_ref[...] = qkv_vreg
-    q_compact, k_compact, v_compact = load_as_qkv_compact(qkv_vmem_ref, cfgs)
+
+    k_offset = cfgs.num_kq_heads * cfgs.kq_head_dim
+    v_offset = 2 * k_offset
+
+    q_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_kq_heads,
+                                   cfgs.kq_head_dim)
+    k_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_kq_heads,
+                                   cfgs.kq_head_dim, k_offset)
+    v_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_v_heads,
+                                   cfgs.v_head_dim, v_offset)
     b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
-    a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
+    if cfgs.is_kda:
+        # KDA's gate is per-channel, so it splits into heads like q/k/v do
+        # instead of occupying a single lane per head.
+        a_compact = load_compact_heads(a_vmem_ref, cfgs.num_v_heads,
+                                       cfgs.kq_head_dim)
+    else:
+        a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
     return q_compact, k_compact, v_compact, b_compact, a_compact
 
 
@@ -349,22 +323,36 @@ def load_activation_as_large(
 
     qkv_vmem_ref[...] = qkv_vreg
 
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    kq_lanes = cfgs.num_kq_heads * (cfgs.kq_head_dim // num_lanes)
+
     q_large_list = []
     k_large_list = []
     v_large_list = []
+    a_large_list = []
     for idx in range(cfgs.seq_tile_size):
-        q_large, k_large, v_large = load_as_qkv_large(qkv_vmem_ref.at[idx],
-                                                      cfgs)
-        q_large_list.append(q_large)
-        k_large_list.append(k_large)
-        v_large_list.append(v_large)
+        qkv_slot = qkv_vmem_ref.at[idx]
+        q_large_list.append(
+            load_strided_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim))
+        k_large_list.append(
+            load_strided_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim,
+                               kq_lanes))
+        v_large_list.append(
+            load_strided_heads(qkv_slot, cfgs.num_v_heads, cfgs.v_head_dim,
+                               2 * kq_lanes))
+        if cfgs.is_kda:
+            # Per-channel gate: split into heads and transpose like q/k/v.
+            a_large_list.append(
+                load_strided_heads(a_vmem_ref.at[idx], cfgs.num_v_heads,
+                                   cfgs.kq_head_dim))
 
     q_large = jnp.stack(q_large_list, axis=0)
     k_large = jnp.stack(k_large_list, axis=0)
     v_large = jnp.stack(v_large_list, axis=0)
-    b_large = load_compact_to_large(b_vmem_ref)
-    a_large = load_compact_to_large(a_vmem_ref)
-    b_large = jnp.expand_dims(b_large, axis=1)
-    a_large = jnp.expand_dims(a_large, axis=1)
+    b_large = jnp.expand_dims(load_compact_to_large(b_vmem_ref), axis=1)
+    if cfgs.is_kda:
+        a_large = jnp.stack(a_large_list, axis=0)
+    else:
+        a_large = jnp.expand_dims(load_compact_to_large(a_vmem_ref), axis=1)
 
     return q_large, k_large, v_large, b_large, a_large
