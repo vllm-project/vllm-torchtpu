@@ -1,6 +1,6 @@
 # Docker images
 
-This folder contains the Dockerfile used to build the main image variants for torchtpu-vllm.
+This folder contains the Dockerfile used to build the main image variants for vllm-torchtpu.
 
 ## Pre-built Nightly Images
 
@@ -64,7 +64,7 @@ Use this image for CI and test infrastructure. It includes extra tooling on top 
 * `psmisc` / `fuser`
 
 > [!NOTE]
-> This image does not install the `torchtpu-vllm` project itself, only the dependencies and tools needed for CI.
+> This image does not install the `vllm-torchtpu` project itself, only the dependencies and tools needed for CI.
 
 Example build using the standard helper script:
 
