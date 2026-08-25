@@ -39,10 +39,15 @@ def _vllm_config(*,
                  block_size: int = 16,
                  mamba_page_size_padded: int | None = None):
     return SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Qwen3_5MoeForConditionalGeneration",
+            is_hybrid=True,
+        ),
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
             cp_kv_cache_interleave_size=interleave_size,
             data_parallel_size=1,
+            tensor_parallel_size=1,
         ),
         cache_config=SimpleNamespace(
             block_size=block_size,
@@ -52,6 +57,23 @@ def _vllm_config(*,
         ),
         speculative_config=None,
     )
+
+
+class _Qwen35_397bModel:
+    """Class-side state calculator for the geometry below, TP-sharded only."""
+
+    @staticmethod
+    def get_mamba_state_shape_from_config(vllm_config):
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        conv_dim = (2 * 128 * 64 + 128 * 64) // tp_size
+        return ((3, conv_dim), (64 // tp_size, 128, 128))
+
+
+def _kv_cache_spec(attn, vllm_config):
+    attn._vllm_config = vllm_config
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(_Qwen35_397bModel, None)):
+        return attn.get_kv_cache_spec(vllm_config)
 
 
 def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
@@ -161,13 +183,12 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.all(output == 1)
         assert torch.all(z == 2)
 
-    def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
+    def test_get_kv_cache_spec_declares_pcp_local_gdn_state(self):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
-        attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
 
-        full_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=1))
-        local_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=8))
+        full_spec = _kv_cache_spec(attn, _vllm_config(pcp_size=1))
+        local_spec = _kv_cache_spec(attn, _vllm_config(pcp_size=8))
 
         assert isinstance(full_spec, MambaSpec)
         assert isinstance(local_spec, MambaSpec)
@@ -177,34 +198,33 @@ class TestVllmGatedDeltaNetAttention:
         assert local_spec.shapes[1][1:] == full_spec.shapes[1][1:]
         assert local_spec.page_size_bytes == full_spec.page_size_bytes // 8
 
-    def test_get_kv_cache_spec_drops_full_unpadded_padding_after_localizing(
-            self):
+    def test_get_kv_cache_spec_keeps_the_platform_padded_page(self):
+        """The padded page is derived from this same PCP-local declaration,
+        so the layer takes it as given instead of second-guessing it."""
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
-        attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
-        full_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=1))
-        assert isinstance(full_spec, MambaSpec)
-
-        local_spec = attn.get_kv_cache_spec(
-            _vllm_config(pcp_size=8,
-                         mamba_page_size_padded=full_spec.page_size_bytes))
-
+        local_spec = _kv_cache_spec(attn, _vllm_config(pcp_size=8))
         assert isinstance(local_spec, MambaSpec)
-        assert local_spec.page_size_padded is None
-        assert local_spec.page_size_bytes == full_spec.page_size_bytes // 8
+        padded = local_spec.page_size_bytes * 2
+
+        padded_spec = _kv_cache_spec(
+            attn, _vllm_config(pcp_size=8, mamba_page_size_padded=padded))
+
+        assert isinstance(padded_spec, MambaSpec)
+        assert padded_spec.page_size_padded == padded
+        assert padded_spec.page_size_bytes == padded
 
     def test_get_kv_cache_spec_rejects_dim_first_state_for_pcp(self):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
-        attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
 
         with patch(
-                "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                "vllm.model_executor.layers.mamba.mamba_utils."
                 "is_conv_state_dim_first",
                 return_value=True,
         ), pytest.raises(NotImplementedError,
                          match="VLLM_SSM_CONV_STATE_LAYOUT=SD"):
-            attn.get_kv_cache_spec(_vllm_config(pcp_size=8))
+            _kv_cache_spec(attn, _vllm_config(pcp_size=8))
 
     def test_init_builds_only_regular_gdn_op_without_pcp(self):
         regular_op = MagicMock()

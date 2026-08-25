@@ -10,6 +10,9 @@ from vllm_torchtpu.gdn_pool_layout import (
     POOLED_GDN_CONV_STATE_ITEMSIZE, POOLED_GDN_SSM_STATE_ITEMSIZE,
     PooledGDNStateLayout, derive_pooled_gdn_state_layout,
     unified_kv_layout_enabled_for_architecture)
+from vllm_torchtpu.gdn_state_declaration import (gdn_state_declaration_applies,
+                                                 gdn_state_dtypes,
+                                                 gdn_state_shapes)
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -109,6 +112,17 @@ def _hybrid_mamba_state_layout(
     model_config = vllm_config.model_config
     if not model_config.is_hybrid:
         return None
+
+    if gdn_state_declaration_applies(vllm_config):
+        # The declaration the GDN layer itself hands vLLM, so the slot is
+        # budgeted for exactly the page the engine accounts for.
+        shapes = gdn_state_shapes(vllm_config)
+        dtypes = gdn_state_dtypes(vllm_config)
+        return derive_pooled_gdn_state_layout(
+            ssm_bytes=math.prod(shapes[1]) * dtypes[1].itemsize,
+            conv_bytes=math.prod(shapes[0]) * dtypes[0].itemsize,
+            token_bytes=fa_physical_bytes_per_token,
+        )
 
     from vllm.model_executor.models import ModelRegistry
 

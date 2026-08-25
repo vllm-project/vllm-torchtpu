@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 import functools
 
 import jax
@@ -20,18 +19,14 @@ import torch
 from einops import rearrange
 from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_utils import \
-    is_conv_state_dim_first
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
-from vllm_torchtpu.gdn_pool_layout import (
-    POOLED_GDN_CONV_STATE_DTYPE, unified_kv_layout_enabled_for_architecture)
+from vllm_torchtpu.gdn_state_declaration import (gdn_state_dtypes,
+                                                 gdn_state_shapes)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.layers.common.gdn_attention import (
@@ -227,54 +222,15 @@ def gdn_attention_core_tpu_pcp_prefill(
     return new_conv_state, new_recurrent_state, output
 
 
-def _get_pcp_size(vllm_config: VllmConfig) -> int:
-    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-    return pcp_size if pcp_size > 1 else 1
-
-
-def _localize_gdn_mamba_spec_for_pcp(
-    spec: MambaSpec,
-    pcp_size: int,
-) -> MambaSpec:
-    if pcp_size <= 1 or len(spec.shapes) != 2:
-        return spec
-    if is_conv_state_dim_first():
-        raise NotImplementedError("TPU GDN PCP state sharding requires "
-                                  "VLLM_SSM_CONV_STATE_LAYOUT=SD.")
-
-    conv_shape = tuple(spec.shapes[0])
-    recurrent_shape = tuple(spec.shapes[1])
-    if not conv_shape or not recurrent_shape:
-        return spec
-    if conv_shape[-1] % pcp_size != 0:
-        raise ValueError("GDN conv state width must be divisible by PCP size: "
-                         f"shape={conv_shape}, pcp_size={pcp_size}")
-    if recurrent_shape[0] % pcp_size != 0:
-        raise ValueError(
-            "GDN recurrent state head count must be divisible by PCP size: "
-            f"shape={recurrent_shape}, pcp_size={pcp_size}")
-
-    unpadded_page_size = dataclasses.replace(
-        spec, page_size_padded=None).page_size_bytes
-    page_size_padded = spec.page_size_padded
-    if page_size_padded == unpadded_page_size:
-        page_size_padded = None
-
-    return dataclasses.replace(
-        spec,
-        shapes=(
-            (*conv_shape[:-1], conv_shape[-1] // pcp_size),
-            (recurrent_shape[0] // pcp_size, *recurrent_shape[1:]),
-        ),
-        page_size_padded=page_size_padded,
-    )
-
-
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The state declaration below is keyed on the whole config, not on
+        # this instance, so that the platform can compute the same answer
+        # before any layer exists.
+        self._vllm_config = get_vllm_model_wrapper_context().vllm_config
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         self.kv_cache = None
@@ -287,40 +243,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_pcp_op = (self._build_pooled_pcp_gdn_op()
                                   if pcp_enabled else None)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        spec = super().get_kv_cache_spec(vllm_config)
-        if spec is None:
-            return None
-        assert isinstance(spec, MambaSpec)
-        return _localize_gdn_mamba_spec_for_pcp(spec,
-                                                _get_pcp_size(vllm_config))
-
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
-        conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        if unified_kv_layout_enabled_for_architecture(
-                self.model_config.architecture):
-            # Declare exactly what the pool physically stores. vLLM sizes the
-            # mamba page from the dtype declared HERE and asserts the padded
-            # page covers it, while the block-slot derivation budgets the page
-            # from POOLED_GDN_CONV_STATE_DTYPE. Declaring anything wider is not
-            # conservative, it is a contradiction: the two disagreed once and
-            # every hybrid GDN engine failed to start on that assert.
-            conv_state_dtype = getattr(
-                torch,
-                POOLED_GDN_CONV_STATE_DTYPE.split(".")[1])
-        else:
-            # TODO: Support bf16 conv state.
-            # Per-layer cache: unlike the pool, the declared dtype IS the
-            # storage dtype (vLLM strides the raw tensor with it), and this
-            # kernel path still reads fp32 conv state. Nothing pads this
-            # layout, so the wider declaration costs only its own bytes.
-            conv_state_dtype = torch.float32
-        return conv_state_dtype, temporal_state_dtype
+        return gdn_state_dtypes(self._vllm_config)
 
-    def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        conv_state_shape, temporal_state_shape = super().get_state_shape()
-        conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
-        return conv_state_shape, temporal_state_shape
+    def get_state_shape(self, ) -> tuple[tuple[int, ...], ...]:
+        return gdn_state_shapes(self._vllm_config)
 
     @staticmethod
     def _pcp_streaming_enabled() -> bool:

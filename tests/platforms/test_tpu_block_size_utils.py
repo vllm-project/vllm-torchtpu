@@ -78,7 +78,7 @@ class FakeCompactMambaModel:
 
     @staticmethod
     def get_mamba_state_shape_from_config(_):
-        # 1 physical conv row followed by 256 physical SSM rows.
+        # 2 physical conv rows followed by 256 physical SSM rows.
         return ((1, 512), (2, 128, 256))
 
     @staticmethod
@@ -197,7 +197,7 @@ def test_hybrid_fit_uses_physical_gdn_extent(vllm_config):
 
     _update(vllm_config)
 
-    # SSM=1024 rows, raw conv=24 rows, tiled conv=32 rows.
+    # SSM=1024 rows, raw conv=48 rows, tiled conv=64 rows.
     assert vllm_config.cache_config.block_size == 1280
     assert vllm_config.cache_config.mamba_block_size == 1280
     assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
@@ -232,7 +232,7 @@ def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
 
     _update(vllm_config)
 
-    # SSM=512 rows, raw conv=12 rows, tiled conv=16 rows.
+    # SSM=512 rows, raw conv=24 rows, tiled conv=32 rows.
     assert vllm_config.cache_config.block_size == 768
     assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
@@ -244,8 +244,8 @@ def test_fit_has_no_fixed_16_token_alignment(vllm_config):
             backend_cls=FakePlainAttentionBackend,
             model_cls=FakeCompactMambaModel)
 
-    assert vllm_config.cache_config.block_size == 257
-    assert vllm_config.cache_config.mamba_page_size_padded == 257 * 1024
+    assert vllm_config.cache_config.block_size == 258
+    assert vllm_config.cache_config.mamba_page_size_padded == 258 * 1024
 
 
 def test_user_block_size_below_fit_is_promoted(vllm_config):
@@ -364,3 +364,69 @@ def test_hybrid_gdn_pcp_rejects_non_sharding_shape_calculator(vllm_config):
                    match="PCP-local Mamba state size must be exactly"):
         update_tpu_block_size_and_slot_config(vllm_config,
                                               FakeBatchedRPAAttentionBackend)
+
+
+class FakeSpecAwareGDNModel(FakeQwenMambaModel):
+    """Widens the conv state under spec decode, like the real calculator.
+
+    Its dtypes are deliberately not the declared ones: the block slot is
+    budgeted from the layer's declaration, not from this class's view.
+    """
+
+    @staticmethod
+    def get_mamba_state_shape_from_config(vllm_config):
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        num_spec = (vllm_config.speculative_config.num_speculative_tokens
+                    if vllm_config.speculative_config else 0)
+        return ((3 + num_spec, 4096 // tp_size), (16 // tp_size, 128, 128))
+
+    @staticmethod
+    def get_mamba_state_dtype_from_config(_):
+        return (torch.bfloat16, torch.bfloat16)
+
+
+@pytest.mark.parametrize("num_spec", [0, 1, 2, 4])
+def test_block_slot_covers_the_declared_mamba_page(vllm_config, num_spec):
+    """The padded page must cover the page the layer declares.
+
+    `MambaSpec.page_size_bytes` asserts exactly this, and every hybrid GDN
+    engine failed to start when the two sides were derived separately.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_torchtpu.gdn_state_declaration import (gdn_state_dtypes,
+                                                     gdn_state_shapes)
+
+    _configure_hybrid(vllm_config, tp_size=2)
+    vllm_config.speculative_config = MagicMock()
+    vllm_config.speculative_config.num_speculative_tokens = num_spec
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeSpecAwareGDNModel, None)):
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakeBatchedRPAAttentionBackend)
+        declared = MambaSpec(
+            shapes=gdn_state_shapes(vllm_config),
+            dtypes=gdn_state_dtypes(vllm_config),
+            block_size=vllm_config.cache_config.mamba_block_size,
+            page_size_padded=vllm_config.cache_config.mamba_page_size_padded,
+        )
+
+    # No assertion error, and the engine accounts for the padded page.
+    assert (declared.page_size_bytes ==
+            vllm_config.cache_config.mamba_page_size_padded)
+
+
+def test_block_slot_ignores_the_model_class_state_dtypes(vllm_config):
+    """The declaration pins both regions f32, so the class's dtypes cannot
+    move the slot. Sizing from the class view is what let the slot be
+    budgeted for bf16 while the layer declared f32."""
+    _configure_hybrid(vllm_config, tp_size=2)
+    vllm_config.speculative_config = None
+
+    _update(vllm_config, model_cls=FakeSpecAwareGDNModel)
+
+    # SSM 16/2 x 128 x 128 f32 = 512 rows, conv 3 x 2048 f32 = 24 -> 32;
+    # the 544-token fit rounds up to this backend's 256-token blocks.
+    assert vllm_config.cache_config.block_size == 768
+    assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
