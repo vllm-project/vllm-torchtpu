@@ -133,6 +133,10 @@ EVAL_TOLERANCE=""
 # Ratio tolerance for the perf regression gate (per-metric floors in
 # check_regression.py still apply). Raise per config for noisier layouts.
 PERF_TOLERANCE="0.05"
+MAX_MODEL_LEN=""
+MAX_NUM_BATCHED_TOKENS=""
+MAX_NUM_SEQS=""
+GPU_MEMORY_UTILIZATION=""
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
@@ -207,7 +211,7 @@ start_vllm_server() {
     local max_model_len=$1
     local max_num_batched_tokens=$2
     local max_num_seqs=$3
-    local gpu_mem_util="${GPU_MEMORY_UTILIZATION:-0.95}"
+    local gpu_mem_util=$4
 
     # Build extra args
     local extra_args=""
@@ -407,6 +411,7 @@ run_benchmark_once() {
 max_model_len=${MAX_MODEL_LEN:-16384}
 max_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 max_num_seqs=${MAX_NUM_SEQS:-512}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
 
 # JSON-encode capture_profile + profile_dir for config.json.
 capture_profile_json=${CAPTURE_PROFILE:-0}
@@ -445,6 +450,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,
+    "gpu_memory_utilization": $gpu_memory_utilization,
     "capture_profile": $capture_profile_json,
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
@@ -486,7 +492,7 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 if [ "$START_SERVER" = "1" ]; then
     trap stop_vllm_server EXIT INT TERM
-    start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
+    start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs" "$gpu_memory_utilization"
 fi
 
 exit_code=0
