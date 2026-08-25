@@ -35,6 +35,14 @@ def get_megacore() -> bool:
     return _megacore
 
 
+def largest_divisor(x: int, cap: int) -> int:
+    """Largest divisor of `x` that is <= `cap`."""
+    for candidate in range(min(x, cap), 0, -1):
+        if x % candidate == 0:
+            return candidate
+    return 1
+
+
 def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
     if tp_size <= num_kv_heads:
         assert num_kv_heads % tp_size == 0

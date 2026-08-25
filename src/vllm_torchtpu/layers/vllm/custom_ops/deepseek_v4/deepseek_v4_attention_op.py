@@ -29,19 +29,11 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import \
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import \
     sparse_ragged_paged_attention
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import align_to
+from vllm_torchtpu.utils import align_to, largest_divisor
 
 logger = init_logger(__name__)
 
 BATCH_AXIS = None
-
-
-def _largest_divisor(x: int, cap: int) -> int:
-    """Largest divisor of `x` that is <= `cap`."""
-    for candidate in range(min(x, cap), 0, -1):
-        if x % candidate == 0:
-            return candidate
-    return 1
 
 
 def _run_swa(
@@ -84,7 +76,7 @@ def _run_swa(
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(2, 2, 2),
         num_queries_per_block=(1, 32, 32),
-        q_compute_block_size=2,
+        q_compute_block_size=4,
         unnormalized_output=not swa_only,
     )
 
@@ -218,7 +210,7 @@ def _attention_csa(
     if gather_and_attention_chunk_size is None:
         # The kernel falls back to a single chunk of q.shape[0]; the batch
         # size must divide it.
-        attention_kernel_batch_size = _largest_divisor(q.shape[0], 16)
+        attention_kernel_batch_size = largest_divisor(q.shape[0], 16)
     else:
         attention_kernel_batch_size = 16
 

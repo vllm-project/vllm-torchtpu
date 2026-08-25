@@ -48,6 +48,14 @@ def get_kv_cache_shape(
     )
 
 
+def _largest_divisor(x: int, cap: int) -> int:
+    """Largest divisor of ``x`` that is <= ``cap``."""
+    for candidate in range(min(x, cap), 0, -1):
+        if x % candidate == 0:
+            return candidate
+    return 1
+
+
 _GATHER_PAGE_CHUNK = 128
 
 
@@ -458,7 +466,7 @@ def sparse_ragged_paged_attention(
     sm_scale: float = 1.0,
     k_scale: float = 1.0,
     # Kernel optimization params.
-    gather_and_attention_chunk_size: int | None = None,
+    gather_and_attention_chunk_size: int = 64,
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> jax.Array:
@@ -489,8 +497,6 @@ def sparse_ragged_paged_attention(
     # byte planes (dequantized by the shim).
     assert cache_kv_nope.dtype == jnp.uint8
     assert cache_kv_rope.dtype == jnp.uint8
-    if gather_and_attention_chunk_size is None:
-        gather_and_attention_chunk_size = q.shape[0]
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
@@ -558,7 +564,7 @@ def sparse_ragged_paged_attention(
             jnp.zeros((2, ), jnp.int32),
         )
 
-        scope_name = f"MLA-p_{cache_kv_rope.shape[1]}"
+        scope_name = f"MLA-p_{cache_kv_rope.shape[1]}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -625,15 +631,12 @@ def sparse_ragged_paged_attention(
     )
 
     assert page_ids.shape == (q.shape[0], topk)
-
-    # TODO: handle the case where q.shape[0] is not divisible by
-    # gather_and_attention_chunk_size.
-    assert q.shape[0] % gather_and_attention_chunk_size == 0
-    num_chunks = q.shape[0] // gather_and_attention_chunk_size
+    num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
-        end_pos = start_pos + gather_and_attention_chunk_size
+        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+        chunk_size = end_pos - start_pos
         indices = (page_ids[start_pos:end_pos, ...] * page_size +
                    token_offset[start_pos:end_pos, ...]).reshape(-1)
 
@@ -652,24 +655,29 @@ def sparse_ragged_paged_attention(
             indices,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
-            gather_and_attention_chunk_size,
+            chunk_size,
             topk * dsa_gather.TILE_SUBROWS,
             dsa_gather.TILE_LANE_BYTES,
         )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
-            gather_and_attention_chunk_size, topk, -1)
+            chunk_size, topk, -1)
         # We treat each query token as a one independent sequence, attend to their
         # respective gathered kv tokens in the `gathered_kv_buffer`.
         # -1 in topk_indices is padded elements at the end of each row.
         # Batching
-        assert gather_and_attention_chunk_size % attention_kernel_batch_size == 0
-        batch_end = (cdiv(
+        kernel_batch_size = _largest_divisor(chunk_size,
+                                             attention_kernel_batch_size)
+        assert chunk_size % kernel_batch_size == 0
+        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
+        # steps, so `batch_end - start_pos` MUST be a multiple of
+        # `kernel_batch_size`.
+        batch_end = start_pos + (cdiv(
             jnp.minimum(
                 cu_q_lens[distribution[2]],
-                start_pos + gather_and_attention_chunk_size,
-            ),
-            attention_kernel_batch_size,
-        ) * attention_kernel_batch_size)
+                end_pos,
+            ) - start_pos,
+            kernel_batch_size,
+        ) * kernel_batch_size)
         q = run_mla_kernel(
             q,
             gathered_nope_buffer,
@@ -677,7 +685,7 @@ def sparse_ragged_paged_attention(
             kv_lens,
             start_seq_idx=start_pos,
             end_seq_idx=batch_end,
-            kernel_batch_size=attention_kernel_batch_size,
+            kernel_batch_size=kernel_batch_size,
         )
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim

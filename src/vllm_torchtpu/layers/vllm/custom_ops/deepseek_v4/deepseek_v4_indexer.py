@@ -28,6 +28,7 @@ from vllm.models.deepseek_v4.attention import (DeepseekV4Indexer,
                                                DeepseekV4IndexerCache)
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
     VllmDeepseekCompressor
@@ -43,26 +44,11 @@ _indexer_op_cache = {}
 BATCH_AXIS = None
 
 
-def _jax_quantize_tensor(dtype, tensor, axis=-1):
-    dtype_info = jnp.finfo(dtype)
-    dtype_max = float(dtype_info.max)
-    dtype_min = float(dtype_info.min)
-
-    abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
-    scale = abs_max / dtype_max
-    # An all-zero row gives scale 0 and `1 / 0` is inf; map that to the largest
-    # finite float so the row quantizes to 0 instead of `0 * inf` = NaN.
-    scale_inv = jnp.nan_to_num(1 / scale)
-
-    tensor_q = jnp.clip(tensor * scale_inv, dtype_min, dtype_max)
-    tensor_q = tensor_q.astype(dtype)
-    scale = jnp.squeeze(scale, axis).astype(jnp.float32)
-    return tensor_q, scale
-
-
 # Module-level so `pallas.jax_op` can trace and register it as a torch op.
 def _indexer_jax(
-    q_rope: jax.Array,
+    q: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
     indexer_weights: jax.Array,
     cache_kv: jax.Array,
     seq_lens: jax.Array,
@@ -78,17 +64,21 @@ def _indexer_jax(
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
-        return jnp.zeros((q_rope.shape[0], k), dtype=jnp.int32)
+        return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
 
-    def _indexer_local(q_rope, indexer_weights, cache_kv, seq_lens,
-                       page_indices, cu_q_lens, distribution):
-        q_quant, q_scales = _jax_quantize_tensor(jnp.float8_e4m3fn,
-                                                 q_rope,
-                                                 axis=-1)
+    def _indexer_local(q, positions, cos_sin_cache, indexer_weights, cache_kv,
+                       seq_lens, page_indices, cu_q_lens, distribution):
+        # One kernel rotates the queries and quantizes each row on the way out.
+        # Note: vLLM's implementation rounds the scale factors up to the next
+        # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
+        # sufficient here.
+        q_quant, q_scales = rope_quant(q,
+                                       positions,
+                                       cos_sin_cache,
+                                       quant_dtype=jnp.float8_e4m3fn)
 
         # Fold the query quantization scales into the weights.
-        weights = (indexer_weights.astype(q_rope.dtype) * softmax_scale *
-                   (n_head**-0.5) * q_scales)
+        weights = (indexer_weights * softmax_scale * (n_head**-0.5) * q_scales)
 
         return streamindex_topk(
             q=q_quant,
@@ -105,12 +95,9 @@ def _indexer_jax(
             num_queries_per_block=(1, 128, 128),
         )
 
-    res = _indexer_local(q_rope, indexer_weights, cache_kv, seq_lens,
-                         page_indices, cu_q_lens, distribution)
-    if res.shape[0] < q_rope.shape[0]:
-        res = jnp.pad(res, ((0, q_rope.shape[0] - res.shape[0]), (0, 0)),
-                      constant_values=-1)
-    return res
+    return _indexer_local(q, positions, cos_sin_cache, indexer_weights,
+                          cache_kv, seq_lens, page_indices, cu_q_lens,
+                          distribution)
 
 
 class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
@@ -172,7 +159,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q_rope
+                P(attn_data_axis, attn_head_axis, None),  # q
+                P(attn_data_axis),  # positions
+                P(),  # cos_sin_cache
                 P(attn_data_axis, attn_head_axis),  # indexer_weights
                 P(),  # cache_kv
                 P(batch_axis),  # seq_lens
@@ -182,10 +171,10 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             ),
         )
 
-        def _fake_indexer(q_rope, indexer_weights, *args, **kwargs):
-            return torch.empty((q_rope.shape[0], self.topk_tokens),
+        def _fake_indexer(q, *args, **kwargs):
+            return torch.empty((q.shape[0], self.topk_tokens),
                                dtype=torch.int32,
-                               device=q_rope.device)
+                               device=q.device)
 
         indexer_jax_op.register_fake(_fake_indexer)
 
@@ -204,8 +193,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         q, _ = self.wq_b(query)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        q_rope, _ = rotary_emb(positions, q)
-
         self.compressor(hidden_states, positions, rotary_emb)
 
         # No KV cache is bound during the profiling forward; the values are
@@ -213,9 +200,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # placeholder rather than None, so test emptiness.
         kv_cache = getattr(self.k_cache, "kv_cache", None)
         if kv_cache is None or kv_cache.numel() == 0:
-            return torch.zeros((q_rope.shape[0], self.topk_tokens),
+            return torch.zeros((q.shape[0], self.topk_tokens),
                                dtype=torch.int32,
-                               device=q_rope.device)
+                               device=q.device)
 
         attn_ctx = get_forward_context().attn_metadata
         if isinstance(attn_ctx, dict):
@@ -234,8 +221,10 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         idx_q_start_loc = attn_metadata.query_start_loc
         idx_req_dist = attn_metadata.request_distribution
 
-        topk_indices = self.indexer_op(
-            q_rope,
+        return self.indexer_op(
+            q,
+            positions,
+            rotary_emb.cos_sin_cache,
             indexer_weights,
             kv_cache,
             idx_seq_lens,
@@ -243,11 +232,3 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             idx_q_start_loc,
             idx_req_dist,
         )
-        fill_pad = torch.full((positions.shape[0], topk_indices.shape[1]),
-                              -1,
-                              dtype=topk_indices.dtype,
-                              device=topk_indices.device)
-        topk_indices = torch.cat([topk_indices, fill_pad],
-                                 dim=0)[:positions.shape[0]]
-
-        return topk_indices

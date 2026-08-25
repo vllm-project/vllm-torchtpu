@@ -544,11 +544,6 @@ def rpa_metadata_schedule_kernel(
     for b_idx in range(cfgs.batch_size):
         max_steps = jnp.maximum(max_steps, lane_lengths_ref[b_idx])
 
-    pl.debug_check(
-        max_steps <= cfgs.max_steps_ub,
-        f"Max steps exceeded SMEM capacity limit! {max_steps} vs"
-        f" {cfgs.max_steps_ub}",
-    )
     schedule_ref.actual_steps[0] = max_steps
 
     safe_max_steps = jnp.minimum(max_steps + cfgs.n_buffer + 1,

@@ -15,6 +15,7 @@
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -195,6 +196,37 @@ def test_propose_draft_token_ids_async_bootstrap_returns_device_tensor():
     assert args[0] == []
     assert kwargs["next_tokens_per_chunk"] is None
     assert kwargs["device_seed"] is seed
+
+
+def test_stage_and_take_draft_token_ids_snapshots_req_ids():
+    # Async scheduling: stage launches the D2H copy and snapshots req_ids;
+    # take is only called after the NEXT step's execute_model has already
+    # mutated input_batch, so it must answer from the snapshot.
+    manager, mock_runner, _ = _make_manager_with_eagle3_drafter(num_reqs=2)
+    mock_runner.input_batch.req_ids = ["req-a", "req-b", None]
+    drafts = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+
+    manager.stage_draft_token_ids_for_host(drafts)
+
+    # Simulate the next step's batch update (req-a finished, req-c joined).
+    mock_runner.input_batch.num_reqs = 2
+    mock_runner.input_batch.req_ids = ["req-c", "req-b", None]
+
+    result = manager.take_draft_token_ids()
+    assert result is not None
+    assert result.req_ids == ["req-a", "req-b"]
+    assert result.draft_token_ids == [[1, 2, 3], [4, 5, 6]]
+    # Consumed: a second take (nothing staged, no sync cache) returns None.
+    assert manager._staged_draft_copy is None
+    assert manager.take_draft_token_ids() is None
+
+
+def test_stage_draft_token_ids_rejects_row_mismatch():
+    manager, mock_runner, _ = _make_manager_with_eagle3_drafter(num_reqs=2)
+    mock_runner.input_batch.req_ids = ["req-a", "req-b", None]
+    with pytest.raises(AssertionError):
+        manager.stage_draft_token_ids_for_host(
+            torch.zeros((3, 2), dtype=torch.int32))
 
 
 def test_propose_draft_token_ids_ngram_dispatches_correctly():

@@ -14,10 +14,10 @@
 
 # 1P1D end-to-end benchmark on the Raiden KV-transfer engine: PCP8/TP1
 # prefill + DP8/TP1 decode (the topologies Raiden's Qwen3.5 admission
-# requires), TPURaidenConnector with the stage-3 reshard transport, and a
-# per-role RaidenController (examples/disagg/run_raiden_controller.py)
-# started inside each server container. Kernel-selection env stays at
-# defaults.
+# requires) and TPURaidenConnector with the stage-3 reshard transport.
+# The reshard control plane runs in store mode: each engine's
+# transfer-rank-0 worker hosts the service in-process, so there is no
+# controller sidecar. Kernel-selection env stays at defaults.
 #
 # The workload follows the tpu_benchmark_daily client shapes: 8192/1
 # sweep c8-256, TTFT 8K-64K (128K/252K need max-model-len beyond the
@@ -135,15 +135,6 @@ spec:
                     # ephemeral-storage limit; the backtrace in the log is
                     # the useful artifact.
                     ulimit -c 0
-                    # The stage-3 reshard registers work units with this
-                    # per-role controller.
-                    python3 /root/torchtpu-vllm/examples/disagg/run_raiden_controller.py --port 27000 > /tmp/raiden_controller.log 2>&1 &
-                    for i in $(seq 1 60); do
-                      grep -q "is running" /tmp/raiden_controller.log && break
-                      sleep 1
-                    done
-                    grep -q "is running" /tmp/raiden_controller.log || { echo "raiden controller failed to start"; cat /tmp/raiden_controller.log; exit 1; }
-                    export TPU_RAIDEN_CONTROLLER_ADDRESS="${POD_IP}:27000"
                     export VLLM_HOST_IP="${POD_IP}"
                     exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=32768 --long-prefill-token-threshold=32768 --max-num-seqs=8 --prefill-context-parallel-size=8 --cp-kv-cache-interleave-size=256 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[1024,2048,4096,5120],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}'
                 env:
@@ -180,6 +171,18 @@ spec:
                   value: "1"
                 - name: TPU_KV_RESHARD_TRANSPORT
                   value: "raiden"
+                # Sidecar-less reshard plane: rank-0 hosts the service at
+                # PORT_BASE + dp_rank, dispatch at DISPATCH_BASE + dp_rank.
+                - name: TPU_RAIDEN_RESHARD_IMPL
+                  value: "store"
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: TPU_RAIDEN_RESHARD_PORT_BASE
+                  value: "27000"
+                - name: TPU_RAIDEN_STORE_DISPATCH_PORT_BASE
+                  value: "27100"
                 - name: TPU_RAIDEN_TRANSFER_PARALLELISM
                   value: "8"
                 - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
@@ -341,15 +344,6 @@ spec:
                     # ephemeral-storage limit; the backtrace in the log is
                     # the useful artifact.
                     ulimit -c 0
-                    # The stage-3 reshard registers work units with this
-                    # per-role controller.
-                    python3 /root/torchtpu-vllm/examples/disagg/run_raiden_controller.py --port 28000 > /tmp/raiden_controller.log 2>&1 &
-                    for i in $(seq 1 60); do
-                      grep -q "is running" /tmp/raiden_controller.log && break
-                      sleep 1
-                    done
-                    grep -q "is running" /tmp/raiden_controller.log || { echo "raiden controller failed to start"; cat /tmp/raiden_controller.log; exit 1; }
-                    export TPU_RAIDEN_CONTROLLER_ADDRESS="${POD_IP}:28000"
                     export VLLM_HOST_IP="${POD_IP}"
                     exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=4384 --max-num-seqs=32 --prefill-context-parallel-size=1 --data-parallel-size=8 --data-parallel-size-local=8 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[8,16,32,4352,4384],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}'
                 env:
@@ -386,6 +380,18 @@ spec:
                   value: "1"
                 - name: TPU_KV_RESHARD_TRANSPORT
                   value: "raiden"
+                # Sidecar-less reshard plane; DP8, so ranks 0-7 bind
+                # 28000-28007 (service) and 28100-28107 (dispatch).
+                - name: TPU_RAIDEN_RESHARD_IMPL
+                  value: "store"
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: TPU_RAIDEN_RESHARD_PORT_BASE
+                  value: "28000"
+                - name: TPU_RAIDEN_STORE_DISPATCH_PORT_BASE
+                  value: "28100"
                 - name: TPU_RAIDEN_TRANSFER_PARALLELISM
                   value: "8"
                 - name: TPU_GDN_CONV_QK_PAIR_LAYOUT

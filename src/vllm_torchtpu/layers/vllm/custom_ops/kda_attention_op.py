@@ -7,6 +7,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Torch custom-op bridges for Kimi KDA and its short convolution."""
 
+import os
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -14,6 +16,9 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.kimi_k3 import chunk_kda
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
+from vllm_torchtpu.kernels.kimi_k3.mega_kda import \
+    _layout_supported as _mega_kda_layout_supported
+from vllm_torchtpu.kernels.kimi_k3.mega_kda import kda_forward_inference
 
 
 def _token_sequence_ids(
@@ -320,6 +325,17 @@ def _match_rows(x: jax.Array, num_rows: int) -> jax.Array:
     return jnp.pad(x, [(0, num_rows - have)] + [(0, 0)] * (x.ndim - 1))
 
 
+def _get_kda_prefill_kernel() -> str:
+    """Read and validate the compile-time K3 prefill kernel selection."""
+    kernel = os.environ.get("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL",
+                            "chunked").strip().lower()
+    if kernel not in ("chunked", "mega"):
+        raise ValueError(
+            "VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL must be 'chunked' or "
+            f"'mega', got {kernel!r}.")
+    return kernel
+
+
 def build_kimi_dispatched_kda_op(
     prefix: str,
     *,
@@ -333,6 +349,8 @@ def build_kimi_dispatched_kda_op(
     ``decode_kda`` fuses the convolution into the recurrence and so cannot be fed
     by a separate convolution op the way the chunked kernel is.
     """
+    prefill_kernel = _get_kda_prefill_kernel()
+    use_mega_prefill = prefill_kernel == "mega"
 
     def dispatched_core(
         mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
@@ -434,27 +452,69 @@ def build_kimi_dispatched_kda_op(
 
             initial_state = jnp.where(has_initial_state[:, None, None, None],
                                       pool_after_decode[state_indices], 0.0)
+            activated_beta = _activate_beta(beta)
+            gate = raw_gate.reshape(num_tokens, num_heads, head_dim)
 
-            chunk_out, final_state = chunk_kda(
-                head_major(qkv[:, 0]),
-                head_major(qkv[:, 1]),
-                head_major(qkv[:, 2]),
-                head_major(raw_gate.reshape(num_tokens, num_heads, head_dim)),
-                jnp.transpose(_activate_beta(beta), (1, 0))[:,
-                                                            None],  # [H, 1, T]
-                A_log=a_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                use_gate_in_kernel=True,
-                use_qk_l2norm_in_kernel=True,
-                segment_ids=segment_ids[None],
-                N_max=num_seqs,
-                initial_state=initial_state[None],
-                output_final_state=True,
-                start_seq=decode_end,
-            )
-            chunk_out = jnp.transpose(chunk_out[:, 0],
-                                      (1, 0, 2))  # -> [T, H, D]
+            def run_chunked_kda():
+                chunk_out, final_state = chunk_kda(
+                    head_major(qkv[:, 0]),
+                    head_major(qkv[:, 1]),
+                    head_major(qkv[:, 2]),
+                    head_major(gate),
+                    jnp.transpose(activated_beta, (1, 0))[:,
+                                                          None],  # [H, 1, T]
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    lower_bound=lower_bound,
+                    use_gate_in_kernel=True,
+                    use_qk_l2norm_in_kernel=True,
+                    segment_ids=segment_ids[None],
+                    N_max=num_seqs,
+                    initial_state=initial_state[None],
+                    output_final_state=True,
+                    start_seq=decode_end,
+                )
+                return (
+                    jnp.transpose(chunk_out[:, 0], (1, 0, 2)),
+                    final_state,
+                )
+
+            def run_mega_kda():
+                chunk_out, final_state = kda_forward_inference(
+                    qkv[None, :, 0],
+                    qkv[None, :, 1],
+                    qkv[None, :, 2],
+                    gate[None],
+                    activated_beta[None],
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    lower_bound=lower_bound,
+                    use_gate_in_kernel=True,
+                    use_qk_l2norm_in_kernel=True,
+                    segment_ids=segment_ids[None],
+                    N_max=num_seqs,
+                    initial_state=initial_state[None],
+                    output_final_state=True,
+                    safe_gate=True,
+                )
+                return chunk_out[0], final_state
+
+            # The inference mega-kernel requires T % 64 == 0 and does not have
+            # the chunked kernel's device-valued `start_seq` contract. Use it
+            # only for a pure-prefill batch; mixed batches keep the chunked
+            # implementation so decode-owned cache slots remain untouched. A
+            # tile containing more than two live requests also falls back: the
+            # native boundary path represents only its first and last segment.
+            if use_mega_prefill and num_tokens % 64 == 0:
+                mega_layout_supported = _mega_kda_layout_supported(
+                    query_start_loc, num_tokens)
+                chunk_out, final_state = jax.lax.cond(
+                    (decode_end == 0) & mega_layout_supported,
+                    run_mega_kda,
+                    run_chunked_kda,
+                )
+            else:
+                chunk_out, final_state = run_chunked_kda()
 
             # Rows with no scheduled token have no state worth keeping; their
             # writes go to the reserved null block, slot 0.
@@ -495,7 +555,8 @@ def build_kimi_dispatched_kda_op(
 
         return output, conv_after_prefill, new_pool
 
-    op_name = f"pallas::kimi_dispatched_kda_{prefix.replace('.', '_')}"
+    op_name = (f"pallas::kimi_dispatched_kda_{prefill_kernel}_"
+               f"{prefix.replace('.', '_')}")
     dispatched_op = pallas.jax_op(op_name,
                                   dispatched_core,
                                   donate_argnums=(4, 5))

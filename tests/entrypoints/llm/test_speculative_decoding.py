@@ -37,9 +37,21 @@ from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
 
-# Heavy Llama-3.1-8B spec-decode integration suite; presubmit deselects it via
-# `-m "not nightly"`, full coverage runs in the nightly workflow.
-pytestmark = pytest.mark.nightly
+# Spec-decode e2e integration suite, split across the PR and nightly steps in
+# `.buildkite/pipeline_tests.yml`:
+#
+#   correctness tests  -- unmarked, so they run at PR time AND nightly. A
+#       spec-decode correctness regression is expensive to find after the
+#       fact, and these paths (rejection sampling, chunked verify, draft
+#       proposal, the DP lockstep) have no cheaper coverage. Anything added
+#       here lands on the critical path of every PR; weigh its runtime.
+#
+#   `*_performance*`   -- `@pytest.mark.nightly`, so the PR steps
+#       (`-m "not nightly"`) deselect them and only the nightly steps run
+#       them. They assert acceptance-rate floors that are calibration
+#       sensitive: a loaded shared agent can push an otherwise healthy run
+#       under the floor, and the floors are re-measured against the nightly
+#       baselines anyway. They gate throughput, not correctness.
 
 
 def _is_v7x():
@@ -186,42 +198,77 @@ SPEC_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens"
 SPEC_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens"
 
 
-def _assert_no_spec_divergence(prompts: list[str], ref_texts: list[str],
-                               spec_texts: list[str]):
+def _assert_no_spec_divergence(prompts: list[str],
+                               ref_texts: list[str],
+                               spec_texts: list[str],
+                               group_keys: list | None = None):
     """Speculation must not change greedy output. Shared by the in-process
     and served correctness tests so both apply the same standard.
 
-    Greedy decoding of one prompt has a single answer, but on TPU at batch > 1 the NO-SPEC reference does not
-    reproduce it on every row: a row's logits depend on its position in the
-    batch (tiling and reduction order), so a near-tie argmax can flip for one
-    row while its siblings agree. Comparing spec[i] to ref[i] positionally
-    charges such a baseline glitch to speculation. Compare each prompt's spec
-    rows against that prompt's majority reference output instead.
+    Greedy decoding of one prompt has a single answer, but on TPU at
+    batch > 1 NEITHER run reproduces it on every row: a row's logits depend
+    on its position in the batch (tiling and reduction order), so a near-tie
+    argmax can flip for one row while its siblings agree. Speculation does
+    not cause this -- the same flip, to the same alternative text, has been
+    observed in the no-spec reference -- and because the two runs batch
+    differently it lands on different rows. Comparing spec[i] to ref[i]
+    positionally charges it to speculation.
+
+    Compare each group's majority output instead. Every row of a group is
+    the same prompt with the same params, so each run must agree with itself
+    on a majority of the group, and the two majorities must then match. A
+    group of one degenerates to exact comparison, so unique-prompt callers
+    lose no strictness. A systematic masking or rejection bug moves a
+    group's majority and is still caught; a single flipped row inside an
+    otherwise-agreeing group is indistinguishable from the tiling noise
+    above and is tolerated -- for structured requests the caller's per-row
+    schema check still covers every row.
+
+    Rows are grouped by prompt. Pass `group_keys` when rows sharing a prompt
+    do NOT share sampling params (a mixed structured/unconstrained batch):
+    only rows that are supposed to produce the same text may vote in the
+    same majority, so the key has to carry whatever else varies per row.
     """
     assert len(ref_texts) == len(spec_texts) == len(prompts), (
         f"{len(prompts)} prompts, reference produced {len(ref_texts)} "
         f"outputs, speculative produced {len(spec_texts)}")
+    keys = prompts if group_keys is None else group_keys
+    assert len(keys) == len(prompts), (
+        f"{len(prompts)} prompts but {len(keys)} group keys")
 
-    rows_by_prompt: dict[str, list[int]] = collections.defaultdict(list)
-    for i, prompt in enumerate(prompts):
-        rows_by_prompt[prompt].append(i)
+    rows_by_key: dict[object, list[int]] = collections.defaultdict(list)
+    for i, key in enumerate(keys):
+        rows_by_key[key].append(i)
+    # A group votes on one expected text, so a key must be at least as
+    # fine-grained as the prompt. A key that pools rows with different
+    # prompts would compare unrelated outputs and still report a pass.
+    for key, rows in rows_by_key.items():
+        distinct = {prompts[i] for i in rows}
+        assert len(distinct) == 1, (
+            f"group key {key!r} pools {len(distinct)} different prompts "
+            f"across rows {rows}; the key must include the prompt")
 
-    misses = 0
-    for prompt, rows in rows_by_prompt.items():
-        counts = collections.Counter(ref_texts[i] for i in rows)
+    def majority(texts: list[str], rows: list[int], label: str,
+                 key: object) -> str:
+        counts = collections.Counter(texts[i] for i in rows)
         modal_text, modal_rows = counts.most_common(1)[0]
         if modal_rows != len(rows):
-            print(f"reference is not row-uniform for prompt {prompt!r}: "
-                  f"{len(counts)} distinct outputs across {len(rows)} rows "
+            print(f"{label} is not row-uniform for {key!r}: {len(counts)} "
+                  f"distinct outputs across {len(rows)} rows "
                   f"(majority {modal_rows}/{len(rows)})")
         assert modal_rows * 2 > len(rows), (
-            f"no majority reference output for prompt {prompt!r}; the "
-            f"baseline is too unstable to validate against: {dict(counts)}")
-        for i in rows:
-            if spec_texts[i] != modal_text:
-                misses += 1
-                print(f"ref_output: {modal_text}")
-                print(f"spec_output: {spec_texts[i]}")
+            f"no majority {label} output for {key!r}; it is too unstable to "
+            f"compare against: {dict(counts)}")
+        return modal_text
+
+    misses = 0
+    for key, rows in rows_by_key.items():
+        ref_modal = majority(ref_texts, rows, "reference", key)
+        spec_modal = majority(spec_texts, rows, "speculative", key)
+        if spec_modal != ref_modal:
+            misses += 1
+            print(f"ref_output: {ref_modal}")
+            print(f"spec_output: {spec_modal}")
 
     assert misses == 0
 
@@ -522,6 +569,7 @@ def _test_performance_helper(
                                 speculative_config["method"])
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1800)
 def test_ngram_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
@@ -537,6 +585,7 @@ def test_ngram_performance_greedy(
                              min_acceptance_rate=0.85)
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "async_scheduling",
@@ -580,6 +629,7 @@ def test_eagle3_performance(
     )
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "async_scheduling",
@@ -619,6 +669,7 @@ def test_dflash_performance_greedy(
     )
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "async_scheduling",
@@ -877,14 +928,22 @@ def test_structured_output_spec_decode_correctness_greedy(
             if i % 2 == 0:
                 _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+        # (b) Speculation must not change greedy output. Compared per-group
+        # majority, not row-for-row: the unconstrained rows run the full 64
+        # free tokens, and at this batch size either run can flip one row on
+        # a near-tie (see _assert_no_spec_divergence) -- both directions have
+        # been observed here. Structured and unconstrained rows share a
+        # prompt but not sampling params, so the group key carries the params
+        # too; they must not vote in one majority. Every structured row is
+        # still checked individually by (a) above.
+        ref_texts = [o.outputs[0].text for o in ref_outputs]
+        spec_texts = [o.outputs[0].text for o in spec_outputs]
+        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
+                      for i, prompt in enumerate(test_prompts)]
+        _assert_no_spec_divergence(test_prompts,
+                                   ref_texts,
+                                   spec_texts,
+                                   group_keys=group_keys)
 
         # (c) The masked verify path actually saw draft traffic.
         num_draft_tokens = num_accepted_tokens = 0
@@ -954,19 +1013,22 @@ def test_structured_output_spec_decode_non_greedy(
 
 
 @pytest.mark.timeout(2400)
-def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
+                                         async_scheduling: bool):
     """Structured outputs under greedy eagle3 speculative decoding.
 
     Same three assertions as the ngram combo test -- (a) every structured
     output satisfies its schema, (b) greedy output matches a no-spec
     reference, (c) drafts were proposed and accepted -- but with a
-    model-based drafter.
-
-    Sync scheduling only: eagle3 + async scheduling + structured output
-    raises NotImplementedError (the TPU async path keeps drafts on device,
-    so the engine cannot substitute them into the grammar bitmask).
+    model-based drafter. The async archive additionally exercises the
+    deferred grammar-bitmask path: the worker stages a host copy of each
+    step's device drafts for take_draft_token_ids(), which the engine
+    substitutes for the async scheduler's -1 placeholders.
     """
-    async_scheduling = False
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
     schema = {
         "type": "object",
@@ -1025,14 +1087,22 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch):
             if i % 2 == 0:
                 _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+        # (b) Speculation must not change greedy output. Compared per-group
+        # majority, not row-for-row: the unconstrained rows run the full 64
+        # free tokens, and at this batch size either run can flip one row on
+        # a near-tie (see _assert_no_spec_divergence) -- both directions have
+        # been observed here. Structured and unconstrained rows share a
+        # prompt but not sampling params, so the group key carries the params
+        # too; they must not vote in one majority. Every structured row is
+        # still checked individually by (a) above.
+        ref_texts = [o.outputs[0].text for o in ref_outputs]
+        spec_texts = [o.outputs[0].text for o in spec_outputs]
+        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
+                      for i, prompt in enumerate(test_prompts)]
+        _assert_no_spec_divergence(test_prompts,
+                                   ref_texts,
+                                   spec_texts,
+                                   group_keys=group_keys)
 
         # (c) The masked verify path actually saw draft traffic.
         num_draft_tokens = num_accepted_tokens = 0
@@ -1053,6 +1123,71 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch):
         spec_llm.llm_engine.engine_core.shutdown()
         del spec_llm
         cleanup_dist_env_and_memory()
+
+
+@pytest.mark.timeout(2400)
+def test_structured_output_eagle3_async_adversarial_choice(
+        monkeypatch: pytest.MonkeyPatch):
+    """Async + eagle3 + a choice constraint that fights greedy decoding.
+
+    The repeat-JSON workload above can pass even with a degraded bitmask:
+    greedy argmax already lands inside the grammar, so an all-allow mask row
+    is a fuse that never blows. Here the prompt pulls greedy decoding toward
+    free text while the constraint only allows two fixed multi-token strings.
+    If the bitmask were built from the async scheduler's -1 placeholders
+    (all-allow from the second draft position on), the model's own
+    continuation would slip through a spec-verify step and either violate
+    the choice or kill the request with a grammar error -- so every valid,
+    completed output is direct evidence the deferred-bitmask path saw the
+    real drafts.
+    """
+    model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    choices = ["strawberry banana kiwi", "pineapple mango papaya"]
+    params = SamplingParams(
+        temperature=0,
+        max_tokens=16,
+        structured_outputs=StructuredOutputsParams(choice=choices),
+    )
+    # Nothing in the prompt suggests the allowed strings: greedy wants a
+    # color word, the grammar only permits fruit.
+    prompts = ["My favorite color is " for _ in range(8)]
+
+    with monkeypatch.context():
+        spec_llm = LLM(
+            model=model_name,
+            speculative_config={
+                "method": "eagle3",
+                "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+                "num_speculative_tokens": 3,
+                "draft_tensor_parallel_size": 1,
+            },
+            max_model_len=256,
+            max_num_seqs=4,
+            tensor_parallel_size=_get_tensor_parallel_size(),
+            async_scheduling=True,
+            disable_log_stats=False,
+        )
+        try:
+            outputs = spec_llm.generate(prompts, params)
+            assert len(outputs) == len(prompts)
+            for output in outputs:
+                assert output.outputs[0].text in choices, (
+                    f"constraint violated: {output.outputs[0].text!r}")
+
+            # The constrained region must have seen draft traffic, else the
+            # masked verify path was never exercised. No acceptance floor:
+            # the constraint is designed to reject the model's own drafts.
+            num_draft_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == SPEC_DRAFT_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+            assert num_draft_tokens > 0, \
+                "no draft tokens proposed under structured outputs"
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
 
 
 @pytest.mark.timeout(1200)
@@ -1501,6 +1636,7 @@ def test_qwen35_mtp_dp_correctness_greedy(
     )
 
 
+@pytest.mark.nightly
 @pytest.mark.multichip
 @pytest.mark.timeout(2400)
 def test_qwen35_mtp_dp_performance_greedy(

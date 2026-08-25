@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING, Any
 
+import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
@@ -32,6 +33,9 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
+from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import \
+    fused_reverse_rope_wo_a_projection
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
     BATCH_AXIS, VllmDeepseekV4SWACache, _attention_csa, _attention_hca,
     get_packed_mla_head_size)
@@ -45,8 +49,68 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 
 logger = init_logger(__name__)
 
-# Cache compiled Pallas JAX attention ops by name to avoid duplicate graph tracing across layers.
-_attn_op_cache: dict[str, Any] = {}
+_pallas_op_cache: dict[str, Any] = {}
+
+
+# Module-level so `pallas.jax_op` can trace and register them as torch ops.
+def _qnorm_rope_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float,
+) -> jax.Array:
+    """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
+    return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+
+
+def _rope_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+) -> jax.Array:
+    """RoPE over the trailing `rotary_dim` channels of `x`."""
+    return rope_kernel.rope(x, positions, cos_sin_cache)
+
+
+def _o_proj_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scale: jax.Array,
+    *,
+    head_dim: int,
+) -> jax.Array:
+    """Inverse RoPE fused into the per-group `wo_a` projection."""
+    return fused_reverse_rope_wo_a_projection(
+        x,
+        positions,
+        cos_sin_cache,
+        wo_a,
+        wo_a_scale.reshape(-1),
+        head_dim=head_dim,
+        inverse=True,
+        quantize_activations=True,
+    )
+
+
+def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty_like(x)
+
+
+def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args,
+                 **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty((x.shape[0], wo_a.shape[-1]),
+                       dtype=x.dtype,
+                       device=x.device)
+
+
+def _name_float(value: float) -> str:
+    """A float rendered so it is safe inside a torch op name."""
+    return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
 
 
 def _live_cache(entry: object) -> torch.Tensor | None:
@@ -269,8 +333,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                    f"{'_aliased' if two_caches_same_buffer else ''}"
                    f"{'' if built_from_real_caches else '_prof'}")
 
-        if op_name in _attn_op_cache:
-            return _attn_op_cache[op_name], built_from_real_caches
+        if op_name in _pallas_op_cache:
+            return _pallas_op_cache[op_name], built_from_real_caches
 
         logger.info(
             "[ATTN_BUILD] %s: building %s logical_page_size=%s window=%s "
@@ -321,7 +385,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             return out_tensor, torch.empty_like(sw_cache)
 
         attn_jax_op.register_fake(_fake_attn)
-        _attn_op_cache[op_name] = attn_jax_op
+        _pallas_op_cache[op_name] = attn_jax_op
         return attn_jax_op, built_from_real_caches
 
     def attn_gemm(
@@ -336,21 +400,65 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
 
         return qr_kv, indexer_weights
 
+    @property
+    def qnorm_rope_op(self):
+        """The fused q-RMSNorm + RoPE op, built lazily on first forward."""
+        op = self.__dict__.get("_qnorm_rope_op_instance")
+        if op is not None:
+            return op
+
+        eps = float(self.mla_attn.eps)
+        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_qnorm_rope_jax, eps=eps),
+                mesh=get_vllm_model_wrapper_context().mesh,
+                input_partition_specs=(
+                    P(None, "model", None),  # q
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                ),
+            )
+            op.register_fake(_fake_rope)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qnorm_rope_op_instance", op)
+        return op
+
+    @property
+    def kv_rope_op(self):
+        """The RoPE op for the decoupled key states, built lazily."""
+        op = self.__dict__.get("_kv_rope_op_instance")
+        if op is not None:
+            return op
+
+        op_name = "pallas::deepseek_v4_kv_rope"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                _rope_jax,
+                mesh=get_vllm_model_wrapper_context().mesh,
+                input_partition_specs=(
+                    P(),  # kv
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                ),
+            )
+            op.register_fake(_fake_rope)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_kv_rope_op_instance", op)
+        return op
+
     def qnorm_rope(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """Apply RMSNorm and scaling RoPE to query head states."""
-        orig_dtype = q.dtype
-        qf = q.to(torch.float32)
-
-        rms = torch.rsqrt(
-            qf.pow(2).mean(dim=-1, keepdim=True) + self.mla_attn.eps)
-        qf = qf * rms
-
-        q_rotated, _ = self.mla_attn.rotary_emb(positions, qf)
-        return q_rotated.to(orig_dtype)
+        return self.qnorm_rope_op(q, positions,
+                                  self.mla_attn.rotary_emb.cos_sin_cache)
 
     def kv_rope(
         self,
@@ -358,11 +466,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """Apply scaling RoPE to decoupled key states."""
-        orig_dtype = kv.dtype
-        kv_rotated, _ = self.mla_attn.rotary_emb(
-            positions,
-            kv.unsqueeze(1).to(torch.float32))
-        return kv_rotated.squeeze(1).to(orig_dtype)
+        return self.kv_rope_op(kv, positions,
+                               self.mla_attn.rotary_emb.cos_sin_cache)
 
     def attention_impl(
         self,
@@ -553,28 +658,121 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
 
         return output
 
+    @property
+    def o_proj_op(self):
+        """The fused inverse-RoPE + `wo_a` projection op, built lazily."""
+        op = self.__dict__.get("_o_proj_op_instance")
+        if op is not None:
+            return op
+
+        self._assert_o_proj_supported()
+        head_dim = int(self.head_dim)
+        op_name = f"pallas::deepseek_v4_o_proj_d{head_dim}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_o_proj_jax, head_dim=head_dim),
+                mesh=get_vllm_model_wrapper_context().mesh,
+                input_partition_specs=(
+                    P(None, "model", None),  # o
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                    P(),  # wo_a
+                    P(),  # wo_a_scale
+                ),
+            )
+            op.register_fake(_fake_o_proj)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_o_proj_op_instance", op)
+        return op
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Store `wo_a` in the layout the fused o-projection kernel wants,
+        which is (self.n_local_heads * self.head_dim // self.n_local_groups,
+                  self.n_local_groups * self.o_lora_rank).
+        """
+        del act_dtype
+        weight = self.wo_a.weight
+        transposed = (self.n_local_heads * self.head_dim //
+                      self.n_local_groups,
+                      self.n_local_groups * self.o_lora_rank)
+        if tuple(weight.shape) == transposed:
+            # Already done -- a reload path can run this hook twice.
+            return
+        assert tuple(weight.shape) == transposed[::-1], (
+            f"{self.prefix}.wo_a: expected the linear to hold "
+            f"{list(transposed[::-1])}, got {list(weight.shape)}.")
+
+        out = torch.empty(transposed, dtype=weight.dtype, device=weight.device)
+        out.copy_(weight.data.t())
+        self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+
+    def _assert_o_proj_supported(self) -> None:
+        """Check what the fused `wo_a` kernel requires.
+
+        The kernel is the only `wo_a` path, so an unmet condition is a
+        configuration error.
+        """
+        weight = self.wo_a.weight
+        scale = getattr(self.wo_a, "weight_scale", None)
+
+        # Both MXU operands are fp8: the kernel quantizes the activations
+        # itself and multiplies them against the fp8 `wo_a`. A different
+        # runtime weight dtype (REQUANTIZE_WEIGHT_DTYPE) has nothing to run on.
+        assert weight.dtype == torch.float8_e4m3fn, (
+            f"{self.prefix}.wo_a: the fused o-projection kernel needs an "
+            f"fp8_e4m3fn weight, got {weight.dtype}. Check "
+            "REQUANTIZE_WEIGHT_DTYPE and that the checkpoint is fp8.")
+
+        # Per-output-channel scales only. The blockwise requantization path
+        # (ENABLE_QUANTIZED_MATMUL_KERNEL + REQUANTIZE_BLOCK_SIZE) reshapes
+        # this to [n_in_blocks, 1, n_out], which the kernel cannot consume.
+        assert scale is not None and scale.ndim == 1 and scale.shape[0] == (
+            weight.shape[-1]), (
+                f"{self.prefix}.wo_a: the fused o-projection kernel needs a "
+                f"per-channel weight_scale of shape [{weight.shape[-1]}], got "
+                f"{None if scale is None else list(scale.shape)}. Unset "
+                "REQUANTIZE_BLOCK_SIZE.")
+
+        # `wo_a` is applied per group, and the kernel assumes one group's
+        # heads fill exactly one sublane.
+        assert self.n_local_heads % self.n_local_groups == 0
+        heads_per_group = self.n_local_heads // self.n_local_groups
+        assert heads_per_group == 8, (
+            f"{self.prefix}.wo_a: the fused o-projection kernel assumes 8 "
+            f"heads per group, got {heads_per_group}.")
+
+        # Lane/rotation constraints of the kernel and its cos/sin gather.
+        assert self.head_dim % 128 == 0, (
+            f"{self.prefix}.wo_a: head_dim {self.head_dim} is not a multiple "
+            "of the 128-lane width.")
+        rotary_dim = self.rotary_emb.cos_sin_cache.shape[-1]
+        assert rotary_dim % 2 == 0 and rotary_dim <= 128, (
+            f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at "
+            "most 128.")
+
     def _o_proj(self, o: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
-        t = o.shape[0]
-        o_f = o.to(torch.float32).view(t, self.n_local_heads, self.head_dim)
-        o_ref, _ = self.rotary_emb(positions, o_f, inverse=True)
-        o_ref = o_ref.to(torch.bfloat16)
+        # The kernel folds the inverse RoPE, the activation quantization and
+        # the per-group `wo_a` matmul into one pass.
+        assert o.dtype == torch.bfloat16, (
+            f"{self.prefix}: the fused o-projection kernel needs bf16 "
+            f"activations, got {o.dtype}.")
+        assert o.shape[1:] == (self.n_local_heads, self.head_dim), (
+            f"{self.prefix}: the fused o-projection kernel consumes the heads "
+            f"in place and needs [t, {self.n_local_heads}, {self.head_dim}], "
+            f"got {list(o.shape)}.")
+        z = self.o_proj_op(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.wo_a.weight,
+            self.wo_a.weight_scale,
+        )
 
-        n_local_groups = self.n_local_groups
-        o_lora_rank = self.o_lora_rank
-
-        o_ref_grouped = o_ref.view(t, n_local_groups, -1)
-        wo_a_grouped = self.wo_a.weight.view(n_local_groups, o_lora_rank, -1)
-        wo_a_scale = self.wo_a.weight_scale.view(n_local_groups, o_lora_rank)
-
-        z = torch.einsum("tgd,grd->tgr", o_ref_grouped,
-                         wo_a_grouped.to(torch.bfloat16))
-        z = z * wo_a_scale.unsqueeze(0).to(torch.bfloat16)
-        z = z.to(torch.bfloat16)
-        z_flat = z.flatten(1)
-
-        out = self.wo_b(z_flat)
+        out = self.wo_b(z)
         if isinstance(out, tuple):
             out = out[0]
         return out

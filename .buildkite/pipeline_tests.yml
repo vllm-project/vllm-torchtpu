@@ -26,11 +26,11 @@ steps:
   - group: "Unit Tests on TPU"
     depends_on: "build_docker"
     steps:
-      # Every test in test_speculative_decoding.py is nightly-marked, so a
-      # dedicated PR step for it collected 37 items, deselected 37, and exited 5
-      # -- masked by the `|| [ $? -eq 5 ]` in unit_test_defaults. Folding the
-      # file into the general selection drops the step (and its agent) while
-      # keeping a future non-nightly spec-decode test gated at PR time.
+      # test_speculative_decoding.py gets its own PR steps, mirroring the
+      # nightly pair below, so spec-decode results are visible as their own
+      # step rather than buried in the general run and so the suite runs on
+      # its own agent instead of serializing behind everything else. The
+      # general steps exclude the file to avoid running it twice.
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
@@ -40,6 +40,7 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (PR)"
@@ -53,6 +54,34 @@ steps:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      # Correctness only at PR time: the `*_performance*` tests are
+      # nightly-marked (acceptance-rate floors are calibration sensitive on a
+      # loaded agent), so `not nightly` deselects them here and the nightly
+      # steps below still run them.
+      - label: "Unit Tests - Speculative Decoding (PR)"
+        key: "unit_tests_spec_decode_pr"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") != "1"'
+        agents:
+          queue: "tpu_v7x_2_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=1800 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - Speculative Decoding Multichip (PR)"
+        key: "unit_tests_spec_decode_multichip_pr"
+        <<: *unit_test_defaults
+        if: 'build.env("NIGHTLY") != "1"'
+        agents:
+          queue: "tpu_v7x_8_queue"
+        plugins:
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=3600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
