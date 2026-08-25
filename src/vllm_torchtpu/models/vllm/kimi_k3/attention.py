@@ -37,6 +37,24 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def kda_state_dtype(
+        vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
+    """Storage dtypes for one KDA layer's conv and recurrent state.
+
+    The conv cache is fp32 regardless of ``mamba_cache_dtype``: v3's conv1d
+    needs fp32 compact layout, so anything narrower makes ``fused_conv1d_gdn``
+    widen the whole slot pool once per layer per step. Past about a thousand
+    slots that costs more than the fused kernel saves.
+    ``VllmGatedDeltaNetAttention.get_state_dtype`` declares fp32 for the same
+    reason.
+    """
+    _, recurrent_dtype = MambaStateDtypeCalculator.kda_state_dtype(
+        vllm_config.model_config.dtype,
+        vllm_config.cache_config.mamba_cache_dtype,
+    )
+    return torch.float32, recurrent_dtype
+
+
 def _load_a_log(parameter: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Load either the old ``[1, 1, H, 1]`` or current ``[H]`` layout."""
 
@@ -472,10 +490,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         return MambaAttentionBackendEnum.LINEAR
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.kda_state_dtype(
-            self.vllm_config.model_config.dtype,
-            self.vllm_config.cache_config.mamba_cache_dtype,
-        )
+        return kda_state_dtype(self.vllm_config)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         # Keep the KDA short-convolution cache in the Pallas DMA layout.

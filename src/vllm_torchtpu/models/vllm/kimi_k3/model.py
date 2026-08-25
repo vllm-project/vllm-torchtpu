@@ -18,8 +18,7 @@ from vllm.model_executor.layers.fused_moe import \
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateCopyFunc, MambaStateCopyFuncCalculator,
-    MambaStateDtypeCalculator)
+    MambaStateCopyFunc, MambaStateCopyFuncCalculator)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.compressed_tensors import \
     compressed_tensors
@@ -48,7 +47,8 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu.utils import synchronize_tensors
 
-from .attention import KimiDeltaAttention, MultiHeadLatentAttention
+from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
+                        kda_state_dtype)
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
@@ -297,10 +297,9 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.kda_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-        )
+        # Same helper the layer uses. vLLM sizes the cache from here and
+        # allocates from get_state_dtype, so the two cannot diverge.
+        return kda_state_dtype(vllm_config)
 
     @classmethod
     def get_mamba_state_shape_from_config(

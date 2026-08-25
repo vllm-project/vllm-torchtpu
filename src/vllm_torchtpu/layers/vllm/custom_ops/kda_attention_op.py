@@ -29,13 +29,12 @@ logger = init_logger(__name__)
 def _use_fused_kda() -> bool:
     """Whether to route KDA through the fused conv1d + GDN v3 kernel.
 
-    Read per build rather than at import so it can be flipped between
-    builds. Off by default here only to keep this change inert: the fused
-    path matches the manual one on gsm8k with Kimi-Linear-48B (0.8969 vs
-    0.8886 flexible-extract, against a stderr of 0.0087), so switching the
-    default is a follow-up rather than a blocked item.
+    Read per build rather than at import so it can be flipped between builds.
+    ``VLLM_TORCHTPU_KDA_FUSED=0`` gets the manual path back, and is the only
+    way to reach ``VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL=mega``, since the fused
+    core replaces the whole op instead of composing with the prefill choice.
     """
-    return os.environ.get("VLLM_TORCHTPU_KDA_FUSED", "0") == "1"
+    return os.environ.get("VLLM_TORCHTPU_KDA_FUSED", "1") == "1"
 
 
 def _token_sequence_ids(
@@ -652,14 +651,21 @@ def build_kimi_dispatched_kda_op(
     # the chunked/mega selection rather than composing with it.
     use_fused = _use_fused_kda()
     variant = "fused" if use_fused else prefill_kernel
-    core = _build_fused_core(lower_bound, eps) if use_fused else dispatched_core
+    core = _build_fused_core(lower_bound,
+                             eps) if use_fused else dispatched_core
+
+    if use_fused and prefill_kernel != "chunked":
+        logger.warning(
+            "VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL=%s is ignored while the fused "
+            "KDA path is on. Set VLLM_TORCHTPU_KDA_FUSED=0 to use it.",
+            prefill_kernel)
 
     # vLLM's compile cache is keyed on the model config and not on either env
     # var, so the variant goes in the op name. If this line disagrees with the
     # kernels in a profile, the run came from cache.
-    logger.info("KDA op %s: using the %s path.", prefix,
-                "fused conv1d + GDN v3" if use_fused else
-                f"manual with {prefill_kernel} prefill")
+    logger.info(
+        "KDA op %s: using the %s path.", prefix, "fused conv1d + GDN v3"
+        if use_fused else f"manual with {prefill_kernel} prefill")
 
     op_name = (f"pallas::kimi_dispatched_kda_{variant}_"
                f"{prefix.replace('.', '_')}")
