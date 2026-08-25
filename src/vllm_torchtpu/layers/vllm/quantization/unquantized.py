@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization import \
     register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
+from vllm.model_executor.utils import replace_parameter
 
 from vllm_torchtpu.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
@@ -59,6 +60,61 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
+    """Dense linear on the canonical (k, n) weight layout.
+
+    vLLM's stock `UnquantizedLinearMethod` runs `F.linear(x, W)` with `W`
+    stored `[n_out, n_in]`, i.e. `(m, k) @ (n, k).T`. The transposed
+    contraction is inefficient on TPU, so the weight is transposed once after
+    loading and the forward pass becomes a plain `(m, k) @ (k, n)` matmul.
+    This matches the layout the FP8 dense path and the MoE GMM kernels already
+    use.
+
+    `create_weights` is inherited unchanged on purpose: vLLM's loaders slice
+    `[n_out, n_in]` using the parameter's `input_dim=1` / `output_dim=0`
+    attributes to shard across TP ranks, so the transpose has to happen after
+    loading rather than at creation.
+    """
+
+    # Marks a layer whose weight has already been flipped to (k, n), so a
+    # second process_weights_after_loading call cannot transpose it back.
+    _KMAJOR_ATTR = "_tpu_kmajor_weight"
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, self._KMAJOR_ATTR, False):
+            return
+        weight = layer.weight.data
+        if weight.dim() != 2:
+            # Not a plain dense weight; leave the stock behaviour alone.
+            return
+        weight = weight.transpose(0, 1).contiguous()
+        replace_parameter(layer, "weight",
+                          torch.nn.Parameter(weight, requires_grad=False))
+        setattr(layer, self._KMAJOR_ATTR, True)
+        if layer.weight.device.type == "tpu":
+            synchronize_tensors([layer.weight])
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # layer.weight is [n_in, n_out], so this contracts x's trailing dim
+        # against axis 0 with no transpose.
+        weight = layer.weight
+        if bias is None:
+            return torch.matmul(x, weight)
+        # Fuse the bias via addmm rather than `matmul(...) + bias`: the latter
+        # rounds the product to the activation dtype before adding, which
+        # diverges from F.linear's single rounding and would silently change
+        # outputs for every bf16 model. addmm accumulates then rounds once,
+        # keeping this bit-identical to vLLM's stock path.
+        orig_out_shape = (*x.shape[:-1], weight.shape[-1])
+        x_2d = x.reshape(-1, x.shape[-1])
+        return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
 
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
@@ -106,13 +162,10 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             A QuantizeMethodBase implementation, or None to use defaults.
         """
         if isinstance(layer, LinearBase):
-            # Return None to let vLLM use its default UnquantizedLinearMethod
-            # which uses torch.matmul - works fine on TPU
-            # TODO: Do we need to use our own linear method?
-            logger.warning_once(
-                "Using vLLM's unquantized linear method for layer, performance may be affected."
-            )
-            return UnquantizedLinearMethod()
+            # TPU-native dense linear: canonical (k, n) weight layout so the
+            # forward pass is (m, k) @ (k, n) rather than vLLM's
+            # (m, k) @ (n, k).T.
+            return VllmUnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):
             # For MoE layers, use our custom TPU implementation

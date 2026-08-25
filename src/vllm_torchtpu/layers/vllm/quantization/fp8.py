@@ -44,8 +44,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
 from vllm.model_executor.layers.linear import (
-    LinearBase, UnquantizedLinearMethod,
-    register_weight_loader_v2_supported_method)
+    LinearBase, register_weight_loader_v2_supported_method)
 from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -199,17 +198,20 @@ def _format_linear_scale_for_runtime(
 ) -> torch.Tensor:
     """Reshape `weight_scale` to the layout expected by the matmul bridge.
 
-    - Blockwise kernel path: kernel expects `[n_in_blocks, 1, n_out]`. The
-      requantizer produces `[n_out, n_in_blocks]`, so transpose and add the
-      singleton middle axis.
+    - Blockwise path: gmm_v2 expects `[1, n_in_blocks, 1, n_out]` (its
+      `[size_group, num_blocks, 1, out_size]` rhs_scale, single group). The
+      requantizer produces `[n_out, n_in_blocks]`, so transpose and add both
+      the singleton middle axis and the leading group axis.
     - XLA per-channel path: kernel expects a 1-D `[n_out]` scale, so drop
-      a trailing singleton dim if present.
+      a trailing singleton dim if present. Layout independent -- the scale is
+      per output channel either way.
     """
     weight_scale = weight_scale.to(torch.float32).contiguous()
     if blockwise_kernel:
-        # quantize_tensor returns [n_out, n_blocks]. The blockwise kernel
-        # expects [n_blocks, 1, n_out].
-        weight_scale = weight_scale.transpose(0, 1).contiguous().unsqueeze(1)
+        # quantize_tensor returns [n_out, n_blocks]; gmm_v2 wants
+        # [1, n_blocks, 1, n_out].
+        weight_scale = weight_scale.transpose(
+            0, 1).contiguous().unsqueeze(1).unsqueeze(0)
     elif weight_scale.ndim == 2 and weight_scale.shape[-1] == 1:
         weight_scale = weight_scale.squeeze(-1).contiguous()
     return weight_scale
@@ -601,7 +603,9 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                     ignored_layers=self.ignored_layers,
                     fused_mapping=self.packed_modules_mapping,
             ):
-                return UnquantizedLinearMethod()
+                from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+                    VllmUnquantizedLinearMethod
+                return VllmUnquantizedLinearMethod()
             return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
 
         if isinstance(layer, Attention):
@@ -987,6 +991,16 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             requant_dtype_name = desired_quant_dtype
 
+        # Canonical (k, n) layout: the runtime matmul is (m, k) @ (k, n), so
+        # the checkpoint's [n_out, n_in] weight is transposed once here at load
+        # instead of being transposed per step inside the contraction. Placed
+        # where both branches above converge (fp8-serialized checkpoint and
+        # load-time quantization) so neither can reach the matmul N-major, and
+        # after quantization so the requantizer still sees the contracting dim
+        # last (axis=-1). The reallocation below materializes the view.
+        ckpt_n_out, ckpt_n_in = weight.shape
+        weight = weight.transpose(0, 1)
+
         # The dequant/requant chain may leave views backed by higher-rank PJRT
         # buffers. Allocate fresh contiguous persistent parameters so the
         # matmul boundary sees plain row-major buffers.
@@ -1009,13 +1023,16 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream linear kernels and dequantization
         # pipelines properly recognize scale broadcast granularity right across tensor-parallel shards.
         if requant_block_size is None:
+            # Stated in checkpoint [n_out, n_in] terms, which is what the
+            # downstream dequantization pipelines read; the transpose above
+            # changes only the runtime matmul layout, not scale granularity.
             if weight_scale.ndim == 1:
-                if weight_scale.shape[0] == weight.shape[0]:
-                    layer.weight_block_size = (1, weight.shape[1])
+                if weight_scale.shape[0] == ckpt_n_out:
+                    layer.weight_block_size = (1, ckpt_n_in)
                 else:
-                    layer.weight_block_size = (weight.shape[0], 1)
+                    layer.weight_block_size = (ckpt_n_out, 1)
             else:
-                layer.weight_block_size = (weight.shape[0], weight.shape[1])
+                layer.weight_block_size = (ckpt_n_out, ckpt_n_in)
         else:
             layer.weight_block_size = requant_block_size
 

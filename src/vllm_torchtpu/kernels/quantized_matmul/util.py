@@ -73,14 +73,18 @@ def xla_quantized_matmul(
     quantize_activation=True,
 ) -> jax.Array:
     """
-    Reference (pure JAX) implementation of the quantized matmul kernel below.
+    Reference (pure JAX) implementation of the quantized matmul kernel.
+
+    Weights are in the canonical (k, n) layout, so this is a plain
+    `(m, k) @ (k, n)` contraction. Callers holding an N-major
+    `[n_output_features, n_input_features]` weight (the Pallas kernels and
+    their tests) transpose at the call site.
 
     Args:
         x:  Activation.
-        w_q: Weight quantized array. [n_output_features, n_input_features]
-        w_s: Weight quantization scale. [n_output_features]
-        mesh: Mesh to shard on.
-        weight_sharding: PartitionSpec for the weight tensor.
+        x: Activation. [num_tokens, n_input_features]
+        w_q: Weight quantized array. [n_input_features, n_output_features]
+        w_scale: Weight quantization scale. [n_output_features]
 
     Returns:
         Output of the quantized matmul.
@@ -94,7 +98,7 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x_q,
             w_q,
-            dimension_numbers=(((1, ), (1, )), ((), ())),
+            dimension_numbers=(((1, ), (0, )), ((), ())),
             preferred_element_type=acc_dtype,
         ).astype(jnp.float32)
         out *= x_scale
@@ -102,7 +106,7 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x,
             w_q,
-            dimension_numbers=(((1, ), (1, )), ((), ())),
+            dimension_numbers=(((1, ), (0, )), ((), ())),
             preferred_element_type=jnp.float32,
         )
     out *= jnp.expand_dims(w_scale, 0)

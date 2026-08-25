@@ -643,9 +643,11 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         jnp.float8_e4m3fn,
     )
     qkvz_weight_scale = qkvz_weight_scale[:, 0]
+    # `qkvz_weight` is N-major `[n_out, n_in]` to match the projection kernel;
+    # `xla_quantized_matmul` takes the canonical (k, n) layout.
     projected_qkvz = quantized_matmul_util.xla_quantized_matmul(
         hidden,
-        qkvz_weight,
+        qkvz_weight.T,
         qkvz_weight_scale,
     )
     mixed_qkv = projected_qkvz[:, :qkv_dim]

@@ -193,7 +193,9 @@ class TestFp8LinearRuntimeQuant:
             FakeQuant(weight_block_size=[block_h, block_w]))
         method.process_weights_after_loading(layer)
 
-        assert layer.weight.shape == (out_dim, in_dim)
+        # Canonical (k, n): the runtime matmul is (m, k) @ (k, n), so the
+        # checkpoint's [n_out, n_in] weight is stored transposed.
+        assert layer.weight.shape == (in_dim, out_dim)
         assert layer.weight.dtype == torch.float8_e4m3fn
         assert layer.weight_scale.shape == (out_dim, )
         assert layer.weight_scale.dtype == torch.float32
@@ -224,22 +226,26 @@ class TestFp8LinearRuntimeQuant:
             FakeQuant(weight_block_size=[block_h, block_w]))
         method.process_weights_after_loading(layer)
 
-        w = layer.weight.float() * layer.weight_scale[:, None]
-        # fp8 ones = 1.0, so each block should be scaled by its scale_inv
-        # Block [0,0] (top-left 128x128) should be ~1.0
-        # Block [0,1] (top-right 128x128) should be ~2.0
-        # Block [1,0] (bottom-left 128x128) should be ~3.0
-        # Block [1,1] (bottom-right 128x128) should be ~4.0
+        # Weight is stored (k, n), so it indexes [in, out] and the
+        # per-output-channel scale broadcasts along the trailing axis.
+        w = layer.weight.float() * layer.weight_scale[None, :]
+        # fp8 ones = 1.0, so each block should be scaled by its scale_inv.
+        # w[i, o] == w_checkpoint[o, i], so the off-diagonal blocks swap
+        # relative to the checkpoint's [out, in] grid:
+        # scale_inv[0,0] -> w[:128, :128]  ~1.0
+        # scale_inv[1,0] -> w[:128, 128:]  ~3.0
+        # scale_inv[0,1] -> w[128:, :128]  ~2.0
+        # scale_inv[1,1] -> w[128:, 128:]  ~4.0
         assert torch.allclose(w[:128, :128].mean(),
                               torch.tensor(1.0, device=device),
                               rtol=0.06,
                               atol=0.05)
         assert torch.allclose(w[:128, 128:].mean(),
-                              torch.tensor(2.0, device=device),
+                              torch.tensor(3.0, device=device),
                               rtol=0.06,
                               atol=0.05)
         assert torch.allclose(w[128:, :128].mean(),
-                              torch.tensor(3.0, device=device),
+                              torch.tensor(2.0, device=device),
                               rtol=0.06,
                               atol=0.05)
         assert torch.allclose(w[128:, 128:].mean(),
@@ -268,7 +274,9 @@ class TestFp8LinearRuntimeQuant:
         assert layer.weight.dtype == torch.float8_e4m3fn
         assert layer.weight_scale.shape == (out_dim, )
         # fp8 ones * 2.5 should be ~2.5
-        runtime_deq = layer.weight.float() * layer.weight_scale[:, None]
+        # (k, n) storage: scale is per output channel, so it broadcasts
+        # along the trailing axis.
+        runtime_deq = layer.weight.float() * layer.weight_scale[None, :]
         assert torch.allclose(runtime_deq.mean(),
                               torch.tensor(2.5, device=device),
                               atol=0.1)
@@ -322,8 +330,10 @@ class TestFp8LinearRuntimeQuant:
             FakeQuant(weight_block_size=[128, 128]))
 
         layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(torch.ones(out_dim,
-                                                     in_dim,
+        # apply() consumes the canonical (k, n) layout that
+        # process_weights_after_loading produces, i.e. [n_in, n_out].
+        layer.weight = torch.nn.Parameter(torch.ones(in_dim,
+                                                     out_dim,
                                                      device=device,
                                                      dtype=torch.bfloat16).to(
                                                          torch.float8_e4m3fn),
@@ -370,7 +380,8 @@ class TestFp8LinearRuntimeQuant:
         method.process_weights_after_loading(layer)
 
         assert layer.weight.dtype == torch.float8_e4m3fn
-        assert layer.weight_scale.shape == (in_dim // 128, 1, out_dim)
+        # gmm_v2 rhs_scale layout: [size_group, num_blocks, 1, out_size].
+        assert layer.weight_scale.shape == (1, in_dim // 128, 1, out_dim)
 
     def test_blockwise_kernel_requires_block_size(self, monkeypatch):
         """Match ullm: enabling the blockwise kernel requires block size."""
@@ -391,8 +402,8 @@ class TestFp8LinearRuntimeQuant:
     def test_blockwise_scale_output_dim_validated(self):
         """Blockwise matmul should reject scales with the wrong output dim."""
         x = jnp.ones((2, 4), dtype=jnp.bfloat16)
-        w_q = jnp.ones((3, 4), dtype=jnp.float8_e4m3fn)
-        w_scale = jnp.ones((1, 1, 2), dtype=jnp.float32)
+        w_q = jnp.ones((4, 3), dtype=jnp.float8_e4m3fn)  # (k, n)
+        w_scale = jnp.ones((1, 1, 1, 2), dtype=jnp.float32)  # n=2 != 3
 
         with pytest.raises(ValueError, match="output dim"):
             _quantized_matmul_jax(x, w_q, w_scale)
@@ -400,8 +411,8 @@ class TestFp8LinearRuntimeQuant:
     def test_blockwise_scale_block_count_validated(self):
         """Blockwise matmul should reject ambiguous scale block counts."""
         x = jnp.ones((2, 5), dtype=jnp.bfloat16)
-        w_q = jnp.ones((3, 5), dtype=jnp.float8_e4m3fn)
-        w_scale = jnp.ones((2, 1, 3), dtype=jnp.float32)
+        w_q = jnp.ones((5, 3), dtype=jnp.float8_e4m3fn)  # (k, n), k=5
+        w_scale = jnp.ones((1, 2, 1, 3), dtype=jnp.float32)  # 5 % 2 != 0
 
         with pytest.raises(ValueError, match="divisible by block scale count"):
             _quantized_matmul_jax(x, w_q, w_scale)
