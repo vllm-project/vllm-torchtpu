@@ -413,6 +413,9 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    _gm_id: jax.Array | int | None = None,
+    _k_id: jax.Array | int | None = None,
+    _num_k: int | None = None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -432,9 +435,16 @@ def inner_kernel(
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
+        _gm_id: Overrides the gm grid index. Defaults to the (num_n, num_gm,
+            num_k) pipeline's gm axis.
+        _k_id: Overrides the k grid index. Defaults to that pipeline's k axis.
+        _num_k: Overrides the number of k steps. Defaults to the size of that
+            pipeline's k axis.
     """
 
-    gm_id = pl.program_id(1)
+    # gmm_v2_fused drives this kernel from a (num_gm,) grid and computes the k
+    # split itself, so it has no grid axis to read these from.
+    gm_id = pl.program_id(1) if _gm_id is None else _gm_id
     m_start = metadata_ref.gm_id_to_m_offset[gm_id]
     m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
     m_offset = m_start - m_start % cfgs.dims.size_lhs_sublane
@@ -649,8 +659,8 @@ def inner_kernel(
                     is_last_k_step=True,
                     bucket_m=bucket_m)
 
-        num_k = pl.num_programs(2)
-        k_id = pl.program_id(2)
+        num_k = pl.num_programs(2) if _num_k is None else _num_k
+        k_id = pl.program_id(2) if _k_id is None else _k_id
         is_first_k_step = k_id == 0
         is_last_k_step = k_id == (num_k - 1)
 
