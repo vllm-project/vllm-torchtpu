@@ -33,6 +33,43 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
         vllm_config.model_config.architecture)
 
 
+def validate_kv_layout_supports_unified_pool(backend_cls) -> None:
+    """Reject KV layouts whose pages cannot host pooled GDN state.
+
+    The pooled layout carves whole FA *token rows* out of the tail of each
+    page (`derive_pooled_gdn_state_layout` counts the conv and SSM regions in
+    units of `fa_physical_bytes_per_token`), so one token's bytes have to be
+    contiguous within a page. That holds for HEAD_ALONG_SUBLANE, whose page is
+    `[page_size, ...]` with the token axis outermost, but not for
+    SEQ_ALONG_LANE, whose token axis is innermost: there a single token is one
+    lane, strided across the entire page, and a reserved "row" would interleave
+    byte-for-byte with live attention data instead of sitting after it.
+
+    Making the pool layout-aware means giving the GDN regions whole pages
+    rather than token rows, which is b/545917884 and not something a page-size
+    calculation can paper over — so fail loudly instead of corrupting state.
+    """
+    from vllm_torchtpu.kernels.experimental.batched_rpa import configs
+    from vllm_torchtpu.layers.vllm.attention import (
+        PallasBatchedRPAAttentionBackend, resolve_batched_rpa_kv_layout)
+
+    if resolve_batched_rpa_kv_layout() is not configs.KVLayout.SEQ_ALONG_LANE:
+        return
+    # Only the batched-RPA backend reads the layout; on any other backend the
+    # env var selects nothing and there is nothing to reject.
+    if not (isinstance(backend_cls, type)
+            and issubclass(backend_cls, PallasBatchedRPAAttentionBackend)):
+        return
+    raise NotImplementedError(
+        "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache layout, "
+        "which cannot back the unified block pool: pooled GDN state is "
+        "addressed as whole token rows inside a page, and SEQ_ALONG_LANE "
+        "spreads each token across the page's lane axis. Use "
+        "VLLM_KV_CACHE_LAYOUT=NHD for this model, or run it with "
+        "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 if its architecture does not "
+        "need the pool.")
+
+
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,

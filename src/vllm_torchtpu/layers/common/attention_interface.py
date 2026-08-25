@@ -18,6 +18,8 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
@@ -321,15 +323,27 @@ def sharded_ragged_paged_attention(
     shard: bool = True,
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout | None = None,
 ):
     """Shards along KV heads."""
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
-    if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not use_hd64:
-        kv_cache_spec = P(None, "model", None, None, None)
-    else:
-        kv_cache_spec = P(None, None, "model", None, None)
+    # Both forks can lay the cache out seq-along-lane, and they announce it
+    # differently: the longctx fork reads `USE_BATCHED_RPA_SEQ_ON_LANE` inside
+    # its own wrapper, while the mainline fork is handed an explicit
+    # `kv_layout` resolved from `VLLM_KV_CACHE_LAYOUT`. This is the one site
+    # both share, so it honours either signal.
+    seq_along_lane = ((kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+                       or envs.USE_BATCHED_RPA_SEQ_ON_LANE) and not use_hd64)
+    # The KV-head axis is what gets sharded, and the two layouts put it in
+    # different places: HEAD_ALONG_SUBLANE packs KV heads into dim 2, while
+    # SEQ_ALONG_LANE gives them dim 1 outright and fills dim 2 with head_dim
+    # words. Sharding dim 2 under SEQ_ALONG_LANE splits head_dim across chips;
+    # the kernel's `validate_inputs` rejects the resulting per-shard shape, so
+    # getting this wrong fails loudly rather than corrupting output.
+    kv_cache_spec = (P(None, "model", None, None, None)
+                     if seq_along_lane else P(None, None, "model", None, None))
     in_specs = (
         qkv_spec,  # q
         qkv_spec,  # k
@@ -362,7 +376,7 @@ def sharded_ragged_paged_attention(
     # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the local path.
     block_kwargs: dict[str, Any] = {}
     if not shard and kv_block_cap is not None and not use_hd64:
-        page_size = kv_cache.shape[1]
+        page_size = kv_cache.shape[4] if seq_along_lane else kv_cache.shape[1]
         max_num_seqs = kv_lens.shape[0]
         pages_per_seq = page_indices.shape[0] // max_num_seqs
         cap_tokens = max(page_size, (kv_block_cap // page_size) * page_size)
@@ -390,6 +404,17 @@ def sharded_ragged_paged_attention(
             block_kwargs["p_block_sizes"] = _capped(
                 rpa_default.RpaCase.PREFILL)
 
+    # Only the batched kernel takes a layout; the v3 and hd64 kernels have a
+    # single layout and no such parameter. head_dim==64 was rerouted to hd64
+    # above, and HEAD_ALONG_SUBLANE is the only layout that reaches it — a
+    # SEQ_ALONG_LANE cache for a 64-wide head is refused at allocation by
+    # `PallasBatchedRPAAttentionBackend.get_kv_cache_shape`. The longctx fork
+    # resolves its own layout from `USE_BATCHED_RPA_SEQ_ON_LANE`; passing it an
+    # explicit `kv_layout` would override that, so leave it alone.
+    pass_layout = (kv_layout is not None and not use_hd64
+                   and not envs.USE_BATCHED_RPA_LONGCTX)
+    layout_kwargs = {"kv_layout": kv_layout} if pass_layout else {}
+
     def _ragged_paged_attention(*args):
         return func(
             *args,
@@ -401,6 +426,7 @@ def sharded_ragged_paged_attention(
             soft_cap=soft_cap,
             skip_kv_update=skip_kv_update,
             use_causal_mask=use_causal_mask,
+            **layout_kwargs,
             **block_kwargs,
         )
 
@@ -539,6 +565,7 @@ def attention(
     shard: bool = True,
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -579,6 +606,7 @@ def attention(
         v_scale=v_scale,
         skip_kv_update=skip_kv_update,
         rpa_func=rpa_func,
+        kv_layout=kv_layout,
         soft_cap=soft_cap,
         shard=shard,
         kv_block_cap=kv_block_cap,
