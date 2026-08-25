@@ -14,11 +14,27 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
+from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
 from vllm_torchtpu.kernels.kimi_k3 import chunk_kda
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import \
     _layout_supported as _mega_kda_layout_supported
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import kda_forward_inference
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def _use_fused_kda() -> bool:
+    """Whether to route KDA through the fused conv1d + GDN v3 kernel.
+
+    Read per build rather than at import so it can be flipped between builds.
+    ``VLLM_TORCHTPU_KDA_FUSED=0`` gets the manual path back, and is the only
+    way to reach ``VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL=mega``, since the fused
+    core replaces the whole op instead of composing with the prefill choice.
+    """
+    return os.environ.get("VLLM_TORCHTPU_KDA_FUSED", "1") == "1"
 
 
 def _token_sequence_ids(
@@ -336,6 +352,82 @@ def _get_kda_prefill_kernel() -> str:
     return kernel
 
 
+def _build_fused_core(lower_bound: float | None, eps: float):
+    """The same op, on the fused conv1d + GDN v3 kernel.
+
+    One Pallas call replaces the four-stage manual pipeline: the fused kernel
+    owns the convolution, silu, q/k L2-norm, the gate activation, beta's
+    sigmoid, both recurrences and the state write-back, and it dispatches
+    decode against prefill/mixed off `distribution` inside the kernel rather
+    than by emitting both paths and selecting per token.
+
+    Only `_gated_output_norm` stays outside, since the fused kernel has no
+    notion of the output gate.
+    """
+
+    def fused_core(
+        mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
+        raw_gate: jax.Array,  # [T, H * D]
+        beta: jax.Array,  # [T, H]
+        output_gate: jax.Array,  # [T, H * D]
+        conv_state: jax.Array,  # [num_slots, K - 1, 3, H, D]
+        recurrent_state: jax.Array,  # [num_slots, H, K, V]
+        conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
+        a_log: jax.Array,  # [H]
+        dt_bias: jax.Array,  # [H * D]
+        norm_weight: jax.Array,  # [D]
+        query_start_loc: jax.Array,  # [N + 1]
+        state_indices: jax.Array,  # [N]
+        seq_lens: jax.Array,  # [N]
+        distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        num_tokens, _, num_heads, head_dim = _check_kda_abi(
+            mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
+            dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
+        kernel_size = conv_weight.shape[0]
+
+        # `mixed_qkv`, `conv_state` and `conv_weight` all lay their channels
+        # out as (3, H, D) in row-major order, which is exactly the flat
+        # `dim` axis the fused kernel indexes -- the reshapes are free. The
+        # kernel wants the weight transposed to [dim, 1, kernel_size].
+        conv_weight_flat = conv_weight.reshape(kernel_size, -1)
+        conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+
+        (new_conv_state, new_pool), out = gdn_wrapper.fused_conv1d_gdn(
+            qkv=mixed_qkv,
+            # Raw: the kernel applies sigmoid to `b` and the gate activation
+            # to `a` itself.
+            b=beta,
+            a=raw_gate,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            conv_weight=conv_weight_flat,
+            # Kimi's short convolution is bias-free.
+            conv_bias=None,
+            a_log=a_log,
+            # Per-channel under KDA, and Mosaic rejects the flat form.
+            dt_bias=dt_bias.reshape(num_heads, head_dim),
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=num_heads,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+            attention_mode=gdn_config.AttentionMode.KDA,
+            gate_lower_bound=lower_bound,
+        )
+
+        output = out.reshape(num_tokens, num_heads, head_dim)
+        output = _gated_output_norm(output, output_gate, norm_weight, eps,
+                                    mixed_qkv.dtype)
+        return output, new_conv_state, new_pool
+
+    return fused_core
+
+
 def build_kimi_dispatched_kda_op(
     prefix: str,
     *,
@@ -555,11 +647,29 @@ def build_kimi_dispatched_kda_op(
 
         return output, conv_after_prefill, new_pool
 
-    op_name = (f"pallas::kimi_dispatched_kda_{prefill_kernel}_"
+    # The fused core replaces the whole op, prefill included, so it overrides
+    # the chunked/mega selection rather than composing with it.
+    use_fused = _use_fused_kda()
+    variant = "fused" if use_fused else prefill_kernel
+    core = _build_fused_core(lower_bound,
+                             eps) if use_fused else dispatched_core
+
+    if use_fused and prefill_kernel != "chunked":
+        logger.warning(
+            "VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL=%s is ignored while the fused "
+            "KDA path is on. Set VLLM_TORCHTPU_KDA_FUSED=0 to use it.",
+            prefill_kernel)
+
+    # vLLM's compile cache is keyed on the model config and not on either env
+    # var, so the variant goes in the op name. If this line disagrees with the
+    # kernels in a profile, the run came from cache.
+    logger.info(
+        "KDA op %s: using the %s path.", prefix, "fused conv1d + GDN v3"
+        if use_fused else f"manual with {prefill_kernel} prefill")
+
+    op_name = (f"pallas::kimi_dispatched_kda_{variant}_"
                f"{prefix.replace('.', '_')}")
-    dispatched_op = pallas.jax_op(op_name,
-                                  dispatched_core,
-                                  donate_argnums=(4, 5))
+    dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
 
     def _fake_dispatched(mixed_qkv, _raw_gate, _beta, _output_gate, conv_state,
                          recurrent_state, *args, **kwargs):

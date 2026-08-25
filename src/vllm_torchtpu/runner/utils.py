@@ -7,8 +7,11 @@ import os
 from enum import Enum
 from typing import Any, Optional
 
+import torch
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
+from vllm.model_executor.layers.rotary_embedding.base import \
+    RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
@@ -364,3 +367,119 @@ class PhaseBasedProfiler:
                 self._start_profiling(batch_composition_stats)
             else:
                 self._step_or_stop_profiling(batch_composition_stats)
+
+
+# (dtype, shape) -> minor_to_major, for buffers whose device layout is not
+# XLA's default-for-shape and so must be pinned on the compiled entry too.
+_PINNED_ENTRY_LAYOUTS: dict[tuple[torch.dtype, tuple[int, ...]],
+                            list[int]] = {}
+_entry_pin_installed = False
+
+
+def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
+    """Return `tensor` re-materialized on its device with a `{1,0}` layout.
+
+    `LayoutContext` hooks host->device transfers only -- a device-side
+    allocation inside the context still gets the default layout -- so the
+    tensor makes one round trip through the host. Shape and values are
+    unchanged; only the physical layout differs.
+    """
+    from torch_tpu._internal.compile import tpu_torch_compile as ttc
+    from torch_tpu._internal.device_utils.annotations import (LayoutContext,
+                                                              TpuLayout)
+
+    # Keep the dtype's own tiling; only the dimension order changes.
+    _, tiles, elem_bits = ttc.get_default_layout(tensor.dtype, tensor.shape)
+    row_major = TpuLayout(minor_to_major=[1, 0],
+                          tiles=tiles,
+                          element_size_in_bits=elem_bits)
+    host = tensor.cpu()
+    with LayoutContext(row_major):
+        device_tensor = host.to(tensor.device)
+    _PINNED_ENTRY_LAYOUTS[(tensor.dtype, tuple(tensor.shape))] = [1, 0]
+    return device_tensor
+
+
+def relayout_rope_caches(model: torch.nn.Module):
+    """Re-materialize every rope cache with a row-major device layout. """
+    num_changed = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, RotaryEmbeddingBase):
+            continue
+        # The buffers on a rotary module that are indexed by position.
+        caches = [(buf_name, getattr(module, buf_name, None))
+                  for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")]
+        caches = [(n, b) for n, b in caches if isinstance(b, torch.Tensor)]
+        if not caches:
+            continue
+        if any(b.ndim != 2 for _, b in caches):
+            continue
+        for buf_name, buf in caches:
+            setattr(module, buf_name, _to_row_major(buf))
+        num_changed += 1
+        logger.info("Relayouted rope cache %s to {1,0} (shape %s)", name,
+                    tuple(caches[0][1].shape))
+
+    if num_changed:
+        _install_entry_layout_pin()
+    logger.info("Row-major relayouted %d rope caches", num_changed)
+
+
+def relayout_hash_tables(model: torch.nn.Module):
+    """Re-materialize every MOE hash-routing table row-major. """
+    seen: set[int] = set()
+    num_changed = 0
+    for name, module in model.named_modules():
+        # The attributes under which one hash-routing table is reachable;
+        # the same tensor object is bound to all of them.
+        for attr in ("tid2eid", "hash_indices_table"):
+            table = getattr(module, attr, None)
+            if not isinstance(table, torch.Tensor) or id(table) in seen:
+                continue
+            seen.add(id(table))
+            if table.ndim != 2:
+                continue
+            table.data = _to_row_major(table.data)
+            num_changed += 1
+            logger.info("Relayouted hash table %s.%s to {1,0} (shape %s)",
+                        name, attr, tuple(table.shape))
+
+    if num_changed:
+        _install_entry_layout_pin()
+    logger.info("Row-major relayouted %d hash tables", num_changed)
+
+
+def _install_entry_layout_pin() -> None:
+    """Make the compiler pin entry layouts for buffers in the registry. """
+    global _entry_pin_installed
+    if _entry_pin_installed:
+        return
+    from torch_tpu._internal.compile import compiler as tt_compiler
+
+    original_call = tt_compiler.StaticCompiler.__call__
+
+    def _call_with_pinned_layouts(self, graph_module, example_inputs, *args,
+                                  **kwargs):
+        # `argument_layouts` is the 5th positional parameter; len(args) < 3
+        # means the caller did not pass it positionally.
+        if (_PINNED_ENTRY_LAYOUTS and len(args) < 3
+                and kwargs.get("argument_layouts") is None):
+            # One entry per *tensor* argument: `fx_to_mlir` filters the
+            # non-tensors (generators, symints) out before length-checking.
+            layouts: list[list[int]] = []
+            pinned_any = False
+            for val in example_inputs:
+                if not isinstance(val, torch.Tensor):
+                    continue
+                pin = _PINNED_ENTRY_LAYOUTS.get((val.dtype, tuple(val.shape)))
+                layouts.append(list(pin) if pin is not None else [])
+                pinned_any = pinned_any or pin is not None
+            if pinned_any:
+                kwargs["argument_layouts"] = layouts
+                logger.info("Pinned %d of %d entry layouts for this graph",
+                            sum(1 for entry in layouts if entry), len(layouts))
+        return original_call(self, graph_module, example_inputs, *args,
+                             **kwargs)
+
+    tt_compiler.StaticCompiler.__call__ = _call_with_pinned_layouts
+    _entry_pin_installed = True

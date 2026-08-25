@@ -1140,17 +1140,35 @@ def test_structured_output_eagle3_async_adversarial_choice(
     the choice or kill the request with a grammar error -- so every valid,
     completed output is direct evidence the deferred-bitmask path saw the
     real drafts.
+
+    Odd rows run unconstrained on the file's standard eagle3 prompt, whose
+    continuation the drafter predicts well. Those rows carry the
+    "speculation actually ran" floor, which the constrained rows cannot --
+    see the metric comment below.
     """
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
     choices = ["strawberry banana kiwi", "pineapple mango papaya"]
-    params = SamplingParams(
+    constrained = SamplingParams(
         temperature=0,
         max_tokens=16,
         structured_outputs=StructuredOutputsParams(choice=choices),
     )
-    # Nothing in the prompt suggests the allowed strings: greedy wants a
-    # color word, the grammar only permits fruit.
-    prompts = ["My favorite color is " for _ in range(8)]
+    unconstrained = SamplingParams(temperature=0, max_tokens=16)
+    # Nothing in the constrained prompt suggests the allowed strings: greedy
+    # wants a color word, the grammar only permits fruit. The control rows
+    # use the drafter-friendly sequence prompt the other eagle3 tests rest
+    # their acceptance floors on -- the adversarial prompt is a poor control
+    # (measured: 8 accepted tokens across 4 rows, a thin margin over the
+    # floor), and nothing about the constrained rows depends on the control
+    # rows sharing their prompt.
+    prompts = [
+        "My favorite color is " if i % 2 == 0 else get_eagle3_test_prompts()[0]
+        for i in range(8)
+    ]
+    params = [
+        constrained if i % 2 == 0 else unconstrained
+        for i in range(len(prompts))
+    ]
 
     with monkeypatch.context():
         spec_llm = LLM(
@@ -1170,20 +1188,46 @@ def test_structured_output_eagle3_async_adversarial_choice(
         try:
             outputs = spec_llm.generate(prompts, params)
             assert len(outputs) == len(prompts)
-            for output in outputs:
+            for i, output in enumerate(outputs):
+                if i % 2:
+                    continue  # unconstrained control row
                 assert output.outputs[0].text in choices, (
                     f"constraint violated: {output.outputs[0].text!r}")
 
-            # The constrained region must have seen draft traffic, else the
-            # masked verify path was never exercised. No acceptance floor:
-            # the constraint is designed to reject the model's own drafts.
-            num_draft_tokens = 0
+            # Speculation must have actually run, or the checks above are
+            # just plain decoding and say nothing about the masked verify
+            # path. The floor is on ACCEPTED tokens and the unconstrained
+            # rows are what supply it; a drafted-token floor cannot work
+            # here.
+            #
+            # `vllm:spec_decode_num_draft_tokens` is reported net of the
+            # drafts the grammar threw out: under async scheduling the
+            # scheduler counts the K placeholder spec tokens it scheduled,
+            # then make_spec_decoding_stats() subtracts
+            # scheduler_output.num_invalid_spec_tokens -- the drafts
+            # update_draft_token_ids_in_output() handed to
+            # grammar.validate_tokens() and the grammar refused -- and
+            # records nothing once the remainder reaches 0. validate_tokens
+            # keeps only the accepted prefix, and this grammar is built to
+            # refuse the model's own drafts from the first position on, so a
+            # healthy deferred-bitmask path reports exactly 0 drafted on the
+            # constrained rows. A path that regressed to the -1 placeholders
+            # would never call validate_tokens and would report K per step
+            # instead: a >0 drafted floor fails on the working path and
+            # passes on the broken one.
+            num_draft_tokens = num_accepted_tokens = 0
             for metric in spec_llm.get_metrics():
                 if metric.name == SPEC_DRAFT_METRIC:
                     assert isinstance(metric, Counter)
                     num_draft_tokens += metric.value
-            assert num_draft_tokens > 0, \
-                "no draft tokens proposed under structured outputs"
+                elif metric.name == SPEC_ACCEPTED_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print("adversarial choice + eagle3(async): "
+                  f"accepted={num_accepted_tokens} "
+                  f"drafted(net of grammar-rejected)={num_draft_tokens}")
+            assert num_accepted_tokens > 0, \
+                "no draft tokens accepted on the unconstrained control rows"
         finally:
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm

@@ -1126,6 +1126,58 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=256,
         vmem_limit_bytes=62914560,
     ),
+    # Kimi-K3 mixed prefill on TPU v7x with TP32, FP8 KV, 8K tokens,
+    # and 16-token KV cache pages.
+    TuningKey(
+        case="mixed",
+        max_num_tokens=8192,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=520,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=4,
+        num_kv_pages_per_block=256,
+        num_queries_per_block=512,
+        vmem_limit_bytes=58720256,
+    ),
+    # Same workload with 256-token pages, as required when a cache page must
+    # also accommodate the KDA recurrent state for prefix caching.
+    TuningKey(
+        case="mixed",
+        max_num_tokens=8192,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=64,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=40,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=8,
+        num_kv_pages_per_block=16,
+        num_queries_per_block=512,
+        vmem_limit_bytes=54525952,
+    ),
 }
 
 
