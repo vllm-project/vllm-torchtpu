@@ -983,8 +983,19 @@ class TPUModelRunner(GPUModelRunner):
                 "Use vLLM multiprocess mode for --tensor-parallel-size > 1.")
         mesh_devices = np.asarray(local_devices[:1]).reshape((1, ))
         mesh = Mesh(mesh_devices, axis_names=("model", ))
-        logger.info("Init mesh | tp_size=1 | device_id=%s",
-                    getattr(local_devices[0], "id", str(local_devices[0])))
+        # Also report the global device view. This mesh is deliberately
+        # single-device, but op-local multi-device meshes (see
+        # distributed.pcp.get_or_create_pcp_mesh) are built from `jax.devices()`
+        # and only work when every peer's device is visible here, so the counts
+        # are worth having in every server log.
+        logger.info(
+            "Init mesh | tp_size=1 | device_id=%s | jax local_devices=%d "
+            "global devices=%d ids=%s",
+            getattr(local_devices[0], "id", str(local_devices[0])),
+            len(local_devices),
+            jax.device_count(),
+            [getattr(d, "id", None) for d in jax.devices()],
+        )
         return mesh
 
     # Entries described per report before the rest are summarized. A boot

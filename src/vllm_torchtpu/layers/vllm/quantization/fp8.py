@@ -811,6 +811,28 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        # Resolve the EP mesh here, not on the first forward: it maps ranks to
+        # TPU device ids with an all_gather_object, and Dynamo cannot trace a
+        # collective inside the compiled graph.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            prebuild_fused_moe_ep
+        prebuild_fused_moe_ep(layer,
+                              topk=layer.moe_config.experts_per_token,
+                              renormalize=layer.renormalize,
+                              activation=activation_str)
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        """Whether this method owns the expert-parallel dispatch and combine.
+
+        vLLM brackets `apply_monolithic` with an all-gather and a
+        reduce-scatter unless the method claims them (`MoERunner.
+        do_naive_dispatch_combine`). The fused EP kernel does the exchange
+        inside its own program, so when it is enabled we take ownership --
+        and then `apply_monolithic` is responsible for the exchange on the
+        shapes the fused kernel does not serve, which is decode.
+        """
+        return envs.USE_MOE_FUSED_EP_KERNEL
 
     def apply_monolithic(
         self,
@@ -821,6 +843,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
+        if self.supports_internal_mk:
+            return self._apply_owning_dispatch(layer, x, router_logits,
+                                               activation_str)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -853,6 +878,56 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
+
+    def _apply_owning_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation_str: str,
+    ) -> torch.Tensor:
+        """Run the layer when this method owns the EP exchange.
+
+        `x` and `router_logits` are this rank's own tokens. Shapes the fused
+        kernel serves go through it whole; the rest reproduce exactly what
+        vLLM's naive dispatch/combine would have done, so the two paths differ
+        only in who issues the collectives.
+        """
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            fused_moe_ep, fused_moe_ep_supported)
+
+        topk = layer.moe_config.experts_per_token
+        if fused_moe_ep_supported():
+            return fused_moe_ep(x, layer.w13_weight, layer.w2_weight,
+                                layer.w13_weight_scale_inv,
+                                layer.w2_weight_scale_inv, router_logits)
+
+        ep = get_ep_group()
+        gathered_x, gathered_logits = ep.dispatch_router_logits(
+            x, router_logits, False)
+        topk_weights, topk_ids = moe_routing.route(layer, gathered_x,
+                                                   gathered_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = (
+                token_padding.zero_routing_weights_for_padding(
+                    topk_ids, topk_weights))
+        out = fused_moe_gmm(
+            hidden_states=gathered_x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, 'w13_bias', None),
+            w2_bias=getattr(layer, 'w2_bias', None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=topk,
+            activation=activation_str,
+        )
+        return ep.combine(out, False)
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

@@ -111,6 +111,12 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/vllm/attention.py",
     "vllm_torchtpu/layers/vllm/custom_ops",
     "vllm_torchtpu/layers/vllm/fused_moe.py",
+    # The fused EP MoE op and the helper that registers it. Both sit behind a
+    # torch custom-op boundary Dynamo cannot see through, and the kernel they
+    # export is chosen from their source, so an edit here has to invalidate
+    # the compiled executables like any other kernel change.
+    "vllm_torchtpu/layers/vllm/fused_moe_ep.py",
+    "vllm_torchtpu/distributed/sharded_jax_op.py",
     "vllm_torchtpu/layers/vllm/linear_common.py",
     "vllm_torchtpu/layers/vllm/router_topk.py",
     "vllm_torchtpu/layers/vllm/quantization",

@@ -534,6 +534,11 @@ class TestOnlineFp8Quantization:
         layer.custom_routing_function = mock_routing
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
+        # `supports_internal_mk` is a property, and a spec'd MagicMock hands
+        # back a Mock for it, which is truthy -- so `apply_monolithic` would
+        # take the owning-dispatch branch and never reach the router. This
+        # test is about the routing path, which is the non-owning one.
+        method.supports_internal_mk = False
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
 

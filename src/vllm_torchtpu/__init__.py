@@ -223,6 +223,54 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
+def _patch_moe_runner_fused_output_is_reduced() -> None:
+    """Tell vLLM the fused EP MoE kernel already reduced its output.
+
+    `fused_moe_ep` returns this rank's tokens combined over ALL experts -- the
+    kernel pushes each result row back to the chip that owns the token, so
+    there is nothing left to reduce. vLLM does not know that: it decides from
+    `MoERunner._fused_output_is_reduced`, which reads
+    `quant_method.moe_kernel.output_is_reduced()`, and the TPU fp8 method never
+    sets `moe_kernel` -- it declares itself through `supports_internal_mk`
+    instead. So `moe_runner.py` all-reduces the already-combined output
+    whenever `tp_size > 1 or ep_size > 1`.
+
+    Today that is harmless only by accident: under DP8 the tensor-parallel
+    group has world size one and the all-reduce is the identity. Turn on any
+    tensor parallelism -- DP4+TP2, say -- and it silently multiplies every
+    routed MoE output by tp_size, which no test would catch and no log would
+    mention.
+
+    Reporting True here is the correct signal rather than deleting the
+    all-reduce, because the SHARED expert genuinely is TP-partial
+    (`Qwen3NextMLP(..., reduce_results=False)`): the same flag routes it to
+    `_maybe_reduce_shared_expert_output`, which reduces it on its own.
+    """
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+
+    if getattr(_mr.MoERunner, "_tpu_fused_output_reduced_patch", False):
+        return
+
+    original = _mr.MoERunner._fused_output_is_reduced
+
+    @property
+    def patched(self):
+        # `skip_final_all_reduce` asserts the fused output is NOT pre-reduced,
+        # and in that mode the model reduces externally anyway, so leave it be.
+        if getattr(self.moe_config, "skip_final_all_reduce", False):
+            return original.fget(self)
+        try:
+            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+                fused_moe_ep_supported
+        except ImportError:
+            return original.fget(self)
+        return fused_moe_ep_supported() or original.fget(self)
+
+    _mr.MoERunner._fused_output_is_reduced = patched
+    _mr.MoERunner._tpu_fused_output_reduced_patch = True
+    logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
+
+
 def _patch_moe_explicit_pcp_collectives() -> None:
     """Keep PCP MoE dispatch/combine explicit unless chunking owns it.
 
