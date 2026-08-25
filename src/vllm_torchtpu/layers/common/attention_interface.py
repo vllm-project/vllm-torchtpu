@@ -329,19 +329,13 @@ def sharded_ragged_paged_attention(
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
-    # Both forks can lay the cache out seq-along-lane, and they announce it
-    # differently: the longctx fork reads `USE_BATCHED_RPA_SEQ_ON_LANE` inside
-    # its own wrapper, while the mainline fork is handed an explicit
-    # `kv_layout` resolved from `VLLM_KV_CACHE_LAYOUT`. This is the one site
-    # both share, so it honours either signal.
+    # The longctx fork announces seq-along-lane through
+    # `USE_BATCHED_RPA_SEQ_ON_LANE`, the mainline fork through `kv_layout`;
+    # this is the one site both share.
     seq_along_lane = ((kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
                        or envs.USE_BATCHED_RPA_SEQ_ON_LANE) and not use_hd64)
-    # The KV-head axis is what gets sharded, and the two layouts put it in
-    # different places: HEAD_ALONG_SUBLANE packs KV heads into dim 2, while
-    # SEQ_ALONG_LANE gives them dim 1 outright and fills dim 2 with head_dim
-    # words. Sharding dim 2 under SEQ_ALONG_LANE splits head_dim across chips;
-    # the kernel's `validate_inputs` rejects the resulting per-shard shape, so
-    # getting this wrong fails loudly rather than corrupting output.
+    # The sharded KV-head axis is dim 1 under SEQ_ALONG_LANE and dim 2 under
+    # HEAD_ALONG_SUBLANE.
     kv_cache_spec = (P(None, "model", None, None, None)
                      if seq_along_lane else P(None, None, "model", None, None))
     in_specs = (
@@ -404,13 +398,10 @@ def sharded_ragged_paged_attention(
             block_kwargs["p_block_sizes"] = _capped(
                 rpa_default.RpaCase.PREFILL)
 
-    # Only the batched kernel takes a layout; the v3 and hd64 kernels have a
-    # single layout and no such parameter. head_dim==64 was rerouted to hd64
-    # above, and HEAD_ALONG_SUBLANE is the only layout that reaches it — a
-    # SEQ_ALONG_LANE cache for a 64-wide head is refused at allocation by
-    # `PallasBatchedRPAAttentionBackend.get_kv_cache_shape`. The longctx fork
-    # resolves its own layout from `USE_BATCHED_RPA_SEQ_ON_LANE`; passing it an
-    # explicit `kv_layout` would override that, so leave it alone.
+    # Only the batched kernel takes a layout; v3 and hd64 have no such
+    # parameter, and longctx resolves its own from
+    # `USE_BATCHED_RPA_SEQ_ON_LANE`, which an explicit `kv_layout` would
+    # override.
     pass_layout = (kv_layout is not None and not use_hd64
                    and not envs.USE_BATCHED_RPA_LONGCTX)
     layout_kwargs = {"kv_layout": kv_layout} if pass_layout else {}

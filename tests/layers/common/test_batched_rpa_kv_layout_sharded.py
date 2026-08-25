@@ -1,13 +1,8 @@
 """Sharded parity between the two batched-RPA KV cache layouts.
 
-`sharded_ragged_paged_attention` shards the KV cache over the `model` axis, and
-the KV-head axis it has to split sits at a different dimension in each layout:
-dim 2 for HEAD_ALONG_SUBLANE (KV heads packed into 32-bit words) and dim 1 for
-SEQ_ALONG_LANE (KV heads outright, with head_dim in the words). Sharding the
-wrong one splits head_dim across chips instead.
-
-The single-chip tests in `tests/kernels/test_rpa_skip_kv_update.py` cannot see
-this — the partition spec only bites once there is more than one device.
+The KV-head axis that `sharded_ragged_paged_attention` splits sits at dim 2
+under HEAD_ALONG_SUBLANE and dim 1 under SEQ_ALONG_LANE. The partition spec
+only bites with more than one device, so single-chip tests cannot see this.
 """
 import jax
 import jax.numpy as jnp
