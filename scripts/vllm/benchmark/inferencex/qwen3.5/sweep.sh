@@ -22,7 +22,7 @@ server_config_for() {
     8192,1024,32) printf "%s" "TP8_EP 32 16384 1" ;;
     8192,1024,64) printf "%s" "TP8_EP 64 16384 1" ;;
     8192,1024,128) printf "%s" "DP8_EP 16 2048 1" ;;
-    8192,1024,256) printf "%s" "DP8_EP 32 2560 2" ;;
+    8192,1024,256) printf "%s" "DP8_EP 32 2560 1" ;;
     *) return 1 ;;
   esac
 }
