@@ -59,6 +59,14 @@ ROWBLK = 8
 # A token row is a whole number of 128-lane blocks: the lane count of the
 # vector unit this kernel is built for.
 HIDDEN_LANE_BLOCK = 128
+# The token-gather table stays in HBM and is streamed through two scalar-memory
+# windows. One window covers this many activation tiles; grouping amortizes
+# the metadata DMA without making the scalar footprint grow with the request.
+TOKEN_GATHER_TILES_PER_WINDOW = 4
+# HBM int32 rows are tiled in 128-element units. Expert slabs are only
+# ROWBLK-aligned, so a window may start up to 120 rows before its logical base
+# and needs one extra HBM tile of overfetch.
+TOKEN_GATHER_DMA_ALIGNMENT = HIDDEN_LANE_BLOCK
 # The most of those blocks the kernel's row staging holds.
 HIDDEN_MAX_BLOCKS = 32
 # The share of the chip's VMEM the kernel may claim.
@@ -118,6 +126,17 @@ SCALE_MIRROR_LANE_RATIO = 1024
 
 def align_up(v, m):
     return -(-v // m) * m
+
+
+def token_gather_window_rows(tile_m):
+    """Int32 rows in one aligned HBM-to-SMEM token-gather window."""
+    return (TOKEN_GATHER_TILES_PER_WINDOW * tile_m +
+            TOKEN_GATHER_DMA_ALIGNMENT)
+
+
+def token_gather_smem_bytes(tile_m):
+    """Fixed scalar-memory footprint of the two token-gather windows."""
+    return 2 * token_gather_window_rows(tile_m) * jnp.dtype(jnp.int32).itemsize
 
 
 def row_lane_blocks(hidden):

@@ -53,7 +53,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v2.host import ragged_stride_bound
+from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -63,10 +63,10 @@ logger = init_logger(__name__)
 # is not free to change here alone.
 _TILE_M = 128
 
-# SMEM the kernel's prefetched routing tables have to fit in, in bytes. The
-# tables are i32 and `ragged_stride_bound` long; see the gate in
-# `prebuild_fused_moe_ep` for why this is the real limit on the token count.
-_ROUTING_TABLE_SMEM_BUDGET = 1024 * 1024
+# SMEM used by the resident routing tables and Mosaic's scalar working set,
+# excluding the two fixed token-gather windows. Measured by subtracting the
+# former full token-gather scalar-prefetch table at the allocation boundary.
+_SMEM_OVERHEAD_BYTES = 236 * 1024
 
 # One op for every shape: `fused_ep_moe_v2` derives its routing block and ragged
 # stride from the operands when they are not given, so nothing here has to vary
@@ -331,39 +331,12 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
             "expert-parallel, so each shard would hold the whole expert set.")
         return None
 
-    # Two separate things stop this kernel serving under tensor parallelism,
-    # and they were conflated for a long time. Both are gated here.
-    #
-    # FIRST, a compile-time SMEM bound, driven by the TOKEN COUNT rather than
-    # by TP.
-    #
-    # The kernel prefetches its routing tables into SMEM at the head of the
-    # program, and they are sized by `ragged_stride_bound(T, topk, e_total,
-    # capacity)` i32 entries against a 1 MiB budget. For Qwen3.5-397B
-    # (topk 10, 512 experts, capacity 128) that crosses 1 MiB between
-    # T = 25,843 and T = 32,768: `ragged_stride_bound(32768, ...) * 4` is
-    # 1,325,568, which is exactly the size the compiler reported when every
-    # worker died. So the failure is a token-count crossing.
-    #
-    # TP only LOOKED causal because under plain tensor parallelism the batch
-    # is replicated, so each rank hands the op a full copy as its shard and
-    # the kernel's global T becomes node_tokens * tp_size. At the benchmark's
-    # 16,384-token chunk that is 131,072 tokens and 5.25 MB of tables -- five
-    # times over -- while the same chunk under DP8 is 16,384 tokens and fits.
-    # "tp > 1" and "T too large" coincided at the batch we happened to run.
-    #
-    # The bound is gated below, once the mesh gives us the EP width. It is
-    # not TP-specific -- a DP deployment above ~3,200 tokens per engine
-    # crosses it too, and used to die the same way.
-    #
-    # SECOND, and independently, the kernel DEADLOCKS under tensor
-    # parallelism. With the SMEM bound respected (chunk 2048, so 16,384
-    # global tokens and 670 KB of tables) it now arms, compiles every bucket
-    # and enters the warmup ladder -- and then every worker hangs inside
-    # `_dummy_run` and is killed by a libtpu telemetry abort. Measured
-    # 2026-08-20 on TP8; chunk 3072 does not even compile ("Program smem
-    # requirement 1.11M", the tables plus ~115 KB of other prefetched
-    # operands).
+    # The former full token-gather scalar-prefetch table made this path look
+    # token-count limited under TP and at a 4K/rank DP8 bucket. The table now
+    # remains in HBM and is streamed through two fixed SMEM windows, so that
+    # compile-time limit is gone. Tensor parallelism is still refused for an
+    # independent reason: the kernel deadlocks during warmup, and a replicated
+    # batch would also make every rank repeat the full expert work.
     #
     # That hang is NOT specific to this kernel: the fused reduce-scatter MoE
     # kernel, written independently, fails at the same phase with the same
@@ -374,8 +347,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # XLA all-reduces. The untested candidate is GDN's `ragged_all_to_all`, a
     # data-dependent collective in 45 of this model's 60 layers.
     #
-    # So TP is still refused, but now for the reason that actually holds.
-    # There is a third thing worth knowing before anyone lifts it: under
+    # There is another thing worth knowing before anyone lifts it: under
     # replicated TP each rank hands the op a full copy of the batch as its
     # shard, so the kernel does ep_size times the expert work for one batch
     # of output. Lifting the refusal usefully needs the bridge to hand each
@@ -422,24 +394,17 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     ep = mesh.shape[EP_AXIS_NAME]
     _EP_SIZE = ep
 
-    # `_max_node_tokens(ep)` is already the GLOBAL token count this kernel
-    # sees: under DP it is the per-engine cap times the engines, and under
-    # replicated TP it is the per-rank batch times the ranks, because every
-    # rank hands the op a full copy as its shard.
-    global_tokens = _max_node_tokens(ep)
-    if global_tokens:
-        table_bytes = ragged_stride_bound(
-            global_tokens, topk, layer.global_num_experts, _TILE_M) * 4
-        if table_bytes > _ROUTING_TABLE_SMEM_BUDGET:
-            logger.warning_once(
-                "Fused EP MoE not engaged: at %d global tokens its routing "
-                "tables need %d B of SMEM, over the %d B budget. Cap "
-                "--max-num-batched-tokens at %d, or shard the token axis so "
-                "the kernel sees fewer tokens.", global_tokens, table_bytes,
-                _ROUTING_TABLE_SMEM_BUDGET,
-                _max_node_tokens_fitting_smem(topk, layer.global_num_experts,
-                                              ep))
-            return None
+    gather_bytes = token_gather_smem_bytes(_TILE_M)
+    needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
+    smem = _smem_capacity_bytes()
+    if needed_smem > smem:
+        logger.warning_once(
+            "Fused EP MoE not engaged: its fixed routing working set needs "
+            "%d B of this chip's %d B SMEM (%d B for two streamed "
+            "token-gather windows and about %d B for resident tables and "
+            "compiler working memory).", needed_smem, smem, gather_bytes,
+            _SMEM_OVERHEAD_BYTES)
+        return None
     global _RANK_BUFFER, _EXPERT_ORDER
     # The kernel's index is this rank's position in the mesh, which is ordered
     # by device id, not its EP rank.
@@ -607,21 +572,13 @@ def _max_node_tokens(ep: int) -> int:
     return int(cap) * ep if isinstance(cap, int) else 0
 
 
-def _max_node_tokens_fitting_smem(topk: int, e_total: int, ep: int) -> int:
-    """Largest per-step node-wide token count whose routing tables fit SMEM.
-
-    Reported in the refusal so the operator is told the number to set rather
-    than left to bisect --max-num-batched-tokens by hand. Divided by the EP
-    width to undo `_max_node_tokens`, which is the scheduler's per-engine cap
-    times the engines: what the operator sets is the per-engine number.
-    """
-    lo, hi = 1, 1 << 20
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        fits = ragged_stride_bound(mid, topk, e_total,
-                                   _TILE_M) * 4 <= _ROUTING_TABLE_SMEM_BUDGET
-        lo, hi = (mid, hi) if fits else (lo, mid - 1)
-    return lo // max(ep, 1)
+def _smem_capacity_bytes() -> int:
+    """This chip's scalar memory, or tpu7x's outside a device process."""
+    try:
+        from jax.experimental.pallas import tpu as pltpu
+        return int(pltpu.get_tpu_info().smem_capacity_bytes)
+    except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
+        return 1024 * 1024
 
 
 def _pcp_size(layer) -> int:

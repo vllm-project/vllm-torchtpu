@@ -27,7 +27,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     act_scale_slab_rows, align_up, build_routing_tables, expert_visit_list,
     local_slab_rows, ragged_stride_bound, routing_block, shard_count_vector,
     shard_expert_slabs, shard_push_tables_in_rows, shard_token_gather,
-    shard_transport_tables_in_blocks, weight_form, weight_format_of_dtype)
+    shard_transport_tables_in_blocks, token_gather_window_rows, weight_form,
+    weight_format_of_dtype)
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel, rowquant_fp8)
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
@@ -305,6 +306,12 @@ def fused_ep_moe_v2(x,
         token_gather = shard_token_gather(routing,
                                           me,
                                           shard_stride=ragged_stride)
+        # The kernel DMA-aligns each logical expert window down by as much as
+        # 127 int32 rows and always copies a full fixed window. Pad after the
+        # scatter (rather than enlarging its destination) so the off-shard
+        # sentinel remains out of range and cannot write a live padding row.
+        token_gather = jnp.pad(token_gather,
+                               (0, token_gather_window_rows(capacity)))
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on. It exists only where the rows were quantized.
         #

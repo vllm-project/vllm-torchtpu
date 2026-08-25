@@ -26,7 +26,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.fused_moe.v2.host import ragged_stride_bound
+from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.vllm import fused_moe_ep as bridge
 
 # The width of the mesh `_prebuild` stubs in. `_layer` sizes the global expert
@@ -58,7 +58,13 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
     return layer
 
 
-def _prebuild(layer, *, has_mesh=True, tp=1, node_tokens=4096, **kwargs):
+def _prebuild(layer,
+              *,
+              has_mesh=True,
+              tp=1,
+              node_tokens=4096,
+              smem_bytes=1024 * 1024,
+              **kwargs):
     """Call prebuild with the distributed lookups stubbed out.
 
     `build_ep_mesh` does an `all_gather_object` over the EP group, so it is
@@ -72,6 +78,8 @@ def _prebuild(layer, *, has_mesh=True, tp=1, node_tokens=4096, **kwargs):
             patch.object(bridge, "ep_mesh_index", return_value=0), \
             patch.object(bridge, "ep_rank_order", return_value=None), \
             patch.object(bridge, "_max_node_tokens", return_value=node_tokens), \
+            patch.object(bridge, "_smem_capacity_bytes",
+                         return_value=smem_bytes), \
             patch.object(bridge, "_tensor_parallel_size", return_value=tp), \
             patch.object(bridge, "_build_op", return_value="op"):
         defaults = dict(topk=2, renormalize=True, activation="silu")
@@ -126,21 +134,18 @@ def test_refused_below_the_token_threshold():
         assert _prebuild(_layer()) is None
 
 
-def test_refused_over_the_routing_table_smem_budget():
-    """The tables are prefetched into SMEM; past the budget it does not
-    fail gracefully, so the refusal is what keeps it from being armed."""
+def test_qwen_4096_bucket_is_not_refused_by_smem():
+    """A 4K/rank DP8 bucket no longer scales the SMEM working set."""
     layer = _layer(experts=256)  # 512 global experts over the stub's ep=2
-    assert _prebuild(layer, topk=10, node_tokens=1 << 17) is None
-    assert _prebuild(layer, topk=10, node_tokens=4096) == "op"
+    assert _prebuild(layer, topk=10, node_tokens=32768) == "op"
 
 
-def test_smem_ceiling_reported_to_the_operator():
-    """The refusal above names a --max-num-batched-tokens for the operator to
-    set, so the number has to be the real edge of the bisection."""
-    assert bridge._max_node_tokens_fitting_smem(10, 512, 8) == 3230
-    budget = bridge._ROUTING_TABLE_SMEM_BUDGET
-    assert ragged_stride_bound(25843, 10, 512, 128) * 4 == budget
-    assert ragged_stride_bound(25844, 10, 512, 128) * 4 > budget
+def test_fixed_smem_working_set_is_still_checked():
+    gather_bytes = token_gather_smem_bytes(bridge._TILE_M)
+    assert gather_bytes == 5120
+    needed = bridge._SMEM_OVERHEAD_BYTES + gather_bytes
+    assert _prebuild(_layer(), smem_bytes=needed) == "op"
+    assert _prebuild(_layer(), smem_bytes=needed - 1) is None
 
 
 @pytest.mark.parametrize("weights", [
