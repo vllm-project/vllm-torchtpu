@@ -1,5 +1,5 @@
 #!/bin/bash
-# Self-contained benchmark runner for torchtpu-vllm.
+# Self-contained benchmark runner for vllm-torchtpu.
 # Starts a vLLM server, runs benchmark_serving.py for each ISL/OSL x concurrency
 # combo, saves results locally.
 #

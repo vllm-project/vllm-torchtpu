@@ -852,7 +852,7 @@ class TpuPlatform(Platform):
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
-                "Pathways is not supported by torchtpu-vllm. "
+                "Pathways is not supported by vllm-torchtpu. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config

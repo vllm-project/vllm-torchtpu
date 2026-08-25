@@ -1,4 +1,4 @@
-# Benchmarking torchtpu-vllm
+# Benchmarking vllm-torchtpu
 
 All configs target TPU v7x-8 (TP=8). KV cache is forced to fp8 in `run_benchmarks.sh`.
 

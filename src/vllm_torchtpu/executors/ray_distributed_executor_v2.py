@@ -126,7 +126,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
     def _get_actor_resource_kwargs(self) -> dict[str, Any]:
         """Return Ray actor resource kwargs for the TPU platform.
 
-        For torchtpu-vllm, we always use 1 TPU per worker similar to
+        For vllm-torchtpu, we always use 1 TPU per worker similar to
         Multiprocexecutor.
         """
         device_key = current_platform.ray_device_key

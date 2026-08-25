@@ -13,7 +13,7 @@
 # limitations under the License.
 """TPU flash-attention for vision encoders (ViT) as an out-of-tree CustomOp.
 
-vLLM's ``MMEncoderAttention`` is a ``CustomOp``. torchtpu-vllm registers its TPU
+vLLM's ``MMEncoderAttention`` is a ``CustomOp``. vllm-torchtpu registers its TPU
 platform as an out-of-tree plugin, so ``CustomOp.dispatch_forward`` routes to
 ``forward_oot`` (vllm/model_executor/custom_op.py). Following the vLLM
 device-extension design (docs/design/custom_op.md), we register an out-of-tree
@@ -148,7 +148,7 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         out = out.permute(0, 2, 1, 3)  # [b, s_pad, h, d]
         return out[:, :seq_len].contiguous()
 
-    # torchtpu-vllm registers TpuPlatform as an out-of-tree plugin, so vLLM's
+    # vllm-torchtpu registers TpuPlatform as an out-of-tree plugin, so vLLM's
     # CustomOp.dispatch_forward routes to forward_oot. Alias forward_tpu to the
     # same impl so an in-tree TPU platform would also pick it up.
     forward_tpu = forward_oot
