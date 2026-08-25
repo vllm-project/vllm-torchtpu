@@ -1,4 +1,4 @@
-# Dockerfile.override for torchtpu-vllm.
+# Dockerfile.override for vllm-torchtpu.
 # This Dockerfile builds a local-wheel-override variant image that overrides the pre-installed
 # torch-tpu with a local wheel from an override source.
 

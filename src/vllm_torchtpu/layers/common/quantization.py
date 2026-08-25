@@ -35,6 +35,7 @@ Usage in MXFP4 MoE pipeline:
 
 from typing import Tuple
 
+import jax.numpy as jnp
 import torch
 
 # MXFP4 block size as stored in checkpoints
@@ -49,6 +50,15 @@ REQUANTIZED_BLOCK_SIZE = 512
 # for the uint8 form used throughout this module.
 E8M0_MIN_EXP = -127
 E8M0_MAX_EXP = 127
+
+# Same value as jnp.finfo(jnp.float8_e4m3fn).max (448.0).
+FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def dtype_max(dtype: jnp.dtype) -> float:
+    info = (jnp.iinfo(dtype)
+            if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype))
+    return float(info.max)
 
 
 def is_floating_dtype(dtype: torch.dtype) -> bool:

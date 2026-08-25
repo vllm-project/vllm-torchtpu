@@ -26,13 +26,19 @@ if TYPE_CHECKING:
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
+    TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_RESHARD_IMPL: str = "controller"
+    TPU_RAIDEN_CLIENT_IMPL: str = "cpp"
+    TPU_RAIDEN_ADVERTISE_HOST: str = ""
+    TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
+    TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     USE_MOE_SPARSE_CORE: bool = True
-    ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -44,9 +50,15 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
+    USE_BATCHED_RPA_LONGCTX: bool = False
 
 
 def env_with_choices(
@@ -130,6 +142,22 @@ def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
     return _get_optional_bool_env
 
 
+def env_optional_int(env_name: str) -> Callable[[], int | None]:
+    """
+    Integer parsing where, like ``env_optional_bool``, an unset or empty
+    variable reads as ``None`` so callers can tell "explicitly set" from
+    "not configured".
+    """
+
+    def _get_optional_int_env() -> int | None:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    return _get_optional_int_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
@@ -211,6 +239,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
     "TPU_RAIDEN_QWEN35_ADMISSION":
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
+    "TPU_RAIDEN_GLM_ADMISSION":
+    env_bool("TPU_RAIDEN_GLM_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
     # the existing v1 connector protocol; selecting ``raiden`` enables
     # the fail-closed controller path.
@@ -226,6 +256,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
+    # Reshard control-plane hosting (zero sidecar processes): "store" hosts the
+    # reshard service inside each engine's rank-0 worker via an in-process
+    # KVCacheStore; "controller" keeps the external (sidecar) controller.
+    "TPU_RAIDEN_RESHARD_IMPL":
+    env_with_choices("TPU_RAIDEN_RESHARD_IMPL",
+                     "controller", ["controller", "store"],
+                     case_sensitive=False),
+    # Reshard client ownership: "cpp" backs the facade surface
+    # with the C++ ReshardClient (encodings, transport, and error text in
+    # C++, byte-compatible); "python" keeps the legacy Python facade as
+    # the one-release rollback.
+    "TPU_RAIDEN_CLIENT_IMPL":
+    env_with_choices("TPU_RAIDEN_CLIENT_IMPL",
+                     "cpp", ["cpp", "python"],
+                     case_sensitive=False),
+    # Host advertised for in-process reshard/dispatch services (store mode).
+    "TPU_RAIDEN_ADVERTISE_HOST":
+    lambda: os.getenv("TPU_RAIDEN_ADVERTISE_HOST", "").strip(),
+    # Per-engine deterministic ports (store mode): engine dp_rank i binds
+    # reshard service at RESHARD_PORT_BASE+i and its dispatch controller at
+    # STORE_DISPATCH_PORT_BASE+i; peers derive the same addresses.
+    "TPU_RAIDEN_RESHARD_PORT_BASE":
+    lambda: int(os.getenv("TPU_RAIDEN_RESHARD_PORT_BASE") or "27000"),
+    "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE":
+    lambda: int(os.getenv("TPU_RAIDEN_STORE_DISPATCH_PORT_BASE") or "27100"),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
@@ -233,11 +288,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
-    # Use Onehot+Matmul for permute and unpermute before and after moe
-    # when the batch size <= this threshold. When set to 0, this feature
-    # is effectively disabled.
+    # Use one-hot matmuls for MoE permute and unpermute when the routed row
+    # count (num_tokens * topk) is <= this threshold. Unset or empty means
+    # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
+    # from SparseCore geometry (0 on hosts without SparseCore). 0 keeps every
+    # size on the SparseCore path; a positive value forces that
+    # threshold. The knob and its row-count semantics come from
+    # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
-    lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD") or "0"),
+    env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":
@@ -288,15 +347,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # MoE router top-k implementation: "rowmax" (default) is the sort-free
+    # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
+    "TPU_MOE_ROUTER_TOPK":
+    env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
 
-    # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
-    # chunked kernel.
-    "VLLM_TPU_USE_NAIVE_KDA":
-    env_bool("VLLM_TPU_USE_NAIVE_KDA"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE":
     env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+
+    # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
+    # layout at load, May cost more HBM due to padding.
+    "TPU_ROPE_CACHE_ROW_MAJOR":
+    env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    "TPU_MOE_HASH_TABLE_ROW_MAJOR":
+    env_bool("TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA":
     lambda: [
@@ -306,6 +372,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Post-gather MoE token chunk size for communication-computation pipelining.
+    # When set to 0, chunking and communication pipelining are disabled.
+    "TPU_MOE_COLLECTION_CHUNK_SIZE":
+    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    "USE_BATCHED_RPA_SEQ_ON_LANE":
+    env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
+    # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
+    "USE_BATCHED_RPA_LONGCTX":
+    env_bool("USE_BATCHED_RPA_LONGCTX"),
 }
 
 

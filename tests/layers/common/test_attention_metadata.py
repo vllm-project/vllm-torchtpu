@@ -355,3 +355,53 @@ class TestAttentionMetadataBuilderPlumbing:
         ],
                                 dtype=torch.int32)
         assert torch.equal(meta.mamba_state_indices, expected)
+
+    def test_mamba_groups_share_row_plan_but_not_block_tables(self):
+        """The shared row plan must not leak one group's blocks into another.
+
+        Every mamba group derives the same row offsets from `seq_lens`, so the
+        derivation runs once per chunk and all of them reuse it — only the
+        gather into each group's own block table stays per-group. This pins
+        that sharing the offsets does not also share the blocks.
+        """
+        window = 3
+        runner = self._make_runner_mock(num_groups=2, max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 17, 33, 33], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            mamba_ckpt_window=window,
+        )
+        runner._attn_metadata_builder_ctx = ctx
+
+        metas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid).build(
+                common_prefix_len=0, common_attn_metadata=self._make_cm(4))
+            for gid in range(2)
+        ]
+
+        # Derived once, reused by the second group.
+        assert len(ctx.mamba_row_plans) == 1
+
+        # (seq_len - 1) // 16 for a 16-token block: 0, 1, 2, 2.
+        base_cols = [0, 1, 2, 2]
+        for gid, meta in enumerate(metas):
+            block_tables = (runner.input_batch.block_table[gid].get_cpu_tensor.
+                            return_value)
+            for row, col0 in enumerate(base_cols):
+                for t in range(window):
+                    assert (
+                        meta.mamba_ckpt_indices[row,
+                                                t] == block_tables[row, col0 +
+                                                                   t]), (gid,
+                                                                         row,
+                                                                         t)
+
+        # Group 1's block ids sit 100 above group 0's; a plan that carried
+        # blocks rather than offsets would have collapsed them together.
+        assert not torch.equal(metas[0].mamba_state_indices,
+                               metas[1].mamba_state_indices)

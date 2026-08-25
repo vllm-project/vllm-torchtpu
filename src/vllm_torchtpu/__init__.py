@@ -224,13 +224,13 @@ def _patch_default_moe_runner_select_forward() -> None:
 
 
 def _patch_moe_explicit_pcp_collectives() -> None:
-    """Keep PCP MoE dispatch/combine explicit for TorchTPU.
+    """Keep PCP MoE dispatch/combine explicit unless chunking owns it.
 
     vLLM treats PCP+EP as an all-to-all-kernel configuration and therefore
     skips the explicit PCP all-gather/reduce-scatter in ``MoERunner``.  The
     TorchTPU monolithic MoE kernels only compute local expert contributions;
-    they do not implement internal PCP dispatch/combine.  Do not let PCP by
-    itself select that internal-kernel contract until the backend supports it.
+    they only implement internal PCP dispatch/combine when MoE collective
+    chunking is enabled.  Otherwise keep dispatch/combine explicit.
     """
     from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
 
@@ -244,15 +244,16 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
     def use_all2all_kernels(self):
         if (self.use_ep and self.pcp_size > 1 and self.dp_size == 1
-                and not self.is_sequence_parallel):
+                and not self.is_sequence_parallel
+                and envs.TPU_MOE_COLLECTION_CHUNK_SIZE <= 0):
             return False
         return upstream_getter(self)
 
     FusedMoEParallelConfig.use_all2all_kernels = property(
         use_all2all_kernels, doc=upstream_property.__doc__)
     FusedMoEParallelConfig._tpu_explicit_pcp_collectives_patch = True
-    logger.info(
-        "Applied TPU patch: use explicit PCP collectives for monolithic MoE.")
+    logger.info("Applied TPU patch: use explicit PCP collectives unless MoE "
+                "chunk pipelining is enabled.")
 
 
 def _patch_expert_map_host_lookup() -> None:
@@ -572,6 +573,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     # Install this constructor patch at the engine-core boundary instead, before
     # the first scheduler is created.
     _patch_vllm_hybrid_producer_prefix_hits()
+    _patch_vllm_merge_multimodal_embeddings()
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -958,6 +960,33 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         if module is not None:
             setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
 
+    # Upstream _promote_local_kv_cache_specs asserts that all workers share a
+    # uniform KV cache spec across groups, raising ValueError when encountering
+    # heterogeneous layer configurations (e.g. hybrid attention/Mamba models,
+    # pure linear state layers, or disaggregated PCP configurations with
+    # per-group block sizing). We patch it to catch ValueError and return an
+    # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
+    # cache coordinator without crashing.
+    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs",
+                               None)
+    if original_promote is not None and not getattr(
+            original_promote, "_tpu_hybrid_promote_patch", False):
+
+        def patched_promote(specs):
+            try:
+                return original_promote(specs)
+            except ValueError:
+                return {}
+
+        patched_promote._tpu_hybrid_promote_patch = True
+        kv_cache_utils._promote_local_kv_cache_specs = patched_promote
+        for module_name in ("vllm.v1.engine.core",
+                            "vllm.v1.core.kv_cache_utils"):
+            mod = sys.modules.get(module_name)
+            if mod is not None and hasattr(mod,
+                                           "_promote_local_kv_cache_specs"):
+                setattr(mod, "_promote_local_kv_cache_specs", patched_promote)
+
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = (
             EngineCoreProc.run_engine_core)
@@ -968,6 +997,62 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     if not already_patched:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP "
                     "block sizes.")
+
+
+def _patch_vllm_merge_multimodal_embeddings() -> None:
+    """Patch vLLM's _merge_multimodal_embeddings to use static indexing on TPU.
+
+    PyTorch boolean indexing (inputs[mask] = values) internally lowers to
+    `nonzero()` + `index_put_`, which creates dynamic coordinate shapes
+    parameterized by the number of True entries. On TPU, this causes
+    `tt_jit_index_put__nonzero` to recompile on every request with a different
+    image token count (~15s compilation each). We replace it with static prefix-sum
+    indexing and `torch.where`, which avoids `nonzero` and eliminates recompilation.
+    """
+    import sys
+
+    import torch
+    import vllm.model_executor.models.utils as vllm_utils
+    from vllm.multimodal import NestedTensors
+
+    if not getattr(vllm_utils, "_tpu_static_merge_mm_patch", False):
+        orig_merge = vllm_utils._merge_multimodal_embeddings
+
+        def static_merge_multimodal_embeddings(
+            inputs_embeds: torch.Tensor,
+            multimodal_embeddings: NestedTensors,
+            is_multimodal: torch.Tensor,
+        ) -> torch.Tensor:
+            if len(multimodal_embeddings) == 0:
+                return inputs_embeds
+
+            mm_embeds_flat = vllm_utils._flatten_embeddings(
+                multimodal_embeddings)
+            if mm_embeds_flat.numel() == 0:
+                return inputs_embeds
+
+            mm_embeds_flat = mm_embeds_flat.to(dtype=inputs_embeds.dtype,
+                                               device=inputs_embeds.device)
+
+            idx = torch.cumsum(is_multimodal, dim=0, dtype=torch.int32) - 1
+            idx = torch.clamp(idx, 0, mm_embeds_flat.shape[0] - 1)
+            gathered = mm_embeds_flat[idx]
+            condition = is_multimodal.unsqueeze(-1)
+            return torch.where(condition, gathered, inputs_embeds)
+
+        vllm_utils._original_merge_multimodal_embeddings = orig_merge
+        vllm_utils._merge_multimodal_embeddings = static_merge_multimodal_embeddings
+        vllm_utils._tpu_static_merge_mm_patch = True
+        logger.info("Applied TPU patch: static _merge_multimodal_embeddings")
+
+    # Re-run the sweep across imported model modules on every invocation so that
+    # models imported after the first call also have their bindings updated.
+    patched_fn = vllm_utils._merge_multimodal_embeddings
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name.startswith("vllm.model_executor.models") and hasattr(
+                mod, "_merge_multimodal_embeddings"):
+            if getattr(mod, "_merge_multimodal_embeddings") is not patched_fn:
+                setattr(mod, "_merge_multimodal_embeddings", patched_fn)
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:

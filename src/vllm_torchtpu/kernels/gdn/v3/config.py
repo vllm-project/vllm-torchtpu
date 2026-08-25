@@ -22,6 +22,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+class AttentionMode(enum.StrEnum):
+    # Gated Delta Net: one scalar gate per value head.
+    GDN = enum.auto()
+    # Kimi Delta Attention: the gate is per-channel, so it carries
+    # `kq_head_dim` values per value head instead of one.
+    KDA = enum.auto()
+
+
 class GDNMode(enum.StrEnum):
     # Multiple sequences per tile, one tile per sequence. Each sequence
     # carries `window_size` tokens: a single decoded token, or a speculative
@@ -95,6 +103,10 @@ class GDNConfig:
     num_v_heads: int
     kq_head_dim: int
     v_head_dim: int
+    attention_mode: AttentionMode = AttentionMode.GDN
+    # KDA only, and must be negative. Selects the bounded gate form over the
+    # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
+    gate_lower_bound: float | None = None
     num_buffers: int = 2
     state_plan: StateSourcePlan | None = None
     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
@@ -127,6 +139,39 @@ class GDNConfig:
         return self.kernel_size - 1
 
     @property
+    def is_kda(self) -> bool:
+        return self.attention_mode == AttentionMode.KDA
+
+    @property
+    def gate_dim(self) -> int:
+        """Width of the gate activation `a`, in elements per token."""
+        if self.is_kda:
+            return self.num_v_heads * self.kq_head_dim
+        return self.num_v_heads
+
+    @property
+    def aligned_gate_dim(self) -> int:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return pl.cdiv(self.gate_dim, num_lanes) * num_lanes
+
+    @property
+    def triangular_block_size(self) -> int:
+        """Sub-block size of the chunked KDA intra-chunk solve.
+
+        The diagonal sub-blocks are evaluated on the VPU/XLU with exact
+        pairwise gate differences and the off-diagonal ones as MXU GEMMs,
+        so this trades the two units off against each other: raising it
+        moves work from MXU to XLU. More value heads already means more
+        XLU work, hence the smaller blocks there.
+        """
+        # TODO(alynie): create a better heuristic to tune this value.
+        if self.num_v_heads == 64:
+            return 2
+        if self.num_v_heads == 32:
+            return 8
+        return 16
+
+    @property
     def use_recurrent(self) -> bool:
         """Whether GDN runs the token-recurrent scan instead of the chunked one.
 
@@ -157,7 +202,10 @@ class GDNConfig:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
-        return f"fused_conv1d_gdn_{self.mode.value}{suffix}"
+        if self.is_kda and self.gate_lower_bound is not None:
+            suffix += "_bounded"
+        return (f"fused_conv1d_{self.attention_mode.value}"
+                f"_{self.mode.value}{suffix}")
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)

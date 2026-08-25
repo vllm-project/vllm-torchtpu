@@ -30,6 +30,8 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
+from vllm_torchtpu.gdn_pool_layout import (
+    POOLED_GDN_CONV_STATE_DTYPE, unified_kv_layout_enabled_for_architecture)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.layers.common.gdn_attention import (
@@ -189,12 +191,18 @@ def gdn_attention_core_tpu_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    state_len = conv_state.shape[1]
+    if state_len > kernel_size - 1:
+        conv_state_in = conv_state[:, :kernel_size - 1, :]
+    else:
+        conv_state_in = conv_state
+
     (new_conv_state,
      new_recurrent_state), output = run_jax_gdn_attention_pcp_tp_prefill(
          mixed_qkv,
          b,
          a,
-         conv_state,
+         conv_state_in,
          recurrent_state,
          conv_weight,
          conv_bias,
@@ -213,6 +221,9 @@ def gdn_attention_core_tpu_pcp_prefill(
          interleave_size=interleave_size,
          mesh=mesh,
      )
+    if state_len > kernel_size - 1:
+        new_conv_state = conv_state.at[:, :kernel_size -
+                                       1, :].set(new_conv_state)
     return new_conv_state, new_recurrent_state, output
 
 
@@ -286,8 +297,24 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        # TODO: Support bf16 conv state
-        conv_state_dtype = torch.float32
+        if unified_kv_layout_enabled_for_architecture(
+                self.model_config.architecture):
+            # Declare exactly what the pool physically stores. vLLM sizes the
+            # mamba page from the dtype declared HERE and asserts the padded
+            # page covers it, while the block-slot derivation budgets the page
+            # from POOLED_GDN_CONV_STATE_DTYPE. Declaring anything wider is not
+            # conservative, it is a contradiction: the two disagreed once and
+            # every hybrid GDN engine failed to start on that assert.
+            conv_state_dtype = getattr(
+                torch,
+                POOLED_GDN_CONV_STATE_DTYPE.split(".")[1])
+        else:
+            # TODO: Support bf16 conv state.
+            # Per-layer cache: unlike the pool, the declared dtype IS the
+            # storage dtype (vLLM strides the raw tensor with it), and this
+            # kernel path still reads fp32 conv state. Nothing pads this
+            # layout, so the wider declaration costs only its own bytes.
+            conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
     def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -310,15 +337,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_context = get_vllm_model_wrapper_context()
         parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
                                   None)
-        # Speculative decoding: verify windows run in the GDN kernel's SPEC
-        # mode, which checkpoints the state after every window position so
-        # rejected drafts can be rolled back by checkpoint selection (see
-        # TPUModelRunner.mamba_slot_read_offsets).
+        # The non-PCP op uses num_spec_tokens for verify/rollback. PCP is a
+        # prefill-only path admitted at the platform boundary; its widened
+        # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
         num_spec_tokens = self.num_spec
-        if pcp_streaming and num_spec_tokens > 0:
-            raise NotImplementedError(
-                "Speculative decoding is not supported with GDN PCP "
-                "streaming prefill.")
+
+        def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state, *args,
+                      **kwargs):
+            num_tokens = mixed_qkv.size(0)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            return torch.empty_like(conv_state), torch.empty_like(
+                recurrent_state), torch.empty(out_shape,
+                                              dtype=mixed_qkv.dtype,
+                                              device=mixed_qkv.device)
+
         if pcp_streaming:
             interleave_size = getattr(parallel_config,
                                       "cp_kv_cache_interleave_size", 0)
@@ -380,17 +412,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 input_partition_specs=input_partition_specs,
                 output_partition_specs=output_partition_specs,
             )
-
-            def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
-                          *args, **kwargs):
-                num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-                return torch.empty_like(conv_state), torch.empty_like(
-                    recurrent_state), torch.empty(out_shape,
-                                                  dtype=mixed_qkv.dtype,
-                                                  device=mixed_qkv.device)
-
-            gdn_jax_op.register_fake(_fake_gdn)
         else:
             op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"
             wrapped_fn = functools.partial(
@@ -407,16 +428,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                        wrapped_fn,
                                        donate_argnums=(3, 4))
 
-            def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
-                          *args, **kwargs):
-                num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-                return torch.empty_like(conv_state), torch.empty_like(
-                    recurrent_state), torch.empty(out_shape,
-                                                  dtype=mixed_qkv.dtype,
-                                                  device=mixed_qkv.device)
-
-            gdn_jax_op.register_fake(_fake_gdn)
+        gdn_jax_op.register_fake(_fake_gdn)
 
         def gdn_impl(
             mixed_qkv: torch.Tensor,
@@ -434,8 +446,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            # The PCP op keeps its original 13-arg signature (spec decoding
-            # is rejected with PCP streaming at op-build time).
+            # The PCP prefill op keeps its original 13-arg signature. Its
+            # speculative state tail is not a rollback operand.
             extra_args = (() if pcp_streaming else (slot_read_offsets, ))
             new_conv, new_rec, outputs = gdn_jax_op(
                 mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
@@ -565,10 +577,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.num_k_heads // self.tp_size
         has_conv_bias = self.conv1d.bias is not None
-        if self.num_spec > 0:
-            raise NotImplementedError(
-                "Speculative decoding is not supported with GDN pooled PCP "
-                "streaming prefill.")
         parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
                                   None)
         interleave_size = getattr(parallel_config,
@@ -753,14 +761,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         gdn_pooled_pcp_op = self.gdn_pooled_pcp_op
         assert gdn_pooled_pcp_op is not None
-        # This path passes the plain `request_distribution` and no rollback
-        # metadata, so it must never see a verify window.
-        # `_build_pooled_pcp_gdn_op` already refuses to build with
-        # num_spec > 0; assert here so the invariant is visible at the call
-        # site that depends on it.
-        assert self.num_spec == 0, (
-            "Speculative decoding is not supported with GDN pooled PCP "
-            "streaming prefill.")
         qkvz_weight, qkvz_weight_scale = (
             self._require_pcp_projection_parameters())
         ba, _ = self.in_proj_ba(hidden_states)
@@ -922,14 +922,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     attn_metadata, "mamba_request_distribution", None)
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
-                if self.num_spec > 0:
+                use_pcp_streaming = is_pcp_streaming_attention_metadata(
+                    attn_metadata)
+                if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
                         "mamba_slot_read_offsets in the attention metadata.")
 
                 # Execute the TorchTPU custom op
-                use_pcp_streaming = is_pcp_streaming_attention_metadata(
-                    attn_metadata)
                 if not use_pcp_streaming:
                     core_attn_out = self.gdn_op(
                         mixed_qkv, b, a, conv_state, recurrent_state,
@@ -943,13 +943,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         raise RuntimeError(
                             "GDN PCP prefill op was not initialized during model "
                             "loading.")
-                    # As above: PCP passes the plain `request_distribution`
-                    # and no `slot_read_offsets`, so a verify window must
-                    # never reach it. `_build_gdn_op(pcp_streaming=True)`
-                    # already refuses to build with num_spec > 0.
-                    assert self.num_spec == 0, (
-                        "Speculative decoding is not supported with GDN PCP "
-                        "streaming prefill.")
                     core_attn_out = gdn_pcp_op(
                         mixed_qkv, b, a, conv_state, recurrent_state,
                         self.conv1d.weight, self.conv1d.bias, self.A_log,

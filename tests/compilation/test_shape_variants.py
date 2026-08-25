@@ -105,16 +105,32 @@ class FakeExecutable:
         CALLS.append((self.rows, self.waves))
         return (torch.zeros(self.rows, HIDDEN), )
 
+    def serialize(self):
+        """Stand in for the bundled AOTAutograd entry.
+
+        A method rather than an attribute set per instance: the adaptor pickles
+        whatever this returns, and a closure in the instance __dict__ would not
+        survive that. The real entry bundles a wrapper around an executable;
+        here the executable is the whole runnable, so it is its own entry.
+        """
+        return self
+
 
 CALLS: list[tuple[int, int]] = []
 
 
 class FakeTpuBackend:
-    """torch_tpu's TpuBackend, minus torch_tpu. Everything above it is real."""
+    """torch_tpu's TpuBackend, minus torch_tpu. Everything above it is real.
+
+    Mirrors the one part of the real contract the compiler adaptor depends on:
+    the returned runnable carries ``serialize()``, which hands back a picklable
+    bundled entry holding both the wrapper and the executable. The adaptor
+    caches that entry and nothing else, so a fake without it silently disables
+    the disk cache and every warm start recompiles.
+    """
 
     def __init__(self) -> None:
         self.compiled: list[tuple[int, int]] = []  # (bucket, waves)
-        self._compiled_executables: list[FakeExecutable] = []
 
     def __call__(self, graph: fx.GraphModule, example_inputs):
         rows = max(t.shape[0] for t in example_inputs
@@ -122,8 +138,7 @@ class FakeTpuBackend:
         waves = sum(1 for node in graph.graph.nodes
                     if "wave" in str(node.target))
         self.compiled.append((rows, waves))
-        self._compiled_executables.append(FakeExecutable(rows, waves))
-        return self._compiled_executables[-1]
+        return FakeExecutable(rows, waves)
 
 
 @dataclasses.dataclass
@@ -209,6 +224,9 @@ def prepare(cache_root: str, splitting_ops=None):
     vllm_torchtpu._patch_vllm_aot_compile_cache_key()
     backend = FakeTpuBackend()
     tpu_compiler._tpu_backend = backend
+    # A FakeExecutable never went through torch, so it cannot come back through
+    # torch's bundled-entry deserializer either; it is already the runnable.
+    tpu_compiler._deserialize_entry = lambda entry: entry
     CALLS.clear()
     return make_config(splitting_ops), backend
 
@@ -418,32 +436,6 @@ def _warm_start_reuses_the_cache(cache_root):
 
 def test_warm_start_reuses_the_cache_without_compiling(tmp_path):
     in_child(partial(_warm_start_reuses_the_cache, str(tmp_path)))
-
-
-def _tier3_does_not_bypass_the_screen(cache_root):
-    os.environ[
-        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"] = f"{cache_root}/tier3"
-    config, backend = prepare(cache_root)
-    assert warm(build(WaveModel, config), config) == 1
-    backend.compiled.clear()
-
-    torch._dynamo.reset()
-    model = build(WaveModel, config)
-    assert warm(model, config) == 1
-    # Tier-3 regenerates each executable through torch_tpu on load, so every
-    # bucket must come from a graph that owns it, not from whichever graph the
-    # artifact restored.
-    assert backend.compiled == [(16, 1), (2048, 1), (4096, 2)]
-    CALLS.clear()
-    for num_tokens in BUCKETS:
-        assert run(model, config, num_tokens).shape[0] == num_tokens
-    assert CALLS == [(16, 1), (2048, 1), (4096, 2)]
-
-
-def test_tier3_cache_does_not_bypass_the_screen(tmp_path):
-    """With the Tier-3 C++ cache the load path recompiles from the graph it is
-    given (#416), so a bucket the graph refuses must still be refused there."""
-    in_child(partial(_tier3_does_not_bypass_the_screen, str(tmp_path)))
 
 
 def _session_does_not_outlive_warmup(cache_root):

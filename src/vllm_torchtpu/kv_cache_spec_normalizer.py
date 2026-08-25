@@ -1,3 +1,4 @@
+import math
 from dataclasses import replace
 
 import torch
@@ -27,14 +28,20 @@ def normalize_kv_cache_specs_for_tpu(
             normalized[layer_name] = spec
             continue
         normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
-    if (enable_unified_kv_layout
-            and _has_hybrid_attention_and_mamba(normalized)):
-        page_size = max(spec.page_size_bytes for spec in normalized.values())
-        normalized = {
-            layer_name:
-            (spec if layer_name in exempt else _pad_page_size(spec, page_size))
-            for layer_name, spec in normalized.items()
+    if enable_unified_kv_layout:
+        non_exempt_specs = {
+            k: v
+            for k, v in normalized.items() if k not in exempt
         }
+        if _has_hybrid_attention_and_mamba(non_exempt_specs):
+            page_size = max(
+                _required_page_size_bytes(spec)
+                for spec in non_exempt_specs.values())
+            normalized = {
+                layer_name: (spec if layer_name in exempt else _pad_page_size(
+                    spec, page_size))
+                for layer_name, spec in normalized.items()
+            }
     return normalized
 
 
@@ -68,11 +75,13 @@ def _normalize_one_spec(
             spec.head_size,
             kv_cache_dtype,
         )
+    target_spec = replace(spec, dtype=kv_cache_dtype)
     padded_page_size = spec.page_size_padded or 0
-    page_size = max(page_size, spec.real_page_size_bytes, padded_page_size)
+    page_size = max(page_size, target_spec.real_page_size_bytes,
+                    padded_page_size)
     if spec.page_size_padded == page_size and spec.dtype == kv_cache_dtype:
         return spec
-    return replace(spec, dtype=kv_cache_dtype, page_size_padded=page_size)
+    return replace(target_spec, page_size_padded=page_size)
 
 
 def _has_hybrid_attention_and_mamba(
@@ -84,9 +93,27 @@ def _has_hybrid_attention_and_mamba(
     return has_attention and has_mamba
 
 
+def _mamba_unpadded_page_size_bytes(spec: MambaSpec) -> int:
+    return sum(
+        math.prod(shape) * dtype.itemsize
+        for shape, dtype in zip(spec.shapes, spec.dtypes))
+
+
+def _required_page_size_bytes(spec: KVCacheSpec) -> int:
+    if isinstance(spec, MambaSpec):
+        return max(_mamba_unpadded_page_size_bytes(spec), spec.page_size_padded
+                   or 0)
+    return spec.page_size_bytes
+
+
 def _pad_page_size(spec: KVCacheSpec, page_size: int) -> KVCacheSpec:
-    if not isinstance(spec, (AttentionSpec, MambaSpec)):
-        return spec
-    if spec.page_size_bytes == page_size:
-        return spec
-    return replace(spec, page_size_padded=page_size)
+    if isinstance(spec, AttentionSpec):
+        if spec.page_size_bytes == page_size:
+            return spec
+        return replace(spec, page_size_padded=page_size)
+    if isinstance(spec, MambaSpec):
+        target = max(page_size, _mamba_unpadded_page_size_bytes(spec))
+        if spec.page_size_padded == target:
+            return spec
+        return replace(spec, page_size_padded=target)
+    return spec

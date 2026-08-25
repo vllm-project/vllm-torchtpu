@@ -123,6 +123,8 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 COMPILE_SIZES="${COMPILE_SIZES:-16384}"
 PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-${COMPILE_SIZES}}"
 DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-${COMPILE_SIZES}}"
+PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-}"
+DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
@@ -162,11 +164,16 @@ for compile_sizes_name in COMPILE_SIZES PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZ
   fi
 done
 
-managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}" "${PREFILL_CTRL_PORT}" "${DECODE_CTRL_PORT}")
+managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}")
 for offset in 0 1 2 3; do
   managed_ports+=("$((PREFILL_TPU_KV_TRANSFER_PORT + offset))")
   managed_ports+=("$((DECODE_TPU_KV_TRANSFER_PORT + offset))")
+  managed_ports+=("$((PREFILL_CTRL_PORT + offset))")
+  managed_ports+=("$((PREFILL_CTRL_PORT + 100 + offset))")
+  managed_ports+=("$((DECODE_CTRL_PORT + offset))")
+  managed_ports+=("$((DECODE_CTRL_PORT + 100 + offset))")
 done
+mapfile -t managed_ports < <(printf '%s\n' "${managed_ports[@]}" | sort -u)
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
   stop_port_listeners "${managed_ports[@]}"
 else
@@ -279,6 +286,8 @@ DECODE_TP=${DECODE_TP}
 DECODE_DP=${DECODE_DP}
 PREFILL_COMPILE_SIZES=${PREFILL_COMPILE_SIZES}
 DECODE_COMPILE_SIZES=${DECODE_COMPILE_SIZES}
+PREFILL_SPECULATIVE_CONFIG=${PREFILL_SPECULATIVE_CONFIG}
+DECODE_SPECULATIVE_CONFIG=${DECODE_SPECULATIVE_CONFIG}
 PREFILL_BLOCK_SIZE=${prefill_block_size_label}
 DECODE_BLOCK_SIZE=${decode_block_size_label}
 NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE}
@@ -299,6 +308,9 @@ ATTENTION_BACKEND=${ATTENTION_BACKEND}
 EOF
 
 printf '%q ' "${common_args[@]}" >"${RUN_DIR}/vllm_args.quoted"
+
+plan_dump_dir="${RUN_DIR}/plan_dump"
+mkdir -p "${plan_dump_dir}"
 
 if [[ "${USE_CURRENT_PY_ENV}" == "1" ]]; then
   activation_cmd=":"
@@ -328,6 +340,7 @@ export TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT}";
 export ONEHOT_MOE_PERMUTE_THRESHOLD=1024;
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
 export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0;
+export TPU_RAIDEN_PLAN_DUMP_DIR=$(shell_quote "${plan_dump_dir}");
 
 # Raiden configurations:
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1;
@@ -345,6 +358,12 @@ decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "$
 if [[ "${DECODE_DP}" -gt 1 ]]; then
   decode_args+=(--data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}")
 fi
+if [[ -n "${PREFILL_SPECULATIVE_CONFIG}" ]]; then
+  prefill_args+=(--speculative-config "${PREFILL_SPECULATIVE_CONFIG}")
+fi
+if [[ -n "${DECODE_SPECULATIVE_CONFIG}" ]]; then
+  decode_args+=(--speculative-config "${DECODE_SPECULATIVE_CONFIG}")
+fi
 if [[ -n "${PREFILL_BLOCK_SIZE}" ]]; then
   prefill_args+=(--block-size "${PREFILL_BLOCK_SIZE}")
 fi
@@ -354,23 +373,8 @@ fi
 printf '%q ' "${prefill_args[@]}" >"${RUN_DIR}/prefill_vllm_args.quoted"
 printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 
-prefill_ctrl_cmd="${python_bin} ${TORCHTPU_VLLM_SRC}/examples/disagg/run_raiden_controller.py --port ${PREFILL_CTRL_PORT}"
-decode_ctrl_cmd="${python_bin} ${TORCHTPU_VLLM_SRC}/examples/disagg/run_raiden_controller.py --port ${DECODE_CTRL_PORT}"
-
-printf '%s\n' "${prefill_ctrl_cmd}" >"${RUN_DIR}/prefill_ctrl_cmd.sh"
-printf '%s\n' "${decode_ctrl_cmd}" >"${RUN_DIR}/decode_ctrl_cmd.sh"
-
-# Launch controllers:
-setsid bash -lc "${prefill_ctrl_cmd}" >"${RUN_DIR}/logs/prefill_controller.log" 2>&1 &
-echo $! >"${RUN_DIR}/prefill_controller.pid"
-
-setsid bash -lc "${decode_ctrl_cmd}" >"${RUN_DIR}/logs/decode_controller.log" 2>&1 &
-echo $! >"${RUN_DIR}/decode_controller.pid"
-
-sleep 2
-
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:${PREFILL_CTRL_PORT}; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:${DECODE_CTRL_PORT}; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"
@@ -380,8 +384,6 @@ echo $! >"${RUN_DIR}/prefill.pid"
 setsid bash -lc "${decode_cmd}" >"${RUN_DIR}/logs/decode.log" 2>&1 &
 echo $! >"${RUN_DIR}/decode.pid"
 
-echo "prefill controller pid $(cat "${RUN_DIR}/prefill_controller.pid")"
-echo "decode controller pid $(cat "${RUN_DIR}/decode_controller.pid")"
 echo "prefill pid $(cat "${RUN_DIR}/prefill.pid")"
 echo "decode pid $(cat "${RUN_DIR}/decode.pid")"
 
@@ -394,15 +396,13 @@ for ((attempt = 1; attempt <= 120; attempt++)); do
     break
   fi
   if ! kill -0 "$(cat "${RUN_DIR}/prefill.pid" 2>/dev/null)" 2>/dev/null \
-     || ! kill -0 "$(cat "${RUN_DIR}/decode.pid" 2>/dev/null)" 2>/dev/null \
-     || ! kill -0 "$(cat "${RUN_DIR}/prefill_controller.pid" 2>/dev/null)" 2>/dev/null \
-     || ! kill -0 "$(cat "${RUN_DIR}/decode_controller.pid" 2>/dev/null)" 2>/dev/null; then
+     || ! kill -0 "$(cat "${RUN_DIR}/decode.pid" 2>/dev/null)" 2>/dev/null; then
     if grep -E "Traceback|RuntimeError|ValueError|LLVM ERROR|registered memory region overlaps|strided KV pull failed" "${RUN_DIR}/logs/prefill.log" "${RUN_DIR}/logs/decode.log" >/tmp/pd_p4d2_launch_err.$$ 2>/dev/null; then
       cat /tmp/pd_p4d2_launch_err.$$
       rm -f /tmp/pd_p4d2_launch_err.$$
       exit 1
     fi
-    echo "Prefill, decode, or one of their controller processes died unexpectedly!"
+    echo "Prefill, decode, or one of their processes died unexpectedly!"
     exit 1
   fi
   sleep 15

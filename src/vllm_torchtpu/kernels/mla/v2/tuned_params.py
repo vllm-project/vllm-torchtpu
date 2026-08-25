@@ -1106,6 +1106,26 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
+    # Kimi-K3 mixed prefill on TPU v7x-8 with TP8, BF16, and 4K tokens.
+    TuningKey(
+        case="mixed",
+        max_num_tokens=4096,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=128,
+        kv_packing=2,
+        max_num_seqs=8,
+        pages_per_seq=128,
+    ):
+    TunableParams(
+        q_split=1,
+        num_kv_pages_per_block=4,
+        num_queries_per_block=256,
+        vmem_limit_bytes=62914560,
+    ),
 }
 
 

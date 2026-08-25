@@ -275,7 +275,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         worker_metadata: List[RayWorkerMetaData] = []
         driver_ip = get_ip()
-        # For torchtpu-vllm, we always use 1 TPU per worker similar to Multiprocexecutor
+        # For vllm-torchtpu, we always use 1 TPU per worker similar to Multiprocexecutor
         num_tpu_per_worker = 1.0
         for rank, bundle_id in enumerate(bundle_indices):
             scheduling_strategy = PlacementGroupSchedulingStrategy(

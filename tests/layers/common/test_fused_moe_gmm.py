@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for the local-routing fused MoE GMM wrapper."""
 
+import types
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -468,3 +470,255 @@ def test_fused_moe_func_int4_packed_matches_reference():
                                np.asarray(expected),
                                atol=8.0,
                                rtol=3e-1)
+
+
+def _fake_tpu_info(sparse_core):
+    return types.SimpleNamespace(sparse_core=sparse_core)
+
+
+def _fake_sc_info(num_lanes, num_cores, num_subcores):
+    return types.SimpleNamespace(num_lanes=num_lanes,
+                                 num_cores=num_cores,
+                                 num_subcores=num_subcores)
+
+
+def test_onehot_threshold_env_parsing(monkeypatch):
+    getter = envs.environment_variables["ONEHOT_MOE_PERMUTE_THRESHOLD"]
+    monkeypatch.delenv("ONEHOT_MOE_PERMUTE_THRESHOLD", raising=False)
+    assert getter() is None
+    monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "")
+    assert getter() is None
+    monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "-1")
+    assert getter() == -1
+
+
+def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
+
+    def _fail():
+        raise AssertionError("get_tpu_info must not be called")
+
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _fail)
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 0, raising=False)
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
+@pytest.mark.parametrize("explicit", [None, -1])
+def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
+    monkeypatch.setattr(envs,
+                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
+                        explicit,
+                        raising=False)
+    # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) and a
+    # 256-row block (v6e) both sit at or below the cap, so block - 1 wins:
+    # a full block stays on the SparseCore path. None and -1 both select
+    # auto.
+    for sc_info, expected in ((_fake_sc_info(16, 2, 16), 511),
+                              (_fake_sc_info(8, 2, 16), 255)):
+        monkeypatch.setattr(fused_moe_gmm.pltpu,
+                            "get_tpu_info",
+                            lambda info=sc_info: _fake_tpu_info(info))
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == expected
+
+
+def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
+    monkeypatch.setattr(envs,
+                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
+                        None,
+                        raising=False)
+    # A hypothetical 1024-row block exceeds the cap, so the cap wins.
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
+                        lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)))
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 512
+
+
+def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
+    monkeypatch.setattr(envs,
+                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
+                        None,
+                        raising=False)
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
+                        lambda: _fake_tpu_info(None))
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
+def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
+    monkeypatch.setattr(envs,
+                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
+                        None,
+                        raising=False)
+
+    def _raise():
+        raise ValueError("Unsupported TPU device kind: cpu")
+
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _raise)
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
+def test_prepare_routed_onehot_permute_matches_plain_gather():
+    num_tokens, topk, hidden = 4, 2, 8
+    hidden_states = (jnp.arange(num_tokens * hidden, dtype=jnp.float32) /
+                     7).reshape(num_tokens, hidden).astype(jnp.bfloat16)
+    # -1 marks non-local experts (EP mask path).
+    topk_indices = jnp.array([[0, 1], [1, -1], [2, 0], [-1, 3]],
+                             dtype=jnp.int32)
+    topk_weights = jnp.full((num_tokens, topk), 0.5, dtype=jnp.float32)
+
+    common = dict(local_num_experts=4, topk=topk, use_ep=True)
+    onehot_out = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=num_tokens * topk,
+        **common)
+    plain_out = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+        **common)
+
+    # Each one-hot row selects exactly one token, so the permuted activations
+    # match the plain gather bit-for-bit and the routing metadata is shared.
+    for got, want in zip(onehot_out, plain_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
+    num_tokens, topk, hidden = 4, 2, 8
+    rows = num_tokens * topk
+    k1, k2 = jax.random.split(jax.random.key(1))
+    gmm1 = (jax.random.normal(k1, (rows, hidden), dtype=jnp.float32) /
+            10).astype(jnp.bfloat16)
+    gmm2 = (jax.random.normal(k2, (rows, hidden), dtype=jnp.float32) /
+            10).astype(jnp.bfloat16)
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+
+    def run(**overrides):
+        outputs = iter([gmm1, gmm2])
+        monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                            lambda *args, **kwargs: next(outputs))
+        kwargs = dict(
+            x=jnp.ones((rows, hidden), dtype=jnp.bfloat16),
+            w1=jnp.ones((1, hidden, hidden), dtype=jnp.bfloat16),
+            w1_scale=None,
+            w1_bias=None,
+            w2=jnp.ones((1, hidden, hidden), dtype=jnp.bfloat16),
+            w2_scale=None,
+            w2_bias=None,
+            group_sizes=jnp.array([rows], dtype=jnp.int32),
+            argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
+                                             dtype=jnp.int32),
+            topk_weights_flat=jnp.linspace(0.1, 0.8, rows, dtype=jnp.float32),
+            valid_mask_flat=jnp.array(
+                [True, True, False, True, True, False, True, True]),
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=rows,
+        )
+        kwargs.update(overrides)
+        return fused_moe_gmm.moe_gmm(**kwargs)
+
+    onehot_res = run()
+    plain_res = run(use_ep=False)
+
+    assert onehot_res.dtype == jnp.bfloat16
+    # Path equivalence only: with these inputs both paths compute the same
+    # weighted sums up to reduction order, so the bf16 results agree to
+    # final-rounding tolerance. The dot's output dtype is asserted
+    # separately in test_moe_gmm_onehot_combine_keeps_operand_dtype.
+    np.testing.assert_allclose(np.asarray(onehot_res, dtype=np.float32),
+                               np.asarray(plain_res, dtype=np.float32),
+                               rtol=2e-2,
+                               atol=1e-3)
+
+
+def _small_moe_gmm_kwargs(num_tokens=4, topk=2, hidden=8):
+    """Kwargs for a moe_gmm call whose gmm stages are monkeypatched away."""
+    rows = num_tokens * topk
+    return dict(
+        x=jnp.ones((rows, hidden), dtype=jnp.bfloat16),
+        w1=jnp.ones((1, hidden, hidden), dtype=jnp.bfloat16),
+        w1_scale=None,
+        w1_bias=None,
+        w2=jnp.ones((1, hidden, hidden), dtype=jnp.bfloat16),
+        w2_scale=None,
+        w2_bias=None,
+        group_sizes=jnp.array([rows], dtype=jnp.int32),
+        argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
+                                         dtype=jnp.int32),
+        topk_weights_flat=jnp.full((rows, ), 0.5, dtype=jnp.bfloat16),
+        valid_mask_flat=jnp.ones((rows, ), dtype=bool),
+        activation="silu",
+        num_tokens=num_tokens,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+    )
+
+
+def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
+    # With production dtypes (bf16 weights, bf16 gmm output) the combine
+    # matmul must NOT request f32 output: the MXU accumulates bf16 dots in
+    # f32 either way, and a widened f32 output costs bandwidth at large row
+    # counts (#485). Assert at the jaxpr level because backends that
+    # accumulate bf16 matmuls in f32 make the widening invisible to output
+    # comparison.
+    kwargs = _small_moe_gmm_kwargs()
+    rows = kwargs["argsort_revert_indices"].size
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    # Identity gmm keeps the combine matmul a function of the traced input,
+    # so it cannot constant-fold out of the jaxpr.
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda lhs, *args, **kwargs: lhs)
+
+    def run(x):
+        return fused_moe_gmm.moe_gmm(**{
+            **kwargs, "x": x,
+            "onehot_moe_permute_threshold": rows
+        })
+
+    jaxpr = jax.make_jaxpr(run)(kwargs["x"])
+    dots = [
+        eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == "dot_general"
+    ]
+    assert dots, "one-hot combine must lower to a dot_general"
+    assert all(
+        eqn.params.get("preferred_element_type") != jnp.float32
+        for eqn in dots)
+
+
+def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
+    # With skip_padded_tokens, gmm output rows past the valid prefix are
+    # uninitialized (NaN here); the one-hot combine must zero them before the
+    # matmul or they would spread to every token in the batch.
+    kwargs = _small_moe_gmm_kwargs()
+    rows = kwargs["argsort_revert_indices"].size
+    valid_rows = rows - 2
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    gmm2 = jnp.ones((rows, 8), dtype=jnp.bfloat16)
+    gmm2 = gmm2.at[valid_rows:].set(jnp.nan)
+    outputs = iter([jnp.ones((rows, 8), dtype=jnp.bfloat16), gmm2])
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda *args, **kwargs: next(outputs))
+    # Mark the slots whose routed rows fall in the NaN tail as invalid, as
+    # prepare_routed_gmm_inputs does for padded tokens.
+    revert = kwargs["argsort_revert_indices"]
+    kwargs["valid_mask_flat"] = revert < valid_rows
+    kwargs["group_sizes"] = jnp.array([valid_rows], dtype=jnp.int32)
+
+    out = fused_moe_gmm.moe_gmm(
+        **{
+            **kwargs,
+            "onehot_moe_permute_threshold": rows,
+            "skip_padded_tokens": True,
+        })
+
+    assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))

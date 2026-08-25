@@ -657,7 +657,6 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
-    layer.use_naive_kda = False
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -680,19 +679,7 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         assert args[4] is recurrent_cache
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
-    def unexpected(name):
-
-        def op(*args, **kwargs):
-            raise AssertionError(f"{name} must not run for this batch")
-
-        return op
-
     layer.dispatched_kda_op = dispatched_kda_op
-    # Neither of these is reachable without VLLM_TPU_USE_NAIVE_KDA, and a
-    # separate `sconv_op` in front of the dispatched op would convolve twice.
-    layer.sconv_op = unexpected("sconv_op")
-    layer.chunk_kda_op = unexpected("chunk_kda_op")
-    layer.kda_op = unexpected("kda_op")
 
     output = layer(torch.arange(2), torch.ones(2, 4))
     assert calls == ["dispatched"]
@@ -707,72 +694,34 @@ def test_kda_custom_ops_compile_as_one_full_graph(
 
     def jax_op(name, function, donate_argnums=()):
         del function, donate_argnums
-        if "dispatched" in name:
+        assert "dispatched" in name
 
-            def implementation(
-                mixed_qkv: torch.Tensor,
-                raw_gate: torch.Tensor,
-                beta: torch.Tensor,
-                output_gate: torch.Tensor,
-                conv_state: torch.Tensor,
-                recurrent_state: torch.Tensor,
-                conv_weight: torch.Tensor,
-                a_log: torch.Tensor,
-                dt_bias: torch.Tensor,
-                norm_weight: torch.Tensor,
-                query_start_loc: torch.Tensor,
-                state_indices: torch.Tensor,
-                seq_lens: torch.Tensor,
-                distribution: torch.Tensor,
-            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
-                del conv_weight, distribution
-                del query_start_loc, state_indices, seq_lens
-                num_heads, head_dim = recurrent_state.shape[1:3]
-                output = mixed_qkv[:, :num_heads * head_dim]
-                return (
-                    output.view(-1, num_heads, head_dim).clone(),
-                    conv_state + 1,
-                    recurrent_state + 1,
-                )
-
-        elif "sconv" in name:
-
-            def implementation(
-                mixed_qkv: torch.Tensor,
-                conv_state: torch.Tensor,
-                conv_weight: torch.Tensor,
-                query_start_loc: torch.Tensor,
-                state_indices: torch.Tensor,
-                seq_lens: torch.Tensor,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                del conv_weight
-                del query_start_loc, state_indices, seq_lens
-                return conv_state + 1, mixed_qkv.clone()
-
-        else:
-
-            def implementation(
-                mixed_qkv: torch.Tensor,
-                raw_gate: torch.Tensor,
-                beta: torch.Tensor,
-                output_gate: torch.Tensor,
-                recurrent_state: torch.Tensor,
-                a_log: torch.Tensor,
-                dt_bias: torch.Tensor,
-                norm_weight: torch.Tensor,
-                query_start_loc: torch.Tensor,
-                state_indices: torch.Tensor,
-                seq_lens: torch.Tensor,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
-                del query_start_loc, state_indices, seq_lens
-                num_heads, head_dim = recurrent_state.shape[1:3]
-                output = mixed_qkv[:, :num_heads * head_dim]
-                return (
-                    output.view(-1, num_heads, head_dim).clone(),
-                    recurrent_state + 1,
-                )
+        def implementation(
+            mixed_qkv: torch.Tensor,
+            raw_gate: torch.Tensor,
+            beta: torch.Tensor,
+            output_gate: torch.Tensor,
+            conv_state: torch.Tensor,
+            recurrent_state: torch.Tensor,
+            conv_weight: torch.Tensor,
+            a_log: torch.Tensor,
+            dt_bias: torch.Tensor,
+            norm_weight: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            state_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            distribution: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
+            del conv_weight, distribution
+            del query_start_loc, state_indices, seq_lens
+            num_heads, head_dim = recurrent_state.shape[1:3]
+            output = mixed_qkv[:, :num_heads * head_dim]
+            return (
+                output.view(-1, num_heads, head_dim).clone(),
+                conv_state + 1,
+                recurrent_state + 1,
+            )
 
         return torch.library.custom_op(name, mutates_args=())(implementation)
 
@@ -800,22 +749,6 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
-    layer.use_naive_kda = False
-    layer.sconv_op = kimi_custom_ops.build_kimi_sconv_op(
-        "test_compile",
-        kernel_size=3,
-        state_dim_first=True,
-    )
-    layer.kda_op = kimi_custom_ops.build_kimi_kda_op(
-        "test_compile",
-        lower_bound=None,
-        eps=1e-5,
-    )
-    layer.chunk_kda_op = kimi_custom_ops.build_kimi_chunk_kda_op(
-        "test_compile",
-        lower_bound=None,
-        eps=1e-5,
-    )
     layer.dispatched_kda_op = kimi_custom_ops.build_kimi_dispatched_kda_op(
         "test_compile",
         lower_bound=None,

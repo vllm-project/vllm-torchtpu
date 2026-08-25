@@ -14,6 +14,7 @@ from vllm.config import (VllmConfig, get_layers_from_vllm_config,
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu.layers.common.attention_metadata import \
     AttentionMetadataBuilderContext
@@ -22,7 +23,8 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
-                                             maybe_share_embeddings)
+                                             maybe_share_embeddings,
+                                             maybe_share_lm_head)
 from vllm_torchtpu.utils import synchronize_tensors
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
@@ -105,6 +107,8 @@ class Eagle3Proposer:
                 f"on TPU: it must be 1 (replicated draft) or {target_tp} "
                 f"(== target tensor_parallel_size, sharded draft).")
         self._draft_replicated = (draft_tp == 1)
+        # Independent from replication: target TP1 / draft TP1 can alias.
+        self._draft_tp_matches_target = (draft_tp == target_tp)
         # Lazily resolved by _draft_has_moe once the draft model exists.
         self._draft_has_moe_cache: bool | None = None
         logger.info(
@@ -113,6 +117,7 @@ class Eagle3Proposer:
             "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
             draft_tp)
         self.draft_model = None
+        self.draft_vllm_config: VllmConfig
         # Attention-layer names belonging to the draft model. Populated in
         # load_model by diffing the global attention-layer registry before
         # vs after the draft model loads.
@@ -142,12 +147,20 @@ class Eagle3Proposer:
         self._load_draft_model()
         all_attn_layers = get_layers_from_vllm_config(self.vllm_config,
                                                       AttentionLayerBase)
-        self._draft_attn_layer_names = (set(all_attn_layers.keys()) -
-                                        target_attn_layer_names)
+        draft_attn_layer_names = (set(all_attn_layers.keys()) -
+                                  target_attn_layer_names)
+        self._draft_attn_layer_names = draft_attn_layer_names
+
+        if self.runner._pcp_mtp_k1_enabled is True:
+            self._validate_pcp_draft_model(draft_attn_layer_names)
 
         maybe_share_embeddings(self.draft_model, target_model,
-                               self._draft_replicated)
-        self._maybe_share_lm_head(target_model)
+                               self._draft_tp_matches_target)
+        maybe_share_lm_head(self.draft_model,
+                            target_model,
+                            self._draft_replicated,
+                            self._draft_tp_matches_target,
+                            materialize_if_mismatched=False)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -170,7 +183,7 @@ class Eagle3Proposer:
         # lives in a separate prefix from the target's "backbone" prefix.
         draft_tp1_ctx = (_force_draft_tp1() if self._draft_replicated else
                          contextlib.nullcontext())
-        draft_vllm_config = copy.copy(self.vllm_config)
+        self.draft_vllm_config = copy.copy(self.vllm_config)
         draft_model_config = copy.copy(
             self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
@@ -180,42 +193,26 @@ class Eagle3Proposer:
             self.vllm_config.compilation_config.inductor_compile_config)
         draft_compilation_config.inductor_compile_config[
             "_vllm_model_tag"] = "eagle_head"
-        draft_vllm_config.compilation_config = draft_compilation_config
+        self.draft_vllm_config.compilation_config = draft_compilation_config
         with set_model_tag("eagle_head"), set_vllm_model_wrapper_context(
-                mesh=self.runner.mesh), set_current_vllm_config(
-                    draft_vllm_config), draft_tp1_ctx:
+                mesh=self.runner.mesh,
+                vllm_config=self.draft_vllm_config), set_current_vllm_config(
+                    self.draft_vllm_config), draft_tp1_ctx:
             self.draft_model = model_loader.load_model(
-                vllm_config=draft_vllm_config,
+                vllm_config=self.draft_vllm_config,
                 model_config=draft_model_config,
             )
 
-    def _maybe_share_lm_head(self, target_model) -> None:
-        """Override of LLMBaseProposer._maybe_share_lm_head.
-
-        Upstream conditionally shares the target's lm_head weights; we don't
-        share weights, we align the logits all_gather with the draft's
-        parallelism:
-
-        - REPLICATED (tp=1) draft: the head holds the full vocab on every
-          worker, so each already has the complete logits.
-          otherwise force (it reads the runtime TP group, size = target tp).
-        - SHARDED (draft_tp == target tp) draft: the head is column-parallel
-          over the vocab like the target, so each rank holds only vocab/tp
-          logits and the native _gather_logits all_gather IS required — leave it
-          untouched (early return below).
-        """
-        del target_model  # unused; kept to match upstream override signature
-        if not self._draft_replicated:
-            return
-        lp = getattr(self.draft_model, "logits_processor", None)
-        if lp is not None:
-            # Fail loudly if upstream renames the attr: a silent no-op here
-            # would leave the cross-rank all_gather enabled, producing wrong
-            # draft logits under a TP target.
-            assert hasattr(lp, "_gather_logits"), (
-                "draft logits_processor has no _gather_logits to override; "
-                "vLLM may have renamed it.")
-            lp._gather_logits = lambda logits: logits
+    def _validate_pcp_draft_model(self,
+                                  draft_attn_layer_names: set[str]) -> None:
+        """Validate draft KV-cache capabilities known only after model load."""
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+        for layer_name in sorted(draft_attn_layer_names):
+            spec = kv_cache_specs.get(layer_name)
+            if not isinstance(spec, FullAttentionSpec):
+                raise NotImplementedError(
+                    "PCP MTP draft requires FullAttentionSpec for layer "
+                    f"{layer_name}, got {type(spec).__name__}")
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -393,9 +390,14 @@ class Eagle3Proposer:
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
+            owner_mask = last_token_indices.ge(0)
+            safe_gather_indices = last_token_indices.clamp_min(0)
             hidden_carry, positions_carry, last_hidden_carry = (
                 self._draft_gather_carries(hidden, positions, last_hidden,
-                                           last_token_indices))
+                                           safe_gather_indices))
+            last_hidden_carry = (
+                chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
+                    last_hidden_carry, owner_mask))
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -709,6 +711,14 @@ class Eagle3Proposer:
                 gather_indices = torch.from_numpy(padded_lti_np).to(
                     runner.device)
 
+        draft_input_ids, gather_indices = (
+            chunk.sequence_layout_plan.
+            localize_token_tensor_and_gather_indices(
+                draft_input_ids,
+                gather_indices,
+                num_valid_gathers=num_reqs,
+            ))
+
         return (draft_input_ids, chunk.position_ids, gather_indices,
                 num_rejected_out)
 
@@ -837,6 +847,8 @@ class Eagle3Proposer:
             # positions so the block-table build uses the zeroed-table branch
             # instead of slicing the real (idle-rank) block table.
             position_ids_override=chunk.attn_ctx.position_ids_override,
+            sequence_layout_descriptor=(
+                chunk.attn_ctx.sequence_layout_descriptor),
         )
         try:
             slot_mappings = runner.empty_slot_mappings
@@ -917,15 +929,14 @@ class Eagle3Proposer:
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
 
-        draft_vllm_cfg = getattr(self.draft_model, "vllm_config",
-                                 self.vllm_config)
         with set_model_tag("eagle_head"), set_forward_context(
                 attn_metadata,
-                draft_vllm_cfg,
+                self.draft_vllm_config,
                 num_tokens=num_tokens,
                 num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(
                     num_tokens),
-        ), set_vllm_model_wrapper_context(mesh=self.runner.mesh):
+        ), set_vllm_model_wrapper_context(mesh=self.runner.mesh,
+                                          vllm_config=self.draft_vllm_config):
             out = self.draft_model(**kwargs)
 
         return self._unwrap_model_out(out)
@@ -937,9 +948,9 @@ class Eagle3Proposer:
         the first real propose(): combine_hidden_states (token-count buckets),
         seed_input_ids ((token, index) buckets), and the lm-head/argmax
         compute_logits (num_reqs buckets). The draft forward and the per-step
-        fused propose/verify programs are warmed by the real-path
-        _warmup_spec_decode generation, not here (a zeros-precompile of those
-        emits programs that never match the runtime eager fusion).
+        fused propose/verify programs are warmed by a real-path lifecycle
+        warmup, not here (a zeros-precompile of those emits programs that never
+        match the runtime eager fusion).
         """
         if self.runner.enforce_eager:
             return

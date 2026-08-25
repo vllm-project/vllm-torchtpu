@@ -18,12 +18,15 @@ import numpy as np
 import pytest
 import torch
 
+import vllm_torchtpu.layers.common.sequence_layout as sequence_layout
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_logits_indices, build_pcp_rank_major_token_order)
 from vllm_torchtpu.layers.common.pcp_sequence_layout import (
-    PcpSequenceLayoutEligibility, PcpSequenceLayoutMode,
-    PcpSequenceLayoutPlanner)
-from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
+    PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR, PcpSequenceLayoutEligibility,
+    PcpSequenceLayoutMode, PcpSequenceLayoutPlanner)
+from vllm_torchtpu.layers.common.sequence_layout import (
+    AllSequenceLayoutPlanner, SequenceLayoutDescriptor, SequenceLayoutKind,
+    SequenceLayoutPlan)
 
 
 def _eligibility(
@@ -33,7 +36,6 @@ def _eligibility(
     dcp_size=1,
     pipeline_parallel_size=1,
     async_scheduling=False,
-    speculative_enabled=False,
     is_kv_producer=None,
 ):
     return PcpSequenceLayoutEligibility(
@@ -42,7 +44,6 @@ def _eligibility(
         dcp_size=dcp_size,
         pipeline_parallel_size=pipeline_parallel_size,
         async_scheduling=async_scheduling,
-        speculative_enabled=speculative_enabled,
         is_kv_producer=is_kv_producer,
     )
 
@@ -260,6 +261,163 @@ def test_batch_flat_owner_is_independent_from_request_absolute_position():
     )
 
 
+@pytest.mark.parametrize(
+    ("q_lens", "pcp_size", "interleave_size", "padded_num_tokens",
+     "owner_starts"),
+    [
+        ([2, 3], 2, 1, 6, [0, 2]),
+        ([3, 3], 2, 2, 8, [0, 3]),
+        ([2, 5, 1], 4, 2, 16, [0, 2, 7]),
+        ([1], 4, 2, 8, [5]),
+    ],
+)
+def test_pcp_token_orders_are_inverses_and_each_request_has_one_owner(
+        q_lens, pcp_size, interleave_size, padded_num_tokens, owner_starts):
+    packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
+        q_lens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        padded_num_tokens=padded_num_tokens,
+        token_owner_start_offsets_per_req=owner_starts,
+    )
+    total_num_tokens = sum(q_lens)
+    np.testing.assert_array_equal(
+        packed_to_request[request_to_packed],
+        np.arange(total_num_tokens),
+    )
+
+    request_gathers = torch.tensor(
+        np.cumsum(q_lens, dtype=np.int64) - 1,
+        dtype=torch.int64,
+    )
+    request_tokens = torch.arange(total_num_tokens, dtype=torch.int64)
+    local_padded_num_tokens = padded_num_tokens // pcp_size
+    owner_counts = torch.zeros(len(q_lens), dtype=torch.int64)
+    for rank in range(pcp_size):
+        local_start = rank * local_padded_num_tokens
+        plan = SequenceLayoutPlan(
+            descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
+            token_slice=slice(local_start,
+                              local_start + local_padded_num_tokens),
+            global_num_tokens=total_num_tokens,
+            global_padded_num_tokens=padded_num_tokens,
+            local_num_tokens=int(
+                np.count_nonzero(
+                    packed_to_request[local_start:local_start +
+                                      local_padded_num_tokens] >= 0)),
+            local_padded_num_tokens=local_padded_num_tokens,
+            _packed_to_request_major_token_indices=packed_to_request,
+            _request_major_to_packed_token_indices=request_to_packed,
+        )
+
+        local_tokens, local_gathers = (
+            plan.localize_token_tensor_and_gather_indices(
+                request_tokens,
+                request_gathers,
+                num_valid_gathers=len(q_lens),
+            ))
+        if plan.local_num_tokens == 0:
+            torch.testing.assert_close(local_tokens,
+                                       torch.zeros_like(local_tokens))
+            torch.testing.assert_close(local_gathers,
+                                       torch.full_like(local_gathers, -1))
+        owner_counts += local_gathers.ge(0)
+
+    torch.testing.assert_close(owner_counts, torch.ones_like(owner_counts))
+
+
+def test_partial_plan_ignores_padded_request_aligned_gathers():
+    packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
+        [2, 3],
+        pcp_size=2,
+        interleave_size=1,
+        padded_num_tokens=6,
+        token_owner_start_offsets_per_req=[0, 2],
+    )
+    request_tokens = torch.tensor([10, 11, 20, 21, 22])
+    request_gathers = torch.tensor([1, 4, 0])
+
+    expected = [
+        (torch.tensor([10, 20, 22]), torch.tensor([-1, 2, -1])),
+        (torch.tensor([11, 21, 0]), torch.tensor([0, -1, -1])),
+    ]
+    for rank, (expected_tokens, expected_gathers) in enumerate(expected):
+        local_start = rank * 3
+        plan = SequenceLayoutPlan(
+            descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
+            token_slice=slice(local_start, local_start + 3),
+            global_num_tokens=5,
+            global_padded_num_tokens=6,
+            local_num_tokens=3 if rank == 0 else 2,
+            local_padded_num_tokens=3,
+            _packed_to_request_major_token_indices=packed_to_request,
+            _request_major_to_packed_token_indices=request_to_packed,
+        )
+
+        local_tokens, local_gathers = (
+            plan.localize_token_tensor_and_gather_indices(request_tokens,
+                                                          request_gathers,
+                                                          num_valid_gathers=2))
+
+        torch.testing.assert_close(local_tokens, expected_tokens)
+        torch.testing.assert_close(local_gathers, expected_gathers)
+
+
+def _carry_plan(descriptor: SequenceLayoutDescriptor) -> SequenceLayoutPlan:
+    return SequenceLayoutPlan(
+        descriptor=descriptor,
+        token_slice=slice(0, 3),
+        global_num_tokens=3,
+        global_padded_num_tokens=3,
+        local_num_tokens=3,
+        local_padded_num_tokens=3,
+    )
+
+
+def test_default_plan_skips_pcp_carry_collective(monkeypatch):
+    plan = AllSequenceLayoutPlanner().prepare_dummy(
+        num_tokens=3,
+        num_reqs=3,
+        kv_cache_initialized=False,
+    )
+    local_tensor = torch.tensor([[99.0], [20.0], [7.0]])
+    owner_mask = torch.tensor([False, True, False])
+    monkeypatch.setattr(
+        sequence_layout,
+        "_pcp_all_reduce_sum",
+        lambda _tensor: pytest.fail("default layout entered PCP collective"),
+        raising=False,
+    )
+
+    result = plan.aggregate_request_aligned_tensor(local_tensor, owner_mask)
+
+    torch.testing.assert_close(result, local_tensor)
+
+
+def test_pcp_plan_masks_non_owner_before_request_aligned_reduce(monkeypatch):
+    plan = _carry_plan(PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR)
+    local_tensor = torch.tensor([[99.0], [20.0], [7.0]])
+    owner_mask = torch.tensor([False, True, False])
+    reduced_inputs = []
+
+    def fake_reduce(masked_tensor):
+        reduced_inputs.append(masked_tensor.clone())
+        remote_owner = torch.zeros_like(masked_tensor)
+        remote_owner[0, 0] = 10
+        return masked_tensor + remote_owner
+
+    monkeypatch.setattr(sequence_layout,
+                        "_pcp_all_reduce_sum",
+                        fake_reduce,
+                        raising=False)
+
+    result = plan.aggregate_request_aligned_tensor(local_tensor, owner_mask)
+
+    torch.testing.assert_close(reduced_inputs[0],
+                               torch.tensor([[0.0], [20.0], [0.0]]))
+    torch.testing.assert_close(result, torch.tensor([[10.0], [20.0], [0.0]]))
+
+
 def test_evaluate_runner_chunk_classifies_multi_active_streaming_prefill():
     decision = _evaluate(
         computed=[0, 0],
@@ -362,8 +520,6 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
         (_eligibility(dcp_size=2), NotImplementedError, "DCP"),
         (_eligibility(pipeline_parallel_size=2), NotImplementedError,
          "pipeline parallelism"),
-        (_eligibility(speculative_enabled=True), NotImplementedError,
-         "speculative decoding"),
         (_eligibility(is_kv_producer=False), NotImplementedError,
          "KV consumer"),
         (_eligibility(interleave_size=0), ValueError, "interleave_size > 0"),
@@ -456,6 +612,28 @@ def test_pcp_sequence_layout_planner_returns_partial_plan(monkeypatch):
     assert plan.local_index_for_request_major_token(0) is None
     assert plan.local_index_for_request_major_token(16) == 0
     assert plan.local_index_for_request_major_token(24) == 8
+    expected_packed_to_request = np.full(512, -1, dtype=np.int64)
+    expected_packed_to_request[:16] = np.arange(16)
+    expected_packed_to_request[256:265] = np.arange(16, 25)
+    np.testing.assert_array_equal(
+        plan._packed_to_request_major_token_indices,
+        expected_packed_to_request,
+    )
+    np.testing.assert_array_equal(
+        plan._request_major_to_packed_token_indices,
+        np.concatenate((np.arange(16), np.arange(256, 265))),
+    )
+    local_tokens, local_gathers = (
+        plan.localize_token_tensor_and_gather_indices(
+            torch.arange(25, dtype=torch.int32),
+            torch.tensor([24]),
+            num_valid_gathers=1,
+        ))
+    torch.testing.assert_close(local_tokens[:9],
+                               torch.arange(16, 25, dtype=torch.int32))
+    torch.testing.assert_close(local_tokens[9:],
+                               torch.zeros(247, dtype=torch.int32))
+    torch.testing.assert_close(local_gathers, torch.tensor([8]))
     torch.testing.assert_close(
         plan.logits_indices_cpu,
         torch.tensor([264] + [-1] * 7, dtype=torch.int32),

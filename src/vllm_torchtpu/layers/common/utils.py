@@ -126,14 +126,16 @@ def slice_sharded_tensor_for_concatenation(sharded_tensor: jax.Array,
     return split_tensors
 
 
-def update_sparse_mla_kv_cache(kv_cache: jax.Array, kv_c_normed: jax.Array,
-                               k_pe: jax.Array, seq_lens: jax.Array,
-                               block_tables: jax.Array,
-                               query_start_loc: jax.Array) -> jax.Array:
-    """Scatter this step's new MLA latents into the paged fp8 KV cache.
+def update_sparse_mla_kv_cache(
+        kv_cache_nope: jax.Array, kv_cache_rope: jax.Array,
+        kv_c_normed: jax.Array, k_pe: jax.Array, seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Scatter this step's new MLA latents into the split sparse-MLA cache.
 
     Args:
-      kv_cache: Paged MLA latent cache (`[num_blocks, block_size // kv_packing, kv_packing, padded_row]`).
+      kv_cache_nope: uint8 `[num_blocks, block_size, tile_subrows, lane_bytes]` in dsa_gather's tiled layout.
+      kv_cache_rope: uint8 `[num_blocks, block_size // tile_subrows, tile_subrows, lane_bytes]`; rows padded to the lane width.
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
       seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
@@ -141,8 +143,29 @@ def update_sparse_mla_kv_cache(kv_cache: jax.Array, kv_c_normed: jax.Array,
       query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
 
     Returns:
-      The updated cache, same shape/dtype as `kv_cache`.
+      The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.
     """
+    from vllm_torchtpu.kernels.mla.sparse import dsa_gather
+
+    assert kv_c_normed.dtype == jnp.float8_e4m3fn, (
+        "sparse MLA kernel requires --kv-cache-dtype fp8 (got "
+        f"{kv_c_normed.dtype})")
+    assert (kv_cache_nope.dtype == jnp.uint8
+            and kv_cache_rope.dtype == jnp.uint8)
+
+    tile_subrows = dsa_gather.TILE_SUBROWS
+    lane_bytes = dsa_gather.TILE_LANE_BYTES
+    lkv_dim = kv_c_normed.shape[-1]
+    rope_dim = k_pe.shape[-1]
+    # dsa_gather moves one (`tile_subrows`, `lane_bytes`) uint8 tile of nope and
+    # one `lane_bytes`-byte lane row of rope per token; other head dims don't
+    # fit its address arithmetic.
+    assert (
+        lkv_dim == tile_subrows * lane_bytes and rope_dim * 2 == lane_bytes
+    ), ("dsa_gather used in the sparse MLA kernel needs the fp8 nope head "
+        f"dimension to be {tile_subrows * lane_bytes} and the fp8 rope head "
+        f"dimension to be {lane_bytes // 2}, got {lkv_dim}+{rope_dim}")
+
     num_tokens = kv_c_normed.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     seq_id = jnp.searchsorted(query_start_loc[1:], tok,
@@ -157,61 +180,20 @@ def update_sparse_mla_kv_cache(kv_cache: jax.Array, kv_c_normed: jax.Array,
 
     # page index for padded tokens, XLA drops out-of-bounds scatter writes.
     OOB_PAGE = jnp.int32(2**30)
-    kv_packing = kv_cache.shape[2]
-    page_size = kv_cache.shape[1] * kv_packing
+    page_size = kv_cache_nope.shape[1]
     page = jnp.where(valid, block_tables_2d[seq_id, pos // page_size],
                      OOB_PAGE)
     slot = pos % page_size
 
-    new_kv_cache_rows = jnp.concatenate([kv_c_normed, k_pe], axis=-1)
-    return kv_cache.at[page, slot // kv_packing,
-                       slot % kv_packing, :new_kv_cache_rows.shape[-1]].set(
-                           new_kv_cache_rows)
-
-
-def repack_sparse_mla_cache(
-        kv_cache: jax.Array, lkv_dim: int, rope_dim: int,
-        dequant_scale: float) -> tuple[jax.Array, jax.Array]:
-    """Repack the fp8 cache (pages, page_size // kv_packing, kv_packing, padded_concat_head_dim)
-    into the tiled uint8 pair csa_gather requires; see the layout contract
-    constants (TILE_SUBROWS, TILE_LANE_BYTES) in csa_gather.py.
-    """
-    from vllm_torchtpu.kernels.mla.sparse import csa_gather
-
-    assert kv_cache.dtype == jnp.float8_e4m3fn, (
-        "sparse MLA kernel requires --kv-cache-dtype fp8 (got "
-        f"{kv_cache.dtype}); the nope conversion is a pure bitcast.")
-
-    tile_subrows = csa_gather.TILE_SUBROWS
-    lane_bytes = csa_gather.TILE_LANE_BYTES
-
-    # `csa_gather` moves one (4, 128) uint8 tile of nope and one 128-byte lane
-    # row of rope per token.
-    assert (
-        lkv_dim == tile_subrows * lane_bytes and rope_dim * 2 == lane_bytes
-    ), ("csa_gather used in the sparse MLA kernel needs the fp8 nope head "
-        f"dimension to be {tile_subrows * lane_bytes} and the bf16 rope head "
-        f"dimension to be {lane_bytes // 2}, got {lkv_dim}+{rope_dim}")
-
-    pages = kv_cache.shape[0]
-    page_size = kv_cache.shape[1] * kv_cache.shape[2]
-    flat = kv_cache.reshape(pages, page_size, kv_cache.shape[-1])
-
-    nope_u8 = jax.lax.bitcast_convert_type(
-        flat[..., :lkv_dim],
-        jnp.uint8).reshape(pages, page_size, lkv_dim // lane_bytes, lane_bytes)
-
-    # TODO(gxd3): if GLM 5.2 keeps rope in fp8 like nope, both sides get cheaper:
-    # this repack becomes a plain bitcast, and csa_gather's `process_rope` drops
-    # the per-element shift/mask/or that rebuilds (1, 128) uint8 into (1, 64)
-    # bf16, leaving the SparseCore to just move bytes.
-    rope_bf16 = flat[..., lkv_dim:lkv_dim + rope_dim].astype(jnp.bfloat16)
-    if dequant_scale != 1.0:
-        rope_bf16 = rope_bf16 * jnp.bfloat16(dequant_scale)
-    rope_u16 = jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16)
-    rope_u8 = jnp.concatenate([(rope_u16 >> 8).astype(jnp.uint8),
-                               (rope_u16 & 0xFF).astype(jnp.uint8)],
-                              axis=-1).reshape(pages,
-                                               page_size // tile_subrows,
-                                               tile_subrows, lane_bytes)
-    return nope_u8, rope_u8
+    nope_tiles = jax.lax.bitcast_convert_type(kv_c_normed, jnp.uint8).reshape(
+        num_tokens, tile_subrows, lane_bytes)
+    # Pad rope to the full lane row; full-row writes keep the scatter fast.
+    k_pe_u8 = jax.lax.bitcast_convert_type(k_pe, jnp.uint8)
+    rope_rows = jnp.concatenate(
+        [k_pe_u8,
+         jnp.zeros((num_tokens, lane_bytes - rope_dim), jnp.uint8)],
+        axis=-1)
+    new_nope = kv_cache_nope.at[page, slot].set(nope_tiles)
+    new_rope = kv_cache_rope.at[page, slot // tile_subrows,
+                                slot % tile_subrows].set(rope_rows)
+    return new_nope, new_rope

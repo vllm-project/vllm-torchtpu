@@ -46,7 +46,8 @@ def _make_runner(*,
                  prompt_tokens,
                  scheduled_tokens,
                  token_paddings,
-                 uses_mrope=False):
+                 uses_mrope=False,
+                 pcp_mtp_k1_enabled=False):
     num_reqs = len(scheduled_tokens)
     max_model_len = max(64, max(prompt_tokens) + 16)
     max_num_reqs = 8
@@ -68,6 +69,7 @@ def _make_runner(*,
     runner.supports_mm_inputs = False
     runner.lora_config = None
     runner.speculative_config = None
+    runner._pcp_mtp_k1_enabled = pcp_mtp_k1_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=2,
@@ -288,6 +290,76 @@ def test_prepare_inputs_builds_rank_local_partial_layout(monkeypatch):
     torch.testing.assert_close(
         logits_indices.cpu(), torch.tensor([271] + [-1] * 7,
                                            dtype=torch.int32))
+
+
+def test_prepare_inputs_pcp_mtp_snapshots_request_major_tokens_before_pack(
+        monkeypatch):
+    scheduled = [25]
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=scheduled,
+                          scheduled_tokens=scheduled,
+                          token_paddings=[256],
+                          pcp_mtp_k1_enabled=True)
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    prepared = TPUModelRunner._prepare_inputs(runner,
+                                              _scheduler_output(scheduled), 0,
+                                              0)
+
+    request_major_input_ids, sequence_layout_plan = prepared[-2:]
+    assert sequence_layout_plan is not None
+    assert request_major_input_ids is not None
+    assert request_major_input_ids.shape == (512, )
+    torch.testing.assert_close(request_major_input_ids[:25].cpu(),
+                               torch.arange(100, 125, dtype=torch.int32))
+    torch.testing.assert_close(request_major_input_ids[25:].cpu(),
+                               torch.zeros(487, dtype=torch.int32))
+    # The target input still owns the packed rank-local representation.
+    torch.testing.assert_close(runner.input_ids[:9].cpu(),
+                               torch.arange(116, 125, dtype=torch.int32))
+
+
+def test_prepare_inputs_pcp_mtp_returns_each_chunks_own_plan(monkeypatch):
+    scheduled = [17, 25]
+    runner = _make_runner(num_computed_tokens=[0, 0],
+                          prompt_tokens=scheduled,
+                          scheduled_tokens=scheduled,
+                          token_paddings=[32],
+                          pcp_mtp_k1_enabled=True)
+    runner.num_reqs_max_model_len = 1
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    first_prepared = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 0, 0)
+    first_input_ids, first_plan = first_prepared[-2:]
+    assert first_plan is not None
+    first_packed_to_request = (
+        first_plan._packed_to_request_major_token_indices.copy())
+
+    second_prepared = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 1, 0)
+    second_input_ids, second_plan = second_prepared[-2:]
+
+    assert second_plan is not None
+    assert first_plan is not second_plan
+    assert first_plan.global_padded_num_tokens == 64
+    assert second_plan.global_padded_num_tokens == 64
+    assert not np.array_equal(
+        first_plan._packed_to_request_major_token_indices,
+        second_plan._packed_to_request_major_token_indices,
+    )
+    np.testing.assert_array_equal(
+        first_plan._packed_to_request_major_token_indices,
+        first_packed_to_request,
+    )
+    torch.testing.assert_close(first_input_ids[:17].cpu(),
+                               torch.arange(100, 117, dtype=torch.int32))
+    torch.testing.assert_close(second_input_ids[:25].cpu(),
+                               torch.arange(200, 225, dtype=torch.int32))
 
 
 def test_prepare_inputs_builds_rank_local_multi_request_partial_layout(

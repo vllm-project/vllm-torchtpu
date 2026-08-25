@@ -7,6 +7,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import \
     layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
+from .raiden_test_utils import FakeTensor, glm_named_kv_caches
+
 
 def _manifest(*, page_tokens=4096):
     storage = object()
@@ -109,3 +111,117 @@ def test_fa_page_tokens_rejects_divergent_pool_geometry():
     manifest.pools.append(second)
     with pytest.raises(ValueError, match="differs across pools"):
         rlf.fa_page_tokens(manifest)
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.2 MLA fingerprint (row-granular transfers).
+# ---------------------------------------------------------------------------
+
+
+def _glm_layout_getter(tensor):
+    packing = tensor.shape[2]
+    return ([3, 2, 1, 0], [[packing, 128], [packing, 1]], 0)
+
+
+def _glm_manifest(**kwargs):
+    return rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=glm_named_kv_caches(**kwargs),
+        raw_tensors=(),
+        block_size_tokens=1024)
+
+
+def _glm_versions(package):
+    return {
+        "torch_tpu": "torch-tpu-test-version",
+        "libtpu": "libtpu-test-version",
+    }[package]
+
+
+def test_measured_glm_layout_fingerprint_golden():
+    fingerprint, payload = rlf.measured_glm_layout_fingerprint(
+        _glm_manifest(),
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+
+    # Per-page geometry only: prefill and decode admit different pool
+    # capacities, so num_blocks must not enter the identity.
+    assert payload == {
+        "schema": "glm-mla-raw-layout-fingerprint-v1",
+        "torch_tpu": "torch-tpu-test-version",
+        "libtpu": "libtpu-test-version",
+        "page_tokens": 1024,
+        "layouts": {
+            "fa": {
+                "page_shape": [256, 4, 640],
+                "row_bytes": 2560,
+                "minor_to_major": [3, 2, 1, 0],
+                "tiles": [[4, 128], [4, 1]],
+                "element_size_in_bits": 8,
+            },
+            "dsa.idx": {
+                "page_shape": [256, 4, 256],
+                "row_bytes": 1024,
+                "minor_to_major": [3, 2, 1, 0],
+                "tiles": [[4, 128], [4, 1]],
+                "element_size_in_bits": 8,
+            },
+        },
+    }
+    assert fingerprint == (
+        "9e424c400c946a5b921e39f6468e73fd4f5098033166db3d0045338ea8bea8f2")
+
+
+def test_glm_fingerprint_accepts_bf16_pair_packing():
+    _, payload = rlf.measured_glm_layout_fingerprint(
+        _glm_manifest(fa_shape=(16, 512, 2, 640),
+                      fa_esz=2,
+                      fa_dtype="torch.bfloat16"),
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    assert payload["layouts"]["fa"] == {
+        "page_shape": [512, 2, 640],
+        "row_bytes": 2560,
+        "minor_to_major": [3, 2, 1, 0],
+        "tiles": [[2, 128], [2, 1]],
+        "element_size_in_bits": 16,
+    }
+
+
+@pytest.mark.parametrize(
+    ("layout", "page_tokens", "message"),
+    [
+        (([2, 3, 1, 0], [[4, 128], [4, 1]], 0), 1024, "physical order"),
+        (([3, 2, 1, 0], [[8, 128], [4, 1]], 0), 1024, "tile shape"),
+        (None, 1024, "no materialized"),
+        (([3, 2, 1, 0], [[4, 128], [4, 1]], 0), 512, "page geometry"),
+    ],
+)
+def test_measured_glm_layout_fingerprint_fails_closed(layout, page_tokens,
+                                                      message):
+    with pytest.raises(RuntimeError, match=message):
+        rlf.measured_glm_layout_fingerprint(
+            _glm_manifest(),
+            page_tokens=page_tokens,
+            layout_getter=lambda tensor: layout,
+            package_version=lambda package: "unused",
+        )
+
+
+def test_glm_fingerprint_rejects_shape_divergence_within_tag():
+    manifest = _glm_manifest()
+    divergent = _glm_manifest(fa_shape=(16, 256, 4, 512))
+    manifest.pools.append(divergent.pools[-1])
+    manifest.storages.append(
+        FakeTensor((16, 256, 4, 512), 1, dtype="torch.float8_e5m2"))
+    manifest.pools[-1].storage_index = len(manifest.storages) - 1
+    with pytest.raises(RuntimeError, match="disagree on shape"):
+        rlf.measured_glm_layout_fingerprint(
+            manifest,
+            page_tokens=1024,
+            layout_getter=_glm_layout_getter,
+            package_version=lambda package: "unused",
+        )

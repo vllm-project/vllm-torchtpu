@@ -11,10 +11,12 @@ import dataclasses
 import math
 import os
 import time
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -91,9 +93,13 @@ from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.mm_encoder_manager import \
+    maybe_create_mm_encoder_manager
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.structured_decoding_manager import \
@@ -131,6 +137,68 @@ class ExecuteModelState:
     # and so contributes a single-element list.
     mamba_state_indices_list: list[list[torch.Tensor]
                                    | None] = field(default_factory=list)
+
+
+# Per-step mamba read-offset operations, consolidated into single cached
+# TPU programs (avoiding per-group eager launches). Each body is defined
+# once; the compiled variant is derived from it, and the dispatchers pick
+# eager on CPU (unit tests, pre-init paths) since the tpu backend cannot
+# trace CPU tensors.
+def _reset_read_offsets_impl(read_offsets: torch.Tensor,
+                             keep_dev: torch.Tensor,
+                             stacked_groups: torch.Tensor,
+                             null: torch.Tensor) -> None:
+    """Scatter reset across all mamba groups in a single program.
+    `stacked_groups` is [G, width]; `keep_dev` [width] broadcasts across G.
+    Non-new rows collapse onto the null slot, where writing 0 is a no-op."""
+    targets = torch.where(keep_dev, stacked_groups, null)
+    zero = torch.zeros((),
+                       dtype=read_offsets.dtype,
+                       device=read_offsets.device)
+    read_offsets.index_put_((targets.reshape(-1).long(), ), zero)
+
+
+def _rollback_offsets_seed_impl(read_offsets: torch.Tensor,
+                                dst_t: torch.Tensor) -> None:
+    read_offsets.index_put_((dst_t, ),
+                            torch.zeros(dst_t.shape[0],
+                                        dtype=read_offsets.dtype,
+                                        device=read_offsets.device))
+
+
+def _rollback_offsets_migrate_impl(read_offsets: torch.Tensor,
+                                   src_t: torch.Tensor,
+                                   dst_t: torch.Tensor) -> None:
+    read_offsets.index_put_((dst_t, ), read_offsets[src_t])
+
+
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
+_rollback_offsets_migrate_compiled = _tpu_compile(
+    _rollback_offsets_migrate_impl)
+
+
+def _reset_read_offsets(read_offsets: torch.Tensor, keep_dev: torch.Tensor,
+                        stacked_groups: torch.Tensor,
+                        null: torch.Tensor) -> None:
+    fn = (_reset_read_offsets_compiled
+          if read_offsets.device.type == "tpu" else _reset_read_offsets_impl)
+    fn(read_offsets, keep_dev, stacked_groups, null)
+
+
+def _rollback_offsets_seed(read_offsets: torch.Tensor,
+                           dst_t: torch.Tensor) -> None:
+    fn = (_rollback_offsets_seed_compiled if read_offsets.device.type == "tpu"
+          else _rollback_offsets_seed_impl)
+    fn(read_offsets, dst_t)
+
+
+def _rollback_offsets_migrate(read_offsets: torch.Tensor, src_t: torch.Tensor,
+                              dst_t: torch.Tensor) -> None:
+    fn = (_rollback_offsets_migrate_compiled if read_offsets.device.type
+          == "tpu" else _rollback_offsets_migrate_impl)
+    fn(read_offsets, src_t, dst_t)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -377,6 +445,8 @@ class TPUModelRunner(GPUModelRunner):
         # wrong scope and fails silently. See `_init_phased_profiling`.
         self._profiler_rank = profiler_rank
         self._profiler_world_size = profiler_world_size
+        self._pcp_mtp_k1_enabled = (PcpStaticSupportValidator.from_vllm_config(
+            vllm_config).pcp_mtp_k1_enabled)
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
@@ -512,6 +582,7 @@ class TPUModelRunner(GPUModelRunner):
         # bucket and chunk count.
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
+        self._dp_step_max_reqs: int = 0
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -637,7 +708,6 @@ class TPUModelRunner(GPUModelRunner):
                                                     self.block_size),
             self.max_num_reqs, self.max_num_tokens)
 
-        self.structured_decoding_manager = StructuredDecodingManager(self)
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and
@@ -674,6 +744,7 @@ class TPUModelRunner(GPUModelRunner):
         self.speculative_config = self.vllm_config.speculative_config
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
+        self.structured_decoding_manager = StructuredDecodingManager(self)
 
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
@@ -916,15 +987,95 @@ class TPUModelRunner(GPUModelRunner):
                     getattr(local_devices[0], "id", str(local_devices[0])))
         return mesh
 
+    # Entries described per report before the rest are summarized. A boot
+    # compiles hundreds, and the interesting case -- a handful appearing once
+    # traffic is running -- is well under this.
+    _MAX_DESCRIBED_GRAPHS = 20
+
+    # Newest entry seen by the previous report, which is what makes an entry
+    # "first read since then". A class attribute rather than an __init__ one
+    # because the first report runs from inside __init__, so an instance
+    # attribute has to be assigned above that call to exist in time.
+    _xla_graphs_checked_at = None
+
+    @staticmethod
+    def _describe_xla_graph(entry) -> str:
+        """One line describing a cache entry, from whatever fields it carries.
+
+        ``per_entry_stats`` holds an opaque pybind type whose fields differ
+        between torch_tpu versions, so read them reflectively rather than
+        pinning names that will silently vanish on an upgrade.
+        """
+        fields = []
+        for name in sorted(dir(entry)):
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(entry, name)
+            except Exception:  # a property that needs live device state
+                continue
+            if callable(value):
+                continue
+            text = str(value).replace("\n", " ")
+            if len(text) > 120:
+                text = text[:117] + "..."
+            fields.append(f"{name}={text}")
+        return " ".join(fields) if fields else repr(entry)[:200]
+
+    @staticmethod
+    def _xla_graph_compile_secs(entry) -> float:
+        duration = getattr(entry, "compilation_duration", None)
+        total_seconds = getattr(duration, "total_seconds", None)
+        return total_seconds() if total_seconds is not None else 0.0
+
+    def _fresh_xla_graphs(self, entries) -> list:
+        """The entries this process compiled since the previous report.
+
+        There is no identifier on an entry to diff against, and the list is not
+        append-only -- its tail routinely holds boot-time programs with
+        ``read_count`` in the dozens -- so slicing off ``num_xla_graphs`` names
+        the wrong graphs. What each entry does carry is when it was last read
+        and how often, so an entry first read after the previous report is one
+        this report is responsible for.
+        """
+        fresh, newest = [], self._xla_graphs_checked_at
+        for entry in entries:
+            last_read = getattr(entry, "last_read", None)
+            if last_read is None:
+                continue
+            if newest is None or last_read > newest:
+                newest = last_read
+            if getattr(entry, "read_count", 0) != 1:
+                continue  # read before, so it predates this report
+            if (self._xla_graphs_checked_at is not None
+                    and last_read <= self._xla_graphs_checked_at):
+                continue
+            fresh.append(entry)
+        self._xla_graphs_checked_at = newest
+        fresh.sort(key=self._xla_graph_compile_secs, reverse=True)
+        return fresh
+
     def _update_num_xla_graphs(self, case_str):
         check_comp = self.check_recompilation and not self.enforce_eager
         if not check_comp:
             return
 
         stats = torch.tpu._get_cache_stats()
-        total_graphs = len(stats.per_entry_stats)
+        entries = stats.per_entry_stats
+        total_graphs = len(entries)
+        if total_graphs < self.num_xla_graphs:
+            # Entries were evicted, so the delta below would understate what
+            # was compiled. Resynchronize rather than report a negative count.
+            logger.info(
+                "XLA cache shrank from %d to %d entries (case: %s); "
+                "resynchronizing the recompilation counter",
+                self.num_xla_graphs, total_graphs, case_str)
+            self.num_xla_graphs = total_graphs
+            return
+
+        fresh = self._fresh_xla_graphs(entries)
         new_compiled_graphs = total_graphs - self.num_xla_graphs
-        if new_compiled_graphs == 0:
+        if new_compiled_graphs == 0 and not fresh:
             logger.info(f"No new compiled graphs for case: {case_str}")
             return
 
@@ -933,6 +1084,24 @@ class TPUModelRunner(GPUModelRunner):
         logger.info(
             f"Total number of cached graphs: {total_graphs}, new: {new_compiled_graphs}, case: {case_str}"
         )
+
+        # A count says four graphs appeared; it does not say which op keeps
+        # producing fresh shapes, which is the only thing that makes a runtime
+        # recompilation actionable. Note the compile seconds: an entry with a
+        # zero duration was served from a cache rather than compiled here, so
+        # it costs nothing even though it counts.
+        if fresh:
+            secs = sum(map(self._xla_graph_compile_secs, fresh))
+            logger.info(
+                "  %d first read since the last check, %.3fs compiling",
+                len(fresh), secs)
+            for i, entry in enumerate(fresh[:self._MAX_DESCRIBED_GRAPHS], 1):
+                logger.info("  graph %d/%d: %s", i, len(fresh),
+                            self._describe_xla_graph(entry))
+            if len(fresh) > self._MAX_DESCRIBED_GRAPHS:
+                logger.info("  ... %d more not shown",
+                            len(fresh) - self._MAX_DESCRIBED_GRAPHS)
+
         self.num_xla_graphs += new_compiled_graphs
 
     def _reorder_batch_for_rpa(
@@ -1010,6 +1179,7 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
@@ -1089,9 +1259,9 @@ class TPUModelRunner(GPUModelRunner):
                         self.kv_cache_dtype,
                     )
                     page_size_padded = (
-                        self._hybrid_uniform_page_size_bytes if
-                        self._hybrid_uniform_page_size_bytes is not None else
-                        PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        self._hybrid_uniform_page_size_bytes
+                        if self._hybrid_uniform_page_size_bytes is not None
+                        else backend_cls.get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
@@ -1167,6 +1337,41 @@ class TPUModelRunner(GPUModelRunner):
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
         )
+
+    def build_attention_metadata_for_layers(
+        self,
+        layer_names: Collection[str],
+        num_reqs_padded: int,
+    ) -> dict[str, AttentionMetadata]:
+        """Build attention metadata for only the groups owning `layer_names`.
+
+        `_build_attention_metadata` walks every KV cache group. A drafter
+        needs only its own layers, and the group count tracks the layer count
+        whenever vLLM's spec bucketing collapses — which a drafter mixing
+        window and full attention causes on its own. Building every group and
+        discarding all but the draft's costs a block-table H2D plus a handful
+        of gathers per discarded group, per chunk, per step.
+
+        Reads the same `_attn_metadata_builder_ctx` the full build does, so
+        callers stage it identically.
+        """
+        # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
+        # common metadata; everything else it needs comes from
+        # `_attn_metadata_builder_ctx`.
+        common = SimpleNamespace(num_reqs=num_reqs_padded)
+        metadata: dict[str, AttentionMetadata] = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                selected = [n for n in group.layer_names if n in layer_names]
+                if not selected:
+                    continue
+                built = group.metadata_builders[0].build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                )
+                for name in selected:
+                    metadata[name] = built
+        return metadata
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -1281,69 +1486,32 @@ class TPUModelRunner(GPUModelRunner):
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-    def _plan_ds_v4_auxiliary_overlay(
-            self, layer_names: Iterable[str]) -> dict[str, str]:
-        """Map each DSv4 compressor state cache to the layer it overlays.
+    _DS_V4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
+    _DS_V4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+    _DS_V4_ROPE_CACHE_SUFFIX = "_rope"
+    _DS_V4_KV_PACKING = 4
+    _DS_V4_CSA_COMPRESS_RATIO = 4
 
-        Planned before allocation: allocating then aliasing still counts
-        against peak HBM, since every array in the loop is live at once.
+    @staticmethod
+    def _ds_v4_compressed_kv_layer_name(state_cache_name: str) -> str:
+        """The layer whose compressed-KV records a DSv4 state cache accompanies.
+
+        Mirrors how vLLM wires `DeepseekCompressor.k_cache_prefix` (the
+        attention layer itself for the main compressor, the indexer's
+        `k_cache` for the indexer compressor):
+
+          `<...>.attn.compressor.state_cache`          -> `<...>.attn`
+          `<...>.attn.indexer.compressor.state_cache`  ->
+              `<...>.attn.indexer.k_cache`
         """
-        static_forward_context = (
-            self.vllm_config.compilation_config.static_forward_context)
-        state_suffix = ".compressor.state_cache"
-        overlay: dict[str, str] = {}
-        for layer_name in layer_names:
-            attn_module = static_forward_context.get(layer_name)
-            if isinstance(
-                    attn_module,
-                    CompressorStateCache) or layer_name.endswith(state_suffix):
-                if not layer_name.endswith(state_suffix):
-                    raise ValueError(
-                        "DeepSeek-V4 compressor state cache has an unexpected "
-                        f"layer name {layer_name!r}; expected it to end with "
-                        f"{state_suffix!r} so the host layer can be derived.")
-                base = layer_name[:-len(state_suffix)]
-                # Map compressor state cache layer name to host attention layer's k_cache.
-                overlay[layer_name] = (base + ".k_cache"
-                                       if base.endswith(".indexer") else base)
-        return overlay
-
-    def _alias_ds_v4_auxiliary_caches(
-        self,
-        kv_caches: dict[str, torch.Tensor],
-        overlay: dict[str, str],
-        per_layer_spec: Callable[[str], KVCacheSpec],
-    ) -> None:
-        """Point DeepSeek-V4 compressor state caches at their host's tensor.
-
-        The state cache is packed into the host's page, so a layout change
-        that makes it no longer fit must fail here rather than let
-        `pack_state_cache` write past the page.
-        """
-        for layer_name, host_layer_name in overlay.items():
-            if host_layer_name not in kv_caches:
-                raise ValueError(
-                    "DeepSeek-V4 auxiliary cache has no host KV layer to overlay: "
-                    f"cache={layer_name!r}, expected KV layer {host_layer_name!r}, "
-                    f"known layers={sorted(kv_caches.keys())}")
-            host = kv_caches[host_layer_name]
-            spec = per_layer_spec(layer_name)
-            # 4-D packed layout: (pages, rows/packing, packing, width).
-            host_page_entries = host.shape[1] * host.shape[2]
-            host_page_bytes = host_page_entries * host.shape[-1]
-            state_page_bytes = (spec.block_size * spec.num_kv_heads *
-                                spec.head_size * spec.dtype.itemsize)
-            if state_page_bytes > host_page_bytes:
-                raise ValueError(
-                    f"DeepSeek-V4 state cache {layer_name!r} needs "
-                    f"{state_page_bytes} B per page but its host "
-                    f"{host_layer_name!r} page holds {host_page_bytes} B.")
-            if host_page_entries % spec.block_size != 0:
-                raise ValueError(
-                    f"DeepSeek-V4 state cache {layer_name!r} has block_size "
-                    f"{spec.block_size}, which does not divide its host's "
-                    f"{host_page_entries} entries per page.")
-            kv_caches[layer_name] = host
+        suffix = TPUModelRunner._DS_V4_STATE_CACHE_SUFFIX
+        if not state_cache_name.endswith(suffix):
+            raise ValueError(
+                "DeepSeek-V4 compressor state cache has an unexpected layer "
+                f"name {state_cache_name!r}; expected it to end with "
+                f"{suffix!r} so the compressed-KV layer can be derived.")
+        base = state_cache_name[:-len(suffix)]
+        return base + ".k_cache" if base.endswith(".indexer") else base
 
     @staticmethod
     def _is_ds_v4_swa_layer(layer_name: str, spec: KVCacheSpec) -> bool:
@@ -1354,23 +1522,23 @@ class TPUModelRunner(GPUModelRunner):
         return isinstance(spec,
                           SlidingWindowMLASpec) and "swa_cache" in layer_name
 
-    def _plan_ds_v4_swa_overlay(
+    def _classify_ds_v4_layers(
         self,
         kv_cache_config: KVCacheConfig,
         per_layer_spec: Callable[[str], KVCacheSpec],
-        cache_shape_of: Callable[[KVCacheSpec], tuple[int, ...]],
-    ) -> dict[str, str]:
-        """Map each DSv4 SWA cache onto a compatible compressed-KV layer.
+    ) -> tuple[list[str], list[list[str]], list[str]]:
+        """Split DSv4's layers by the kernel that reads their array.
 
-        vLLM assigns page indices assuming these caches share one allocation.
-        TPU arrays cannot be byte views into a slab, so the overlay is rebuilt
-        here: an `MLAAttentionSpec` host must be at least as wide and hold at
-        least as many entries, and any unmapped remainder gets its own array.
+        Iteration is in cache-group order so allocation and overlay
+        assignment are deterministic across workers.
 
-        Returns `{swa_layer_name: host_layer_name}` for the layers that overlay.
+        Returns `(mla_layer_names, swa_layer_groups, state_layer_names)`.
+        SWA layers stay grouped: layers of one cache group share a block
+        table, so each must land on a different array.
         """
-        mla_layers: list[str] = []
-        swa_groups: list[list[str]] = []
+        mla_layer_names: list[str] = []
+        swa_layer_groups: list[list[str]] = []
+        state_layer_names: list[str] = []
         for group in kv_cache_config.kv_cache_groups:
             swa_in_group: list[str] = []
             for layer_name in group.layer_names:
@@ -1378,45 +1546,26 @@ class TPUModelRunner(GPUModelRunner):
                     continue
                 spec = per_layer_spec(layer_name)
                 if isinstance(spec, MLAAttentionSpec):
-                    mla_layers.append(layer_name)
+                    mla_layer_names.append(layer_name)
+                elif layer_name.endswith(self._DS_V4_STATE_CACHE_SUFFIX):
+                    state_layer_names.append(layer_name)
                 elif self._is_ds_v4_swa_layer(layer_name, spec):
                     swa_in_group.append(layer_name)
+                else:
+                    raise ValueError(
+                        "DeepSeek-V4 layer has no known role (expected an "
+                        "MLAAttentionSpec cache, a `*.compressor.state_cache` "
+                        f"or a `*swa_cache*` layer): layer={layer_name}, "
+                        f"spec={spec}")
             if swa_in_group:
-                swa_groups.append(swa_in_group)
+                swa_layer_groups.append(swa_in_group)
 
-        if not swa_groups:
-            return {}
-        if not mla_layers:
+        if not mla_layer_names:
             raise ValueError(
-                "DeepSeek-V4 model has SWA caches but no MLAAttentionSpec "
-                "layers to overlay them onto: swa_layers="
-                f"{[n for g in swa_groups for n in g]}")
-
-        overlay: dict[str, str] = {}
-        # One host per SWA cache, tracked globally: layers in a group share a
-        # block table, and resetting per group would reuse hosts[0] everywhere.
-        taken: set[str] = set()
-        for swa_layers in swa_groups:
-            swa_spec = per_layer_spec(swa_layers[0])
-            swa_entry_bytes = (swa_spec.num_kv_heads * swa_spec.head_size *
-                               swa_spec.dtype.itemsize)
-            for layer_name in swa_layers:
-                for host_name in mla_layers:
-                    if host_name in taken:
-                        continue
-                    host_spec = per_layer_spec(host_name)
-                    shape = cache_shape_of(host_spec)
-                    # 4-D packed MLA layout:
-                    # (pages, rows/packing, packing, width).
-                    page_entries = shape[1] * shape[2]
-                    entry_width_bytes = shape[-1] * host_spec.dtype.itemsize
-                    if (host_spec.dtype == swa_spec.dtype
-                            and entry_width_bytes >= swa_entry_bytes
-                            and page_entries >= swa_spec.storage_block_size):
-                        overlay[layer_name] = host_name
-                        taken.add(host_name)
-                        break
-        return overlay
+                "DeepSeek-V4 model has no MLAAttentionSpec layers to anchor "
+                "the KV cache overlays. groups="
+                f"{[g.layer_names for g in kv_cache_config.kv_cache_groups]}")
+        return mla_layer_names, swa_layer_groups, state_layer_names
 
     def _update_attention_page_size_padded(self,
                                            layers: dict[str,
@@ -1456,10 +1605,11 @@ class TPUModelRunner(GPUModelRunner):
         to make sure every layer is pinned to the *same* one.
         """
         attn_page_sizes = set()
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         for m in layers.values():
             if isinstance(m, Attention):
                 attn_page_sizes.add(
-                    PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                    backend_cls.get_kv_cache_page_size_bytes(
                         block_size,
                         m.num_kv_heads,
                         m.head_size,
@@ -1539,8 +1689,7 @@ class TPUModelRunner(GPUModelRunner):
         first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        attention_backend = (PallasMLAttentionBackend if isinstance(
-            first_attn_module, MLAAttention) else PallasAttentionBackend)
+        attention_backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.block_size, num_kv_heads, first_attn_module.head_size,
             self.kv_cache_dtype)
@@ -1655,6 +1804,8 @@ class TPUModelRunner(GPUModelRunner):
         filling the connector reserve back up with KV blocks and defeating
         the worker-side subtraction.
         """
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            return kv_cache_memory_bytes
         budget = utils.compute_hbm_budget(
             [self.device], self.cache_config.gpu_memory_utilization)
         return budget.available - utils.estimate_kv_connector_hbm_reserve(
@@ -2050,11 +2201,7 @@ class TPUModelRunner(GPUModelRunner):
                                  dtype=torch.long).to(self.device,
                                                       non_blocking=True)
             assert self.mamba_slot_read_offsets is not None
-            self.mamba_slot_read_offsets.index_put_(
-                (dst_t, ),
-                torch.zeros(dst_t.shape[0],
-                            dtype=self.mamba_slot_read_offsets.dtype,
-                            device=self.mamba_slot_read_offsets.device))
+            _rollback_offsets_seed(self.mamba_slot_read_offsets, dst_t)
         elif self.mamba_slot_read_offsets is not None and offset_pairs:
             # Migrate the read offsets with the state: gather at the old
             # blocks, scatter at the new ones (both device-side, before the
@@ -2067,8 +2214,8 @@ class TPUModelRunner(GPUModelRunner):
             dst_t = torch.tensor([d for _, d in offset_pairs],
                                  dtype=torch.long).to(self.device,
                                                       non_blocking=True)
-            self.mamba_slot_read_offsets.index_put_(
-                (dst_t, ), self.mamba_slot_read_offsets[src_t])
+            _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t,
+                                      dst_t)
 
         for raw, srcs_dev, dsts_dev in per_raw_dev.values():
             src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev))
@@ -2752,6 +2899,13 @@ class TPUModelRunner(GPUModelRunner):
                                                      num_reqs] +
             num_scheduled_tokens_per_req)
 
+        request_major_input_ids_cpu: torch.Tensor
+        if self._pcp_mtp_k1_enabled:
+            # prepare_real() may repack input_ids_cpu in place. Preserve only
+            # the real request-major prefix before crossing that boundary.
+            request_major_input_ids_cpu = self.input_ids_cpu.narrow(
+                0, 0, int(total_num_scheduled_tokens)).clone()
+
         if use_max_model_len:
             target_num_reqs = self.num_reqs_max_model_len
         else:
@@ -2774,6 +2928,17 @@ class TPUModelRunner(GPUModelRunner):
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = (
             layout_plan.global_padded_num_tokens)
+        request_major_input_ids = None
+        if self._pcp_mtp_k1_enabled:
+            request_major_input_ids_cpu_padded = torch.zeros(
+                layout_plan.global_padded_num_tokens,
+                dtype=request_major_input_ids_cpu.dtype,
+            )
+            request_major_input_ids_cpu_padded.narrow(
+                0, 0, layout_plan.global_num_tokens).copy_(
+                    request_major_input_ids_cpu)
+            request_major_input_ids = request_major_input_ids_cpu_padded.to(
+                self.device, non_blocking=True)
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = (
             layout_plan.local_padded_num_tokens)
@@ -3012,6 +3177,8 @@ class TPUModelRunner(GPUModelRunner):
             cur_input_indices,
             pre_next_tokens_indices,
             spec_decode_metadata,
+            request_major_input_ids,
+            layout_plan,
         )
 
     def _get_model_inputs(
@@ -3062,14 +3229,22 @@ class TPUModelRunner(GPUModelRunner):
         return (utils.get_dp_size(self.parallel_config) > 1
                 and self.parallel_config.enable_expert_parallel)
 
-    def _count_input_chunks(self, scheduler_output: "SchedulerOutput") -> int:
-        """Match _prepare_inputs chunking without staging any tensors."""
+    def _count_input_chunks(
+            self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:
+        """Match _prepare_inputs chunking without staging any tensors.
+
+        Returns (num_chunks, max_chunk_reqs). The second value is the exact
+        maximum request count of any chunk — a most-model-len chunk holds up
+        to num_reqs_most_model_len requests, which can exceed
+        num_reqs_max_model_len, so no batch-level clamp is a safe substitute.
+        """
         if scheduler_output.total_num_scheduled_tokens == 0:
-            return 0
+            return 0, 0
 
         num_reqs = self.input_batch.num_reqs
         start_index = 0
         num_chunks = 0
+        max_chunk_reqs = 0
         while start_index < num_reqs:
             use_max_model_len = self.most_model_len is None
             for i in range(start_index, num_reqs):
@@ -3085,13 +3260,17 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
-            start_index += min(chunk_reqs, num_reqs - start_index)
+            this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
+            max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
+            start_index += this_chunk_reqs
             num_chunks += 1
-        return num_chunks
+        return num_chunks, max_chunk_reqs
 
     def _dp_coordinated_step(
-            self, local_num_tokens: int,
-            local_num_chunks: int) -> "tuple[int | None, int]":
+            self,
+            local_num_tokens: int,
+            local_num_chunks: int,
+            local_num_reqs: int = 0) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
@@ -3101,8 +3280,11 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        t = torch.tensor([int(local_num_tokens),
-                          int(local_num_chunks)],
+        t = torch.tensor([
+            int(local_num_tokens),
+            int(local_num_chunks),
+            int(local_num_reqs)
+        ],
                          dtype=torch.int64,
                          device="cpu")
         torch.distributed.all_reduce(t,
@@ -3110,6 +3292,11 @@ class TPUModelRunner(GPUModelRunner):
                                      group=get_dp_group().cpu_group)
         bucket = _get_padded_token_len(self.num_tokens_paddings,
                                        int(t[0].item()))
+        # Spec-decode draft forwards size themselves off the step's DP-wide
+        # max per-chunk request count (see DFlashProposer), riding this same
+        # all-reduce instead of paying the theoretical max bucket or a
+        # second collective.
+        self._dp_step_max_reqs = int(t[2].item())
         return bucket, int(t[1].item())
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
@@ -3226,9 +3413,14 @@ class TPUModelRunner(GPUModelRunner):
                 mm_cumsum_np = np.concatenate(
                     [[0], np.cumsum(is_mm_embed_full.cpu().numpy())])
 
-        local_num_chunks = self._count_input_chunks(scheduler_output)
+        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
+            scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens, local_num_chunks)
+            scheduler_output.total_num_scheduled_tokens,
+            local_num_chunks,
+            # Exact per-chunk request bound on this rank; the DP-wide MAX of
+            # it sizes every rank's draft forwards.
+            local_num_reqs=local_max_chunk_reqs)
         # Retained for the spec-decode propose phase (sample_tokens): under
         # EP-DP locksteps every rank must run the same number of draft forwards per step,
         # and the coordinated chunk count from this one all-reduce is the shared
@@ -3267,7 +3459,8 @@ class TPUModelRunner(GPUModelRunner):
 
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
              end_index, cur_input_indices, pre_next_tokens_indices,
-             spec_decode_metadata) = (self._prepare_inputs(
+             spec_decode_metadata, request_major_input_ids,
+             draft_sequence_layout_plan) = (self._prepare_inputs(
                  scheduler_output, start_index, num_decode_reqs,
                  num_windowed_reqs))
 
@@ -3417,23 +3610,25 @@ class TPUModelRunner(GPUModelRunner):
                     ctx.unified_mamba_state_indices)
             if is_draft_model:
                 # Capture this chunk's draft inputs while they are valid.
-                draft_chunks.append(
-                    DraftChunkInputs(
-                        input_ids=draft_input_ids_src,
-                        position_ids=self.position_ids,
-                        query_start_loc_np=self.query_start_loc_np[:num_reqs +
-                                                                   1].copy(),
-                        attn_ctx=self._attn_metadata_builder_ctx,
-                        start_index=start_index,
-                        num_reqs=num_reqs,
-                        aux_hidden_states=aux_hidden_states
-                        if aux_hidden_states is not None else [],
-                        hidden_states=hidden_states,
-                        draft_lengths=(spec_decode_metadata.draft_lengths
-                                       if spec_decode_metadata is not None else
-                                       None),
-                        attn_metadata=attn_metadata,
-                    ))
+                draft_chunk = DraftChunkInputs(
+                    input_ids=(request_major_input_ids
+                               if request_major_input_ids is not None else
+                               draft_input_ids_src),
+                    position_ids=self.position_ids,
+                    query_start_loc_np=self.query_start_loc_np[:num_reqs +
+                                                               1].copy(),
+                    attn_ctx=self._attn_metadata_builder_ctx,
+                    start_index=start_index,
+                    num_reqs=num_reqs,
+                    aux_hidden_states=(aux_hidden_states if aux_hidden_states
+                                       is not None else []),
+                    hidden_states=hidden_states,
+                    draft_lengths=(spec_decode_metadata.draft_lengths if
+                                   spec_decode_metadata is not None else None),
+                    attn_metadata=attn_metadata,
+                    sequence_layout_plan=draft_sequence_layout_plan,
+                )
+                draft_chunks.append(draft_chunk)
 
             start_index = end_index
             chunk_index += 1
@@ -3507,9 +3702,14 @@ class TPUModelRunner(GPUModelRunner):
             num_valid = (next_tokens[:num_reqs]
                          != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
             offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
-        for group_indices in indices_per_group:
-            self.mamba_slot_read_offsets.index_put_((group_indices.long(), ),
-                                                    offsets)
+        if len(indices_per_group) == 1:
+            self.mamba_slot_read_offsets.index_put_(
+                (indices_per_group[0].long(), ), offsets)
+        else:
+            all_indices = torch.cat(indices_per_group, dim=0).long()
+            all_offsets = offsets.repeat(len(indices_per_group))
+            self.mamba_slot_read_offsets.index_put_((all_indices, ),
+                                                    all_offsets)
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -3570,7 +3770,7 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.req_id_to_index.keys())
 
         width = groups[0].shape[0]
-        keep, keep_dev, zeros, null = self._read_offset_reset_scratch(
+        keep, keep_dev, null = self._read_offset_reset_scratch(
             width, groups[0].device)
         keep.zero_()
         for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
@@ -3583,16 +3783,16 @@ class TPUModelRunner(GPUModelRunner):
         # No `if nothing_new: return` here — see the docstring. The device
         # work below must be issued on every rank on every step.
         keep_dev.copy_(keep, non_blocking=True)
-        for group_indices in groups:
-            # Non-new rows collapse onto the null slot; writing 0 there is a
-            # no-op, which keeps this scatter one fixed shape.
-            targets = torch.where(keep_dev, group_indices, null)
-            self.mamba_slot_read_offsets.index_put_((targets.long(), ), zeros)
+        # Stack groups and reset offsets across all groups in one compiled program.
+        stacked = torch.stack(groups) if len(
+            groups) > 1 else groups[0].unsqueeze(0)
+        _reset_read_offsets(self.mamba_slot_read_offsets, keep_dev, stacked,
+                            null)
 
     def _read_offset_reset_scratch(
         self, width: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reusable `(keep_cpu, keep_dev, zeros, null)` of length `width`.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reusable `(keep_cpu, keep_dev, null)` of length `width`.
 
         `_reset_read_offsets_for_new_requests` runs on every step, so its
         working set is allocated once per width rather than per step. Width
@@ -3605,15 +3805,109 @@ class TPUModelRunner(GPUModelRunner):
         key = (width, str(device))
         entry = self._read_offset_scratch.get(key)
         if entry is None:
-            offsets = self.mamba_slot_read_offsets
             entry = (
                 torch.zeros(width, dtype=torch.bool),
                 torch.zeros(width, dtype=torch.bool, device=device),
-                torch.zeros(width, dtype=offsets.dtype, device=offsets.device),
                 torch.zeros((), dtype=torch.int32, device=device),
             )
             self._read_offset_scratch[key] = entry
         return entry
+
+    def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        """argmax logits, only used when `all_greedy` is True.
+        """
+        dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
+        return self.sample_from_logits_func(logits,
+                                            dummy,
+                                            dummy,
+                                            torch.empty((1, 1),
+                                                        dtype=torch.int32,
+                                                        device=logits.device),
+                                            torch.empty((1, 1),
+                                                        dtype=torch.float32,
+                                                        device=logits.device),
+                                            all_greedy=True)
+
+    def _sample_spec_verify_chunk(
+        self,
+        logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        grammar_output: "GrammarOutput | None",
+        scheduler_output: "SchedulerOutput",
+        cur_start_idx: int,
+        cur_end_idx: int,
+        all_greedy: bool,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """Bonus-token sampling + draft rejection for one spec-verify chunk.
+
+        Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
+        selected tokens for the chunk.
+        """
+        if all_greedy and grammar_output is None:
+            bonus_token_ids, target_logits = (
+                self.spec_bonus_and_target_logits(logits,
+                                                  md.bonus_logits_indices,
+                                                  md.target_logits_indices))
+        else:
+            bonus_logits, target_logits = (
+                self.spec_gather_bonus_and_target_logits(
+                    logits, md.bonus_logits_indices, md.target_logits_indices))
+            if grammar_output is not None:
+                target_logits, bonus_logits = (
+                    self.structured_decoding_manager.mask_spec_logits(
+                        target_logits, bonus_logits, grammar_output,
+                        scheduler_output.scheduled_spec_decode_tokens,
+                        md.draft_lengths_cpu, cur_start_idx, cur_end_idx))
+            if all_greedy:
+                bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
+            else:
+                req_temperatures, req_top_k, req_top_p = (
+                    self._build_padded_sampling_params(cur_start_idx,
+                                                       cur_end_idx,
+                                                       bonus_logits))
+                bonus_u = torch.rand_like(bonus_logits,
+                                          generator=sampling_generator)
+                bonus_token_ids = self.sample_from_logits_func(
+                    bonus_logits,
+                    req_temperatures,
+                    bonus_u,
+                    req_top_k,
+                    req_top_p,
+                    all_greedy=False).view(-1)
+        if all_greedy:
+            return self.rejection_sampler(
+                draft_token_ids=md.draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=target_logits,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=self.speculative_config.
+                num_speculative_tokens,
+            )
+        accept_u = torch.rand(md.draft_token_ids.shape,
+                              dtype=torch.float32,
+                              device=target_logits.device,
+                              generator=sampling_generator)
+        recover_u = torch.rand_like(target_logits,
+                                    dtype=torch.float32,
+                                    generator=sampling_generator)
+        return self.rejection_sampler(
+            draft_token_ids=md.draft_token_ids,
+            num_draft_tokens=md.draft_lengths,
+            target_logits=target_logits,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=md.segment_ids,
+            group_indices=md.group_indices,
+            max_draft_tokens=self.speculative_config.num_speculative_tokens,
+            temperatures=req_temperatures[md.segment_ids],
+            top_k=req_top_k[md.segment_ids],
+            top_p=req_top_p[md.segment_ids],
+            accept_u=accept_u,
+            recover_u=recover_u,
+            do_sampling=True,
+        )
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -3672,12 +3966,6 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
                     "TPU yet.")
-            if grammar_output is not None:
-                # TODO(haotianx): remove this when structured output is support in
-                # spec decoding path.
-                raise NotImplementedError(
-                    "Structured outputs with speculative decoding is not "
-                    "supported on TPU yet.")
             # Per-chunk device rejection outputs, kept for the async-spec
             # producer below.
             next_tokens_per_chunk: list[torch.Tensor] = []
@@ -3688,93 +3976,24 @@ class TPUModelRunner(GPUModelRunner):
                     state.spec_decode_metadata_list, mamba_idx_list):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
-                    if all_greedy:
-                        # Extract bonus tokens + gather target_logits from the
-                        # target model logits in one compiled region (bonus argmax
-                        # + the two gathers) so they don't eager-fuse per context.
-                        bonus_token_ids, target_logits = (
-                            self.spec_bonus_and_target_logits(
-                                logits, md.bonus_logits_indices,
-                                md.target_logits_indices))
-                        next_tokens = self.rejection_sampler(
-                            draft_token_ids=md.draft_token_ids,
-                            num_draft_tokens=md.draft_lengths,
-                            target_logits=target_logits,
-                            bonus_token_ids=bonus_token_ids,
-                            segment_ids=md.segment_ids,
-                            group_indices=md.group_indices,
-                            max_draft_tokens=self.speculative_config.
-                            num_speculative_tokens,
-                        )
-                    else:
-                        # Gather bonus + target logits in one compiled region
-                        # (mirrors the greedy spec_bonus_and_target_logits) so
-                        # the raw logits[...] gathers don't eager-fuse into
-                        # per-context programs.
-                        bonus_logits, target_logits = (
-                            self.spec_gather_bonus_and_target_logits(
-                                logits, md.bonus_logits_indices,
-                                md.target_logits_indices))
-                        req_temperatures, req_top_k, req_top_p = (
-                            self._build_padded_sampling_params(
-                                cur_start_idx, cur_end_idx, bonus_logits))
-                        bonus_u = torch.rand_like(bonus_logits,
-                                                  generator=sampling_generator)
-                        bonus_token_ids = self.sample_from_logits_func(
-                            bonus_logits,
-                            req_temperatures,
-                            bonus_u,
-                            req_top_k,
-                            req_top_p,
-                            all_greedy=False,
-                        ).view(-1)
-                        accept_u = torch.rand(md.draft_token_ids.shape,
-                                              dtype=torch.float32,
-                                              device=target_logits.device,
-                                              generator=sampling_generator)
-                        recover_u = torch.rand_like(
-                            target_logits,
-                            dtype=torch.float32,
-                            generator=sampling_generator)
-                        next_tokens = self.rejection_sampler(
-                            draft_token_ids=md.draft_token_ids,
-                            num_draft_tokens=md.draft_lengths,
-                            target_logits=target_logits,
-                            bonus_token_ids=bonus_token_ids,
-                            segment_ids=md.segment_ids,
-                            group_indices=md.group_indices,
-                            max_draft_tokens=self.speculative_config.
-                            num_speculative_tokens,
-                            temperatures=req_temperatures[md.segment_ids],
-                            top_k=req_top_k[md.segment_ids],
-                            top_p=req_top_p[md.segment_ids],
-                            accept_u=accept_u,
-                            recover_u=recover_u,
-                            do_sampling=True,
-                        )
+                    next_tokens = self._sample_spec_verify_chunk(
+                        logits, md, grammar_output, scheduler_output,
+                        cur_start_idx, cur_end_idx, all_greedy,
+                        sampling_generator)
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
                     self._update_mamba_slot_read_offsets(
                         mamba_indices, next_tokens, num_reqs)
                 else:
-                    dummy = torch.empty((1, 1),
-                                        dtype=logits.dtype,
-                                        device=logits.device)
-                    dummy_int = torch.empty((1, 1),
-                                            dtype=torch.int32,
-                                            device=logits.device)
-                    dummy_float = torch.empty((1, 1),
-                                              dtype=torch.float32,
-                                              device=logits.device)
+                    if grammar_output is not None:
+                        _, logits = (
+                            self.structured_decoding_manager.mask_spec_logits(
+                                None, logits, grammar_output,
+                                scheduler_output.scheduled_spec_decode_tokens,
+                                None, cur_start_idx, cur_end_idx))
                     if all_greedy:
-                        selected = self.sample_from_logits_func(
-                            logits,
-                            dummy,
-                            dummy,
-                            dummy_int,
-                            dummy_float,
-                            all_greedy=True)
+                        selected = self._greedy_sample(logits)
                     else:
                         temperatures_tpu, top_k_tpu, top_p_tpu = (
                             self._build_padded_sampling_params(
@@ -3819,29 +4038,10 @@ class TPUModelRunner(GPUModelRunner):
                 self._update_mamba_slot_read_offsets(mamba_indices, None,
                                                      num_reqs)
                 if grammar_output is not None:
-                    require_struct_decoding, grammar_bitmask_padded, arange = (
-                        self.structured_decoding_manager.
-                        prepare_structured_decoding_input(
-                            logits, grammar_output, cur_start_idx,
-                            cur_end_idx))
-                    logits = self.structured_decoding_manager.structured_decode(
-                        require_struct_decoding, grammar_bitmask_padded,
-                        logits, arange)
+                    logits = self.structured_decoding_manager.mask_logits(
+                        logits, grammar_output, cur_start_idx, cur_end_idx)
                 if all_greedy:
-                    dummy_placeholder = torch.empty((1, 1),
-                                                    dtype=logits.dtype,
-                                                    device=logits.device)
-                    selected_token_ids = self.sample_from_logits_func(
-                        logits,
-                        dummy_placeholder,
-                        dummy_placeholder,
-                        torch.empty((1, 1),
-                                    dtype=torch.int32,
-                                    device=logits.device),
-                        torch.empty((1, 1),
-                                    dtype=torch.float32,
-                                    device=logits.device),
-                        all_greedy=True)
+                    selected_token_ids = self._greedy_sample(logits)
                 else:
                     temperatures_tpu, top_k_tpu, top_p_tpu = (
                         self._build_padded_sampling_params(
@@ -4008,6 +4208,15 @@ class TPUModelRunner(GPUModelRunner):
             eagle3_drafts = self._sync_replicated_drafts_across_tp(
                 eagle3_drafts)
 
+            if (eagle3_drafts is not None
+                    and scheduler_output.has_structured_output_requests):
+                # The deferred grammar-bitmask will fetch these drafts via
+                # take_draft_token_ids() to replace the async scheduler's -1
+                # splaceholders. Stage after the TP pin above so the host
+                # copy matches what gets substituted on device.
+                self.spec_decode_manager.stage_draft_token_ids_for_host(
+                    eagle3_drafts)
+
             # Build the async substitution source from the drafts proposed
             # above: the [bonus, draft_1..K] source + 1+K next_token_indices,
             # and the per-request rejected count to park.
@@ -4157,6 +4366,10 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+            runner_utils.relayout_rope_caches(self.model)
+        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
+            runner_utils.relayout_hash_tables(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -4247,6 +4460,11 @@ class TPUModelRunner(GPUModelRunner):
                             module, "indexer_op"):
                         _ = module.indexer_op
                         initialized_count += 1
+                    for op_name in ("mhc_ops", "mhc_post_op", "qnorm_rope_op",
+                                    "kv_rope_op", "o_proj_op"):
+                        if hasattr(type(module), op_name):
+                            _ = getattr(module, op_name)
+                            initialized_count += 1
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)
@@ -4457,6 +4675,27 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
+            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
+            # we skip it here as well.
+            if self.speculative_config is None or self._pcp_mtp_k1_enabled:
+                return
+            # For spec decoding, target logits have padded_logits_length rows.
+            max_target_rows = self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[
+                0]
+            for num_tokens in self.num_tokens_paddings:
+                if num_tokens > max_target_rows:
+                    break
+                out = self.structured_decoding_manager.structured_decode(
+                    self.structured_decoding_manager.
+                    require_structured_out_target_cpu[:num_tokens].to(
+                        self.device),
+                    self.structured_decoding_manager.
+                    target_grammar_bitmask_cpu[:num_tokens].to(self.device),
+                    self._dummy_logits(num_tokens),
+                    arange,
+                )
+                synchronize_tensors(out)
+                logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
@@ -4541,8 +4780,8 @@ class TPUModelRunner(GPUModelRunner):
         ``drafter.precompile()`` (draft forward only), so they recompile every
         time the verify length (``padded_logits_length``) lands in a new
         num-tokens bucket as requests finish and the batch shrinks. Replay the
-        verify inner body (the ``use_spec`` branch in ``sample_tokens``) at
-        every ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
+        verify inner body (``_sample_spec_verify_chunk``) at every
+        ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
         produce so the real call is a cache hit. Shared sync + async.
 
         Both verify sub-branches are distinct ``dynamic=False`` graphs, so warm
@@ -4551,16 +4790,21 @@ class TPUModelRunner(GPUModelRunner):
         ``spec_bonus_and_target_logits``) and non-greedy (``do_sampling=True``
         -> ``_random_rejection_sample_with_segment``, prelude
         ``spec_gather_bonus_and_target_logits``). Which one runs is decided per
-        step by ``input_batch.all_greedy``, so both are reachable and must be
-        pre-compiled here.
+        step by ``input_batch.all_greedy`` and ``grammar_output``, so both are
+        reachable and must be pre-compiled here; the greedy + structured-output
+        combination reuses graphs warmed by these two passes.
         """
         if not (self._is_async_drafter):
             return
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
         # padded_logits_length sweep to the bucket that covers the full batch.
-        max_logits_len = _get_padded_token_len(self.num_tokens_paddings,
-                                               self.max_num_reqs * (k + 1))
+        # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
+        # (which is the largest bucket), and logits rows never exceed the largest
+        # bucket.
+        max_logits_len = _get_padded_token_len(
+            self.num_tokens_paddings,
+            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]))
         with self._precompile_timed("rejection_sampler"):
             for num_tokens in self.num_tokens_paddings:
                 if num_tokens > max_logits_len:
@@ -4666,18 +4910,120 @@ class TPUModelRunner(GPUModelRunner):
                 self._precompile_backbone()
 
             self._precompile_sampling_subgraphs()
+            self._precompile_mamba_rollback_helpers()
+
+            # Precompile multimodal vision encoder graphs
+            self.encoder_cudagraph_manager = (maybe_create_mm_encoder_manager(
+                self.vllm_config, self.device, self.model))
+            if self.encoder_cudagraph_manager is not None:
+                with self._precompile_timed("multimodal vision encoder"):
+                    self.encoder_cudagraph_manager.precompile_vision_encoder()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
             if (self._is_async_drafter):
                 self.drafter.precompile()
-                self._precompile_rejection_sampler()
-                # The isolated precompile above emits standalone fused programs;
-                # the real per-step propose+verify+sampling dispatch fuses them
-                # differently, so the first real request would otherwise compile
-                # a handful of new graphs. Warm those by running the REAL
-                # two-phase spec-decode path once on a synthetic request.
-                self._warmup_spec_decode()
+                if self._pcp_mtp_k1_enabled:
+                    logger.info(
+                        "Skipping rejection replay and decode/verify warmup "
+                        "for prefill-only PCP MTP K1")
+                    self._warmup_pcp_mtp_prefill()
+                else:
+                    self._precompile_rejection_sampler()
+                    # The isolated precompiles above emit standalone fused
+                    # programs; the real per-step propose+verify+sampling
+                    # dispatch fuses them differently, so the first real
+                    # request would otherwise compile new graphs. Warm those
+                    # through the real two-phase spec-decode path.
+                    self._warmup_spec_decode()
+
+    def _warmup_pcp_mtp_prefill(self) -> None:
+        """Warm the real PCP MTP K1 prefill proposal and nothing else.
+
+        The real path may fail once while its draft forward is being cold
+        compiled. Run one bounded retry during startup so no live request
+        becomes the compiler probe.
+
+        This lifecycle is intentionally separate from ``_warmup_spec_decode``:
+        a prefill-only producer must never synthesize decode/verify work.
+        """
+        if os.environ.get("SPEC_WARMUP", "1") == "0":
+            return
+        if self.enforce_eager or not self._is_async_drafter:
+            return
+        P = min(int(self.num_tokens_paddings[0]), self.max_model_len)
+        n0 = self.num_xla_graphs
+        with _suspend_kv_transfer_group(), self._precompile_timed(
+                "PCP MTP real prefill warmup"):
+            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):
+                if not self._warmup_one_pcp_mtp_prefill(P):
+                    raise RuntimeError(
+                        "PCP MTP prefill warmup failed after retry; refusing "
+                        "to start a producer whose first live proposal would "
+                        "hit the same failure")
+        logger.info("PCP MTP prefill warmup compiled %d graphs",
+                    self.num_xla_graphs - n0)
+
+    def _warmup_one_pcp_mtp_prefill(self, P: int, quiet: bool = False) -> bool:
+        """Run one synthetic PCP prefill through target sampling + K1 propose."""
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+
+        rid = "__pcp_mtp_warmup__"
+        max_pos = min(self.max_model_len, P + 1)
+        top = int(self.kv_cache_config.num_blocks)
+        block_ids_per_group = []
+        max_nblk = 0
+        for group in self.kv_cache_config.kv_cache_groups:
+            group_block_size = int(group.kv_cache_spec.block_size)
+            group_num_blocks = min(cdiv(max_pos, group_block_size),
+                                   cdiv(self.max_model_len, group_block_size))
+            block_ids_per_group.append(list(range(top - group_num_blocks,
+                                                  top)))
+            max_nblk = max(max_nblk, group_num_blocks)
+        if top <= max_nblk + 1:
+            raise RuntimeError(
+                "PCP MTP prefill warmup has not enough KV blocks for its "
+                f"synthetic request: num_blocks={top}, required>{max_nblk + 1}"
+            )
+
+        attempt_succeeded = True
+        try:
+            request = NewRequestData(
+                req_id=rid,
+                prompt_token_ids=[0] * P,
+                mm_features=[],
+                sampling_params=SamplingParams(temperature=0.0),
+                pooling_params=None,
+                block_ids=tuple(block_ids_per_group),
+                num_computed_tokens=0,
+                lora_request=None,
+            )
+            scheduler_output = SchedulerOutput.make_empty()
+            scheduler_output.scheduled_new_reqs = [request]
+            scheduler_output.num_scheduled_tokens = {rid: P}
+            scheduler_output.total_num_scheduled_tokens = P
+            self.execute_model(scheduler_output)
+            self.sample_tokens(None)
+            self.take_draft_token_ids()
+        except Exception:
+            attempt_succeeded = False
+            if quiet:
+                logger.warning(
+                    "PCP MTP prefill warmup P=%d first attempt failed; "
+                    "retrying once.",
+                    P,
+                    exc_info=True)
+            else:
+                logger.exception("PCP MTP prefill warmup P=%d retry failed", P)
+        finally:
+            cleanup_succeeded = self._warmup_spec_decode_cleanup(rid)
+
+        if not cleanup_succeeded:
+            raise RuntimeError(
+                "PCP MTP prefill warmup cleanup failed; refusing to retry or "
+                "start with residual synthetic request state")
+        return attempt_succeeded
 
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
@@ -4709,6 +5055,33 @@ class TPUModelRunner(GPUModelRunner):
                 raise shape_variants.ShapeSpecializationError(
                     "warmup left token buckets uncompiled: "
                     f"{sorted(buckets.refused)}")
+
+    def _precompile_mamba_rollback_helpers(self) -> None:
+        """Warm the compiled rollback scatters at every bucket length.
+
+        Mamba block-boundary crossings do not occur during the synthetic
+        warmup request (unlike the reset scatter, which the real warmup
+        path exercises), so without this the first real crossing would
+        compile XLA mid-serving while lockstep peers wait at their next
+        collective. All-zero indices write the null slot, moving no state.
+        Crossings accumulate across every mamba group in a step, so the
+        ladder tops out at num_groups * max_num_reqs; src and dst must be
+        DISTINCT tensors or dynamo specializes the migrate graph on
+        src-is-dst and the real two-tensor call retraces mid-serving.
+        """
+        offsets = self.mamba_slot_read_offsets
+        if offsets is None:
+            return
+        with self._precompile_timed("mamba rollback helpers"):
+            num_groups = max(1, len(self._mamba_copy_plan))
+            limit = self._bucket_len(num_groups * self.max_num_reqs)
+            n = 8
+            while n <= limit:
+                src = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                dst = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                _rollback_offsets_seed_compiled(offsets, dst)
+                _rollback_offsets_migrate_compiled(offsets, src, dst)
+                n *= 4
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
@@ -4993,9 +5366,10 @@ class TPUModelRunner(GPUModelRunner):
             self._warmup_spec_decode_cleanup(rid)
         return True
 
-    def _warmup_spec_decode_cleanup(self, rids) -> None:
+    def _warmup_spec_decode_cleanup(self, rids) -> bool:
         """Tear down the synthetic warmup request(s) so serving starts clean."""
         from vllm.v1.core.sched.output import SchedulerOutput
+        cleanup_succeeded = True
         if isinstance(rids, str):
             rids = [rids]
         # Reset the two-phase guard: a half-finished step would otherwise make
@@ -5012,7 +5386,8 @@ class TPUModelRunner(GPUModelRunner):
             try:
                 self._pre_async_results.wait_for_copy()
             except Exception:
-                pass
+                cleanup_succeeded = False
+                logger.exception("spec-decode warmup async copy wait failed")
             self._pre_async_results = None
         try:
             idx_map = self.input_batch.req_id_to_index
@@ -5025,29 +5400,44 @@ class TPUModelRunner(GPUModelRunner):
                 self.execute_model(so)
                 self.execute_model_state = None
         except Exception:
+            cleanup_succeeded = False
             logger.exception("spec-decode warmup drain failed")
         # Belt-and-suspenders: drop any synthetic state defensively.
         for r in rids:
             try:
                 self.requests.pop(r, None)
             except Exception:
-                pass
+                cleanup_succeeded = False
+                logger.exception("spec-decode warmup request cleanup failed")
         for attr in ("_draft_token_ids", ):
             try:
                 if hasattr(self.spec_decode_manager, attr):
                     setattr(self.spec_decode_manager, attr, None)
             except Exception:
-                pass
+                cleanup_succeeded = False
+                logger.exception("spec-decode warmup draft cleanup failed")
         try:
             if self.drafter is not None:
                 self.drafter.draft_chunks = None
         except Exception:
-            pass
+            cleanup_succeeded = False
+            logger.exception("spec-decode warmup chunk cleanup failed")
         self._pre_async_results = None
         self.mm_embed_inputs = None
         if self.input_batch.num_reqs != 0:
+            cleanup_succeeded = False
             logger.warning("spec-decode warmup left batch non-empty (%d)",
                            self.input_batch.num_reqs)
+        remaining = {
+            r
+            for r in rids
+            if r in self.requests or r in self.input_batch.req_id_to_index
+        }
+        if remaining:
+            cleanup_succeeded = False
+            logger.warning("spec-decode warmup state still contains %s",
+                           sorted(remaining))
+        return cleanup_succeeded
 
     @contextmanager
     def _profile_isolated_cache(self) -> Iterator[None]:
@@ -5327,87 +5717,182 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         """Allocate and alias DeepSeek-V4's KV caches.
 
-        vLLM lays DSv4's cache groups out as one packed slab and assigns page
-        indices assuming the compressed-KV, SWA and compressor-state caches
-        share it. TPU arrays cannot be byte views into a slab, so the overlay
-        is rebuilt from the specs instead:
+        vLLM lays DSv4's cache groups out as one packed byte slab and assigns
+        page indices assuming the compressed-KV, SWA and compressor-state
+        caches share it. TPU tensors cannot be byte views into a slab, so the
+        overlay is rebuilt here from the specs.
 
-        - every `MLAAttentionSpec` layer gets an array shaped by its own spec,
-          so the kernels see the page geometry the spec promised;
-        - every compressor state cache maps onto its compressed-KV layer's
-          array, which the compressor writes both records through;
-        - every SWA cache maps onto a distinct compressed-KV array, distinct
-          because layers of one group share a block table; any overflow gets
-          its own array.
+        Every array is uint8 and shaped for the kernel that reads it, rather
+        than by the generic `head_size` formula. With `T =
+        spec.storage_block_size` compressed tokens per page:
+
+            CSA `*.attn`      NoPE `(N, T, 4, 128)`     512B/token
+                              RoPE `(N, T/4, 4, 128)`   128B/token, in a
+                                                        companion array
+            indexer k_cache   `(N, T/4, 4, 256)`        256B/token
+            HCA `*.attn`      `(N, T*2, 4, 128)`       1024B/token (raw bf16)
+
+        The overlays, all of which the specs' byte budgets already account
+        for:
+
+        - Every SWA cache maps onto a CSA NoPE array by its position in its
+          cache group.
+        - Every CSA / indexer compressor state cache maps onto the array of
+          its own compressed-KV layer: the compressor kernel writes the f32
+          state rows and the compressed KV through that one buffer. State and
+          full-attention groups never own the same block ID, so the rows
+          never collide.
+        - The i-th HCA compressor state cache maps onto the i-th CSA NoPE
+          array.
 
         Overlays are planned before allocating: allocating an array and
         aliasing it afterwards still counts against peak HBM.
         """
-        aux_overlay = self._plan_ds_v4_auxiliary_overlay([
-            n for g in kv_cache_config.kv_cache_groups for n in g.layer_names
-        ])
-        swa_overlay = self._plan_ds_v4_swa_overlay(
-            kv_cache_config,
-            per_layer_spec,
-            lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
-                num_blocks,
-                spec.storage_block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                spec.dtype,
-                head_size_is_packed_width=True,
-            ),
-        )
+        mla_layer_names, swa_layer_groups, state_layer_names = (
+            self._classify_ds_v4_layers(kv_cache_config, per_layer_spec))
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # One array per KVCacheTensor, shared by the layers that name it:
-            # vLLM sizes `num_blocks` from `kv_cache_tensor.size`, which
-            # budgets a single array for the whole `shared_by` set.
-            shared: dict[tuple, torch.Tensor] = {}
-            for layer_name in kv_cache_tensor.shared_by:
-                if layer_name in swa_overlay or layer_name in aux_overlay:
-                    continue
-                spec = per_layer_spec(layer_name)
-                if not isinstance(spec,
-                                  (MLAAttentionSpec, SlidingWindowMLASpec)):
-                    raise NotImplementedError(
-                        f"DeepSeek-V4 layer {layer_name!r} has unexpected "
-                        f"spec {type(spec).__name__}")
-                # `head_size` is already the packed byte width, and pages hold
-                # `storage_block_size` compressed rows rather than one per
-                # token. SlidingWindowMLASpec is shaped here too so it gets
-                # the 4-D layout its host uses, not a 5-D one.
-                shape = PallasMLAttentionBackend.get_kv_cache_shape(
-                    num_blocks,
-                    spec.storage_block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    spec.dtype,
-                    head_size_is_packed_width=True,
-                )
-                key = (tuple(shape), spec.dtype)
-                if key not in shared:
-                    shared[key] = torch.zeros(shape,
-                                              dtype=spec.dtype).to(self.device)
-                kv_caches[layer_name] = shared[key]
+        packing = self._DS_V4_KV_PACKING
 
-        for swa_layer_name, host_layer_name in swa_overlay.items():
-            if host_layer_name not in kv_caches:
+        def _create_cache(shape: tuple[int, ...], tag: str) -> torch.Tensor:
+            cache = torch.zeros(shape, dtype=torch.uint8).to(self.device)
+            logger.debug("DeepSeek-V4 KV array for %s: shape=%s", tag, shape)
+            return cache
+
+        # CSA NoPE tensors, in layer order; the SWA caches and the HCA
+        # compressor states overlay these.
+        csa_nope_hosts: list[torch.Tensor] = []
+        # HCA compressed-KV layers, whose own page is far too small to host
+        # their state cache.
+        hca_layer_names: set[str] = set()
+
+        for layer_name in mla_layer_names:
+            spec = per_layer_spec(layer_name)
+            page_size = spec.storage_block_size
+            if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
+                # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
+                # padded to a 256B record; 4 tokens per row.
+                shape = (num_blocks, page_size // packing, packing, 256)
+                kv_caches[layer_name] = _create_cache(shape, layer_name)
+            elif spec.compress_ratio == self._DS_V4_CSA_COMPRESS_RATIO:
+                # CSA is split across two arrays, for NoPE and RoPE.
+                nope = _create_cache((num_blocks, page_size, packing, 128),
+                                     layer_name)
+                rope = _create_cache(
+                    (num_blocks, page_size // packing, packing, 128),
+                    f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}")
+                kv_caches[layer_name] = (nope, rope)
+                csa_nope_hosts.append(nope)
+            else:
+                # HCA keeps raw bf16 latents: 512 values = 1024B per token,
+                # i.e. two rows per token.
+                shape = (num_blocks, page_size * 2, packing, 128)
+                kv_caches[layer_name] = _create_cache(shape, layer_name)
+                hca_layer_names.add(layer_name)
+
+        if not csa_nope_hosts:
+            raise ValueError(
+                "DeepSeek-V4 model has no CSA layer (compress_ratio "
+                f"{self._DS_V4_CSA_COMPRESS_RATIO}) to host the SWA and HCA "
+                f"state caches. MLA layers={mla_layer_names}")
+
+        def _host_at(hosts: list[torch.Tensor], position: int) -> torch.Tensor:
+            """`hosts[position]`, growing the list with standalone arrays.
+
+            More SWA (or HCA) layers than CSA arrays is normal -- DSv4-Flash
+            has 43 SWA layers to 21 CSA ones -- and the overflow cannot reuse
+            an array already taken by a same-group layer.
+            """
+            while position >= len(hosts):
+                hosts.append(
+                    _create_cache(tuple(csa_nope_hosts[0].shape),
+                                  f"ds_v4_overflow.{len(hosts)}"))
+            return hosts[position]
+
+        # SWA caches overlay the CSA NoPE arrays; so do the HCA states, and
+        # both index the same host list so they never collide on one array.
+        overlay_hosts = list(csa_nope_hosts)
+        for group_swa_layers in swa_layer_groups:
+            for position, layer_name in enumerate(group_swa_layers):
+                kv_caches[layer_name] = _host_at(overlay_hosts, position)
+
+        hca_state_layers: list[str] = []
+        for layer_name in state_layer_names:
+            kv_layer_name = self._ds_v4_compressed_kv_layer_name(layer_name)
+            if kv_layer_name not in kv_caches:
                 raise ValueError(
-                    "DeepSeek-V4 SWA cache has no host KV layer to overlay: "
-                    f"swa_cache={swa_layer_name!r}, expected KV layer "
-                    f"{host_layer_name!r}, known layers="
-                    f"{sorted(kv_caches.keys())}")
-            kv_caches[swa_layer_name] = kv_caches[host_layer_name]
-        if swa_overlay:
-            logger.info(
-                "DeepSeek-V4 SWA cache overlay: %d of %d sliding-window "
-                "caches share a compressed-KV array; the rest have their own.",
-                len(swa_overlay),
-                sum(1 for name in kv_caches
-                    if self._is_ds_v4_swa_layer(name, per_layer_spec(name))))
-        self._alias_ds_v4_auxiliary_caches(kv_caches, aux_overlay,
-                                           per_layer_spec)
+                    "DeepSeek-V4 compressor state cache has no compressed-KV "
+                    "layer (its compressed records are written there): "
+                    f"state_cache={layer_name}, expected KV layer "
+                    f"{kv_layer_name}, known MLA layers={mla_layer_names}")
+            if kv_layer_name in hca_layer_names:
+                hca_state_layers.append(layer_name)
+            else:
+                kv_caches[layer_name] = kv_caches[kv_layer_name]
+
+        for position, layer_name in enumerate(hca_state_layers):
+            kv_caches[layer_name] = _host_at(overlay_hosts, position)
+
+        self._validate_ds_v4_overlay(kv_cache_config, kv_caches)
+
+        # SWA and HCA-state overlays are assigned by position *within a cache
+        # group*, so the group shape decides how many arrays are needed: two
+        # layers of one group must never share one (they share a block table),
+        # while layers of different groups may. Log it -- a grouping change
+        # silently changes the overlay plan.
+        logger.info(
+            "DeepSeek-V4 KV cache: %d arrays for %d layers (mla=%d of which "
+            "csa=%d, swa=%d in %d group(s) "
+            "sized %s, state=%d), num_blocks=%d, largest array=%s",
+            len({
+                id(t)
+                for e in kv_caches.values()
+                for t in self._ds_v4_cache_arrays(e)
+            }), len(kv_caches), len(mla_layer_names), len(csa_nope_hosts),
+            sum(len(g) for g in swa_layer_groups),
+            len(swa_layer_groups), [len(g) for g in swa_layer_groups],
+            len(state_layer_names), num_blocks,
+            max((tuple(t.shape) for e in kv_caches.values()
+                 for t in self._ds_v4_cache_arrays(e)),
+                key=lambda shp: math.prod(shp),
+                default=()))
+
+    @staticmethod
+    def _ds_v4_cache_arrays(entry) -> tuple[torch.Tensor, ...]:
+        """Every array a bound DSv4 KV entry holds.
+
+        A CSA layer binds a `(nope, rope)` pair -- one layer, two arrays under
+        one block table -- while every other role binds a bare tensor. This is
+        the producer side of that convention; the two consumers that can see a
+        pair (the compressor's `k_cache` and the attention layer's own entry)
+        unpack it inline.
+        """
+        return tuple(entry) if isinstance(entry, tuple) else (entry, )
+
+    @classmethod
+    def _validate_ds_v4_overlay(cls, kv_cache_config: KVCacheConfig,
+                                kv_caches: dict[str, torch.Tensor]) -> None:
+        """No two layers of one cache group may share an array.
+
+        Layers of a group share a block table, so a shared array means they
+        would write each other's pages.
+        """
+        for group in kv_cache_config.kv_cache_groups:
+            hosts: dict[int, str] = {}
+            for layer_name in group.layer_names:
+                cache = kv_caches.get(layer_name)
+                if cache is None:
+                    continue
+                cache = cls._ds_v4_cache_arrays(cache)[0]
+                ptr = id(cache)
+                if ptr in hosts:
+                    raise ValueError(
+                        "DeepSeek-V4 KV cache overlay put two layers of one "
+                        "cache group on the same array; they share a block "
+                        f"table, so they would corrupt each other: "
+                        f"{layer_name} and {hosts[ptr]} both map to the array "
+                        f"of shape {tuple(cache.shape)}. Group "
+                        f"layers={group.layer_names}")
+                hosts[ptr] = layer_name
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -5433,6 +5918,7 @@ class TPUModelRunner(GPUModelRunner):
         if self._unified_kv_layout:
             self._initialize_unified_kv_cache(kv_cache_config)
             return
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
 
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
@@ -5581,6 +6067,22 @@ class TPUModelRunner(GPUModelRunner):
                                         dtype=dtype).to(self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
+                    attn_module = (self.vllm_config.compilation_config.
+                                   static_forward_context.get(layer_name))
+                    if getattr(attn_module, "use_sparse", False):
+                        # Split (nope, rope) cache in dsa_gather's tiled
+                        # layouts; uint8 bytes of the fp8 latents.
+                        shapes = (PallasMLAttentionBackend.
+                                  get_sparse_kv_cache_shapes(
+                                      num_blocks,
+                                      kv_cache_spec.block_size,
+                                      kv_cache_spec.head_size,
+                                      kv_cache_spec.dtype,
+                                  ))
+                        kv_caches[layer_name] = tuple(
+                            torch.zeros(shape, dtype=torch.uint8).to(
+                                self.device) for shape in shapes)
+                        continue
                     # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
                     # Because MLA maps all attention heads onto a single joint compressed latent key-value
                     # representation (`num_kv_heads=1`), the physical KV cache dimension never splits
@@ -5608,7 +6110,7 @@ class TPUModelRunner(GPUModelRunner):
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
                             f"tp_size {tp_size} under SPMD mode")
-                    kv_cache_shape = PallasAttentionBackend.get_kv_cache_shape(
+                    kv_cache_shape = backend_cls.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,

@@ -450,12 +450,16 @@ def test_adapter_scoped_callable_uses_lowered_out_shardings(monkeypatch):
         out_tree = FakeOutTree()
         mlir_module_serialized = b"mlir"
 
+        def mlir_module(self):
+            return "module {}"
+
     class FakePcpCallable(pcp_adapter._PcpStreamingJaxCallable):
 
         def __init__(self):
             self.trace_key = "trace"
             self.static_argnums = ()
             self.output_shapes = {}
+            self.kernel_key_to_mlir_fingerprint = {}
             self.mesh = "mesh"
             self.input_partition_specs = ("input_spec", )
             self.name = "op"

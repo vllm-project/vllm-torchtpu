@@ -19,7 +19,7 @@ which KV entries each token attends to and computes softmax(q @ k^T) @ v in
 float32 over the same fp8-rounded latents the kernel reads. With causal
 arange indices and kv_len <= topk this is exactly dense MLA attention, which
 makes the first cases a dense-parity check of the full path
-(insert -> repack -> SparseCore gather -> attention kernel).
+(insert -> SparseCore gather -> attention kernel).
 """
 
 import math
@@ -29,6 +29,8 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
+from vllm_torchtpu.kernels.mla.sparse import dsa_gather
+from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.common import attention_interface, utils
 
 LKV_DIM = 512
@@ -38,6 +40,17 @@ PAGE_SIZE = 32
 PAGES_PER_SEQ = 4
 TOTAL_PAGES = 16
 TOKEN_PAD = 16  # attention kernel batch size; token count must be a multiple
+
+
+def _empty_pair():
+    """Zeroed uint8 (nope, rope) caches in dsa_gather's native tiled layouts."""
+    nope_shape, rope_shape = (sparse_mla_kernel.get_kv_cache_shape(
+        TOTAL_PAGES, PAGE_SIZE, dim, jnp.float8_e4m3fn)
+                              for dim in (LKV_DIM, ROPE_DIM))
+    blocks, ps_div, kv_packing, nope_dim = nope_shape
+    lane = dsa_gather.TILE_LANE_BYTES
+    return (jnp.zeros((blocks, ps_div * kv_packing, nope_dim // lane, lane),
+                      jnp.uint8), jnp.zeros(rope_shape, jnp.uint8))
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -93,17 +106,18 @@ class SparseMlaAttentionTest(parameterized.TestCase):
                            dtype=jnp.int32)
 
     def _empty_cache(self):
-        return jnp.zeros((TOTAL_PAGES, PAGE_SIZE // 4, 4, 640),
-                         dtype=jnp.float8_e4m3fn)
+        return _empty_pair()
 
     def _call(self, kv_cache, ql_nope, q_pe, kv_c_fp8, k_pe_fp8, topk_rows,
               seq_lens, query_start_loc, distribution, block_tables, mesh):
-        return attention_interface.sparse_mla_attention(
+        nope_cache, rope_cache, output = \
+            attention_interface.sparse_mla_attention(
             ql_nope,
             q_pe,
             kv_c_fp8,
             k_pe_fp8,
-            kv_cache,
+            kv_cache[0],
+            kv_cache[1],
             jnp.asarray(topk_rows, dtype=jnp.int32),
             jnp.asarray(seq_lens, dtype=jnp.int32),
             block_tables,
@@ -113,6 +127,7 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             sm_scale=self.sm_scale,
             k_scale=self.k_scale,
         )
+        return (nope_cache, rope_cache), output
 
     def _reference(self, ql_nope, q_pe, topk_rows, q_lens, query_start_loc,
                    kv_c_deq, k_pe_deq):
@@ -307,62 +322,60 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         block_tables[0, :2] = [5, 2]
         block_tables[1, 0] = 9
 
-        cache = utils.update_sparse_mla_kv_cache(
-            jnp.zeros((TOTAL_PAGES, PAGE_SIZE // 4, 4, 640),
-                      jnp.float8_e4m3fn), kv_c, k_pe,
-            jnp.asarray(seq_lens, jnp.int32),
+        nope_cache, rope_cache = utils.update_sparse_mla_kv_cache(
+            *_empty_pair(), kv_c, k_pe, jnp.asarray(seq_lens, jnp.int32),
             jnp.asarray(block_tables.reshape(-1)),
             jnp.asarray([0, 5, 8], jnp.int32))
 
-        rows = np.asarray(jax.lax.bitcast_convert_type(
-            cache, jnp.uint8)).reshape(TOTAL_PAGES, PAGE_SIZE, 640)
-        expected = np.asarray(
-            jax.lax.bitcast_convert_type(jnp.concatenate([kv_c, k_pe], -1),
-                                         jnp.uint8))
+        nope_rows = np.asarray(
+            jax.lax.bitcast_convert_type(nope_cache, jnp.uint8)).reshape(
+                TOTAL_PAGES, PAGE_SIZE, LKV_DIM)
+        rope_rows = np.asarray(
+            jax.lax.bitcast_convert_type(rope_cache, jnp.uint8)).reshape(
+                TOTAL_PAGES, PAGE_SIZE, rope_cache.shape[-1])
+        exp_nope = np.asarray(jax.lax.bitcast_convert_type(kv_c, jnp.uint8))
+        exp_rope = np.asarray(jax.lax.bitcast_convert_type(k_pe, jnp.uint8))
         # seq 0: positions 32..36 -> page 2 slots 0..4; seq 1: page 9 slots 0..2.
         placements = [(2, i, i) for i in range(5)]
         placements += [(9, i, 5 + i) for i in range(3)]
         touched = np.zeros((TOTAL_PAGES, PAGE_SIZE), bool)
         for page, slot, token in placements:
-            np.testing.assert_array_equal(rows[page, slot, :576],
-                                          expected[token])
+            np.testing.assert_array_equal(nope_rows[page, slot],
+                                          exp_nope[token])
+            np.testing.assert_array_equal(rope_rows[page, slot, :ROPE_DIM],
+                                          exp_rope[token])
+            # Pad tail is never written (zero fill).
+            self.assertEqual(
+                int(np.count_nonzero(rope_rows[page, slot, ROPE_DIM:])), 0)
             touched[page, slot] = True
-        self.assertEqual(int(np.count_nonzero(rows[~touched])), 0)
+        self.assertEqual(int(np.count_nonzero(nope_rows[~touched])), 0)
+        self.assertEqual(int(np.count_nonzero(rope_rows[~touched])), 0)
 
+    def test_padded_batch_is_dropped(self):
+        """Padded tokens (valid=False) must be dropped, never written."""
+        rng = np.random.default_rng(42)
+        total_tokens, valid_tokens = 16, 6
+        kv_c = _quantize_fp8(
+            rng.standard_normal((total_tokens, LKV_DIM)).astype(np.float32),
+            1.0)
+        k_pe = _quantize_fp8(
+            rng.standard_normal((total_tokens, ROPE_DIM)).astype(np.float32),
+            1.0)
+        block_tables = np.full((2, PAGES_PER_SEQ), 7, np.int32)
+        block_tables[0, 0] = 1
+        block_tables[1, 0] = 2
 
-class RepackSparseMlaCacheTest(parameterized.TestCase):
-    """Repack-layout unit test; pure jnp bitcasts, runs on CPU too."""
+        nope_cache, rope_cache = utils.update_sparse_mla_kv_cache(
+            *_empty_pair(), kv_c, k_pe, jnp.asarray([4, 2], jnp.int32),
+            jnp.asarray(block_tables.reshape(-1)),
+            jnp.asarray([0, 4, valid_tokens], jnp.int32))
 
-    @parameterized.parameters(1.0, 1.5)
-    def test_nope_bytes_and_rope_planes(self, dequant_scale):
-        pages, page_size, padded_row = 3, 8, 640
-        rng = np.random.default_rng(0)
-        cache = jnp.asarray(
-            rng.standard_normal((pages, page_size // 4, 4, padded_row)),
-            jnp.float8_e4m3fn)
-
-        nope_u8, rope_u8 = utils.repack_sparse_mla_cache(
-            cache, LKV_DIM, ROPE_DIM, dequant_scale)
-
-        # Shapes carry the (4, 128) tiling contract csa_gather asserts.
-        self.assertEqual(nope_u8.shape, (pages, page_size, 4, 128))
-        self.assertEqual(rope_u8.shape, (pages, page_size // 4, 4, 128))
-
-        flat = cache.reshape(pages, page_size, padded_row)
-
-        # Nope must be a byte-exact bitcast of the fp8 latents.
-        np.testing.assert_array_equal(
-            np.asarray(nope_u8).reshape(pages, page_size, LKV_DIM),
-            np.asarray(
-                jax.lax.bitcast_convert_type(flat[..., :LKV_DIM], jnp.uint8)))
-
-        # Rope: decoding the hi/lo byte planes must bitwise-reproduce
-        # fp8 -> bf16 dequant (the transport encoding is lossless).
-        rope_flat = np.asarray(rope_u8).reshape(pages, page_size, 128)
-        decoded_u16 = ((rope_flat[..., :ROPE_DIM].astype(np.uint16) << 8)
-                       | rope_flat[..., ROPE_DIM:].astype(np.uint16))
-        expected = flat[..., LKV_DIM:LKV_DIM + ROPE_DIM].astype(
-            jnp.bfloat16) * jnp.bfloat16(dequant_scale)
-        np.testing.assert_array_equal(
-            decoded_u16,
-            np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint16)))
+        nope_rows = np.asarray(
+            jax.lax.bitcast_convert_type(nope_cache,
+                                         jnp.uint8)).reshape(-1, LKV_DIM)
+        rope_rows = np.asarray(
+            jax.lax.bitcast_convert_type(rope_cache, jnp.uint8)).reshape(
+                -1, rope_cache.shape[-1])
+        # Exactly the valid tokens landed, nothing else.
+        self.assertEqual(int(nope_rows.any(axis=1).sum()), valid_tokens)
+        self.assertEqual(int(rope_rows.any(axis=1).sum()), valid_tokens)

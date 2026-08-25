@@ -15,14 +15,16 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 from jax.sharding import PartitionSpec
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
-    VllmGatedDeltaNetAttention
+from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
+    VllmGatedDeltaNetAttention, gdn_attention_core_tpu_pcp_prefill)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
@@ -67,6 +69,46 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
 
 
 class TestVllmGatedDeltaNetAttention:
+
+    @patch("vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+           "run_jax_gdn_attention_pcp_tp_prefill")
+    def test_pcp_core_updates_only_widened_conv_state_prefix(self, mock_run):
+        kernel_size = 4
+        conv_state = jnp.arange(2 * kernel_size * 3,
+                                dtype=jnp.float32).reshape(2, kernel_size, 3)
+        recurrent_state = jnp.zeros((2, 1, 1, 1), dtype=jnp.float32)
+        new_prefix = jnp.full((2, kernel_size - 1, 3), 77, dtype=jnp.float32)
+        new_recurrent = jnp.ones_like(recurrent_state)
+        output = jnp.zeros((5, 1, 1), dtype=jnp.float32)
+        mock_run.return_value = (new_prefix, new_recurrent), output
+
+        new_conv, returned_recurrent, returned_output = (
+            gdn_attention_core_tpu_pcp_prefill(
+                *(jnp.zeros((1, ), dtype=jnp.float32) for _ in range(3)),
+                conv_state,
+                recurrent_state,
+                *(jnp.zeros((1, ), dtype=jnp.float32) for _ in range(8)),
+                mesh=MagicMock(),
+                n_kq=1,
+                n_v=1,
+                d_k=1,
+                d_v=1,
+                kernel_size=kernel_size,
+                pcp_size=2,
+                interleave_size=1,
+            ))
+
+        kernel_conv_state = mock_run.call_args.args[3]
+        assert kernel_conv_state.shape == (2, kernel_size - 1, 3)
+        np.testing.assert_array_equal(np.asarray(kernel_conv_state),
+                                      np.asarray(conv_state[:, :-1, :]))
+        np.testing.assert_array_equal(np.asarray(new_conv[:, :-1, :]), 77)
+        np.testing.assert_array_equal(np.asarray(new_conv[:, -1:, :]),
+                                      np.asarray(conv_state[:, -1:, :]))
+        np.testing.assert_array_equal(np.asarray(returned_recurrent),
+                                      np.asarray(new_recurrent))
+        np.testing.assert_array_equal(np.asarray(returned_output),
+                                      np.asarray(output))
 
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
@@ -396,6 +438,32 @@ class TestVllmGatedDeltaNetAttention:
         assert fake_jax_op.register_fake.call_count == 2
 
     @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=8)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_pcp_compact_and_unified_ops_construct_with_mtp_k1(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        attn.num_spec = 1
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        fake_jax_op = MagicMock()
+
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), patch(
+                    "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                    "pcp_streaming_jax_op",
+                    return_value=fake_jax_op,
+                ):
+            compact_op = attn._build_gdn_op(pcp_streaming=True)
+            unified_op = attn._build_pooled_pcp_gdn_op()
+
+        assert callable(compact_op)
+        assert callable(unified_op)
+
+    @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_cuda_lora(self, mock_get_forward_context):
@@ -654,7 +722,7 @@ class TestVllmGatedDeltaNetAttention:
     def test_forward_uses_native_gdn_pcp_op_for_pcp_prefill(
             self, _mock_rank, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
-        attn.num_spec = 0
+        attn.num_spec = 1
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1
@@ -709,8 +777,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata.query_start_loc = torch.tensor([0, 4],
                                                           dtype=torch.int32)
         mock_attn_metadata.request_distribution = torch.zeros(3)
-        # Non-spec path: the runner leaves these unset (None) unless
-        # speculative decoding is active.
+        # PCP prefill does not consume non-PCP verify rollback offsets.
         mock_attn_metadata.mamba_request_distribution = None
         mock_attn_metadata.mamba_slot_read_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
@@ -743,10 +810,54 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
+    def test_forward_non_pcp_spec_verify_still_requires_slot_offsets(
+            self, mock_get_forward_context):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 1
+        attn.head_v_dim = 16
+        attn.num_v_heads = 4
+        attn.tp_size = 1
+        attn.prefix = "test_layer"
+        attn.gqa_interleaved_layout = True
+        attn.conv1d = SimpleNamespace(weight=torch.randn(1),
+                                      bias=torch.randn(1))
+        attn.A_log = torch.randn(1)
+        attn.dt_bias = torch.randn(1)
+        attn.kv_cache = (torch.ones(1), torch.ones(1))
+        attn.gdn_op = MagicMock()
+        attn.gdn_pcp_op = MagicMock()
+        attn.in_proj_qkv = MagicMock(return_value=(torch.randn(2, 96), None))
+        attn.in_proj_z = MagicMock(return_value=(torch.randn(2, 64), None))
+        attn.in_proj_ba = MagicMock(return_value=(torch.randn(2, 32), None))
+
+        metadata = SimpleNamespace(
+            seq_lens=torch.ones(2),
+            block_tables=torch.tensor([5, 6, 7, 8]),
+            mamba_state_indices=torch.tensor([3, 1], dtype=torch.int32),
+            sequence_layout_kind=SequenceLayoutKind.ALL.value,
+            sequence_layout_protocol="default",
+            query_start_loc=torch.zeros(2),
+            request_distribution=torch.zeros(3),
+            mamba_request_distribution=None,
+            mamba_slot_read_offsets=None,
+        )
+        mock_get_forward_context.return_value = SimpleNamespace(
+            attn_metadata={"test_layer": metadata})
+
+        with pytest.raises(AssertionError,
+                           match="requires mamba_slot_read_offsets"):
+            attn.forward(torch.randn(2, 64))
+
+        attn.gdn_op.assert_not_called()
+        attn.gdn_pcp_op.assert_not_called()
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+    )
     def test_forward_uses_fused_projection_for_pooled_pcp_prefill(
             self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
-        attn.num_spec = 0
+        attn.num_spec = 1
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1

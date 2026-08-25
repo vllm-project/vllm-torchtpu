@@ -245,3 +245,38 @@ def get_raiden_transfer_num_slots() -> int:
 def get_raiden_inline_load() -> bool:
     """Load remote KV before the first forward instead of a no-forward step."""
     return _get_bool_env("TPU_RAIDEN_INLINE_LOAD", False)
+
+
+_RAIDEN_TELEMETRY_MODULE = None
+_RAIDEN_TELEMETRY_CONFIGURED = False
+_RAIDEN_TELEMETRY_IMPORT_ATTEMPTED = False
+
+
+def get_raiden_telemetry_module():
+    """Gets and caches the TPU Raiden C++ extension module."""
+    global _RAIDEN_TELEMETRY_MODULE, _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED
+    if not _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED:
+        # Try to load raiden module only once and ignore other attempts
+        _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED = True
+        try:
+            from tpu_sync.api.torch import kv_cache_manager as kcm
+            _RAIDEN_TELEMETRY_MODULE = kcm._torch_impl()
+        except Exception as e:
+            logger.warning("Failed to import TPU Raiden telemetry module: %s",
+                           e)
+            return None
+    return _RAIDEN_TELEMETRY_MODULE
+
+
+def configure_raiden_telemetry(
+        backends: list[str] | set[str] | None = None) -> None:
+    """Configures TPU Raiden C++ telemetry backends if available."""
+    global _RAIDEN_TELEMETRY_CONFIGURED
+    try:
+        telemetry = get_raiden_telemetry_module()
+        if telemetry is not None and hasattr(telemetry, "configure_telemetry"):
+            telemetry.configure_telemetry(backends)
+            _RAIDEN_TELEMETRY_CONFIGURED = True
+            logger.info("Configured TPU Raiden C++ telemetry backends")
+    except Exception as e:
+        logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)

@@ -34,4 +34,4 @@
 /src/vllm_torchtpu/platforms/ @Geyuhao @sixiang-google
 
 # Docker Configuration
-/docker/ @QiliangCui @theminghuango
+/docker/ @QiliangCui @theminghuang

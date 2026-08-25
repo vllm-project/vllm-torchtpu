@@ -45,6 +45,12 @@ class SpeculativeDecodingManager:
         self.runner = runner
         # Cached draft tokens.
         self._draft_token_ids: Optional[list[list[int]]] = None
+        # For async-scheduling: in-flight D2H copy of drafts on device,
+        # as (cpu_tensor, ready_event, req_ids snapshot). See
+        # stage_draft_token_ids_for_host.
+        self._staged_draft_copy: Optional[tuple[torch.Tensor,
+                                                Optional[torch.Event],
+                                                list[str]]] = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
         # tensors are pure functions of (num_draft_tokens,
@@ -58,6 +64,15 @@ class SpeculativeDecodingManager:
                                             int]] = None
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+        if self._staged_draft_copy is not None:
+            # For async scheduling: the engine only asks when a step carries
+            # structured-output requests, to swap real drafts into the
+            # deferred grammar-bitmask computation.
+            drafts_cpu, ready_event, req_ids = self._staged_draft_copy
+            self._staged_draft_copy = None
+            if ready_event is not None:
+                ready_event.synchronize()
+            return DraftTokenIds(req_ids, drafts_cpu.tolist())
         if self._draft_token_ids is None:
             return None
         num_reqs = self.runner.input_batch.num_reqs
@@ -65,6 +80,27 @@ class SpeculativeDecodingManager:
         draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
+
+    def stage_draft_token_ids_for_host(self, drafts: torch.Tensor) -> None:
+        """Starts a non-blocking D2H copy of drafts on device.
+
+        Async scheduling keeps drafts on device (return_device=True), but the
+        deferred grammar-bitmask path still needs a host copy via
+        take_draft_token_ids(). Launching the copy here enqueues it before
+        the next step's forward, so take only waits for the copy itself.
+        Note that req_ids must be snapshotted now because take_draft_token_ids()
+        is called after the next step's execute_model mutates input_batch.
+        """
+        num_reqs = self.runner.input_batch.num_reqs
+        assert drafts.shape[0] == num_reqs, (
+            f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}")
+        req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
+        drafts_cpu = drafts.to("cpu", non_blocking=True)
+        ready_event = None
+        if drafts.device.type != "cpu":
+            ready_event = torch.tpu.Event()
+            ready_event.record()
+        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids)
 
     def propose_draft_token_ids(
         self,

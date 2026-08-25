@@ -51,6 +51,8 @@ logger = init_logger(__name__)
 #     as a single device, so key == X*Y*Z and the trailing T=2 is not counted.
 #   - 3D Torus (v7x / Ironwood): two cores per chip exposed as two separate
 #     devices, so key == X*Y*Z*T, twice the chip count.
+#   - Hierarchical BoardFly (TPU v8i): 4 chips per board,
+#     up to 8 boards per group, up to 32 groups per slice, so key == C*B*G.
 #
 # Multi-host TPU slice mesh topologies for 2D Torus architectures.
 TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
@@ -85,6 +87,25 @@ TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
     512: "4,8,8,2",
 }
 
+# Multi-host TPU slice mesh topologies for TPU v8i, which uses a hierarchical
+# BoardFly topology: (Chips per Board) x (Boards per Group) x (Groups per Slice),
+# noted as C x B x G (4 chips per board, up to 8 boards per group, up to 32 groups per slice).
+TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
+    4: "4,1,1",
+    8: "4,2,1",
+    12: "4,3,1",
+    16: "4,4,1",
+    20: "4,5,1",
+    24: "4,6,1",
+    28: "4,7,1",
+    32: "4,8,1",
+    64: "4,8,2",
+    128: "4,8,4",
+    256: "4,8,8",
+    512: "4,8,16",
+    1024: "4,8,32",
+}
+
 # TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
 # TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
 _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
@@ -93,6 +114,9 @@ _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
 # surfaces as "TPU v7" from get_tpu_device_name() and as "TPU7x" from the
 # device-kind path, so both spellings have to match.
 _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
+
+# TPU v8i / TPU8i generations.
+_TPU_8I_GENERATIONS = ("v8i", "tpu8i")
 
 
 def get_tpu_multihost_topology(
@@ -123,6 +147,8 @@ def get_tpu_multihost_topology(
     device_name = device_name.lower()
     if any(gen in device_name for gen in _TPU_2D_TORUS_GENERATIONS):
         topo_map = TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
+    elif any(gen in device_name for gen in _TPU_8I_GENERATIONS):
+        topo_map = TPU_8I_MULTIHOST_TOPOLOGY_MAP
     elif any(gen in device_name for gen in _TPU_DUAL_DEVICE_GENERATIONS):
         topo_map = TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP
     else:
@@ -349,17 +375,17 @@ def apply_tpu_patches() -> None:
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
-    from vllm_torchtpu import (_patch_dflash_bypass_v2_runner_check,
-                               _patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env,
-                               _patch_vllm_compile_prefix_isolation,
-                               _patch_vllm_config_triton_tpu,
-                               _patch_vllm_piecewise_backend)
+    from vllm_torchtpu import (  # isort: skip
+        _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
+        _patch_multiproc_worker_global_rank_env,
+        _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
+        _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_vllm_reset_compile_wrapper()
     _patch_vllm_piecewise_backend()
     _patch_vllm_compile_prefix_isolation()
+    _patch_vllm_merge_multimodal_embeddings()
     _patch_dflash_bypass_v2_runner_check()
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import \
@@ -618,7 +644,7 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES"
+        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -627,6 +653,23 @@ class TpuPlatform(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         return
+
+    @classmethod
+    def device_id_to_physical_device_id(cls, device_id: int) -> int:
+        """Map logical DP/TP device id to a local physical TPU device.
+
+        Under multi-core TPU (e.g. v7x with 2 cores per chip), the logical
+        rank/device_id may exceed the physical chip count in TPU_VISIBLE_CHIPS.
+        Wrap with modulo so every rank resolves to a valid local physical chip.
+        """
+        device_control_env = os.environ.get(cls.device_control_env_var, "")
+        if device_control_env:
+            device_ids = [
+                s.strip() for s in device_control_env.split(",") if s.strip()
+            ]
+            if device_ids:
+                return int(device_ids[device_id % len(device_ids)])
+        return int(device_id % max(1, cls.device_count()))
 
     @classmethod
     def device_count(cls) -> int:
@@ -742,6 +785,14 @@ class TpuPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_current_memory_usage(cls,
+                                 device: torch.device | None = None) -> float:
+        if not torch.tpu.is_initialized():
+            return 0.0
+        free, total = torch.accelerator.get_memory_info(device)
+        return float(total - free)
+
+    @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         return False
 
@@ -801,7 +852,7 @@ class TpuPlatform(Platform):
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
-                "Pathways is not supported by torchtpu-vllm. "
+                "Pathways is not supported by vllm-torchtpu. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
@@ -862,7 +913,22 @@ class TpuPlatform(Platform):
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
 
+        # Backed dynamic shapes 0/1-specialize a size-1 compile into a static
+        # retrace that trips PiecewiseBackend's single-entry assert;
+        # size-oblivious backed shapes keep the graph dynamic at size 1.
+        from vllm.config.compilation import DynamicShapesType
+        dynamic_shapes_config = compilation_config.dynamic_shapes_config
+        if (1 in compilation_config.compile_sizes
+                and dynamic_shapes_config.type == DynamicShapesType.BACKED):
+            dynamic_shapes_config.type = (
+                DynamicShapesType.BACKED_SIZE_OBLIVIOUS)
+            logger.info(
+                "compile_sizes contains 1, which backed dynamic shapes "
+                "cannot compile (0/1 specialization); switching to "
+                "backed_size_oblivious dynamic shapes.")
+
         model_config = vllm_config.model_config
+
         if model_config is not None and model_config.dtype in (
                 torch.float16,
                 torch.float32,
@@ -877,7 +943,7 @@ class TpuPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
 
-        is_hybrid = model_config.is_hybrid
+        is_hybrid = model_config.is_hybrid if model_config is not None else False
         if vllm_config.speculative_config is not None and scheduler_config.async_scheduling:
             method = vllm_config.speculative_config.method
             if not vllm_config.speculative_config.use_eagle():
@@ -887,18 +953,13 @@ class TpuPlatform(Platform):
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
         # the pool's align-mode mamba state seed copies; other cache modes
-        # and speculative decoding must be rejected up front instead of
-        # failing partway through warmup.
+        # must be rejected up front instead of failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
                     "mamba_cache_mode='align' (got "
                     f"{cache_config.mamba_cache_mode!r}).")
-            if vllm_config.speculative_config is not None:
-                raise NotImplementedError(
-                    "Speculative decoding is not yet supported with hybrid "
-                    "Mamba prefix caching (mamba_cache_mode='align').")
             if not unified_kv_layout_enabled(vllm_config):
                 # Seed copies live on the pooled path only, so the per-layer
                 # layout restores no Mamba state on a prefix-cache hit and
