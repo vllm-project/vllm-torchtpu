@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_RPA_FOLD_KV_HEAD_DIM: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
@@ -382,6 +383,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
+
+    # Enable dynamic fused conv1d GDN kernel with adaptive tiling.
+    "TPU_ENABLE_GDN_DYNAMIC_TILING":
+    env_bool("TPU_ENABLE_GDN_DYNAMIC_TILING", default=False),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
