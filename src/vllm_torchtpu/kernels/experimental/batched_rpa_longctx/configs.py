@@ -85,6 +85,7 @@ class ServingConfigs:
     scale_k: int | None = None
     scale_v: int | None = None
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
+    fold_kv_head_dim: bool = False
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
 
@@ -235,12 +236,36 @@ class RpaConfigs:
 
     @property
     def bkv_stride(self) -> int:
-        bkv_stride = pl.cdiv(self.model.num_kv_heads * 2,
-                             self.serve.packing_kv)
+        bkv_stride = pl.cdiv(self.num_kv_cache_rows, self.serve.packing_kv)
 
         if utils.has_bank_conflicts(bkv_stride):
             bkv_stride += 1
         return bkv_stride
+
+    @property
+    def kv_head_dim_fold(self) -> int:
+        """Packing slots one (K|V, head) vector occupies in the cache."""
+        if (self.serve.kv_layout != KVLayout.HEAD_ALONG_SUBLANE
+                or not self.serve.fold_kv_head_dim):
+            return 1
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return utils.kv_head_dim_fold(self.model.num_kv_heads,
+                                      self.model.head_dim,
+                                      self.serve.packing_kv, num_lanes)
+
+    @property
+    def num_kv_cache_rows(self) -> int:
+        """Rows of `kv_cache_lane_dim` lanes one token occupies, pre-packing."""
+        return self.model.num_kv_heads * 2 * self.kv_head_dim_fold
+
+    @property
+    def kv_cache_lane_dim(self) -> int:
+        """Lane width of one cache row.
+
+        Equals the compute-side `aligned_kv_head_dim` unless folded, where a
+        head_dim vector is spread over `kv_head_dim_fold` rows.
+        """
+        return self.aligned_kv_head_dim // self.kv_head_dim_fold
 
     @property
     def aligned_q_head_dim(self) -> int:
@@ -262,7 +287,7 @@ class RpaConfigs:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         packing_kv = self.serve.packing_kv
-        return utils.align_to(self.model.num_kv_heads * 2, packing_kv)
+        return utils.align_to(self.num_kv_cache_rows, packing_kv)
 
     @property
     def aligned_num_q_heads_per_kv_head(self) -> int:
@@ -274,8 +299,7 @@ class RpaConfigs:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
-        return utils.align_to(self.model.num_kv_heads * 2,
-                              kv_packing) // kv_packing
+        return utils.align_to(self.num_kv_cache_rows, kv_packing) // kv_packing
 
     @property
     def fuse_accum(self) -> bool:
@@ -286,7 +310,7 @@ class RpaConfigs:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
         else:
-            num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
+            num_elements = self.aligned_num_kv_heads_x2 * self.kv_cache_lane_dim
         return num_elements * self.serve.dtype_kv.itemsize
 
     @property
@@ -329,7 +353,7 @@ class RpaConfigs:
             self.block.bkv_sz,
             self.bkv_stride,
             self.serve.packing_kv,
-            self.aligned_kv_head_dim,
+            self.kv_cache_lane_dim,
         )
 
     @property
@@ -405,7 +429,7 @@ class RpaConfigs:
                 self.serve.page_size,
                 self.aligned_num_kv_heads_x2 // self.serve.packing_kv,
                 self.serve.packing_kv,
-                self.aligned_kv_head_dim,
+                self.kv_cache_lane_dim,
             )
 
         if kv_cache.shape != expected_kv_cache_shape:

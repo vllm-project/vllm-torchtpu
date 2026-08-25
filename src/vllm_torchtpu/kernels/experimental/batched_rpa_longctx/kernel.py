@@ -37,10 +37,14 @@ def strided_load_bkv(
     *,
     cfgs: configs.RpaConfigs,
 ) -> list[tuple[jax.Array, jax.Array]]:
+    # `start` counts (K|V, head) entries; a folded cache spends `fold` rows on
+    # each one, so the row index -- and with it the packed-word index -- scales.
+    fold = cfgs.kv_head_dim_fold
+    start *= fold
     assert start % cfgs.serve.packing_kv == 0
     start //= cfgs.serve.packing_kv
     kv_u32_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32)
-    kv_ref = kv_u32_ref.reshape(-1, cfgs.aligned_kv_head_dim)
+    kv_ref = kv_u32_ref.reshape(-1, cfgs.kv_cache_lane_dim)
 
     if cfgs.serve.packing_kv == 1:
         k = utils.strided_load(
@@ -63,9 +67,23 @@ def strided_load_bkv(
                             cfgs.bkv_stride)
     bitwidth = jax.dtypes.itemsize_bits(cfgs.serve.dtype_kv)
 
-    return utils.convert_to_target_bitwidth(kv,
-                                            target_bitwidth=bitwidth,
-                                            kv_dtype=cfgs.serve.dtype_kv)
+    kv_lst = utils.convert_to_target_bitwidth(kv,
+                                              target_bitwidth=bitwidth,
+                                              kv_dtype=cfgs.serve.dtype_kv)
+    if fold == 1:
+        return kv_lst
+
+    # Unfolded, the de-interleaved slots already are (K, V) of one head. Folded,
+    # they are head_dim segments in row order -- fold of K, then fold of V --
+    # so glue each run back together on the lane dim and re-pair. The segments
+    # are exact halves of the same values in the same order, so this reproduces
+    # the unfolded vectors bit for bit.
+    segments = [seg for pair in kv_lst for seg in pair]
+    heads = [
+        jnp.concatenate(segments[i * fold:(i + 1) * fold], axis=-1)
+        for i in range(len(segments) // fold)
+    ]
+    return list(zip(heads[0::2], heads[1::2]))
 
 
 def calculate_and_store_out(
@@ -249,7 +267,10 @@ def rpa_body(
             v_b.append(jnp.stack(vs, axis=0))
     else:
         for b_idx in range(cfgs.batch_size):
-            heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
+            # A packed word holds `packing_kv` rows; folded, a head costs
+            # `kv_head_dim_fold` rows instead of one.
+            heads_per_load = pl.cdiv(cfgs.serve.packing_kv,
+                                     2 * cfgs.kv_head_dim_fold)
             ks = []
             vs = []
             for kv_head_start in range(0, cfgs.model.num_kv_heads,

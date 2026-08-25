@@ -50,6 +50,7 @@ def prepare_inputs(
     kv_dtype: jnp.dtype,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
+    fold_kv_head_dim: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
 
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
@@ -95,8 +96,6 @@ def prepare_inputs(
 
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
-    num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2,
-                                             kv_packing)
 
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_lanes = pltpu.get_tpu_info().num_lanes
@@ -119,21 +118,30 @@ def prepare_inputs(
             kv_packing,
         ).transpose(1, 2, 3, 0))
     else:
+        kv_fold = (utils.kv_head_dim_fold(actual_num_kv_heads, actual_head_dim,
+                                          kv_packing, num_lanes)
+                   if fold_kv_head_dim else 1)
+        # Folded, a head_dim vector spans `kv_fold` rows of `kv_cache_lane_dim`
+        # lanes, so the reshape below cuts it up and there is no head padding
+        # left to write (the fold is only taken when it removes all of it).
+        num_kv_rows = utils.align_to(actual_num_kv_heads_x2 * kv_fold,
+                                     kv_packing)
+        kv_cache_lane_dim = aligned_kv_head_dim // kv_fold
         new_kv_hbm = jnp.pad(
             jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
                                                      actual_num_kv_heads_x2,
                                                      actual_head_dim),
             (
                 (0, 0),
-                (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
+                (0, num_kv_rows // kv_fold - actual_num_kv_heads_x2),
                 (0, aligned_kv_head_dim - actual_head_dim),
             ),
             constant_values=0,
         ).reshape(
             total_q_tokens,
-            num_kv_heads_x2_aligned // kv_packing,
+            num_kv_rows // kv_packing,
             kv_packing,
-            aligned_kv_head_dim,
+            kv_cache_lane_dim,
         )
     return o_hbm_alias_q_hbm, new_kv_hbm
 
@@ -151,12 +159,15 @@ def get_kv_cache_shape(
     kv_dtype=None,
     kv_packing: int | None = None,
     kv_layout: configs.KVLayout | None = None,
+    fold_kv_head_dim: bool | None = None,
 ):
     if kv_layout is None:
         if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
         else:
             kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    if fold_kv_head_dim is None:
+        fold_kv_head_dim = envs.TPU_RPA_FOLD_KV_HEAD_DIM
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
 
@@ -171,12 +182,16 @@ def get_kv_cache_shape(
             kv_packing,
             page_size,
         )
+    kv_fold = (utils.kv_head_dim_fold(actual_num_kv_heads, actual_head_dim,
+                                      kv_packing, num_lanes)
+               if fold_kv_head_dim else 1)
     return (
         total_num_pages,
         page_size,
-        utils.align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
+        utils.align_to(actual_num_kv_heads * 2 * kv_fold, kv_packing) //
         kv_packing,
-        utils.align_to(actual_head_dim, num_lanes),
+        kv_packing,
+        utils.align_to(actual_head_dim, num_lanes) // kv_fold,
     )
 
 
@@ -198,10 +213,18 @@ def calculate_block_sizes(
     aligned_num_q_heads = (aligned_num_q_heads_per_kv_head *
                            model_cfgs.num_kv_heads)
 
+    # Rows and lane width of one cached token, which the fold trades against
+    # each other; keep them paired so the KV buffer estimate stays exact.
+    kv_cache_lane_dim = aligned_head_dim
     if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
     else:
-        bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2,
+        kv_fold = (utils.kv_head_dim_fold(model_cfgs.num_kv_heads,
+                                          model_cfgs.head_dim,
+                                          serve_cfgs.packing_kv, num_lanes)
+                   if serve_cfgs.fold_kv_head_dim else 1)
+        kv_cache_lane_dim = aligned_head_dim // kv_fold
+        bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2 * kv_fold,
                              serve_cfgs.packing_kv)
         if utils.has_bank_conflicts(bkv_stride):
             bkv_stride += 1
@@ -223,7 +246,8 @@ def calculate_block_sizes(
             bkv_array_size = ((bkv_sz + 2 * serve_cfgs.page_size) *
                               aligned_num_kv_heads_x2 * aligned_head_dim)
         else:
-            bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
+            bkv_array_size = (bkv_sz * aligned_num_kv_heads_x2 *
+                              kv_cache_lane_dim)
 
         # Get output buffer size as well - which has same size as query size.
         bo_array_size = bq_array_size
@@ -396,6 +420,7 @@ def calculate_block_sizes(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
+        "fold_kv_head_dim",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -425,6 +450,7 @@ def ragged_paged_attention(
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
     kv_layout: configs.KVLayout | None = None,
+    fold_kv_head_dim: bool | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -466,6 +492,11 @@ def ragged_paged_attention(
             target layer earlier in the same forward pass, ignores its own k/v
             inputs, and does not write the cache back. Inverse of upstream
             tpu-inference's `update_kv_cache`.
+        fold_kv_head_dim: Store head_dim across the packing slots that
+            `num_kv_heads * 2` would otherwise pad out, halving the cached
+            bytes per token where that padding exists. Defaults to
+            `TPU_RPA_FOLD_KV_HEAD_DIM`. `kv_cache` must already have the
+            matching shape from `get_kv_cache_shape`.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -479,6 +510,8 @@ def ragged_paged_attention(
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
         else:
             kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    if fold_kv_head_dim is None:
+        fold_kv_head_dim = envs.TPU_RPA_FOLD_KV_HEAD_DIM
 
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
@@ -526,6 +559,7 @@ def ragged_paged_attention(
         scale_k=k_scale,
         scale_v=v_scale,
         kv_layout=kv_layout,
+        fold_kv_head_dim=fold_kv_head_dim,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
@@ -536,6 +570,7 @@ def ragged_paged_attention(
         kv_cache.dtype,
         kv_layout=kv_layout,
         page_size=page_size,
+        fold_kv_head_dim=fold_kv_head_dim,
     )
 
     default_decode, default_prefill = calculate_block_sizes(

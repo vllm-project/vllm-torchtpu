@@ -15,19 +15,28 @@ def normalize_kv_cache_specs_for_tpu(
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
+    attn_backend_cls: type | None = None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
 
     `exempt_layers` pass through untouched: their packed, compressed layout is
     not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
+
+    `attn_backend_cls` is the backend that will actually own the non-MLA pages.
+    It has to be the selected one, not `PallasAttentionBackend`: backends may
+    lay a page out differently (the batched-RPA one folds head_dim into the
+    packing padding under `TPU_RPA_FOLD_KV_HEAD_DIM`), and a spec padded to
+    another backend's page size does not match the tensor that gets allocated.
     """
     exempt = exempt_layers or set()
+    backend_cls = attn_backend_cls or PallasAttentionBackend
     normalized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_specs.items():
         if layer_name in exempt:
             normalized[layer_name] = spec
             continue
-        normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
+        normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype,
+                                                     backend_cls)
     if enable_unified_kv_layout:
         non_exempt_specs = {
             k: v
@@ -48,6 +57,7 @@ def normalize_kv_cache_specs_for_tpu(
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: str | torch.dtype,
+    attn_backend_cls: type,
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
@@ -69,7 +79,7 @@ def _normalize_one_spec(
             kv_cache_dtype,
         )
     else:
-        page_size = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+        page_size = attn_backend_cls.get_kv_cache_page_size_bytes(
             spec.block_size,
             spec.num_kv_heads,
             spec.head_size,

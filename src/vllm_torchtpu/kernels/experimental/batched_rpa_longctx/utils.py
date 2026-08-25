@@ -41,6 +41,39 @@ def get_dtype_packing(dtype):
     return 32 // jax.dtypes.itemsize_bits(dtype)
 
 
+def kv_head_dim_fold(num_kv_heads: int, head_dim: int, kv_packing: int,
+                     num_lanes: int) -> int:
+    """How many packing slots one (K|V, head) vector occupies in the cache.
+
+    HEAD_ALONG_SUBLANE stores one (K|V, head) vector per packing slot and pads
+    `num_kv_heads * 2` up to a whole 32-bit word, so a rank holding a single KV
+    head of an fp8 cache spends half of every token on structural zeros. The
+    fold spends those slots on head_dim instead: the vector is cut into
+    `fold` lane-wide segments that occupy `fold` consecutive slots.
+
+    Returns 1 (no fold) unless every condition below holds, so the caller never
+    has to know which parallelism it is running under:
+      - there is padding to reclaim: `num_kv_heads * 2` is not already a whole
+        number of words (under DP the rank keeps both KV heads and the fold
+        would only move bytes around);
+      - head_dim spans more than one lane register, so there is something to
+        cut;
+      - a packed word holds a whole number of (K|V, head) vectors, and a load
+        of `packing // (2 * fold)` heads is a whole number of heads. The kernel
+        de-interleaves one word at a time, so a vector split across two words
+        -- or a word holding K without its V -- has no single-load form.
+    """
+    heads_x2 = num_kv_heads * 2
+    if heads_x2 % kv_packing == 0:
+        return 1
+    fold = align_to(head_dim, num_lanes) // num_lanes
+    if fold <= 1 or kv_packing % (2 * fold) != 0:
+        return 1
+    if num_kv_heads % (kv_packing // (2 * fold)) != 0:
+        return 1
+    return fold
+
+
 def strided_load(ref, start_row, num_rows, step, *, dtype=None):
     """Loads data from HBM with strided access, handling 128-lane alignment."""
     _, row_width = ref.shape

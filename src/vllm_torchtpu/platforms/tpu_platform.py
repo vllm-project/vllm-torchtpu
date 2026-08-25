@@ -293,6 +293,72 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
             "--profiler-config.torch_profiler_dir=<dir>.")
 
 
+def _refuse_kv_head_dim_fold(vllm_config: "VllmConfig") -> None:
+    """Turn TPU_RPA_FOLD_KV_HEAD_DIM off where the folded page is not readable.
+
+    The fold changes what a KV page *means*: the packing slots stop being
+    (K|V, head) and become head_dim segments. Only the batched_rpa_longctx
+    HEAD_ALONG_SUBLANE kernel knows that. Anything else that reads or writes a
+    page -- the PCP streaming path (which packs through the mainline
+    batched_rpa wrapper), a draft layer sharing a pool sized for a wider head,
+    a KV connector shipping pages off-box -- would read the right bytes with
+    the wrong meaning, silently, which is the PR #275 failure class.
+
+    Refuse rather than let it happen. Mutating the environment is the choke
+    point because the kernel reads the flag directly and `enable_envs_cache()`
+    has not run yet at config time.
+    """
+    if not envs.TPU_RPA_FOLD_KV_HEAD_DIM:
+        return
+    parallel_config = vllm_config.parallel_config
+    reason = None
+    if not envs.USE_BATCHED_RPA_LONGCTX:
+        reason = "the batched_rpa_longctx kernel is not selected"
+    elif envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        reason = "the SEQ_ALONG_LANE layout has no packing slots to reclaim"
+    elif getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
+        reason = "PCP streaming packs KV through the unfolded mainline wrapper"
+    elif vllm_config.speculative_config is not None:
+        reason = "a draft layer may share a pool sized for a wider head"
+    elif vllm_config.kv_transfer_config is not None:
+        reason = "a KV connector ships pages that assume the unfolded layout"
+    if reason is not None:
+        os.environ["TPU_RPA_FOLD_KV_HEAD_DIM"] = "0"
+        logger.warning(
+            "TPU_RPA_FOLD_KV_HEAD_DIM was requested but is refused: %s. "
+            "Running with the unfolded KV page.", reason)
+
+
+def _reject_seq_along_lane_unified_pool(vllm_config: "VllmConfig") -> None:
+    """SEQ_ALONG_LANE cannot back the unified GDN pool. Say so at startup.
+
+    The pool is structurally token-major: `pool_adapters` and `gdn_attention`
+    read `pool.shape[1]` as the kernel block's token count. SEQ_ALONG_LANE puts
+    `num_kv_heads * 2` there and the tokens on the last axis, so `split` comes
+    out as the head count and `math.prod(pool.shape[2:])` as a whole page --
+    the divisibility guard in `gdn_attention` still passes and the GDN state is
+    addressed at the wrong stride.
+
+    Until now this was caught by accident: `allocate_raw_kv_cache_tensors`
+    asserted `fa_page_bytes * split == pool_page_bytes` against a spec that
+    `kv_cache_spec_normalizer` had padded from `PallasAttentionBackend`, so the
+    layouts disagreed and it aborted. Normalizing from the selected backend
+    (which the head_dim fold requires) makes those agree, so the assert stops
+    firing and the mis-addressing would become reachable. Reject explicitly
+    instead of relying on a byte count to disagree.
+    """
+    if not (envs.USE_BATCHED_RPA_SEQ_ON_LANE and envs.USE_BATCHED_RPA_LONGCTX):
+        return
+    if not unified_kv_layout_enabled(vllm_config):
+        return
+    raise ValueError(
+        "USE_BATCHED_RPA_SEQ_ON_LANE=1 is not supported with the unified KV "
+        "pool: the pool addresses GDN state token-major and the "
+        "SEQ_ALONG_LANE page is head-major, which mis-addresses the state "
+        "without tripping any shape check. Unset it, or run with "
+        "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.")
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -1096,6 +1162,8 @@ class TpuPlatform(Platform):
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size)
+        _reject_seq_along_lane_unified_pool(vllm_config)
+        _refuse_kv_head_dim_fold(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:

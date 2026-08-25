@@ -1336,6 +1336,7 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
+            attn_backend_cls=backend_cls,
         )
 
     def build_attention_metadata_for_layers(
@@ -6030,7 +6031,12 @@ class TPUModelRunner(GPUModelRunner):
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     elif isinstance(spec, AttentionSpec):
-                        total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        # `backend_cls`, not `PallasAttentionBackend`: the
+                        # tensor this divides into is allocated from
+                        # `backend_cls.get_kv_cache_shape` below, and the
+                        # batched-RPA backend's page is half the base one's
+                        # under `TPU_RPA_FOLD_KV_HEAD_DIM`.
+                        total_group_page_size += backend_cls.get_kv_cache_page_size_bytes(
                             spec.block_size,
                             spec.num_kv_heads,
                             spec.head_size,

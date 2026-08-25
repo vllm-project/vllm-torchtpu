@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_RPA_FOLD_KV_HEAD_DIM: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -168,6 +169,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
+    # Reinterpret the KV cache's dead packing slots as head_dim segments, so a
+    # rank whose num_kv_heads * 2 is not a multiple of the packing factor stops
+    # paying for the slots it pads out (TP8 on a 2-KV-head model: 1024 B/token
+    # for 512 B of live K+V). It is a no-op wherever there is no padding to
+    # reclaim -- notably under DP, where the rank keeps both KV heads.
+    #
+    # It is NOT safe to leave on everywhere: only the batched_rpa_longctx
+    # HEAD_ALONG_SUBLANE kernel can read the folded layout, and the fold changes
+    # the meaning of every page, so PCP streaming (which packs KV through the
+    # mainline batched_rpa wrapper), a pool shared with a narrower draft layer,
+    # KV offload and P/D disaggregation all disagree with it. Those combinations
+    # are refused at startup rather than left to corrupt silently -- see
+    # `_refuse_kv_head_dim_fold`.
+    "TPU_RPA_FOLD_KV_HEAD_DIM":
+    env_bool("TPU_RPA_FOLD_KV_HEAD_DIM"),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),
