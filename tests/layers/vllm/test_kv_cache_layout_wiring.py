@@ -287,3 +287,68 @@ def test_page_size_bytes_is_not_overridden():
     """Inherited on purpose: the base classmethod sizes itself from
     `cls.get_kv_cache_shape`, so an override would repeat the layout branch."""
     assert "get_kv_cache_page_size_bytes" not in vars(BATCHED)
+
+
+# --------------------------------------------------------------------------
+# The page size the memory planner actually sees
+# --------------------------------------------------------------------------
+#
+# `normalize_kv_cache_specs_for_tpu` runs over every spec the runner builds and
+# is the last thing to touch `page_size_padded`, which vLLM divides into free
+# memory to get `num_blocks`. It used to recompute that from a hardcoded
+# `PallasAttentionBackend`, discarding the layout-aware value the runner had
+# just set.
+
+
+def _normalized_page_bytes(backend, num_kv_heads, head_size, dtype):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from vllm_torchtpu.kv_cache_spec_normalizer import \
+        normalize_kv_cache_specs_for_tpu
+    spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+        page_size_padded=page_bytes(backend, num_kv_heads, head_size, dtype),
+        indexes_kv_by_block_stride=True,
+    )
+    normalized = normalize_kv_cache_specs_for_tpu(
+        {"l": spec}, dtype, attention_backend_cls=backend)
+    return normalized["l"].page_size_bytes
+
+
+@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
+def test_normalizer_preserves_the_fp8_halving(hnd, num_kv_heads, head_size):
+    bf16 = _normalized_page_bytes(BATCHED, num_kv_heads, head_size, BF16)
+    fp8 = _normalized_page_bytes(BATCHED, num_kv_heads, head_size, FP8)
+    assert bf16 == 2 * fp8, (num_kv_heads, head_size, bf16, fp8)
+
+
+@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
+@pytest.mark.parametrize("dtype", [BF16, FP8])
+def test_normalizer_agrees_with_the_allocated_page(hnd, num_kv_heads,
+                                                   head_size, dtype):
+    """The planner's per-block budget must equal what gets allocated, or blocks
+    are counted against a page nobody builds."""
+    assert (_normalized_page_bytes(BATCHED, num_kv_heads, head_size,
+                                   dtype) == page_bytes(
+                                       BATCHED, num_kv_heads, head_size,
+                                       dtype))
+
+
+@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
+@pytest.mark.parametrize("dtype", [BF16, FP8])
+def test_normalizer_leaves_the_default_layout_alone(nhd, num_kv_heads,
+                                                    head_size, dtype):
+    assert (_normalized_page_bytes(BATCHED, num_kv_heads, head_size,
+                                   dtype) == page_bytes(
+                                       BASE, num_kv_heads, head_size, dtype))
+
+
+def test_layout_blind_backend_would_lose_the_halving(hnd):
+    """Non-vacuousness: the base class the normalizer used to hardcode reports
+    a bf16-sized page for fp8, which is the bug these tests guard."""
+    assert (_normalized_page_bytes(BASE, 1, 128,
+                                   FP8) == _normalized_page_bytes(
+                                       BASE, 1, 128, BF16))

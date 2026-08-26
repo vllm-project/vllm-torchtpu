@@ -2,7 +2,6 @@ import math
 from dataclasses import replace
 
 import torch
-from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec)
 
@@ -14,11 +13,15 @@ def normalize_kv_cache_specs_for_tpu(
     kv_cache_specs: dict[str, KVCacheSpec],
     kv_cache_dtype: str | torch.dtype,
     *,
+    attention_backend_cls: type[PallasAttentionBackend],
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
-    attention_backend: type[AttentionBackend] | None = None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
+
+    `attention_backend_cls` must be the backend that will actually allocate
+    these caches: page geometry varies by KV layout, so a fixed base class here
+    would floor the spec at a page size nobody allocates.
 
     `exempt_layers` pass through untouched: their packed, compressed layout is
     not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
@@ -29,11 +32,8 @@ def normalize_kv_cache_specs_for_tpu(
         if layer_name in exempt:
             normalized[layer_name] = spec
             continue
-        normalized[layer_name] = _normalize_one_spec(
-            spec,
-            kv_cache_dtype,
-            attention_backend=attention_backend,
-        )
+        normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype,
+                                                     attention_backend_cls)
     if enable_unified_kv_layout:
         non_exempt_specs = {
             k: v
@@ -54,8 +54,7 @@ def normalize_kv_cache_specs_for_tpu(
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: str | torch.dtype,
-    *,
-    attention_backend: type[AttentionBackend] | None = None,
+    attention_backend_cls: type[PallasAttentionBackend],
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
@@ -70,6 +69,7 @@ def _normalize_one_spec(
         kv_cache_dtype = spec.dtype
 
     if isinstance(spec, MLAAttentionSpec):
+        # MLA has one layout, so its backend is not a caller's choice.
         page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
             spec.block_size,
             spec.num_kv_heads,
@@ -77,8 +77,7 @@ def _normalize_one_spec(
             kv_cache_dtype,
         )
     else:
-        backend = attention_backend or PallasAttentionBackend
-        page_size = backend.get_kv_cache_page_size_bytes(
+        page_size = attention_backend_cls.get_kv_cache_page_size_bytes(
             spec.block_size,
             spec.num_kv_heads,
             spec.head_size,

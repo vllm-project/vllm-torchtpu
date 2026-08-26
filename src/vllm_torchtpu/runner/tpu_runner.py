@@ -1381,9 +1381,9 @@ class TPUModelRunner(GPUModelRunner):
         return normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
+            attention_backend_cls=backend_cls,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
-            attention_backend=backend_cls,
         )
 
     def _build_attention_metadata(
