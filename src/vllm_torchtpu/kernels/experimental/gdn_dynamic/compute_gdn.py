@@ -453,16 +453,16 @@ def recurrent_gdn(
     k_curr = jnp.repeat(k_compact[:, :, 0, 0, :], cfg.v_per_kq_head, axis=1)
     k_curr = jnp.expand_dims(k_curr, axis=2)
 
-    k_curr_t = jnp.repeat(k_compact_t[:, :, 0, :, 0], cfg.v_per_kq_head, axis=1)
+    k_curr_t = jnp.repeat(k_compact_t[:, :, 0, :, 0],
+                          cfg.v_per_kq_head,
+                          axis=1)
     k_curr_t = jnp.expand_dims(k_curr_t, axis=3)
 
     v_curr = jnp.expand_dims(v_compact[:, :, 0, 0, :], axis=2)
-    beta_curr = beta[:, :, 0, 0, 0].reshape(
-        cfg.seq_tile_size, cfg.num_v_heads, 1, 1
-    )
-    gating_curr = gating_log[:, :, 0, 0, 0].reshape(
-        cfg.seq_tile_size, cfg.num_v_heads, 1, 1
-    )
+    beta_curr = beta[:, :, 0, 0, 0].reshape(cfg.seq_tile_size, cfg.num_v_heads,
+                                            1, 1)
+    gating_curr = gating_log[:, :, 0, 0, 0].reshape(cfg.seq_tile_size,
+                                                    cfg.num_v_heads, 1, 1)
 
     # 1. State decay update
     state_updated = state_prev * gating_curr
@@ -471,18 +471,15 @@ def recurrent_gdn(
     b_size, n_v_heads = cfg.seq_tile_size, cfg.num_v_heads
     kq_merged = jnp.concat([k_curr, q_curr], axis=2)  # [B, n_v, 2, d_k]
     kq_merged_flat = kq_merged.reshape(-1, 2, cfg.kq_head_dim)
-    state_updated_flat = state_updated.reshape(
-        -1, cfg.kq_head_dim, cfg.v_head_dim
-    )
+    state_updated_flat = state_updated.reshape(-1, cfg.kq_head_dim,
+                                               cfg.v_head_dim)
 
     kq_proj_flat = jax.lax.dot_general(
         kq_merged_flat,
         state_updated_flat,
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+        dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
         preferred_element_type=jnp.float32,
-    ).astype(
-        cfg.dtypes.compute
-    )  # [B * n_v, 2, d_v]
+    ).astype(cfg.dtypes.compute)  # [B * n_v, 2, d_v]
     kq_proj = kq_proj_flat.reshape(b_size, n_v_heads, 2, cfg.v_head_dim)
 
     v_updated = kq_proj[:, :, :1, :]

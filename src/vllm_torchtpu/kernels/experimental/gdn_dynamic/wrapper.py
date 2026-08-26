@@ -520,11 +520,9 @@ def fused_conv1d_gdn(
         )
 
     # Pre-allocate zero output buffer when zero_initialize_out is enabled.
-    out_act_init = (
-        jnp.zeros((padded_batch_size, n_v, d_v), dtype=act_out_dtype)
-        if zero_initialize_out
-        else None
-    )
+    out_act_init = (jnp.zeros(
+        (padded_batch_size, n_v,
+         d_v), dtype=act_out_dtype) if zero_initialize_out else None)
 
     def call_kernel_if_active(
         in_conv_state: jax.Array,
@@ -533,16 +531,16 @@ def fused_conv1d_gdn(
         mode: config.GDNMode,
         is_active: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-      """Conditionally launches Pallas kernel if the pass has active sequences."""
+        """Conditionally launches Pallas kernel if the pass has active sequences."""
 
-      def _execute():
-        return call_kernel(in_conv_state, in_recurrent_state, in_act, mode)
+        def _execute():
+            return call_kernel(in_conv_state, in_recurrent_state, in_act, mode)
 
-      def _skip():
-        act = in_act if in_act is not None else out_act_init
-        return act, in_conv_state, in_recurrent_state
+        def _skip():
+            act = in_act if in_act is not None else out_act_init
+            return act, in_conv_state, in_recurrent_state
 
-      return jax.lax.cond(is_active, _execute, _skip)
+        return jax.lax.cond(is_active, _execute, _skip)
 
     # Phase 1: Decode pass over sequences [0, distribution[0])
     out_act, out_conv_state, out_recurrent_state = call_kernel_if_active(
