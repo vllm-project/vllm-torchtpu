@@ -46,6 +46,7 @@ from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
+from vllm_torchtpu.layers.vllm.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.utils import synchronize_tensors
 
 # streamindex_topk block-tuning knobs. NOT tuned: these are the first values
@@ -362,7 +363,28 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.kv_cache_dtype.lower().strip())
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        super().process_weights_after_loading(act_dtype)
+        # Upstream `MLAAttention.process_weights_after_loading` reads this
+        # weight raw -- `get_and_maybe_dequant_weights(kv_b_proj).T` -- and
+        # asserts the [n_out, n_in] shape. The TPU linear method has already
+        # flipped it to (k, n), so present the layout upstream expects for the
+        # duration of that call. `kv_b_proj`'s parameters are cleared a few
+        # lines below once `W_UK_T`/`W_UV` are extracted, and it never runs a
+        # forward pass, so this view is the only consumer either way.
+        kv_b_weight = getattr(self.kv_b_proj, "weight", None)
+        # The weight's own type says whether it was flipped, so no bookkeeping
+        # flag is needed. Upstream below wants the [n_out, n_in] view.
+        flipped = (kv_b_weight is not None
+                   and getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False))
+        if flipped:
+            self.kv_b_proj.weight = Parameter(kv_b_weight.transpose(
+                0, 1).contiguous(),
+                                              requires_grad=False)
+        try:
+            super().process_weights_after_loading(act_dtype)
+        finally:
+            if flipped and getattr(self.kv_b_proj, "weight", None) is not None:
+                self.kv_b_proj.weight = Parameter(kv_b_weight,
+                                                  requires_grad=False)
 
         device = torch.device("tpu")
 

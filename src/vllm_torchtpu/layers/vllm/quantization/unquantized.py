@@ -55,6 +55,8 @@ from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
+from vllm_torchtpu.layers.vllm.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
+                                                     WEIGHT_FLIPPED_ATTR)
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
@@ -80,13 +82,13 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
     loading rather than at creation.
     """
 
-    # Marks a layer whose weight has already been flipped to (k, n), so a
-    # second process_weights_after_loading call cannot transpose it back.
-    _KMAJOR_ATTR = "_tpu_kmajor_weight"
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if getattr(layer, self._KMAJOR_ATTR, False):
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            # A consumer reads this weight raw and expects [n_out, n_in];
+            # `apply` below falls back to the stock contraction.
             return
+        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return  # already flipped; reload paths re-enter this hook
         weight = layer.weight.data
         if weight.dim() != 2:
             # Not a plain dense weight; leave the stock behaviour alone.
@@ -94,7 +96,7 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         weight = weight.transpose(0, 1).contiguous()
         replace_parameter(layer, "weight",
                           torch.nn.Parameter(weight, requires_grad=False))
-        setattr(layer, self._KMAJOR_ATTR, True)
+        setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if layer.weight.device.type == "tpu":
             synchronize_tensors([layer.weight])
 
@@ -104,6 +106,9 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            # Left in vLLM's [n_out, n_in] for a consumer that reads it raw.
+            return super().apply(layer, x, bias)
         # layer.weight is [n_in, n_out], so this contracts x's trailing dim
         # against axis 0 with no transpose.
         weight = layer.weight

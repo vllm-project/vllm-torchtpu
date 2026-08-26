@@ -12,6 +12,30 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
+# Some layers have their `.weight` read raw -- bypassing the linear method's
+# `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
+# to (k, n) corrupts the consumer silently, so they keep the upstream layout.
+#
+# The requirement belongs to the *consumer*, not to a name list here: the
+# module that reads the weight raw sets this attribute on the linear layer in
+# its own `__init__`. That runs during model construction, before any
+# `process_weights_after_loading`, so it is set by the time the layout decision
+# is made -- and it moves with the code if a layer is renamed, which a
+# name-matched list would not.
+KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
+
+# Idempotence guard, set by the linear method once it has flipped a weight.
+# Not how `apply` picks its contraction -- that keys off the marker above.
+#
+# It has to be a stored flag rather than a property of the weight: the flip
+# cannot be recovered from the shape (`o_proj` and friends are square in most
+# models), and encoding it in a Parameter subclass does not survive vLLM's
+# `replace_parameter`, which re-wraps by type. Meanwhile
+# `process_weights_after_loading` IS re-entered by vLLM's reload paths
+# (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
+# back and silently corrupt the values.
+WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     """Return the activation quant dtype paired with a given weight dtype.

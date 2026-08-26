@@ -66,7 +66,9 @@ from vllm_torchtpu.layers.vllm import moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
-from vllm_torchtpu.layers.vllm.linear_common import quantized_matmul
+from vllm_torchtpu.layers.vllm.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
+                                                     WEIGHT_FLIPPED_ATTR,
+                                                     quantized_matmul)
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import (
@@ -1013,7 +1015,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # after quantization so the requantizer still sees the contracting dim
         # last (axis=-1). The reallocation below materializes the view.
         ckpt_n_out, ckpt_n_in = weight.shape
-        weight = weight.transpose(0, 1)
+        # Layers whose weight is read raw by code expecting vLLM's
+        # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
+        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return  # already flipped; reload paths re-enter this hook
+        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        if not keep_vllm_layout:
+            weight = weight.transpose(0, 1)
 
         # The dequant/requant chain may leave views backed by higher-rank PJRT
         # buffers. Allocate fresh contiguous persistent parameters so the
@@ -1030,6 +1038,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
         replace_parameter(layer, "weight",
                           torch.nn.Parameter(weight, requires_grad=False))
+        if not keep_vllm_layout:
+            setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
@@ -1065,7 +1075,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        out = quantized_matmul(x, layer.weight, layer.weight_scale)
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
+            # takes the canonical (k, n), so flip the view for the contraction.
+            weight = weight.transpose(0, 1)
+        out = quantized_matmul(x, weight, layer.weight_scale)
         if bias is not None:
             out = out + bias
         return out

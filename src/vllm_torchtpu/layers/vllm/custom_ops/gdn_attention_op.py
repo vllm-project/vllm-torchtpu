@@ -40,6 +40,7 @@ from vllm_torchtpu.layers.common.gdn_attention import (
     run_jax_gdn_attention_pooled_pcp_prefill_projection)
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
+from vllm_torchtpu.layers.vllm.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 
@@ -275,6 +276,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # `_require_pcp_projection_parameters` hands this weight straight to
+        # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
+        if hasattr(self, "in_proj_qkvz"):
+            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         self.kv_cache = None
