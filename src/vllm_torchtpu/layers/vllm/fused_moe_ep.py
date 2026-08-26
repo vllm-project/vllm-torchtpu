@@ -29,17 +29,10 @@ router's full 512-wide sort, both routed-row argsorts, the SparseCore permute,
 both grouped matmuls, the combine, and both collectives.
 
 ``MOE_FUSED_EP_KERNEL_MIN_TOKENS`` decides once, at weight load, against the
-scheduler's largest batch, whether to arm this for the deployment. Where it is
-armed it serves every step, decode included.
-
-Upstream's recipe instead picks per step and leaves decode on the grouped-matmul
-path, on the reasoning that decode is weight-bandwidth bound with no transport
-to hide. That is right for their configuration and wrong for Qwen3.5-397B at
-DP8+EP, measured: arming everything gives 33,304 tok/s against 30,888 for the
-grouped-matmul path, and decode gets *faster* too, 54.87 ms median TPOT against
-56.86. At hidden 4096 the combine this replaces is worth paying a kernel for
-even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
-usual story for anything that scales with hidden size.
+scheduler's largest batch, whether to build this operation for the deployment.
+When it is built, ``TPU_MOE_FUSED_EP_STEP_MIN_TOKENS`` can keep smaller compiled
+token shapes on the gather/grouped-matmul/combine path while larger shapes use
+this fully fused path. Its default of zero preserves fused EP for every shape.
 """
 
 from typing import Any
@@ -80,6 +73,7 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # into a tensor, so the mesh must never appear in a traced frame.
 _OP: Any = None
 _EP_SIZE: int | None = None
+_SKIP_PADDED_TOKENS = False
 # This rank's mesh index, as a device tensor. The kernel needs it as data;
 # see the note in fused_ep_moe_v2 on why a value computed inside the traced
 # function turns into a `partition-id` XLA will not accept.
@@ -112,30 +106,22 @@ def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
 def fused_moe_ep_supported() -> bool:
     """Whether `prebuild_fused_moe_ep` armed the fused path for this layer.
 
-    Takes no tensor on purpose. A per-step choice would have to branch on the
-    token count, and vLLM traces the backbone once with that dimension dynamic,
-    so the first bucket traced freezes the decision for every other bucket:
-    measured, gating that way fused one of eleven buckets and gave back the
-    whole win (30,667 tok/s against 33,304). vllm-torchtpu #474 exists to fix
-    exactly that, by reading Dynamo's shape guards and retracing per bucket. It
-    was tried here and reverted -- its warmup ladder goes out of step with a
-    partition that falls mid-ladder ("artifact_compile_range_8_8 was left to a
-    later trace (s18 >= 128) and never compiled"), and every request failed.
-    Revisit if that PR lands with the ladder issue resolved; the gain on offer
-    is decode steps skipping this kernel's ~180 us per-call fixed cost.
+    Shape selection belongs to the FP8 method, which owns the EP exchange and
+    selects fused EP or gather/GMM/combine for each compiled static shape.
+    This helper reports only whether the fused operation is available.
     """
     return _OP is not None
 
 
-def _build_op(mesh, topk: int, renormalize: bool, activation: str):
+def _build_op(mesh, topk: int, renormalize: bool, activation: str,
+              skip_padded_tokens: bool):
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
-    # Every operand is annotated jax.Array: torch_tpu infers static argnums
-    # from the signature and refuses an unannotated one.
-    def moe(x: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: jax.Array,
-            w2_scale: jax.Array, gating: jax.Array,
-            rank: jax.Array) -> jax.Array:
+    def run_moe(x: jax.Array, w1: jax.Array, w2: jax.Array,
+                w1_scale: jax.Array, w2_scale: jax.Array,
+                gating: jax.Array, rank: jax.Array,
+                valid_tokens: jax.Array | None) -> jax.Array:
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -158,7 +144,28 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str):
                                block=None,
                                ragged_stride=None,
                                weight_format=WeightFormat.FP8,
-                               act_fn=activation)
+                               act_fn=activation,
+                               valid_tokens=valid_tokens)
+
+    # Add the valid-prefix operand only when padding is skipped.
+    if skip_padded_tokens:
+
+        def moe(x: jax.Array, w1: jax.Array, w2: jax.Array,
+                w1_scale: jax.Array, w2_scale: jax.Array,
+                gating: jax.Array, valid_tokens: jax.Array,
+                rank: jax.Array) -> jax.Array:
+            return run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank,
+                           valid_tokens)
+
+        input_specs = (PartitionSpec(EP_AXIS_NAME), ) * 8
+    else:
+
+        def moe(x: jax.Array, w1: jax.Array, w2: jax.Array,
+                w1_scale: jax.Array, w2_scale: jax.Array,
+                gating: jax.Array, rank: jax.Array) -> jax.Array:
+            return run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, None)
+
+        input_specs = (PartitionSpec(EP_AXIS_NAME), ) * 7
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
@@ -171,7 +178,7 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str):
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank -- every operand is
         # sharded on axis 0 over the EP axis, and so is the single output.
-        input_partition_specs=(spec, ) * 7,
+        input_partition_specs=input_specs,
         output_partition_specs=spec,
     )
 
@@ -179,8 +186,9 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str):
         return torch.empty_like(x)
 
     op.register_fake(_fake)
-    global _OP
+    global _OP, _SKIP_PADDED_TOKENS
     _OP = op
+    _SKIP_PADDED_TOKENS = skip_padded_tokens
     return op
 
 
@@ -199,9 +207,39 @@ def fused_moe_ep(
     all-gather the input or reduce-scatter the output. Only call it when
     `fused_moe_ep_supported` said yes.
     """
-    return _OP(hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
-               _squeeze_channel_scale_checked(w2_scale),
-               _to_mesh_expert_order(router_logits), _RANK_BUFFER)
+    args = (hidden_states, w1, w2,
+            _squeeze_channel_scale_checked(w1_scale),
+            _squeeze_channel_scale_checked(w2_scale),
+            _to_mesh_expert_order(router_logits))
+    if _SKIP_PADDED_TOKENS:
+        from vllm_torchtpu.layers.vllm import token_padding
+        valid_tokens = token_padding.get_local_valid_tokens()
+        if valid_tokens is None:
+            raise RuntimeError("fused EP padding skipping is enabled but the "
+                               "runner did not install padding state")
+        return _OP(*args, valid_tokens, _RANK_BUFFER)
+    return _OP(*args, _RANK_BUFFER)
+
+
+def retain_fused_ep_graph_inputs(output: torch.Tensor) -> torch.Tensor:
+    """Keep fused-EP buffers stable across shape-specific graphs."""
+    graph_inputs = [_RANK_BUFFER, _EXPERT_ORDER]
+    if _SKIP_PADDED_TOKENS:
+        from vllm_torchtpu.layers.vllm import token_padding
+        valid_tokens = token_padding.get_local_valid_tokens()
+        if valid_tokens is None:
+            raise RuntimeError("fused EP padding skipping is enabled but the "
+                               "runner did not install padding state")
+        graph_inputs.append(valid_tokens)
+
+    marker = None
+    for graph_input in graph_inputs:
+        if graph_input is None:
+            continue
+        value = graph_input.reshape(-1)[0].to(output.dtype)
+        zero = value - value
+        marker = zero if marker is None else marker + zero
+    return output if marker is None else output + marker
 
 
 def _to_mesh_expert_order(router_logits: torch.Tensor) -> torch.Tensor:
@@ -380,11 +418,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     local_experts, hidden = w1.shape[0], w1.shape[1]
     inter = w1.shape[2] // 2
 
-    # The threshold is applied here rather than per step: the op is shape
-    # agnostic, so the only place a token count is known outside the traced
-    # forward is the scheduler's cap. A deployment whose largest batch is below
-    # the threshold never builds the op at all; one above it uses the kernel
-    # for every step, decode included.
+    # Build fused EP only when the largest batch justifies it.
     max_node_tokens = _max_node_tokens(ep)
     if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
         logger.info_once(
@@ -399,10 +433,12 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return
 
-    _build_op(mesh, topk, renormalize, activation)
+    _build_op(mesh, topk, renormalize, activation,
+              envs.TPU_MOE_SKIP_PADDED_TOKENS)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "topk=%d capacity=%d", hidden, inter, local_experts, ep, topk, _TILE_M)
+        "topk=%d capacity=%d skip_padded_tokens=%s", hidden, inter,
+        local_experts, ep, topk, _TILE_M, envs.TPU_MOE_SKIP_PADDED_TOKENS)
 
 
 def _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts, hidden,

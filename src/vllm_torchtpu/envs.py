@@ -54,7 +54,11 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS: int = 0
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
+    TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER: bool = False
+    TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS: int = 0
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
@@ -374,6 +378,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
+    # Enable native hierarchical all-reduce above this token count.
+    "TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS":
+    lambda: int(os.getenv("TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS", "0")),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
@@ -381,11 +388,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL":
     env_bool("USE_MOE_FUSED_EP_KERNEL"),
-    # Largest node-wide token count, out of the scheduler's cap, at or above
-    # which the fused kernel is armed for the whole deployment. Decided once at
-    # weight load, not per step: a per-step choice would need the token count
-    # inside the traced graph, and on Qwen3.5-397B it also measured worse than
-    # arming everything. Below the threshold the grouped-matmul path serves.
+    # Select fused EP only for sufficiently large compiled shapes.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS":
+    lambda: int(os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")),
+    # Allow the fused-EP row gather to overlap routing.
+    "TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER":
+    env_bool("TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER"),
+    # Gather small DP batches before routing to save a collective.
+    "TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS":
+    lambda: int(os.getenv("TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS", "0")),
+    # Build fused EP only when the largest batch justifies it.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
 

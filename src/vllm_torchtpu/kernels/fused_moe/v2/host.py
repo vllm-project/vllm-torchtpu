@@ -53,9 +53,8 @@ WEIGHT_PREFETCH_DISTANCE = 2
 # prefetch distance's worth of earlier experts are still live, so the slot
 # count has to exceed the distance for all of them to stay distinct.
 NBUF = WEIGHT_PREFETCH_DISTANCE + 1
-# Every transport moves whole 8-row blocks; dynamic DMA offsets are
-# block-aligned.
-ROWBLK = 8
+# Use single-row blocks to avoid per-expert padding on small batches.
+ROWBLK = 1
 # A token row is a whole number of 128-lane blocks: the lane count of the
 # vector unit this kernel is built for.
 HIDDEN_LANE_BLOCK = 128
@@ -355,7 +354,7 @@ class RoutingTables(NamedTuple):
 
 def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
                          shard_stride):
-    """Assign every routed (token, expert) pair the slab row it computes on."""
+    """Assign valid routes to expert slab rows."""
     # topk_idx [T, K] i32 expert ids, all-gathered. Rows order by expert then
     # by owning shard, each run padded to ROWBLK.
     T, K = topk_idx.shape
@@ -404,6 +403,8 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
     expert_of_pair = topk_idx.reshape(-1).astype(jnp.int32)
     n_blocks = n // block
     expert_blocks = expert_of_pair.reshape(n_blocks, block)
+    valid_blocks = ((expert_blocks >= 0) & (expert_blocks < e_total))
+    valid_pair = valid_blocks.reshape(-1)
     bins = jnp.arange(e_total, dtype=jnp.int32)
 
     block_hist = jnp.sum(
@@ -414,7 +415,8 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
         expert_blocks[:, :, None] == bins[None, None, :],
         block_off[:, None, :], 0),
                             axis=2)  # [n_blocks, block]
-    eq = expert_blocks[:, :, None] == expert_blocks[:, None, :]
+    eq = ((expert_blocks[:, :, None] == expert_blocks[:, None, :]) &
+          valid_blocks[:, :, None] & valid_blocks[:, None, :])
     tri = jnp.tril(jnp.ones((block, block), dtype=jnp.bool_), k=-1)
     rank = jnp.sum((eq & tri[None]).astype(jnp.int32), axis=2)
     pair_rank = (base_per_slot + rank).reshape(-1)  # [n] rank in its expert
@@ -471,7 +473,10 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
     pos = pair_rank + jnp.right_shift(packed_sel, SLOT_FIELD_SHIFT)
     slot = pair_rank + (packed_sel & SLOT_FIELD_MASK)
 
-    slab_row = base_of_pair + slot  # always < total
+    # Keep invalid arrivals safe and drop their slab writes.
+    pos = jnp.where(valid_pair, pos, jnp.int32(0))
+    slab_row = jnp.where(valid_pair, base_of_pair + slot,
+                         jnp.int32(rows_alloc))
 
     return RoutingTables(arrival_row=pos.reshape(T, K),
                          slab_row=slab_row,

@@ -842,10 +842,20 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
+        del input_ids
         activation_str = layer._tpu_activation_str
+        fused_ep_step_min_tokens = envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+        if fused_ep_step_min_tokens < 0:
+            raise ValueError(
+                "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0")
         if self.supports_internal_mk:
-            return self._apply_owning_dispatch(layer, x, router_logits,
-                                               activation_str)
+            return self._apply_owning_dispatch(
+                layer,
+                x,
+                router_logits,
+                activation_str,
+                use_fused_kernel=x.shape[0] >= fused_ep_step_min_tokens,
+            )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -879,12 +889,46 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         return fused_moe_gmm(**kwargs)
 
+    def apply_monolithic_external_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run GMM after external dispatch for small token shapes."""
+        del input_ids
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = (
+                token_padding.zero_routing_weights_for_padding(
+                    topk_ids, topk_weights))
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            retain_fused_ep_graph_inputs)
+        out = fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, 'w13_bias', None),
+            w2_bias=getattr(layer, 'w2_bias', None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=layer._tpu_activation_str,
+        )
+        return retain_fused_ep_graph_inputs(out)
+
     def _apply_owning_dispatch(
         self,
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         activation_str: str,
+        *,
+        use_fused_kernel: bool = True,
     ) -> torch.Tensor:
         """Run the layer when this method owns the EP exchange.
 
@@ -896,13 +940,18 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         from vllm.distributed.parallel_state import get_ep_group
 
         from vllm_torchtpu.layers.vllm.fused_moe_ep import (
-            fused_moe_ep, fused_moe_ep_supported)
+            fused_moe_ep, fused_moe_ep_supported, retain_fused_ep_graph_inputs)
 
         topk = layer.moe_config.experts_per_token
-        if fused_moe_ep_supported():
-            return fused_moe_ep(x, layer.w13_weight, layer.w2_weight,
-                                layer.w13_weight_scale_inv,
-                                layer.w2_weight_scale_inv, router_logits)
+        if use_fused_kernel and fused_moe_ep_supported():
+            out = fused_moe_ep(x, layer.w13_weight, layer.w2_weight,
+                               layer.w13_weight_scale_inv,
+                               layer.w2_weight_scale_inv, router_logits)
+            experts_start = layer._experts_start
+            if experts_start is not None:
+                value = experts_start.to(out.dtype)
+                out = out + (value - value)
+            return token_padding.retain_padding_graph_input(out)
 
         ep = get_ep_group()
         gathered_x, gathered_logits = ep.dispatch_router_logits(
@@ -927,7 +976,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk=topk,
             activation=activation_str,
         )
-        return ep.combine(out, False)
+        return retain_fused_ep_graph_inputs(
+            ep.combine(out, False))
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
