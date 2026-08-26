@@ -1077,6 +1077,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                  kv_packing, padded_head_size] (preferred)
                 or legacy 4D
                 [num_blocks, block_size, num_kv_heads_x2, padded_head_size]
+                or, under SEQ_ALONG_LANE,
+                [num_blocks, num_kv_heads_x2, padded_head_size // kv_packing,
+                 kv_packing, block_size]
             attn_metadata: Metadata for attention.
             output: buffer written in place, shape
                 = [num_tokens, num_heads, head_size_v]
