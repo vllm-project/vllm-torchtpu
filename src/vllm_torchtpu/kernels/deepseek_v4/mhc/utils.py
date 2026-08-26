@@ -12,8 +12,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
+
+# bf16 tiles are (16, 128); keep token blocks sublane-aligned.
+SUBLANE = 16
+
+# Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
+# fused_moe use the same constant). Never rely on the backend default —
+# it varies by Mosaic version.
+DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+
+def round_up(x: int, multiple: int) -> int:
+    return (x + multiple - 1) // multiple * multiple
+
+
+def select_token_block(
+    num_tokens: int,
+    token_block_size: int,
+    *,
+    vmem_need: Callable[[int], int] | None = None,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> tuple[int, int]:
+    """Grid token block, and the token count padded to a multiple of it.
+
+    ``vmem_need(tb)`` estimates a kernel's VMEM footprint for a block of
+    ``tb`` tokens. When supplied, the block halves until it fits within
+    ``vmem_limit_bytes`` — degrading to a smaller block instead of a
+    compile-time VMEM OOM — with ``SUBLANE`` as the floor.
+
+    Returns (token_block, padded_tokens).
+    """
+    tb = min(token_block_size, round_up(num_tokens, SUBLANE))
+    if vmem_need is not None:
+        while tb > SUBLANE and vmem_need(tb) > vmem_limit_bytes:
+            tb //= 2
+    return tb, round_up(num_tokens, tb)
+
+
+def pad_to(padded_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
+    """Zero-pad the leading (token) axis of each array to ``padded_tokens``."""
+    pad = padded_tokens - arrays[0].shape[0]
+    if pad == 0:
+        return arrays
+    return tuple(jnp.pad(a, ((0, pad), (0, 0))) for a in arrays)
+
+
+def trim_to(num_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
+    """Inverse of ``pad_to``: drop the rows the padding added."""
+    if arrays[0].shape[0] == num_tokens:
+        return arrays
+    return tuple(a[:num_tokens] for a in arrays)
+
+
+def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24).
+
+    Computed in XLA outside the kernel; the chunks are what stays
+    VMEM-resident. Chunks MUST be built with reduce_precision, not dtype
+    round-trips: XLA's excess-precision simplification folds
+    f32->bf16->f32 into the identity, which silently zeroes the mid/lo
+    chunks.
+    """
+    fn_hi = jax.lax.reduce_precision(fn, 8, 7)
+    rem = fn - fn_hi
+    fn_mid = jax.lax.reduce_precision(rem, 8, 7)
+    fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
+    return tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo))
 
 
 def mhc_pre_gates(

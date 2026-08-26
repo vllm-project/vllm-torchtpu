@@ -20,18 +20,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-
-# bf16 tiles are (16, 128); keep token blocks sublane-aligned.
-_SUBLANE = 16
-
-# Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
-# fused_moe use the same constant). Never rely on the backend default —
-# it varies by Mosaic version.
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-
-
-def _round_up(x: int, multiple: int) -> int:
-    return (x + multiple - 1) // multiple * multiple
+from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import \
+    DEFAULT_VMEM_LIMIT_BYTES
 
 
 def _fused_kernel(x_ref, res_ref, post_ref, comb_ref, fn_hi_ref, fn_mid_ref,
@@ -153,26 +143,13 @@ def fused_post_pre_mixes(
     assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, res2d.shape)
     assert gemm_precision in ("highest", "default"), gemm_precision
 
-    tb = min(token_block_size, _round_up(num_tokens, _SUBLANE))
-    padded_tokens = _round_up(num_tokens, tb)
-    if padded_tokens != num_tokens:
-        pad = padded_tokens - num_tokens
-        x2d = jnp.pad(x2d, ((0, pad), (0, 0)))
-        res2d = jnp.pad(res2d, ((0, pad), (0, 0)))
-        post2d = jnp.pad(post2d, ((0, pad), (0, 0)))
-        comb2d = jnp.pad(comb2d, ((0, pad), (0, 0)))
+    # This kernel keeps a fixed block: its default (32) already fits the
+    # budget at DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
+    tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
+    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d,
+                                              post2d, comb2d)
 
-    # 3-chunk bf16 split of fn (8 mantissa bits each = f32's 24). Computed
-    # in XLA outside the kernel; the chunks are what stays VMEM-resident.
-    # Chunks MUST be built with reduce_precision, not dtype round-trips:
-    # XLA's excess-precision simplification folds f32->bf16->f32 into the
-    # identity, which silently zeroes the mid/lo chunks.
-    fn_hi = jax.lax.reduce_precision(fn, 8, 7)
-    rem = fn - fn_hi
-    fn_mid = jax.lax.reduce_precision(rem, 8, 7)
-    fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    fn_hi, fn_mid, fn_lo = (t.astype(jnp.bfloat16)
-                            for t in (fn_hi, fn_mid, fn_lo))
+    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -217,12 +194,7 @@ def fused_post_pre_mixes(
         compiler_params=compiler_params,
     )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
-    if padded_tokens != num_tokens:
-        new_res = new_res[:num_tokens]
-        mixes = mixes[:num_tokens]
-        sqrsum = sqrsum[:num_tokens]
-        layer2d = layer2d[:num_tokens]
-    return new_res, mixes, sqrsum, layer2d
+    return utils.trim_to(num_tokens, new_res, mixes, sqrsum, layer2d)
 
 
 def mhc_fused_post_pre(
