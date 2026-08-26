@@ -97,6 +97,10 @@ DECODE_TPU_KV_TRANSFER_PORT="${DECODE_TPU_KV_TRANSFER_PORT:-9200}"
 TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT:-9600}"
 PREFILL_CTRL_PORT="${PREFILL_CTRL_PORT:-27000}"
 DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
+PREFILL_OFFLOAD_CONTROLLER_PORT="${PREFILL_OFFLOAD_CONTROLLER_PORT:-47800}"
+DECODE_OFFLOAD_CONTROLLER_PORT="${DECODE_OFFLOAD_CONTROLLER_PORT:-48800}"
+PREFILL_CPU_BYTES_TO_USE="${PREFILL_CPU_BYTES_TO_USE:-274877906944}"
+DECODE_CPU_BYTES_TO_USE="${DECODE_CPU_BYTES_TO_USE:-8589934592}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 PREFILL_PCP="${PREFILL_PCP:-1}"
@@ -164,7 +168,7 @@ for compile_sizes_name in COMPILE_SIZES PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZ
   fi
 done
 
-managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}")
+managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}" "${KV_PORT}")
 for offset in 0 1 2 3; do
   managed_ports+=("$((PREFILL_TPU_KV_TRANSFER_PORT + offset))")
   managed_ports+=("$((DECODE_TPU_KV_TRANSFER_PORT + offset))")
@@ -172,6 +176,8 @@ for offset in 0 1 2 3; do
   managed_ports+=("$((PREFILL_CTRL_PORT + 100 + offset))")
   managed_ports+=("$((DECODE_CTRL_PORT + offset))")
   managed_ports+=("$((DECODE_CTRL_PORT + 100 + offset))")
+  managed_ports+=("$((PREFILL_OFFLOAD_CONTROLLER_PORT + offset))")
+  managed_ports+=("$((DECODE_OFFLOAD_CONTROLLER_PORT + offset))")
 done
 mapfile -t managed_ports < <(printf '%s\n' "${managed_ports[@]}" | sort -u)
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
@@ -260,8 +266,8 @@ else
   common_args+=(--no-async-scheduling)
 fi
 
-p_kv='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer"}'
-d_kv='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer"}'
+p_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${PREFILL_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${PREFILL_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
+d_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_consumer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${DECODE_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${DECODE_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
 
 prefill_namespace="prefill_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
 decode_namespace="decode_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
@@ -277,8 +283,8 @@ TORCHTPU_VLLM_PYTHONPATH=${TORCHTPU_VLLM_SRC}
 MODEL_PATH=${MODEL_PATH}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
 EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}
-CONNECTOR=TPUConnector
-CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_connector
+CONNECTOR=TPUMultiConnector
+CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector
 PREFILL_TP=${PREFILL_TP}
 PREFILL_PCP=${PREFILL_PCP}
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
@@ -303,6 +309,10 @@ DECODE_TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}
 TPU_SIDE_CHANNEL_PORT=${TPU_SIDE_CHANNEL_PORT}
 PREFILL_CTRL_PORT=${PREFILL_CTRL_PORT}
 DECODE_CTRL_PORT=${DECODE_CTRL_PORT}
+PREFILL_OFFLOAD_CONTROLLER_PORT=${PREFILL_OFFLOAD_CONTROLLER_PORT}
+DECODE_OFFLOAD_CONTROLLER_PORT=${DECODE_OFFLOAD_CONTROLLER_PORT}
+PREFILL_CPU_BYTES_TO_USE=${PREFILL_CPU_BYTES_TO_USE}
+DECODE_CPU_BYTES_TO_USE=${DECODE_CPU_BYTES_TO_USE}
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 EOF
