@@ -1054,6 +1054,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.sinks = torch.nn.Parameter(self.sinks.to(torch.float32),
                                             requires_grad=False)
 
+    def _cache_head_width(self, kv_cache: torch.Tensor) -> int:
+        """Head width the cache stores, for reconciling a layer narrower than
+        the page it writes into."""
+        return kv_cache.shape[-1]
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -1130,11 +1135,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        if (isinstance(self, PallasBatchedRPAAttentionBackendImpl)
-                and envs.USE_BATCHED_RPA_SEQ_ON_LANE):
-            pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
-        else:
-            pool_head_dim = kv_cache.shape[-1]
+        pool_head_dim = self._cache_head_width(kv_cache)
         if pool_head_dim > self.head_size:
             pad_size = pool_head_dim - self.head_size
             query = torch.nn.functional.pad(query, (0, pad_size))
@@ -1238,6 +1239,17 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+
+    def _cache_head_width(self, kv_cache: torch.Tensor) -> int:
+        # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
+        # The longctx fork selects that layout with USE_BATCHED_RPA_SEQ_ON_LANE
+        # and the mainline fork with VLLM_KV_CACHE_LAYOUT=HND; check the env
+        # var first, since the resolver rejects the two set together.
+        if (envs.USE_BATCHED_RPA_SEQ_ON_LANE
+                or resolve_batched_rpa_kv_layout()
+                is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
+            return kv_cache.shape[2] * kv_cache.shape[3]
+        return kv_cache.shape[-1]
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

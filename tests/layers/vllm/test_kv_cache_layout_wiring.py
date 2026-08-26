@@ -352,3 +352,47 @@ def test_layout_blind_backend_would_lose_the_halving(hnd):
     assert (_normalized_page_bytes(BASE, 1, 128,
                                    FP8) == _normalized_page_bytes(
                                        BASE, 1, 128, BF16))
+
+
+# --------------------------------------------------------------------------
+# Head width read off the cache
+# --------------------------------------------------------------------------
+#
+# The impl pads a layer narrower than the page it writes into. That width is
+# `shape[-1]` under HEAD_ALONG_SUBLANE but `shape[2] * shape[3]` under
+# SEQ_ALONG_LANE, whose last axis is page_size.
+
+
+def _width(impl_cls, shape):
+    import torch as _torch
+    impl = impl_cls.__new__(impl_cls)
+    return impl._cache_head_width(_torch.empty(shape, device="meta"))
+
+
+@pytest.mark.parametrize("head_size", [80, 96, 112, 128, 256])
+def test_cache_head_width_under_seq_along_lane(hnd, head_size):
+    from vllm_torchtpu.layers.vllm.attention import \
+        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
+    shape = BATCHED.get_kv_cache_shape(4, 128, 2, head_size, BF16)
+    assert _width(BATCHED_IMPL, shape) == shape[2] * shape[3]
+    # page_size is what the naive `shape[-1]` would have returned.
+    assert shape[-1] == 128
+
+
+@pytest.mark.parametrize("head_size", [80, 96, 112, 128, 256])
+def test_cache_head_width_default_layout(nhd, head_size):
+    from vllm_torchtpu.layers.vllm.attention import \
+        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
+    shape = BATCHED.get_kv_cache_shape(4, 128, 2, head_size, BF16)
+    assert _width(BATCHED_IMPL, shape) == shape[-1]
+
+
+def test_narrow_head_is_not_spuriously_padded(hnd):
+    """head_size 80 stores 80 wide under SEQ_ALONG_LANE, so no padding is due.
+    Reading `shape[-1]` would have padded q/k/v to 128 against an 80-wide
+    cache."""
+    from vllm_torchtpu.layers.vllm.attention import \
+        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
+    shape = BATCHED.get_kv_cache_shape(4, 128, 2, 80, BF16)
+    assert _width(BATCHED_IMPL, shape) == 80
+    assert shape[-1] > 80  # what the bug read
