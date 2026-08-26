@@ -1410,6 +1410,120 @@ def _patch_vllm_block_pool_lifo_free() -> None:
 
     BlockPool.free_blocks = free_blocks
     BlockPool._tpu_lifo_free_patch = True
-    from vllm_torchtpu.logger import init_logger
-    init_logger(__name__).info(
+    logger.info(
         "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+
+
+def _patch_vllm_vocab_parallel_embedding() -> None:
+    """Register shard index bounds as module buffers in VocabParallelEmbedding.
+
+    Prevents TorchTPU from baking rank-specific integer literals into the MLIR
+    graph as scalar constants, ensuring identical CompilationCacheKeys across
+    all TP ranks.
+    """
+    import torch
+    import vllm.model_executor.layers.vocab_parallel_embedding as vpe
+
+    if getattr(vpe.VocabParallelEmbedding,
+               "_tpu_vocab_parallel_embedding_patch", False):
+        return
+
+    original_init = vpe.VocabParallelEmbedding.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not hasattr(self, "org_vocab_start_index"):
+            self.register_buffer(
+                "org_vocab_start_index",
+                torch.tensor(self.shard_indices.org_vocab_start_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "org_vocab_end_index",
+                torch.tensor(self.shard_indices.org_vocab_end_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "num_org_vocab_padding",
+                torch.tensor(self.shard_indices.num_org_vocab_padding,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "added_vocab_start_index",
+                torch.tensor(self.shard_indices.added_vocab_start_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "added_vocab_end_index",
+                torch.tensor(self.shard_indices.added_vocab_end_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+
+    def patched_forward(self, input_):
+        if self.tp_size > 1:
+            masked_input, input_mask = vpe.get_masked_input_and_mask(
+                input_,
+                getattr(self, "org_vocab_start_index",
+                        self.shard_indices.org_vocab_start_index),
+                getattr(self, "org_vocab_end_index",
+                        self.shard_indices.org_vocab_end_index),
+                getattr(self, "num_org_vocab_padding",
+                        self.shard_indices.num_org_vocab_padding),
+                getattr(self, "added_vocab_start_index",
+                        self.shard_indices.added_vocab_start_index),
+                getattr(self, "added_vocab_end_index",
+                        self.shard_indices.added_vocab_end_index),
+            )
+        else:
+            masked_input = input_
+        output_parallel = self.quant_method.embedding(self,
+                                                      masked_input.long())
+        if self.tp_size > 1:
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+            from vllm.distributed import tensor_model_parallel_all_reduce
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def patched_get_masked_input_and_mask(
+        input_: torch.Tensor,
+        org_vocab_start_index: int | torch.Tensor,
+        org_vocab_end_index: int | torch.Tensor,
+        num_org_vocab_padding: int | torch.Tensor,
+        added_vocab_start_index: int | torch.Tensor,
+        added_vocab_end_index: int | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = input_.device
+        dtype = input_.dtype
+
+        def _to_tensor(val: int | torch.Tensor) -> torch.Tensor:
+            if isinstance(val, torch.Tensor):
+                return val.to(device=device)
+            return torch.tensor(val, dtype=dtype, device=device)
+
+        start = _to_tensor(org_vocab_start_index)
+        end = _to_tensor(org_vocab_end_index)
+        num_padding = _to_tensor(num_org_vocab_padding)
+        added_start = _to_tensor(added_vocab_start_index)
+        added_end = _to_tensor(added_vocab_end_index)
+
+        org_vocab_mask = (input_ >= start) & (input_ < end)
+        added_vocab_mask = (input_ >= added_start) & (input_ < added_end)
+        added_offset = (added_start - (end - start) - num_padding)
+        valid_offset = (start * org_vocab_mask) + (added_offset *
+                                                   added_vocab_mask)
+        vocab_mask = org_vocab_mask | added_vocab_mask
+        input_ = vocab_mask * (input_ - valid_offset)
+        return input_, ~vocab_mask
+
+    vpe.get_masked_input_and_mask = patched_get_masked_input_and_mask
+    vpe.VocabParallelEmbedding.__init__ = patched_init
+    vpe.VocabParallelEmbedding.forward = patched_forward
+    vpe.VocabParallelEmbedding._tpu_vocab_parallel_embedding_patch = True
+    logger.info(
+        "Applied TPU patch: register shard index bounds as buffers in VocabParallelEmbedding"
+    )
