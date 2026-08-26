@@ -408,6 +408,8 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
+                               _patch_moe_fused_ep_threshold_contract,
+                               _patch_moe_gather_then_route,
                                _patch_moe_no_ep_tp_scope,
                                _patch_moe_runner_fused_output_is_reduced,
                                _patch_rowparallel_defer_bias,
@@ -429,6 +431,8 @@ def apply_tpu_patches() -> None:
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
+    _patch_moe_fused_ep_threshold_contract()
+    _patch_moe_gather_then_route()
     _patch_moe_runner_fused_output_is_reduced()
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
