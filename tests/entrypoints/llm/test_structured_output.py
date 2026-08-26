@@ -81,6 +81,64 @@ REGEX_PARAMS = SamplingParams(
 )
 REGEX_PROMPT = "A random US phone number without area code: "
 
+COMPLEX_AST_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ExpressionTree",
+    "type": "object",
+    "properties": {
+        "operator": {
+            "type": "string",
+            "enum": ["ADD", "SUB", "MUL", "DIV", "POW", "MOD"],
+        },
+        "description": {
+            "type": "string",
+            "pattern": r"^[A-Za-z0-9_ -]{5,50}$",
+        },
+        "operands": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {
+                        "type": "number"
+                    },
+                    {
+                        "$ref": "#/$defs/SubTree"
+                    },
+                ]
+            },
+            "minItems": 2,
+            "maxItems": 2,
+        },
+    },
+    "required": ["operator", "description", "operands"],
+    "$defs": {
+        "SubTree": {
+            "type": "object",
+            "properties": {
+                "operator": {
+                    "type": "string",
+                    "enum": ["ADD", "SUB", "MUL"]
+                },
+                "operands": {
+                    "type": "array",
+                    "items": {
+                        "type": "number"
+                    },
+                    "minItems": 2,
+                    "maxItems": 2,
+                },
+            },
+            "required": ["operator", "operands"],
+        }
+    },
+}
+COMPLEX_AST_PARAMS = SamplingParams(
+    temperature=0,
+    max_tokens=128,
+    structured_outputs=StructuredOutputsParams(json=COMPLEX_AST_SCHEMA),
+)
+COMPLEX_AST_PROMPT = "Generate a math expression AST in JSON format: "
+
 UNCONSTRAINED_PARAMS = SamplingParams(temperature=0, max_tokens=16)
 UNCONSTRAINED_PROMPT = "The capital of France is"
 
@@ -94,6 +152,17 @@ def _assert_json(text: str) -> None:
     assert isinstance(parsed, dict), text
     assert isinstance(parsed.get("name"), str), text
     assert isinstance(parsed.get("age"), int), text
+
+
+def _assert_complex_ast_json(text: str) -> None:
+    parsed = json.loads(text)
+    assert isinstance(parsed, dict), text
+    assert parsed.get("operator") in [
+        "ADD", "SUB", "MUL", "DIV", "POW", "MOD"
+    ], text
+    assert isinstance(parsed.get("description"), str), text
+    assert isinstance(parsed.get("operands"), list), text
+    assert len(parsed["operands"]) == 2, text
 
 
 def _assert_regex(text: str) -> None:
@@ -137,6 +206,13 @@ def test_json_schema_greedy(llm: LLM):
     assert len(outputs) == 4
     for output in outputs:
         _assert_json(output.outputs[0].text)
+
+
+def test_complex_ast_json_schema_greedy(llm: LLM):
+    outputs = llm.generate([COMPLEX_AST_PROMPT] * 4, COMPLEX_AST_PARAMS)
+    assert len(outputs) == 4
+    for output in outputs:
+        _assert_complex_ast_json(output.outputs[0].text)
 
 
 def test_regex_greedy(llm: LLM):
