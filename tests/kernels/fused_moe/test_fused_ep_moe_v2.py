@@ -371,6 +371,53 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
+def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
+    """Physical expert placement may follow device order, not EP-rank order.
+
+    Keep the logical router logits untouched, place each logical expert block
+    on the mesh index that owns its EP rank, and relabel only selected IDs. The
+    result must match the identity placement bit for bit with the sharded plan
+    enabled, which is the served configuration.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
+                                               22,
+                                               hidden=SMALL["hidden"],
+                                               inter=SMALL["inter"],
+                                               e_total=SMALL["e_total"],
+                                               weight_format=WeightFormat.FP8)
+    x, gating = _make_inputs(mesh,
+                             23,
+                             tokens=SMALL["tokens"],
+                             hidden=SMALL["hidden"],
+                             e_total=SMALL["e_total"])
+    order = (0, 1, 6, 7, 2, 3, 4, 5)
+    g_local = SMALL["e_total"] // EP
+    expert_sharding = NamedSharding(mesh, P(AXIS))
+
+    def place_in_mesh_order(a):
+        host = np.asarray(a)
+        by_rank = host.reshape((EP, g_local) + host.shape[1:])
+        placed = by_rank[np.asarray(order)].reshape(host.shape)
+        return jax.device_put(placed, expert_sharding)
+
+    common = dict(topk=SMALL["topk"],
+                  renormalize=True,
+                  mesh=mesh,
+                  capacity=CAPACITY,
+                  weight_format=WeightFormat.FP8,
+                  sharded_plan=True)
+    identity = fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    placed = tuple(
+        place_in_mesh_order(a) for a in (w1, w2, w1_scale, w2_scale))
+    remapped = fused_ep_moe_v2(x,
+                               *placed,
+                               gating,
+                               mesh_ep_ranks=order,
+                               **common)
+    np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

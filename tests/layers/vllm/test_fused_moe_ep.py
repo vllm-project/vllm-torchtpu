@@ -22,6 +22,8 @@ op is built, and the one path that does build stops at `_build_op`.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 
@@ -64,6 +66,7 @@ def _prebuild(layer,
               tp=1,
               node_tokens=4096,
               smem_bytes=1024 * 1024,
+              ep_order=None,
               build_op=None,
               **kwargs):
     """Call prebuild with the distributed lookups stubbed out.
@@ -78,7 +81,7 @@ def _prebuild(layer,
     build_op = build_op or (lambda *_args: "op")
     with patch.object(bridge, "build_ep_mesh", return_value=mesh), \
             patch.object(bridge, "ep_mesh_index", return_value=0), \
-            patch.object(bridge, "ep_rank_order", return_value=None), \
+            patch.object(bridge, "ep_rank_order", return_value=ep_order), \
             patch.object(bridge, "_max_node_tokens", return_value=node_tokens), \
             patch.object(bridge, "_smem_capacity_bytes",
                          return_value=smem_bytes), \
@@ -108,6 +111,15 @@ def test_sharded_plan_flag_reaches_the_built_op():
         assert _prebuild(
             _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
     assert seen and seen[0][-1] is True
+
+
+def test_mesh_expert_order_is_closed_into_the_built_op():
+    order = (1, 0)
+    seen = []
+    assert _prebuild(_layer(),
+                     ep_order=order,
+                     build_op=lambda *args: seen.append(args) or "op") == "op"
+    assert seen and seen[0][-2] == order
 
 
 def test_refused_without_the_env_flag():
@@ -237,43 +249,52 @@ def test_squeeze_channel_scale_terminates_on_a_non_singleton_axis():
     assert bridge._squeeze_channel_scale_checked(scale).shape == scale.shape
 
 
-def test_mesh_expert_order_moves_each_rank_block_to_its_mesh_index():
-    """The mesh is built in device-id order, so mesh index i owns EP rank
-    `ep_rank_order()[i]`'s experts. Getting this wrong is the failure the
-    kernel cannot see: every routed row goes to the wrong peer."""
+def test_selected_expert_ids_move_each_rank_block_to_its_mesh_index():
+    """Relabel only selected IDs, not the full router-logit tensor."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import \
+        _relabel_expert_ids_to_mesh_order
+
     ep, per_shard = 4, 2
     order = (0, 2, 3, 1)
-    logits = torch.arange(ep * per_shard,
-                          dtype=torch.float32).reshape(1, ep * per_shard)
+    selected = jnp.arange(ep * per_shard, dtype=jnp.int32).reshape(2, 4)
+    got = np.asarray(
+        _relabel_expert_ids_to_mesh_order(selected,
+                                          g_local=per_shard,
+                                          mesh_ep_ranks=order))
+    mesh_index_of_rank = {ep_rank: i for i, ep_rank in enumerate(order)}
+    want = np.asarray([[
+        mesh_index_of_rank[int(e) // per_shard] * per_shard +
+        int(e) % per_shard for e in row
+    ] for row in np.asarray(selected)], np.int32)
+    np.testing.assert_array_equal(got, want)
 
-    with patch.object(bridge, "_EP_SIZE", ep), \
-            patch.object(bridge, "_EXPERT_ORDER", torch.tensor(order)):
-        out = bridge._to_mesh_expert_order(logits)
 
-    for mesh_index, ep_rank in enumerate(order):
-        want = logits[:, ep_rank * per_shard:(ep_rank + 1) * per_shard]
-        got = out[:, mesh_index * per_shard:(mesh_index + 1) * per_shard]
-        assert torch.equal(got, want), f"mesh index {mesh_index}"
+def test_forward_passes_router_logits_without_a_full_expert_gather():
+    """The Torch graph must hand the original logits straight to the op."""
+    seen = []
+    owner = SimpleNamespace()
 
+    def op(*args):
+        seen.append(args)
+        return args[0]
 
-def test_mesh_expert_order_is_skipped_for_the_identity():
-    """`None` is the identity, and the hot path must not pay a gather for it."""
+    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR, op)
+    hidden = torch.zeros(1, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
     logits = torch.zeros(1, 8)
-    with patch.object(bridge, "_EXPERT_ORDER", None):
-        assert bridge._to_mesh_expert_order(logits) is logits
+    assert bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales,
+                               logits) is hidden
+    assert seen[0][5] is logits
 
 
 @pytest.mark.parametrize("order,expected", [
     ((0, 1, 2, 3), None),
     ((0, 2, 3, 1), (0, 2, 3, 1)),
 ])
-def test_expert_block_permutation(order, expected):
+def test_mesh_expert_order(order, expected):
     with patch.object(bridge, "ep_rank_order", return_value=order):
-        got = bridge._expert_block_permutation(len(order), device="cpu")
-    if expected is None:
-        assert got is None
-    else:
-        assert tuple(got.tolist()) == expected
+        assert bridge._mesh_expert_order(len(order)) == expected
 
 
 def test_ep_rank_order_maps_ranks_to_ascending_device_ids():
