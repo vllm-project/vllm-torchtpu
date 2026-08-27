@@ -92,7 +92,7 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # -- read things that are not in it. So prebuild hands the op back to the caller
 # and the caller records it on the layer's own quant method; see
 # `fused_moe_ep_supported`.
-_OPS: dict[tuple[int, bool, str], Any] = {}
+_OPS: dict[tuple[int, bool, str, bool], Any] = {}
 _EP_SIZE: int | None = None
 # The next two are facts about the MESH, not about a layer, so one copy for the
 # process is what they are: every layer in a deployment sees the same EP group.
@@ -156,12 +156,13 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
-def _build_op(mesh, topk: int, renormalize: bool, activation: str):
+def _build_op(mesh, topk: int, renormalize: bool, activation: str,
+              sharded_plan: bool):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
-    key = (topk, renormalize, activation)
+    key = (topk, renormalize, activation, sharded_plan)
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -199,7 +200,8 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str):
                                block=None,
                                ragged_stride=None,
                                weight_format=WeightFormat.FP8,
-                               act_fn=activation)
+                               act_fn=activation,
+                               sharded_plan=sharded_plan)
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
@@ -455,10 +457,12 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
-    op = _build_op(mesh, topk, renormalize, activation)
+    sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    op = _build_op(mesh, topk, renormalize, activation, sharded_plan)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "topk=%d capacity=%d", hidden, inter, local_experts, ep, topk, _TILE_M)
+        "topk=%d capacity=%d sharded_plan=%s", hidden, inter, local_experts,
+        ep, topk, _TILE_M, sharded_plan)
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either
     # the padding mask or the chunked path. Padding costs expert work and

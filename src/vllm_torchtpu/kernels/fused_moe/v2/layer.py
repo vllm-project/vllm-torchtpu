@@ -24,9 +24,10 @@ from jax import lax
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat,
-    act_scale_slab_rows, align_up, build_routing_tables, expert_visit_list,
-    local_slab_rows, ragged_stride_bound, routing_block, shard_count_vector,
-    shard_expert_slabs, shard_push_tables_in_rows, shard_token_gather,
+    act_scale_slab_rows, align_up, build_routing_tables,
+    build_routing_tables_sharded, expert_visit_list, local_slab_rows,
+    ragged_stride_bound, routing_block, shard_count_vector, shard_expert_slabs,
+    shard_push_tables_in_rows, shard_token_gather,
     shard_transport_tables_in_blocks, token_gather_window_rows, weight_form,
     weight_format_of_dtype)
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
@@ -108,7 +109,8 @@ def fused_ep_moe_v2(x,
                     weight_format=WeightFormat.FP8,
                     rhs_qb=None,
                     act_fn="silu",
-                    rank=None):
+                    rank=None,
+                    sharded_plan=False):
     """Run one MoE layer through the fused expert-parallel kernel.
 
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
@@ -141,6 +143,10 @@ def fused_ep_moe_v2(x,
     an explicitly passed one still has to divide tokens // ep * topk and to
     reach the no-drop bound respectively. act_fn selects the fused FFN
     activation from the kernel's ACT_FNS and is a build-time constant.
+
+    sharded_plan computes the same kernel operands from the two complementary
+    1/ep slices their consumers read, plus one small expert-count all-gather.
+    It changes routing-plan construction only, never the core kernel.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -284,13 +290,21 @@ def fused_ep_moe_v2(x,
                                 tiled=True)
         topk_idx_g, row_scale_g = _unpack_routing_blob(blob_g, topk)
 
-        routing = build_routing_tables(topk_idx_g,
-                                       e_total=e_total,
-                                       ep=ep,
-                                       t_local=t_local,
-                                       block=block,
-                                       tile_m=capacity,
-                                       shard_stride=ragged_stride)
+        plan_kw = dict(e_total=e_total,
+                       ep=ep,
+                       t_local=t_local,
+                       block=block,
+                       tile_m=capacity,
+                       shard_stride=ragged_stride)
+        if sharded_plan:
+            routing = build_routing_tables_sharded(
+                topk_idx_g,
+                me,
+                all_gather_rows=lambda row: lax.all_gather(
+                    row, ax, axis=0, tiled=True),
+                **plan_kw)
+        else:
+            routing = build_routing_tables(topk_idx_g, **plan_kw)
         block_tables = shard_transport_tables_in_blocks(routing,
                                                         me,
                                                         e_total=e_total,
@@ -389,8 +403,8 @@ def fused_ep_moe_v2(x,
                                        rank=rank_l)
 
         # The destination's own table: one arrival row per selection slot.
-        pos = lax.dynamic_slice(routing.arrival_row, (me * t_local, 0),
-                                (t_local, topk))
+        pos = routing.pos if sharded_plan else lax.dynamic_slice(
+            routing.arrival_row, (me * t_local, 0), (t_local, topk))
         return _combine_arrivals(arrivals, arrival_scales, pos, topk_weights,
                                  x_l.dtype)
 
@@ -416,8 +430,8 @@ def fused_ep_moe_v2(x,
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (mesh, T, hidden, e_total, inter, topk, bool(renormalize), capacity,
-           block, ragged_stride, weight_format, rhs_qb, act_fn, x.dtype,
-           w1.dtype, w2.dtype, form.has_scales
+           block, ragged_stride, weight_format, rhs_qb, act_fn,
+           bool(sharded_plan), x.dtype, w1.dtype, w2.dtype, form.has_scales
            and w1_scale.dtype, gating.dtype, has_w1_bias
            and w1_bias.dtype, has_w2_bias and w2_bias.dtype)
     sm = _LAYER_SM_CACHE.get(key)

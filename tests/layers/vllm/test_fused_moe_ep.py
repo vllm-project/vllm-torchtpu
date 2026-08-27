@@ -64,6 +64,7 @@ def _prebuild(layer,
               tp=1,
               node_tokens=4096,
               smem_bytes=1024 * 1024,
+              build_op=None,
               **kwargs):
     """Call prebuild with the distributed lookups stubbed out.
 
@@ -74,6 +75,7 @@ def _prebuild(layer,
     """
     mesh = (SimpleNamespace(
         shape={bridge.EP_AXIS_NAME: _STUB_EP}) if has_mesh else None)
+    build_op = build_op or (lambda *_args: "op")
     with patch.object(bridge, "build_ep_mesh", return_value=mesh), \
             patch.object(bridge, "ep_mesh_index", return_value=0), \
             patch.object(bridge, "ep_rank_order", return_value=None), \
@@ -81,7 +83,7 @@ def _prebuild(layer,
             patch.object(bridge, "_smem_capacity_bytes",
                          return_value=smem_bytes), \
             patch.object(bridge, "_tensor_parallel_size", return_value=tp), \
-            patch.object(bridge, "_build_op", return_value="op"):
+            patch.object(bridge, "_build_op", side_effect=build_op):
         defaults = dict(topk=2, renormalize=True, activation="silu")
         defaults.update(kwargs)
         return bridge.prebuild_fused_moe_ep(layer, **defaults)
@@ -91,12 +93,21 @@ def _prebuild(layer,
 def _armed():
     """Every test here runs as if the operator asked for the kernel."""
     with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True), \
-            patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1024):
+            patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1024), \
+            patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", False):
         yield
 
 
 def test_arms_on_a_supported_layer():
     assert _prebuild(_layer()) == "op"
+
+
+def test_sharded_plan_flag_reaches_the_built_op():
+    seen = []
+    with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
+        assert _prebuild(
+            _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
+    assert seen and seen[0][-1] is True
 
 
 def test_refused_without_the_env_flag():
