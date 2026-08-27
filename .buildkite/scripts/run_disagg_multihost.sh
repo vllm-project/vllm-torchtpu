@@ -114,17 +114,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "--- Pre-start container and image cleanup"
+echo "--- Pre-start container, disk, and image cleanup"
 cleanup
+rm -rf "${PERSIST_ROOT}/perf_eval_results" "${HOST_HF_HOME}/hub"
+mkdir -p "${PERSIST_ROOT}/perf_eval_results" "${HOST_HF_HOME}"
+chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
-ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist/perf_eval_results ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true"
 
-# ---------------------------------------------------------------------------
-# Stage model snapshot on Head and Worker
-# ---------------------------------------------------------------------------
-echo "--- Staging model snapshot on Head and Worker"
-bash "${SCRIPT_DIR}/stage_model_snapshot.sh" gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ "${HOST_HF_HOME}/hub" || true
-ssh_retry "${SSH_USER}@${WORKER_IP}" "if [ ! -d ~/hf_home/hub/models--Qwen--Qwen3.5-35B-A3B-FP8 ]; then mkdir -p ~/hf_home/hub && gcloud storage cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ ~/hf_home/hub/ || true; fi" || true
+ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist/perf_eval_results ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true; rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* >/dev/null 2>&1 || true"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "bash -s" < "${SCRIPT_DIR}/cleanup_docker.sh" || true
 
 # ---------------------------------------------------------------------------
 # Environment variables for Docker containers
