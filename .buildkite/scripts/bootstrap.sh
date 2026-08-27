@@ -144,6 +144,9 @@ echo "--- Starting Buildkite Bootstrap"
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.
 
+echo "Uploading Nightly Verification and Model Pipeline"
+upload_with_priority .buildkite/nightly_verify.yml "$JOB_PRIORITY"
+
 echo "Uploading Perf and Eval Pipeline"
 upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
 

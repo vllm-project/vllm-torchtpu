@@ -1,0 +1,380 @@
+#!/bin/bash
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# This script, by default, will test running Llama3.1-8B-Instruct on 10 prompts on the MLPerf dataset to check that the ROUGE score and overall throughput are reasonable.
+# Specifically, it will do the following:
+# 1. Spin up a vLLM server
+# 2. Once the server is ready, run 10 prompts of the MLPerf benchmark
+# 3. Check the ROUGE score and throughput and exit cleanly if and only if they are both reasonably high
+
+# You can also manually invoke this script to run an E2E benchmark on any given model and dataset, making sure
+# you specify the --dataset-name, --dataset-path, and --root-dir flags
+
+# Example default usage: bash tests/e2e/benchmarking/mlperf.sh -r /local/root_dir
+# Example local docker + JAX TPU usage: BUILDKITE_COMMIT=0f199f1 .buildkite/scripts/run_in_docker.sh bash /workspace/tpu_inference/tests/e2e/benchmarking/mlperf.sh
+
+# Logs the vLLM server output to a file
+LOG_FILE="server.log"
+BENCHMARK_LOG_FILE="benchmark.log"
+# The sentinel message that indicates the server is ready (in LOG_FILE)
+export READY_MESSAGE="Application startup complete."
+# After how long we should timeout if the server doesn't start
+export TIMEOUT_SECONDS=1800
+
+# The minimum ROUGE1 and throughput scores we expect
+# TODO (jacobplatin): these are very low, so we'll want to boost them eventually
+# We need to support different targets for different models.
+TARGET_ROUGE1="40"
+TARGET_THROUGHPUT="1500"
+
+model_list="Qwen/Qwen2.5-1.5B-Instruct Qwen/Qwen2.5-0.5B-Instruct meta-llama/Llama-3.1-8B-Instruct"
+if [ "$USE_V6E8_QUEUE" == "True" ]; then
+    model_list="meta-llama/Llama-4-Scout-17B-16E-Instruct"
+fi
+
+extra_serve_args=()
+if [ "$QUANTIZATION" = "True" ]; then
+    echo "QUANTIZATION is True. Running with quantization."
+    extra_serve_args+=("--additional_config")
+    extra_serve_args+=('{"quantization": "int8_default.yaml"}')
+else
+    echo "QUANTIZATION is False. Running without quantization."
+fi
+
+root_dir=/workspace
+dataset_name=mlperf
+dataset_path=""
+num_prompts=1000
+exit_code=0
+use_dummy_weights=false
+
+helpFunction()
+{
+   echo ""
+   echo "Usage: $0 [-r full_path_to_root_dir -m model_id]"
+   echo -e "\t-r The path your root directory containing both 'vllm' and 'tpu_inference' (default: /workspace/, which is used in the Dockerfile)"
+   echo -e "\t-d The dataset name (default: mlperf, which will download the dataset)"
+   echo -e "\t-p The path to the processed MLPerf dataset (default: None, which will download the dataset)"
+   echo -e "\t-m A space-separated list of HuggingFace model ids to use (default: Qwen/Qwen2.5-1.5B-Instruct, Qwen/Qwen2.5-0.5B-Instruct, meta-llama/Llama-3.1-8B-Instruct and meta-llama/Llama-4-Scout-17B-16E-Instruct)"
+   echo -e "\t-n Number of prompts to use for the benchmark (default: 10)"
+   echo -e "\t-t The timeout in seconds to wait for the vLLM server to start (default: 1800)"
+   echo -e "\t--use-dummy-weights Use dummy random weight (default: false)"
+   exit 1
+}
+
+# Print the variables this script actually reads. A full `printenv` was ~100
+# lines of mostly-irrelevant container environment in every job that runs it.
+echo "Environment variables:"
+for _var in TPU_VERSION DEVICE_COUNT USE_V6E8_QUEUE USE_V7X8_QUEUE \
+            MODEL_IMPL_TYPE NEW_MODEL_DESIGN QUANTIZATION \
+            SKIP_ACCURACY_TESTS TARGET_ROUGE1 TARGET_THROUGHPUT \
+            TIMEOUT_SECONDS LOG_FILE BENCHMARK_LOG_FILE EXPECTED_SHA256; do
+  echo "  ${_var}=${!_var-}"
+done
+unset _var
+
+# Access shared benchmarking functionality
+# shellcheck disable=SC1091
+source "$(dirname "$0")/bench_utils.sh"
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -r|--root-dir-path)
+            root_dir="$2"
+            shift
+            shift
+            ;;
+        -d|--dataset-name)
+            dataset_name="$2"
+            shift
+            shift
+            ;;
+        -p|--dataset-path)
+            dataset_path="$2"
+            shift
+            shift
+            ;;
+        -m|--model)
+            model_list="$2"
+            shift
+            shift
+            ;;
+        -n|--num-prompts)
+            num_prompts="$2"
+            shift
+            shift
+            ;;
+        -t|--timeout)
+            TIMEOUT_SECONDS="$2"
+            export TIMEOUT_SECONDS
+            shift
+            shift
+            ;;
+        --use-dummy-weights)
+            use_dummy_weights=true
+            shift
+            shift
+            ;;
+        -h|--help)
+            helpFunction
+            ;;
+        *) # unknown option
+            echo "Unknown option: $1"
+            helpFunction
+            ;;
+    esac
+done
+
+echo "Using the root directory at $root_dir"
+echo "Using $num_prompts prompts"
+echo "Using server timeout of $TIMEOUT_SECONDS seconds"
+
+
+
+cd "$root_dir" || exit
+# If the user doesn't specify a dataset_path then download the MLPerf data (if it doesn't already exist)
+if [ -z "$dataset_path" ]; then
+    if [ "$dataset_name" != "mlperf" ]; then
+        echo "Dataset name must be mlperf if dataset_path is not specified.  We only support downloading the MLPerf dataset at this time."
+        exit 1
+    fi
+
+    dataset_path="$root_dir/open_orca/open_orca_gpt4_tokenized_llama.sampled_24576.pkl"
+    EXPECTED_SHA256="b64e66e54b6267f79eb4f9ccec52d466bab3ac94747ed258c3b0f337ed166fab"
+
+    if [ ! -f "$dataset_path" ]; then
+        echo "Downloading and verifying the MLPerf dataset..."
+
+        # Check if rclone is installed; if not, install it via package manager for security
+        if ! command -v rclone &> /dev/null; then
+            echo "rclone not found. Installing..."
+            sudo apt-get update && sudo apt-get install -y rclone
+        fi
+
+        rclone config create mlc-inference s3 provider=Cloudflare \
+            access_key_id=f65ba5eef400db161ea49967de89f47b \
+            secret_access_key=fbea333914c292b854f14d3fe232bad6c5407bf0ab1bebf78833c2b359bdfd2b \
+            endpoint=https://c2686074cb2caf5cbaf6d134bdba8b47.r2.cloudflarestorage.com
+        rclone copy mlc-inference:mlcommons-inference-wg-public/open_orca ./open_orca -P
+        gzip -d open_orca/open_orca_gpt4_tokenized_llama.sampled_24576.pkl.gz
+    else
+        echo "Not downloading the MLPerf dataset because it already exists"
+    fi
+
+    echo "Verifying file integrity..."
+    if ! echo "$EXPECTED_SHA256  $dataset_path" | sha256sum -c -; then
+        echo "CRITICAL SECURITY ERROR: SHA256 hash mismatch for $dataset_path!"
+        echo "The file may be corrupted or tampered with. Deleting file and exiting."
+        rm -f "$dataset_path"
+        exit 1
+    fi
+    echo "Verification successful."
+fi
+
+if [ "$use_dummy_weights" = true ]; then
+    extra_serve_args+=("--load-format=dummy")
+fi
+
+if [ "$USE_V6E8_QUEUE" == "True" ] || [ "$USE_V7X8_QUEUE" == "True" ]; then
+    # Set to 8 if job is in 8 chips queue.
+    # TODO (Qiliang Cui) Rename USE_V6E8_QUEUE to USE_8_CHIPS_QUEUE
+    DEVICE_COUNT=8
+elif [ "$TPU_VERSION" == "tpu7x" ]; then
+    # Set the default value to 2 for tpu v7x
+    # TODO (Qiliang Cui) Investigate why tensor-parallel-size=1 breaks in tpu7x
+    DEVICE_COUNT=2
+else
+    DEVICE_COUNT=1
+fi
+echo "device count: $DEVICE_COUNT"
+extra_serve_args+=(--tensor-parallel-size "${DEVICE_COUNT}")
+
+
+echo extra_serve_args: "${extra_serve_args[@]}"
+
+
+echo "Using the dataset at $dataset_path"
+
+cd "$root_dir"/vllm || exit
+echo "Current working directory: $(pwd)"
+echo "Using vLLM hash: $(git rev-parse HEAD)"
+
+# Overwrite a few of the vLLM benchmarking scripts with the TPU Inference ones
+cp -r "$root_dir"/tpu_inference/scripts/vllm/benchmarking/*.py "$root_dir"/vllm/benchmarks/
+echo "Using TPU Inference hash: $(git -C "$root_dir"/tpu_inference rev-parse HEAD)"
+
+checkThroughputAndRouge() {
+    # This function checks whether the ROUGE1 score and total token throughput
+    # from a benchmark log file meet specified target values. It validates the
+    # presence and accessibility of the log file, extracts the ROUGE1 score and
+    # total token throughput, and compares them against predefined targets.
+    # The function outputs the results of these comparisons and exits with a
+    # status code indicating overall success or failure.
+
+    # Check if the inputs are valid
+    if [ -z "$BENCHMARK_LOG_FILE" ]; then
+        echo "Error: BENCHMARK_LOG_FILE environment variable is not set." >&2
+        exit_code=2
+        return
+    fi
+    if [ ! -f "$BENCHMARK_LOG_FILE" ]; then
+        echo "Error: Benchmark log file '$BENCHMARK_LOG_FILE' not found." >&2
+        exit_code=2
+        return
+    fi
+
+    # Extract ROUGE1 score
+    actual_rouge1=$(grep -oP "'rouge1': \K[0-9.]+" "$BENCHMARK_LOG_FILE")
+
+    # Extract Total token throughput
+    actual_throughput=$(awk '/Total token throughput \(tok\/s\):/ {print $NF}' "$BENCHMARK_LOG_FILE")
+
+    echo "--- Extracted Values ---"
+    if [ "$SKIP_ACCURACY_TESTS" = "True" ]; then
+        echo "skipping accuracy test"
+        rouge1_pass=1
+    elif [ -z "$actual_rouge1" ]; then
+        echo "Rouge1 score: NOT FOUND"
+        rouge1_pass=0
+    else
+        echo "Rouge1 score: $actual_rouge1"
+        # awk exits with 0 if the condition (actual >= target) is true, making the 'if' statement succeed.
+        # We achieve this by 'exit !(condition)' because awk's boolean true is 1, false is 0.
+        # So, if (actual >= target) is true (1), !(1) is 0. exit 0.
+        # If (actual >= target) is false (0), !(0) is 1. exit 1.
+        if awk -v actual="$actual_rouge1" -v target="$TARGET_ROUGE1" 'BEGIN { exit !(actual >= target) }'; then
+            echo "Rouge1 comparison (>= $TARGET_ROUGE1): PASSED"
+            rouge1_pass=1
+        else
+            echo "Rouge1 comparison (>= $TARGET_ROUGE1): FAILED"
+            rouge1_pass=0
+        fi
+    fi
+    echo
+
+    if [ -z "$actual_throughput" ]; then
+        echo "Total token throughput: NOT FOUND"
+        throughput_pass=0
+    else
+        echo "Total token throughput: $actual_throughput"
+        if awk -v actual="$actual_throughput" -v target="$TARGET_THROUGHPUT" 'BEGIN { exit !(actual >= target) }'; then
+            echo "Total token throughput comparison (>= $TARGET_THROUGHPUT): PASSED"
+            throughput_pass=1
+        else
+            echo "Total token throughput comparison (>= $TARGET_THROUGHPUT): FAILED"
+            throughput_pass=0
+        fi
+    fi
+    echo
+
+    echo "--- Summary ---"
+    # Ensure pass flags are initialized if extraction fails
+    : "${rouge1_pass:=0}"
+    : "${throughput_pass:=0}"
+
+    if [ "$rouge1_pass" -eq 1 ] && [ "$throughput_pass" -eq 1 ]; then
+        echo "Overall: PASSED"
+    else
+        echo "Overall: FAILED"
+        [ "$rouge1_pass" -eq 0 ] && echo "Reason: Rouge1 check failed or value not found."
+        [ "$throughput_pass" -eq 0 ] && echo "Reason: Throughput check failed or value not found."
+        exit_code=1
+    fi
+}
+
+for model_name in $model_list; do
+    echo "--------------------------------------------------"
+    echo "Running benchmark for model: $model_name"
+    echo "--------------------------------------------------"
+
+    if [ "$NEW_MODEL_DESIGN" = "True" ] && { [ "$model_name" == "Qwen/Qwen2.5-1.5B-Instruct" ] || [ "$model_name" == "Qwen/Qwen2.5-0.5B-Instruct" ];}; then
+       echo "Skipping $model_name for NEW_MODEL_DESIGN: True"
+        continue
+    fi
+
+    if [ "$MODEL_IMPL_TYPE" == "vllm" ] && [ "$model_name" == "Qwen/Qwen2.5-0.5B-Instruct" ]; then
+        echo "Skipping $model_name for MODEL_IMPL_TYPE: vllm"
+        continue
+    fi
+
+    # TODO (jacobplatin): remove when Qwen2.5 uses new model implementation
+    if [ "$QUANTIZATION" = "True" ] && { [ "$model_name" == "Qwen/Qwen2.5-1.5B-Instruct" ] || [ "$model_name" == "Qwen/Qwen2.5-0.5B-Instruct" ];}; then
+       echo "Skipping $model_name for QUANTIZATION: True"
+        continue
+    fi
+
+    # Define model-specific arguments
+    current_serve_args=("${extra_serve_args[@]}")
+    max_batched_tokens=8192
+    served_name=$model_name
+
+    if [ "$USE_V6E8_QUEUE" == "True" ]; then
+        max_batched_tokens=1024
+        if [ "$model_name" == "meta-llama/Llama-4-Scout-17B-16E-Instruct" ]; then
+            current_serve_args+=(--hf-overrides '{"architectures": ["Llama4ForCausalLM"]}')
+        fi
+    else
+        if [[ "${model_name,,}" == *"deepseek"* || "${model_name,,}" == *"kimi"* ]]; then
+            max_batched_tokens=1024
+            if [[ "${model_name,,}" == *"kimi"* ]]; then
+                served_name=moonshotai/Kimi-K2.6
+                current_serve_args+=(--kv-cache-dtype=fp8 --gpu-memory-utilization 0.95 --limit-mm-per-prompt='{"image": 0, "video": 0, "vision_chunk": 0}' )
+                current_serve_args+=(--served-model-name "${served_name}"  --load-format=runai_streamer --enable-expert-parallel  --trust-remote-code --kv-cache-dtype=fp8 --additional-config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true, "tensor_parallelism": '"${DEVICE_COUNT}"'}}}')
+            else
+                served_name=deepseek-ai/DeepSeek-R1
+                current_serve_args+=(--served-model-name "${served_name}"  --load-format=runai_streamer   --trust-remote-code --kv-cache-dtype=fp8 )
+                current_serve_args+=(--hf_overrides '{"num_hidden_layers": 5}' )
+                current_serve_args+=(--additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true, "expert_parallelism": '"${DEVICE_COUNT}"', "tensor_parallelism": 1}}, "replicate_attn_weights": "True", "sparse_matmul": "True"}')
+            fi
+        fi
+    fi
+
+    # Spin up the vLLM server
+    echo "Spinning up the vLLM server..."
+    (vllm serve "$model_name" --max-model-len 1024 --max-num-batched-tokens "$max_batched_tokens" "${current_serve_args[@]}" 2>&1 | tee -a "$LOG_FILE") &
+
+    # Set initial trap to ensure cleanup happens even on immediate exit
+    trap 'cleanUp "$model_name"' EXIT
+
+    waitForServerReady
+
+    echo "Starting the benchmark for $served_name..."
+    echo "Current working directory: $(pwd)"
+    python benchmarks/benchmark_serving.py \
+    --backend vllm \
+    --model "$served_name" \
+    --dataset-name "$dataset_name" \
+    --dataset-path "$dataset_path" \
+    --num-prompts "$num_prompts" \
+    --trust-remote-code \
+    --run-eval 2>&1 | tee -a "$BENCHMARK_LOG_FILE"
+
+        # TODO (jacobplatin): probably want to add an option to skip this in the future
+        if [ "$dataset_name" == "mlperf" ]; then
+            checkThroughputAndRouge
+            if [ "$exit_code" -ne 0 ]; then
+                exit_code=1
+            fi
+        fi
+
+    # Call cleanUp normally instead of using a trap
+    cleanUp "$model_name"
+done
+
+# We successfully cleanUp every model, so cancel the trap.
+trap - EXIT
+
+exit $exit_code
