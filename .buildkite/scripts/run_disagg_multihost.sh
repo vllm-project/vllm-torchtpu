@@ -108,9 +108,10 @@ mkdir -p perf_eval_results
 # Cleanup handlers
 # ---------------------------------------------------------------------------
 cleanup() {
-  echo "--- Cleaning up disagg containers"
-  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "docker rm -f disagg-worker >/dev/null 2>&1 || true" || true
+  echo "--- Cleaning up disagg containers and persist directories"
+  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "docker rm -f disagg-worker >/dev/null 2>&1 || true; sudo -n rm -rf ~/persist/perf_eval_results >/dev/null 2>&1 || true" || true
   docker rm -f disagg-head >/dev/null 2>&1 || true
+  sudo -n rm -rf "${PERSIST_ROOT}/perf_eval_results" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
