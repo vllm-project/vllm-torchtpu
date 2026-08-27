@@ -1,0 +1,28 @@
+[run]
+source =
+    core
+    resolvers
+    runners
+    run_sweep_orchestrator
+    sparsity
+
+omit =
+    tests/*
+    */__pycache__/*
+    results/*
+    plots/*
+    plot_scripts/*
+    scripts/*
+    scratch/*
+    sparsity/llama.py
+    sparsity/datautils.py
+
+[report]
+show_missing = True
+precision = 2
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
