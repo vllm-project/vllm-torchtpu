@@ -92,18 +92,14 @@ fi
 WORKER_IP="${WORKER_IPS_ARRAY[0]}"
 
 # ---------------------------------------------------------------------------
-# Host storage & results setup
+# Results dir on host (no /mnt/disks on these agents; boot disk only)
 # ---------------------------------------------------------------------------
-if [ -d /mnt/disks/persist ]; then
-  PERSIST_ROOT="/mnt/disks/persist"
-else
-  PERSIST_ROOT="${HOME}/persist"
-fi
-
+PERSIST_ROOT="${HOME}/persist"
 rm -rf "${PERSIST_ROOT}/perf_eval_results"
 mkdir -p "${PERSIST_ROOT}/perf_eval_results"
 chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
-mkdir -p /mnt/disks/persist/models "${HOME}/hf_home"
+HOST_HF_HOME="${HOME}/hf_home"
+mkdir -p "${HOST_HF_HOME}"
 
 rm -rf perf_eval_results
 mkdir -p perf_eval_results
@@ -121,7 +117,14 @@ trap cleanup EXIT INT TERM
 echo "--- Pre-start container and image cleanup"
 cleanup
 bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
-ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist/perf_eval_results ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true"
+
+# ---------------------------------------------------------------------------
+# Stage model snapshot on Head and Worker
+# ---------------------------------------------------------------------------
+echo "--- Staging model snapshot on Head and Worker"
+bash "${SCRIPT_DIR}/stage_model_snapshot.sh" gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ "${HOST_HF_HOME}/hub" || true
+ssh_retry "${SSH_USER}@${WORKER_IP}" "if [ ! -d ~/hf_home/hub/models--Qwen--Qwen3.5-35B-A3B-FP8 ]; then mkdir -p ~/hf_home/hub && gcloud storage cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ ~/hf_home/hub/ || true; fi" || true
 
 # ---------------------------------------------------------------------------
 # Environment variables for Docker containers
@@ -186,7 +189,7 @@ echo "--- Starting disagg-worker (ROLE=decode) on ${WORKER_IP}"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker pull ${IMAGE_TAG} || true"
 
 # shellcheck disable=SC2029
-ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v /mnt/disks/persist/models:/local_hf_cache -v \${HOME}/hf_home:/root/.cache/huggingface -e HF_HOME=/local_hf_cache -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh"
 
 # ---------------------------------------------------------------------------
 # Start Head container (ROLE=head)
@@ -197,9 +200,8 @@ docker pull "${IMAGE_TAG}" || true
 set +e
 docker run --name disagg-head --privileged --net=host --shm-size=128g --device /dev/fuse \
   -w /root/torchtpu-vllm \
-  -v /mnt/disks/persist/models:/local_hf_cache \
+  -v "${HOST_HF_HOME}:/root/.cache/huggingface" \
   -v "${PERSIST_ROOT}/perf_eval_results:/perf_eval_results" \
-  -e HF_HOME=/local_hf_cache \
   -e ROLE=head \
   "${CONTAINER_ENV_COMMON[@]}" \
   "${TEST_SUITE_VARS[@]}" \
