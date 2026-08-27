@@ -11,6 +11,7 @@ RUN_CODE_EVAL=0
 RUN_MM_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
+EVAL_NUM_CONCURRENT_OVERRIDE=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -35,6 +36,10 @@ while [[ $# -gt 0 ]]; do
             RUN_MM_EVAL=1
             shift
             ;;
+        --num-concurrent)
+            EVAL_NUM_CONCURRENT_OVERRIDE="$2"
+            shift 2
+            ;;
         --host)
             HOST="$2"
             START_SERVER=0
@@ -48,10 +53,14 @@ while [[ $# -gt 0 ]]; do
             SKIP_DB_UPLOAD_FLAG=1
             shift
             ;;
+        -h|--help)
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--num-concurrent N] [--host HOST] [--port PORT] [--skip-db-upload]"
+            exit 0
+            ;;
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--num-concurrent N] [--host HOST] [--port PORT] [--skip-db-upload]"
             exit 1
             ;;
     esac
@@ -92,6 +101,7 @@ run_lm_eval() {
     local task="$1"
     local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
+    local num_concurrent="${EVAL_NUM_CONCURRENT:-4}"
 
     local lm_eval_args=(
         --tasks "$task"
@@ -101,7 +111,7 @@ run_lm_eval() {
 
     case "$task" in
         humaneval_plus_tpu|mbpp_plus_tpu)
-            # HF evaluate's code_eval metric has its own unsafe-code gate on
+            # Python code generation: needs HF_ALLOW_CODE_EVAL=1 in the env on
             # top of lm-eval's --confirm_run_unsafe_code. No --limit: the
             # full EvalPlus datasets (164 + 378 problems), like the evalplus
             # CLI ran them.
@@ -109,7 +119,7 @@ run_lm_eval() {
             lm_eval_args+=(
                 --include_path "$SCRIPT_DIR/lm_eval_tasks"
                 --model local-chat-completions
-                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=$num_concurrent"
                 --apply_chat_template
                 --gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}'
                 --confirm_run_unsafe_code
@@ -119,7 +129,7 @@ run_lm_eval() {
             lm_eval_args+=(
                 --limit 100
                 --model local-chat-completions
-                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=$num_concurrent"
                 --apply_chat_template
             )
             if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
@@ -234,6 +244,19 @@ MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
 PERF_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("perf_tolerance", 0.05))' "$RESULTS_DIR/config.json")
+EVAL_NUM_CONCURRENT=$(python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+val = cfg.get("eval_num_concurrent") or cfg.get("num_concurrent")
+if not val:
+    opts = str(cfg.get("concurrency_options", "4")).split()
+    val = opts[0] if opts else "4"
+print(val)
+' "$RESULTS_DIR/config.json")
+
+if [ -n "$EVAL_NUM_CONCURRENT_OVERRIDE" ]; then
+    EVAL_NUM_CONCURRENT="$EVAL_NUM_CONCURRENT_OVERRIDE"
+fi
 
 fail=0
 
