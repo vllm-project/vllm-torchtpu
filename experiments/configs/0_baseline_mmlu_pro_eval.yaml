@@ -1,0 +1,13 @@
+# Goal: Baseline quality and accuracy evaluation for standard dense Gemma 4 (31B) on MMLU-Pro
+mode: "eval"
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 4096
+
+evaluation:
+  tasks: "mmlu_pro_philosophy"   # Quick initial category for verification (or "mmlu_pro" for full benchmark)
+  limit: 10                     # 10 samples for fast verification
+
+sweep_matrix:
+  model: ["/mnt/pd/huggingface_cache/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475"]

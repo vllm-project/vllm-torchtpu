@@ -1,0 +1,19 @@
+# Goal: Benchmark Decode Phase Throughput
+# Importance: Evaluates the system limit by holding context size constant and
+# exponentially scaling the batch size. This helps determine the max operational
+# batch capacity before TPU HBM memory (KV Cache limit) is exhausted.
+mode: profile
+
+engine_args:
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 65537
+env_vars:
+  VLLM_ENABLE_V1_MULTIPROCESSING: '0'
+sweep_matrix:
+  output_len: [512]
+  batch_size: [1, 8, 16, 32, 64, 128, 256]
+  input_len: [128]
+  model: [google/gemma-4-12B-it]
