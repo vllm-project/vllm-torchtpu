@@ -288,36 +288,78 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
 
 
 def _patch_moe_explicit_pcp_collectives() -> None:
-    """Keep PCP MoE dispatch/combine explicit unless chunking owns it.
+    """Give each PCP MoE implementation exactly one collective owner.
 
     vLLM treats PCP+EP as an all-to-all-kernel configuration and therefore
     skips the explicit PCP all-gather/reduce-scatter in ``MoERunner``.  The
     TorchTPU monolithic MoE kernels only compute local expert contributions;
     they only implement internal PCP dispatch/combine when MoE collective
     chunking is enabled.  Otherwise keep dispatch/combine explicit.
+
+    Chunk pipelining is a process-wide configuration, so it can select the
+    contract through ``FusedMoEParallelConfig.use_all2all_kernels``.  The fused
+    EP kernel is different: it is armed per layer after checking that layer's
+    weights, routing and device resources.  Patch ``MoERunner`` as well so an
+    armed layer suppresses the outer PCP pair, while a refused layer in the
+    same model still gets the explicit fallback collectives.
     """
     from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
+    from vllm.model_executor.layers.fused_moe.runner import \
+        moe_runner as _moe_runner
 
-    if getattr(FusedMoEParallelConfig, "_tpu_explicit_pcp_collectives_patch",
-               False):
-        return
+    if not getattr(FusedMoEParallelConfig,
+                   "_tpu_explicit_pcp_collectives_patch", False):
+        upstream_property = FusedMoEParallelConfig.use_all2all_kernels
+        upstream_getter = upstream_property.fget
+        assert upstream_getter is not None
 
-    upstream_property = FusedMoEParallelConfig.use_all2all_kernels
-    upstream_getter = upstream_property.fget
-    assert upstream_getter is not None
+        def use_all2all_kernels(self):
+            if (self.use_ep and self.pcp_size > 1 and self.dp_size == 1
+                    and not self.is_sequence_parallel
+                    and envs.TPU_MOE_COLLECTION_CHUNK_SIZE <= 0):
+                return False
+            return upstream_getter(self)
 
-    def use_all2all_kernels(self):
-        if (self.use_ep and self.pcp_size > 1 and self.dp_size == 1
-                and not self.is_sequence_parallel
-                and envs.TPU_MOE_COLLECTION_CHUNK_SIZE <= 0):
-            return False
-        return upstream_getter(self)
+        FusedMoEParallelConfig.use_all2all_kernels = property(
+            use_all2all_kernels, doc=upstream_property.__doc__)
+        FusedMoEParallelConfig._tpu_explicit_pcp_collectives_patch = True
 
-    FusedMoEParallelConfig.use_all2all_kernels = property(
-        use_all2all_kernels, doc=upstream_property.__doc__)
-    FusedMoEParallelConfig._tpu_explicit_pcp_collectives_patch = True
+    runner_cls = _moe_runner.MoERunner
+    if not getattr(runner_cls, "_tpu_fused_ep_pcp_collectives_patch", False):
+        upstream_dispatch = runner_cls._maybe_dispatch
+        upstream_combine = runner_cls._maybe_combine
+
+        def fused_ep_owns_pcp_collectives(self) -> bool:
+            if self.moe_config.pcp_size <= 1:
+                return False
+            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+                fused_moe_ep_supported
+            return fused_moe_ep_supported(getattr(self, "_quant_method", None))
+
+        def maybe_dispatch(self, hidden_states, router_logits):
+            if fused_ep_owns_pcp_collectives(self):
+                # An armed fused method also reports supports_internal_mk, so
+                # upstream's generic DP/EP dispatch is a no-op.  The only work
+                # being bypassed here is its explicit PCP all-gather pair.
+                return hidden_states, router_logits
+            return upstream_dispatch(self, hidden_states, router_logits)
+
+        def maybe_combine(self, shared_output, hidden_states):
+            if fused_ep_owns_pcp_collectives(self):
+                # The fused program has already pushed and summed routed rows
+                # back onto their token-owning PCP rank.  Preserve upstream's
+                # return shape for a separately-computed shared expert.
+                if self.shared_experts is not None:
+                    return shared_output, hidden_states
+                return hidden_states
+            return upstream_combine(self, shared_output, hidden_states)
+
+        runner_cls._maybe_dispatch = maybe_dispatch
+        runner_cls._maybe_combine = maybe_combine
+        runner_cls._tpu_fused_ep_pcp_collectives_patch = True
+
     logger.info("Applied TPU patch: use explicit PCP collectives unless MoE "
-                "chunk pipelining is enabled.")
+                "chunk pipelining or an armed fused EP layer owns them.")
 
 
 def _patch_expert_map_host_lookup() -> None:
