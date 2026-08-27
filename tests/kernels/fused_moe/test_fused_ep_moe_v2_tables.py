@@ -62,8 +62,8 @@ GEOMETRIES = [
 ]
 
 
-def _routing(ep, t_local, g_local, topk, *, skew, seed):
-    """Routing tables for one step.
+def _routing_inputs(ep, t_local, g_local, topk, *, skew, seed):
+    """Routing indices and builder arguments for one step.
 
     `skew` reproduces low concurrency, where only a few experts are selected at
     all and most runs are empty -- the case where the alignment padding and the
@@ -80,13 +80,114 @@ def _routing(ep, t_local, g_local, topk, *, skew, seed):
     capacity = 128
     stride = host.ragged_stride_bound(T, topk, e_total, capacity)
     block = host.routing_block(t_local, topk)
-    return host.build_routing_tables(jnp.asarray(idx.astype(np.int32)),
-                                     e_total=e_total,
-                                     ep=ep,
-                                     t_local=t_local,
-                                     block=block,
-                                     tile_m=capacity,
-                                     shard_stride=stride), e_total
+    return jnp.asarray(idx.astype(np.int32)), dict(e_total=e_total,
+                                                   ep=ep,
+                                                   t_local=t_local,
+                                                   block=block,
+                                                   tile_m=capacity,
+                                                   shard_stride=stride)
+
+
+def _routing(ep, t_local, g_local, topk, *, skew, seed):
+    idx, kwargs = _routing_inputs(ep,
+                                  t_local,
+                                  g_local,
+                                  topk,
+                                  skew=skew,
+                                  seed=seed)
+    return host.build_routing_tables(idx, **kwargs), kwargs["e_total"]
+
+
+def _assert_arrays_equal(left, right, *, shard):
+    assert len(left) == len(right)
+    for i, (actual, expected) in enumerate(zip(left, right)):
+        np.testing.assert_array_equal(np.asarray(actual),
+                                      np.asarray(expected),
+                                      err_msg=f"shard {shard}, table {i}")
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_sharded_plan_produces_the_same_kernel_operands(
+        ep, t_local, g_local, topk, skew, seed):
+    """The decomposed plan changes plan arithmetic, not kernel inputs."""
+    idx, kwargs = _routing_inputs(ep,
+                                  t_local,
+                                  g_local,
+                                  topk,
+                                  skew=skew,
+                                  seed=seed)
+    whole = host.build_routing_tables(idx, **kwargs)
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    flat = np.asarray(idx)
+    counts = np.stack([
+        np.bincount(flat[d * t_local:(d + 1) * t_local].reshape(-1),
+                    minlength=e_total) for d in range(ep)
+    ]).astype(np.int32)
+
+    for me in range(ep):
+        seen = []
+
+        def all_gather_rows(row):
+            seen.append(np.asarray(row))
+            return jnp.asarray(counts)
+
+        shard = host.build_routing_tables_sharded(
+            idx, jnp.int32(me), all_gather_rows=all_gather_rows, **kwargs)
+        assert len(seen) == 1
+        np.testing.assert_array_equal(seen[0].reshape(-1), counts[me])
+        np.testing.assert_array_equal(
+            np.asarray(shard.pos),
+            np.asarray(whole.arrival_row[me * t_local:(me + 1) * t_local]))
+
+        whole_rows = np.asarray(
+            host.local_slab_rows(whole, me, shard_stride=stride))
+        shard_rows = np.asarray(
+            host.local_slab_rows(shard, me, shard_stride=stride))
+        whole_live = whole_rows < stride
+        shard_live = shard_rows < stride
+        np.testing.assert_array_equal(whole_live, shard_live)
+        np.testing.assert_array_equal(whole_rows[whole_live],
+                                      shard_rows[shard_live])
+
+        for builder in (host.shard_transport_tables_in_blocks,
+                        host.shard_push_tables_in_rows):
+            _assert_arrays_equal(builder(whole, me, e_total=e_total, ep=ep),
+                                 builder(shard, me, e_total=e_total, ep=ep),
+                                 shard=me)
+        whole_experts = host.shard_expert_slabs(whole,
+                                                me,
+                                                e_total=e_total,
+                                                ep=ep)
+        shard_experts = host.shard_expert_slabs(shard,
+                                                me,
+                                                e_total=e_total,
+                                                ep=ep)
+        _assert_arrays_equal(whole_experts, shard_experts, shard=me)
+        np.testing.assert_array_equal(
+            np.asarray(host.shard_token_gather(whole, me,
+                                               shard_stride=stride)),
+            np.asarray(host.shard_token_gather(shard, me,
+                                               shard_stride=stride)))
+
+        whole_visit = host.expert_visit_list(whole_experts[0], g_local)
+        shard_visit = host.expert_visit_list(shard_experts[0], g_local)
+        _assert_arrays_equal(whole_visit, shard_visit, shard=me)
+        np.testing.assert_array_equal(
+            np.asarray(
+                host.shard_count_vector(whole,
+                                        whole_experts[0],
+                                        me,
+                                        e_total=e_total,
+                                        ep=ep)),
+            np.asarray(
+                host.shard_count_vector(shard,
+                                        shard_experts[0],
+                                        me,
+                                        e_total=e_total,
+                                        ep=ep)))
 
 
 @pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)

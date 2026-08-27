@@ -333,6 +333,44 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
         token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND)
 
 
+def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
+    """Plan decomposition changes only how the kernel operands are built."""
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
+                                               20,
+                                               hidden=SMALL["hidden"],
+                                               inter=SMALL["inter"],
+                                               e_total=SMALL["e_total"],
+                                               weight_format=WeightFormat.FP8)
+    x, gating = _make_inputs(mesh,
+                             21,
+                             tokens=SMALL["tokens"],
+                             hidden=SMALL["hidden"],
+                             e_total=SMALL["e_total"])
+    common = dict(topk=SMALL["topk"],
+                  renormalize=True,
+                  mesh=mesh,
+                  capacity=CAPACITY,
+                  weight_format=WeightFormat.FP8)
+    replicated = fused_ep_moe_v2(x,
+                                 w1,
+                                 w2,
+                                 w1_scale,
+                                 w2_scale,
+                                 gating,
+                                 sharded_plan=False,
+                                 **common)
+    sharded = fused_ep_moe_v2(x,
+                              w1,
+                              w2,
+                              w1_scale,
+                              w2_scale,
+                              gating,
+                              sharded_plan=True,
+                              **common)
+    np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

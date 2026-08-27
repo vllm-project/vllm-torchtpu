@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -389,6 +390,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
+    # Build each rank's two consumed routing-plan slices instead of
+    # replicating the full T * topk * experts plan arithmetic on every rank.
+    "MOE_FUSED_EP_V2_SHARDED_PLAN":
+    env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
