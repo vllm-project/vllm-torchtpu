@@ -90,14 +90,15 @@ echo "--- Starting Buildkite Bootstrap"
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.
 
-echo "Uploading Perf and Eval Pipeline"
-upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
+# Temporarily disabled to conserve CI resources during experimental testing
+# echo "Uploading Perf and Eval Pipeline"
+# upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
 
 echo "Uploading Integration Tests Pipeline"
 upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
 
-echo "Uploading Unit Tests Pipeline"
-upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
+# echo "Uploading Unit Tests Pipeline"
+# upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
 
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"
