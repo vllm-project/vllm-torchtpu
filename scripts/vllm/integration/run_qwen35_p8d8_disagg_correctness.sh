@@ -130,6 +130,7 @@ export P4D2_LONG_SHARED_ROUNDS="${P4D2_LONG_SHARED_ROUNDS:-3}"
 export P4D2_MIXED_LINES="${P4D2_MIXED_LINES:-60}"
 export P4D2_MIXED_ROUNDS="${P4D2_MIXED_ROUNDS:-2}"
 export P4D2_CONCURRENT_REQUESTS="${P4D2_CONCURRENT_REQUESTS:-1}"
+export PREFIX_E2E_DIVERGENCE_LOGPROB_ATOL="${PREFIX_E2E_DIVERGENCE_LOGPROB_ATOL:-0.2}"
 
 cd "${repo_root}"
 
@@ -255,6 +256,7 @@ case "${ROLE}" in
         --port "${PROXY_PORT}" \
         --model "${SERVED_MODEL_NAME}" \
         --max-tokens 1 \
+        --logprob-atol "${PREFIX_E2E_DIVERGENCE_LOGPROB_ATOL}" \
         2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
       DIVERGENCE_EXIT_CODE=$?
     else
