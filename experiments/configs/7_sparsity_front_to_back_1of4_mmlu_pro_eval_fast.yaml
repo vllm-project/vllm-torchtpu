@@ -1,0 +1,33 @@
+# Goal: Fast MMLU-Pro Quality Evaluation for Gemma 4 31B with Front-to-Back (first_to_last) 1:4 Structured Sparsity (Canonical SparseGPT)
+mode: eval
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+
+evaluation:
+  tasks: mmlu_pro
+  limit: 0.05
+  batch_size: auto
+
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: /mnt/pd/huggingface_cache/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475
+    reference_sparse_model: /mnt/pd/sparse_checkpoints/gemma4_31b_1of4_canonical_64c4_full
+    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    strategy: first_to_last
+    prunen: 1
+    prunem: 4
+
+sweep_matrix:
+  num_sparse_layers: [0, 5, 10, 20, 30, 40, 50, 60]

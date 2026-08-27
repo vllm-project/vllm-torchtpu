@@ -1,0 +1,32 @@
+# Goal: Full MMLU-Pro Quality Evaluation across varying numbers of 2:4 structured sparse layers in Gemma 4 31B
+mode: eval
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+
+evaluation:
+  tasks: mmlu_pro
+  batch_size: auto
+
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: /mnt/pd/huggingface_cache/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475
+    reference_sparse_model: /mnt/pd/sparse_checkpoints/gemma4_31b_2of4
+    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    strategy: last_to_first
+    prunen: 2
+    prunem: 4
+
+sweep_matrix:
+  num_sparse_layers: [0, 5, 10, 20, 30, 40, 50, 60]
