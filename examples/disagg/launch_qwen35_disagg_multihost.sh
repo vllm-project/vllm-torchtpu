@@ -144,7 +144,7 @@ TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
 TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB:-8}"
 TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
-STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-600}"
+STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
 
 mkdir -p "${RUN_DIR}/logs"
 
@@ -474,6 +474,14 @@ done
 
 if [[ "${all_healthy:-0}" -ne 1 ]]; then
   echo "ERROR: Server(s) failed to reach healthy status within ${STARTUP_TIMEOUT_S}s" >&2
+  if [[ -f "${RUN_DIR}/logs/prefill.log" ]]; then
+    echo "=== Prefill Server Log Tail (last 100 lines) ==="
+    tail -n 100 "${RUN_DIR}/logs/prefill.log" || true
+  fi
+  if [[ -f "${RUN_DIR}/logs/decode.log" ]]; then
+    echo "=== Decode Server Log Tail (last 100 lines) ==="
+    tail -n 100 "${RUN_DIR}/logs/decode.log" || true
+  fi
   exit 1
 fi
 

@@ -168,6 +168,7 @@ CONTAINER_ENV_COMMON=(
   -e PREFILL_TPU_KV_TRANSFER_PORT="${PREFILL_TPU_KV_TRANSFER_PORT:-9100}"
   -e DECODE_TPU_KV_TRANSFER_PORT="${DECODE_TPU_KV_TRANSFER_PORT:-9200}"
   -e TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
+  -e STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
   -e RUN_ROOT="/perf_eval_results/qwen35_p8d8_disagg_ci"
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"}
   ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"}
@@ -217,6 +218,8 @@ echo "--- Collecting server logs"
 docker logs disagg-head --tail 2000 > "${PERSIST_ROOT}/perf_eval_results/head.log" 2>&1 || true
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "docker logs disagg-worker --tail 2000" \
   > "${PERSIST_ROOT}/perf_eval_results/worker_decode.log" 2>&1 || true
+ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "tar -czf - -C ~/persist/perf_eval_results . 2>/dev/null" \
+  | tar -xzf - -C "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 
 echo "--- Copying results back for artifact upload"
 cp -r "${PERSIST_ROOT}/perf_eval_results"/* perf_eval_results/ 2>/dev/null || true
