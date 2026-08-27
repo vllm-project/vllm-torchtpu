@@ -41,6 +41,8 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
+    VllmDeepseekCompressor  # noqa: E501
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
     MHCOps, get_mhc_ops, get_mhc_post_op)
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import \
@@ -555,6 +557,15 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights,
                                             mapper=self.hf_to_vllm_mapper)
+
+        # Post-load weight surgery goes here.
+        # `fused_wkv_wgate` is built with `quant_config=None`, so it never
+        # reaches a TPU linear method and the canonical (k, n) flip does not
+        # apply; the compress-and-store kernel still wants
+        # [hidden_size, 2 * coff * head_dim], so transpose it once here.
+        for module in self.modules():
+            if isinstance(module, VllmDeepseekCompressor):
+                module.transpose_wkv_wgate()
 
         return loaded_params
 
