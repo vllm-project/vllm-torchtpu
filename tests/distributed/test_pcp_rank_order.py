@@ -344,10 +344,7 @@ def test_verify_does_nothing_when_no_order_was_applied(monkeypatch):
 
 
 def test_verify_accepts_the_order_it_asked_for(monkeypatch):
-    _patch_groups(monkeypatch,
-                  rank=6,
-                  pcp=[0, 1, 6, 7, 4, 5, 2, 3],
-                  tp=[6])
+    _patch_groups(monkeypatch, rank=6, pcp=[0, 1, 6, 7, 4, 5, 2, 3], tp=[6])
 
     order_mod.verify_pcp_topology_order({
         "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
