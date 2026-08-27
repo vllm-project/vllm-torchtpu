@@ -153,9 +153,9 @@ case "${ROLE}" in
   head|runner|all)
     if [[ "${ROLE}" == "head" ]]; then
       echo "--- Launching head prefill server locally"
-      ROLE=prefill PREFILL_HOST="127.0.0.1" bash "${repo_root}/examples/disagg/launch_qwen35_disagg_multihost.sh" \
+      ROLE=prefill bash "${repo_root}/examples/disagg/launch_qwen35_disagg_multihost.sh" \
         2>&1 | tee "${RUN_DIR}/logs/launch_head_prefill.log"
-      target_prefill_host="127.0.0.1"
+      target_prefill_host="${PREFILL_HOST:-127.0.0.1}"
       target_decode_host="${DECODE_HOST}"
     elif [[ "${ROLE}" == "all" ]]; then
       echo "--- Launching prefill and decode servers locally"

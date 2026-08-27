@@ -220,7 +220,7 @@ docker logs disagg-head --tail 2000 > "${PERSIST_ROOT}/perf_eval_results/head.lo
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "docker logs disagg-worker --tail 2000" \
   > "${PERSIST_ROOT}/perf_eval_results/worker_decode.log" 2>&1 || true
 sudo -n chmod -R 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
-ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "tar -czf - -C ~/persist/perf_eval_results . 2>/dev/null" \
+ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "sudo -n chmod -R 777 ~/persist/perf_eval_results 2>/dev/null || true; tar -czf - -C ~/persist/perf_eval_results . 2>/dev/null" \
   | tar -xzf - -C "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 sudo -n chmod -R 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 
