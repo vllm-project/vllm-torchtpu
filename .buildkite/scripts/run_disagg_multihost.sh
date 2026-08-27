@@ -168,6 +168,7 @@ CONTAINER_ENV_COMMON=(
   -e PREFILL_TPU_KV_TRANSFER_PORT="${PREFILL_TPU_KV_TRANSFER_PORT:-9100}"
   -e DECODE_TPU_KV_TRANSFER_PORT="${DECODE_TPU_KV_TRANSFER_PORT:-9200}"
   -e TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
+  -e PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-128}"
   -e STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
   -e RUN_ROOT="/perf_eval_results/qwen35_p8d8_disagg_ci"
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"}
@@ -177,7 +178,7 @@ CONTAINER_ENV_COMMON=(
   ${MAX_NUM_BATCHED_TOKENS:+-e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS}"}
   ${MAX_NUM_SEQS:+-e MAX_NUM_SEQS="${MAX_NUM_SEQS}"}
   ${PREFILL_COMPILE_SIZES:+-e PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES}"}
-  ${DECODE_COMPILE_SIZES:+-e DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES}"}
+  ${DECODE_COMPILE_SIZES:+-e DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-256,4096}"}
   ${NUM_GPU_BLOCKS_OVERRIDE:+-e NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE}"}
   ${RUN_PREFIX_CACHE_E2E_DIVERGENCE:+-e RUN_PREFIX_CACHE_E2E_DIVERGENCE="${RUN_PREFIX_CACHE_E2E_DIVERGENCE}"}
 )
@@ -218,8 +219,10 @@ echo "--- Collecting server logs"
 docker logs disagg-head --tail 2000 > "${PERSIST_ROOT}/perf_eval_results/head.log" 2>&1 || true
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "docker logs disagg-worker --tail 2000" \
   > "${PERSIST_ROOT}/perf_eval_results/worker_decode.log" 2>&1 || true
+sudo -n chmod -R 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "tar -czf - -C ~/persist/perf_eval_results . 2>/dev/null" \
   | tar -xzf - -C "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
+sudo -n chmod -R 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 
 echo "--- Copying results back for artifact upload"
 cp -r "${PERSIST_ROOT}/perf_eval_results"/* perf_eval_results/ 2>/dev/null || true
