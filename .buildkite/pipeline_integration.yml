@@ -16,6 +16,18 @@ steps:
   - group: "Integration Tests on TPU"
     depends_on: "build_docker"
     steps:
+      - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
+        key: "integration_qwen35_pcp4_dp4_disagg_correctness"
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "/perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
         key: "integration_qwen35_pcp8_dp8_disagg_correctness"
         agents:
@@ -28,69 +40,63 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      # - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
-      #   key: "integration_qwen35_pcp4_dp4_disagg_correctness"
-      #   agents:
-      #     queue: "tpu_v7x_8_queue"
-      #   env:
-      #     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
-      #     RUN_ROOT: "/perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
-      #   commands:
-      #     - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh"
-      #   artifact_paths:
-      #     - "perf_eval_results/**/*"
+      - label: "Presubmit: disagg-single-host"
+        key: "presubmit_disagg_single_host"
+        if: "build.pull_request.id != null"
+        agents:
+          queue: "tpu_v7x_8_queue"
+        commands:
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            env
+            -u TPU_USE_RAIDEN_CONNECTOR
+            -u TPU_USE_RAIDEN_KV_CACHE_MANAGER
+            -u TPU_RAIDEN_QWEN35_ADMISSION
+            TPU_KV_RESHARD_TRANSPORT=zmq
+            LOG_DIR=/perf_eval_results/disagg_single_host
+            bash ./examples/disagg/run_disagg_single_host.sh
 
-      # - label: "Presubmit: disagg-single-host"
-      #   key: "presubmit_disagg_single_host"
-      #   if: "build.pull_request.id != null"
-      #   agents:
-      #     queue: "tpu_v7x_8_queue"
-      #   commands:
-      #     - >-
-      #       bash .buildkite/scripts/run_in_docker.sh
-      #       env
-      #       -u TPU_USE_RAIDEN_CONNECTOR
-      #       -u TPU_USE_RAIDEN_KV_CACHE_MANAGER
-      #       -u TPU_RAIDEN_QWEN35_ADMISSION
-      #       TPU_KV_RESHARD_TRANSPORT=zmq
-      #       LOG_DIR=/perf_eval_results/disagg_single_host
-      #       bash ./examples/disagg/run_disagg_single_host.sh
+      - label: "Integration: qwen35-apc-correctness"
+        key: "integration_qwen35_apc_correctness"
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          RUN_ROOT: "/perf_eval_results/qwen35_apc_ci"
+        commands:
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
 
-      # - label: "Integration: qwen35-apc-correctness"
-      #   key: "integration_qwen35_apc_correctness"
-      #   agents:
-      #     queue: "tpu_v7x_8_queue"
-      #   env:
-      #     RUN_ROOT: "/perf_eval_results/qwen35_apc_ci"
-      #   commands:
-      #     - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
-      #     - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh"
-      #   artifact_paths:
-      #     - "perf_eval_results/**/*"
+      - label: "Integration: qwen35-gpc-global-dram-pool"
+        key: "integration_qwen35_gpc_global_dram_pool"
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          RUN_ROOT: "/perf_eval_results/qwen35_gpc_dram_pool_ci"
+        commands:
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
 
-      # - label: "Integration: qwen35-gpc-global-dram-pool"
-      #   key: "integration_qwen35_gpc_global_dram_pool"
-      #   agents:
-      #     queue: "tpu_v7x_8_queue"
-      #   env:
-      #     RUN_ROOT: "/perf_eval_results/qwen35_gpc_dram_pool_ci"
-      #   commands:
-      #     - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
-      #     - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh"
-      #   artifact_paths:
-      #     - "perf_eval_results/**/*"
+      - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
+        key: "vllm_torchtpu_multihost_presubmit"
+        agents:
+          queue: "tpu_v7x_16_queue"
+        commands:
+          - |
+            bash .buildkite/scripts/run_multihost.sh \
+              python3 examples/offline_inference.py \
+                --model Qwen/Qwen3-0.6B \
+                --tensor-parallel-size 16 \
+                --max-model-len 256 \
+                --max-num-batched-tokens 256 \
+                --max-tokens 32
 
-      # - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
-      #   key: "vllm_torchtpu_multihost_presubmit"
-      #   agents:
-      #     queue: "tpu_v7x_16_queue"
-      #   commands:
-      #     - |
-      #       bash .buildkite/scripts/run_multihost.sh       #         python3 examples/offline_inference.py       #           --model Qwen/Qwen3-0.6B       #           --tensor-parallel-size 16       #           --max-model-len 256       #           --max-num-batched-tokens 256       #           --max-tokens 32
-
-      # - label: "Integration: compilation-cache-e2e"
-      #   key: "integration_compilation_cache_e2e"
-      #   agents:
-      #     queue: "tpu_v7x_2_queue"
-      #   commands:
-      #     - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh"
+      - label: "Integration: compilation-cache-e2e"
+        key: "integration_compilation_cache_e2e"
+        agents:
+          queue: "tpu_v7x_2_queue"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh"
