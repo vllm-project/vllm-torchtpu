@@ -95,13 +95,13 @@ WORKER_IP="${WORKER_IPS_ARRAY[0]}"
 # Results dir on host (no /mnt/disks on these agents; boot disk only)
 # ---------------------------------------------------------------------------
 PERSIST_ROOT="${HOME}/persist"
-rm -rf "${PERSIST_ROOT}/perf_eval_results"
+sudo -n rm -rf "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || rm -rf "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 mkdir -p "${PERSIST_ROOT}/perf_eval_results"
 chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 HOST_HF_HOME="${HOME}/hf_home"
 mkdir -p "${HOST_HF_HOME}"
 
-rm -rf perf_eval_results
+rm -rf perf_eval_results 2>/dev/null || true
 mkdir -p perf_eval_results
 
 # ---------------------------------------------------------------------------
@@ -116,12 +116,12 @@ trap cleanup EXIT INT TERM
 
 echo "--- Pre-start container, disk, and image cleanup"
 cleanup
-rm -rf "${PERSIST_ROOT}/perf_eval_results" "${HOST_HF_HOME}/hub"
+sudo -n rm -rf "${PERSIST_ROOT}/perf_eval_results" "${HOST_HF_HOME}/hub" 2>/dev/null || rm -rf "${PERSIST_ROOT}/perf_eval_results" "${HOST_HF_HOME}/hub" 2>/dev/null || true
 mkdir -p "${PERSIST_ROOT}/perf_eval_results" "${HOST_HF_HOME}"
 chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
 
-ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist/perf_eval_results ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true; rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* >/dev/null 2>&1 || true"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist/perf_eval_results ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true; sudo -n rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* >/dev/null 2>&1 || rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* >/dev/null 2>&1 || true"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "bash -s" < "${SCRIPT_DIR}/cleanup_docker.sh" || true
 
 # ---------------------------------------------------------------------------
