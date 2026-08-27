@@ -228,5 +228,9 @@ echo "--- Copying results back for artifact upload"
 cp -r "${PERSIST_ROOT}/perf_eval_results"/* perf_eval_results/ 2>/dev/null || true
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 
+# Clean up persist directories to prevent permissions conflicts in subsequent jobs
+sudo -n rm -rf "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
+ssh "${SSH_OPTS[@]}" "${SSH_USER}@${WORKER_IP}" "sudo -n rm -rf ~/persist/perf_eval_results 2>/dev/null || true" || true
+
 echo "--- Disaggregation multi-host finished with exit code ${HEAD_EXIT_CODE}"
 exit "${HEAD_EXIT_CODE}"
