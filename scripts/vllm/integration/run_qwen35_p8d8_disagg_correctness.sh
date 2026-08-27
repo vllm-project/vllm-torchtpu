@@ -129,7 +129,9 @@ case "${ROLE}" in
     prefill_pid="$(cat "${RUN_DIR}/prefill.pid" 2>/dev/null || true)"
     if [[ -n "${prefill_pid}" ]]; then
       echo "Prefill server running (PID: ${prefill_pid}). Waiting on process..."
-      wait "${prefill_pid}"
+      while kill -0 "${prefill_pid}" 2>/dev/null; do
+        sleep 2
+      done
     fi
     ;;
 
@@ -140,7 +142,9 @@ case "${ROLE}" in
     decode_pid="$(cat "${RUN_DIR}/decode.pid" 2>/dev/null || true)"
     if [[ -n "${decode_pid}" ]]; then
       echo "Decode server running (PID: ${decode_pid}). Waiting on process..."
-      wait "${decode_pid}"
+      while kill -0 "${decode_pid}" 2>/dev/null; do
+        sleep 2
+      done
     fi
     ;;
 
