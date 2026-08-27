@@ -119,7 +119,7 @@ NUM_HOSTS=$(( ${#WORKER_IPS_ARRAY[@]} + 1 ))
 # Results dir on host (no /mnt/disks on these agents; boot disk only)
 # ---------------------------------------------------------------------------
 PERSIST_ROOT="${HOME}/persist"
-rm -rf "${PERSIST_ROOT}/perf_eval_results"
+rm -rf "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 mkdir -p "${PERSIST_ROOT}/perf_eval_results"
 chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 HOST_HF_HOME="${HOME}/hf_home"   # tokenizer/config only; weights stream from GCS

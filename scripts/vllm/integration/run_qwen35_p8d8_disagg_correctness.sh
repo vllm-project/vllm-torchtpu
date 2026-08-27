@@ -266,6 +266,8 @@ case "${ROLE}" in
     fi
     set -e
 
+    chmod -R 777 /perf_eval_results 2>/dev/null || true
+
     if [[ "${CORRECTNESS_EXIT_CODE}" -ne 0 || "${DIVERGENCE_EXIT_CODE}" -ne 0 ]]; then
       echo "ERROR: Disaggregation smoke tests failed (correctness=${CORRECTNESS_EXIT_CODE}, divergence=${DIVERGENCE_EXIT_CODE})" >&2
       exit 1
