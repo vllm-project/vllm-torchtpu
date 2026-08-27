@@ -191,7 +191,7 @@ echo "--- Starting disagg-worker (ROLE=decode) on ${WORKER_IP}"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker pull ${IMAGE_TAG} || true"
 
 # shellcheck disable=SC2029
-ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh'"
 
 # ---------------------------------------------------------------------------
 # Start Head container (ROLE=head)
@@ -209,7 +209,7 @@ docker run --name disagg-head --privileged --net=host --shm-size=128g --device /
   "${TEST_SUITE_VARS[@]}" \
   "${BQ_EVAL_VARS[@]}" \
   "${IMAGE_TAG}" \
-  bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh
+  bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh'
 HEAD_EXIT_CODE=$?
 set -e
 
