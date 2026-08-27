@@ -121,6 +121,16 @@ export DECODE_COMPILE_SIZES
 export RUN_PREFIX_CACHE_E2E_DIVERGENCE
 export STARTUP_TIMEOUT_S
 
+export P4D2_SHORT_REPEAT_LINES="${P4D2_SHORT_REPEAT_LINES:-32}"
+export P4D2_SHORT_REPEAT_COUNT="${P4D2_SHORT_REPEAT_COUNT:-3}"
+export P4D2_LONG_REPEAT_LINES="${P4D2_LONG_REPEAT_LINES:-96}"
+export P4D2_LONG_REPEAT_COUNT="${P4D2_LONG_REPEAT_COUNT:-3}"
+export P4D2_LONG_SHARED_LINES="${P4D2_LONG_SHARED_LINES:-72}"
+export P4D2_LONG_SHARED_ROUNDS="${P4D2_LONG_SHARED_ROUNDS:-2}"
+export P4D2_MIXED_LINES="${P4D2_MIXED_LINES:-72}"
+export P4D2_MIXED_ROUNDS="${P4D2_MIXED_ROUNDS:-2}"
+export P4D2_CONCURRENT_REQUESTS="${P4D2_CONCURRENT_REQUESTS:-1}"
+
 cd "${repo_root}"
 
 case "${ROLE}" in
@@ -229,11 +239,13 @@ case "${ROLE}" in
 
     # Run prefix cache correctness test
     echo "--- Running smoke_prefix_cache_correctness.py"
+    set +e
     "${PYTHON_BIN}" "${repo_root}/scripts/vllm/integration/smoke_prefix_cache_correctness.py" \
       --host "127.0.0.1" \
       --port "${PROXY_PORT}" \
       --model "${SERVED_MODEL_NAME}" \
       2>&1 | tee "${RUN_DIR}/logs/correctness.log"
+    CORRECTNESS_EXIT_CODE=$?
 
     # Run prefix cache divergence test
     if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
@@ -244,8 +256,16 @@ case "${ROLE}" in
         --model "${SERVED_MODEL_NAME}" \
         --max-tokens 1 \
         2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
+      DIVERGENCE_EXIT_CODE=$?
     else
       echo "RUN_PREFIX_CACHE_E2E_DIVERGENCE=${RUN_PREFIX_CACHE_E2E_DIVERGENCE}; skipping prefix-cache E2E divergence smoke"
+      DIVERGENCE_EXIT_CODE=0
+    fi
+    set -e
+
+    if [[ "${CORRECTNESS_EXIT_CODE}" -ne 0 || "${DIVERGENCE_EXIT_CODE}" -ne 0 ]]; then
+      echo "ERROR: Disaggregation smoke tests failed (correctness=${CORRECTNESS_EXIT_CODE}, divergence=${DIVERGENCE_EXIT_CODE})" >&2
+      exit 1
     fi
 
     echo "Disaggregation correctness smoke tests completed successfully."
