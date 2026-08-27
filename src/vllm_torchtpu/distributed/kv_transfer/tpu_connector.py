@@ -363,6 +363,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker = worker_cls(vllm_config)
 
     # ---- Scheduler-side methods -----------------------------------------
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
     def get_num_new_matched_tokens(
             self, request: "Request",
             num_computed_tokens: int) -> tuple[int, bool]:
@@ -585,6 +589,12 @@ class TPUConnectorScheduler:
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True
+
+    def on_new_request(self, request: "Request") -> None:
+        """Leaves the request as submitted: the ZMQ backend needs no
+        admission-time normalization. The Raiden stage-3 subclass overrides
+        this to truncate Mamba prompts."""
+        return
 
     def get_num_new_matched_tokens(
         self,
@@ -869,15 +879,21 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
 
+    def on_new_request(self, request: "Request") -> None:
+        """Truncates a P-side Mamba prompt at admission, ahead of the
+        scheduler's prefix-cache lookup. The lookup caps its hit at
+        num_tokens - 1 of whatever length it sees, so shortening the prompt
+        any later can leave zero new tokens to schedule."""
+        if (self.is_producer and _use_raiden_stage3_transport()
+                and self._stage3_mamba_group_indices):
+            self._maybe_truncate_for_mamba(request)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         if self.is_producer:
-            if (_use_raiden_stage3_transport()
-                    and self._stage3_mamba_group_indices):
-                self._maybe_truncate_for_mamba(request)
             return 0, False
         if not request.kv_transfer_params:
             return 0, False

@@ -684,6 +684,50 @@ class TestTPURaidenConnectorScheduler:
         self.consumer = _make_raiden_scheduler(is_producer=False)
         self.producer = _make_raiden_scheduler(is_producer=True)
 
+    def test_stage3_mamba_truncation_happens_at_admission(self):
+        producer = _make_raiden_scheduler(is_producer=True)
+        producer._stage3_mamba_group_indices = [1]
+        req = MagicMock()
+        req.request_id = "req-mamba-p"
+        req.prompt_token_ids = list(range(33))
+        req._all_token_ids = list(range(33))
+        req.num_prompt_tokens = 33
+        req.kv_transfer_params = {"do_remote_decode": True}
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            producer.on_new_request(req)
+            assert len(req.prompt_token_ids) == 32
+            assert req.num_prompt_tokens == 32
+            assert req.kv_transfer_params["_p_side_truncated"] is True
+
+            # Re-admission after preemption must not truncate again.
+            producer.on_new_request(req)
+            assert len(req.prompt_token_ids) == 32
+
+            # The lookup path runs once the prefix-cache hit is fixed, so
+            # it must leave the length alone.
+            assert producer.get_num_new_matched_tokens(req, 0) == (0, False)
+            assert len(req.prompt_token_ids) == 32
+
+    def test_stage3_truncation_skipped_without_mamba_groups(self):
+        producer = _make_raiden_scheduler(is_producer=True)
+        req = MagicMock()
+        req.request_id = "req-fa-p"
+        req.prompt_token_ids = list(range(33))
+        req._all_token_ids = list(range(33))
+        req.num_prompt_tokens = 33
+        req.kv_transfer_params = {"do_remote_decode": True}
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            producer.on_new_request(req)
+
+        assert len(req.prompt_token_ids) == 33
+        assert "_p_side_truncated" not in req.kv_transfer_params
+
     @patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=True)
     def test_inline_full_hit_recomputes_last_token(self, _inline):
         req = MagicMock()
