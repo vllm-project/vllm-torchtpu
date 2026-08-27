@@ -1093,6 +1093,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if (num_tokens < min_transfer_tokens):
                 return False, {}
 
+        max_transfer_tokens = tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS
+        if max_transfer_tokens is not None and max_transfer_tokens > 0:
+            if num_tokens > max_transfer_tokens:
+                logger.warning(
+                    "Stage-3 producer token count (%d) exceeds "
+                    "TPU_RAIDEN_MAX_TRANSFER_TOKENS (%d) for req_id=%s; "
+                    "skipping transfer and freeing blocks immediately.",
+                    num_tokens, max_transfer_tokens, request.request_id)
+                return False, {}
+
         scheduler_block_tokens = self.block_size * pcp_size
         expected_scheduler_blocks = (
             (num_tokens + scheduler_block_tokens - 1) //

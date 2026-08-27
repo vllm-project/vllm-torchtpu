@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
     TPU_RAIDEN_RESHARD_IMPL: str = "controller"
     TPU_RAIDEN_CLIENT_IMPL: str = "cpp"
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
@@ -256,6 +257,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
+    "TPU_RAIDEN_MAX_TRANSFER_TOKENS":
+    env_optional_int("TPU_RAIDEN_MAX_TRANSFER_TOKENS"),
     # Reshard control-plane hosting (zero sidecar processes): "store" hosts the
     # reshard service inside each engine's rank-0 worker via an in-process
     # KVCacheStore; "controller" keeps the external (sidecar) controller.

@@ -933,6 +933,35 @@ class TestTPURaidenConnectorScheduler:
         # Only the block covering the transferred prefix is published.
         assert list(meta.reqs_to_send[req.request_id].local_block_ids) == [100]
 
+    def test_v3_stage3_finish_rejects_exceeding_max_transfer_tokens(self):
+        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer and free blocks."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8)
+        req = MagicMock()
+        req.request_id = "too-long"
+        req.prompt_token_ids = [0] * 10_000
+        req.num_prompt_tokens = 10_000
+        req.num_computed_tokens = 10_000
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        block_ids = [100]
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS",
+                           8192,
+                           create=True):
+            delay, params = producer.request_finished(req, block_ids)
+            meta = producer.build_connector_meta()
+
+        assert not delay
+        assert params == {}
+        assert req.request_id not in meta.reqs_to_send
+
     def test_v3_stage3_finish_still_rejects_too_few_blocks(self):
         """Trimming the tail must not mask a genuinely short block table."""
         producer = _make_raiden_scheduler(is_producer=True,
