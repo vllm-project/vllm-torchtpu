@@ -92,18 +92,13 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # -- read things that are not in it. So prebuild hands the op back to the caller
 # and the caller records it on the layer's own quant method; see
 # `fused_moe_ep_supported`.
-_OPS: dict[tuple[int, bool, str, bool], Any] = {}
-_EP_SIZE: int | None = None
-# The next two are facts about the MESH, not about a layer, so one copy for the
-# process is what they are: every layer in a deployment sees the same EP group.
-#
+_OPS: dict[tuple[int, bool, str, tuple[int, ...] | None, bool], Any] = {}
+# This is a fact about the mesh, not about a layer, so one copy for the process
+# is what it is: every layer in a deployment sees the same EP group.
 # This rank's mesh index, as a device tensor. The kernel needs it as data;
 # see the note in fused_ep_moe_v2 on why a value computed inside the traced
 # function turns into a `partition-id` XLA will not accept.
 _RANK_BUFFER: Any = None
-# Which EP rank's expert block sits at each mesh index, or None for the
-# identity. See `_to_mesh_expert_order`.
-_EXPERT_ORDER: Any = None
 
 # The attribute prebuild's result is recorded under, on the quant method that
 # owns the layer. vLLM builds one quant method per MoE layer
@@ -157,12 +152,12 @@ def fused_moe_ep_supported(owner: Any) -> bool:
 
 
 def _build_op(mesh, topk: int, renormalize: bool, activation: str,
-              sharded_plan: bool):
+              mesh_expert_order: tuple[int, ...] | None, sharded_plan: bool):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
-    key = (topk, renormalize, activation, sharded_plan)
+    key = (topk, renormalize, activation, mesh_expert_order, sharded_plan)
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -201,6 +196,7 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
                                ragged_stride=None,
                                weight_format=WeightFormat.FP8,
                                act_fn=activation,
+                               mesh_ep_ranks=mesh_expert_order,
                                sharded_plan=sharded_plan)
 
     spec = PartitionSpec(EP_AXIS_NAME)
@@ -249,42 +245,31 @@ def fused_moe_ep(
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     return op(hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
-              _squeeze_channel_scale_checked(w2_scale),
-              _to_mesh_expert_order(router_logits), _RANK_BUFFER)
+              _squeeze_channel_scale_checked(w2_scale), router_logits,
+              _RANK_BUFFER)
 
 
-def _to_mesh_expert_order(router_logits: torch.Tensor) -> torch.Tensor:
-    """Reindex the expert axis from EP-rank order to mesh order.
-
-    The kernel reads a token's expert id as `mesh_index * experts_per_shard +
-    j`, but vLLM numbers experts by EP rank, and the mesh is ordered by device
-    id (see `ep_mesh.ep_rank_order`). Where those two orders differ, the block
-    of logits for EP rank r has to move to the position of the mesh index that
-    rank sits at. The output is per token, so nothing has to be undone
-    afterwards. `_EXPERT_ORDER` is None when the orders already agree, which is
-    every deployment whose EP ranks come up in device-id order.
-    """
-    if _EXPERT_ORDER is None:
-        return router_logits
-    # Split and rejoin the expert axis without naming the token axis: reading
-    # `shape[0]` here would put the token count in the traced graph.
-    blocks = router_logits.unflatten(-1, (_EP_SIZE, -1))
-    return blocks.index_select(-2, _EXPERT_ORDER).flatten(-2)
-
-
-def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
+def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
     """Which EP rank's expert block belongs at each mesh index, or None.
 
-    None means the identity, so the hot path can skip the gather entirely.
+    The tuple is static configuration closed into the JAX op. The router keeps
+    its original EP-rank order; only the selected expert IDs are mapped inside
+    the op after top-k.
     """
     order = ep_rank_order()
-    if order is None or tuple(order) == tuple(range(ep)):
+    if order is None:
+        return None
+    order = tuple(order)
+    if tuple(sorted(order)) != tuple(range(ep)):
+        raise ValueError(
+            f"EP rank order must permute range({ep}); got {order}")
+    if order == tuple(range(ep)):
         return None
     # A tuple, not a list: `info_once` keys its cache on the arguments.
     logger.info_once(
         "Fused EP MoE: EP ranks are not in device-id order, so the expert "
-        "axis is reindexed to mesh order | ep_rank_at_mesh_index=%s", order)
-    return torch.tensor(order, dtype=torch.int32, device=device)
+        "IDs are relabelled after top-k | ep_rank_at_mesh_index=%s", order)
+    return order
 
 
 def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:
@@ -316,7 +301,6 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     records it, which is what makes arming per layer rather than per process --
     several of the refusals below read things that vary by layer.
     """
-    global _EP_SIZE
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return None
 
@@ -394,7 +378,6 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                          "the grouped-matmul path serves every step.")
         return None
     ep = mesh.shape[EP_AXIS_NAME]
-    _EP_SIZE = ep
 
     gather_bytes = token_gather_smem_bytes(_TILE_M)
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
@@ -407,13 +390,13 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
             "compiler working memory).", needed_smem, smem, gather_bytes,
             _SMEM_OVERHEAD_BYTES)
         return None
-    global _RANK_BUFFER, _EXPERT_ORDER
+    global _RANK_BUFFER
     # The kernel's index is this rank's position in the mesh, which is ordered
     # by device id, not its EP rank.
     _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
                                 dtype=torch.int32,
                                 device=layer.w13_weight.device)
-    _EXPERT_ORDER = _expert_block_permutation(ep, layer.w13_weight.device)
+    mesh_expert_order = _mesh_expert_order(ep)
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
@@ -458,7 +441,8 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
-    op = _build_op(mesh, topk, renormalize, activation, sharded_plan)
+    op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
+                   sharded_plan)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "topk=%d capacity=%d sharded_plan=%s", hidden, inter, local_experts,

@@ -85,6 +85,33 @@ def _unpack_routing_blob(blob_g, topk):
     return topk_idx_g, row_scale_g
 
 
+def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
+    """Map selected experts from EP-rank order to device-mesh order.
+
+    vLLM numbers contiguous expert blocks by EP rank, while the Mosaic remote
+    DMA kernel addresses peers by their position in the device-id-ordered JAX
+    mesh. ``mesh_ep_ranks[i]`` names the EP rank at mesh index ``i``.
+
+    Apply the permutation after top-k selection. Reordering the full router
+    logits before selection materializes a ``[tokens, experts]`` gather at the
+    Torch/JAX boundary, and can also change which expert wins an exact tie.
+    Here only the ``[tokens, topk]`` integer IDs move; the selected weights keep
+    the arithmetic and tie behavior of the unpermuted router.
+    """
+    if mesh_ep_ranks is None:
+        return topk_idx
+    ep = len(mesh_ep_ranks)
+    if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
+        raise ValueError("mesh_ep_ranks must be a permutation of "
+                         f"range({ep}); got {mesh_ep_ranks}")
+    owning_rank = topk_idx // g_local
+    mesh_block = jnp.zeros_like(topk_idx)
+    for mesh_index, ep_rank in enumerate(mesh_ep_ranks):
+        mesh_block = jnp.where(owning_rank == ep_rank, jnp.int32(mesh_index),
+                               mesh_block)
+    return mesh_block * g_local + topk_idx % g_local
+
+
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
@@ -110,6 +137,7 @@ def fused_ep_moe_v2(x,
                     rhs_qb=None,
                     act_fn="silu",
                     rank=None,
+                    mesh_ep_ranks=None,
                     sharded_plan=False):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -147,6 +175,10 @@ def fused_ep_moe_v2(x,
     sharded_plan computes the same kernel operands from the two complementary
     1/ep slices their consumers read, plus one small expert-count all-gather.
     It changes routing-plan construction only, never the core kernel.
+
+    mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
+    order relabels only the selected expert ids after top-k, keeping the full
+    router-logit tensor in its original order.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -196,6 +228,11 @@ def fused_ep_moe_v2(x,
                                  f"takes")
     (ax, ) = mesh.axis_names
     ep = mesh.shape[ax]
+    if mesh_ep_ranks is not None:
+        mesh_ep_ranks = tuple(int(rank) for rank in mesh_ep_ranks)
+        if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
+            raise ValueError("mesh_ep_ranks must be a permutation of "
+                             f"range({ep}); got {mesh_ep_ranks}")
     g_local = e_total // ep
     t_local = T // ep
     P = jax.sharding.PartitionSpec
@@ -261,6 +298,8 @@ def fused_ep_moe_v2(x,
         topk_weights, topk_idx = pallas_select(scores,
                                                topk=topk,
                                                block_rows=select_rows)
+        topk_idx = _relabel_expert_ids_to_mesh_order(
+            topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks)
         # A row of scores carrying no real value routes nowhere. It was
         # dropped by arithmetic accident: the selector gives every slot of
         # such a row a large negative sentinel, and the renormalization below
@@ -430,7 +469,7 @@ def fused_ep_moe_v2(x,
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (mesh, T, hidden, e_total, inter, topk, bool(renormalize), capacity,
-           block, ragged_stride, weight_format, rhs_qb, act_fn,
+           block, ragged_stride, weight_format, rhs_qb, act_fn, mesh_ep_ranks,
            bool(sharded_plan), x.dtype, w1.dtype, w2.dtype, form.has_scales
            and w1_scale.dtype, gating.dtype, has_w1_bias
            and w1_bias.dtype, has_w2_bias and w2_bias.dtype)

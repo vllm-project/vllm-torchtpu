@@ -98,7 +98,7 @@ def ep_rank_order() -> tuple[int, ...] | None:
     Ordering by device id means mesh index i is no longer EP rank i, so the
     shard sitting at mesh index i owns the experts of EP rank
     `ep_rank_order()[i]` rather than of rank i. The caller has to say so -- see
-    `fused_moe_ep._expert_block_permutation` -- because the kernel reads a
+    `fused_moe_ep._mesh_expert_order` -- because the kernel reads a
     token's expert id as `mesh_index * experts_per_shard + j`.
 
     Returns None when EP is off.
