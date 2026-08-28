@@ -13,6 +13,7 @@ Adheres to SOLID architecture principles:
 import argparse
 import csv
 import itertools
+import json
 import os
 import sys
 from datetime import datetime
@@ -156,8 +157,28 @@ class SweepOrchestrator:
         return resolver.resolve(current_config, spec.get("config", {}))
 
     def _get_completed_coordinates(self) -> List[Dict[str, Any]]:
-        """Reads existing rows from the results CSV to support seamless sweep resumption."""
+        """Reads existing completed trial parameters from sweep.json (primary source of truth)
+
+        with fallback to results.csv for legacy backwards compatibility.
+        """
         completed: List[Dict[str, Any]] = []
+
+        # 1. Primary Source of Truth: sweep.json
+        if os.path.exists(self.json_file):
+            try:
+                with open(self.json_file, "r") as f:
+                    data = json.load(f)
+                    for trial in data.get("experiments", []):
+                        if trial.get(
+                                "status"
+                        ) == "COMPLETED" and "parameters" in trial:
+                            completed.append(trial["parameters"])
+                if completed:
+                    return completed
+            except Exception as e:
+                print(f">>> [WARNING] Failed to parse {self.json_file}: {e}")
+
+        # 2. Fallback for legacy experiments: results.csv
         if os.path.exists(self.csv_file):
             with open(self.csv_file, "r", newline="") as f:
                 reader = csv.DictReader(f)
@@ -180,7 +201,7 @@ class SweepOrchestrator:
         sweep_values = list(sweep.values())
         cross_product = list(itertools.product(*sweep_values))
 
-        # Check for previously completed coordinates
+        # Check for previously completed coordinates from sweep.json (or csv fallback)
         completed_configs = self._get_completed_coordinates()
 
         print("=======================================================")
@@ -195,7 +216,7 @@ class SweepOrchestrator:
         for combo in cross_product:
             current_config = dict(zip(sweep_keys, combo))
 
-            # Resumption check: skip coordinate if already recorded in CSV
+            # Resumption check: skip coordinate if already recorded in sweep.json or CSV
             skip = False
             for completed_row in completed_configs:
                 if all(
@@ -205,8 +226,10 @@ class SweepOrchestrator:
                     break
 
             if skip:
+                source_file = (self.json_file if os.path.exists(self.json_file)
+                               and completed_configs else self.csv_file)
                 print(
-                    f">>> [SKIPPED] Coordinate {current_config} already completed in {self.csv_file}."
+                    f">>> [SKIPPED] Coordinate {current_config} already completed in {os.path.basename(source_file)}."
                 )
                 continue
 

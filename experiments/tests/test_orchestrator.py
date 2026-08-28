@@ -8,6 +8,7 @@ Unit test suite for the master sweep orchestrator:
 """
 
 import csv
+import json
 import os
 import sys
 import tempfile
@@ -143,6 +144,79 @@ class TestSweepOrchestrator(unittest.TestCase):
                 reader = list(csv.DictReader(f))
                 self.assertEqual(len(reader), 2,
                                  "Final CSV should contain both rows")
+
+    def test_resume_skipping_already_evaluated_points_from_sweep_json(self):
+        """Verifies that sweep.json is the primary source of truth for skipping evaluated coordinates."""
+        config_data = {
+            "mode": "profile",
+            "sweep_matrix": {
+                "model": ["model_A", "model_B"],
+                "batch_size": [4]
+            }
+        }
+        self._write_yaml(config_data)
+
+        exp_dir = os.path.join(self.results_dir, "test_resume_json_exp")
+        os.makedirs(exp_dir, exist_ok=True)
+        json_file = os.path.join(exp_dir, "sweep.json")
+        metadata_file = os.path.join(exp_dir, "metadata.yaml")
+
+        # Pre-seed sweep.json with model_A already completed
+        sweep_data = {
+            "schema_version":
+            "1.0.0",
+            "sweep_id":
+            "test_resume_json_exp",
+            "status":
+            "RUNNING",
+            "metadata":
+            config_data,
+            "experiments": [{
+                "experiment_id": "test_resume_json_exp_trial_000",
+                "trial_index": 0,
+                "status": "COMPLETED",
+                "timestamp": "2026-08-28T12:00:00Z",
+                "parameters": {
+                    "model": "model_A",
+                    "batch_size": 4
+                },
+                "metrics": {
+                    "Throughput_tok_s": 50.0
+                }
+            }]
+        }
+        with open(json_file, "w") as f:
+            json.dump(sweep_data, f)
+
+        # Pre-seed metadata.yaml matching config
+        with open(metadata_file, "w") as f:
+            yaml.dump(config_data, f)
+
+        mock_runner = MagicMock()
+        mock_runner.execute.return_value = BenchmarkResult(
+            duration_s=5.0,
+            metrics={"Throughput_tok_s": 60.0},
+            log_path="dummy.json")
+
+        with patch("runners.registry.RunnerRegistry.get",
+                   return_value=mock_runner):
+            orchestrator = run_sweep.SweepOrchestrator(
+                config_path=self.config_path,
+                result_dir=self.results_dir,
+                experiment_id="test_resume_json_exp")
+            orchestrator.run()
+
+            # Assert: Runner only invoked 1 time (for model_B) because model_A was in sweep.json
+            self.assertEqual(
+                mock_runner.execute.call_count, 1,
+                "model_A was recorded in sweep.json, so only model_B should run"
+            )
+
+            with open(json_file, "r") as f:
+                data = json.load(f)
+                self.assertEqual(
+                    len(data["experiments"]), 2,
+                    "Final sweep.json should contain both trials")
 
     def test_metadata_file_creation_with_message(self):
         """Verifies that a new experiment creates metadata.yaml containing config and description."""
