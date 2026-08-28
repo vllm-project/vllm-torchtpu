@@ -27,6 +27,13 @@ if EXPERIMENTS_DIR not in sys.path:
     sys.path.insert(0, EXPERIMENTS_DIR)
 
 from core.csv_recorder import CsvResultRecorder  # noqa: E402
+
+# Patch transformers for heterogeneous architectures (e.g. Gemma 4)
+try:
+    from transformers.configuration_utils import PretrainedConfig  # noqa: E402
+    PretrainedConfig.allow_global_per_layer_attribute_access = True
+except Exception:
+    pass
 from core.env import setup_tpu_env  # noqa: E402
 from core.models import BenchmarkResult, ExecutionContext  # noqa: E402
 from resolvers.registry import ResolverRegistry  # noqa: E402
@@ -53,18 +60,19 @@ class SweepOrchestrator:
         result_dir: str = DEFAULT_RESULT_DIR,
         experiment_id: Optional[str] = None,
         message: Optional[str] = None,
+        resume: bool = False,
     ):
         """Initializes the sweep orchestrator and prepares output directory and recorders."""
         self.config_path = config_path
         self.result_dir = result_dir
         self.experiment_id = experiment_id
         self.message = message
+        self.resume = resume
         self.config = self._load_config(config_path)
 
-        exp_id = (self.experiment_id if self.experiment_id else
-                  datetime.now().strftime("%Y%m%d_%H%M%S"))
-        self.exp_id = exp_id
-        self.exp_dir = os.path.join(self.result_dir, exp_id)
+        self.exp_id = (self.experiment_id if self.experiment_id else
+                       datetime.now().strftime("%Y%m%d_%H%M%S"))
+        self.exp_dir = os.path.join(self.result_dir, self.exp_id)
         os.makedirs(self.exp_dir, exist_ok=True)
         self.csv_file = os.path.join(self.exp_dir, "results.csv")
         self.json_file = os.path.join(self.exp_dir, "sweep.json")
@@ -94,13 +102,12 @@ class SweepOrchestrator:
             for k, v in self.config.items() if k != "description"
         }
 
-        if self.experiment_id:
-            # Resuming experiment: -m is ignored and only works if config matches metadata.yaml
-            if not os.path.exists(self.metadata_file):
-                raise FileNotFoundError(
-                    f"Cannot resume experiment '{self.experiment_id}': metadata file"
-                    f" not found at {self.metadata_file}.")
+        if self.resume and not os.path.exists(self.metadata_file):
+            raise FileNotFoundError(
+                f"Cannot resume experiment '{self.exp_id}': metadata file"
+                f" not found at {self.metadata_file}.")
 
+        if os.path.exists(self.metadata_file):
             saved_metadata = self._load_config(self.metadata_file) or {}
             self.metadata_content = saved_metadata
             if "config" in saved_metadata and isinstance(
@@ -114,10 +121,10 @@ class SweepOrchestrator:
 
             if current_config != saved_config:
                 raise ValueError(
-                    f"Cannot resume experiment '{self.experiment_id}': provided"
+                    f"Cannot resume experiment '{self.exp_id}': provided"
                     " config does not match the config saved in"
                     f" {self.metadata_file}.")
-            print(f">>> [RESUME] Resuming experiment {self.experiment_id} with"
+            print(f">>> [RESUME] Resuming experiment {self.exp_id} with"
                   " verified matching config (ignoring -m/--message).")
         else:
             # Fresh run: save a copy of the exact config under id/metadata.yaml with description
@@ -327,12 +334,19 @@ def main():
         help="Base directory for results",
     )
     parser.add_argument(
-        "-id",
-        "--id",
         "--experiment-id",
+        "--id",
+        "-id",
         dest="experiment_id",
         default=None,
-        help="Pass to resume sweep from specific ID",
+        help="Experiment identifier to run or resume",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help=
+        "Require resuming an existing experiment (fails if metadata is missing)",
     )
     parser.add_argument(
         "-m",
@@ -348,6 +362,7 @@ def main():
         result_dir=args.result_dir,
         experiment_id=args.experiment_id,
         message=args.message,
+        resume=args.resume,
     )
     orchestrator.run()
 
