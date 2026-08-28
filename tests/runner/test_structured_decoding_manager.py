@@ -202,8 +202,11 @@ class TestStructuredDecode:
                                 (num_reqs, num_words),
                                 dtype=torch.int32)
         arange = torch.arange(32)
+        # All rows structured: the fused gate reduces to the plain bitmask,
+        # so the output must match the per-bit reference exactly.
+        require = torch.ones((num_reqs, 1), dtype=torch.bool)
 
-        out = manager.apply_grammar_bitmask(logits, bitmask, arange)
+        out = manager._structured_decode(require, bitmask, logits, arange)
 
         expected = reference_apply_bitmask(logits, bitmask, vocab_size)
         assert torch.equal(out, expected)
