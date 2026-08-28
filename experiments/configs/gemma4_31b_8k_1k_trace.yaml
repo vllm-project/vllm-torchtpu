@@ -1,0 +1,32 @@
+# Goal: Single-point throughput and latency profile with advanced TPU hardware tracing
+# Model: Gemma 4 31B-IT (TP=4, BF16)
+# Workload: batch_size=1, input_len=8192 (8k), output_len=1024 (1k)
+# Hardware: Cloud TPU v6e-4 (4 chips)
+
+mode: profile
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 16384
+
+engine_args:
+  enable_prefix_caching: false
+  gpu_memory_utilization: 0.90
+
+env_vars:
+  VLLM_ENABLE_V1_MULTIPROCESSING: '0'
+
+trace_configs:
+  - batch_size: 1
+    input_len: 8192
+    output_len: 1024
+    jax_advanced_configuration:
+      tpu_enable_periodic_counter_sampling: true
+      tpu_tc_perf_counter_sampling_options: "interval_us:10 scaling:0 counter_size_bits:1 indices:56 indices:57 indices:58 indices:38 indices:105"
+      tpu_cmn_perf_counter_sampling_options: "interval_us:32 scaling:0 counter_size_bits:2 indices:1 indices:2 indices:58"
+
+sweep_matrix:
+  model: [google/gemma-4-31B-it]
+  batch_size: [1]
+  input_len: [8192]
+  output_len: [1024]
