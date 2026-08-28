@@ -1,0 +1,123 @@
+{
+  "schema_version": "1.0.0",
+  "sweep_id": "20260826_173544",
+  "created_at": "2026-08-26T17:35:44Z",
+  "completed_at": "2026-08-26T17:44:35Z",
+  "status": "COMPLETED",
+  "user_ldap": "shenrunz",
+  "hardware": {
+    "accelerator_type": "TPU v6e",
+    "chip_count": 4,
+    "node_hostname": "shenrunz-v6e-4-southamerica-west1-a-tpu"
+  },
+  "git_info": {
+    "commit_hash": "176256b43d2ef74558ef9c7e39be3dd57d3eb84a",
+    "branch": "main",
+    "is_dirty": false
+  },
+  "metadata": {
+    "description": "Baseline MMLU-Pro fast evaluation on Gemma 4 31B",
+    "mode": "eval",
+    "benchmark": "mmlu_pro_fast",
+    "tensor_parallel_size": 4,
+    "dtype": "bfloat16",
+    "max_model_len": 16384,
+    "engine_args": {
+      "enable_prefix_caching": false,
+      "gpu_memory_utilization": 0.9
+    },
+    "sweep_matrix": {
+      "model": [
+        "google/gemma-4-31B-it"
+      ],
+      "tasks": [
+        "mmlu_pro_fast"
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "experiment_id": "20260826_173544_trial_000",
+      "trial_index": 0,
+      "status": "COMPLETED",
+      "timestamp": "2026-08-26T17:44:30Z",
+      "parameters": {
+        "model": "google/gemma-4-31B-it",
+        "benchmark": "mmlu_pro_fast",
+        "total_sample_len": 608,
+        "tensor_parallel_size": 4,
+        "dtype": "bfloat16"
+      },
+      "metrics": {
+        "eval_duration_seconds": 530.49,
+        "mmlu_pro_exact_match": 0.6842,
+        "mmlu_pro_exact_match_stderr": 0.0189,
+        "total_samples": 608,
+        "category_scores": {
+          "biology": {
+            "samples": 36,
+            "score": 0.7222
+          },
+          "business": {
+            "samples": 40,
+            "score": 0.65
+          },
+          "chemistry": {
+            "samples": 57,
+            "score": 0.614
+          },
+          "computer_science": {
+            "samples": 21,
+            "score": 0.7619
+          },
+          "economics": {
+            "samples": 43,
+            "score": 0.7442
+          },
+          "engineering": {
+            "samples": 49,
+            "score": 0.6327
+          },
+          "health": {
+            "samples": 41,
+            "score": 0.7073
+          },
+          "history": {
+            "samples": 20,
+            "score": 0.8
+          },
+          "law": {
+            "samples": 56,
+            "score": 0.6786
+          },
+          "math": {
+            "samples": 68,
+            "score": 0.6029
+          },
+          "other": {
+            "samples": 47,
+            "score": 0.7234
+          },
+          "philosophy": {
+            "samples": 25,
+            "score": 0.76
+          },
+          "physics": {
+            "samples": 65,
+            "score": 0.6462
+          },
+          "psychology": {
+            "samples": 40,
+            "score": 0.75
+          }
+        }
+      },
+      "artifacts": {
+        "log_path": "/mnt/pd/vllm-torchtpu/experiments/results/20260826_173544/results.csv",
+        "eval_report_path": "/mnt/pd/vllm-torchtpu/experiments/results/20260826_173544/eval_summary.json"
+      },
+      "reproduction_command": "python3 run_sweep_orchestrator.py --config /mnt/pd/vllm-torchtpu/experiments/configs/0_baseline_mmlu_pro_fast.yaml",
+      "error_message": null
+    }
+  ]
+}

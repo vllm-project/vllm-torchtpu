@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0.0",
+  "sweep_id": "20260827_235950",
+  "created_at": "2026-08-27T23:59:50Z",
+  "completed_at": "2026-08-28T00:03:15Z",
+  "status": "COMPLETED",
+  "user_ldap": "shenrunz",
+  "hardware": {
+    "accelerator_type": "TPU v6e",
+    "chip_count": 4,
+    "node_hostname": "shenrunz-v6e-4-southamerica-west1-a-tpu"
+  },
+  "metadata": {
+    "description": "Gemma 4 31B 8k input 1k output batch 1 with periodic hardware counter sampling",
+    "mode": "profile",
+    "tensor_parallel_size": 4,
+    "dtype": "bfloat16",
+    "max_model_len": 16384,
+    "engine_args": {
+      "enable_prefix_caching": false,
+      "gpu_memory_utilization": 0.9
+    },
+    "env_vars": {
+      "VLLM_ENABLE_V1_MULTIPROCESSING": "0"
+    },
+    "trace_configs": [
+      {
+        "batch_size": 1,
+        "input_len": 8192,
+        "output_len": 1024,
+        "jax_advanced_configuration": {
+          "tpu_enable_periodic_counter_sampling": true,
+          "tpu_tc_perf_counter_sampling_options": "interval_us:10 scaling:0 counter_size_bits:1 indices:56 indices:57 indices:58 indices:38 indices:105",
+          "tpu_cmn_perf_counter_sampling_options": "interval_us:32 scaling:0 counter_size_bits:2 indices:1 indices:2 indices:58"
+        }
+      }
+    ],
+    "sweep_matrix": {
+      "model": [
+        "google/gemma-4-31B-it"
+      ],
+      "batch_size": [
+        1
+      ],
+      "input_len": [
+        8192
+      ],
+      "output_len": [
+        1024
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "experiment_id": "20260827_235950_trial_000",
+      "trial_index": 0,
+      "status": "COMPLETED",
+      "timestamp": "2026-08-28T00:03:10Z",
+      "parameters": {
+        "model": "google/gemma-4-31B-it",
+        "batch_size": 1,
+        "input_len": 8192,
+        "output_len": 1024,
+        "tensor_parallel_size": 4,
+        "dtype": "bfloat16",
+        "max_model_len": 16384
+      },
+      "metrics": {
+        "throughput_tokens_per_sec": 58.62,
+        "duration_seconds": 17.4673,
+        "prompt_tokens": 8192,
+        "generation_tokens": 1024,
+        "total_tokens": 9216
+      },
+      "artifacts": {
+        "log_path": "/mnt/pd/vllm-torchtpu/experiments/results/20260827_235950/results.csv",
+        "trace_paths": [
+          "/mnt/pd/vllm-torchtpu/experiments/results/20260827_235950/traces/plugins/profile/2026_08_27_23_59_50/local_tpu_worker.xplane.pb"
+        ]
+      },
+      "reproduction_command": "python3 run_sweep_orchestrator.py --config configs/gemma4_31b_8k_1k_trace.yaml",
+      "error_message": null
+    }
+  ]
+}
