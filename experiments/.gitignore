@@ -24,3 +24,4 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+g3doc

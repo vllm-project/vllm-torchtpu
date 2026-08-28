@@ -1,5 +1,6 @@
-"""core package.
-
+"""
+core package
+------------
 Core domain models, execution interfaces, and orchestration utilities.
 """
 
@@ -10,6 +11,7 @@ from core.env import (HF_HOME, ROOT_DIR, SPARSE_CHECKPOINTS_DIR,
                       VLLM_TORCHTPU_SRC, setup_tpu_env)
 from core.interfaces import (IModelResolver, IResultRecorder, IRunner,
                              ISparsityEngine)
+from core.json_recorder import CompositeResultRecorder, JsonResultRecorder
 from core.models import BenchmarkResult, ExecutionContext
 
 __all__ = [
@@ -20,6 +22,8 @@ __all__ = [
     "IResultRecorder",
     "ISparsityEngine",
     "CsvResultRecorder",
+    "JsonResultRecorder",
+    "CompositeResultRecorder",
     "VllmEngineBuilder",
     "ROOT_DIR",
     "HF_HOME",
