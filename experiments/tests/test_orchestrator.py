@@ -309,7 +309,7 @@ class TestSweepOrchestrator(unittest.TestCase):
                       str(ctx.exception))
 
     def test_resume_missing_metadata_raises_error(self):
-        """Verifies that resuming an experiment ID with no metadata.yaml raises FileNotFoundError."""
+        """Verifies that explicitly resuming an experiment ID with no metadata.yaml raises FileNotFoundError."""
         config_data = {
             "mode": "eval",
             "model": "base_model",
@@ -322,8 +322,28 @@ class TestSweepOrchestrator(unittest.TestCase):
         with self.assertRaises(FileNotFoundError) as ctx:
             run_sweep.SweepOrchestrator(config_path=self.config_path,
                                         result_dir=self.results_dir,
-                                        experiment_id="non_existent_exp")
+                                        experiment_id="non_existent_exp",
+                                        resume=True)
         self.assertIn("metadata file not found", str(ctx.exception))
+
+    def test_fresh_run_with_custom_experiment_id(self):
+        """Verifies that passing an experiment_id without resume=True starts a fresh run with that ID."""
+        config_data = {
+            "mode": "eval",
+            "model": "base_model",
+            "sweep_matrix": {
+                "batch_size": [1]
+            }
+        }
+        self._write_yaml(config_data)
+
+        orchestrator = run_sweep.SweepOrchestrator(
+            config_path=self.config_path,
+            result_dir=self.results_dir,
+            experiment_id="custom_named_exp",
+            resume=False)
+        self.assertEqual(orchestrator.exp_id, "custom_named_exp")
+        self.assertTrue(os.path.exists(orchestrator.metadata_file))
 
 
 if __name__ == "__main__":
