@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://google.corp/marc/schemas/sweep.schema.json",
+  "title": "MarcExperimentSweep",
+  "description": "Canonical JSON schema for MARC experiment sweeps, trials, and metadata.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "sweep_id",
+    "created_at",
+    "status",
+    "user_ldap",
+    "metadata",
+    "experiments"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Semantic schema version."
+    },
+    "sweep_id": {
+      "type": "string",
+      "description": "Unique sweep identifier (e.g. '20260827_235950').",
+      "pattern": "^[0-9]{8}_[0-9]{6}(_[a-z0-9]+)?$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 creation timestamp for date-range filtering."
+    },
+    "completed_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 completion timestamp (null while running)."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PENDING", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"],
+      "description": "High-level execution status of the sweep."
+    },
+    "user_ldap": {
+      "type": "string",
+      "description": "LDAP of the experiment author (e.g. 'shenrunz')."
+    },
+    "hardware": {
+      "type": "object",
+      "properties": {
+        "accelerator_type": { "type": "string", "example": "TPU v6e" },
+        "chip_count": { "type": "integer", "default": 4 }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Exact dictionary snapshot from metadata.yaml (config, description, sweep_matrix).",
+      "required": ["description", "mode"],
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "User description passed via --message / -m."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["profile", "eval", "both"],
+          "description": "Primary sweep execution mode."
+        },
+        "sweep_matrix": {
+          "type": "object",
+          "description": "Cartesian product axes defined in YAML."
+        }
+      },
+      "additionalProperties": true
+    },
+    "experiments": {
+      "type": "array",
+      "description": "Array of individual experiment trials executed within this sweep.",
+      "items": {
+        "$ref": "#/$defs/ExperimentTrial"
+      }
+    }
+  },
+  "$defs": {
+    "ExperimentTrial": {
+      "type": "object",
+      "required": [
+        "experiment_id",
+        "trial_index",
+        "status",
+        "timestamp",
+        "parameters",
+        "metrics"
+      ],
+      "properties": {
+        "experiment_id": {
+          "type": "string",
+          "description": "Unique trial ID (e.g. '20260827_235950_trial_000')."
+        },
+        "trial_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-indexed sequential trial counter."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["COMPLETED", "FAILED", "RUNNING", "SKIPPED"]
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when this trial completed."
+        },
+        "parameters": {
+          "type": "object",
+          "description": "Flexible independent variables (sweep coordinates + model specs). Dynamic key-value map.",
+          "additionalProperties": {
+            "type": ["string", "number", "boolean", "array", "object", "null"]
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "description": "Flexible dependent variables (profile throughput, latencies, eval accuracy, category scores). Dynamic key-value map.",
+          "additionalProperties": {
+            "type": ["number", "string", "boolean", "object", "array", "null"]
+          }
+        },
+        "artifacts": {
+          "type": "object",
+          "description": "File paths or URIs to traces, logs, and artifacts.",
+          "properties": {
+            "log_path": { "type": "string" },
+            "trace_paths": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "checkpoint_path": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        },
+        "reproduction_command": {
+          "type": "string",
+          "description": "Exact CLI command string to reproduce this trial."
+        },
+        "error_message": {
+          "type": ["string", "null"]
+        }
+      }
+    }
+  }
+}
