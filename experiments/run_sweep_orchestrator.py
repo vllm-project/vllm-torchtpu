@@ -26,6 +26,7 @@ if EXPERIMENTS_DIR not in sys.path:
     sys.path.insert(0, EXPERIMENTS_DIR)
 
 from core.csv_recorder import CsvResultRecorder  # noqa: E402
+from core.json_recorder import JsonResultRecorder, CompositeResultRecorder  # noqa: E402
 from core.env import setup_tpu_env  # noqa: E402
 from core.models import BenchmarkResult, ExecutionContext  # noqa: E402
 from resolvers.registry import ResolverRegistry  # noqa: E402
@@ -51,7 +52,7 @@ class SweepOrchestrator:
         experiment_id: Optional[str] = None,
         message: Optional[str] = None,
     ):
-        """Initializes the sweep orchestrator and prepares output directory and CSV recorder."""
+        """Initializes the sweep orchestrator and prepares output directory and recorders."""
         self.config_path = config_path
         self.result_dir = result_dir
         self.experiment_id = experiment_id
@@ -67,12 +68,24 @@ class SweepOrchestrator:
         self.exp_dir = os.path.join(self.result_dir, exp_id)
         os.makedirs(self.exp_dir, exist_ok=True)
         self.csv_file = os.path.join(self.exp_dir, "results.csv")
+        self.json_file = os.path.join(self.exp_dir, "sweep.json")
         self.metadata_file = os.path.join(self.exp_dir, "metadata.yaml")
 
         self._setup_metadata()
 
-        # Initialize CSV result recorder
-        self.recorder = CsvResultRecorder(self.csv_file)
+        # Initialize dual result recorders (CSV for flat logs, JSON for hierarchical schema)
+        self.csv_recorder = CsvResultRecorder(self.csv_file)
+        hardware_info = {
+            "accelerator_type": self.config.get("accelerator_type", "TPU v6e"),
+            "chip_count": int(self.config.get("tensor_parallel_size", 4)),
+        }
+        self.json_recorder = JsonResultRecorder(
+            json_file=self.json_file,
+            sweep_id=self.exp_id,
+            metadata=getattr(self, "metadata_content", self.config),
+            hardware=hardware_info,
+        )
+        self.recorder = CompositeResultRecorder([self.csv_recorder, self.json_recorder])
 
     def _setup_metadata(self) -> None:
         """Handles metadata.yaml persistence and config verification on resume."""
@@ -89,6 +102,7 @@ class SweepOrchestrator:
                 )
 
             saved_metadata = self._load_config(self.metadata_file) or {}
+            self.metadata_content = saved_metadata
             if "config" in saved_metadata and isinstance(
                 saved_metadata["config"], dict
             ):
@@ -122,6 +136,7 @@ class SweepOrchestrator:
                 yaml.dump(
                     metadata, f, default_flow_style=False, sort_keys=False
                 )
+            self.metadata_content = metadata
             print(
                 ">>> [METADATA] Saved experiment metadata to"
                 f" {self.metadata_file}"
@@ -208,12 +223,34 @@ class SweepOrchestrator:
             combined_metadata = {**current_config}
             batch_size = current_config.get(
                 "batch_size",
-                eval_cfg.get("batch_size", self.config.get(
-                    "batch_size", "auto")),
+                eval_cfg.get(
+                    "batch_size", self.config.get("batch_size", "auto")
+                ),
             )
-            tasks = current_config.get("tasks",
-                                       eval_cfg.get("tasks", "mmlu_pro"))
+            tasks = current_config.get(
+                "tasks", eval_cfg.get("tasks", "mmlu_pro")
+            )
             limit = current_config.get("limit", eval_cfg.get("limit", None))
+
+            # Resolve trace configuration and advanced JAX profiler options
+            trace_configs = self.config.get("trace_configs", [])
+            trace = bool(trace_configs)
+            matching_jax_config = {}
+            for tc in trace_configs:
+                matches = True
+                for k in ("batch_size", "input_len", "output_len"):
+                    if k in tc and str(tc[k]) != str(current_config.get(k)):
+                        matches = False
+                        break
+                if matches:
+                    matching_jax_config = tc.get(
+                        "jax_advanced_configuration", {}
+                    )
+                    break
+            if trace and not matching_jax_config and trace_configs:
+                matching_jax_config = trace_configs[0].get(
+                    "jax_advanced_configuration", {}
+                )
 
             context = ExecutionContext(
                 model_path=target_model,
@@ -226,10 +263,13 @@ class SweepOrchestrator:
                 csv_file=self.csv_file,
                 batch_size=batch_size,
                 input_len=current_config.get(
-                    "input_len", current_config.get("inputs", 128)),
+                    "input_len", current_config.get("inputs", 128)
+                ),
                 output_len=current_config.get(
-                    "output_len", current_config.get("output", 64)),
-                trace=bool(self.config.get("trace_configs", [])),
+                    "output_len", current_config.get("output", 64)
+                ),
+                trace=trace,
+                jax_advanced_configuration=matching_jax_config,
                 tasks=tasks,
                 limit=limit,
             )
@@ -240,7 +280,7 @@ class SweepOrchestrator:
                 runner = RunnerRegistry.get(r_name)
                 result: BenchmarkResult = runner.execute(context)
 
-                # 4. Persist trial metrics to CSV
+                # 4. Persist trial metrics to CSV and JSON
                 cmd_repro = f"python3 run_sweep_orchestrator.py --config {self.config_path}"
                 self.recorder.record(
                     metadata=combined_metadata,
@@ -248,7 +288,15 @@ class SweepOrchestrator:
                     reproduction_cmd=cmd_repro,
                 )
 
+        # Finalize recorders (e.g. stamp completed_at in sweep.json)
+        if hasattr(self.recorder, "finalize") and callable(
+            getattr(self.recorder, "finalize")
+        ):
+            self.recorder.finalize(status="COMPLETED")
+
         print(f">>> [SWEEP COMPLETE] Results written to {self.csv_file}")
+        if os.path.exists(self.json_file):
+            print(f">>> [SWEEP COMPLETE] Sweep JSON written to {self.json_file}")
         return self.csv_file
 
 

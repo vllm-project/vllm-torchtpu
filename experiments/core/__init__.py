@@ -1,9 +1,11 @@
-"""core package.
-
+"""
+core package
+------------
 Core domain models, execution interfaces, and orchestration utilities.
 """
 
 from core.csv_recorder import CsvResultRecorder
+from core.json_recorder import JsonResultRecorder, CompositeResultRecorder
 from core.engine_builder import VllmEngineBuilder
 from core.env import (
     HF_HOME,
@@ -30,6 +32,8 @@ __all__ = [
     "IResultRecorder",
     "ISparsityEngine",
     "CsvResultRecorder",
+    "JsonResultRecorder",
+    "CompositeResultRecorder",
     "VllmEngineBuilder",
     "ROOT_DIR",
     "HF_HOME",
