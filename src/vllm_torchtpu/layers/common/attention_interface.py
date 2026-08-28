@@ -19,10 +19,12 @@ import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
+from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.utils import update_sparse_mla_kv_cache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
 
@@ -743,6 +745,8 @@ def sparse_mla_attention(
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
         mesh: Mesh,
+        nope_spec: SparseMLAKVCacheSpec,
+        rope_spec: SparseMLAKVCacheSpec,
         sm_scale: float | None = None,
         k_scale: float | None = None
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -753,14 +757,16 @@ def sparse_mla_attention(
       q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      kv_cache_nope: Paged uint8 nope cache in dsa_gather's tiled layout (`[num_blocks, block_size, tile_subrows, lane_bytes]`)
-      kv_cache_rope: Paged uint8 rope cache in dsa_gather's tiled layout (`[num_blocks, block_size // tile_subrows, tile_subrows, lane_bytes]`)
+      kv_cache_nope: Paged uint8 nope cache, shaped by `nope_spec`.
+      kv_cache_rope: Paged uint8 rope cache, shaped by `rope_spec`.
       topk_indices: Indexer output specifying tokens to gather (`[num_tokens, topk]`).
       seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
       block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
       query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
       request_distribution: Tensor of (decode_end, prefill_end, num_seqs) indexing bounds.
       mesh: Target sharding mesh.
+      nope_spec: Layout descriptor the nope cache was allocated from.
+      rope_spec: Layout descriptor the rope cache was allocated from.
       sm_scale: Softmax temperature scale.
       k_scale: Dequantization scale for fp8 keys.
 
@@ -781,6 +787,19 @@ def sparse_mla_attention(
       * Per-token kv_lens derive from the "-1" tail padding in
         `topk_indices`; every token must have at least one valid entry.
     """
+    # dsa_gather moves one (`TILE_SUBROWS`, `TILE_LANE_BYTES`) uint8 tile of
+    # nope and one `TILE_LANE_BYTES`-byte lane row of rope per token; other
+    # head dims don't fit its address arithmetic.
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    tile_subrows = dsa_gather.TILE_SUBROWS
+    lane_bytes = dsa_gather.TILE_LANE_BYTES
+    assert (
+        lkv_dim == tile_subrows * lane_bytes and rope_dim * 2 == lane_bytes), (
+            "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+            f"head dimension to be {tile_subrows * lane_bytes} and the fp8 "
+            f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+            f"{rope_dim}")
+
     in_specs = (
         P(None, None, None),  # ql_nope
         P(None, None, None),  # q_pe
@@ -808,8 +827,15 @@ def sparse_mla_attention(
                                            query_start_loc_,
                                            request_distribution_):
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
-            kv_cache_nope, kv_cache_rope, kv_c_normed, k_pe, seq_lens_,
-            block_tables_, query_start_loc_)
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec)
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         output = sparse_mla_ragged_paged_attention(

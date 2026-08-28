@@ -66,6 +66,8 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
 
 
 def env_with_choices(
@@ -182,6 +184,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eval config turns it on, since a prefilled assistant turn needs it.
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE":
     env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
+    # NoPE and RoPE KV cache layouts allocated for sparse MLA.
+    "TPU_SPARSE_MLA_NOPE_LAYOUT":
+    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore",
+                     ["sparsecore", "tensorcore"]),
+    "TPU_SPARSE_MLA_ROPE_LAYOUT":
+    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
+                     ["sparsecore", "tensorcore"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),
