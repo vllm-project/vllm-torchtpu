@@ -19,7 +19,8 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, calculate_tiling,
+                                                   get_packing_factor, gmm_v2)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
@@ -157,6 +158,20 @@ def gmm_wrapper(lhs,
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
     is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
                      and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    tile_info = calculate_tiling
+    if (is_fp4_weight and lhs.shape[0] <= 16 and rhs.shape[0] == 28):
+        # Kimi K3 TEP32 decode (896 / 32 = 28 local experts). Multiple N
+        # tiles pipeline low-occupancy work better than the generic full-N
+        # heuristic. Splitting only GMM1 remains near-neutral through the
+        # possible 16 local routes; splitting GMM2 regresses high occupancy.
+        # Keep this exact guard away from prefill and other models; see
+        # benchmark_kimi_k3_mxfp4_gmm.py.
+        if (fuse_act is not None and lhs.shape[1:] == (3584, )
+                and rhs.shape[1:] == (3584, 6144)):
+            tile_info = TileSizes(tile_m=lhs.shape[0],
+                                  tile_k=3584,
+                                  tile_n=1536,
+                                  bucket_base=lhs.shape[0])
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -169,6 +184,7 @@ def gmm_wrapper(lhs,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        tile_info=tile_info,
     )
 
 

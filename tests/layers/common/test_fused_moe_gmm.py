@@ -21,7 +21,9 @@ import numpy as np
 import pytest
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
+                                                   calculate_tiling,
+                                                   interleave_lane)
 from vllm_torchtpu.layers.common import fused_moe_gmm
 from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
 
@@ -49,6 +51,34 @@ def test_ragged_gather_reduce_uses_configured_version():
     expected = fused_moe_gmm._select_ragged_gather_reduce(
         envs.RAGGED_GATHER_REDUCE_VERSION)
     assert fused_moe_gmm.ragged_gather_reduce is expected
+
+
+@pytest.mark.parametrize(
+    ("lhs_shape", "rhs_shape", "fuse_act", "expected"),
+    [
+        ((16, 3584),
+         (28, 3584, 6144), "situ:4.0:25.0", TileSizes(16, 3584, 1536, 16)),
+        ((16, 3072), (28, 3072, 3584), None, calculate_tiling),
+    ],
+)
+def test_gmm_wrapper_selects_kimi_k3_mxfp4_decode_tiles(
+        monkeypatch, lhs_shape, rhs_shape, fuse_act, expected):
+    captured = {}
+
+    def fake_gmm_v2(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_v2", fake_gmm_v2)
+    fused_moe_gmm.gmm_wrapper(
+        jax.ShapeDtypeStruct(lhs_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(rhs_shape, jnp.float4_e2m1fn),
+        None,
+        None,
+        jax.ShapeDtypeStruct((28, ), jnp.int32),
+        jnp.zeros((1, ), jnp.int32),
+        fuse_act=fuse_act,
+    )
+    assert captured["tile_info"] == expected
 
 
 def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
