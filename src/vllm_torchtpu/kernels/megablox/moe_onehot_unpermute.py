@@ -109,12 +109,11 @@ def _accumulate_route_block(
 
     # Standard GMM2 initializes the valid prefix but leaves its capacity tail
     # undefined. A zero selector does not suppress a NaN tail row, so clear
-    # those BF16 rows bitwise before the dot. The predicate is constructed
-    # directly at the 2-D route shape because Mosaic cannot lay out a
-    # [128] -> [128, 1] predicate reshape.
-    route_bits = lax.bitcast_convert_type(route_rows, jnp.uint16)
-    route_bits = jnp.where(route_row_valid, route_bits, 0)
-    route_rows = lax.bitcast_convert_type(route_bits, jnp.bfloat16)
+    # invalid rows before the dot. The predicate is constructed directly at
+    # the 2-D route shape because Mosaic cannot lay out a [128] -> [128, 1]
+    # predicate reshape.
+    route_rows = jnp.where(route_row_valid, route_rows,
+                           jnp.zeros_like(route_rows))
 
     mxu_size = pltpu.get_tpu_info().mxu_column_size
     for n_start in range(0, route_rows.shape[-1], mxu_size):
