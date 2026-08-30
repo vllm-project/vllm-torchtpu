@@ -720,6 +720,7 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_reqs, self.max_num_tokens)
 
         self.sample_from_logits_func = self.sample_from_logits
+        self._sharded_sample_op: Callable[..., torch.Tensor] | None = None
 
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
@@ -3505,6 +3506,10 @@ class TPUModelRunner(GPUModelRunner):
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = (self._is_async_drafter)
+        use_sharded_sampling = (
+            self._sharded_sample_op is not None
+            and self.input_batch.max_num_logprobs is None
+            and not scheduler_output.has_structured_output_requests)
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -3631,14 +3636,22 @@ class TPUModelRunner(GPUModelRunner):
             sample_hidden_states = (
                 sequence_layout_planner.maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices))
+            sampling_num_reqs = (_get_padded_token_len(
+                self.num_tokens_paddings, num_reqs)
+                                 if use_sharded_sampling else None)
             if sample_hidden_states is None:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
                     layout_plan,
                 )
-                logits = self.compute_selected_logits(hidden_states,
-                                                      logits_indices)
+                if sampling_num_reqs is not None:
+                    logits = self.compute_selected_local_logits(
+                        hidden_states, logits_indices[:sampling_num_reqs])
+                else:
+                    logits = self.compute_selected_logits(
+                        hidden_states, logits_indices)
             else:
+                assert sampling_num_reqs is None
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
 
@@ -4112,7 +4125,25 @@ class TPUModelRunner(GPUModelRunner):
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx)
-                if all_greedy:
+                if logits.shape[-1] != self.vocab_size:
+                    temperatures_tpu, top_k_tpu, top_p_tpu = (
+                        self._build_padded_sampling_params(
+                            cur_start_idx, cur_end_idx, logits))
+                    if all_greedy:
+                        u = torch.empty((logits.shape[0], self.vocab_size),
+                                        dtype=logits.dtype,
+                                        device=logits.device)
+                    else:
+                        rng_num_reqs = _get_padded_num_reqs_with_upper_limit(
+                            num_reqs, self.max_num_reqs)
+                        padded_u = torch.rand((rng_num_reqs, self.vocab_size),
+                                              dtype=logits.dtype,
+                                              device=logits.device,
+                                              generator=sampling_generator)
+                        u = padded_u[:logits.shape[0]]
+                    selected_token_ids = self.sharded_sample_from_local_logits(
+                        logits, temperatures_tpu, u, top_k_tpu, top_p_tpu)
+                elif all_greedy:
                     selected_token_ids = self._greedy_sample(logits)
                 else:
                     temperatures_tpu, top_k_tpu, top_p_tpu = (
@@ -4465,6 +4496,22 @@ class TPUModelRunner(GPUModelRunner):
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
+        if not hasattr(self.model, "compute_logits_local"):
+            return
+        parallel_config = self.parallel_config
+        if (parallel_config.tensor_parallel_size <= 1
+                or parallel_config.world_size
+                != parallel_config.tensor_parallel_size
+                or self.speculative_config is not None
+                or _get_sequence_layout_planner_for_runner(
+                    self).uses_selected_logits_hidden_states):
+            return
+        from vllm_torchtpu.layers.vllm.custom_ops.sharded_sampling_op import \
+            build_sharded_sampling_op
+
+        self._sharded_sample_op = cast(
+            Callable[..., torch.Tensor],
+            build_sharded_sampling_op(self.vocab_size))
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.vllm.linear_common import (
@@ -4721,6 +4768,25 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+
+                if self._sharded_sample_op is None:
+                    continue
+                for num_reqs in self.num_tokens_paddings:
+                    indices = torch.zeros(num_reqs,
+                                          dtype=torch.int32,
+                                          device=self.device)
+                    local_logits = self.compute_selected_local_logits(
+                        dummy_hidden, indices)
+                    temperatures, top_k, top_p = (
+                        self._build_padded_sampling_params(0, 0, local_logits))
+                    out = self.sharded_sample_from_local_logits(
+                        local_logits, temperatures,
+                        torch.rand((num_reqs, self.vocab_size),
+                                   dtype=self._hidden_states_dtype,
+                                   device=self.device), top_k, top_p)
+                    synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
@@ -6476,6 +6542,23 @@ class TPUModelRunner(GPUModelRunner):
     def compute_logits_from_hidden_states(
             self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_local_logits(
+            self, hidden_states: torch.Tensor,
+            indices_do_sample: torch.Tensor) -> torch.Tensor:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self.model.compute_logits_local(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def sharded_sample_from_local_logits(self, local_logits: torch.Tensor,
+                                         temperatures: torch.Tensor,
+                                         u: torch.Tensor, top_k: torch.Tensor,
+                                         top_p: torch.Tensor) -> torch.Tensor:
+        assert self._sharded_sample_op is not None
+        tokens = self._sharded_sample_op(local_logits, temperatures, u, top_k,
+                                         top_p)
+        return tokens.to(torch.int64).unsqueeze(-1)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(

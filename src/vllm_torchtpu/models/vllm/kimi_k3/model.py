@@ -292,6 +292,18 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                        hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_logits_local(self,
+                             hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project this TP rank's vocabulary shard without gathering it."""
+        processor = self.logits_processor
+        logits = processor._apply_head(self.lm_head, hidden_states, None)
+        if processor.soft_cap is not None:
+            logits = (torch.tanh(logits / processor.soft_cap) *
+                      processor.soft_cap)
+        if processor.scale != 1.0:
+            logits = logits * processor.scale
+        return logits
+
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
@@ -608,6 +620,10 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
                        **kwargs: object) -> torch.Tensor | None:
         del kwargs
         return self.language_model.compute_logits(hidden_states)
+
+    def compute_logits_local(self,
+                             hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.language_model.compute_logits_local(hidden_states)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

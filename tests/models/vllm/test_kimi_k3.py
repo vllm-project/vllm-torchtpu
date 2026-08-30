@@ -84,6 +84,30 @@ def test_kimi_architectures_are_registered() -> None:
                 ModelRegistry.models[architecture] = registered
 
 
+def test_kimi_causal_lm_computes_local_logits_without_gather() -> None:
+    model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
+    nn.Module.__init__(model)
+    model.lm_head = nn.Identity()
+    hidden_states = torch.randn(8, 16)
+    projected = torch.randn(8, 32)
+    calls = []
+
+    def apply_head(lm_head, hidden_states, bias):
+        calls.append((lm_head, hidden_states, bias))
+        return projected
+
+    processor = SimpleNamespace(_apply_head=apply_head,
+                                scale=0.5,
+                                soft_cap=2.0)
+    model.logits_processor = processor
+
+    actual = model.compute_logits_local(hidden_states)
+
+    expected = torch.tanh(projected / 2.0) * 2.0 * 0.5
+    torch.testing.assert_close(actual, expected)
+    assert calls == [(model.lm_head, hidden_states, None)]
+
+
 def test_kimi_k3_multimodal_interface_and_weight_mapping() -> None:
     assert KimiK3ForConditionalGeneration.supports_multimodal
     assert KimiK3ForConditionalGeneration.supports_encoder_tp_data
