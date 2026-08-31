@@ -19,22 +19,18 @@ def set_node_kv_ip_port(ip_port: tuple[int, str, int]):
 
 def get_kv_ips() -> str:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
-        num_nodes = len(_NODES_KV_IP_PORT)
-        ips = []
-        for node_id in range(num_nodes):
-            ips.append(_NODES_KV_IP_PORT[node_id][0])
-        return ips
+        if not _NODES_KV_IP_PORT:
+            return []
+        return [ip for _, (ip, _) in sorted(_NODES_KV_IP_PORT.items())]
     else:
         return get_host_ip()
 
 
 def get_kv_ports() -> str:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
-        num_nodes = len(_NODES_KV_IP_PORT)
-        ports = []
-        for node_id in range(num_nodes):
-            ports.append(_NODES_KV_IP_PORT[node_id][1])
-        return ports
+        if not _NODES_KV_IP_PORT:
+            return []
+        return [port for _, (_, port) in sorted(_NODES_KV_IP_PORT.items())]
     else:
         return get_kv_transfer_port()
 
@@ -55,7 +51,8 @@ def get_side_channel_port() -> str:
 
 
 def get_node_id() -> int:
-    # TODO(xiang): Is it possible to get this from a pre-defiend env?
+    if envs.TPU_MULTIHOST_BACKEND == "ray":
+        return 0
     id = os.getenv("TPU_NODE_ID", 0)
     return int(id)
 
