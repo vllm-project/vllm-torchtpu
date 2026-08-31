@@ -89,6 +89,20 @@ def test_worker_requires_prefix_caching():
         DecodeBenchConnectorWorker(config, _hybrid_cache_config())
 
 
+def test_worker_rejects_raw_integer_cache_encoding():
+    worker = DecodeBenchConnectorWorker(_vllm_config(), _hybrid_cache_config())
+
+    with pytest.raises(TypeError, match="raw or integer cache encodings"):
+        worker.register_kv_caches({
+            "attn": (
+                torch.zeros((4, 8, 1, 128), dtype=torch.uint8),
+                torch.zeros((4, 2, 1, 128), dtype=torch.uint8),
+            ),
+        })
+
+    assert worker.kv_caches is None
+
+
 def test_scheduler_uses_each_group_block_size_and_cleans_up():
     cache_config = _hybrid_cache_config()
     scheduler = DecodeBenchConnectorScheduler(_vllm_config(), cache_config)
@@ -499,14 +513,19 @@ def test_worker_dispatches_gaussian_fill_with_independent_seeds():
     constant_fill.assert_not_called()
 
 
-def test_worker_aggregates_unified_attention_and_gdn_by_storage():
+@pytest.mark.parametrize(("ssm_dtype", "ssm_itemsize"), [
+    (torch.bfloat16, 2),
+    (torch.float32, 4),
+])
+def test_worker_aggregates_unified_attention_and_gdn_by_storage(
+        ssm_dtype, ssm_itemsize):
     attention = FullAttentionSpec(block_size=8,
                                   num_kv_heads=1,
                                   head_size=8,
                                   dtype=torch.bfloat16)
     recurrent = MambaSpec(block_size=8,
                           shapes=((1, 8), (1, 2, 2)),
-                          dtypes=(torch.bfloat16, torch.float32),
+                          dtypes=(torch.bfloat16, ssm_dtype),
                           page_size_padded=attention.page_size_bytes)
     cache_config = KVCacheConfig(
         num_blocks=6,
@@ -551,6 +570,7 @@ def test_worker_aggregates_unified_attention_and_gdn_by_storage():
     assert fill.call_args.kwargs == {
         "split": 2,
         "ssm_bytes": 16,
+        "ssm_itemsize": ssm_itemsize,
         "conv_bytes": 16,
     }
     synchronize.assert_called_once_with([raw])

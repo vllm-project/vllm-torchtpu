@@ -362,6 +362,7 @@ def test_unified_hybrid_fill_preserves_null_padding_and_unrelated_bytes():
         jnp.asarray([0.25], dtype=jnp.float32),
         split=2,
         ssm_bytes=512,
+        ssm_itemsize=4,
         conv_bytes=256,
     )
     got = np.asarray(updated)
@@ -394,7 +395,45 @@ def test_unified_hybrid_fill_preserves_null_padding_and_unrelated_bytes():
         got[3], np.full(shape[1:], 0.25, dtype=np.dtype("bfloat16")))
 
 
-def test_unified_hybrid_normal_fill_uses_typed_state_distributions():
+def test_unified_hybrid_fill_supports_attention_only_pages():
+    pool = jnp.zeros((8, 4, 2, LANES), dtype=jnp.bfloat16)
+    updated = pallas_fill_hybrid_slots(
+        pool,
+        jnp.asarray([1], dtype=jnp.int32),
+        jnp.asarray([1], dtype=jnp.int32),
+        jnp.asarray([0.25], dtype=jnp.float32),
+        split=2,
+        ssm_bytes=0,
+        ssm_itemsize=0,
+        conv_bytes=0,
+    )
+    got = np.asarray(updated)
+
+    np.testing.assert_array_equal(got[:2], np.zeros_like(got[:2]))
+    np.testing.assert_array_equal(got[2:4], np.full_like(got[2:4], 0.25))
+    np.testing.assert_array_equal(got[4:], np.zeros_like(got[4:]))
+
+
+def test_unified_hybrid_fill_rejects_unknown_ssm_itemsize():
+    with pytest.raises(ValueError, match="BF16 or FP32"):
+        pallas_fill_hybrid_slots(
+            jnp.zeros((8, 4, 2, LANES), dtype=jnp.bfloat16),
+            jnp.asarray([1], dtype=jnp.int32),
+            jnp.asarray([3], dtype=jnp.int32),
+            jnp.asarray([0.25], dtype=jnp.float32),
+            split=2,
+            ssm_bytes=512,
+            ssm_itemsize=1,
+            conv_bytes=256,
+        )
+
+
+@pytest.mark.parametrize(("ssm_dtype", "ssm_itemsize"), [
+    (jnp.bfloat16, 2),
+    (jnp.float32, 4),
+])
+def test_unified_hybrid_normal_fill_uses_typed_state_distributions(
+        ssm_dtype, ssm_itemsize):
     pool = jnp.zeros((8, 4, 2, LANES), dtype=jnp.bfloat16)
     manager_indices = jnp.asarray([1], dtype=jnp.int32)
     updated = pallas_normal_fill_hybrid_slots(
@@ -404,7 +443,8 @@ def test_unified_hybrid_normal_fill_uses_typed_state_distributions():
         jnp.asarray([0.4, 0.2], dtype=jnp.float32),
         jnp.asarray([1234], dtype=jnp.int32),
         split=2,
-        ssm_bytes=512,
+        ssm_bytes=LANES * ssm_itemsize,
+        ssm_itemsize=ssm_itemsize,
         conv_bytes=256,
     )
     got = np.asarray(updated)
@@ -414,8 +454,9 @@ def test_unified_hybrid_normal_fill_uses_typed_state_distributions():
                                     manager_indices,
                                     tok0=0,
                                     ntok=1,
-                                    out_dtype=jnp.float32,
-                                    split=2)).reshape(-1)
+                                    out_dtype=ssm_dtype,
+                                    split=2))[:,
+                                              0].astype(np.float32).reshape(-1)
     conv = got[2, 1, 0].astype(np.float32).reshape(-1)
     assert ssm.mean() == pytest.approx(0.4, abs=0.05)
     assert ssm.std() == pytest.approx(0.2, abs=0.05)
@@ -423,7 +464,11 @@ def test_unified_hybrid_normal_fill_uses_typed_state_distributions():
     assert conv.std() == pytest.approx(0.2, abs=0.05)
 
 
-def test_unified_hybrid_fp8_pool_uses_typed_state_abi():
+@pytest.mark.parametrize(("ssm_dtype", "ssm_itemsize"), [
+    (jnp.bfloat16, 2),
+    (jnp.float32, 4),
+])
+def test_unified_hybrid_fp8_pool_uses_typed_state_abi(ssm_dtype, ssm_itemsize):
     # Real FP8 attention caches keep their four-byte pack as its own payload
     # dimension: (blocks, tokens, packed KV heads, pack, lanes).
     shape = (8, 4, 1, 4, LANES)
@@ -435,7 +480,8 @@ def test_unified_hybrid_fp8_pool_uses_typed_state_abi():
         jnp.asarray([3], dtype=jnp.int32),
         jnp.asarray([0.25], dtype=jnp.float32),
         split=2,
-        ssm_bytes=512,
+        ssm_bytes=LANES * ssm_itemsize,
+        ssm_itemsize=ssm_itemsize,
         conv_bytes=256,
     )
 
@@ -445,7 +491,7 @@ def test_unified_hybrid_fp8_pool_uses_typed_state_abi():
                                     manager_indices,
                                     tok0=0,
                                     ntok=1,
-                                    out_dtype=jnp.float32,
+                                    out_dtype=ssm_dtype,
                                     split=2))
     conv = np.asarray(
         pool_adapters.gather_region(updated,
@@ -456,8 +502,8 @@ def test_unified_hybrid_fp8_pool_uses_typed_state_abi():
                                     split=2)).astype(np.float32)
 
     np.testing.assert_array_equal(got[:2], np.full_like(got[:2], 0.5))
-    np.testing.assert_array_equal(
-        ssm, np.full((1, 1, LANES), 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(ssm[0, 0].astype(np.float32),
+                                  np.full((LANES, ), 0.25, dtype=np.float32))
     np.testing.assert_array_equal(conv[0, 0],
                                   np.full((LANES, ), 0.25, dtype=np.float32))
     np.testing.assert_array_equal(got[3],
@@ -477,6 +523,7 @@ def test_unified_hybrid_torch_bridge_donates_and_writes_back():
                                          fill_value,
                                          split=2,
                                          ssm_bytes=512,
+                                         ssm_itemsize=4,
                                          conv_bytes=256)
     got = cache.cpu().float().numpy()
 
@@ -492,7 +539,12 @@ def test_unified_hybrid_torch_bridge_donates_and_writes_back():
                                   np.full(shape[1:], 0.25, dtype=np.float32))
 
 
-def test_unified_hybrid_fp8_torch_bridge_donates_and_writes_back():
+@pytest.mark.parametrize(("ssm_bytes", "ssm_itemsize"), [
+    (256, 2),
+    (512, 4),
+])
+def test_unified_hybrid_fp8_torch_bridge_donates_and_writes_back(
+        ssm_bytes, ssm_itemsize):
     shape = (8, 4, 1, 4, LANES)
     cache = torch.full(shape, 0.5, dtype=torch.float8_e4m3fn, device="tpu")
     indices = torch.tensor([1], dtype=torch.int32, device="tpu")
@@ -504,7 +556,8 @@ def test_unified_hybrid_fp8_torch_bridge_donates_and_writes_back():
                                          fill_kinds,
                                          fill_value,
                                          split=2,
-                                         ssm_bytes=512,
+                                         ssm_bytes=ssm_bytes,
+                                         ssm_itemsize=ssm_itemsize,
                                          conv_bytes=256)
     got = cache.cpu().float().numpy()
 

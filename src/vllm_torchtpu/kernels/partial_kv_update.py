@@ -337,8 +337,17 @@ def _store_typed_live_rows(block_ref, num_rows: int, dtype, params_ref, *,
     typed_ref[...] = jnp.where(rows < num_rows, values, typed_ref[...])
 
 
+def _pooled_ssm_dtype(ssm_itemsize: int):
+    if ssm_itemsize == jnp.dtype(jnp.bfloat16).itemsize:
+        return jnp.bfloat16
+    if ssm_itemsize == jnp.dtype(jnp.float32).itemsize:
+        return jnp.float32
+    raise ValueError("pooled SSM state must use BF16 or FP32, got itemsize "
+                     f"{ssm_itemsize}")
+
+
 def _hybrid_state_segments(pool: jax.Array, *, split: int, ssm_bytes: int,
-                           conv_bytes: int):
+                           ssm_itemsize: int, conv_bytes: int):
     """Static per-kernel-block live segments for the pooled GDN ABI."""
     if ssm_bytes == 0 and conv_bytes == 0:
         return (), ()
@@ -384,14 +393,15 @@ def _hybrid_state_segments(pool: jax.Array, *, split: int, ssm_bytes: int,
                 (block, token_row, token_rows, segment_bytes // row_bytes))
         return tuple(result)
 
-    ssm_segments = segments(0, ssm_bytes, jnp.dtype(jnp.float32).itemsize)
+    ssm_segments = segments(0, ssm_bytes, ssm_itemsize)
     conv_start = layout.ssm_tokens * token_bytes
     conv_segments = segments(conv_start, conv_bytes,
                              jnp.dtype(jnp.bfloat16).itemsize)
     return ssm_segments, conv_segments
 
 
-def _make_hybrid_fill_kernel(*, normal: bool, ssm_segments, conv_segments):
+def _make_hybrid_fill_kernel(*, normal: bool, ssm_dtype, ssm_segments,
+                             conv_segments):
 
     def _kernel(indices_ref, kinds_ref, params_ref, *refs):
         if normal:
@@ -429,14 +439,14 @@ def _make_hybrid_fill_kernel(*, normal: bool, ssm_segments, conv_segments):
                 pool_out_ref.at[block][...] = values
 
         # Typed stores run after the raw attention store, so an overlapping
-        # attention/state block ends with valid FP32 SSM and BF16 conv values.
+        # attention/state block ends with valid typed SSM and BF16 conv values.
         @pl.when(fill_state)
         def _fill_state_regions():
             for block, token_row, token_rows, live_rows in ssm_segments:
                 region = pool_out_ref.at[block, pl.ds(token_row, token_rows)]
                 _store_typed_live_rows(region,
                                        live_rows,
-                                       jnp.float32,
+                                       ssm_dtype,
                                        params_ref,
                                        normal=normal)
             for block, token_row, token_rows, live_rows in conv_segments:
@@ -453,7 +463,8 @@ def _make_hybrid_fill_kernel(*, normal: bool, ssm_segments, conv_segments):
 def _pallas_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
                               fill_kinds: jax.Array, params: jax.Array,
                               seed: jax.Array | None, *, split: int,
-                              ssm_bytes: int, conv_bytes: int) -> jax.Array:
+                              ssm_bytes: int, ssm_itemsize: int,
+                              conv_bytes: int) -> jax.Array:
     if pool.ndim < 3:
         raise ValueError(
             f"hybrid slot fill requires pool ndim >= 3, got {pool.ndim}")
@@ -476,11 +487,18 @@ def _pallas_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
 
     indices = indices.astype(jnp.int32)
     fill_kinds = fill_kinds.astype(jnp.int32)
-    ssm_segments, conv_segments = _hybrid_state_segments(pool,
-                                                         split=split,
-                                                         ssm_bytes=ssm_bytes,
-                                                         conv_bytes=conv_bytes)
+    # Attention-only pages have no typed state regions. Keep their zero-valued
+    # layout sentinel valid; the fallback dtype is never used by the kernel.
+    ssm_dtype = (_pooled_ssm_dtype(ssm_itemsize)
+                 if ssm_bytes else jnp.bfloat16)
+    ssm_segments, conv_segments = _hybrid_state_segments(
+        pool,
+        split=split,
+        ssm_bytes=ssm_bytes,
+        ssm_itemsize=ssm_itemsize,
+        conv_bytes=conv_bytes)
     kernel = _make_hybrid_fill_kernel(normal=normal,
+                                      ssm_dtype=ssm_dtype,
                                       ssm_segments=ssm_segments,
                                       conv_segments=conv_segments)
     padding = (0, ) * (pool.ndim - 1)
@@ -526,7 +544,7 @@ def _pallas_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
 
 def pallas_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
                              fill_kinds: jax.Array, fill_value: jax.Array, *,
-                             split: int, ssm_bytes: int,
+                             split: int, ssm_bytes: int, ssm_itemsize: int,
                              conv_bytes: int) -> jax.Array:
     """Fill attention and typed GDN regions with one donated pool update."""
     return _pallas_fill_hybrid_slots(pool,
@@ -536,13 +554,14 @@ def pallas_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
                                      None,
                                      split=split,
                                      ssm_bytes=ssm_bytes,
+                                     ssm_itemsize=ssm_itemsize,
                                      conv_bytes=conv_bytes)
 
 
 def pallas_normal_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
                                     fill_kinds: jax.Array, mean_std: jax.Array,
                                     seed: jax.Array, *, split: int,
-                                    ssm_bytes: int,
+                                    ssm_bytes: int, ssm_itemsize: int,
                                     conv_bytes: int) -> jax.Array:
     """Normal-distribution variant of :func:`pallas_fill_hybrid_slots`."""
     return _pallas_fill_hybrid_slots(pool,
@@ -552,6 +571,7 @@ def pallas_normal_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
                                      seed,
                                      split=split,
                                      ssm_bytes=ssm_bytes,
+                                     ssm_itemsize=ssm_itemsize,
                                      conv_bytes=conv_bytes)
 
 
@@ -661,7 +681,7 @@ def pallas_normal_fill_slots_(cache: torch.Tensor, indices: torch.Tensor,
 
 def _jax_hybrid_fill_op(pool: jax.Array, indices: jax.Array,
                         fill_kinds: jax.Array, fill_value: jax.Array,
-                        split: int, ssm_bytes: int,
+                        split: int, ssm_bytes: int, ssm_itemsize: int,
                         conv_bytes: int) -> tuple[jax.Array, jax.Array]:
     updated = pallas_fill_hybrid_slots(pool,
                                        indices,
@@ -669,6 +689,7 @@ def _jax_hybrid_fill_op(pool: jax.Array, indices: jax.Array,
                                        fill_value,
                                        split=split,
                                        ssm_bytes=ssm_bytes,
+                                       ssm_itemsize=ssm_itemsize,
                                        conv_bytes=conv_bytes)
     return updated, indices[0]
 
@@ -681,9 +702,9 @@ _pallas_hybrid_fill_torch_op = torch_pallas.jax_op(
 
 def _fake_hybrid_fill_op(pool: torch.Tensor, indices: torch.Tensor,
                          fill_kinds: torch.Tensor, fill_value: torch.Tensor,
-                         split: int, ssm_bytes: int,
+                         split: int, ssm_bytes: int, ssm_itemsize: int,
                          conv_bytes: int) -> tuple[torch.Tensor, torch.Tensor]:
-    del fill_kinds, fill_value, split, ssm_bytes, conv_bytes
+    del fill_kinds, fill_value, split, ssm_bytes, ssm_itemsize, conv_bytes
     return torch.empty_like(pool), torch.empty((),
                                                dtype=indices.dtype,
                                                device=indices.device)
@@ -696,12 +717,13 @@ _pallas_hybrid_fill_torch_op.register_fake(_fake_hybrid_fill_op)
 def pallas_fill_hybrid_slots_(cache: torch.Tensor, indices: torch.Tensor,
                               fill_kinds: torch.Tensor,
                               fill_value: torch.Tensor, *, split: int,
-                              ssm_bytes: int, conv_bytes: int) -> torch.Tensor:
+                              ssm_bytes: int, ssm_itemsize: int,
+                              conv_bytes: int) -> torch.Tensor:
     """Fill selected unified attention/GDN manager pages in one donation."""
     new_cache, _ = _pallas_hybrid_fill_torch_op(cache, indices.to(torch.int32),
                                                 fill_kinds.to(torch.int32),
                                                 fill_value, split, ssm_bytes,
-                                                conv_bytes)
+                                                ssm_itemsize, conv_bytes)
     cache.copy_(new_cache)
     return cache
 
@@ -709,6 +731,7 @@ def pallas_fill_hybrid_slots_(cache: torch.Tensor, indices: torch.Tensor,
 def _jax_normal_hybrid_fill_op(pool: jax.Array, indices: jax.Array,
                                fill_kinds: jax.Array, mean_std: jax.Array,
                                seed: jax.Array, split: int, ssm_bytes: int,
+                               ssm_itemsize: int,
                                conv_bytes: int) -> tuple[jax.Array, jax.Array]:
     updated = pallas_normal_fill_hybrid_slots(pool,
                                               indices,
@@ -717,6 +740,7 @@ def _jax_normal_hybrid_fill_op(pool: jax.Array, indices: jax.Array,
                                               seed,
                                               split=split,
                                               ssm_bytes=ssm_bytes,
+                                              ssm_itemsize=ssm_itemsize,
                                               conv_bytes=conv_bytes)
     return updated, indices[0]
 
@@ -730,8 +754,9 @@ _pallas_normal_hybrid_fill_torch_op = torch_pallas.jax_op(
 def _fake_normal_hybrid_fill_op(
         pool: torch.Tensor, indices: torch.Tensor, fill_kinds: torch.Tensor,
         mean_std: torch.Tensor, seed: torch.Tensor, split: int, ssm_bytes: int,
+        ssm_itemsize: int,
         conv_bytes: int) -> tuple[torch.Tensor, torch.Tensor]:
-    del fill_kinds, mean_std, seed, split, ssm_bytes, conv_bytes
+    del fill_kinds, mean_std, seed, split, ssm_bytes, ssm_itemsize, conv_bytes
     return torch.empty_like(pool), torch.empty((),
                                                dtype=indices.dtype,
                                                device=indices.device)
@@ -746,11 +771,11 @@ def pallas_normal_fill_hybrid_slots_(cache: torch.Tensor,
                                      fill_kinds: torch.Tensor,
                                      mean_std: torch.Tensor,
                                      seed: torch.Tensor, *, split: int,
-                                     ssm_bytes: int,
+                                     ssm_bytes: int, ssm_itemsize: int,
                                      conv_bytes: int) -> torch.Tensor:
     """Normally fill unified attention/GDN pages in one donated update."""
     new_cache, _ = _pallas_normal_hybrid_fill_torch_op(
         cache, indices.to(torch.int32), fill_kinds.to(torch.int32), mean_std,
-        seed.to(torch.int32), split, ssm_bytes, conv_bytes)
+        seed.to(torch.int32), split, ssm_bytes, ssm_itemsize, conv_bytes)
     cache.copy_(new_cache)
     return cache

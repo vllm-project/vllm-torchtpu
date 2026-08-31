@@ -28,6 +28,8 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, MambaSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.worker.block_table import BlockTable
 
+from vllm_torchtpu.gdn_pool_layout import (pooled_gdn_state_dtypes,
+                                           pooled_gdn_state_itemsize)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     get_tpu_pooled_gdn_state_layout
@@ -114,7 +116,8 @@ def _upstream_fill_slots_in_place(cache: torch.Tensor, indices: torch.Tensor,
 def _fill_hybrid_pool_in_place(cache: torch.Tensor, indices: torch.Tensor,
                                fill_kinds: torch.Tensor,
                                fill_value: torch.Tensor, *, split: int,
-                               ssm_bytes: int, conv_bytes: int) -> None:
+                               ssm_bytes: int, ssm_itemsize: int,
+                               conv_bytes: int) -> None:
     from vllm_torchtpu.kernels.partial_kv_update import \
         pallas_fill_hybrid_slots_
     pallas_fill_hybrid_slots_(cache,
@@ -123,6 +126,7 @@ def _fill_hybrid_pool_in_place(cache: torch.Tensor, indices: torch.Tensor,
                               fill_value,
                               split=split,
                               ssm_bytes=ssm_bytes,
+                              ssm_itemsize=ssm_itemsize,
                               conv_bytes=conv_bytes)
 
 
@@ -131,7 +135,8 @@ def _normal_fill_hybrid_pool_in_place(cache: torch.Tensor,
                                       fill_kinds: torch.Tensor,
                                       mean_std: torch.Tensor,
                                       seed: torch.Tensor, *, split: int,
-                                      ssm_bytes: int, conv_bytes: int) -> None:
+                                      ssm_bytes: int, ssm_itemsize: int,
+                                      conv_bytes: int) -> None:
     from vllm_torchtpu.kernels.partial_kv_update import \
         pallas_normal_fill_hybrid_slots_
     pallas_normal_fill_hybrid_slots_(cache,
@@ -141,6 +146,7 @@ def _normal_fill_hybrid_pool_in_place(cache: torch.Tensor,
                                      seed,
                                      split=split,
                                      ssm_bytes=ssm_bytes,
+                                     ssm_itemsize=ssm_itemsize,
                                      conv_bytes=conv_bytes)
 
 
@@ -156,6 +162,7 @@ class _UnifiedPoolFill:
     state_blocks: set[int]
     layer_name: str
     ssm_bytes: int | None = None
+    ssm_itemsize: int | None = None
     conv_bytes: int | None = None
 
 
@@ -316,6 +323,19 @@ class DecodeBenchConnectorWorker:
         self._logged_fill_summary = False
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+        for layer_name, cache in kv_caches.items():
+            tensors: tuple[torch.Tensor, ...] = ()
+            if isinstance(cache, torch.Tensor):
+                tensors = (cache, )
+            elif (isinstance(cache, (tuple, list)) and cache and all(
+                    isinstance(tensor, torch.Tensor) for tensor in cache)):
+                tensors = tuple(cache)
+            for tensor in tensors:
+                if not tensor.is_floating_point():
+                    raise TypeError(
+                        "TPU DecodeBenchConnector cannot synthesize numeric "
+                        "values for raw or integer cache encodings: layer "
+                        f"{layer_name!r} has dtype {tensor.dtype}")
         self.kv_caches = kv_caches
 
     def register_runner(self, runner: "TPUModelRunner") -> None:
@@ -412,6 +432,23 @@ class DecodeBenchConnectorWorker:
         result = (layout.ssm_bytes, layout.conv_bytes)
         self._pooled_state_bytes_by_token_size[token_bytes] = result
         return result
+
+    @staticmethod
+    def _pooled_ssm_itemsize(specs: tuple[Any, ...]) -> int:
+        itemsizes: set[int] = set()
+        for spec in specs:
+            dtypes = tuple(spec.dtypes)
+            if len(dtypes) != 2:
+                raise ValueError(
+                    "unified DecodeBenchConnector requires conv and SSM "
+                    f"dtypes, got {dtypes}")
+            _, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+            itemsizes.add(pooled_gdn_state_itemsize(ssm_dtype))
+        if len(itemsizes) != 1:
+            raise ValueError(
+                "pooled GDN layers in one cache group have different SSM "
+                f"item sizes: {sorted(itemsizes)}")
+        return itemsizes.pop()
 
     def _fill_value_for(self, cache: torch.Tensor) -> torch.Tensor:
         value = self._fill_values.get(cache.device)
@@ -554,6 +591,8 @@ class DecodeBenchConnectorWorker:
                                                     set(physical_rows),
                                                     layer_name)
             elif all(isinstance(spec, MambaSpec) for spec in specs):
+                ssm_itemsize = (self._pooled_ssm_itemsize(specs)
+                                if unified_layout else None)
                 if unified_layout:
                     state_ids = {
                         int(block_id)
@@ -574,15 +613,18 @@ class DecodeBenchConnectorWorker:
                                 state_tensor)
                             fill = unified_fill_for(state_tensor, layer_name)
                             fill.state_blocks.update(state_ids)
-                            existing = (fill.ssm_bytes, fill.conv_bytes)
-                            if existing != (None,
-                                            None) and existing != (ssm_bytes,
-                                                                   conv_bytes):
+                            existing = (fill.ssm_bytes, fill.ssm_itemsize,
+                                        fill.conv_bytes)
+                            state_layout = (ssm_bytes, ssm_itemsize,
+                                            conv_bytes)
+                            if existing != (None, None,
+                                            None) and existing != state_layout:
                                 raise ValueError(
                                     "pooled GDN layers sharing raw storage have "
                                     "different state layouts: "
-                                    f"{existing} vs {(ssm_bytes, conv_bytes)}")
+                                    f"{existing} vs {state_layout}")
                             fill.ssm_bytes = ssm_bytes
+                            fill.ssm_itemsize = ssm_itemsize
                             fill.conv_bytes = conv_bytes
                             continue
                         key = self._storage_key(state_tensor)
@@ -655,8 +697,10 @@ class DecodeBenchConnectorWorker:
                 dtype=torch.int32,
                 device=fill.cache.device)
             ssm_bytes = fill.ssm_bytes or 0
+            ssm_itemsize = fill.ssm_itemsize or 0
             conv_bytes = fill.conv_bytes or 0
-            if fill.state_blocks and not (ssm_bytes and conv_bytes):
+            if fill.state_blocks and not (ssm_bytes and ssm_itemsize
+                                          and conv_bytes):
                 raise ValueError(
                     f"unified layer {fill.layer_name!r} has state blocks but no "
                     "pooled GDN layout")
@@ -669,6 +713,7 @@ class DecodeBenchConnectorWorker:
                     self._random_seed_for(fill.cache),
                     split=self._pool_block_split,
                     ssm_bytes=ssm_bytes,
+                    ssm_itemsize=ssm_itemsize,
                     conv_bytes=conv_bytes)
             else:
                 _fill_hybrid_pool_in_place(fill.cache,
@@ -677,6 +722,7 @@ class DecodeBenchConnectorWorker:
                                            self._fill_value_for(fill.cache),
                                            split=self._pool_block_split,
                                            ssm_bytes=ssm_bytes,
+                                           ssm_itemsize=ssm_itemsize,
                                            conv_bytes=conv_bytes)
             mutated.append(fill.cache)
 
