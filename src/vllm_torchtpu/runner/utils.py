@@ -27,17 +27,21 @@ BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
 PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
+PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD = -1
 
-# Tuning knob with no `profiler_config` equivalent, so it stays in
+# Tuning knobs with no `profiler_config` equivalent, so they stay in
 # `additional_config`.
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_decode_only_kv_len_threshold")
+PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
+    "phased_profiler_prefill_only_kv_len_threshold")
 
 # Diagnostics-only knob: it steers profiling and never changes the compiled
 # graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
 # TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+    PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
 })
 
 
@@ -152,6 +156,8 @@ class PhaseBasedProfiler:
         int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
         decode_kv_len_threshold:
         int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+        prefill_kv_len_threshold:
+        int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
         standard_opts: Optional[dict[str, Any]] = None,
         advanced_opts: Optional[dict[str, Any]] = None,
     ):
@@ -164,6 +170,9 @@ class PhaseBasedProfiler:
         # Wait for KV cache to reach a certain length before profiling decode-only phase
         # to ensure we capture traces of longer, steady-state context lengths.
         self.decode_kv_len_threshold: int = decode_kv_len_threshold
+        # Same idea for chunked prefill: without this the capture always lands
+        # on batch 1, where the sequence is one chunk long.
+        self.prefill_kv_len_threshold: int = prefill_kv_len_threshold
         self.standard_opts = standard_opts or {}
         self.advanced_opts = advanced_opts or {}
         self.profile_dir: str = profile_dir
@@ -193,6 +202,11 @@ class PhaseBasedProfiler:
             logger.info(
                 "Will skip decode-only steps until min KV len >= %d.",
                 self.decode_kv_len_threshold,
+            )
+        if self.prefill_kv_len_threshold >= 0:
+            logger.info(
+                "Will skip prefill-only steps until min KV len >= %d.",
+                self.prefill_kv_len_threshold,
             )
 
     def _write_batch_composition_stats_to_file_helper(
@@ -236,14 +250,22 @@ class PhaseBasedProfiler:
                 )
                 break
 
-            if (phase == InferencePhase.DECODE_ONLY
-                    and self.decode_kv_len_threshold >= 0):
+            # `min_kv_len` is a batch minimum, so this only makes sense for the
+            # single-composition phases. PREFILL_HEAVY always carries a
+            # freshly-admitted request at kv len 0 and would never arm.
+            kv_len_threshold = -1
+            if phase == InferencePhase.DECODE_ONLY:
+                kv_len_threshold = self.decode_kv_len_threshold
+            elif phase == InferencePhase.PREFILL_ONLY:
+                kv_len_threshold = self.prefill_kv_len_threshold
+            if kv_len_threshold >= 0:
                 min_kv_len = batch_composition_stats.get("min_kv_len", 0)
-                if min_kv_len < self.decode_kv_len_threshold:
+                if min_kv_len < kv_len_threshold:
                     logger.debug(
-                        "Skipping decode-only step as min KV len %d < threshold %d.",
+                        "Skipping %s step as min KV len %d < threshold %d.",
+                        phase.name.lower(),
                         min_kv_len,
-                        self.decode_kv_len_threshold,
+                        kv_len_threshold,
                     )
                     break
 

@@ -809,6 +809,9 @@ class TPUModelRunner(GPUModelRunner):
         decode_kv_len_threshold = additional_config.get(
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+        prefill_kv_len_threshold = additional_config.get(
+            runner_utils.PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+            runner_utils.PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD)
         # Same scoping as the standard profiler: the prefix names the run, and
         # the per-phase subdirectories sit beneath it.
 
@@ -831,6 +834,7 @@ class TPUModelRunner(GPUModelRunner):
                 or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
             num_decode_steps_to_skip=profiler_config.delay_iterations,
             decode_kv_len_threshold=decode_kv_len_threshold,
+            prefill_kv_len_threshold=prefill_kv_len_threshold,
             standard_opts=standard_opts,
             advanced_opts=advanced_opts,
         )

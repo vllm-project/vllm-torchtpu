@@ -337,6 +337,87 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     assert profiler.current_phase == ""
 
 
+def test_phased_profiler_skips_prefill_only_steps_based_on_kv_len(
+    profiler_fixture, ):
+    """Tests that the profiler skips PREFILL_ONLY steps until min KV len reaches threshold."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_context = profiler_fixture["mock_context"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    kv_len_threshold = 10
+    profiler.prefill_kv_len_threshold = kv_len_threshold
+
+    stats = {"num_reqs": 1, "total_num_scheduled_tokens": 100, "min_kv_len": 0}
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+
+    # The first chunk of a chunked prefill sits at min_kv_len 0, which is
+    # exactly the step the threshold exists to skip.
+    profiler.step(stats)
+    mock_profile.assert_not_called()
+    assert not profiler.inference_phase_seen[InferencePhase.PREFILL_ONLY]
+
+    stats["min_kv_len"] = 5
+    profiler.step(stats)
+    mock_profile.assert_not_called()
+    assert not profiler.inference_phase_seen[InferencePhase.PREFILL_ONLY]
+
+    # Should start profiling as min_kv_len (10) >= threshold (10)
+    stats["min_kv_len"] = 10
+    profiler.step(stats)
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[InferencePhase.PREFILL_ONLY]
+    assert profiler.current_phase == "prefill_only"
+    assert (profiler.profiling_n_steps_left ==
+            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+
+    # Profiling continues
+    stats["min_kv_len"] = 11
+    profiler.step(stats)
+    mock_profile.assert_called_once()
+
+    # Complete the profiling cycle (1 more step already done in the step above)
+    for _ in range(PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR - 1):
+        profiler.step(stats)
+    mock_context.__exit__.assert_called_once()
+    assert profiler.current_phase == ""
+
+
+def test_phased_profiler_prefill_kv_len_threshold_defaults_to_off(
+    profiler_fixture, ):
+    """Without a threshold the capture must still arm on the first prefill step."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    assert profiler.prefill_kv_len_threshold < 0
+
+    stats = {"num_reqs": 1, "total_num_scheduled_tokens": 100, "min_kv_len": 0}
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+
+    profiler.step(stats)
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[InferencePhase.PREFILL_ONLY]
+
+
+def test_phased_profiler_prefill_threshold_does_not_gate_prefill_heavy(
+    profiler_fixture, ):
+    """PREFILL_HEAVY always carries a freshly-admitted request at kv len 0, so a
+    min-based threshold must not be applied to it or it would never arm."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    profiler.prefill_kv_len_threshold = 10
+
+    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100, "min_kv_len": 0}
+    mock_determine_phase.return_value = InferencePhase.PREFILL_HEAVY
+
+    profiler.step(stats)
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[InferencePhase.PREFILL_HEAVY]
+
+
 def _stage_rank_capture(rank_dir, ts_name, filename, content):
     """Helper: simulate writing one xplane file under rank_N/plugins/profile/<ts>/."""
     ts_dir = rank_dir / "plugins" / "profile" / ts_name

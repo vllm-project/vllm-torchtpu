@@ -380,6 +380,7 @@ class TestStartStopPhasedProfiling:
             monkeypatch,
             additional_config={
                 "phased_profiler_decode_only_kv_len_threshold": 128,
+                "phased_profiler_prefill_only_kv_len_threshold": 4096,
             },
             max_iterations=20,
             delay_iterations=3,
@@ -396,6 +397,7 @@ class TestStartStopPhasedProfiling:
             num_steps_to_profile_for=20,
             num_decode_steps_to_skip=3,
             decode_kv_len_threshold=128,
+            prefill_kv_len_threshold=4096,
             standard_opts={
                 'host_tracer_level': 2,
                 'device_tracer_level': 1,
