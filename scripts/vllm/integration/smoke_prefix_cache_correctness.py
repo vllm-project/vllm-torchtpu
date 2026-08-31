@@ -261,9 +261,11 @@ def run_repeat_consistency(
 
 
 def build_shared_prefix(namespace: str, line_count: int) -> str:
-    return "\n".join(
-        f"{namespace} row {i:03d}: alpha=ALPHA-314 bravo=BRAVO-271 charlie=CHARLIE-159."
-        for i in range(line_count))
+    lines = [f"Prefix cache namespace={namespace}."]
+    lines.extend((f"Prefix cache fixture row {i:03d}: alpha=ALPHA-314 "
+                  f"bravo=BRAVO-271 charlie=CHARLIE-159.")
+                 for i in range(line_count))
+    return "\n".join(lines)
 
 
 def run_long_shared_prefix_cross_query(
@@ -304,7 +306,7 @@ def run_long_shared_prefix_cross_query(
             expected = answers[key]
             prompt = (
                 common_prefix +
-                f"\n\nQuery key: {key}. Answer exactly {expected} and no other text."
+                f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} and no other text."
             )
             result = chat(url, model, prompt, max_tokens, timeout)
             text = result.get("text", "")
@@ -425,9 +427,10 @@ def run_mixed_query_correctness(
         for name, kind, prompt_or_key, expected in sequence:
             if kind == "long":
                 key = prompt_or_key
-                prompt = (common_prefix +
-                          f"\n\nQuery key: {key}. Answer exactly {expected} "
-                          "and no other text.")
+                prompt = (
+                    common_prefix +
+                    f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
+                    "and no other text.")
             else:
                 prompt = prompt_or_key
 
@@ -527,9 +530,10 @@ def run_concurrent_mixed_query_correctness(
             for index in range(worker_count):
                 key = keys[index % len(keys)]
                 expected = answers[key]
-                prompt = (common_prefix +
-                          f"\n\nQuery key: {key}. Answer exactly {expected} "
-                          "and no other text.")
+                prompt = (
+                    common_prefix +
+                    f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
+                    "and no other text.")
                 future = executor.submit(chat, url, model, prompt, max_tokens,
                                          timeout)
                 future_to_case[future] = (round_index, key, expected)
