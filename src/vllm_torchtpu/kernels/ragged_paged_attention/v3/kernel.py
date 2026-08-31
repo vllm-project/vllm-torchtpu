@@ -1924,3 +1924,71 @@ def ragged_paged_attention(
         prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
         kv_cache,
     )
+
+
+@jax.jit(
+    static_argnames=(
+        "use_causal_mask",
+        "skip_kv_mask",
+        "skip_kv_update",
+        "sm_scale",
+        "sliding_window",
+        "soft_cap",
+        "out_dtype",
+        "mask_value",
+        "q_scale",
+        "k_scale",
+        "v_scale",
+        "chunk_prefill_size",
+        "d_block_sizes",
+        "p_block_sizes",
+        "m_block_sizes",
+        "vmem_limit_bytes",
+        "debug_mode",
+        "disable_bounds_checks",
+        "disable_semaphore_checks",
+    ),
+    donate_argnames=("queries", "keys", "values", "kv_cache_bundle"),
+)
+def ragged_paged_attention_bundled(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache_bundle: jax.
+    Array,  # [num_pages, num_layers, page_size, K2/p, p, H]
+    layer_idx: jax.Array,  # i32 scalar, dynamic
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    **kwargs,
+):
+    """Executes ragged paged attention directly against a bundled block-major KV cache in place.
+
+    Flattens the multi-layer bundle (shape `[num_pages, num_layers, page_size, ...]`) into
+    a flat page view (`[num_pages * num_layers, page_size, ...]`) via zero-copy
+    metadata reshape. Logical page indices are remapped to target the specific
+    layer's contiguous slots:
+
+      flat_page = page * num_layers + layer_idx
+
+    Because the bundle is laid out block-major (blocks outermost, layers second),
+    element `bundle[page, layer]` maps directly to flat row `page * num_layers + layer`.
+    The inner Pallas kernel writes exclusively into the target layer's slots.
+
+    JAX buffer donation (`donate_argnames`) aliases the output directly to the input
+    buffer, ensuring in-place updates without emitting `dynamic_update_slice` or
+    incurring intermediate HBM memory traffic.
+    """
+    num_blocks = kv_cache_bundle.shape[0]
+    num_layers = kv_cache_bundle.shape[1]
+    flat_bundle = kv_cache_bundle.reshape(num_blocks * num_layers,
+                                          *kv_cache_bundle.shape[2:])
+    flat_page_indices = page_indices * num_layers + layer_idx
+    out, new_flat_bundle = ragged_paged_attention(queries, keys, values,
+                                                  flat_bundle, kv_lens,
+                                                  flat_page_indices, cu_q_lens,
+                                                  distribution, **kwargs)
+    new_bundle = new_flat_bundle.reshape(num_blocks, num_layers,
+                                         *new_flat_bundle.shape[1:])
+    return out, new_bundle

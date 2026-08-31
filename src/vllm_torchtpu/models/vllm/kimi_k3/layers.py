@@ -92,6 +92,7 @@ class AttentionResidual(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
+        self.eps = eps
         self.norm = RMSNorm(hidden_size, eps)
         self.proj = ReplicatedLinear(
             hidden_size,
@@ -101,12 +102,28 @@ class AttentionResidual(nn.Module):
             prefix=prefix,
         )
 
+    def process_weights_after_loading(self) -> None:
+        """Fold the norm and projection weights into one [hidden] vector."""
+        folded = self.norm.weight.float() * self.proj.weight[0].float()
+        out = torch.empty_like(folded)
+        out.copy_(folded)
+        self.folded_weight = out
+
     def forward(
         self,
         prefix_sum: torch.Tensor,
         block_residuals: torch.Tensor,
     ) -> torch.Tensor:
-        values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)), dim=-2)
-        scores, _ = self.proj(self.norm(values))
-        probabilities = scores.float().softmax(dim=-2)
-        return (probabilities * values.float()).sum(dim=-2).to(values.dtype)
+        v_blocks = block_residuals.float()
+        v_prefix = prefix_sum.float()
+        w = self.folded_weight
+        inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
+        inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
+        scores = torch.cat(
+            ((v_blocks * w).sum(-1) * inv_blocks,
+             ((v_prefix * w).sum(-1) * inv_prefix).unsqueeze(-1)),
+            dim=-1)  # [T, K]
+        probabilities = scores.softmax(dim=-1)
+        out = (probabilities[..., :-1].unsqueeze(-1) * v_blocks).sum(dim=-2)
+        out = out + probabilities[..., -1].unsqueeze(-1) * v_prefix
+        return out.to(block_residuals.dtype)

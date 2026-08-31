@@ -86,6 +86,13 @@ class FakeCompactMambaModel:
         return (torch.bfloat16, torch.float32)
 
 
+class FakeBf16StateMambaModel(FakeQwenMambaModel):
+
+    @staticmethod
+    def get_mamba_state_dtype_from_config(_):
+        return (torch.bfloat16, torch.bfloat16)
+
+
 class FakeNonShardingMambaModel(FakeQwenMambaModel):
 
     @staticmethod
@@ -201,6 +208,17 @@ def test_hybrid_fit_uses_physical_gdn_extent(vllm_config):
     assert vllm_config.cache_config.block_size == 1280
     assert vllm_config.cache_config.mamba_block_size == 1280
     assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+
+
+def test_hybrid_fit_uses_configured_bf16_ssm_dtype(vllm_config):
+    _configure_hybrid(vllm_config)
+
+    _update(vllm_config, model_cls=FakeBf16StateMambaModel)
+
+    # BF16 halves the SSM extent from 1024 to 512 rows. With 32 Conv rows,
+    # the 544-row fit is aligned to this backend's 256-token block size.
+    assert vllm_config.cache_config.block_size == 768
+    assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
 
 def test_kimi_linear_padded_ssm_fit(vllm_config):

@@ -19,13 +19,15 @@ def make_manager(vocab_size: int = VOCAB_SIZE,
                  req_id_to_index: dict[str, int] | None = None,
                  num_spec_tokens: int | None = None,
                  num_tokens_paddings: list[int] | None = None,
-                 pcp_mtp_k1: bool = False):
+                 pcp_mtp_k1: bool = False,
+                 device: torch.device | str = "cpu"):
     speculative_config = (SimpleNamespace(
         num_speculative_tokens=num_spec_tokens)
                           if num_spec_tokens is not None else None)
     runner = SimpleNamespace(
         vocab_size=vocab_size,
         max_num_reqs=max_num_reqs,
+        device=torch.device(device),
         input_batch=SimpleNamespace(req_id_to_index=req_id_to_index or {}),
         speculative_config=speculative_config,
         num_tokens_paddings=num_tokens_paddings or [16, 32, 64],

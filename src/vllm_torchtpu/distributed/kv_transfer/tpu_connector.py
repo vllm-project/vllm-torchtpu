@@ -21,6 +21,7 @@ import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
@@ -98,7 +99,7 @@ _STAGE3_REGISTRATION_CANCELLED_ERROR = (
 # (FA first = H2D order rank 0).
 _STAGE3_TRANSFER_POOL_TAGS = ("fa", )
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
-_STAGE3_GLM_TRANSFER_POOL_TAGS = ("fa", "dsa.idx")
+_STAGE3_GLM_TRANSFER_POOL_TAGS = ("mla.nope", "mla.rope", "dsa.idx")
 
 
 def _select_committed_mamba_blocks(
@@ -144,6 +145,14 @@ class _Stage3LoadMeta:
     # request (state follows each group's block table; None for FA-only
     # models).
     mamba_state_block_ids: Optional[list[int]] = None
+    # Prefix-aware load: tokens satisfied by the decode-local prefix cache
+    # and excluded from the transfer. local_block_ids then holds only the
+    # suffix pages; the source store clips its plan at
+    # skip_tokens * token_bytes of the FA global destination byte space.
+    skip_tokens: int = 0
+    # Full local hit: nothing to transfer; the worker only releases the
+    # producer's request-block registration instead of pulling.
+    release_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -253,6 +262,33 @@ def _use_raiden_glm_admission() -> bool:
                 and tpu_envs.TPU_RAIDEN_GLM_ADMISSION)
 
 
+def _prefix_aware_load_requested() -> bool:
+    return bool(tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD)
+
+
+@lru_cache(maxsize=1)
+def _prefix_aware_load_supported() -> bool:
+    """Whether the installed reshard client can encode suffix clips.
+
+    Capability/version skew is a performance concern, not a serving-fatal
+    condition: callers fall back to decode-local computation on partial hits.
+    """
+    try:
+        from tpu_sync.api.torch import reshard_client as _reshard_client
+
+        return bool(getattr(_reshard_client, "SUPPORTS_DST_SKIP_BYTES", False))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Could not probe tpu-sync dst_skip_bytes support; prefix-aware "
+            "loads will fall back to decode-local computation: %s", exc)
+        return False
+
+
+def _prefix_aware_load_enabled() -> bool:
+    """Whether suffix-only Stage-3 loads are requested and supported."""
+    return (_prefix_aware_load_requested() and _prefix_aware_load_supported())
+
+
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     if _use_raiden_stage3_transport():
         return True
@@ -327,6 +363,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker = worker_cls(vllm_config)
 
     # ---- Scheduler-side methods -----------------------------------------
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
     def get_num_new_matched_tokens(
             self, request: "Request",
             num_computed_tokens: int) -> tuple[int, bool]:
@@ -549,6 +589,12 @@ class TPUConnectorScheduler:
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True
+
+    def on_new_request(self, request: "Request") -> None:
+        """Leaves the request as submitted: the ZMQ backend needs no
+        admission-time normalization. The Raiden stage-3 subclass overrides
+        this to truncate Mamba prompts."""
+        return
 
     def get_num_new_matched_tokens(
         self,
@@ -801,6 +847,18 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
     def __init__(self, vllm_config: "VllmConfig"):
         super().__init__(vllm_config)
+        stage3_consumer = (not self.is_producer
+                           and _use_raiden_stage3_transport())
+        self._stage3_prefix_aware_load_enabled = (stage3_consumer and
+                                                  _prefix_aware_load_enabled())
+        if (stage3_consumer
+                and bool(vllm_config.cache_config.enable_prefix_caching)
+                and not self._stage3_prefix_aware_load_enabled):
+            log = (logger.warning
+                   if _prefix_aware_load_requested() else logger.info)
+            log("Prefix-aware Stage-3 loads are unavailable; partial "
+                "decode-local prefix hits will skip the remote transfer and "
+                "compute the missing suffix locally")
         # req_id -> (uuid, global block ids, exact token count, wire params).
         # This survives build_connector_meta() so a duplicate request_finished
         # callback cannot mint a conflicting UUID or enqueue a second D5
@@ -821,15 +879,21 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
 
+    def on_new_request(self, request: "Request") -> None:
+        """Truncates a P-side Mamba prompt at admission, ahead of the
+        scheduler's prefix-cache lookup. The lookup caps its hit at
+        num_tokens - 1 of whatever length it sees, so shortening the prompt
+        any later can leave zero new tokens to schedule."""
+        if (self.is_producer and _use_raiden_stage3_transport()
+                and self._stage3_mamba_group_indices):
+            self._maybe_truncate_for_mamba(request)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         if self.is_producer:
-            if (_use_raiden_stage3_transport()
-                    and self._stage3_mamba_group_indices):
-                self._maybe_truncate_for_mamba(request)
             return 0, False
         if not request.kv_transfer_params:
             return 0, False
@@ -847,6 +911,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 raise ValueError(
                     "Stage-3 metadata requires a positive num_tokens")
             count = max(transfer_tokens - num_computed_tokens, 0)
+            if (num_computed_tokens > 0 and count > 0
+                    and not self._stage3_prefix_aware_load_enabled):
+                # A full transfer would overwrite the adopted prefix pages.
+                # Preserve the local hit, decline the external load, and let
+                # the scheduler allocate/compute the missing suffix locally.
+                # update_state_after_alloc() then emits the existing
+                # release-only metadata for the unused producer registration.
+                logger.info(
+                    "Stage-3 partial prefix hit falls back to decode-local "
+                    "suffix computation req_id=%s local_tokens=%d "
+                    "missing_tokens=%d", request.request_id,
+                    num_computed_tokens, count)
+                return 0, False
             if count > 0 and dist_utils.get_raiden_inline_load():
                 return count, False
             return count, count > 0
@@ -947,6 +1024,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     ) -> None:
         """Declares a destination transfer without source physical IDs."""
         if num_external_tokens <= 0:
+            # First admission with a full local prefix hit: nothing to pull,
+            # but the producer holds a request-block registration pinned until
+            # unless released. request.num_computed_tokens is still 0 here
+            # only on first admission — the post-async-load resume re-enters
+            # with the loaded count set, and must not re-release.
+            if int(request.num_computed_tokens) == 0:
+                self._enqueue_stage3_release(request)
             return
         params = request.kv_transfer_params
         assert params is not None
@@ -1003,6 +1087,32 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "page set (prefix-suffix pulls are unsupported): "
                 f"blocks={len(local_block_ids)}, expected={expected_pages}, "
                 f"num_tokens={num_tokens}, page_tokens={self.block_size}")
+        external_tokens = int(num_external_tokens)
+        if external_tokens > num_tokens:
+            raise ValueError(
+                "External token count exceeds the published reshard payload: "
+                f"external={external_tokens}, num_tokens={num_tokens}")
+        skip_tokens = num_tokens - external_tokens
+        if skip_tokens:
+            # Partial local prefix hit: pull only the suffix, and only into
+            # the trailing (newly allocated) pages — the leading adopted
+            # cache pages are shared and must never be transfer targets. The
+            # earlier matched-token decision emits a positive external suffix
+            # only when the prefix-aware capability is enabled.
+            if skip_tokens % self.block_size != 0:
+                raise ValueError(
+                    "Prefix hits must be destination-page aligned: "
+                    f"skip_tokens={skip_tokens}, "
+                    f"page_tokens={self.block_size}")
+            prefix_pages = skip_tokens // self.block_size
+            suffix_pages = ((external_tokens + self.block_size - 1) //
+                            self.block_size)
+            if prefix_pages + suffix_pages != expected_pages:
+                raise ValueError("Suffix page arithmetic is inconsistent: "
+                                 f"prefix_pages={prefix_pages}, "
+                                 f"suffix_pages={suffix_pages}, "
+                                 f"expected_pages={expected_pages}")
+            local_block_ids = local_block_ids[prefix_pages:]
         mamba_state_block_ids: Optional[list[int]] = None
         if self._stage3_mamba_group_indices:
             mamba_block_ids: list[list[int]] = []
@@ -1026,15 +1136,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_data_replica_idx=src_data_replica_idx,
             src_parallelism=src_parallelism,
             mamba_state_block_ids=mamba_state_block_ids,
+            skip_tokens=skip_tokens,
         )
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 load req_id=%s "
-            "source_req_id=%s uuid=%d num_tokens=%d destination_pages=%d "
-            "source_controller=%s",
+            "source_req_id=%s uuid=%d num_tokens=%d skip_tokens=%d "
+            "destination_pages=%d source_controller=%s",
             request.request_id,
             source_req_id,
             uuid,
             num_tokens,
+            skip_tokens,
             len(local_block_ids),
             src_controller_address,
         )
@@ -1052,6 +1164,40 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return str(config_id).strip()
         default_job = "prefill" if self.is_producer else "decode"
         return f"{default_job}-engine"
+
+    def _enqueue_stage3_release(self, request: "Request") -> None:
+        """Full local hit: nothing to pull; ask the worker to promptly
+        release the producer's request-block registration instead of leaving
+        until p2p_wait_pull_timeout. Best-effort: the TTL remains the
+        backstop, so malformed params degrade to a warning, not a failure."""
+        params = request.kv_transfer_params or {}
+        source_req_id = params.get("req_id")
+        uuid = int(params.get("uuid", 0) or 0)
+        src_controller_address = str(params.get("src_controller_address",
+                                                "")).strip()
+        if (not isinstance(source_req_id, str) or not source_req_id
+                or uuid <= 0 or not src_controller_address):
+            logger.warning(
+                "Full prefix hit for req_id=%s carries incomplete "
+                "source metadata; leaving producer release to the TTL",
+                request.request_id)
+            return
+        self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
+            uuid=uuid,
+            source_req_id=source_req_id,
+            local_block_ids=[],
+            num_tokens=int(params.get("num_tokens", 0) or 0),
+            src_controller_address=src_controller_address,
+            src_job_name=str(params.get("src_job_name", "")),
+            src_engine_id=str(params.get("src_engine_id", "")),
+            src_data_replica_idx=int(params.get("src_data_replica_idx", -1)),
+            src_parallelism=int(params.get("src_parallelism", 0) or 0),
+            release_only=True,
+        )
+        logger.info(
+            "TPURaidenConnectorScheduler full prefix hit req_id=%s "
+            "source_req_id=%s uuid=%d releases the producer registration",
+            request.request_id, source_req_id, uuid)
 
     def request_finished(
         self,
@@ -1091,6 +1237,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 or 256)
             min_transfer_tokens = pcp_size * interleave_size
             if (num_tokens < min_transfer_tokens):
+                return False, {}
+
+        max_transfer_tokens = tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS
+        if max_transfer_tokens is not None and max_transfer_tokens > 0:
+            if num_tokens > max_transfer_tokens:
+                logger.warning(
+                    "Stage-3 producer token count (%d) exceeds "
+                    "TPU_RAIDEN_MAX_TRANSFER_TOKENS (%d) for req_id=%s; "
+                    "skipping transfer and freeing blocks immediately.",
+                    num_tokens, max_transfer_tokens, request.request_id)
                 return False, {}
 
         scheduler_block_tokens = self.block_size * pcp_size
@@ -1600,14 +1756,13 @@ class TPURaidenConnectorWorker:
         self._raiden_admission_summary = dict(summary)
         logger.info(
             "Raiden GLM pool admission complete topology=%s role=%s "
-            "binding=%s pools=%d storages=%d fa=%d dsa.idx=%d",
+            "binding=%s pools=%d storages=%d tag_counts=%s",
             topology,
             role,
             manifest.binding,
             len(manifest.pools),
             len(manifest.storages),
-            counts.get(rpm.TAG_FA, 0),
-            counts.get(rpm.TAG_DSA_IDX, 0),
+            dict(counts),
         )
         for tag, geo in geometry.items():
             logger.info(
@@ -2339,7 +2494,7 @@ class TPURaidenConnectorWorker:
                     block_ids=list(scheduler_ids),
                 ) for tag in _STAGE3_GLM_TRANSFER_POOL_TAGS
             ]
-            # Both tags stripe identically, so one tag's span count is this
+            # Every tag stripes identically, so one tag's span count is this
             # rank's page count.
             owned_pages = len(pool_spans[0].spans)
             if not owned_pages:
@@ -2697,6 +2852,43 @@ class TPURaidenConnectorWorker:
         # that happens to collide with an active destination request.
         return self._stage3_destination_req_ids.get(source_req_id)
 
+    def _stage3_release_producer_registration(
+            self, destination_req_id: str, req_meta: _Stage3LoadMeta) -> None:
+        """Full local hit: cancel the producer's unclaimed request-block
+        registration.
+
+        cancel_request_blocks_if_unclaimed is claim-safe — a concurrently
+        claimed (in-flight) registration refuses cancellation — and the TTL
+        remains the backstop, so this is best-effort fire-and-forget."""
+        address = str(req_meta.src_controller_address).strip()
+        cancelled = False
+        try:
+            facade = self._stage3_source_facades.get(address)
+            if facade is None:
+                facade = self._new_raiden_controller_facade(address)
+                self._stage3_source_facades[address] = facade
+            cancelled = bool(
+                facade.cancel_request_blocks_if_unclaimed(
+                    req_id=req_meta.source_req_id, uuid=int(req_meta.uuid)))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "Release-only cancellation failed req_id=%s "
+                "uuid=%d: %s (p2p_wait_pull_timeout remains the backstop)",
+                req_meta.source_req_id, int(req_meta.uuid), exc)
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage3_release_only",
+                    "req_id": req_meta.source_req_id,
+                    "destination_req_id": destination_req_id,
+                    "uuid": int(req_meta.uuid),
+                    "cancelled": cancelled,
+                },
+                sort_keys=True,
+            ),
+        )
+
     def _submit_stage3_loads(self, metadata: TPUConnectorMetadata,
                              engine: "KVCacheManager") -> None:
         """Starts exactly one source-controller transfer per request."""
@@ -2711,6 +2903,10 @@ class TPURaidenConnectorWorker:
                 raise TypeError(
                     "Stage-3 consumer requires controller load metadata, got "
                     f"{type(req_meta).__name__}")
+            if getattr(req_meta, "release_only", False):
+                self._stage3_release_producer_registration(
+                    destination_req_id, req_meta)
+                continue
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens)
             source_req_id = req_meta.source_req_id
@@ -2776,6 +2972,20 @@ class TPURaidenConnectorWorker:
                             transfer_tags.append(f"{tag}.g{ordinal}")
                             dst_blocks.append(int(slot))
                             dst_counts.append(1)
+                # Prefix-aware suffix pull: clip the FA global destination
+                # byte space at the locally-cached prefix; GDN state classes
+                # are not prefix-decomposable and always transfer whole
+                # (skip 0). Omit the kwarg entirely when there is no clip so
+                # skip-free requests stay byte-identical on the wire.
+                skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
+                fa_skip_bytes = 0
+                clip_kwargs: dict[str, Any] = {}
+                if skip_tokens > 0:
+                    token_bytes = self._stage3_fa_token_bytes(
+                        int(self.vllm_config.cache_config.block_size))
+                    fa_skip_bytes = skip_tokens * token_bytes
+                    clip_kwargs["dst_skip_bytes"] = ([fa_skip_bytes] + [0] *
+                                                     (len(transfer_tags) - 1))
                 start_submit = time.perf_counter()
                 accepted = self._start_stage3_transfer_with_d5_retry(
                     source_facade,
@@ -2795,6 +3005,7 @@ class TPURaidenConnectorWorker:
                     num_tokens=num_tokens,
                     transfer_pool_tags=transfer_tags,
                     dst_block_counts=dst_counts,
+                    **clip_kwargs,
                 )
                 submit_ms = (time.perf_counter() - start_submit) * 1000
                 if accepted is not True:
@@ -2839,6 +3050,8 @@ class TPURaidenConnectorWorker:
                         "destination_req_id": destination_req_id,
                         "uuid": uuid,
                         "num_tokens": num_tokens,
+                        "skip_tokens": skip_tokens,
+                        "fa_skip_bytes": fa_skip_bytes,
                         "recv_armed_before_push": True,
                         "state_group_count": self._stage3_state_group_count,
                         "destination_pages": len(local_blocks),
@@ -3184,6 +3397,16 @@ class TPURaidenConnectorWorker:
                 return
             time.sleep(0.001)
 
+    def _flattened_kv_cache_tensors(self) -> list[Any]:
+        assert self.runner is not None
+        flat: list[Any] = []
+        for entry in self.runner.kv_caches:
+            if isinstance(entry, (tuple, list)):
+                flat.extend(entry)
+            else:
+                flat.append(entry)
+        return flat
+
     def _ensure_raiden_transfer_engine(self) -> "KVCacheManager":
         if self._raiden_transfer_engine is not None:
             return self._raiden_transfer_engine
@@ -3191,7 +3414,7 @@ class TPURaidenConnectorWorker:
             raise RuntimeError(
                 "register_runner must be called before transfer")
         engine = self._construct_raiden_transfer_engine(
-            list(self.runner.kv_caches))
+            self._flattened_kv_cache_tensors())
         self._raiden_transfer_engine = engine
         return engine
 
@@ -3307,12 +3530,15 @@ class TPURaidenConnectorWorker:
         if override > 0:
             return override
         assert self.runner is not None
-        kv_layer = self.runner.kv_caches[0]
-        dtype_bytes = torch.tensor([], dtype=kv_layer.dtype).element_size()
-        bytes_per_layer = dtype_bytes * max_blocks
-        for dim in kv_layer.shape[1:]:
-            bytes_per_layer *= int(dim)
-        bytes_per_slot = bytes_per_layer * len(self.runner.kv_caches)
+        # Sum per-block bytes over every flattened tensor: cache entries
+        # can be heterogeneous e.g. split MLA nope/rope tesnsor list
+        # and DSA indexer tensor.
+        bytes_per_slot = 0
+        for kv_tensor in self._flattened_kv_cache_tensors():
+            tensor_bytes = kv_tensor.element_size() * max_blocks
+            for dim in kv_tensor.shape[1:]:
+                tensor_bytes *= int(dim)
+            bytes_per_slot += tensor_bytes
         per_rank_budget = int(dist_utils.get_kv_shm_pool_gb() * (1024**3))
         per_rank_budget //= max(1, self.tp_size)
         return max(1, per_rank_budget // max(1, bytes_per_slot))

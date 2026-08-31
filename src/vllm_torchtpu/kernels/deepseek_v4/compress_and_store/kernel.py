@@ -293,6 +293,7 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     jax.jit,
     static_argnames=(
         "block_table_stride",
+        "state_block_size",
         "compress_ratio",
         "overlap",
         "quant_block",
@@ -311,6 +312,7 @@ def compress_norm_rope_store(
     rms_weight: jax.Array,
     *,
     block_table_stride: int,
+    state_block_size: int,
     state_cache: jax.Array | None = None,
     rope_cache: jax.Array | None = None,
     cos_sin_cache: jax.Array | None = None,
@@ -321,8 +323,7 @@ def compress_norm_rope_store(
     interpret: bool = False,
     name: str = "compress_norm_rope_store",
 ) -> tuple[jax.Array, jax.Array | None]:
-    """Compresses, normalizes, applies RoPE and stores to cache.
-    """
+    """Compresses, normalizes, applies RoPE and stores to cache. """
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
 
@@ -339,6 +340,7 @@ def compress_norm_rope_store(
         size_n=num_tokens,
         physical_page_size=cache.shape[1],
         state_physical_page_size=state_source.shape[1],
+        state_block_size=state_block_size,
         rms_eps=rms_eps,
         tile_n=4,
         head_dim=head_dim,

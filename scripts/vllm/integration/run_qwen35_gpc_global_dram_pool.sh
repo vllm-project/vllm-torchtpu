@@ -42,21 +42,69 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
+# Print to stdout: Buildkite's main log view surfaces stdout, and the
+# failure reason must be readable there without digging through artifacts.
+fail() {
+  echo "GPC_DRAM_POOL_FAIL: $*"
+  exit 1
+}
+
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
 RUN_ROOT="${RUN_ROOT:-/tmp/qwen35_gpc_dram_pool_ci}"
 RUN_DIR="${RUN_DIR:-${RUN_ROOT}/run}"
 BIND_HOST="${BIND_HOST:-127.0.0.1}"
-# The test container runs with --net=host, so fixed ports collide with
-# whatever an earlier run left on the agent (a timed-out job's container
-# outlives its docker client and keeps its listeners). Shift all ports by
-# a per-job value; kept under 47 so the bases never cross each other.
 job_tag="${BUILDKITE_JOB_ID:-${BUILDKITE_BUILD_NUMBER:-0}}"
 PORT_SHIFT="${PORT_SHIFT:-$(($(printf '%s' "${job_tag}" | cksum | cut -d' ' -f1) % 47))}"
-PORT="${PORT:-$((8100 + PORT_SHIFT))}"
-REGISTRY_PORT="${REGISTRY_PORT:-$((48500 + PORT_SHIFT))}"
-OFFLOAD_CONTROLLER_PORT="${OFFLOAD_CONTROLLER_PORT:-$((47800 + PORT_SHIFT))}"
-NODE_CONTROLLER_PORT="${NODE_CONTROLLER_PORT:-$((47900 + PORT_SHIFT))}"
+EPHEMERAL_FLOOR="$(cut -f1 /proc/sys/net/ipv4/ip_local_port_range \
+  2>/dev/null || echo 32768)"
+
+# First free port at or above $1, probed the way the servers bind it: an
+# IPv6 wildcard socket, which on Linux covers the IPv4 wildcard too. The
+# probe closes the socket before the server opens it, so this narrows the
+# race to milliseconds instead of leaving the port unchecked for the run.
+# The scan span stays well inside the 500-port gap between bases.
+pick_port() {
+  python3 - "$1" "${EPHEMERAL_FLOOR}" <<'PY'
+import socket
+import sys
+
+base, floor = int(sys.argv[1]), int(sys.argv[2])
+end = min(base + 100, floor)
+# gRPC binds a dualstack wildcard where it can and falls back to IPv4
+# where it cannot; probe with whichever this host actually supports.
+dualstack = socket.has_dualstack_ipv6()
+family = socket.AF_INET6 if dualstack else socket.AF_INET
+for port in range(base, end):
+    try:
+        probe = socket.create_server(("", port), family=family,
+                                     dualstack_ipv6=dualstack)
+    except OSError:
+        continue
+    probe.close()
+    print(port)
+    break
+else:
+    raise SystemExit(f"no port free in [{base}, {end})")
+PY
+}
+
+server_base=$((8100 + PORT_SHIFT))
+registry_base=$((21500 + PORT_SHIFT))
+offload_base=$((21000 + PORT_SHIFT))
+node_base=$((20500 + PORT_SHIFT))
+
+# Each assignment carries its own `|| fail`: a message printed inside the
+# command substitution would be captured as the port instead of surfacing.
+PORT="${PORT:-$(pick_port "${server_base}")}" \
+  || fail "no free port for the vLLM server near ${server_base}"
+REGISTRY_PORT="${REGISTRY_PORT:-$(pick_port "${registry_base}")}" \
+  || fail "no free port for the global registry near ${registry_base}"
+OFFLOAD_CONTROLLER_PORT="${OFFLOAD_CONTROLLER_PORT:-$(pick_port \
+  "${offload_base}")}" \
+  || fail "no free port for the offload controller near ${offload_base}"
+NODE_CONTROLLER_PORT="${NODE_CONTROLLER_PORT:-$(pick_port "${node_base}")}" \
+  || fail "no free port for the store node controller near ${node_base}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-3600}"
 
 # One pool group covers the serving replica (tier 0, the implicit serving
@@ -108,13 +156,9 @@ POOL_PROMPTS_MAX="${POOL_PROMPTS_MAX:-8}"
 NODE_DRAM_BUDGET_BYTES="${NODE_DRAM_BUDGET_BYTES:-17179869184}"
 
 mkdir -p "${RUN_DIR}/logs"
-
-# Print to stdout: Buildkite's main log view surfaces stdout, and the
-# failure reason must be readable there without digging through artifacts.
-fail() {
-  echo "GPC_DRAM_POOL_FAIL: $*"
-  exit 1
-}
+echo "ports: server=${PORT} registry=${REGISTRY_PORT}\
+ offload controller=${OFFLOAD_CONTROLLER_PORT}\
+ node controller=${NODE_CONTROLLER_PORT}"
 
 # ---------------------------------------------------------------------------
 # Version preflight: the runtime must match pyproject.toml exactly.
@@ -169,6 +213,14 @@ trap cleanup EXIT
 check_control_plane() {
   kill -0 "${REGISTRY_PID}" 2>/dev/null || {
     tail -50 "${RUN_DIR}/logs/registry.log" || true
+    # A lost port race is the one failure the registry cannot report itself
+    # on older wheels: it announces the address it never bound and then
+    # crashes, so name the cause here rather than leaving "exited".
+    if grep -qE "Failed to (add port|listen)" \
+        "${RUN_DIR}/logs/registry.log" 2>/dev/null; then
+      fail "global_registry_server could not bind port ${REGISTRY_PORT}:\
+ something else on this agent holds it"
+    fi
     fail "global_registry_server exited"
   }
   if [[ -n "${NODE_PID}" ]]; then

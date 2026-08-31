@@ -10,9 +10,31 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.blockwise_kernel import \
-    quantized_matmul_kernel as blockwise_quantized_matmul_kernel
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+
+# Some layers have their `.weight` read raw -- bypassing the linear method's
+# `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
+# to (k, n) corrupts the consumer silently, so they keep the upstream layout.
+#
+# The requirement belongs to the *consumer*, not to a name list here: the
+# module that reads the weight raw sets this attribute on the linear layer in
+# its own `__init__`. That runs during model construction, before any
+# `process_weights_after_loading`, so it is set by the time the layout decision
+# is made -- and it moves with the code if a layer is renamed, which a
+# name-matched list would not.
+KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
+
+# Idempotence guard, set by the linear method once it has flipped a weight.
+# Not how `apply` picks its contraction -- that keys off the marker above.
+#
+# It has to be a stored flag rather than a property of the weight: the flip
+# cannot be recovered from the shape (`o_proj` and friends are square in most
+# models), and encoding it in a Parameter subclass does not survive vLLM's
+# `replace_parameter`, which re-wraps by type. Meanwhile
+# `process_weights_after_loading` IS re-entered by vLLM's reload paths
+# (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
+# back and silently corrupt the values.
+WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -30,33 +52,41 @@ def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
 
 def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array,
                           w_s: jax.Array) -> jax.Array:
-    if x.shape[1] != w_q.shape[1]:
+    """FP8 dense matmul on the canonical (k, n) weight layout.
+
+    `w_q` is `[n_in, n_out]`, so this is a plain `(m, k) @ (k, n)` contraction
+    rather than the `(m, k) @ (n, k).T` the N-major layout forced. The
+    blockwise path routes through `gmm_v2` (single group), which consumes a
+    K-major rhs natively; the per-channel path uses the shared
+    `xla_quantized_matmul`, which takes the same (k, n) layout.
+    """
+    if x.shape[1] != w_q.shape[0]:
         raise ValueError(
             f"Input hidden dim {x.shape[1]} must match weight hidden dim "
-            f"{w_q.shape[1]}.")
-    x_q_dtype = _get_x_q_dtype(w_q.dtype)
-    if len(w_s.shape) == 3:
-        k_dim = x.shape[1]
-        sharded_num_blocks, _, _ = w_s.shape
-        if w_s.shape[1] != 1:
+            f"{w_q.shape[0]}.")
+    if len(w_s.shape) == 4:
+        k_dim, n_out = w_q.shape
+        _, sharded_num_blocks, mid, scale_n_out = w_s.shape
+        if mid != 1:
             raise ValueError(
-                f"Blockwise weight scale middle dim must be 1, got {w_s.shape=}"
-            )
-        if w_s.shape[2] != w_q.shape[0]:
+                f"Blockwise weight scale axis 2 must be 1, got {w_s.shape=}")
+        if scale_n_out != n_out:
             raise ValueError(
-                f"Blockwise weight scale output dim {w_s.shape[2]} must match "
-                f"weight output dim {w_q.shape[0]}.")
+                f"Blockwise weight scale output dim {scale_n_out} must match "
+                f"weight output dim {n_out}.")
         if sharded_num_blocks <= 0 or k_dim % sharded_num_blocks != 0:
             raise ValueError(
                 f"Input hidden dim {k_dim} must be divisible by block scale "
                 f"count {sharded_num_blocks}.")
-        block_size = k_dim // sharded_num_blocks
-        return blockwise_quantized_matmul_kernel(
-            x,
-            w_q,
-            w_s,
-            x_q_dtype=x_q_dtype,
-            block_size=block_size,
+        return gmm_v2(
+            lhs=x,
+            rhs=w_q[None],  # [n_in, n_out] -> [1, n_in, n_out]
+            group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+            rhs_scale=w_s,
+            group_offset=jnp.array([0], dtype=jnp.int32),
+            preferred_element_type=x.dtype,
+            maybe_quantize_lhs=True,
+            zero_initialize=True,
         )
     return xla_quantized_matmul(x, w_q, w_s)
 
@@ -81,7 +111,7 @@ def _get_quantized_matmul_op() -> Callable:
                                    w_s: torch.Tensor):
             del w_s
             return torch.empty(x.shape[0],
-                               w_q.shape[0],
+                               w_q.shape[-1],
                                dtype=x.dtype,
                                device=x.device)
 
@@ -95,16 +125,17 @@ def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
     Reshapes `x` to 2-D, dispatches through a cached `pallas.jax_op`, and
-    reshapes the output back. The underlying JAX function picks the blockwise
-    Pallas kernel when `w_s` is rank-3 `[n_in_blocks, 1, n_out]`, and the
-    per-channel `xla_quantized_matmul` path when `w_s` is 1-D `[n_out]`.
+    reshapes the output back. `w_q` is the canonical (k, n) layout
+    `[n_in, n_out]`. The underlying JAX function picks `gmm_v2` when `w_s` is
+    rank-4 `[1, n_in_blocks, 1, n_out]`, and the per-channel dot_general path
+    when `w_s` is 1-D `[n_out]`.
     """
-    if x.shape[-1] != w_q.shape[-1]:
+    if x.shape[-1] != w_q.shape[0]:
         raise ValueError(
             f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
-            f"{w_q.shape[-1]}.")
+            f"{w_q.shape[0]}.")
 
-    orig_out_shape = (*x.shape[:-1], w_q.shape[0])
+    orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)

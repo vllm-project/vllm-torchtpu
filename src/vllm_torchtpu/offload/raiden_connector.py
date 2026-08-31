@@ -238,6 +238,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        # Opt in to uniform cross-layer KV cache allocation when block-major layout is enabled.
+        # Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()` preconditions to enable
+        # bundled tensor allocation in the TPU model runner.
+        from vllm_torchtpu import envs as tpu_envs
+        return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
+
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
                  kv_cache_config: KVCacheConfig):
         # Skip OffloadingConnector.__init__: default factory cannot carry

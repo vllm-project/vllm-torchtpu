@@ -219,11 +219,6 @@ def ref_compress_norm_rope_store(
         slot_bytes = slots_per_part_hbm * d2
 
     state_source = cache if state_cache is None else state_cache
-    state_page_size = page_size if state_cache is None else state_cache.shape[1]
-    slots_per_token = state_page_size // state_block_size
-    f32_per_slot = state_dim // slots_per_token
-    bytes_per_slot = f32_per_slot * 4
-    assert bytes_per_slot == slot_bytes
 
     rope_num_pages, rope_page_size_unpacked, rope_d1, rope_d2 = rope_cache_for_unpack.shape
     assert rope_num_pages == num_pages
@@ -238,14 +233,21 @@ def ref_compress_norm_rope_store(
     # inverse of the pack in ``ref_wkv_proj_and_save_state``.
     phys_pages, phys_page_size, hbm_pack, last_dim = state_source.shape
     assert hbm_pack == 4, f"expected 4 bytes per f32 in a slot row, got {hbm_pack}"
-    state_rows = phys_page_size // state_block_size
-    assert state_rows * hbm_pack * last_dim == state_dim * 4
-    state_bytes_t = state_source.reshape(phys_pages, state_block_size,
+    state_row_bytes = hbm_pack * last_dim
+    state_rows = state_dim * 4 // state_row_bytes
+    assert state_rows * state_row_bytes == state_dim * 4
+    # Slots are laid out at page capacity; `gather_state_windows` then indexes
+    # them with `position % state_block_size`, which stays within it.
+    tokens_per_page = phys_page_size // state_rows
+    assert state_block_size <= tokens_per_page, (
+        f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
+        f"token states a {phys_page_size}-row page holds")
+    state_bytes_t = state_source.reshape(phys_pages, tokens_per_page,
                                          state_rows, hbm_pack,
                                          last_dim).transpose(0, 1, 2, 4, 3)
     state_view = jax.lax.bitcast_convert_type(state_bytes_t,
                                               jnp.float32).reshape(
-                                                  phys_pages, state_block_size,
+                                                  phys_pages, tokens_per_page,
                                                   state_dim)
 
     # 3. Gather state windows

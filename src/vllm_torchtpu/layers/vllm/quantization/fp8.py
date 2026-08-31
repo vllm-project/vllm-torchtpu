@@ -44,8 +44,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
 from vllm.model_executor.layers.linear import (
-    LinearBase, UnquantizedLinearMethod,
-    register_weight_loader_v2_supported_method)
+    LinearBase, register_weight_loader_v2_supported_method)
 from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -67,7 +66,9 @@ from vllm_torchtpu.layers.vllm import moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
-from vllm_torchtpu.layers.vllm.linear_common import quantized_matmul
+from vllm_torchtpu.layers.vllm.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
+                                                     WEIGHT_FLIPPED_ATTR,
+                                                     quantized_matmul)
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import (
@@ -201,17 +202,20 @@ def _format_linear_scale_for_runtime(
 ) -> torch.Tensor:
     """Reshape `weight_scale` to the layout expected by the matmul bridge.
 
-    - Blockwise kernel path: kernel expects `[n_in_blocks, 1, n_out]`. The
-      requantizer produces `[n_out, n_in_blocks]`, so transpose and add the
-      singleton middle axis.
+    - Blockwise path: gmm_v2 expects `[1, n_in_blocks, 1, n_out]` (its
+      `[size_group, num_blocks, 1, out_size]` rhs_scale, single group). The
+      requantizer produces `[n_out, n_in_blocks]`, so transpose and add both
+      the singleton middle axis and the leading group axis.
     - XLA per-channel path: kernel expects a 1-D `[n_out]` scale, so drop
-      a trailing singleton dim if present.
+      a trailing singleton dim if present. Layout independent -- the scale is
+      per output channel either way.
     """
     weight_scale = weight_scale.to(torch.float32).contiguous()
     if blockwise_kernel:
-        # quantize_tensor returns [n_out, n_blocks]. The blockwise kernel
-        # expects [n_blocks, 1, n_out].
-        weight_scale = weight_scale.transpose(0, 1).contiguous().unsqueeze(1)
+        # quantize_tensor returns [n_out, n_blocks]; gmm_v2 wants
+        # [1, n_blocks, 1, n_out].
+        weight_scale = weight_scale.transpose(
+            0, 1).contiguous().unsqueeze(1).unsqueeze(0)
     elif weight_scale.ndim == 2 and weight_scale.shape[-1] == 1:
         weight_scale = weight_scale.squeeze(-1).contiguous()
     return weight_scale
@@ -603,7 +607,9 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                     ignored_layers=self.ignored_layers,
                     fused_mapping=self.packed_modules_mapping,
             ):
-                return UnquantizedLinearMethod()
+                from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+                    VllmUnquantizedLinearMethod
+                return VllmUnquantizedLinearMethod()
             return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
 
         if isinstance(layer, Attention):
@@ -635,9 +641,29 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
     @property
     def supports_internal_mk(self) -> bool:
-        # We need to take control of collective communication (AllGather/ReduceScatter)
-        # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        """Whether this method owns the DP/EP dispatch and combine.
+
+        vLLM brackets `apply_monolithic` with an all-gather and a
+        reduce-scatter unless the method claims them
+        (`MoERunner.do_naive_dispatch_combine`). Two independent paths claim
+        them, and either one alone has to suppress vLLM's pair:
+
+        - chunk pipelining stages the same two collectives itself so they
+          overlap the compute;
+        - the fused EP kernel does the exchange inside its own program.
+
+        The fused half asks `fused_moe_ep_supported` about this method, not
+        `envs.USE_MOE_FUSED_EP_KERNEL`: the env var only says the operator
+        asked for the kernel, while `prebuild_fused_moe_ep` is what decides
+        whether this layer was actually armed. Claiming ownership on the
+        request would strip vLLM's collectives in every configuration prebuild
+        refuses -- TP, PCP, over the SMEM bound, under the token threshold, or
+        a weight or routing layout the kernel cannot serve.
+        """
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            fused_moe_ep_supported
+        return (enable_pipelined_collective_and_compute()
+                or fused_moe_ep_supported(self))
 
     def maybe_roundup_sizes(
         self,
@@ -811,6 +837,19 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        # Resolve the EP mesh here, not on the first forward: it maps ranks to
+        # TPU device ids with an all_gather_object, and Dynamo cannot trace a
+        # collective inside the compiled graph. The result is recorded on this
+        # method, which vLLM builds one of per MoE layer, so a layer the kernel
+        # cannot serve is refused on its own rather than for the process.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
+        setattr(
+            self, FUSED_MOE_EP_OP_ATTR,
+            prebuild_fused_moe_ep(layer,
+                                  topk=layer.moe_config.experts_per_token,
+                                  renormalize=layer.renormalize,
+                                  activation=activation_str))
 
     def apply_monolithic(
         self,
@@ -821,6 +860,16 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
+        # The fused EP kernel takes this rank's own tokens and returns this
+        # rank's own tokens: it routes, exchanges, computes and combines inside
+        # one program. Keyed on the same predicate `supports_internal_mk` uses,
+        # so ownership and the path that exercises it cannot disagree.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            fused_moe_ep, fused_moe_ep_supported)
+        if fused_moe_ep_supported(self):
+            return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
+                                layer.w13_weight_scale_inv,
+                                layer.w2_weight_scale_inv, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1001,6 +1050,22 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             requant_dtype_name = desired_quant_dtype
 
+        # Canonical (k, n) layout: the runtime matmul is (m, k) @ (k, n), so
+        # the checkpoint's [n_out, n_in] weight is transposed once here at load
+        # instead of being transposed per step inside the contraction. Placed
+        # where both branches above converge (fp8-serialized checkpoint and
+        # load-time quantization) so neither can reach the matmul N-major, and
+        # after quantization so the requantizer still sees the contracting dim
+        # last (axis=-1). The reallocation below materializes the view.
+        ckpt_n_out, ckpt_n_in = weight.shape
+        # Layers whose weight is read raw by code expecting vLLM's
+        # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
+        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return  # already flipped; reload paths re-enter this hook
+        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        if not keep_vllm_layout:
+            weight = weight.transpose(0, 1)
+
         # The dequant/requant chain may leave views backed by higher-rank PJRT
         # buffers. Allocate fresh contiguous persistent parameters so the
         # matmul boundary sees plain row-major buffers.
@@ -1016,6 +1081,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
         replace_parameter(layer, "weight",
                           torch.nn.Parameter(weight, requires_grad=False))
+        if not keep_vllm_layout:
+            setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
@@ -1023,13 +1090,16 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream linear kernels and dequantization
         # pipelines properly recognize scale broadcast granularity right across tensor-parallel shards.
         if requant_block_size is None:
+            # Stated in checkpoint [n_out, n_in] terms, which is what the
+            # downstream dequantization pipelines read; the transpose above
+            # changes only the runtime matmul layout, not scale granularity.
             if weight_scale.ndim == 1:
-                if weight_scale.shape[0] == weight.shape[0]:
-                    layer.weight_block_size = (1, weight.shape[1])
+                if weight_scale.shape[0] == ckpt_n_out:
+                    layer.weight_block_size = (1, ckpt_n_in)
                 else:
-                    layer.weight_block_size = (weight.shape[0], 1)
+                    layer.weight_block_size = (ckpt_n_out, 1)
             else:
-                layer.weight_block_size = (weight.shape[0], weight.shape[1])
+                layer.weight_block_size = (ckpt_n_out, ckpt_n_in)
         else:
             layer.weight_block_size = requant_block_size
 
@@ -1048,7 +1118,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        out = quantized_matmul(x, layer.weight, layer.weight_scale)
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
+            # takes the canonical (k, n), so flip the view for the contraction.
+            weight = weight.transpose(0, 1)
+        out = quantized_matmul(x, weight, layer.weight_scale)
         if bias is not None:
             out = out + bias
         return out

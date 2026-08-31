@@ -52,8 +52,10 @@ def _state_cache(compress_ratio: int, head_dim: int = 512):
         # compression ratio alone would suggest.
         (128, 512, 1024, 32),
         (128, 512, 512, 16),
-        # The lightning indexer: 256-lane records.
-        (4, 128, 1024, 32),
+        # The lightning indexer: 256-lane records. Its own page holds 32
+        # token states, but it is floored to CSA's 16 so the two share a
+        # `(block_size, sliding_window)` cache group.
+        (4, 128, 1024, 16),
     ],
 )
 def test_state_block_size_follows_the_host_page(compress_ratio, head_dim,
@@ -61,9 +63,10 @@ def test_state_block_size_follows_the_host_page(compress_ratio, head_dim,
     """Block size must come from the kernel's own layout model.
 
     It is not a closed form -- HCA writes two rows per record, the indexer
-    array is 256 lanes wide, and HCA's state is hosted on a CSA page -- so
-    this pins the values `compress_and_store.config` actually produces, which
-    is what the compressor kernel indexes the block table with.
+    array is 256 lanes wide, HCA's state is hosted on a CSA page, and CSA and
+    the indexer are floored to a shared value -- so this pins the values
+    `compress_and_store.config` actually produces, which is what the
+    compressor kernel indexes the block table with.
     """
     cache = _state_cache(compress_ratio, head_dim)
     assert cache._derive_block_size(cache_block_size) == expected

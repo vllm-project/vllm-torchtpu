@@ -172,7 +172,7 @@ def ref_implementation(
         l_1_scaled = l_1 * jnp.exp(m_1 - m)
         l_2 = jnp.sum(jnp.exp(attn - m), axis=-1, keepdims=True)
         l_sinks = jnp.exp(attention_sinks[..., None, None] - m)
-        l_sum = l_1_scaled + l_2 + l_sinks
+        l = l_1_scaled + l_2 + l_sinks  # noqa: E741
 
         p_2 = jnp.exp(attn - m)
         acc_2 = jnp.einsum("nqk,kl->qnl", p_2, v_i)
@@ -180,7 +180,7 @@ def ref_implementation(
         acc_1_scaled = swa_accumution_i * exp_m1_diff
         acc = acc_1_scaled + acc_2
 
-        out_i = (acc / jnp.transpose(l_sum, (1, 0, 2))).astype(q_i.dtype)
+        out_i = (acc / jnp.transpose(l, (1, 0, 2))).astype(q_i.dtype)
         outputs.append(out_i)
 
     return jnp.concatenate(outputs, axis=0)
@@ -242,50 +242,11 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
     return cache_kv_base, cache_kv_nope, cache_kv_rope
 
 
-def pad_inputs(
-    q,
-    topk_indices,
-    swa_accumution,
-    swa_l,
-    swa_m,
-    gather_and_attention_chunk_size,
-):
-    num_real_tokens = q.shape[0]
-    num_pad = (cdiv(num_real_tokens, gather_and_attention_chunk_size) *
-               gather_and_attention_chunk_size - num_real_tokens)
-    q = jnp.pad(
-        q,
-        ((0, num_pad), (0, 0), (0, 0)),
-        constant_values=0,
-    )
-    topk_indices = jnp.pad(
-        topk_indices,
-        ((0, num_pad), (0, 0)),
-        constant_values=-1,
-    )
-    swa_accumution = jnp.pad(
-        swa_accumution,
-        ((0, num_pad), (0, 0), (0, 0)),
-        constant_values=0,
-    )
-    swa_l = jnp.pad(
-        swa_l,
-        ((0, num_pad), (0, 0)),
-        constant_values=0,
-    )
-    swa_m = jnp.pad(
-        swa_m,
-        ((0, num_pad), (0, 0)),
-        constant_values=0,
-    )
-    return q, topk_indices, swa_accumution, swa_l, swa_m
-
-
 class CorrectnessTest(parameterized.TestCase):
 
     def test_correctness(self):
         topk = 1024
-        rng = np.random.default_rng(1234)
+        rng = np.random.default_rng()
 
         print(f"JAX Backend: {jax.default_backend()}")
 
@@ -352,17 +313,6 @@ class CorrectnessTest(parameterized.TestCase):
         swa_m = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
 
         gather_and_attention_chunk_size = 32
-        num_real_tokens = q.shape[0]
-        # pad num_tokens to be divisible by gather_and_attention_chunk_size.
-        q, topk_indices, swa_accumution, swa_l, swa_m = pad_inputs(
-            q,
-            topk_indices,
-            swa_accumution,
-            swa_l,
-            swa_m,
-            gather_and_attention_chunk_size,
-        )
-
         print("Running Baseline Reference...")
         out_base = ref_implementation(
             q,
@@ -396,8 +346,8 @@ class CorrectnessTest(parameterized.TestCase):
         )
         out_base.block_until_ready()
         out_agent.block_until_ready()
-        out_base = out_base[:num_real_tokens]
-        out_agent = out_agent[:num_real_tokens]
+        out_base = out_base
+        out_agent = out_agent
 
         # Compare
         print("Comparing output attention...")

@@ -489,6 +489,7 @@ def prepare_outputs(out):
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "enable_early_exit",
     ),
 )
 def streamindex_topk(
@@ -507,6 +508,7 @@ def streamindex_topk(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    enable_early_exit: bool = False,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -528,6 +530,11 @@ def streamindex_topk(
     num_queries_per_block: number of queries to be processed in one block in the
       pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
+    enable_early_exit: skip scoring entirely when every sequence in the batch
+      already fits in k, where top-k is the identity and the scores carry no
+      information. The guard is batch-wide, so one long sequence disables it
+      for all of them; when it does fire the scoring kernel, the -inf fill and
+      the top-k reduction are all skipped.
 
   Returns:
     Top-K indices (in compressed space).
@@ -704,89 +711,126 @@ def streamindex_topk(
             scores,
         )
 
-    # Pre-fill the output with -inf and alias it, so masked / unwritten
-    # columns are already -inf.
-    scores_init = jnp.full(
-        (q.shape[0], num_sublanes_total, 128),
-        -jnp.inf,
-        dtype=jnp.float32,
-    )
+    def _fast_path(_):
+        """Top-k for a batch where every sequence already fits in k.
 
-    # TODO: we shall sort the sequences by length, so that multiple decode
-    # sequences in one batch have similar lengths to reduce waste of compute.
-    # With the same batch size, the longest sequence will determine number of
-    # blocks to run computation for.
-    decode_batch_end = (distribution[0] // decode_req_batch_size *
-                        decode_req_batch_size)
-    scores = run_topk_kernel(
-        q,
-        prepared_indexer_weights,
-        cache_kv,
-        scores_init,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=decode_batch_end,
-        static_q_len=1,
-        seq_batch_size=decode_req_batch_size,
-        case=MlaCase.DECODE,
-    )
-    # Handle num_decode_seqs % decode_req_batch_size != 0 case.
-    scores = run_topk_kernel(
-        q,
-        prepared_indexer_weights,
-        cache_kv,
-        scores,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=decode_batch_end,
-        end_seq_idx=distribution[1],
-        static_q_len=1,
-        seq_batch_size=1,
-        case=MlaCase.DECODE,
-    )
+        Once a sequence's compressed length is <= k, every visible position is
+        selected, so the scores decide nothing but the order and the answer is
+        just `[0, 1, ..., last_visible, -1, ...]`. The guard below is
+        batch-wide, so this only runs when that holds for every sequence.
+        """
+        token_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
+        seq_idx = jnp.minimum(
+            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+            max_num_seqs - 1,
+        )
+        seq_len = seq_lens[seq_idx]
+        q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
+        q_abs_pos = (seq_len - q_len) + (token_idx - cu_q_lens[seq_idx])
+        last_visible = jnp.minimum(seq_len // compression_ratio - 1,
+                                   q_abs_pos // compression_ratio)
+        # Padding tokens past the last real query select nothing.
+        last_visible = jnp.where(token_idx < cu_q_lens[-1], last_visible, -1)
+        slot = jnp.arange(k, dtype=jnp.int32)[None, :]
+        return jnp.where(slot <= last_visible[:, None], slot, -1)
 
-    scores = run_topk_kernel(
-        q,
-        prepared_indexer_weights,
-        cache_kv,
-        scores,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
-        start_seq_idx=distribution[1],
-        end_seq_idx=distribution[2],
-        static_q_len=None,
-        seq_batch_size=1,
-        case=MlaCase.MIXED,
-    )
-
-    scores = scores.reshape(q.shape[0], -1)
-    if scores.shape[1] < k:
-        scores = jnp.pad(
-            scores,
-            ((0, 0), (0, k - scores.shape[1])),
-            constant_values=-jnp.inf,
+    def _common_path(_):
+        # Pre-fill the output with -inf and alias it, so masked / unwritten
+        # columns are already -inf.
+        scores_init = jnp.full(
+            (q.shape[0], num_sublanes_total, 128),
+            -jnp.inf,
+            dtype=jnp.float32,
         )
 
-    # TODO: Re-evaluate replacing this with the sparsecore_topk kernel
-    # once SparseCore supports direct VMEM access (e.g., on TPU v8).
-    # Currently, jax.lax.approx_max_k wins due to the HBM read/write tax, but
-    # direct VMEM streaming will allow SC to beat TensorCore performance.
+        # TODO: we shall sort the sequences by length, so that multiple decode
+        # sequences in one batch have similar lengths to reduce waste of
+        # compute. With the same batch size, the longest sequence will
+        # determine number of blocks to run computation for.
+        decode_batch_end = (distribution[0] // decode_req_batch_size *
+                            decode_req_batch_size)
+        scores = run_topk_kernel(
+            q,
+            prepared_indexer_weights,
+            cache_kv,
+            scores_init,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=decode_batch_end,
+            static_q_len=1,
+            seq_batch_size=decode_req_batch_size,
+            case=MlaCase.DECODE,
+        )
+        # Handle num_decode_seqs % decode_req_batch_size != 0 case.
+        scores = run_topk_kernel(
+            q,
+            prepared_indexer_weights,
+            cache_kv,
+            scores,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=decode_batch_end,
+            end_seq_idx=distribution[1],
+            static_q_len=1,
+            seq_batch_size=1,
+            case=MlaCase.DECODE,
+        )
 
-    # jax.lax.approx_max_k(recall_target=1.0) is equivalent to jax.lax.top_k
-    # but faster.
-    top_vals, top_idxs = jax.lax.approx_max_k(scores,
-                                              k,
-                                              reduction_dimension=-1,
-                                              recall_target=1.0)
-    topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
-    return topk_idxs[:q.shape[0], :k]
+        scores = run_topk_kernel(
+            q,
+            prepared_indexer_weights,
+            cache_kv,
+            scores,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
+            static_q_len=None,
+            seq_batch_size=1,
+            case=MlaCase.MIXED,
+        )
+
+        scores = scores.reshape(q.shape[0], -1)
+        if scores.shape[1] < k:
+            scores = jnp.pad(
+                scores,
+                ((0, 0), (0, k - scores.shape[1])),
+                constant_values=-jnp.inf,
+            )
+
+        # TODO: Re-evaluate replacing this with the sparsecore_topk kernel
+        # once SparseCore supports direct VMEM access (e.g., on TPU v8).
+        # Currently, jax.lax.approx_max_k wins due to the HBM read/write tax,
+        # but direct VMEM streaming will allow SC to beat TensorCore
+        # performance.
+
+        # jax.lax.approx_max_k(recall_target=1.0) is equivalent to
+        # jax.lax.top_k but faster.
+        top_vals, top_idxs = jax.lax.approx_max_k(scores,
+                                                  k,
+                                                  reduction_dimension=-1,
+                                                  recall_target=1.0)
+        topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
+        return topk_idxs[:q.shape[0], :k]
+
+    if not enable_early_exit:
+        return _common_path(None)
+    # Batch-wide: a single sequence past k puts the whole batch back on the
+    # scoring kernel. `scores_init` is built inside the branch, so nothing
+    # outside holds it and the pallas donation stays valid.
+    return lax.cond(
+        jnp.max(seq_lens) // compression_ratio <= k,
+        _fast_path,
+        _common_path,
+        None,
+    )

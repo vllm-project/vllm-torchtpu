@@ -180,6 +180,51 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Perf: Nightly deepseek-v4-flash-dp8-ep (TPU v7x-8)"
+        key: "perf_nightly_deepseek_v4_flash_dp8_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 330
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+        commands:
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      - label: "Perf: Nightly deepseek-v4-flash xprof capture (TPU v7x-8)"
+        key: "perf_nightly_deepseek_v4_flash_xprof"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 240
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          RUN_TYPE: "PROFILE"
+        commands:
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep-profile --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep-profile"
+          - |
+            profile_dir=perf_eval_results/deepseek-v4-flash-dp8-ep-profile/profile
+            for phase in "$$profile_dir"/*/; do
+              [ -d "$$phase" ] || continue
+              echo "phase $$(basename "$$phase"): $$(find "$$phase" -name '*.xplane.pb' | wc -l) xplane files"
+            done
+            if ! find "$$profile_dir" -name '*.xplane.pb' -print -quit | grep -q .; then
+              echo "::error::No xplane traces under $$profile_dir; the profiler was armed but wrote nothing xprof can open."
+              exit 1
+            fi
+            # artifact_paths would upload the traces again, so drop them here.
+            gcloud storage cp -r "$$profile_dir"/* \
+              gs://tpu-commons-ci/xprof/deepseek-v4-flash/torchtpu/8k-1k/ \
+              && rm -rf "$$profile_dir"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_5_397b_fp8_tp8_dp1_ep"
         if: 'build.env("NIGHTLY") == "1"'
@@ -191,5 +236,20 @@ steps:
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp8-dp1-ep --results-dir /perf_eval_results/qwen3.5-397b-fp8-tp8-dp1-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      - label: "Perf: Nightly Kimi-K2.6 Real (TPU v7x-8)"
+        key: "perf_nightly_kimi_k2_6_real"
+        if: 'build.env("NIGHTLY") == "1"'
+        soft_fail: true
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --results-dir /perf_eval_results/kimik-2.6-w4a16-tp8-ep"
         artifact_paths:
           - "perf_eval_results/**/*"

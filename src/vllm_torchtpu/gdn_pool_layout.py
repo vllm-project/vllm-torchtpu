@@ -15,25 +15,35 @@ POOLED_GDN_ARCHITECTURES = frozenset({
     "Qwen3_5MoeForConditionalGeneration",
 })
 
-# The pooled GDN kernel's state dtypes inside the unified pool are fixed:
-# conv rows are bf16 and the SSM region is fp32, independent of the layer's
-# declared MambaSpec dtypes (which only drive vLLM's page-size accounting).
-# Everything that describes pool bytes — the kernel's state plan and the
-# Raiden reshard manifest — must take its dtypes and sizes from here, so no
-# two consumers can disagree about the physical layout.
+# The pooled GDN kernel's state dtypes inside the unified pool are fixed for
+# Conv, while SSM follows the layer's declared MambaSpec dtype. Everything
+# that describes pool bytes — the kernel's state plan and the Raiden reshard
+# manifest — must take its dtypes and sizes from here, so no two consumers can
+# disagree about the physical layout.
 #
 # These are torch dtype *names*, not torch.dtype objects: this module is
 # imported by the JAX kernel path and by deviceless tests, so it must stay
 # importable without torch.
-POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
-POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
-
-# Derived from the dtypes above rather than declared separately, so changing
-# a state dtype cannot leave a stale byte width behind.
+DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
+DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
 _ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
-POOLED_GDN_CONV_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[
-    POOLED_GDN_CONV_STATE_DTYPE]
-POOLED_GDN_SSM_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[POOLED_GDN_SSM_STATE_DTYPE]
+
+
+def pooled_gdn_state_dtypes(
+    dtypes: tuple[object, ...], ) -> tuple[object, object]:
+    """Resolve declared Conv/SSM dtypes to their pooled physical dtypes."""
+    return DEFAULT_POOLED_GDN_CONV_STATE_DTYPE, dtypes[1]
+
+
+def pooled_gdn_state_itemsize(dtype: object) -> int:
+    name = str(dtype)
+    if not name.startswith("torch."):
+        name = f"torch.{name}"
+    try:
+        return _ITEMSIZE_BY_DTYPE[name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported pooled GDN state dtype: {dtype}") \
+            from exc
 
 
 def unified_kv_layout_enabled_for_architecture(
@@ -56,14 +66,20 @@ def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
     rows of conv_dim channels. The kernel keeps no spec-decode widening in
     the pool (verify windows roll back via per-slot checkpoints instead)."""
-    return (kernel_size - 1) * conv_dim * POOLED_GDN_CONV_STATE_ITEMSIZE
+    return ((kernel_size - 1) * conv_dim *
+            pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE))
 
 
-def pooled_gdn_ssm_state_bytes(*, num_v_heads: int, head_k_dim: int,
-                               head_v_dim: int) -> int:
-    """Live bytes of one slot's SSM region: fp32, head-major and dense."""
+def pooled_gdn_ssm_state_bytes(
+    *,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    dtype: object = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
+) -> int:
+    """Live bytes of one slot's head-major, dense SSM region in ``dtype``."""
     return (num_v_heads * head_k_dim * head_v_dim *
-            POOLED_GDN_SSM_STATE_ITEMSIZE)
+            pooled_gdn_state_itemsize(dtype))
 
 
 @dataclass(frozen=True)

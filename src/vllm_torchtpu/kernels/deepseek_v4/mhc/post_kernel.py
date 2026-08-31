@@ -19,16 +19,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# bf16 tiles are (16, 128); keep token blocks sublane-aligned.
-_SUBLANE = 16
-
-# Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
-# fused_moe use the same constant).
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-
-
-def _round_up(x: int, multiple: int) -> int:
-    return (x + multiple - 1) // multiple * multiple
+from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
+from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import \
+    DEFAULT_VMEM_LIMIT_BYTES
 
 
 def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult,
@@ -96,17 +89,14 @@ def mhc_post_2d(
         return 2 * (tb * hidden_size *
                     (2 + 2 * hc_mult * 2) * 2 + tb * hidden_size * 4 * 2)
 
-    tb = min(token_block_size, _round_up(num_tokens, _SUBLANE))
-    while tb > _SUBLANE and _vmem_need(tb) > vmem_limit_bytes:
-        # Degrade to a smaller block instead of a compile-time VMEM OOM.
-        tb //= 2
-    padded_tokens = _round_up(num_tokens, tb)
-    if padded_tokens != num_tokens:
-        pad = padded_tokens - num_tokens
-        x2d = jnp.pad(x2d, ((0, pad), (0, 0)))
-        res2d = jnp.pad(res2d, ((0, pad), (0, 0)))
-        post2d = jnp.pad(post2d, ((0, pad), (0, 0)))
-        comb2d = jnp.pad(comb2d, ((0, pad), (0, 0)))
+    tb, padded_tokens = utils.select_token_block(
+        num_tokens,
+        token_block_size,
+        vmem_need=_vmem_need,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d,
+                                              post2d, comb2d)
 
     compiler_params = pltpu.CompilerParams(dimension_semantics=("parallel", ),
                                            vmem_limit_bytes=vmem_limit_bytes,
@@ -129,8 +119,7 @@ def mhc_post_2d(
         compiler_params=compiler_params,
     )(x2d, res2d, post2d, comb2d)
 
-    if padded_tokens != num_tokens:
-        out = out[:num_tokens]
+    (out, ) = utils.trim_to(num_tokens, out)
     return out
 
 

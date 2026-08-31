@@ -358,6 +358,7 @@ def apply_tpu_patches() -> None:
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
                                _patch_moe_no_ep_tp_scope,
+                               _patch_moe_runner_fused_output_is_reduced,
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
@@ -377,6 +378,7 @@ def apply_tpu_patches() -> None:
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
+    _patch_moe_runner_fused_output_is_reduced()
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
@@ -389,6 +391,7 @@ def apply_tpu_patches() -> None:
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
+    tpu_plugin._patch_vllm_vocab_parallel_embedding()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
     from vllm_torchtpu import (  # isort: skip
         _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
@@ -659,7 +662,8 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK"
+        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK",
+        "MOE_FUSED_EP_V2_SHARDED_PLAN"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

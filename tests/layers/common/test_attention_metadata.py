@@ -18,7 +18,8 @@ import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_torchtpu.layers.common.attention_metadata import (
-    AttentionMetadataBuilder, AttentionMetadataBuilderContext)
+    AttentionMetadataBuilder, AttentionMetadataBuilderContext,
+    stage_block_table_uploads)
 from vllm_torchtpu.layers.common.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL, SequenceLayoutDescriptor,
     SequenceLayoutKind)
@@ -37,6 +38,9 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
+        runner._block_table_stage_cpu = None
+        runner.attn_groups = []
+        runner._unified_kv_layout = False
 
         block_tables = []
         for gid in range(num_groups):
@@ -405,3 +409,184 @@ class TestAttentionMetadataBuilderPlumbing:
         # blocks rather than offsets would have collapsed them together.
         assert not torch.equal(metas[0].mamba_state_indices,
                                metas[1].mamba_state_indices)
+
+    def _make_attn_groups(self, runner, builders):
+        """Wrap builders in the runner.attn_groups structure the walks use."""
+        groups = []
+        for builder in builders:
+            group = MagicMock()
+            group.metadata_builders = [builder]
+            group.layer_names = list(builder.layer_names)
+            groups.append([group])
+        runner.attn_groups = groups
+        return groups
+
+    def test_staged_build_matches_unstaged_build(self):
+        """One batched upload must hand every group exactly what it would
+        have uploaded itself — including the batched mamba derivation, which
+        engages when at least two uniform mamba groups are staged. Padded
+        rows (seq_lens == 0) are included to pin the null-block handling."""
+        window = 3
+        num_reqs = 4
+
+        def make(staged):
+            runner = self._make_runner_mock(num_groups=3,
+                                            max_num_blocks_per_req=6)
+            runner._unified_kv_layout = True
+            runner._block_table_stage_cpu = None
+            attn = self._make_builder(runner, kv_cache_group_id=0)
+            mambas = [
+                self._make_mamba_builder(runner, kv_cache_group_id=gid)
+                for gid in (1, 2)
+            ]
+            self._make_attn_groups(runner, [attn] + mambas)
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor([0, 17, 33, 33], dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4],
+                                                  dtype=torch.int32),
+                mamba_ckpt_window=window,
+                unified_mamba_state_indices=[],
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            if staged:
+                stage_block_table_uploads(runner, ctx, num_reqs)
+                assert ctx.staged_block_tables is not None
+                assert set(ctx.staged_block_tables) == {0, 1, 2}
+                assert ctx.staged_mamba_products is not None
+                assert set(ctx.staged_mamba_products) == {1, 2}
+            metas = [
+                b.build(common_prefix_len=0,
+                        common_attn_metadata=self._make_cm(num_reqs))
+                for b in [attn] + mambas
+            ]
+            assert len(ctx.unified_mamba_state_indices) == 2
+            return metas
+
+        for meta_staged, meta_plain in zip(make(staged=True),
+                                           make(staged=False)):
+            assert torch.equal(meta_staged.block_tables,
+                               meta_plain.block_tables)
+            assert (meta_staged.mamba_state_indices
+                    is None) == (meta_plain.mamba_state_indices is None)
+            if meta_plain.mamba_state_indices is not None:
+                assert torch.equal(meta_staged.mamba_state_indices,
+                                   meta_plain.mamba_state_indices)
+                assert torch.equal(meta_staged.mamba_ckpt_indices,
+                                   meta_plain.mamba_ckpt_indices)
+                assert (meta_staged.mamba_state_indices.dtype ==
+                        meta_plain.mamba_state_indices.dtype)
+                assert (meta_staged.mamba_ckpt_indices.dtype ==
+                        meta_plain.mamba_ckpt_indices.dtype)
+
+    def test_single_group_fast_path(self):
+        """Single-group pure attention must stage directly without mamba derivation."""
+        runner = self._make_runner_mock(num_groups=1)
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        self._make_attn_groups(runner, [builder])
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        stage_block_table_uploads(runner, ctx, 4)
+        assert ctx.staged_block_tables is not None
+        assert set(ctx.staged_block_tables) == {0}
+        assert ctx.staged_mamba_products is None
+        assert ctx.staged_block_tables[0].numel() == 4 * 4
+
+    def test_staged_build_skips_per_group_upload(self):
+        """With views staged, build() must not touch the CPU block table."""
+        runner = self._make_runner_mock(num_groups=1)
+        runner._block_table_stage_cpu = None
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        self._make_attn_groups(runner, [builder])
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        stage_block_table_uploads(runner, ctx, 4)
+        source = runner.input_batch.block_table[0].get_cpu_tensor
+        assert source.call_count == 1  # staging read it once
+
+        builder.build(common_prefix_len=0,
+                      common_attn_metadata=self._make_cm(4))
+        assert source.call_count == 1  # build() did not read it again
+
+    def test_staging_respects_gid_subset_and_dummy_override(self):
+        runner = self._make_runner_mock(num_groups=2)
+        runner._block_table_stage_cpu = None
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid)
+            for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+
+        # Subset: only gid 1 is staged (the draft's targeted walk).
+        stage_block_table_uploads(runner, ctx, 4, gids={1})
+        assert set(ctx.staged_block_tables) == {1}
+
+        # Dummy runs stage the same layout with zero-filled tables (so
+        # warmup dispatches the same program sequence serving does) and
+        # never read the CPU source tables.
+        source_calls_before = (
+            runner.input_batch.block_table[0].get_cpu_tensor.call_count)
+        override = torch.zeros((3, 8), dtype=torch.int32)
+        ctx_dummy = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            position_ids_override=override,
+        )
+        stage_block_table_uploads(runner, ctx_dummy, 4)
+        assert set(ctx_dummy.staged_block_tables) == {0, 1}
+        for staged in ctx_dummy.staged_block_tables.values():
+            assert torch.equal(staged, torch.zeros_like(staged))
+        assert (runner.input_batch.block_table[0].get_cpu_tensor.call_count ==
+                source_calls_before)
+
+        # And build() must consume the staged zero table while keeping the
+        # override positions.
+        runner._attn_metadata_builder_ctx = ctx_dummy
+        meta = builders[0].build(common_prefix_len=0,
+                                 common_attn_metadata=self._make_cm(4))
+        assert meta.input_positions is override
+        assert torch.equal(meta.block_tables,
+                           torch.zeros_like(meta.block_tables))
+
+        # Pre-init runs (no attn_groups yet) skip staging entirely.
+        runner.attn_groups = []
+        ctx_preinit = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, ctx_preinit, 4)
+        assert ctx_preinit.staged_block_tables is None

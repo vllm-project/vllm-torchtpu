@@ -32,10 +32,12 @@ class StructuredDecodingManager:
                                                       dtype=torch.bool,
                                                       device="cpu",
                                                       pin_memory=PIN_MEMORY)
+        self.device = runner.device
+        # Pre-allocate directly on device to avoid repeated host-to-device transfers every step
         self.structured_decode_arange = torch.arange(0,
                                                      32,
-                                                     device="cpu",
-                                                     pin_memory=PIN_MEMORY)
+                                                     dtype=torch.int32,
+                                                     device=self.device)
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -103,7 +105,7 @@ class StructuredDecodingManager:
             self.require_structured_out_cpu[:padded_num_reqs].to(
                 logits.device),
             self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
-            self.structured_decode_arange.to(logits.device),
+            self.structured_decode_arange,
         )
 
     def prepare_spec_structured_decoding_input(
@@ -187,7 +189,7 @@ class StructuredDecodingManager:
                 bonus_logits.device),
             self.grammar_bitmask_cpu[:padded_bonus_rows].to(
                 bonus_logits.device),
-            self.structured_decode_arange.to(bonus_logits.device),
+            self.structured_decode_arange,
         )
 
     def mask_logits(

@@ -46,10 +46,10 @@ docker pull "${IMAGE_TAG}"
 # Ensure cache directory exists on the host
 mkdir -p /mnt/disks/persist/models
 
-# Ensure results directory exists on the persistent disk (always mountable)
-rm -rf /mnt/disks/persist/perf_eval_results
-mkdir -p /mnt/disks/persist/perf_eval_results
-chmod 777 /mnt/disks/persist/perf_eval_results 2>/dev/null || true
+# Ensure results directory exists on the persistent disk (always mountable).
+# The container below runs as root, so never assume the agent can rm the
+# leftovers of whatever ran last -- see reset_results_dir.sh.
+bash "${SCRIPT_DIR}/reset_results_dir.sh" /mnt/disks/persist/perf_eval_results "${IMAGE_TAG}"
 
 # Ensure a clean results directory exists in the workspace
 rm -rf perf_eval_results

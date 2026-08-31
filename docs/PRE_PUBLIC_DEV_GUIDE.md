@@ -21,6 +21,7 @@ Every developer merging code **MUST** verify:
 - [ ] Review approval verified: `latestReviews` has at least 1 `APPROVED` for `<PR_NUMBER>` ✅
 - [ ] Discussions checked: All comment threads marked as resolved for `<PR_NUMBER>` ✅
 - [ ] `gh pr checks <PR_NUMBER>` returns **ALL GREEN** ✅ (Automated by the Guarded Merge command)
+- [ ] `ready` label applied, so presubmit CI actually ran (a PR that never got the label has no Buildkite result to be green)
 - [ ] DCO Sign-off verified (`-s` or UI override via "Set DCO to PASS")
 - [ ] All PR discussion comments resolved
 - [ ] Post-merge validation plan ready (Inspect Buildkite Nightly dashboard)
@@ -114,10 +115,19 @@ All contributions during this pre-public phase must strictly follow this 4-step 
 
    ```
 
+1. **Start CI with the `ready` Label:** Opening a PR does **NOT** start the test suite. Buildkite runs a short bootstrap job that stops unless the PR carries the `ready` label, so work-in-progress branches no longer occupy TPU agents:
+
+   ```bash
+   gh pr edit <PR_NUMBER> --add-label ready
+   ```
+
+   Applying the label starts a build on its own — no need to push a new commit for it.
+
 ### Phase 2: Wait for Test Pass & Review Approval
 
 During this pre-public phase, GitHub does not automatically block merges or show status updates in the usual web UI ways. Pay attention to key differences and rules to watch out for:
 
+- **Missing `ready` Label Fails Fast:** If `buildkite/vllm-torchtpu-ci/pr` fails within seconds reporting `Missing 'ready' label`, that is the presubmit gate, not a test failure. Add the label (see Phase 1) and a fresh build starts automatically.
 - **Watch CI Execution (No Automated Merge Blocking):** GitHub will not disable the merge button while CI is running or failing. Developers must manually monitor CI progress until all checks complete green.
   (Refer to [Section 5: Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet-gh-commands-links) for `gh pr checks <PR_NUMBER> --watch --fail-fast`)
   You can also check the Buildkite dashboard from the UI: [Buildkite TPU Commons](https://screenshot.googleplex.com/36Qsd6vKhWSjEmb)
@@ -168,6 +178,20 @@ After the PR is merged into `main`:
 
 ## 4. CI Policy
 
+### Presubmit Requires the `ready` Label
+
+- **Policy:** Presubmit pipelines only run on a PR that carries the `ready` label. Without it, the bootstrap job stops in about ten seconds and no test, build, or benchmark steps are uploaded.
+- **Rationale:** Previously every push to a PR branch launched the full suite, so a branch being iterated on could hold TPU agents for a whole test cycle before anyone intended to review it. The label makes that an explicit, deliberate step.
+- **Applying it:** `gh pr edit <PR_NUMBER> --add-label ready`. Any onboarded developer (Write access or above) can apply it — this is a signal of intent, not a permission boundary.
+- **Re-running:** A label change triggers a build by itself, so you do not need an empty commit to kick CI off. Pushing a new commit to a PR that already has the label rebuilds as usual.
+- **Not affected by the gate:**
+  - Post-merge builds on `main`, scheduled nightlies, and manual Buildkite builds — these never look at labels.
+  - Docs-only PRs — these already short-circuit earlier and need no label.
+  - `pre-commit` and `DCO`, which are GitHub checks and run regardless.
+
+> [!NOTE] The Label Does Not Gate Merging
+> Because this repository has no branch rulesets (see Section 1), the `ready` label controls only whether CI **runs**. It does not block the merge button. The Pre-Merge Verification Checklist is still what protects `main`.
+
 ### Addressing Existing Regression in main
 
 - **Policy:** Should the `main` branch currently exhibit failures (e.g., in nightly TPU benchmarks or post-submit runs), merging remains permissible provided your PR passes all required presubmit validations.
@@ -199,6 +223,10 @@ In urgent situations where you must unblock yourself immediately:
 > [!NOTE]
 > Please use this bypass sparingly and only when strictly necessary. We may reach out offline for additional context.
 
+> [!TIP] `[skip-ci]` PR Title vs `[skip ci]` Commit Message
+> These are two different mechanisms. The `[skip-ci]` **PR title** prefix above is for our daily email automation. A `[skip ci]` (or `[ci skip]`) marker in the **commit message** is understood natively by both Buildkite and GitHub Actions, so no build is created at all — including `pre-commit`. Note that a squash merge can carry that marker into `main`, which would also skip the post-merge build; edit the subject at merge time if you do not want that.
+> Simply leaving the `ready` label off is now the lightest way to keep a PR from consuming CI.
+
 ---
 
 ## 6. Quick Reference Cheat Sheet (gh Commands & Links)
@@ -206,6 +234,7 @@ In urgent situations where you must unblock yourself immediately:
 | Objective | Command / Direct Link |
 | :--- | :--- |
 | **Phase 1: Create PR & Assign** | `gh pr create --fill --assignee reviewer1,reviewer2` |
+| **Phase 1: Start CI (`ready` label)** | `gh pr edit <PR_NUMBER> --add-label ready` |
 | **Phase 2: Check PR Approval** | `gh pr view <PR_NUMBER> --json latestReviews --jq 'if ([.latestReviews[] \| select(.state == "APPROVED")] \| length > 0) then "APPROVED ✅" else "NOT APPROVED ❌" end'` |
 | **Phase 2: Check Resolved Discussions** | `gh api graphql -F owner='vllm-project' -F repo='vllm-torchtpu' -F pr=<PR_NUMBER> -f query='query($owner: String!, $repo: String!, $pr: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $pr) { reviewThreads(first: 50) { nodes { isResolved } } } } }' --jq 'if ([.data.repository.pullRequest.reviewThreads.nodes[] \| select(.isResolved == false)] \| length == 0) then "RESOLVED ✅" else "UNRESOLVED ❌" end'` |
 | **Phase 2: Watch CI (Fail Fast)** | `gh pr checks <PR_NUMBER> --watch --fail-fast` |

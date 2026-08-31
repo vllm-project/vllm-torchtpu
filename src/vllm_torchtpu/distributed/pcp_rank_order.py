@@ -33,17 +33,6 @@ Only ``tp``, ``pcp`` and (degenerately) ``dp``/``pp`` exist at the supported
 scope, and at ``dp == 1, pp == 1`` the DP and PP groups are singletons and the
 EP group is the whole world, so no other group constrains this layout.
 
-Scoped to a single host with no KV transfer. ``pcp_rank`` is load-bearing
-outside topology:
-
-  * the P/D reshard planner reconstructs which prefill rank holds a shard as
-    ``pcp_rank * tp_size + tp_rank`` (kv_transfer/v2/common.py), and
-  * Raiden work units are named ``f"{engine_id}-rank{transfer_rank}"`` from
-    the same composite, with the consumer re-deriving the name.
-
-Both assume an ordering this module changes, so it is disabled whenever a KV
-transfer config is present. Lifting that needs the real rank map to travel in
-the handshake instead of being recomputed from sizes.
 """
 
 import contextlib
@@ -77,10 +66,7 @@ def resolve_pcp_topology_order(
     if pcp_size <= 1:
         return None
 
-    # Not applicable: a ring crossing hosts needs multi-slice ordering over
-    # DCN, not the single-slice mesh this asks for. PcpStaticSupportValidator
-    # already rejects PCP with TPU_MULTIHOST_BACKEND, so only nnodes is
-    # checked here.
+    # Not applicable: PCP runner path does not support TPU multihost yet.
     nnodes = int(getattr(parallel_config, "nnodes", 1) or 1)
     if nnodes > 1:
         logger.info(

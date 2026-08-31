@@ -82,6 +82,60 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   else
     echo "Code files changed. Proceeding with pipeline upload."
   fi
+
+  # --- Require the 'ready' label before spending agent time on a PR ---
+  echo "--- :label: Checking for the 'ready' label on PR #${BUILDKITE_PULL_REQUEST}"
+
+  # Buildkite only populates this on pull_request webhook events. PR builds
+  # triggered by a push arrive as GitHub 'push' events, so fall back to asking
+  # the GitHub API. The repo is private, so that call has to be authenticated.
+  PR_LABELS="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+
+  if [[ -z "${PR_LABELS}" ]]; then
+    # Reuse the GitHub App credential helper the agents already use to clone this
+    # repo (configured system-wide by ci-infra), so there is no extra secret,
+    # IAM grant or token rotation to own here.
+    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+      GITHUB_TOKEN=$(GIT_TERMINAL_PROMPT=0 git credential fill \
+        <<< $'protocol=https\nhost=github.com\n' 2>/dev/null \
+        | sed -n 's/^password=//p' || true)
+    fi
+
+    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+      echo "Could not mint a GitHub token from the agent's git credential helper."
+      echo "Cannot verify labels. Failing closed."
+      exit 1
+    fi
+
+    # Give GitHub a moment to make a just-applied label readable.
+    sleep 5
+
+    PR_API_URL="https://api.github.com/repos/vllm-project/vllm-torchtpu/pulls/${BUILDKITE_PULL_REQUEST}"
+    HTTP_CODE=$(curl -sS -o pr_details.json -w '%{http_code}' \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "${PR_API_URL}" || echo "000")
+
+    if [[ "${HTTP_CODE}" != "200" ]]; then
+      echo "GitHub API returned HTTP ${HTTP_CODE} for ${PR_API_URL}."
+      echo "Cannot verify labels. Failing closed."
+      exit 1
+    fi
+
+    PR_LABELS=$(jq -r '[.labels[].name] | join(",")' < pr_details.json)
+    rm -f pr_details.json
+  fi
+
+  echo "PR labels: ${PR_LABELS:-<none>}"
+
+  # Match the whole label, so 'not-ready' or 'ready-for-review' don't count.
+  if ! grep -qx "ready" <<< "${PR_LABELS//,/$'\n'}"; then
+    echo "Missing 'ready' label on PR #${BUILDKITE_PULL_REQUEST}. Failing build."
+    echo "Add the 'ready' label to the PR when it should run full CI."
+    exit 1
+  fi
+
+  echo "Found 'ready' label. Proceeding with pipeline upload."
 fi
 
 echo "--- Starting Buildkite Bootstrap"

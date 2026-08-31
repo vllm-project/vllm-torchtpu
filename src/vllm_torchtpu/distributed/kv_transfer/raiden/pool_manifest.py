@@ -32,14 +32,13 @@ import dataclasses
 from typing import Any, Mapping, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_CONV_STATE_DTYPE,
-                                           POOLED_GDN_CONV_STATE_ITEMSIZE,
-                                           POOLED_GDN_SSM_STATE_DTYPE,
-                                           POOLED_GDN_SSM_STATE_ITEMSIZE,
-                                           pooled_gdn_conv_state_bytes,
-                                           pooled_gdn_ssm_state_bytes)
+from vllm_torchtpu.gdn_pool_layout import (pooled_gdn_conv_state_bytes,
+                                           pooled_gdn_ssm_state_bytes,
+                                           pooled_gdn_state_dtypes,
+                                           pooled_gdn_state_itemsize)
 
-from .tags import TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
+from .tags import (TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM,
+                   TAG_MLA_NOPE, TAG_MLA_ROPE)
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"
@@ -384,12 +383,13 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
 
     The state geometry is tied to the pooled GDN kernel's byte model
     (``gdn_pool_layout`` — the same helpers ``_build_v3_pool_state_plan``
-    uses), NOT to the layer's declared MambaSpec shapes/dtypes.  The pooled
-    kernel never reads that declaration, so only the kernel model describes
-    the bytes that actually move; a declaration that drifts from it (e.g. a
-    dtype/shape override made for the typed materialization path) must not
-    leak into transfer spans.  The spec contributes only the manager page
-    pitch, plus the identity check that this is a two-state GDN layer.
+    uses), NOT to the layer's declared MambaSpec shapes or Conv dtype.  The
+    pooled kernel never reads those declarations, so only the kernel model
+    describes the geometry and Conv bytes that actually move; a declaration
+    that drifts from it (e.g. a Conv-dtype/shape override made for the typed
+    materialization path) must not leak into transfer spans.  The spec
+    contributes the SSM dtype and manager page pitch, plus the identity check
+    that this is a two-state GDN layer.
     """
     raw_index = _raw_index_for(pool, raw_tensors)
     if raw_index is None:
@@ -416,19 +416,22 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
             f"pooled GDN cache {layer_name} has no conv taps: "
             f"conv_kernel_size={gdn_geometry.conv_kernel_size}")
     conv_shape = (taps, gdn_geometry.conv_dim)
-    conv_dtype = POOLED_GDN_CONV_STATE_DTYPE
-    conv_itemsize = POOLED_GDN_CONV_STATE_ITEMSIZE
+    conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    try:
+        conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
+        ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
     conv_bytes = pooled_gdn_conv_state_bytes(
         kernel_size=gdn_geometry.conv_kernel_size,
         conv_dim=gdn_geometry.conv_dim)
     ssm_shape = (gdn_geometry.local_value_heads, gdn_geometry.value_head_dim,
                  gdn_geometry.key_head_dim)
-    ssm_dtype = POOLED_GDN_SSM_STATE_DTYPE
-    ssm_itemsize = POOLED_GDN_SSM_STATE_ITEMSIZE
     ssm_bytes = pooled_gdn_ssm_state_bytes(
         num_v_heads=gdn_geometry.local_value_heads,
         head_k_dim=gdn_geometry.key_head_dim,
-        head_v_dim=gdn_geometry.value_head_dim)
+        head_v_dim=gdn_geometry.value_head_dim,
+        dtype=ssm_dtype)
 
     try:
         manager_page_bytes = int(spec.page_size_bytes)
@@ -765,11 +768,18 @@ def verify_storage_binding(
     return len(manifest.storages)
 
 
+_GLM_REGION_NAMES = {
+    TAG_MLA_NOPE: "mla_nope_rows",
+    TAG_MLA_ROPE: "mla_rope_rows",
+    TAG_DSA_IDX: "dsa_rows",
+}
+
+
 def _glm_row_region(tag: str, *, row_bytes: int,
                     num_rows: int) -> tuple[RegionSpec, ...]:
     """One dense region of whole packed rows covering the full page."""
     return (RegionSpec(
-        name="mla_rows" if tag == TAG_FA else "dsa_rows",
+        name=_GLM_REGION_NAMES[tag],
         offset_bytes=0,
         stride_bytes=row_bytes,
         unit_bytes=row_bytes,
@@ -786,10 +796,11 @@ def build_glm_mla_pool_manifest(
 ) -> PoolManifest:
     """Builds the Pool Manifest for GLM MLA models.
 
-    Two per-layer TP-replicated cache classes: the MLA latent cache
-    (-> TAG_FA, first tag = H2D order rank 0) and the DSA indexer K cache
-    (-> TAG_DSA_IDX, the only uint8 class). The packed [blocks, rows,
-    packing, width] layout is declared as row-granular regions.
+    Per-layer TP-replicated cache classes: the split sparse MLA latent
+    (nope, rope) tensor pair plus the DSA indexer K cache  (TAG_DSA_IDX).
+    The packed [blocks, rows, packing, width] layout is declared as
+    row-granular regions; a nope cache carries one row per token,
+    every other class packs `packing` tokens per row.
     """
     if block_size_tokens <= 0:
         raise ManifestError("block_size_tokens must be positive")
@@ -797,14 +808,19 @@ def build_glm_mla_pool_manifest(
     for layer_name in sorted(named_kv_caches):
         cache = named_kv_caches[layer_name]
         if isinstance(cache, (list, tuple)):
-            raise ManifestError(
-                f"GLM MLA admission expects plain per-layer cache tensors; "
-                f"layer {layer_name} has a {len(cache)}-tuple")
+            if len(cache) != 2:
+                raise ManifestError(
+                    f"GLM MLA admission expects (nope, rope) cache pairs; "
+                    f"layer {layer_name} has a {len(cache)}-tuple")
+            nope, rope = cache
+            flat.append((TAG_MLA_NOPE, layer_name, _dtype_tag(nope), nope))
+            flat.append((TAG_MLA_ROPE, layer_name, _dtype_tag(rope), rope))
+            continue
         dtype_tag = _dtype_tag(cache)
-        tag = TAG_DSA_IDX if dtype_tag == "uint8" else TAG_FA
-        flat.append((tag, layer_name, dtype_tag, cache))
-    if not any(tag == TAG_FA for tag, _, _, _ in flat):
-        raise ManifestError("GLM MLA admission found no latent (fa) caches")
+        flat.append((TAG_DSA_IDX, layer_name, dtype_tag, cache))
+    if not any(tag == TAG_MLA_NOPE for tag, _, _, _ in flat):
+        raise ManifestError(
+            "GLM MLA admission found no latent (mla.nope) caches")
 
     binding, _ = _binding_for([(layer_name, tensor)
                                for _, layer_name, _, tensor in flat],
@@ -830,7 +846,13 @@ def build_glm_mla_pool_manifest(
                 f"cache {layer_name} nbytes {nbytes} is not divisible by "
                 f"num_blocks {num_blocks}")
         live_stride = nbytes // num_blocks
-        if rows * packing != block_size_tokens:
+        if tag == TAG_MLA_NOPE:
+            # One packed row per token in the nope layout.
+            if rows != block_size_tokens:
+                raise ManifestError(
+                    f"cache {layer_name} nope rows {rows} do not match the "
+                    f"KV block size {block_size_tokens}")
+        elif rows * packing != block_size_tokens:
             raise ManifestError(
                 f"cache {layer_name} rows*packing {rows}*{packing} does not "
                 f"match the KV block size {block_size_tokens}")

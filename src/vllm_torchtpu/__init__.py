@@ -233,6 +233,70 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
+def _patch_moe_runner_fused_output_is_reduced() -> None:
+    """Tell vLLM the fused EP MoE kernel already reduced its output.
+
+    `fused_moe_ep` returns this rank's tokens combined over ALL experts -- the
+    kernel pushes each result row back to the chip that owns the token, so
+    there is nothing left to reduce. vLLM does not know that: it decides from
+    `MoERunner._fused_output_is_reduced`, which reads
+    `quant_method.moe_kernel.output_is_reduced()`, and the TPU fp8 method never
+    sets `moe_kernel` -- it declares itself through `supports_internal_mk`
+    instead. So `moe_runner.py` all-reduces the already-combined output
+    whenever `tp_size > 1 or ep_size > 1`.
+
+    Today it changes no answer, and the reason is worth stating exactly rather
+    than calling it luck: `prebuild_fused_moe_ep` refuses tp_size > 1, so the
+    kernel only ever arms with a tensor-parallel group of world size one, where
+    all three all-reduces this flag gates are `return input_`. The patch is the
+    guard that keeps that true if the TP refusal is ever lifted, at which point
+    the unpatched path would silently multiply every routed MoE output by
+    tp_size, with no test to catch it and no log to mention it.
+
+    Reporting True here is the correct signal rather than deleting the
+    all-reduce, because the SHARED expert genuinely is TP-partial
+    (`Qwen3NextMLP(..., reduce_results=False)`): the same flag routes it to
+    `_maybe_reduce_shared_expert_output`, which reduces it on its own.
+    """
+    # Only installed where the kernel can arm. `prebuild_fused_moe_ep` returns
+    # on its first statement unless this flag is set, so with the flag off the
+    # patch provably cannot change an answer and would only leave an upstream
+    # class mutated in every other TPU deployment. The cost of the gate is that
+    # the unguarded `_fused_output_is_reduced` read below stops failing loudly
+    # on an upstream rename in runs that do not use the kernel; if arming ever
+    # grows a non-env path, this gate has to go with it.
+    if not envs.USE_MOE_FUSED_EP_KERNEL:
+        return
+
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+
+    if getattr(_mr.MoERunner, "_tpu_fused_output_reduced_patch", False):
+        return
+
+    original = _mr.MoERunner._fused_output_is_reduced
+
+    @property
+    def patched(self):
+        # `skip_final_all_reduce` asserts the fused output is NOT pre-reduced,
+        # and in that mode the model reduces externally anyway, so leave it be.
+        if getattr(self.moe_config, "skip_final_all_reduce", False):
+            return original.fget(self)
+        try:
+            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+                fused_moe_ep_supported
+        except ImportError:
+            return original.fget(self)
+        # Asked of the layer's own quant method, because arming is per layer:
+        # a model whose layers do not all qualify must not have one armed layer
+        # answer for the rest.
+        return (fused_moe_ep_supported(getattr(self, "_quant_method", None))
+                or original.fget(self))
+
+    _mr.MoERunner._fused_output_is_reduced = patched
+    _mr.MoERunner._tpu_fused_output_reduced_patch = True
+    logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
+
+
 def _patch_moe_explicit_pcp_collectives() -> None:
     """Keep PCP MoE dispatch/combine explicit unless chunking owns it.
 
@@ -1400,6 +1464,120 @@ def _patch_vllm_block_pool_lifo_free() -> None:
 
     BlockPool.free_blocks = free_blocks
     BlockPool._tpu_lifo_free_patch = True
-    from vllm_torchtpu.logger import init_logger
-    init_logger(__name__).info(
+    logger.info(
         "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+
+
+def _patch_vllm_vocab_parallel_embedding() -> None:
+    """Register shard index bounds as module buffers in VocabParallelEmbedding.
+
+    Prevents TorchTPU from baking rank-specific integer literals into the MLIR
+    graph as scalar constants, ensuring identical CompilationCacheKeys across
+    all TP ranks.
+    """
+    import torch
+    import vllm.model_executor.layers.vocab_parallel_embedding as vpe
+
+    if getattr(vpe.VocabParallelEmbedding,
+               "_tpu_vocab_parallel_embedding_patch", False):
+        return
+
+    original_init = vpe.VocabParallelEmbedding.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not hasattr(self, "org_vocab_start_index"):
+            self.register_buffer(
+                "org_vocab_start_index",
+                torch.tensor(self.shard_indices.org_vocab_start_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "org_vocab_end_index",
+                torch.tensor(self.shard_indices.org_vocab_end_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "num_org_vocab_padding",
+                torch.tensor(self.shard_indices.num_org_vocab_padding,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "added_vocab_start_index",
+                torch.tensor(self.shard_indices.added_vocab_start_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "added_vocab_end_index",
+                torch.tensor(self.shard_indices.added_vocab_end_index,
+                             dtype=torch.int64),
+                persistent=False,
+            )
+
+    def patched_forward(self, input_):
+        if self.tp_size > 1:
+            masked_input, input_mask = vpe.get_masked_input_and_mask(
+                input_,
+                getattr(self, "org_vocab_start_index",
+                        self.shard_indices.org_vocab_start_index),
+                getattr(self, "org_vocab_end_index",
+                        self.shard_indices.org_vocab_end_index),
+                getattr(self, "num_org_vocab_padding",
+                        self.shard_indices.num_org_vocab_padding),
+                getattr(self, "added_vocab_start_index",
+                        self.shard_indices.added_vocab_start_index),
+                getattr(self, "added_vocab_end_index",
+                        self.shard_indices.added_vocab_end_index),
+            )
+        else:
+            masked_input = input_
+        output_parallel = self.quant_method.embedding(self,
+                                                      masked_input.long())
+        if self.tp_size > 1:
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+            from vllm.distributed import tensor_model_parallel_all_reduce
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def patched_get_masked_input_and_mask(
+        input_: torch.Tensor,
+        org_vocab_start_index: int | torch.Tensor,
+        org_vocab_end_index: int | torch.Tensor,
+        num_org_vocab_padding: int | torch.Tensor,
+        added_vocab_start_index: int | torch.Tensor,
+        added_vocab_end_index: int | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = input_.device
+        dtype = input_.dtype
+
+        def _to_tensor(val: int | torch.Tensor) -> torch.Tensor:
+            if isinstance(val, torch.Tensor):
+                return val.to(device=device)
+            return torch.tensor(val, dtype=dtype, device=device)
+
+        start = _to_tensor(org_vocab_start_index)
+        end = _to_tensor(org_vocab_end_index)
+        num_padding = _to_tensor(num_org_vocab_padding)
+        added_start = _to_tensor(added_vocab_start_index)
+        added_end = _to_tensor(added_vocab_end_index)
+
+        org_vocab_mask = (input_ >= start) & (input_ < end)
+        added_vocab_mask = (input_ >= added_start) & (input_ < added_end)
+        added_offset = (added_start - (end - start) - num_padding)
+        valid_offset = (start * org_vocab_mask) + (added_offset *
+                                                   added_vocab_mask)
+        vocab_mask = org_vocab_mask | added_vocab_mask
+        input_ = vocab_mask * (input_ - valid_offset)
+        return input_, ~vocab_mask
+
+    vpe.get_masked_input_and_mask = patched_get_masked_input_and_mask
+    vpe.VocabParallelEmbedding.__init__ = patched_init
+    vpe.VocabParallelEmbedding.forward = patched_forward
+    vpe.VocabParallelEmbedding._tpu_vocab_parallel_embedding_patch = True
+    logger.info(
+        "Applied TPU patch: register shard index bounds as buffers in VocabParallelEmbedding"
+    )

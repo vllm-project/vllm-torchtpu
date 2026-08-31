@@ -61,8 +61,9 @@ def derive_metadata(
     cache: [num_pages, physical_page_size, 4, lanes] uint8. The compressed-KV
       buffer; only its shape is read here.
     compress_ratio: Compression ratio (e.g. 4 for CSA, 128 for HCA).
-    state_block_size: Block size vLLM used to build ``block_table``. Must match
-      the geometry of ``state_cache``; asserted below.
+    state_block_size: Block size vLLM used to build ``block_table``. One page
+      must be able to hold that many token states; it may hold more with the
+      tail rows unused.
     head_dim: Dimensionality of attention heads.
     overlap: Whether to use overlap (CSA path).
     cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
@@ -83,6 +84,7 @@ def derive_metadata(
         size_n=num_tokens,
         physical_page_size=cache.shape[1],
         state_physical_page_size=state_source.shape[1],
+        state_block_size=state_block_size,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -94,12 +96,14 @@ def derive_metadata(
     kv_stride = cfgs.kv_stride
     kv_page_stride = kv_block_size * kv_stride
 
-    # The block tables are paged at vLLM's state-cache block size, so it has to
-    # be the number of token states that actually fit in one physical page.
-    assert state_block_size == cfgs.state_block_size, (
-        f"state cache block_size {state_block_size} does not match the "
+    # The block tables are paged at vLLM's state-cache block size, and the
+    # kernel indexes a page with `position % state_block_size`, so a page must
+    # physically hold that many token states. Fewer is a bug; more is the
+    # deliberate slack left when a mode is floored to its peer's page size.
+    assert state_block_size <= cfgs.state_page_capacity, (
+        f"state cache block_size {state_block_size} overruns the "
         f"{cfgs.dims.mode.value} state cache geometry {state_source.shape}, "
-        f"which holds {cfgs.state_block_size} token states per page ")
+        f"which holds {cfgs.state_page_capacity} token states per page ")
 
     # 2. Map tokens to request indices (Handles Ragged Batch)
     query_lens = jnp.diff(query_start_loc)
@@ -294,6 +298,7 @@ def compressor_forward(
         boundary_kv_slot,
         norm_weight,
         block_table_stride=block_table_row_stride(block_table, num_reqs),
+        state_block_size=state_block_size,
         state_cache=state_cache,
         rope_cache=rope_cache,
         cos_sin_cache=cos_sin_cache,

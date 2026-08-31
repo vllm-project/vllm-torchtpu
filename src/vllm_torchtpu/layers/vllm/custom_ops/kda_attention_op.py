@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Torch custom-op bridges for Kimi KDA and its short convolution."""
 
+import math
 import os
 
 import jax
@@ -14,6 +15,8 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
 from vllm_torchtpu.kernels.kimi_k3 import chunk_kda
@@ -428,6 +431,211 @@ def _build_fused_core(lower_bound: float | None, eps: float):
     return fused_core
 
 
+def _dispatched_kda_core(
+    mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
+    raw_gate: jax.Array,  # [T, H * D]
+    beta: jax.Array,  # [T, H]
+    output_gate: jax.Array,  # [T, H * D]
+    conv_state: jax.Array,  # paged short-convolution cache
+    recurrent_state: jax.Array,  # [num_slots, H, K, V]
+    conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
+    a_log: jax.Array,  # [H]
+    dt_bias: jax.Array,  # [H * D]
+    norm_weight: jax.Array,  # [D]
+    query_start_loc: jax.Array,  # [N + 1]
+    state_indices: jax.Array,  # [N]
+    seq_lens: jax.Array,  # [N]
+    distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+    *,
+    lower_bound: float | None,
+    eps: float,
+    use_mega_prefill: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    num_tokens, num_seqs, num_heads, head_dim = _check_kda_abi(
+        mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
+        dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
+    activation_dtype = mixed_qkv.dtype
+    decode_end = distribution[0].astype(jnp.int32)
+
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    has_initial_state = seq_lens > query_lens
+    conv_in = conv_state
+    # Both convolution paths take the same fused weight, built once at load
+    # time by `KimiDeltaAttention.process_weights_after_loading`. It used
+    # to be concatenated from the checkpoint's three tensors here, on every
+    # step,
+    # and each consumer then transposed it into its own layout.
+
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
+    first_prefill_token = jnp.minimum(query_start_loc[decode_end],
+                                      total_tokens)
+
+    # --- decode segment: fused convolution + recurrence ---------------
+    decode_out, conv_after_decode, pool_after_decode = decode_kda(
+        _match_rows(mixed_qkv, num_seqs),
+        _match_rows(raw_gate, num_seqs).reshape(num_seqs, num_heads, head_dim),
+        _activate_beta(_match_rows(beta, num_seqs)),
+        conv_in,
+        conv_weight,
+        recurrent_state,
+        a_log,
+        dt_bias.reshape(num_heads, head_dim),
+        _null_out_non_decode(state_indices, decode_end),
+        has_initial_state,
+        lower_bound=lower_bound,
+        # The pool is [slots, H, K, V], which is the layout the recurrence
+        # indexes as state[k, v]; no in-kernel swap.
+        state_transposed=False,
+    )
+
+    # --- prefill/mixed segment: convolution, then the chunked kernel ---
+    # Guarded, because a decode-only step pays dearly for it otherwise.
+    # Profiling one put 55% of the layer's device time in this segment while
+    # it had nothing to do: both Pallas calls, the tile plan, and the pool
+    # gather and write-back around them came to more than the decode kernel
+    # doing the actual work. Skipping it takes a 160-request decode step from
+    # 0.838ms to 0.416ms per layer.
+    #
+    # The guard cannot help a genuinely mixed batch, where both segments hold
+    # rows, and there it costs about 4% for the fusion it blocks. That is the
+    # accepted trade: decode-only steady state is the common case and the one
+    # that sets throughput.
+    #
+    # The skipped branch still has to return a full set of correctly shaped
+    # outputs, but zeroing one output and passing two caches through costs
+    # microseconds against the hundreds saved.
+    #
+    # This is a branch on a *device* value inside one traced graph, not a host
+    # branch on batch composition -- see `kimi_short_conv_scan` for why that
+    # distinction is the whole ballgame here.
+    def run_prefill():
+        conv_out, conv_after_prefill = kimi_short_conv_scan(
+            mixed_qkv,
+            conv_after_decode,
+            # Free: contiguous buffer, same channels in the same order.
+            conv_weight.reshape(conv_weight.shape[0], -1),
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            start_seq=decode_end,
+        )
+        conv_out = jax.nn.silu(conv_out)
+
+        sequence_ids = _token_sequence_ids(query_start_loc, num_tokens,
+                                           num_seqs)
+        segment_ids = jnp.where(token_ids < total_tokens, sequence_ids + 1, 0)
+
+        qkv = conv_out.reshape(num_tokens, 3, num_heads, head_dim)
+
+        def head_major(x):  # [T, H, D] -> [H, 1, T, D]
+            return jnp.transpose(x, (1, 0, 2))[:, None]
+
+        initial_state = jnp.where(has_initial_state[:, None, None, None],
+                                  pool_after_decode[state_indices], 0.0)
+        activated_beta = _activate_beta(beta)
+        gate = raw_gate.reshape(num_tokens, num_heads, head_dim)
+
+        def run_chunked_kda():
+            chunk_out, final_state = chunk_kda(
+                head_major(qkv[:, 0]),
+                head_major(qkv[:, 1]),
+                head_major(qkv[:, 2]),
+                head_major(gate),
+                jnp.transpose(activated_beta, (1, 0))[:, None],  # [H, 1, T]
+                A_log=a_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                segment_ids=segment_ids[None],
+                N_max=num_seqs,
+                initial_state=initial_state[None],
+                output_final_state=True,
+                start_seq=decode_end,
+            )
+            return (
+                jnp.transpose(chunk_out[:, 0], (1, 0, 2)),
+                final_state,
+            )
+
+        def run_mega_kda():
+            chunk_out, final_state = kda_forward_inference(
+                qkv[None, :, 0],
+                qkv[None, :, 1],
+                qkv[None, :, 2],
+                gate[None],
+                activated_beta[None],
+                A_log=a_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                segment_ids=segment_ids[None],
+                N_max=num_seqs,
+                initial_state=initial_state[None],
+                output_final_state=True,
+                safe_gate=True,
+            )
+            return chunk_out[0], final_state
+
+        # The inference mega-kernel requires T % 64 == 0 and does not have
+        # the chunked kernel's device-valued `start_seq` contract. Use it
+        # only for a pure-prefill batch; mixed batches keep the chunked
+        # implementation so decode-owned cache slots remain untouched. A
+        # tile containing more than two live requests also falls back: the
+        # native boundary path represents only its first and last segment.
+        if use_mega_prefill and num_tokens % 64 == 0:
+            mega_layout_supported = _mega_kda_layout_supported(
+                query_start_loc, num_tokens)
+            chunk_out, final_state = jax.lax.cond(
+                (decode_end == 0) & mega_layout_supported,
+                run_mega_kda,
+                run_chunked_kda,
+            )
+        else:
+            chunk_out, final_state = run_chunked_kda()
+
+        # Rows with no scheduled token have no state worth keeping; their
+        # writes go to the reserved null block, slot 0.
+        #
+        # Decode slots are excluded belt-and-braces. `start_seq` above
+        # already makes the chunked kernel pass those segments through
+        # untouched, and the state it passes through was read *after*
+        # `decode_kda` ran, so writing it back would currently be a no-op.
+        # The exclusion is what makes that independent of the read order
+        # rather than contingent on it -- and it is the guard if a request
+        # ever reaches the decode segment without carried state, where the
+        # passthrough would be zero rather than the live state.
+        sequence_ids_all = jnp.arange(num_seqs, dtype=jnp.int32)
+        keep = (query_lens > 0) & (sequence_ids_all >= decode_end)
+        write_indices = jnp.where(keep, state_indices, 0)
+        new_pool = pool_after_decode.at[write_indices].set(
+            final_state[0].astype(recurrent_state.dtype))
+        return chunk_out, conv_after_prefill, new_pool
+
+    def skip_prefill():
+        return (jnp.zeros(
+            (num_tokens, num_heads, head_dim),
+            activation_dtype), conv_after_decode, pool_after_decode)
+
+    chunk_out, conv_after_prefill, new_pool = jax.lax.cond(
+        first_prefill_token < total_tokens, run_prefill, skip_prefill)
+
+    # --- select per token ---------------------------------------------
+    # Each side left the other's rows zero, so this is a select rather than
+    # a sum only to keep the intent legible.
+    output = jnp.where(
+        (token_ids < decode_end)[:, None, None],
+        _match_rows(decode_out, num_tokens).astype(chunk_out.dtype),
+        chunk_out,
+    )
+    output = _gated_output_norm(output, output_gate, norm_weight, eps,
+                                activation_dtype)
+
+    return output, conv_after_prefill, new_pool
+
+
 def build_kimi_dispatched_kda_op(
     prefix: str,
     *,
@@ -460,192 +668,23 @@ def build_kimi_dispatched_kda_op(
         seq_lens: jax.Array,  # [N]
         distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        num_tokens, num_seqs, num_heads, head_dim = _check_kda_abi(
-            mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
-            dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
-        activation_dtype = mixed_qkv.dtype
-        decode_end = distribution[0].astype(jnp.int32)
-
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        has_initial_state = seq_lens > query_lens
-        conv_in = conv_state
-        # Both convolution paths take the same fused weight, built once at load
-        # time by `KimiDeltaAttention.process_weights_after_loading`. It used
-        # to be concatenated from the checkpoint's three tensors here, on every
-        # step,
-        # and each consumer then transposed it into its own layout.
-
-        token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-        total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-        first_prefill_token = jnp.minimum(query_start_loc[decode_end],
-                                          total_tokens)
-
-        # --- decode segment: fused convolution + recurrence ---------------
-        decode_out, conv_after_decode, pool_after_decode = decode_kda(
-            _match_rows(mixed_qkv, num_seqs),
-            _match_rows(raw_gate, num_seqs).reshape(num_seqs, num_heads,
-                                                    head_dim),
-            _activate_beta(_match_rows(beta, num_seqs)),
-            conv_in,
-            conv_weight,
-            recurrent_state,
-            a_log,
-            dt_bias.reshape(num_heads, head_dim),
-            _null_out_non_decode(state_indices, decode_end),
-            has_initial_state,
-            lower_bound=lower_bound,
-            # The pool is [slots, H, K, V], which is the layout the recurrence
-            # indexes as state[k, v]; no in-kernel swap.
-            state_transposed=False,
-        )
-
-        # --- prefill/mixed segment: convolution, then the chunked kernel ---
-        # Guarded, because a decode-only step pays dearly for it otherwise.
-        # Profiling one put 55% of the layer's device time in this segment while
-        # it had nothing to do: both Pallas calls, the tile plan, and the pool
-        # gather and write-back around them came to more than the decode kernel
-        # doing the actual work. Skipping it takes a 160-request decode step from
-        # 0.838ms to 0.416ms per layer.
-        #
-        # The guard cannot help a genuinely mixed batch, where both segments hold
-        # rows, and there it costs about 4% for the fusion it blocks. That is the
-        # accepted trade: decode-only steady state is the common case and the one
-        # that sets throughput.
-        #
-        # The skipped branch still has to return a full set of correctly shaped
-        # outputs, but zeroing one output and passing two caches through costs
-        # microseconds against the hundreds saved.
-        #
-        # This is a branch on a *device* value inside one traced graph, not a host
-        # branch on batch composition -- see `kimi_short_conv_scan` for why that
-        # distinction is the whole ballgame here.
-        def run_prefill():
-            conv_out, conv_after_prefill = kimi_short_conv_scan(
-                mixed_qkv,
-                conv_after_decode,
-                # Free: contiguous buffer, same channels in the same order.
-                conv_weight.reshape(conv_weight.shape[0], -1),
-                query_start_loc,
-                state_indices,
-                seq_lens,
-                start_seq=decode_end,
-            )
-            conv_out = jax.nn.silu(conv_out)
-
-            sequence_ids = _token_sequence_ids(query_start_loc, num_tokens,
-                                               num_seqs)
-            segment_ids = jnp.where(token_ids < total_tokens, sequence_ids + 1,
-                                    0)
-
-            qkv = conv_out.reshape(num_tokens, 3, num_heads, head_dim)
-
-            def head_major(x):  # [T, H, D] -> [H, 1, T, D]
-                return jnp.transpose(x, (1, 0, 2))[:, None]
-
-            initial_state = jnp.where(has_initial_state[:, None, None, None],
-                                      pool_after_decode[state_indices], 0.0)
-            activated_beta = _activate_beta(beta)
-            gate = raw_gate.reshape(num_tokens, num_heads, head_dim)
-
-            def run_chunked_kda():
-                chunk_out, final_state = chunk_kda(
-                    head_major(qkv[:, 0]),
-                    head_major(qkv[:, 1]),
-                    head_major(qkv[:, 2]),
-                    head_major(gate),
-                    jnp.transpose(activated_beta, (1, 0))[:,
-                                                          None],  # [H, 1, T]
-                    A_log=a_log,
-                    dt_bias=dt_bias,
-                    lower_bound=lower_bound,
-                    use_gate_in_kernel=True,
-                    use_qk_l2norm_in_kernel=True,
-                    segment_ids=segment_ids[None],
-                    N_max=num_seqs,
-                    initial_state=initial_state[None],
-                    output_final_state=True,
-                    start_seq=decode_end,
-                )
-                return (
-                    jnp.transpose(chunk_out[:, 0], (1, 0, 2)),
-                    final_state,
-                )
-
-            def run_mega_kda():
-                chunk_out, final_state = kda_forward_inference(
-                    qkv[None, :, 0],
-                    qkv[None, :, 1],
-                    qkv[None, :, 2],
-                    gate[None],
-                    activated_beta[None],
-                    A_log=a_log,
-                    dt_bias=dt_bias,
-                    lower_bound=lower_bound,
-                    use_gate_in_kernel=True,
-                    use_qk_l2norm_in_kernel=True,
-                    segment_ids=segment_ids[None],
-                    N_max=num_seqs,
-                    initial_state=initial_state[None],
-                    output_final_state=True,
-                    safe_gate=True,
-                )
-                return chunk_out[0], final_state
-
-            # The inference mega-kernel requires T % 64 == 0 and does not have
-            # the chunked kernel's device-valued `start_seq` contract. Use it
-            # only for a pure-prefill batch; mixed batches keep the chunked
-            # implementation so decode-owned cache slots remain untouched. A
-            # tile containing more than two live requests also falls back: the
-            # native boundary path represents only its first and last segment.
-            if use_mega_prefill and num_tokens % 64 == 0:
-                mega_layout_supported = _mega_kda_layout_supported(
-                    query_start_loc, num_tokens)
-                chunk_out, final_state = jax.lax.cond(
-                    (decode_end == 0) & mega_layout_supported,
-                    run_mega_kda,
-                    run_chunked_kda,
-                )
-            else:
-                chunk_out, final_state = run_chunked_kda()
-
-            # Rows with no scheduled token have no state worth keeping; their
-            # writes go to the reserved null block, slot 0.
-            #
-            # Decode slots are excluded belt-and-braces. `start_seq` above
-            # already makes the chunked kernel pass those segments through
-            # untouched, and the state it passes through was read *after*
-            # `decode_kda` ran, so writing it back would currently be a no-op.
-            # The exclusion is what makes that independent of the read order
-            # rather than contingent on it -- and it is the guard if a request
-            # ever reaches the decode segment without carried state, where the
-            # passthrough would be zero rather than the live state.
-            sequence_ids_all = jnp.arange(num_seqs, dtype=jnp.int32)
-            keep = (query_lens > 0) & (sequence_ids_all >= decode_end)
-            write_indices = jnp.where(keep, state_indices, 0)
-            new_pool = pool_after_decode.at[write_indices].set(
-                final_state[0].astype(recurrent_state.dtype))
-            return chunk_out, conv_after_prefill, new_pool
-
-        def skip_prefill():
-            return (jnp.zeros(
-                (num_tokens, num_heads, head_dim),
-                activation_dtype), conv_after_decode, pool_after_decode)
-
-        chunk_out, conv_after_prefill, new_pool = jax.lax.cond(
-            first_prefill_token < total_tokens, run_prefill, skip_prefill)
-
-        # --- select per token ---------------------------------------------
-        # Each side left the other's rows zero, so this is a select rather than
-        # a sum only to keep the intent legible.
-        output = jnp.where(
-            (token_ids < decode_end)[:, None, None],
-            _match_rows(decode_out, num_tokens).astype(chunk_out.dtype),
-            chunk_out,
-        )
-        output = _gated_output_norm(output, output_gate, norm_weight, eps,
-                                    activation_dtype)
-
-        return output, conv_after_prefill, new_pool
+        return _dispatched_kda_core(mixed_qkv,
+                                    raw_gate,
+                                    beta,
+                                    output_gate,
+                                    conv_state,
+                                    recurrent_state,
+                                    conv_weight,
+                                    a_log,
+                                    dt_bias,
+                                    norm_weight,
+                                    query_start_loc,
+                                    state_indices,
+                                    seq_lens,
+                                    distribution,
+                                    lower_bound=lower_bound,
+                                    eps=eps,
+                                    use_mega_prefill=use_mega_prefill)
 
     # The fused core replaces the whole op, prefill included, so it overrides
     # the chunked/mega selection rather than composing with it.
@@ -719,3 +758,241 @@ def build_kimi_dispatched_kda_op(
         return output
 
     return dispatched_impl
+
+
+def _pooled_kda_core(
+    mixed_qkv: jax.Array,
+    raw_gate: jax.Array,
+    beta: jax.Array,
+    output_gate: jax.Array,
+    pool: jax.Array,  # (num_blocks, block_size, *payload, lanes)
+    conv_weight: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    norm_weight: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    seq_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    pool_block_tokens: int,
+    use_mega_prefill: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    num_reqs = state_indices.shape[0]
+    num_heads = a_log.shape[0]
+    head_dim = norm_weight.shape[0]
+    kernel_size = conv_weight.shape[0]
+    elem_bytes = jnp.dtype(pool.dtype).itemsize
+    tok_bytes = math.prod(pool.shape[2:]) * elem_bytes
+    layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=num_heads * head_dim * head_dim * 4,
+        conv_bytes=(kernel_size - 1) * 3 * num_heads * head_dim * elem_bytes,
+        token_bytes=tok_bytes,
+    )
+    # state_indices are MANAGER block ids, and the region offsets are
+    # manager-block-relative. The pool's shape[1] unit is a packed token
+    # row (an MLA pool packs `pool.shape[2]` tokens per row), and a backend
+    # with a fixed kernel block size splits each manager block into `split`
+    # consecutive pool blocks — so measure the regions against the manager
+    # block and let gather_region/scatter_region remap the ids
+    # (`state_indices * split + kb`) through their split branch.
+    tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    if pool_block_tokens % tokens_per_row != 0:
+        raise ValueError("Manager block size is not a whole number of pool "
+                         f"rows: {pool_block_tokens} tokens at "
+                         f"{tokens_per_row} tokens/row")
+    manager_rows = pool_block_tokens // tokens_per_row
+    if manager_rows % pool.shape[1] != 0:
+        raise ValueError("Manager block does not split into whole pool "
+                         f"blocks: {manager_rows} rows vs pool block of "
+                         f"{pool.shape[1]}")
+    split = manager_rows // pool.shape[1]
+    if layout.required_tokens > manager_rows:
+        raise ValueError("KDA state regions exceed the pool block: "
+                         f"{layout.required_tokens} > {manager_rows}")
+
+    # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
+    # per typed row, so the leading H * D rows are exactly the state.
+    ssm_gathered = pool_adapters.gather_region(pool,
+                                               state_indices,
+                                               tok0=0,
+                                               ntok=layout.ssm_tokens,
+                                               out_dtype=jnp.float32,
+                                               out_lanes=head_dim,
+                                               split=split)
+    ssm_rows = num_heads * head_dim
+    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(num_reqs, num_heads,
+                                                      head_dim, head_dim)
+
+    # Conv region [ssm_tokens, ssm_tokens + conv_tokens): the layer's
+    # (taps, qkv, heads, head_dim) slot order, stored in the pool dtype.
+    conv_gathered = pool_adapters.gather_region(pool,
+                                                state_indices,
+                                                tok0=layout.ssm_tokens,
+                                                ntok=layout.conv_tokens,
+                                                out_dtype=pool.dtype,
+                                                split=split)
+    conv_elems = (kernel_size - 1) * 3 * num_heads * head_dim
+    conv_local = conv_gathered.reshape(num_reqs, -1)[:, :conv_elems].reshape(
+        num_reqs, kernel_size - 1, 3, num_heads, head_dim)
+
+    # Dense slot 0 is scratch for the kernels' idempotent null-block writes.
+    conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local],
+                               axis=0)
+    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local],
+                              axis=0)
+    identity = jnp.arange(1, num_reqs + 1, dtype=jnp.int32)
+
+    output, new_conv_buf, new_ssm_buf = _dispatched_kda_core(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        conv_buf,
+        ssm_buf,
+        conv_weight,
+        a_log,
+        dt_bias,
+        norm_weight,
+        query_start_loc,
+        identity,
+        seq_lens,
+        distribution,
+        lower_bound=lower_bound,
+        eps=eps,
+        use_mega_prefill=use_mega_prefill,
+    )
+
+    # Scatter the real slots back; the padding rows/elems of each region are
+    # zero-filled so the pool bytes stay deterministic.
+    ssm_region_rows = layout.ssm_tokens * tok_bytes // (4 * head_dim)
+    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
+    new_ssm = jnp.pad(new_ssm,
+                      ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
+    pool = pool_adapters.scatter_region(pool,
+                                        new_ssm,
+                                        state_indices,
+                                        tok0=0,
+                                        ntok=layout.ssm_tokens,
+                                        split=split)
+
+    conv_region_elems = layout.conv_tokens * tok_bytes // elem_bytes
+    new_conv = new_conv_buf[1:].reshape(num_reqs, conv_elems)
+    new_conv = jnp.pad(new_conv, ((0, 0), (0, conv_region_elems - conv_elems)))
+    new_conv = new_conv.reshape(num_reqs, -1, pool.shape[-1])
+    pool = pool_adapters.scatter_region(pool,
+                                        new_conv,
+                                        state_indices,
+                                        tok0=layout.ssm_tokens,
+                                        ntok=layout.conv_tokens,
+                                        split=split)
+
+    return output, pool
+
+
+def build_kimi_pooled_kda_op(
+    prefix: str,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    pool_block_tokens: int,
+):
+    """Build the KDA op that reads and writes its state through the pool.
+
+    Same torch-level contract as the dense dispatched op, except the two
+    state caches are replaced by the single attention-shaped pool buffer.
+
+    ``pool_block_tokens`` is the MANAGER block size in tokens
+    (``cache_config.block_size``); the op converts it to pool rows to size
+    the state regions against the manager block and to derive the
+    manager->pool-block split for the state-index remap.
+    """
+
+    prefill_kernel = _get_kda_prefill_kernel()
+    use_mega_prefill = prefill_kernel == "mega"
+
+    def pooled_core(
+        mixed_qkv: jax.Array,
+        raw_gate: jax.Array,
+        beta: jax.Array,
+        output_gate: jax.Array,
+        pool: jax.Array,
+        conv_weight: jax.Array,
+        a_log: jax.Array,
+        dt_bias: jax.Array,
+        norm_weight: jax.Array,
+        query_start_loc: jax.Array,
+        state_indices: jax.Array,
+        seq_lens: jax.Array,
+        distribution: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        # Explicit annotated signature: pallas.jax_op's _verify_signature
+        # rejects unannotated *args.
+        return _pooled_kda_core(mixed_qkv,
+                                raw_gate,
+                                beta,
+                                output_gate,
+                                pool,
+                                conv_weight,
+                                a_log,
+                                dt_bias,
+                                norm_weight,
+                                query_start_loc,
+                                state_indices,
+                                seq_lens,
+                                distribution,
+                                lower_bound=lower_bound,
+                                eps=eps,
+                                pool_block_tokens=pool_block_tokens,
+                                use_mega_prefill=use_mega_prefill)
+
+    op_name = f"pallas::kimi_pooled_kda_{prefix.replace('.', '_')}"
+    pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4, ))
+
+    def _fake_pooled(mixed_qkv, _raw_gate, _beta, _output_gate, pool,
+                     _conv_weight, a_log, _dt_bias, norm_weight, *args,
+                     **kwargs):
+        output = torch.empty(
+            (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0]),
+            dtype=mixed_qkv.dtype,
+            device=mixed_qkv.device)
+        return output, torch.empty_like(pool)
+
+    pooled_op.register_fake(_fake_pooled)
+
+    def pooled_impl(
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        pool: torch.Tensor,
+        conv_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        distribution: torch.Tensor,
+    ) -> torch.Tensor:
+        output, new_pool = pooled_op(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            distribution,
+        )
+        pool.copy_(new_pool)
+        return output
+
+    return pooled_impl

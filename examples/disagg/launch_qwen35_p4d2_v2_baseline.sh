@@ -97,12 +97,34 @@ DECODE_TPU_KV_TRANSFER_PORT="${DECODE_TPU_KV_TRANSFER_PORT:-9200}"
 TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT:-9600}"
 PREFILL_CTRL_PORT="${PREFILL_CTRL_PORT:-27000}"
 DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
+PREFILL_OFFLOAD_CONTROLLER_PORT="${PREFILL_OFFLOAD_CONTROLLER_PORT:-47800}"
+DECODE_OFFLOAD_CONTROLLER_PORT="${DECODE_OFFLOAD_CONTROLLER_PORT:-48800}"
+PREFILL_CPU_BYTES_TO_USE="${PREFILL_CPU_BYTES_TO_USE:-68719476736}"
+DECODE_CPU_BYTES_TO_USE="${DECODE_CPU_BYTES_TO_USE:-8589934592}"
+PREFILL_SB_PORT_BASE="${PREFILL_SB_PORT_BASE:-29500}"
+DECODE_SB_PORT_BASE="${DECODE_SB_PORT_BASE:-29510}"
+DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 PREFILL_PCP="${PREFILL_PCP:-1}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-1}"
 DECODE_TP="${DECODE_TP:-2}"
 DECODE_DP="${DECODE_DP:-1}"
+
+# One slicebuilder address per worker in each instance's TorchTPU slice.
+# The count must equal the instance's TorchTPU world size, or
+# _prepare_singlehost_tpu_env falls back to random ports.
+prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP))
+decode_sb_workers=$((DECODE_TP * DECODE_DP))
+prefill_sb_addresses=""
+for ((i = 0; i < prefill_sb_workers; i++)); do
+  prefill_sb_addresses+="${prefill_sb_addresses:+,}localhost:$((PREFILL_SB_PORT_BASE + i))"
+done
+decode_sb_addresses=""
+for ((i = 0; i < decode_sb_workers; i++)); do
+  decode_sb_addresses+="${decode_sb_addresses:+,}localhost:$((DECODE_SB_PORT_BASE + i))"
+done
+
 # Temporary same-host P4/D2 test hook. This is intentionally DEBUG-prefixed:
 # it offsets TorchTPU's physical LOCAL_RANK binding for the decode server and
 # is not a CUDA_VISIBLE_DEVICES-style remapping mechanism.
@@ -164,7 +186,7 @@ for compile_sizes_name in COMPILE_SIZES PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZ
   fi
 done
 
-managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}")
+managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}" "${KV_PORT}")
 for offset in 0 1 2 3; do
   managed_ports+=("$((PREFILL_TPU_KV_TRANSFER_PORT + offset))")
   managed_ports+=("$((DECODE_TPU_KV_TRANSFER_PORT + offset))")
@@ -172,7 +194,16 @@ for offset in 0 1 2 3; do
   managed_ports+=("$((PREFILL_CTRL_PORT + 100 + offset))")
   managed_ports+=("$((DECODE_CTRL_PORT + offset))")
   managed_ports+=("$((DECODE_CTRL_PORT + 100 + offset))")
+  managed_ports+=("$((PREFILL_OFFLOAD_CONTROLLER_PORT + offset))")
+  managed_ports+=("$((DECODE_OFFLOAD_CONTROLLER_PORT + offset))")
 done
+for ((i = 0; i < prefill_sb_workers; i++)); do
+  managed_ports+=("$((PREFILL_SB_PORT_BASE + i))")
+done
+for ((i = 0; i < decode_sb_workers; i++)); do
+  managed_ports+=("$((DECODE_SB_PORT_BASE + i))")
+done
+managed_ports+=("${DECODE_DP_MASTER_PORT}")
 mapfile -t managed_ports < <(printf '%s\n' "${managed_ports[@]}" | sort -u)
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
   stop_port_listeners "${managed_ports[@]}"
@@ -260,8 +291,8 @@ else
   common_args+=(--no-async-scheduling)
 fi
 
-p_kv='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer"}'
-d_kv='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer"}'
+p_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${PREFILL_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${PREFILL_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
+d_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_consumer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${DECODE_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${DECODE_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
 
 prefill_namespace="prefill_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
 decode_namespace="decode_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
@@ -277,8 +308,8 @@ TORCHTPU_VLLM_PYTHONPATH=${TORCHTPU_VLLM_SRC}
 MODEL_PATH=${MODEL_PATH}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
 EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}
-CONNECTOR=TPUConnector
-CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_connector
+CONNECTOR=TPUMultiConnector
+CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector
 PREFILL_TP=${PREFILL_TP}
 PREFILL_PCP=${PREFILL_PCP}
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
@@ -303,6 +334,10 @@ DECODE_TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}
 TPU_SIDE_CHANNEL_PORT=${TPU_SIDE_CHANNEL_PORT}
 PREFILL_CTRL_PORT=${PREFILL_CTRL_PORT}
 DECODE_CTRL_PORT=${DECODE_CTRL_PORT}
+PREFILL_OFFLOAD_CONTROLLER_PORT=${PREFILL_OFFLOAD_CONTROLLER_PORT}
+DECODE_OFFLOAD_CONTROLLER_PORT=${DECODE_OFFLOAD_CONTROLLER_PORT}
+PREFILL_CPU_BYTES_TO_USE=${PREFILL_CPU_BYTES_TO_USE}
+DECODE_CPU_BYTES_TO_USE=${DECODE_CPU_BYTES_TO_USE}
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 EOF
@@ -373,8 +408,8 @@ fi
 printf '%q ' "${prefill_args[@]}" >"${RUN_DIR}/prefill_vllm_args.quoted"
 printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"

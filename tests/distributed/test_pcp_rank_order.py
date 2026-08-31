@@ -29,10 +29,7 @@ def _config(**kwargs):
         nnodes=kwargs.pop("nnodes", 1),
         pipeline_parallel_size=kwargs.pop("pp", 1),
     )
-    return SimpleNamespace(
-        parallel_config=parallel,
-        kv_transfer_config=kwargs.pop("kv_transfer_config", None),
-    )
+    return SimpleNamespace(parallel_config=parallel)
 
 
 # --- resolve_pcp_topology_order: not applicable -> None --------------------
@@ -313,3 +310,77 @@ def test_context_manager_replaces_both_axes():
     assert seen["pcp"] == orders["pcp"]
     assert seen["tp"] == orders["tp"]
     assert seen["dp"] == [[0]]
+
+
+# --- verify_pcp_topology_order ---------------------------------------------
+
+
+def _patch_groups(monkeypatch, *, rank, pcp=None, tp=None):
+    """Point the verifier at synthetic groups without a live torch world."""
+    import torch.distributed as dist
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(dist, "get_rank", lambda: rank)
+    for name, ranks in (("get_pcp_group", pcp), ("get_tp_group", tp)):
+        monkeypatch.setattr(parallel_state,
+                            name,
+                            lambda ranks=ranks: SimpleNamespace(ranks=ranks),
+                            raising=False)
+
+
+def test_verify_does_nothing_when_no_order_was_applied(monkeypatch):
+    """None and {} both mean the mesh never applied, so there is no promise
+    to check. Reading a group back here would fault on configurations that
+    opted out."""
+    import torch.distributed as dist
+
+    def _explode():
+        raise AssertionError("verify must not touch the world when idle")
+
+    monkeypatch.setattr(dist, "get_rank", _explode)
+
+    order_mod.verify_pcp_topology_order(None)
+    order_mod.verify_pcp_topology_order({})
+
+
+def test_verify_accepts_the_order_it_asked_for(monkeypatch):
+    _patch_groups(monkeypatch, rank=6, pcp=[0, 1, 6, 7, 4, 5, 2, 3], tp=[6])
+
+    order_mod.verify_pcp_topology_order({
+        "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
+        "tp": [[r] for r in range(8)],
+    })
+
+
+def test_verify_raises_when_the_members_match_but_the_order_does_not(
+        monkeypatch):
+    """The failure this function exists for.
+
+    A ring is its order, so a group holding the right ranks in the wrong
+    sequence is exactly as wrong as one holding the wrong ranks -- and it is
+    the shape a set comparison would wave through.
+    """
+    _patch_groups(monkeypatch, rank=6, pcp=[0, 1, 2, 3, 4, 5, 6, 7])
+
+    with pytest.raises(RuntimeError, match="did not adopt the requested"):
+        order_mod.verify_pcp_topology_order(
+            {"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
+
+
+def test_verify_raises_when_the_rank_is_in_no_resolved_group(monkeypatch):
+    """A rank missing from the mesh means the layout does not cover the world;
+    verifying only the ranks that happen to appear would hide it."""
+    _patch_groups(monkeypatch, rank=9, pcp=[0, 1, 6, 7, 4, 5, 2, 3])
+
+    with pytest.raises(RuntimeError, match="does not appear in the pcp"):
+        order_mod.verify_pcp_topology_order(
+            {"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
+
+
+def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
+    """Replacing an axis whose group has no accessor would apply an order that
+    is never checked, which is the state this module refuses to be in."""
+    _patch_groups(monkeypatch, rank=0, pcp=[0, 1])
+
+    with pytest.raises(RuntimeError, match="No group accessor"):
+        order_mod.verify_pcp_topology_order({"ep": [[0, 1]]})

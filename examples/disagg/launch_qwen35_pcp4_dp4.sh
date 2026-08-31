@@ -67,12 +67,29 @@ PROXY_PORT="${PROXY_PORT:-8000}"
 KV_PORT="${KV_PORT:-14579}"
 TPU_KV_TRANSFER_PORT="${TPU_KV_TRANSFER_PORT:-9100}"
 TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT:-9600}"
+PREFILL_SB_PORT_BASE="${PREFILL_SB_PORT_BASE:-29500}"
+DECODE_SB_PORT_BASE="${DECODE_SB_PORT_BASE:-29510}"
+DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
 
 # PCP4 to DP4 serving parameters:
 PREFILL_TP=1
 DECODE_TP=1
 PREFILL_PCP=4
 DECODE_DP=4
+
+# One slicebuilder address per worker in each instance's TorchTPU slice.
+# The count must equal the instance's TorchTPU world size, or
+# _prepare_singlehost_tpu_env falls back to random ports.
+prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP))
+decode_sb_workers=$((DECODE_TP * DECODE_DP))
+prefill_sb_addresses=""
+for ((i = 0; i < prefill_sb_workers; i++)); do
+  prefill_sb_addresses+="${prefill_sb_addresses:+,}localhost:$((PREFILL_SB_PORT_BASE + i))"
+done
+decode_sb_addresses=""
+for ((i = 0; i < decode_sb_workers; i++)); do
+  decode_sb_addresses+="${decode_sb_addresses:+,}localhost:$((DECODE_SB_PORT_BASE + i))"
+done
 
 # Logical Rank Offset mapping:
 PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET=0
@@ -102,6 +119,13 @@ for offset in 0 1 2 3; do
   managed_ports+=("$((TPU_KV_TRANSFER_PORT + offset))")
   managed_ports+=("$((9200 + offset))")
 done
+for ((i = 0; i < prefill_sb_workers; i++)); do
+  managed_ports+=("$((PREFILL_SB_PORT_BASE + i))")
+done
+for ((i = 0; i < decode_sb_workers; i++)); do
+  managed_ports+=("$((DECODE_SB_PORT_BASE + i))")
+done
+managed_ports+=("${DECODE_DP_MASTER_PORT}")
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
   stop_port_listeners "${managed_ports[@]}"
 else
@@ -201,9 +225,9 @@ prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config 
 
 decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "${decode_compilation_config}" --block-size "${BLOCK_SIZE_DECODE}" --num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE_DECODE}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}" --kv-transfer-config "${d_kv}")
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:27000; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:27000; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
 
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:28000; export TPU_KV_TRANSFER_PORT=9200; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:28000; export TPU_KV_TRANSFER_PORT=9200; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 prefill_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port 27000"
 

@@ -20,31 +20,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-
-# bf16 tiles are (16, 128); keep token blocks sublane-aligned.
-_SUBLANE = 16
-
-# Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
-# fused_moe use the same constant).
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-
-
-def _round_up(x: int, multiple: int) -> int:
-    return (x + multiple - 1) // multiple * multiple
-
-
-def _split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24).
-
-    Chunks MUST be built with reduce_precision, not dtype round-trips:
-    XLA's excess-precision simplification folds f32->bf16->f32 into the
-    identity, which silently zeroes the mid/lo chunks.
-    """
-    fn_hi = jax.lax.reduce_precision(fn, 8, 7)
-    rem = fn - fn_hi
-    fn_mid = jax.lax.reduce_precision(rem, 8, 7)
-    fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    return tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo))
+from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import \
+    DEFAULT_VMEM_LIMIT_BYTES
 
 
 def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
@@ -135,18 +112,17 @@ def mhc_pre_mixes(
         return 2 * (tb * hc_hidden *
                     (2 * 2 + 4) + 3 * hc_mult3 * hc_hidden * 2)
 
-    tb = min(token_block_size, _round_up(num_tokens, _SUBLANE))
-    while tb > _SUBLANE and _vmem_need(tb) > vmem_limit_bytes:
-        # Degrade to a smaller block instead of a compile-time VMEM OOM.
-        tb //= 2
-    padded_tokens = _round_up(num_tokens, tb)
-    if padded_tokens != num_tokens:
-        # Zero rows are safe: they produce zero mixes/sqrsum and are
-        # sliced off below.
-        x2d = jnp.pad(x2d, ((0, padded_tokens - num_tokens), (0, 0)))
+    tb, padded_tokens = utils.select_token_block(
+        num_tokens,
+        token_block_size,
+        vmem_need=_vmem_need,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # Zero rows are safe: they produce zero mixes/sqrsum and are sliced
+    # off below.
+    (x2d, ) = utils.pad_to(padded_tokens, x2d)
 
-    # Split in XLA outside the kernel; the chunks stay VMEM-resident.
-    fn_hi, fn_mid, fn_lo = _split_fn3(fn)
+    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
 
     compiler_params = pltpu.CompilerParams(dimension_semantics=("parallel", ),
                                            vmem_limit_bytes=vmem_limit_bytes,
@@ -173,10 +149,7 @@ def mhc_pre_mixes(
         compiler_params=compiler_params,
     )(x2d, fn_hi, fn_mid, fn_lo)
 
-    if padded_tokens != num_tokens:
-        mixes = mixes[:num_tokens]
-        sqrsum = sqrsum[:num_tokens]
-    return mixes, sqrsum
+    return utils.trim_to(num_tokens, mixes, sqrsum)
 
 
 @functools.partial(jax.jit,
@@ -207,7 +180,7 @@ def mhc_pre_mixes_collapse(
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
 
-    fn_hi, fn_mid, fn_lo = _split_fn3(fn)
+    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -217,15 +190,15 @@ def mhc_pre_mixes_collapse(
         return 2 * (tb * hc_hidden * (2 * 2 + 4) + tb * hidden_size * 2 * 2 +
                     3 * hc_mult3 * hc_hidden * 2)
 
-    tb = min(token_block_size, _round_up(num_tokens, _SUBLANE))
-    while tb > _SUBLANE and _vmem_need(tb) > vmem_limit_bytes:
-        # Degrade to a smaller block instead of a compile-time VMEM OOM.
-        tb //= 2
-    padded_tokens = _round_up(num_tokens, tb)
-    if padded_tokens != num_tokens:
-        # Zero rows are safe: they produce zero mixes/sqrsum/layer rows
-        # and are sliced off below.
-        x2d = jnp.pad(x2d, ((0, padded_tokens - num_tokens), (0, 0)))
+    tb, padded_tokens = utils.select_token_block(
+        num_tokens,
+        token_block_size,
+        vmem_need=_vmem_need,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # Zero rows are safe: they produce zero mixes/sqrsum/layer rows and
+    # are sliced off below.
+    (x2d, ) = utils.pad_to(padded_tokens, x2d)
 
     compiler_params = pltpu.CompilerParams(dimension_semantics=("parallel", ),
                                            vmem_limit_bytes=vmem_limit_bytes,
@@ -260,11 +233,7 @@ def mhc_pre_mixes_collapse(
         compiler_params=compiler_params,
     )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
-    if padded_tokens != num_tokens:
-        mixes = mixes[:num_tokens]
-        sqrsum = sqrsum[:num_tokens]
-        layer2d = layer2d[:num_tokens]
-    return mixes, sqrsum, layer2d
+    return utils.trim_to(num_tokens, mixes, sqrsum, layer2d)
 
 
 def mhc_pre(

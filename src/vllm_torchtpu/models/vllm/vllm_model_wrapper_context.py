@@ -28,6 +28,10 @@ class VllmModelWrapperContext:
     kv_caches: Optional[List[torch.Tensor]] = None
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None
     vllm_config: Optional[object] = None
+    # Full-model block-major KV cache bundle shared across layers. When set,
+    # attention forward execution routes through the bundled RPA custom op with
+    # in-place buffer donation, bypassing the per-layer tensor views bound by vLLM.
+    kv_cache_bundle: Optional[torch.Tensor] = None
 
 
 _vllm_model_wrapper_context: Optional[VllmModelWrapperContext] = None
@@ -48,6 +52,7 @@ def set_vllm_model_wrapper_context(
     mesh: Mesh,
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None,
     vllm_config: Optional[object] = None,
+    kv_cache_bundle: Optional[torch.Tensor] = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -56,6 +61,7 @@ def set_vllm_model_wrapper_context(
         mesh=mesh,
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
         vllm_config=vllm_config,
+        kv_cache_bundle=kv_cache_bundle,
     )
 
     try:

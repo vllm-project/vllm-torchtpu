@@ -29,7 +29,7 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import \
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import \
     sparse_ragged_paged_attention
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import align_to, largest_divisor
+from vllm_torchtpu.utils import align_to
 
 logger = init_logger(__name__)
 
@@ -204,16 +204,6 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
-    # `gather_and_attention_chunk_size` and `attention_kernel_batch_size` are
-    # tuned based on microbenchmark results.
-    gather_and_attention_chunk_size = 64 if (q.shape[0] % 64 == 0) else None
-    if gather_and_attention_chunk_size is None:
-        # The kernel falls back to a single chunk of q.shape[0]; the batch
-        # size must divide it.
-        attention_kernel_batch_size = largest_divisor(q.shape[0], 16)
-    else:
-        attention_kernel_batch_size = 16
-
     output = sparse_ragged_paged_attention(
         q=q,
         cache_kv_nope=main_cache_kv,
@@ -227,8 +217,8 @@ def _attention_csa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        gather_and_attention_chunk_size=gather_and_attention_chunk_size,
-        attention_kernel_batch_size=attention_kernel_batch_size,
+        gather_and_attention_chunk_size=64,
+        attention_kernel_batch_size=16,
     )
     return output, updated_sw_cache
 

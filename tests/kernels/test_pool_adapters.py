@@ -78,13 +78,39 @@ def test_copy_blocks():
     np.testing.assert_array_equal(after[2], before[2])
 
 
-def test_misaligned_region_rejected():
+def test_unaligned_region_gcd_decomposition_roundtrip():
+    # tok0=12, ntok=8: 12 % 8 != 0, so the region moves as two aligned
+    # 4-token chunks; the bytes round-trip exactly.
+    pool = _pool()
+    before = np.asarray(pool)
+    idx = jnp.asarray([2, 0], dtype=jnp.int32)
+    tok0, ntok = 12, 8
+    rows = ntok * TOK_BYTES // (4 * LANES)
+    rng = np.random.default_rng(7)
+    vals = jnp.asarray(rng.standard_normal((2, rows, LANES)),
+                       dtype=jnp.float32)
+
+    pool = pool_adapters.scatter_region(pool, vals, idx, tok0=tok0, ntok=ntok)
+    got = pool_adapters.gather_region(pool,
+                                      idx,
+                                      tok0=tok0,
+                                      ntok=ntok,
+                                      out_dtype=jnp.float32)
+
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(vals))
+    after = np.asarray(pool)
+    np.testing.assert_array_equal(after[:, :tok0], before[:, :tok0])
+    np.testing.assert_array_equal(after[:, tok0 + ntok:], before[:,
+                                                                 tok0 + ntok:])
+
+
+def test_out_of_block_region_rejected():
     pool = _pool()
     idx = jnp.asarray([0], dtype=jnp.int32)
     with pytest.raises(AssertionError):
         pool_adapters.gather_region(pool,
                                     idx,
-                                    tok0=8,
+                                    tok0=48,
                                     ntok=32,
                                     out_dtype=jnp.float32)
 

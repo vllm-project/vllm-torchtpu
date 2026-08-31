@@ -31,7 +31,8 @@ from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiLinearForCausalLM,
                                                KimiModel,
                                                MultiHeadLatentAttention)
-from vllm_torchtpu.models.vllm.kimi_k3.layers import SituAndMul
+from vllm_torchtpu.models.vllm.kimi_k3.layers import (AttentionResidual,
+                                                      SituAndMul)
 
 
 def test_kimi_architectures_are_registered() -> None:
@@ -779,3 +780,47 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     torch.testing.assert_close(sconv_cache, torch.ones_like(sconv_cache))
     torch.testing.assert_close(recurrent_cache,
                                torch.ones_like(recurrent_cache))
+
+
+@pytest.mark.parametrize("num_blocks", [0, 8],
+                         ids=["prefix-only", "with-blocks"])
+def test_attention_residual_matches_reference(num_blocks: int) -> None:
+    """The layer computes a softmax-weighted sum over the residual slots:
+    RMS-normalize each slot, project to a scalar score, softmax over slots,
+    mix. The reference below states that directly in fp32.
+    """
+    torch.manual_seed(0)
+    num_tokens, hidden, eps = 33, 64, 1e-5
+    # Stubbed like the other layer tests here: RMSNorm/ReplicatedLinear are
+    # CustomOps whose constructors need a VllmConfig context, and constructing
+    # one is exactly what the TPU device parse makes impossible off-TPU. The
+    # fold only reads the two weights, so stub them with plain Parameters.
+    module = AttentionResidual.__new__(AttentionResidual)
+    nn.Module.__init__(module)
+    module.eps = eps
+    module.norm = SimpleNamespace(weight=nn.Parameter(
+        torch.randn(hidden, dtype=torch.bfloat16) * 0.5 + 1))
+    module.proj = SimpleNamespace(weight=nn.Parameter(
+        torch.randn(1, hidden, dtype=torch.bfloat16) * 0.1))
+    module.process_weights_after_loading()
+
+    prefix_sum = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    block_residuals = torch.randn(num_tokens,
+                                  num_blocks,
+                                  hidden,
+                                  dtype=torch.bfloat16)
+
+    values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)),
+                       dim=-2).float()
+    normed = values * torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + eps)
+    scores = normed @ (module.norm.weight.float() *
+                       module.proj.weight[0].float())
+    probabilities = scores.softmax(dim=-1)
+    expected = (probabilities.unsqueeze(-1) * values).sum(dim=-2).to(
+        prefix_sum.dtype)
+
+    actual = module(prefix_sum, block_residuals)
+
+    assert actual.shape == (num_tokens, hidden)
+    assert actual.dtype == prefix_sum.dtype
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)

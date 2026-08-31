@@ -23,8 +23,7 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_gather import \
 
 def gather_nope_ref_impl(cache, indices):
     page_size = cache.shape[1]
-    x = cache[indices // page_size, indices % page_size, :, :]
-    return x.reshape(-1, 512)
+    return cache[indices // page_size, indices % page_size, :, :]
 
 
 def gather_rope_ref_impl(cache, indices):

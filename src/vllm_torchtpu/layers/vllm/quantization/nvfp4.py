@@ -41,8 +41,7 @@ import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
-from vllm.model_executor.layers.linear import (LinearBase,
-                                               UnquantizedLinearMethod)
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import \
@@ -153,7 +152,9 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
             return None
         if isinstance(layer, LinearBase):
             if self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+                    VllmUnquantizedLinearMethod
+                return VllmUnquantizedLinearMethod()
             return VllmNvfp4LinearMethod(self, self.get_linear_config(layer))
         if isinstance(layer, RoutedExperts):
             if self.is_layer_excluded(prefix):

@@ -54,20 +54,24 @@ class FakeTensor:
 
 def glm_named_kv_caches(*,
                         num_blocks=16,
-                        fa_shape=None,
-                        fa_esz=1,
-                        fa_dtype="torch.float8_e5m2",
+                        block_size_tokens=1024,
+                        nope_shape=None,
+                        rope_shape=None,
                         idx_shape=None):
     """Named per-layer caches shaped like a GLM-5.2 materialization.
 
-    Two MLA latent caches plus one uint8 DSA indexer cache, all packed
-    [blocks, rows, packing, width].
+    Each MLA layer holds a (nope, rope) uint8 tensor pair and
+    one  uint8 DSA indexer cache. Nope packs one token per
+    [packing, width] row, rope packs `packing` tokens per row.
     """
-    fa_shape = fa_shape or (num_blocks, 256, 4, 640)
-    idx_shape = idx_shape or (num_blocks, 256, 4, 256)
+    nope_shape = nope_shape or (num_blocks, block_size_tokens, 4, 128)
+    rope_shape = rope_shape or (num_blocks, block_size_tokens // 4, 4, 128)
+    idx_shape = idx_shape or (num_blocks, block_size_tokens // 4, 4, 256)
     named = {
-        f"model.layers.{idx}.self_attn.mla_attn":
-        FakeTensor(fa_shape, fa_esz, dtype=fa_dtype)
+        f"model.layers.{idx}.self_attn.mla_attn": (
+            FakeTensor(nope_shape, 1, dtype="torch.uint8"),
+            FakeTensor(rope_shape, 1, dtype="torch.uint8"),
+        )
         for idx in range(2)
     }
     named["model.layers.0.self_attn.indexer"] = FakeTensor(idx_shape,

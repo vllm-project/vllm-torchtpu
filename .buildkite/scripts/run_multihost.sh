@@ -119,9 +119,9 @@ NUM_HOSTS=$(( ${#WORKER_IPS_ARRAY[@]} + 1 ))
 # Results dir on host (no /mnt/disks on these agents; boot disk only)
 # ---------------------------------------------------------------------------
 PERSIST_ROOT="${HOME}/persist"
-rm -rf "${PERSIST_ROOT}/perf_eval_results"
-mkdir -p "${PERSIST_ROOT}/perf_eval_results"
-chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
+# Containers write here as root, so never assume the agent can rm the leftovers
+# of whatever ran last -- see reset_results_dir.sh.
+bash "${SCRIPT_DIR}/reset_results_dir.sh" "${PERSIST_ROOT}/perf_eval_results" "${IMAGE_TAG}"
 HOST_HF_HOME="${HOME}/hf_home"   # tokenizer/config only; weights stream from GCS
 mkdir -p "${HOST_HF_HOME}"
 rm -rf perf_eval_results
@@ -144,6 +144,13 @@ cleanup
 # Free disk before pulling this commit's image (100G boot disk only).
 echo "--- Cleaning up old Docker images"
 bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
+
+# Worker hosts pull the same ~9G image every build but never pruned it, so they
+# filled up while the head stayed healthy: tpu7x-16-ci-1 worker 1 reached 98%
+# with six stale images on it. Prune them the same way we prune the head.
+for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
+  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" "bash -s" < "${SCRIPT_DIR}/cleanup_docker.sh" || true
+done
 
 # Test suite and BigQuery tracking env vars
 TEST_SUITE_VARS=()

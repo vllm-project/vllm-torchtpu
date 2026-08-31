@@ -116,6 +116,8 @@ def _make_runner(*,
     # Affine checkpoint addressing (no per-checkpoint blocks) in these tests.
     runner._mamba_ckpt_window = 1
     runner._unified_kv_layout = False
+    # Default to layer-major KV cache (None bundle) for PCP integration layout tests.
+    runner._kv_cache_bundle = None
     # Bind the real seed-copy collector; an empty copy plan makes it a no-op
     # (no mamba align mode in these layout tests).
     runner._mamba_copy_plan = []

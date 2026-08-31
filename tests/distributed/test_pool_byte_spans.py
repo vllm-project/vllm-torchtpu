@@ -378,6 +378,39 @@ def test_glm_row_spans_trim_partial_tail_to_rows():
         assert registration.declared_bytes == live + 2 * row_bytes
 
 
+def test_glm_row_spans_nope_trims_per_token():
+    # A split sparse MLA nope pool holds ONE token per row (row_bytes 512,
+    # live = page_tokens * 512), so the tail trims at token granularity.
+    nope_row_bytes = 512
+    nope_live = _GLM_PAGE_TOKENS * nope_row_bytes
+    registration = _glm_row_spans(
+        tag="mla.nope",
+        num_tokens=2 * _GLM_PAGE_TOKENS + 5,
+        live_bytes_per_block=nope_live,
+        row_bytes=nope_row_bytes,
+    )
+    # Rank 0 of 2 owns pages {0, 2}; 5 tail tokens = exactly 5 rows.
+    assert [span.size_bytes
+            for span in registration.spans] == [nope_live, 5 * nope_row_bytes]
+    assert registration.declared_bytes == nope_live + 5 * nope_row_bytes
+
+
+def test_glm_row_spans_rope_trims_to_packed_rows():
+    # The rope half packs 4 tokens per 512-byte row (live = page_tokens/4
+    # * 512): 5 tail tokens round up to 2 rows.
+    rope_row_bytes = 512
+    rope_live = (_GLM_PAGE_TOKENS // 4) * rope_row_bytes
+    registration = _glm_row_spans(
+        tag="mla.rope",
+        num_tokens=2 * _GLM_PAGE_TOKENS + 5,
+        live_bytes_per_block=rope_live,
+        row_bytes=rope_row_bytes,
+    )
+    assert [span.size_bytes
+            for span in registration.spans] == [rope_live, 2 * rope_row_bytes]
+    assert registration.declared_bytes == rope_live + 2 * rope_row_bytes
+
+
 def test_glm_row_spans_parallelism_one_owns_every_page():
     registration = _glm_row_spans(num_tokens=2 * _GLM_PAGE_TOKENS,
                                   parallelism=1,

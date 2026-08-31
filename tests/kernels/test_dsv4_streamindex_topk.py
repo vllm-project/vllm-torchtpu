@@ -519,6 +519,217 @@ def test_streamindex_topk_quantized():
     )
 
 
+# =====================================================================
+# Early exit
+# =====================================================================
+# `enable_early_exit=True` must change cost, never the answer. Once a
+# sequence's compressed length is <= k, top-k selects every visible position,
+# so the scores decide nothing and the scoring kernel can be skipped outright.
+# The guard is batch-wide, so the tests below pin both halves of that: the
+# shortcut agrees with the scoring path when the whole batch is short, and is
+# inert the moment any single sequence is not.
+
+# `page_size * bkv_p` is 128, the TPU DMA contract of the scores kernel.
+_EE_PAGE_SIZE = 128
+_EE_PAGES_PER_SEQ = 32
+_EE_BKV_P = 1
+_EE_BQ_SZ = 4
+_EE_H_I = 4
+_EE_D = 128
+
+
+def _ee_pack_cache(keys):
+    """fp8-quantize ``[num_pages, page_size, D]`` keys into the uint8 cache.
+
+    Same record layout the tests above build row by row -- ``[fp8 x D | one
+    e8m0 scale byte | pad]`` rounded up to a 128-lane group, addressed as
+    ``[page, slot // 4, slot % 4, width]`` -- just quantized in one shot.
+    """
+    num_pages, page_size, head_dim = keys.shape
+    fp8, scale = quantize_fp8_ue8m0(jnp.asarray(keys), head_dim)
+    record = jnp.concatenate(
+        [_to_byte_lane(fp8), _to_byte_lane(scale)], axis=-1)
+    width = -(-record.shape[-1] // 128) * 128
+    record = jnp.pad(record, ((0, 0), (0, 0), (0, width - record.shape[-1])))
+    return np.asarray(record).reshape(num_pages, page_size // 4, 4, width)
+
+
+def _ee_inputs(q_lens, seq_lens, seed):
+    """One kernel invocation at ``compression_ratio=1``.
+
+    Every sequence gets a shuffled, disjoint set of physical pages so a bug in
+    the page walk cannot hide behind sequential layout.
+    """
+    rng = np.random.default_rng(seed)
+    num_seqs = len(q_lens)
+    num_tokens = int(sum(q_lens))
+    num_pages = num_seqs * _EE_PAGES_PER_SEQ
+
+    block_table = rng.permutation(num_pages).astype(np.int32).reshape(
+        num_seqs, _EE_PAGES_PER_SEQ)
+    keys = rng.standard_normal((num_pages, _EE_PAGE_SIZE, _EE_D),
+                               dtype=np.float32)
+
+    # `distribution` requires the decode-only sequences to lead the batch.
+    num_decodes = 0
+    while num_decodes < num_seqs and q_lens[num_decodes] == 1:
+        num_decodes += 1
+
+    return {
+        "q":
+        rng.standard_normal((num_tokens, _EE_H_I, _EE_D), dtype=np.float32),
+        "indexer_weights":
+        rng.uniform(0.25, 1.75, (num_tokens, _EE_H_I)).astype(np.float32),
+        "cache_kv":
+        _ee_pack_cache(keys),
+        "seq_lens":
+        np.asarray(seq_lens, np.int32),
+        "page_indices":
+        block_table.reshape(-1),
+        "cu_q_lens":
+        np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32),
+        "distribution":
+        np.array([num_decodes, num_decodes, num_seqs], np.int32),
+    }
+
+
+def _ee_both_paths(q_lens, seq_lens, k, seed=11):
+    """Run the same batch with the flag off and on."""
+    inputs = _ee_inputs(q_lens, seq_lens, seed)
+
+    def run(enable_early_exit):
+        return np.asarray(
+            streamindex_topk(**{
+                name: jnp.asarray(value)
+                for name, value in inputs.items()
+            },
+                             k=k,
+                             compression_ratio=1,
+                             num_kv_pages_per_block=_EE_BKV_P,
+                             num_queries_per_block=_EE_BQ_SZ,
+                             enable_early_exit=enable_early_exit))
+
+    return run(False), run(True)
+
+
+def _ee_visible_counts(q_lens, seq_lens):
+    """Causally visible compressed positions per query token.
+
+    At ``compression_ratio=1`` the queries are the tail of their sequence, so
+    query ``i`` of a sequence of length ``S`` sits at absolute position
+    ``S - q_len + i`` and sees every position up to and including it.
+    """
+    counts = []
+    for q_len, seq_len in zip(q_lens, seq_lens):
+        counts.extend(seq_len - q_len + i + 1 for i in range(q_len))
+    return counts
+
+
+def _ee_assert_same_selection(early, baseline):
+    """Both paths must select the same positions, in whatever order.
+
+    The scoring path emits winners in ``approx_max_k`` order and the early-exit
+    path in increasing KV position. Order is deliberately unspecified, so
+    comparing the raw rows would assert something the kernel never promised --
+    compare the selected sets.
+    """
+    assert early.shape == baseline.shape, (early.shape, baseline.shape)
+    for token, (row_e, row_b) in enumerate(zip(early, baseline)):
+        kept_e = np.sort(row_e[row_e >= 0])
+        kept_b = np.sort(row_b[row_b >= 0])
+        np.testing.assert_array_equal(
+            kept_e, kept_b, f"token {token}: early exit selected a different "
+            "set of positions than the scoring path")
+        assert np.all(row_e[len(kept_e):] < 0), (
+            f"token {token}: -1 padding is not a suffix: {row_e}")
+
+
+def _ee_assert_every_visible_position(actual, q_lens, seq_lens, k):
+    """With the whole batch under k the answer is exact, not a ranking.
+
+    Every visible position wins, so the expected index set is closed-form and
+    the check does not depend on score arithmetic at all.
+    """
+    for token, n_visible in enumerate(_ee_visible_counts(q_lens, seq_lens)):
+        assert n_visible <= k, "test setup: sequence is not short"
+        row = actual[token]
+        np.testing.assert_array_equal(
+            np.sort(row[row >= 0]), np.arange(n_visible),
+            f"token {token}: not every visible position was reported")
+        assert np.all(row[n_visible:] < 0), (
+            f"token {token}: -1 padding is not a suffix: {row}")
+
+
+def _ee_assert_full_rows(actual, q_lens, seq_lens, k):
+    """Cheap sanity for the long-sequence cases.
+
+    Correctness of the scoring path itself is what the tests above cover; here
+    the claim under test is that the flag is inert, so this only rules out
+    gross breakage.
+    """
+    counts = _ee_visible_counts(q_lens, seq_lens)
+    limits = []
+    for q_len, seq_len in zip(q_lens, seq_lens):
+        limits.extend([seq_len] * q_len)
+    for token, (n_visible, limit) in enumerate(zip(counts, limits)):
+        assert n_visible > k, "test setup: sequence is not long"
+        row = actual[token]
+        assert np.all(row >= 0), f"token {token}: padded a full-length row"
+        assert row.max() < limit, (
+            f"token {token}: index {row.max()} past seq_len {limit}")
+
+
+def test_streamindex_topk_early_exit_all_short():
+    """Whole batch under k: the global fast path answers on its own."""
+    q_lens, seq_lens, k = (1, 1, 1), (64, 96, 128), 512
+    baseline, early = _ee_both_paths(q_lens, seq_lens, k)
+
+    _ee_assert_every_visible_position(early, q_lens, seq_lens, k)
+    _ee_assert_same_selection(early, baseline)
+
+
+def test_streamindex_topk_early_exit_no_short_is_inert():
+    """Every sequence over k: nothing is skipped, so nothing may change.
+
+    Here the flag must be inert, which is a stronger claim than agreeing as
+    sets -- no row took the shortcut, so the rows are bit-identical.
+    """
+    q_lens, seq_lens, k = (1, 1, 4), (2048, 3072, 4096), 128
+    baseline, early = _ee_both_paths(q_lens, seq_lens, k)
+
+    _ee_assert_full_rows(early, q_lens, seq_lens, k)
+    np.testing.assert_array_equal(early, baseline)
+
+
+def test_streamindex_topk_early_exit_is_batch_wide():
+    """The guard is batch-wide, not per sequence.
+
+    Two short decodes alongside one long prefill: `jnp.max(seq_lens)` is over
+    k, so every token goes back through the scoring kernel including the short
+    ones, and the flag must be bit-for-bit inert.
+    """
+    q_lens, seq_lens, k = (1, 1, 4), (64, 96, 4096), 512
+    baseline, early = _ee_both_paths(q_lens, seq_lens, k)
+
+    np.testing.assert_array_equal(early, baseline)
+
+
+def test_streamindex_topk_early_exit_keeps_causal_mask():
+    """The shortcut is still causal: a prefill token sees only its past.
+
+    The whole sequence fits in k, so a bug that returned `[0, k)` instead of
+    `[0, position]` would still look plausible -- this is what catches it.
+    """
+    q_lens, seq_lens, k = (4, ), (64, ), 256
+    _, early = _ee_both_paths(q_lens, seq_lens, k)
+
+    _ee_assert_every_visible_position(early, q_lens, seq_lens, k)
+    # Four query tokens at the tail of a 64-long sequence sit at absolute
+    # positions 60..63, so they keep 61..64 positions respectively.
+    kept = [int(np.count_nonzero(row >= 0)) for row in early]
+    assert kept == [61, 62, 63, 64], kept
+
+
 def main(argv):
     del argv
 

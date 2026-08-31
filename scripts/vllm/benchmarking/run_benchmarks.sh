@@ -373,10 +373,17 @@ run_benchmark_once() {
         temperature_arg=(--temperature "$BENCHMARK_TEMPERATURE")
     fi
 
+    local tokenizer_arg=()
+    if [ -n "${TOKENIZER:-}" ]; then
+        tokenizer_arg=(--tokenizer "$TOKENIZER")
+    fi
+
     set +e
     vllm bench serve \
         --backend vllm \
         --model "$MODEL" \
+        "${tokenizer_arg[@]}" \
+        --trust-remote-code \
         --host "$HOST" \
         --port "$PORT" \
         --dataset-name random \

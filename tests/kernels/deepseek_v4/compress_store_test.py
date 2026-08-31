@@ -89,19 +89,30 @@ class CompressStoreTest(jtu.JaxTestCase):
         else:
             mode = config.Mode.CSA if overlap else config.Mode.HCA
 
-        cfgs = config.Configs.make(
-            mode,
-            size_n=num_tokens,
-            physical_page_size=physical_page_size,
-            state_physical_page_size=state_physical_page_size,
-            rms_eps=rms_eps,
-            head_dim=head_dim,
-            rope_head_dim=rope_head_dim,
-            compress_ratio=compress_ratio,
-            quant_block=quant_block,
-        )
+        def make_cfgs(state_block_size):
+            return config.Configs.make(
+                mode,
+                size_n=num_tokens,
+                physical_page_size=physical_page_size,
+                state_physical_page_size=state_physical_page_size,
+                rms_eps=rms_eps,
+                head_dim=head_dim,
+                rope_head_dim=rope_head_dim,
+                compress_ratio=compress_ratio,
+                quant_block=quant_block,
+                state_block_size=state_block_size,
+            )
 
-        state_block_size = cfgs.state_block_size
+        # `state_block_size` is vLLM's paging granularity, an input rather than
+        # a property of the page: `config.state_block_size` floors the indexer
+        # to CSA's smaller capacity (always exactly half its own) so the two
+        # share a cache group, leaving the tail of every indexer page unused.
+        # The capacity itself does not depend on it, so probe for it first.
+        state_page_capacity = make_cfgs(1).state_page_capacity
+        state_block_size = (state_page_capacity //
+                            2 if mode is config.Mode.CSA_INDEXER else
+                            state_page_capacity)
+        cfgs = make_cfgs(state_block_size)
         if mode is config.Mode.HCA:
             separate_state = True
         else:
@@ -143,7 +154,20 @@ class CompressStoreTest(jtu.JaxTestCase):
         run_1_positions = jnp.arange(run_1_tokens, dtype=jnp.int32)
 
         slots_per_token = cfgs.state_rows_per_token
-        run_1_slot_mapping = np.arange(run_1_tokens) * slots_per_token
+
+        def state_slot(token_index):
+            """Physical state row of a token, the way `derive_metadata` maps it.
+
+            The block table below is the identity, so the page number is just
+            the block index. Tokens are page-strided, not densely packed: a
+            page holds `state_page_capacity` states but is only paged at
+            `state_block_size` of them.
+            """
+            return ((token_index // state_block_size) *
+                    cfgs.state_physical_page_size +
+                    (token_index % state_block_size) * slots_per_token)
+
+        run_1_slot_mapping = state_slot(np.arange(run_1_tokens))
         run_1_slot_mapping = jnp.array(run_1_slot_mapping, dtype=jnp.int32)
 
         init_cache = jnp.zeros(cfgs.cache_shape(num_pages), dtype=jnp.uint8)
@@ -237,8 +261,7 @@ class CompressStoreTest(jtu.JaxTestCase):
         else:
             init_rope_cache = jnp.zeros((num_pages, 1, 1, 128),
                                         dtype=jnp.uint8)
-        slot_mapping = jnp.where(positions >= 0, positions * slots_per_token,
-                                 -1)
+        slot_mapping = jnp.where(positions >= 0, state_slot(positions), -1)
 
         is_quantized = overlap
         has_rope = rope_head_dim > 0
@@ -295,6 +318,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             kv_slot_mapping,
             rms_weight,
             block_table_stride=block_table_stride,
+            state_block_size=state_block_size,
             state_cache=(jnp.copy(populated_state_cache)
                          if separate_state else None),
             rope_cache=jnp.copy(init_rope_cache),

@@ -82,6 +82,8 @@ from vllm.v1.kv_offload.base import (CanonicalKVCaches, LoadStoreSpec,
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload.block_major_layout import (
+    BlockMajorContract, resolve_block_major_contract)
 
 logger = init_logger(__name__)
 
@@ -950,16 +952,17 @@ class RaidenOffloadingManager(OffloadingManager):
 
 
 def derive_offload_namespace(
-    vllm_config: VllmConfig,
-    *,
-    kernel_block_size: int,
-    per_block_shape: tuple[int, ...],
-    kv_dtype: object,
-    device_block_size: int,
-    world_size: int,
-    num_kv_cache_groups: int,
-    num_kv_cache_tensors: int,
-    cp_geometry: tuple[int, ...] = ()) -> bytes:
+        vllm_config: VllmConfig,
+        *,
+        kernel_block_size: int,
+        per_block_shape: tuple[int, ...],
+        kv_dtype: object,
+        device_block_size: int,
+        world_size: int,
+        num_kv_cache_groups: int,
+        num_kv_cache_tensors: int,
+        cp_geometry: tuple[int, ...] = (),
+        block_major_contract: "BlockMajorContract | None" = None) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and registry key.
 
     Ensures cache keys never collide across incompatible engine deployments by
@@ -970,17 +973,27 @@ def derive_offload_namespace(
     - Distributed topology: world size (TP/PP) and context parallelism geometry
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
+    - Layout contract: block-major layout version, row bytes, and logical fingerprint.
 
     Returns:
-        A 16-byte SHA-256 digest unique to this engine configuration.
+        A 16-byte SHA-256 digest unique to this engine and layout configuration.
     """
     model_config = vllm_config.model_config
-    material = repr((model_config.model, model_config.revision,
-                     model_config.quantization, str(kv_dtype),
-                     kernel_block_size, per_block_shape, device_block_size,
-                     world_size, num_kv_cache_groups, num_kv_cache_tensors,
-                     vllm_config.cache_config.prefix_caching_hash_algo,
-                     "tpu-raiden-offload-ns1") + cp_geometry)
+    material_fields = (model_config.model, model_config.revision,
+                       model_config.quantization, str(kv_dtype),
+                       kernel_block_size, per_block_shape, device_block_size,
+                       world_size, num_kv_cache_groups, num_kv_cache_tensors,
+                       vllm_config.cache_config.prefix_caching_hash_algo,
+                       "tpu-raiden-offload-ns1") + cp_geometry
+    if block_major_contract is not None:
+        # Block-major layout bundles per-block bytes across layers; salt the namespace
+        # with the layout fingerprint to isolate cache entries and prevent collisions
+        # with layer-major or incompatible bundle geometries.
+        material_fields += ("tpu-raiden-offload-ns2-block-major",
+                            block_major_contract.fragment_count,
+                            block_major_contract.bundle_row_bytes,
+                            block_major_contract.logical_fingerprint)
+    material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
 
@@ -1100,6 +1113,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         host_blocks_to_allocate: int,
         controller_address: str,
         rank: int,
+        block_major_contract: BlockMajorContract | None = None,
     ):
         import numpy as np
         import torch
@@ -1113,6 +1127,28 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         bytes_per_kernel_block = (
             int(np.prod(per_block_shape)) *
             torch.empty(0, dtype=kv_dtype).element_size())
+
+        if block_major_contract is not None:
+            # Block-major registration: Register the entire multi-layer bundle as a single
+            # canonical storage ([kernel_blocks, F, *R]). Raiden views the bundle as 1 block array,
+            # executing 1 hardware DMA per block transfer rather than F DMAs.
+            #
+            # Safety invariants:
+            # - Consistent row geometry: Validates that fragment_row_bytes matches physical row bytes.
+            # - Deployment protection: Layer-major peers registering fragment_row_bytes are rejected
+            #   by Raiden's block_array_bytes consistency check against our bundle_row_bytes.
+            assert (block_major_contract.fragment_row_bytes ==
+                    bytes_per_kernel_block), (
+                        "block-major contract kernel-row bytes "
+                        f"{block_major_contract.fragment_row_bytes} != "
+                        f"resolved geometry {bytes_per_kernel_block}")
+            assert len(kv_caches.tensors) == 1, (
+                "block-major requires the device bundle to be one canonical "
+                f"storage; got {len(kv_caches.tensors)} — the runner did not "
+                "materialize the [kernel_blocks, F, *R] bundle")
+            per_block_shape = (
+                block_major_contract.fragment_count, ) + per_block_shape
+            bytes_per_kernel_block = block_major_contract.bundle_row_bytes
 
         # Rebuild typed tensor views shaped by physical kernel blocks from the
         # underlying storage, ensuring leading dimensions match DMA tile layouts.
@@ -1308,6 +1344,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         assert device_block_size % kernel_block_size == 0
         self.device_block_size_factor = device_block_size // kernel_block_size
 
+        # Derive the block-major layout contract (returns None if disabled).
+        # Ensures scheduler and worker ranks agree on namespace salt and bundle geometry ahead of tensor allocation.
+        self.block_major_contract = resolve_block_major_contract(
+            vllm_config, kv_cache_config)
+
         # Verify PCP scaling invariant: scheduler chunks at the logical all-PCP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
         # scales by pcp_size so OffloadKey spans match scheduler blocks.
@@ -1370,6 +1411,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
             num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
             cp_geometry=cp_geometry,
+            block_major_contract=self.block_major_contract,
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
@@ -1432,5 +1474,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 host_blocks_to_allocate=self.kernel_physical_blocks_capacity,
                 controller_address=controller_address,
                 rank=rank,
+                block_major_contract=self.block_major_contract,
             )
         return self._worker

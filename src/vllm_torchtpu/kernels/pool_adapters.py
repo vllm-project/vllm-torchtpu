@@ -17,17 +17,18 @@ The pool is the stock attention-shaped KV cache
 `(num_blocks, block_size, num_kv_heads * 2, head_size)` in the KV dtype —
 the one tensor per physical buffer that every sharing layer receives.
 Attention consumes it natively. Consumers that pack other element types
-into a block's byte-region (the GDN f32 ssm state, the conv slot) go
+into a block's byte-region (the GDN SSM and Conv states) go
 through these adapters: per-request gather/scatter of a token-range,
 reinterpreted in VMEM via Mosaic `ref.bitcast` when the element type
 differs — the only place a cross-dtype view is free on TPU (an XLA-level
 bitcast of a pool slice forces a pool-sized layout copy per step).
 
-Regions are token-ranges `[tok0, tok0 + ntok)` within a block with
-`tok0 % ntok == 0`, so the block spec covers exactly the region and one
-grid step moves only the region's bytes. Scatters alias the pool in place
-(`input_output_aliases`); the unwritten complement is preserved via the
-HBM alias, with no read-modify-write.
+Regions are token-ranges `[tok0, tok0 + ntok)` within a block. Aligned
+ranges (`tok0 % ntok == 0`) are served by a single block spec covering
+exactly the region, so one grid step moves only the region's bytes;
+unaligned ranges decompose into aligned gcd-sized chunks. Scatters alias
+the pool in place (`input_output_aliases`); the unwritten complement is
+preserved via the HBM alias, with no read-modify-write.
 """
 import math
 
@@ -130,15 +131,23 @@ def gather_region(pool,
 
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
-    assert tok0 % ntok == 0 and tok0 + ntok <= block_size
+    assert tok0 + ntok <= block_size
+    # Unaligned regions (tok0 % ntok != 0) move as chunks of
+    # g = gcd(tok0, ntok) tokens, one grid step per (request, chunk) pair of
+    # a single pallas_call — chaining one aliased call per chunk would race
+    # on the shared pool buffer. The output keeps one row-block per chunk so
+    # the block dims stay equal to the array dims (Pallas's escape hatch for
+    # sub-8 rows).
+    g = ntok if tok0 % ntok == 0 else math.gcd(tok0, ntok)
+    chunks = ntok // g
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(out_dtype)
     out_payload = (payload if same_dtype else _bitcast_payload(
         payload, pool.dtype, out_dtype))
-    out_rows = _out_rows(out_payload, ntok)
+    out_rows = _out_rows(out_payload, g)
     if not payload and not same_dtype:
         # 3-D pool: the block ref is 2-D and the bitcast rescales the
         # token/row dim itself (the old validated sublane convention).
-        out_rows = _rescale_rows(ntok, pool.dtype, out_dtype)
+        out_rows = _rescale_rows(g, pool.dtype, out_dtype)
     lane_split = 1
     if out_lanes is not None and out_lanes != lanes:
         assert lanes % out_lanes == 0, (lanes, out_lanes)
@@ -156,16 +165,18 @@ def gather_region(pool,
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na * chunks, ),
             in_specs=[
-                pl.BlockSpec((1, ntok) + payload + (lanes, ), lambda i, s:
-                             (s[i], tok0 // ntok) + pad)
+                pl.BlockSpec((1, g) + payload + (lanes, ), lambda p, s:
+                             (s[p // chunks], (tok0 +
+                                               (p % chunks) * g) // g) + pad)
             ],
-            out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda i, s:
-                                   (i, 0, 0)),
+            out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda p, s:
+                                   (p, 0, 0)),
         ),
-        out_shape=jax.ShapeDtypeStruct((na, out_rows, o_lanes), out_dtype),
-    )(state_indices, pool)
+        out_shape=jax.ShapeDtypeStruct((na * chunks, out_rows, o_lanes),
+                                       out_dtype),
+    )(state_indices, pool).reshape(na, chunks * out_rows, o_lanes)
 
 
 def _gather_window(pool,
@@ -322,13 +333,17 @@ def scatter_region(pool,
 
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
-    assert tok0 % ntok == 0 and tok0 + ntok <= block_size
+    assert tok0 + ntok <= block_size
+    # Unaligned regions move as aligned gcd-sized chunks, one grid step per
+    # (request, chunk) pair; see gather_region.
+    g = ntok if tok0 % ntok == 0 else math.gcd(tok0, ntok)
+    chunks = ntok // g
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)
     val_payload = (payload if same_dtype else _bitcast_payload(
         payload, pool.dtype, vals.dtype))
-    out_rows = _out_rows(val_payload, ntok)
+    out_rows = _out_rows(val_payload, g)
     if not payload and not same_dtype:
-        out_rows = _rescale_rows(ntok, pool.dtype, vals.dtype)
+        out_rows = _rescale_rows(g, pool.dtype, vals.dtype)
     v_lanes = vals.shape[-1]
     lane_split = 1
     if v_lanes != lanes:
@@ -337,12 +352,13 @@ def scatter_region(pool,
         assert lanes % v_lanes == 0, (lanes, v_lanes)
         lane_split = lanes // v_lanes
     v_rows = out_rows * lane_split
-    assert vals.shape == (na, v_rows, v_lanes), (vals.shape, v_rows, v_lanes)
+    assert vals.shape == (na, chunks * v_rows,
+                          v_lanes), (vals.shape, chunks * v_rows, v_lanes)
     pad = (0, ) * (len(payload) + 1)
 
     def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
-        # The output block covers exactly the region and is fully written;
-        # the complement is preserved via the HBM alias.
+        # The output block covers exactly the region chunk and is fully
+        # written; the complement is preserved via the HBM alias.
         typed_ldst.store_typed(pool_out_ref.at[0],
                                val_ref[0],
                                lane_split=lane_split)
@@ -351,18 +367,19 @@ def scatter_region(pool,
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na * chunks, ),
             in_specs=[
-                pl.BlockSpec((1, v_rows, v_lanes), lambda i, s: (i, 0, 0)),
+                pl.BlockSpec((1, v_rows, v_lanes), lambda p, s: (p, 0, 0)),
                 # Aliased with the output; never read, so leave it in HBM.
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=pl.BlockSpec((1, ntok) + payload + (lanes, ),
-                                   lambda i, s: (s[i], tok0 // ntok) + pad),
+            out_specs=pl.BlockSpec((1, g) + payload + (lanes, ), lambda p, s:
+                                   (s[p // chunks],
+                                    (tok0 + (p % chunks) * g) // g) + pad),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
-    )(state_indices, vals, pool)
+    )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
 
 
 def copy_blocks(pool, src_indices, dst_indices):
@@ -446,16 +463,19 @@ def v3_state_source(
         d_k: int,
         d_v: int,
         kernel_size: int,
+        recurrent_state_dtype: jnp.dtype = jnp.float32,
         qk_pair_layout: bool = False) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
     for these regions, without the external round trip.
 
-    The ssm region is the whole kernel blocks at the start of the manager
-    window (one contiguous DMA per slot), viewed f32 with the ``d_v``
-    lane split; the conv region is ``conv_ntok`` token rows inside a
-    single kernel block, viewed bf16 with the tail rows zero-padded.
+    The SSM region is the whole kernel blocks at the start of the manager
+    window (one contiguous DMA per slot), viewed in the configured storage
+    dtype. FP32 uses a ``d_v``-wide typed view; BF16 preserves the raw pool
+    ref's full minormost width. The Conv region is ``conv_ntok`` token rows
+    inside a single kernel block, viewed as BF16 with the tail rows
+    zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
     caller; ``pool`` contributes only its shape and dtype.
 
@@ -468,29 +488,46 @@ def v3_state_source(
     """
     block_size, payload, lanes = _pool_geometry(pool)
     tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+    recurrent_state_dtype = jnp.dtype(recurrent_state_dtype)
 
-    assert lanes % d_v == 0, (lanes, d_v)
     ssm_rows = n_v * d_k
-    # The ssm region may extend past the f32 state bytes when the state does
-    # not divide the pool token row; the kernel truncates loads to
-    # rows_used and zero-fills the padding rows on store.
-    assert ssm_ntok * tok_bytes >= ssm_rows * d_v * 4, (ssm_ntok, tok_bytes,
-                                                        n_v, d_k, d_v)
-    # Each pool token must hold a whole number of typed f32 rows.
-    assert tok_bytes % (d_v * 4) == 0, (tok_bytes, d_v)
+    ssm_elements = ssm_rows * d_v
+    # The SSM region may extend past the typed state bytes when the state does
+    # not divide the pool token row; the kernel truncates loads to rows_used
+    # and zero-fills the padding rows on store.
+    assert ssm_ntok * tok_bytes >= (
+        ssm_elements * recurrent_state_dtype.itemsize), (ssm_ntok, tok_bytes,
+                                                         n_v, d_k, d_v,
+                                                         recurrent_state_dtype)
     if ssm_ntok % block_size == 0:
         ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
     else:
         assert ssm_ntok < block_size, (ssm_ntok, block_size)
         ssm_nblocks, ssm_nrows = 1, ssm_ntok
+    # Mosaic requires a BF16 typed ref to preserve the raw pool ref's minormost
+    # dimension, so load full-width and reshape the resulting array. FP32
+    # supports the d_v-wide ref view, avoiding a post-load lane-crossing
+    # relayout.
+    if recurrent_state_dtype.itemsize == 2:
+        ssm_lane_split = 1
+    else:
+        assert lanes % d_v == 0, (lanes, d_v)
+        ssm_lane_split = lanes // d_v
+    ssm_out_lanes = lanes // ssm_lane_split
+    # load_state_region treats these rows as one contiguous element stream and
+    # reshapes it to (n_v, d_k, d_v); store_state_region reverses that reshape.
+    # FP32 uses d_v-wide rows, while BF16 may pack multiple logical rows into
+    # one full-width carrier row. The logical state must contain a whole number
+    # of carrier rows.
+    assert ssm_elements % ssm_out_lanes == 0, (ssm_elements, ssm_out_lanes)
     ssm = gdn_v3_config.StateRegion(
         kb0=0,
         nblocks=ssm_nblocks,
         row0=0,
         nrows=ssm_nrows,
-        view_dtype=jnp.dtype(jnp.float32),
-        lane_split=lanes // d_v,
-        rows_used=ssm_rows,
+        view_dtype=recurrent_state_dtype,
+        lane_split=ssm_lane_split,
+        rows_used=ssm_elements // ssm_out_lanes,
     )
 
     kb0, row0 = divmod(conv_tok0, block_size)

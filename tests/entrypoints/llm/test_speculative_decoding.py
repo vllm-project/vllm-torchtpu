@@ -138,6 +138,39 @@ QWEN35_MTP_MODEL = "Qwen/Qwen3.5-4B"
 # the 4B, so these tests still exercise the same speculative path.
 QWEN35_MTP_DP_MODEL = "Qwen/Qwen3.5-35B-A3B-FP8"
 
+# Separate draft checkpoint; block size 16, hence num_speculative_tokens=15.
+QWEN35_DFLASH_DP_DRAFT = "z-lab/Qwen3.5-35B-A3B-DFlash"
+
+# Measured 50.03% per engine on v7x at dp=2 x tp=4.
+DFLASH_DP_MIN_ACCEPTANCE_RATE = 0.45
+
+# dp=2 x tp=4: the deployed topology, and the only TP where the draft and
+# target KV geometry match. Same 8 chips as the MTP DP tests.
+DFLASH_DP_SIZE = 2
+DFLASH_DP_TP_SIZE = 4
+
+
+def _qwen35_dflash_dp_kwargs() -> dict:
+    return {
+        **QWEN35_KWARGS,
+        "data_parallel_size": DFLASH_DP_SIZE,
+        "tensor_parallel_size": DFLASH_DP_TP_SIZE,
+        "kv_cache_dtype": "fp8",
+        "enable_expert_parallel": True,
+    }
+
+
+def _qwen35_dflash_speculative_config() -> dict:
+    return {
+        "method": "dflash",
+        "model": QWEN35_DFLASH_DP_DRAFT,
+        "num_speculative_tokens": 15,
+        # A DFlash draft must shard exactly like its target; draft_tp=1 against
+        # a sharded target is rejected at KV-pool materialisation.
+        "draft_tensor_parallel_size": DFLASH_DP_TP_SIZE,
+    }
+
+
 # Engine kwargs every Qwen3.5 run in this file needs, on top of the shared
 # ones the helpers set.
 QWEN35_KWARGS = {
@@ -1436,6 +1469,7 @@ _SERVE_TRANSLATED_KEYS = {
     "limit_mm_per_prompt",
     "disable_log_stats",
     "enable_expert_parallel",
+    "kv_cache_dtype",
 }
 
 
@@ -1454,7 +1488,7 @@ def _serve_args(kwargs: dict) -> list[str]:
 
     args: list[str] = []
     for key in ("max_model_len", "max_num_seqs", "tensor_parallel_size",
-                "data_parallel_size"):
+                "data_parallel_size", "kv_cache_dtype"):
         if kwargs.get(key) is not None:
             args += [f"--{key.replace('_', '-')}", str(kwargs[key])]
 
@@ -1491,12 +1525,15 @@ def _get_local_tpu_chip_count() -> int:
         pytest.skip(f"Unable to detect local TPU chip count: {e}")
 
 
-def _require_chips_for_dp() -> None:
-    tp = _get_tensor_parallel_size()
-    needed = DP_SIZE * tp
+def _require_chips_for_dp(
+    dp_size: int = DP_SIZE,
+    tp_size: int | None = None,
+) -> None:
+    tp = tp_size if tp_size is not None else _get_tensor_parallel_size()
+    needed = dp_size * tp
     available = _get_local_tpu_chip_count()
     if available < needed:
-        pytest.skip(f"DP spec decode needs {needed} chips (dp={DP_SIZE} x "
+        pytest.skip(f"DP spec decode needs {needed} chips (dp={dp_size} x "
                     f"tp={tp}), found {available}")
 
 
@@ -1702,4 +1739,46 @@ def test_qwen35_mtp_dp_performance_greedy(
         model_name=QWEN35_MTP_DP_MODEL,
         async_scheduling=False,
         extra_kwargs=_qwen35_dp_kwargs(),
+    )
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(3600)
+def test_qwen35_dflash_dp_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """DFlash under data parallelism must not change greedy output."""
+    _require_chips_for_dp(DFLASH_DP_SIZE, DFLASH_DP_TP_SIZE)
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        QWEN35_MTP_DP_MODEL,
+        _qwen35_dflash_speculative_config(),
+        async_scheduling=False,
+        extra_kwargs=_qwen35_dflash_dp_kwargs(),
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.timeout(2400)
+def test_qwen35_dflash_dp_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """Every DP engine drafts with DFlash, and drafts are accepted."""
+    _require_chips_for_dp(DFLASH_DP_SIZE, DFLASH_DP_TP_SIZE)
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        _qwen35_dflash_speculative_config(),
+        min_acceptance_rate=DFLASH_DP_MIN_ACCEPTANCE_RATE,
+        model_name=QWEN35_MTP_DP_MODEL,
+        async_scheduling=False,
+        extra_kwargs=_qwen35_dflash_dp_kwargs(),
     )

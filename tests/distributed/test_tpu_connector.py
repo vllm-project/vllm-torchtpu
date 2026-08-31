@@ -31,7 +31,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3RegisteredSend, _select_committed_mamba_blocks,
+    _Stage3LoadMeta, _Stage3RegisteredSend, _select_committed_mamba_blocks,
     stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
@@ -104,6 +104,7 @@ def test_select_committed_mamba_blocks(num_speculative_blocks, expected):
 def _make_vllm_config(*,
                       is_producer: bool = True,
                       block_size: int = 16,
+                      enable_prefix_caching: bool = False,
                       dp_rank: int = 0,
                       dp_size: int = 1,
                       tp_size: int = 1,
@@ -113,6 +114,7 @@ def _make_vllm_config(*,
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.kv_transfer_config.kv_connector_extra_config = {}
     cfg.cache_config.block_size = block_size
+    cfg.cache_config.enable_prefix_caching = enable_prefix_caching
     cfg.model_config.max_model_len = 64
     cfg.model_config.hf_config = SimpleNamespace(
         num_key_value_heads=2,
@@ -148,6 +150,7 @@ def _make_scheduler(*,
 def _make_raiden_scheduler(*,
                            is_producer: bool = False,
                            block_size: int = 16,
+                           enable_prefix_caching: bool = False,
                            dp_rank: int = 0,
                            tp_size: int = 1,
                            pcp_size: int = 1,
@@ -156,6 +159,7 @@ def _make_raiden_scheduler(*,
     """Construct a TPURaidenConnectorScheduler with network calls patched."""
     cfg = _make_vllm_config(is_producer=is_producer,
                             block_size=block_size,
+                            enable_prefix_caching=enable_prefix_caching,
                             dp_rank=dp_rank,
                             tp_size=tp_size,
                             pcp_size=pcp_size)
@@ -680,6 +684,50 @@ class TestTPURaidenConnectorScheduler:
         self.consumer = _make_raiden_scheduler(is_producer=False)
         self.producer = _make_raiden_scheduler(is_producer=True)
 
+    def test_stage3_mamba_truncation_happens_at_admission(self):
+        producer = _make_raiden_scheduler(is_producer=True)
+        producer._stage3_mamba_group_indices = [1]
+        req = MagicMock()
+        req.request_id = "req-mamba-p"
+        req.prompt_token_ids = list(range(33))
+        req._all_token_ids = list(range(33))
+        req.num_prompt_tokens = 33
+        req.kv_transfer_params = {"do_remote_decode": True}
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            producer.on_new_request(req)
+            assert len(req.prompt_token_ids) == 32
+            assert req.num_prompt_tokens == 32
+            assert req.kv_transfer_params["_p_side_truncated"] is True
+
+            # Re-admission after preemption must not truncate again.
+            producer.on_new_request(req)
+            assert len(req.prompt_token_ids) == 32
+
+            # The lookup path runs once the prefix-cache hit is fixed, so
+            # it must leave the length alone.
+            assert producer.get_num_new_matched_tokens(req, 0) == (0, False)
+            assert len(req.prompt_token_ids) == 32
+
+    def test_stage3_truncation_skipped_without_mamba_groups(self):
+        producer = _make_raiden_scheduler(is_producer=True)
+        req = MagicMock()
+        req.request_id = "req-fa-p"
+        req.prompt_token_ids = list(range(33))
+        req._all_token_ids = list(range(33))
+        req.num_prompt_tokens = 33
+        req.kv_transfer_params = {"do_remote_decode": True}
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            producer.on_new_request(req)
+
+        assert len(req.prompt_token_ids) == 33
+        assert "_p_side_truncated" not in req.kv_transfer_params
+
     @patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=True)
     def test_inline_full_hit_recomputes_last_token(self, _inline):
         req = MagicMock()
@@ -933,6 +981,35 @@ class TestTPURaidenConnectorScheduler:
         # Only the block covering the transferred prefix is published.
         assert list(meta.reqs_to_send[req.request_id].local_block_ids) == [100]
 
+    def test_v3_stage3_finish_rejects_exceeding_max_transfer_tokens(self):
+        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer and free blocks."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8)
+        req = MagicMock()
+        req.request_id = "too-long"
+        req.prompt_token_ids = [0] * 10_000
+        req.num_prompt_tokens = 10_000
+        req.num_computed_tokens = 10_000
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        block_ids = [100]
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS",
+                           8192,
+                           create=True):
+            delay, params = producer.request_finished(req, block_ids)
+            meta = producer.build_connector_meta()
+
+        assert not delay
+        assert params == {}
+        assert req.request_id not in meta.reqs_to_send
+
     def test_v3_stage3_finish_still_rejects_too_few_blocks(self):
         """Trimming the tail must not mask a genuinely short block table."""
         producer = _make_raiden_scheduler(is_producer=True,
@@ -1107,6 +1184,149 @@ class TestTPURaidenConnectorScheduler:
 
         load = consumer.reqs_to_load[req.request_id]
         assert load.mamba_state_block_ids == [11]
+
+    def test_stage3_consumer_prefix_hit_pulls_suffix_pages_only(self):
+        req = MagicMock()
+        req.request_id = "suffix-load"
+        req.num_computed_tokens = 0
+        req.prompt_token_ids = [0] * 4096
+        req.kv_transfer_params = {
+            "req_id": "suffix-load-src",
+            "uuid": 993,
+            "num_tokens": 4095,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+        }
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([50, 51, 52, 53], )
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
+                   True,
+                   create=True), \
+             patch(f"{_MOD}._prefix_aware_load_supported",
+                   return_value=True), \
+             patch(f"{_MOD}.dist_utils.get_raiden_inline_load",
+                   return_value=False):
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=1024,
+                                              enable_prefix_caching=True)
+            matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
+            consumer.update_state_after_alloc(req, blocks, matched)
+
+        assert matched == 2047
+        assert is_async
+        load = consumer.reqs_to_load["suffix-load"]
+        assert load.skip_tokens == 2048
+        assert load.local_block_ids == [52, 53]
+        assert load.num_tokens == 4095
+        assert not load.release_only
+
+    @pytest.mark.parametrize(("requested", "supported"),
+                             ((False, True), (True, False)))
+    def test_stage3_consumer_partial_hit_falls_back_to_local_compute(
+            self, requested, supported):
+        req = MagicMock()
+        req.request_id = "local-suffix-fallback"
+        # vLLM assigns the admitted local hit only after the connector update;
+        # zero here makes the unused producer registration release promptly.
+        req.num_computed_tokens = 0
+        req.prompt_token_ids = [0] * 4096
+        req.kv_transfer_params = {
+            "req_id": "local-suffix-fallback-src",
+            "uuid": 994,
+            "num_tokens": 4095,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+        }
+        blocks = MagicMock()
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
+                   requested,
+                   create=True), \
+             patch(f"{_MOD}._prefix_aware_load_supported",
+                   return_value=supported), \
+             patch(f"{_MOD}.dist_utils.get_raiden_inline_load",
+                   return_value=False):
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=1024,
+                                              enable_prefix_caching=True)
+            matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
+            consumer.update_state_after_alloc(req, blocks, matched)
+
+        assert matched == 0
+        assert not is_async
+        blocks.get_block_ids.assert_not_called()
+        release = consumer.reqs_to_load[req.request_id]
+        assert release.release_only
+        assert release.source_req_id == "local-suffix-fallback-src"
+        assert release.local_block_ids == []
+
+    def test_stage3_consumer_full_hit_enqueues_release_only(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        req = MagicMock()
+        req.request_id = "full-hit"
+        req.num_computed_tokens = 0
+        req.prompt_token_ids = [0] * 2048
+        req.kv_transfer_params = {
+            "req_id": "full-hit-src",
+            "uuid": 995,
+            "num_tokens": 2047,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+        }
+        blocks = MagicMock()
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
+            consumer.update_state_after_alloc(req, blocks, matched)
+
+        assert matched == 0
+        assert not is_async
+        load = consumer.reqs_to_load["full-hit"]
+        assert load.release_only
+        assert load.local_block_ids == []
+        assert load.uuid == 995
+        assert load.source_req_id == "full-hit-src"
+
+    def test_stage3_consumer_post_load_resume_does_not_release(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        req = MagicMock()
+        req.request_id = "resumed"
+        # The async-load completion set num_computed_tokens before this
+        # re-admission; a release here would spuriously cancel the claimed
+        # producer registration on every resumed request.
+        req.num_computed_tokens = 2047
+        req.kv_transfer_params = {
+            "req_id": "resumed-src",
+            "uuid": 996,
+            "num_tokens": 2047,
+            "src_controller_address": "prefill-controller.test:27000",
+        }
+        blocks = MagicMock()
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            consumer.update_state_after_alloc(req, blocks, 0)
+
+        assert consumer.reqs_to_load == {}
 
     def test_stage3_consumer_preserves_distinct_source_request_id(self):
         consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
@@ -2138,6 +2358,93 @@ class TestTPURaidenConnectorWorker:
                     facade, req_id="not-retryable", uuid=988)
         facade.start_transfer.assert_called_once()
 
+    def test_stage3_consumer_clip_kwarg_reflects_skip_tokens(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker._raiden_work_unit = MagicMock()
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        common = dict(
+            num_tokens=4095,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+        )
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-suffix"] = _Stage3LoadMeta(
+            uuid=997,
+            source_req_id="src-suffix",
+            local_block_ids=[52, 53],
+            skip_tokens=2048,
+            **common,
+        )
+        meta.reqs_to_load["dst-full"] = _Stage3LoadMeta(
+            uuid=998,
+            source_req_id="src-full",
+            local_block_ids=[50, 51, 52, 53],
+            **common,
+        )
+
+        with patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "10.0.0.2:28000")), \
+             patch.object(worker,
+                          "_stage3_source_work_units",
+                          return_value=[MagicMock()]), \
+             patch.object(worker,
+                          "_raiden_hbm_memory_type",
+                          MagicMock(return_value=3)), \
+             patch.object(worker, "_stage3_fa_token_bytes", return_value=64):
+            worker._submit_stage3_loads(meta, MagicMock())
+
+        assert facade.start_transfer.call_count == 2
+        clipped = facade.start_transfer.call_args_list[0].kwargs
+        assert clipped["dst_skip_bytes"] == [2048 * 64]
+        assert clipped["dst_device_block_ids"] == [52, 53]
+        assert clipped["dst_block_counts"] == [2]
+        assert clipped["transfer_pool_tags"] == ["fa"]
+        assert clipped["num_tokens"] == 4095
+        assert worker._stage3_submitted_loads["dst-suffix"] == 997
+        assert worker._load_block_ids["dst-suffix"] == [52, 53]
+        # Skip-free submissions must stay byte-identical on the wire: the
+        # kwarg is omitted entirely rather than passed as zeros.
+        unclipped = facade.start_transfer.call_args_list[1].kwargs
+        assert "dst_skip_bytes" not in unclipped
+        assert unclipped["dst_device_block_ids"] == [50, 51, 52, 53]
+
+    def test_stage3_release_only_meta_cancels_producer_registration(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker._raiden_work_unit = MagicMock()
+        facade = MagicMock()
+        facade.cancel_request_blocks_if_unclaimed.return_value = True
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-hit"] = _Stage3LoadMeta(
+            uuid=999,
+            source_req_id="src-hit",
+            local_block_ids=[],
+            num_tokens=2047,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+            release_only=True,
+        )
+
+        with patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "10.0.0.2:28000")):
+            worker._submit_stage3_loads(meta, MagicMock())
+
+        facade.cancel_request_blocks_if_unclaimed.assert_called_once_with(
+            req_id="src-hit", uuid=999)
+        facade.start_transfer.assert_not_called()
+        assert worker._stage3_submitted_loads == {}
+        assert "dst-hit" not in worker._load_block_ids
+
     def test_v3_stage3_sender_failure_is_terminal_and_releases_d5(self):
         worker = _make_raiden_worker(tp_rank=0,
                                      tp_size=1,
@@ -2759,6 +3066,23 @@ class TestTPURaidenConnectorWorker:
         with patch(f"{_MOD}.dist_utils.get_raiden_transfer_num_slots",
                    return_value=3):
             assert self.worker._num_raiden_slots(max_blocks=4) == 3
+
+    def test_num_slots_autosizes_sparse_mla_tuples(self):
+        runner = MagicMock()
+        nope = torch.empty((4, 8, 4, 128), dtype=torch.uint8)
+        rope = torch.empty((4, 2, 4, 128), dtype=torch.uint8)
+        idx = torch.empty((4, 2, 4, 256), dtype=torch.uint8)
+        runner.kv_caches = [(nope, rope), idx]
+        self.worker.runner = runner
+        with patch(f"{_MOD}.dist_utils.get_raiden_transfer_num_slots",
+                   return_value=0), \
+             patch(f"{_MOD}.dist_utils.get_kv_shm_pool_gb",
+                   return_value=1.0):
+            # Per-block bytes: nope 8*4*128=4096, rope 2*4*128=1024,
+            # idx 2*4*256=2048 -> 7168; x 4 blocks = 28672 per slot;
+            # budget 1 GiB / tp_size 4.
+            assert self.worker._num_raiden_slots(
+                max_blocks=4) == ((1024**3 // 4) // 28672)
 
     def test_dp_port_configurations(self):
         worker = _make_raiden_worker(dp_rank=0, tp_size=1)
@@ -3397,6 +3721,22 @@ class TestTPUConnectorStats(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # GLM-5.2 admission topology: prefill tp{N}/dp1 -> decode tp1/dp{M} only.
 # ---------------------------------------------------------------------------
+
+
+def test_glm_tag_geometry_measures_manifest_in_fixed_tag_order():
+    from vllm_torchtpu.distributed.kv_transfer.raiden import \
+        pool_manifest as rpm
+
+    from .raiden_test_utils import glm_named_kv_caches
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=glm_named_kv_caches(),
+        raw_tensors=(),
+        block_size_tokens=1024)
+    geometry = TPURaidenConnectorWorker._measure_glm_tag_geometry(manifest)
+    assert list(geometry) == ["mla.nope", "mla.rope", "dsa.idx"]
+    assert geometry["mla.nope"] == (1024 * 512, 512)
+    assert geometry["mla.rope"] == (256 * 512, 512)
+    assert geometry["dsa.idx"] == (256 * 1024, 1024)
 
 
 @pytest.mark.parametrize(("is_producer", "tp_size", "dp_size", "expected"), [

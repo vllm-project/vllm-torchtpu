@@ -17,7 +17,7 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import TAG_FA, PoolManifest
+from .pool_manifest import TAG_FA, TAG_MLA_NOPE, PoolManifest
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
@@ -201,7 +201,8 @@ def measured_glm_layout_fingerprint(
         # the dtype is authoritative.
         element_bits = 8 * int(tensor.element_size())
         _, rows, packing, width = shape
-        if rows * packing != page_tokens:
+        page_rows_tokens = rows if pool.tag == TAG_MLA_NOPE else rows * packing
+        if page_rows_tokens != page_tokens:
             raise RuntimeError(
                 f"{pool.tag} page geometry {rows}x{packing} does not match "
                 f"page_tokens {page_tokens}")

@@ -56,8 +56,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import \
     Mxfp4MoeBackend as Mxfp4Backend
-from vllm.model_executor.layers.linear import (LinearBase,
-                                               UnquantizedLinearMethod)
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import \
@@ -125,12 +124,16 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
                     ignored_layers=self.ignored_layers,
                     fused_mapping=self.packed_modules_mapping,
             ):
-                return UnquantizedLinearMethod()
+                from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+                    VllmUnquantizedLinearMethod
+                return VllmUnquantizedLinearMethod()
             # MXFP4 linear layer is not implemented - use unquantized
             logger.warning_once(
                 "MXFP4 linear layer is not implemented on TPU - "
                 "using unquantized linear method.")
-            return UnquantizedLinearMethod()
+            from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+                VllmUnquantizedLinearMethod
+            return VllmUnquantizedLinearMethod()
 
         elif isinstance(layer, RoutedExperts):
             # RoutedExperts is the main use case for MXFP4 (MoE models like GPT-OSS)

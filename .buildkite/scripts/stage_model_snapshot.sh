@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODEL_GCS_PATH="${1:?model GCS path is required}"
-CACHE_HUB_ROOT="${2:-/mnt/disks/persist/models}"
+CACHE_HUB_ROOT="${2:-/mnt/disks/persist/models/hub}"
 MODEL_DIR="${MODEL_GCS_PATH%/}"
 MODEL_DIR="${MODEL_DIR##*/}"
 

@@ -14,6 +14,7 @@
 """Shared pytest configuration for all tests."""
 
 import os
+import sys
 
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
@@ -62,3 +63,36 @@ def device(request):
         except Exception as e:
             pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
+
+
+def pytest_collection_finish(session):
+    """Fail fast if collecting the suite claimed the accelerator.
+
+    libtpu is process-exclusive. A PJRT client built in the pytest PARENT locks
+    out every child, and vLLM's engine and workers run in spawned children (see
+    VLLM_WORKER_MULTIPROC_METHOD above), so every engine-starting test in the
+    run then dies with "pjrt client not initialized" -- far from the module
+    that actually claimed the device.
+
+    Collection is import-time, so anything evaluated at module scope counts:
+    the usual culprit is a `pytest.mark.skipif(jax.device_count() < N)`, which
+    builds a client to answer and does so even when the marker goes on to
+    deselect every test in the file. Put that check in a fixture instead; a
+    fixture runs at setup, after deselection.
+
+    Checked here rather than left to CI because the failure is invisible to any
+    run that does not collect the offending file and an engine test together.
+    """
+    if "jax" not in sys.modules:
+        return
+    from jax._src import xla_bridge
+    if not xla_bridge.backends_are_initialized():
+        return
+    raise pytest.UsageError(
+        "A JAX backend was initialized during test collection, which claims "
+        "the TPU for this process and makes every spawned engine/worker child "
+        "fail with 'pjrt client not initialized'. Some test module touches the "
+        "accelerator at import time -- most often a module-level "
+        "`jax.device_count()` in a `skipif`. Move it into a fixture. To find "
+        "the module: bisect with `pytest --collect-only <subset>` and check "
+        "`jax._src.xla_bridge.backends_are_initialized()` after each.")

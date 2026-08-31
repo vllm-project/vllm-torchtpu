@@ -45,22 +45,26 @@ def ref_wkv_proj_and_save_state(
     # 2. Geometry setup
     num_pages, page_size, d1, d2 = cache.shape
     slot_bytes = d1 * d2
-    slots_per_token = page_size // state_block_size
+    slots_per_token = state_dim * 4 // slot_bytes
     f32_per_slot = state_dim // slots_per_token
     bytes_per_slot = f32_per_slot * 4
     assert bytes_per_slot == slot_bytes
+    tokens_per_page = page_size // slots_per_token
+    assert state_block_size <= tokens_per_page, (
+        f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
+        f"token states a {page_size}-row page holds")
 
     # 3. Unpack inline
-    cache_reshaped = cache.reshape(num_pages, state_block_size,
-                                   slots_per_token, d1, d2)
+    cache_reshaped = cache.reshape(num_pages, tokens_per_page, slots_per_token,
+                                   d1, d2)
     cache_t = cache_reshaped.transpose(0, 1, 2, 4, 3)
-    cache_bitcast_shape = cache_t.reshape(num_pages, state_block_size,
+    cache_bitcast_shape = cache_t.reshape(num_pages, tokens_per_page,
                                           slots_per_token, (d2 * d1) // 4, 4)
     f32_flat = jax.lax.bitcast_convert_type(cache_bitcast_shape, jnp.float32)
-    flat = f32_flat.reshape(num_pages * state_block_size, state_dim)
+    flat = f32_flat.reshape(num_pages * tokens_per_page, state_dim)
 
     # 4. Scatter
-    num_tokens_flat = num_pages * state_block_size
+    num_tokens_flat = num_pages * tokens_per_page
     valid = slot_mapping >= 0
     slots = jnp.where(valid, slot_mapping // slots_per_token, num_tokens_flat)
     flat_padded = jnp.concatenate([flat, jnp.zeros((1, state_dim))], axis=0)
@@ -68,14 +72,14 @@ def ref_wkv_proj_and_save_state(
     flat = flat_padded[:-1]
 
     # 5. Pack inline back
-    chunk = flat.reshape(num_pages, state_block_size, slots_per_token,
+    chunk = flat.reshape(num_pages, tokens_per_page, slots_per_token,
                          f32_per_slot, 1)
     chunk_bytes = jax.lax.bitcast_convert_type(chunk, jnp.uint8)
-    chunk_bytes_reshaped = chunk_bytes.reshape(num_pages, state_block_size,
+    chunk_bytes_reshaped = chunk_bytes.reshape(num_pages, tokens_per_page,
                                                slots_per_token, d2, d1)
     chunk_bytes_t = chunk_bytes_reshaped.transpose(0, 1, 2, 4, 3)
-    cache_view = cache.reshape(num_pages, state_block_size, slots_per_token,
-                               d1, d2)
+    cache_view = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1,
+                               d2)
     cache_view = cache_view.at[:].set(chunk_bytes_t)
     new_cache = cache_view.reshape(num_pages, page_size, d1, d2)
 

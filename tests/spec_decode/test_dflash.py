@@ -30,7 +30,8 @@ def _make_proposer(draft_tp: int | None = 1,
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
-            "mask_token_id": 0
+            "mask_token_id": 0,
+            "target_layer_ids": [1, 2],
         }
     }
 
@@ -40,6 +41,7 @@ def _make_proposer(draft_tp: int | None = 1,
         draft_model_config=SimpleNamespace(hf_config=hf_config_mock))
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
+        model_config=SimpleNamespace(max_model_len=2048),
         compilation_config=SimpleNamespace(
             static_forward_context={
                 "model.layers.0.self_attn": mock.MagicMock(),
@@ -282,6 +284,7 @@ def test_prepare_dflash_inputs(device):
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
+        max_num_reqs=8,
         _dp_lockstep_enabled=lambda: False,
     )
     chunk = _make_chunk(num_reqs=2,
@@ -450,7 +453,7 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
 
 
 def test_dp_lockstep_run_dummy_draft():
-    proposer = _make_proposer(draft_tp=1)
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.draft_model = mock.MagicMock()
     proposer.runner = SimpleNamespace(
         _dp_lockstep_enabled=lambda: True,
@@ -468,7 +471,7 @@ def test_dp_lockstep_run_dummy_draft():
 
 
 def test_prepare_dflash_inputs_dp_lockstep(device):
-    proposer = _make_proposer(draft_tp=1)
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
     K = 3
     proposer.speculative_config.num_speculative_tokens = K
     proposer.runner = SimpleNamespace(
@@ -476,6 +479,7 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
         num_tokens_paddings=[8, 16, 32],
         _dp_lockstep_enabled=lambda: True,
         _dp_step_max_reqs=4,
+        max_num_reqs=8,
     )
     chunk = _make_chunk(num_reqs=1,
                         start_index=0,

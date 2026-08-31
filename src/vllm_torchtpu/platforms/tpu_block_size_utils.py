@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
-    POOLED_GDN_CONV_STATE_ITEMSIZE, POOLED_GDN_SSM_STATE_ITEMSIZE,
     PooledGDNStateLayout, derive_pooled_gdn_state_layout,
+    pooled_gdn_state_dtypes, pooled_gdn_state_itemsize,
     unified_kv_layout_enabled_for_architecture)
 from vllm_torchtpu.logger import init_logger
 
@@ -139,12 +139,11 @@ def _hybrid_mamba_state_layout(
             "TPU unified hybrid KV pool requires two GDN state regions "
             f"(conv, SSM), got shapes={shapes}")
 
-    # Byte widths come from the pool's own constants, never from the model
-    # class's declared dtypes. The pool stores conv rows and the SSM region at
-    # fixed widths whatever --mamba-cache-dtype says, and every other reader of
-    # pool bytes (the kernel state plan, the Raiden manifest) is already
-    # sourced from there. Sizing the slot from the class view is exactly what
-    # let this slot be budgeted for bf16 while the layer declared fp32.
+    # Byte widths come from the pool's own layout helper. Conv remains fixed
+    # BF16, while SSM follows the model class's configured dtype. Every other
+    # reader of pool bytes (the kernel state plan and the Raiden manifest) is
+    # sourced from the same helper, so slot sizing cannot use a different
+    # dtype source without contradicting the physical layout.
     #
     # Shapes still come from the model class, which is a different kind of
     # fact: kernel taps and head counts are architecture, not layout. They do
@@ -154,16 +153,22 @@ def _hybrid_mamba_state_layout(
     # `VllmGatedDeltaNetAttention.get_state_shape()` still declares the widened
     # conv to vLLM, and the padded page has to cover what vLLM accounts for.
     # Narrowing here means narrowing there in the same change.
-    conv_bytes = math.prod(shapes[0]) * POOLED_GDN_CONV_STATE_ITEMSIZE
-    ssm_bytes = math.prod(shapes[1]) * POOLED_GDN_SSM_STATE_ITEMSIZE
+    dtypes = tuple(model_cls.get_mamba_state_dtype_from_config(vllm_config))
+    if len(dtypes) != 2:
+        raise ValueError(
+            "TPU unified hybrid KV pool requires two GDN state dtypes "
+            f"(conv, SSM), got dtypes={dtypes}")
+    conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
+    ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
+    conv_bytes = math.prod(shapes[0]) * conv_itemsize
+    ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
 
     if pcp_size > 1:
-        # Same constants on both sides of the ratio, so the check compares
+        # Same item sizes on both sides of the ratio, so the check compares
         # sharding rather than dtype bookkeeping.
-        full_conv_bytes = (math.prod(full_shapes[0]) *
-                           POOLED_GDN_CONV_STATE_ITEMSIZE)
-        full_ssm_bytes = (math.prod(full_shapes[1]) *
-                          POOLED_GDN_SSM_STATE_ITEMSIZE)
+        full_conv_bytes = math.prod(full_shapes[0]) * conv_itemsize
+        full_ssm_bytes = math.prod(full_shapes[1]) * ssm_itemsize
         if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes +
                                                    full_ssm_bytes):
             raise ValueError(
