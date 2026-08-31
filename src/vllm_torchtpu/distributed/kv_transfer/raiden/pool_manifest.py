@@ -581,6 +581,27 @@ def _binding_for(typed_tensors: Sequence[tuple[str, Any]],
         f"({aliased[:3]}…) while others are private ({private[:3]}…)")
 
 
+class FaLayoutHook:
+    """How the FA cache tensor's shape maps to tokens and live regions.
+
+    The default (token-major ``[pages, page_tokens, groups, packing,
+    head_dim]``) is implemented inline by ``build_qwen35_pool_manifest``;
+    other resident layouts (``raiden/seq_on_lane.py``) pass an object with
+    these two methods. Kept deliberately tiny: the manifest builder stays
+    layout-neutral everywhere else.
+    """
+
+    name = "head-along-sublane"
+
+    def total_tokens(self, shape: Sequence[int]) -> int:
+        raise NotImplementedError
+
+    def regions(self, *, block_size_tokens: int, shape: Sequence[int],
+                nbytes: int, num_kv_heads: int, head_size: int,
+                itemsize: int) -> tuple[RegionSpec, ...]:
+        raise NotImplementedError
+
+
 def build_qwen35_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
@@ -589,6 +610,7 @@ def build_qwen35_pool_manifest(
     gdn_geometry: GdnHeadGeometry,
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
     per_layer_tags: bool = False,
+    fa_layout: FaLayoutHook | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -659,7 +681,10 @@ def build_qwen35_pool_manifest(
                 raise ManifestError(
                     f"full-attention cache {layer_name} needs a paged shape: "
                     f"got {shape}")
-            total_tokens = shape[0] * shape[1]
+            if fa_layout is not None:
+                total_tokens = int(fa_layout.total_tokens(shape))
+            else:
+                total_tokens = shape[0] * shape[1]
             if total_tokens % block_size != 0:
                 raise ManifestError(
                     f"full-attention cache {layer_name} token capacity "
@@ -672,11 +697,20 @@ def build_qwen35_pool_manifest(
                     f"not divisible by token capacity {total_tokens}")
             token_stride = nbytes // total_tokens
             live_stride = nbytes // num_blocks
-            regions = _fa_regions(block_size_tokens=block_size,
-                                  token_stride_bytes=token_stride,
-                                  num_kv_heads=num_kv_heads,
-                                  head_size=head_size,
-                                  itemsize=itemsize)
+            if fa_layout is not None:
+                regions = tuple(
+                    fa_layout.regions(block_size_tokens=block_size,
+                                      shape=shape,
+                                      nbytes=nbytes,
+                                      num_kv_heads=num_kv_heads,
+                                      head_size=head_size,
+                                      itemsize=itemsize))
+            else:
+                regions = _fa_regions(block_size_tokens=block_size,
+                                      token_stride_bytes=token_stride,
+                                      num_kv_heads=num_kv_heads,
+                                      head_size=head_size,
+                                      itemsize=itemsize)
         else:
             if not shape:
                 raise ManifestError(f"GDN state {layer_name} has no shape")

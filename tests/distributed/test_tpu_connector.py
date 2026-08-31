@@ -3581,15 +3581,89 @@ class TestTPURaidenConnectorWorker:
         assert worker._raiden_transfer_engine is engine
         assert worker.raiden_admission_summary() == {"admitted": False}
 
-    def test_v1_admission_rejects_the_v2_tp2dp4_decode_topology(self):
-        worker = _make_raiden_worker(tp_rank=0,
+    def test_v1_admission_accepts_tp2_decode_topology(self):
+        # Decision D1/D2 (RESHARD_DP4TP2_SEQ_ON_LANE_PLAN.md): a head-sharded
+        # decode engine is admitted; each TP worker is its own destination
+        # unit (transfer_rank = tp_rank).
+        for tp_rank in (0, 1):
+            worker = _make_raiden_worker(tp_rank=tp_rank,
+                                         tp_size=2,
+                                         is_producer=False,
+                                         dp_size=4,
+                                         pcp_size=1)
+            assert worker._raiden_qwen35_admission_topology() == (
+                "dp4tp2_decode")
+            assert worker._local_raiden_transfer_rank() == tp_rank
+
+    def test_tp2_decode_sibling_units_are_distinct_and_enumerable(self):
+        # Live pair r1 (2026-08-22) failed with "dst_units must not contain
+        # duplicates": both TP workers of a decode engine registered the same
+        # RaidenId.
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                   "decode-engine",
+                   create=True), patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
+                                       "",
+                                       create=True):
+            units = []
+            for tp_rank in (0, 1):
+                worker = _make_raiden_worker(tp_rank=tp_rank,
+                                             tp_size=2,
+                                             is_producer=False,
+                                             dp_size=4,
+                                             pcp_size=1)
+                fields = worker._raiden_work_unit_fields(
+                    worker._local_raiden_transfer_rank())
+                assert fields["job_replica_id"] == (
+                    f"decode-engine-rank{tp_rank}")
+                assert fields["data_replica_idx"] == worker.dp_rank
+                units.append(tuple(sorted(fields.items())))
+                siblings = worker._raiden_destination_work_units()
+                assert [unit.job_replica_id for unit in siblings
+                        ] == ["decode-engine-rank0", "decode-engine-rank1"]
+            assert len(set(units)) == 2
+
+            # DP8/TP1 keeps the golden identity (no rank suffix).
+            worker = _make_raiden_worker(tp_rank=0,
+                                         tp_size=1,
+                                         is_producer=False,
+                                         dp_size=8,
+                                         pcp_size=1)
+            fields = worker._raiden_work_unit_fields(0)
+            assert fields["job_replica_id"] == "decode-engine"
+
+    @pytest.mark.parametrize("tp_rank", [0, 1])
+    def test_tp2_load_leader_submits_once_and_broadcasts(self, tp_rank):
+        worker = _make_raiden_worker(tp_rank=tp_rank,
                                      tp_size=2,
                                      is_producer=False,
-                                     dp_size=4,
+                                     dp_size=4)
+        worker._raiden_work_unit = MagicMock()
+        meta = self._make_stage3_load_meta("dst-tp2", "src-tp2", 901, [7, 8])
+        group = MagicMock()
+        outcome = ("accepted", 1.0, "", 0, 0)
+        group.broadcast_object.return_value = outcome
+        with patch.object(worker, "_require_stage3_controller",
+                          return_value=(MagicMock(), "decode:28000")), \
+             patch.object(worker, "_stage3_tp_group", return_value=group), \
+             patch.object(worker, "_submit_stage3_load_as_leader",
+                          return_value=outcome) as submit:
+            worker._submit_stage3_loads(meta, MagicMock())
+        assert submit.call_count == (1 if tp_rank == 0 else 0)
+        if tp_rank == 0:
+            assert len(submit.call_args.kwargs["dst_units"]) == 2
+        group.broadcast_object.assert_called_once_with(
+            outcome if tp_rank == 0 else None, src=0)
+        assert "dst-tp2" in worker._stage3_controller_accepted
+
+    def test_v1_admission_rejects_tp4_decode_topology(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=4,
+                                     is_producer=False,
+                                     dp_size=2,
                                      pcp_size=1)
 
         with unittest.TestCase().assertRaisesRegex(ValueError,
-                                                   "dp8_decode.*requires"):
+                                                   "dp{N}tp2_decode requires"):
             worker._raiden_qwen35_admission_topology()
 
     @pytest.mark.parametrize("dp_size", [4, 8])
