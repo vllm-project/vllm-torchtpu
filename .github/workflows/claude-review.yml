@@ -9,7 +9,7 @@ on:
 jobs:
   review:
     if: github.repository == 'vllm-project/vllm-torchtpu'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
       pull-requests: read
