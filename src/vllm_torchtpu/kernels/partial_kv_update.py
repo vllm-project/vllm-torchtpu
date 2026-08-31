@@ -33,13 +33,14 @@ Rank decides how the kernel is written, never whether the fix is needed:
 Layout caveat, which correctness testing cannot see. Pallas needs the pool in
 the standard descending layout; when the trailing dims are awkward XLA picks a
 permuted one for the array and inserts a pool-sized conversion, leaving the
-result correct but no longer O(update). Empirically, across 14 measured
-shapes, the cost stays O(update) when the minormost dim is a multiple of 128
-and the second-minor is a power of two. That describes when XLA happens to
-choose the standard layout rather than a documented contract, so for an
-unfamiliar shape check the buffer assignment: the parameter's layout and the
-kernel's should match, and a ``copy`` at pool size means they did not.
+result correct but no longer O(update). The Kimi MLA ``(N, 16, 1, 640)`` pool
+is one known case and is dispatched to the pinned-upstream Torch fill by the
+connector. For an unfamiliar shape, check the buffer assignment: the
+parameter's layout and the kernel's should match, and a ``copy`` at pool size
+means they did not.
 """
+
+import math
 
 import jax
 import jax.numpy as jnp
@@ -47,6 +48,9 @@ import torch
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas as torch_pallas
+
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.kernels import typed_ldst
 
 
 def _blockspec_kernel(_sidx_ref, vals_ref, _pool_in_ref, pool_out_ref):
@@ -179,6 +183,378 @@ def pallas_scatter_slots(pool: jax.Array, indices: jax.Array,
     raise ValueError(f"unsupported pool ndim: {pool.ndim}")
 
 
+def _fill_slots_kernel(sidx_ref, fill_ref, _pool_in_ref, pool_out_ref):
+    """Write one constant-valued slot per grid step.
+
+    The pool input exists solely to donate its HBM buffer to the output.  In
+    particular, do not build a slot-shaped value tensor outside this kernel:
+    doing so is both unnecessary and prohibitively large for long-context KV
+    cache fills.
+    """
+    del sidx_ref, _pool_in_ref
+    # Ref stores require an exact-shape value (they do not scalar-broadcast).
+    # This broadcast is local to the selected one-slot VMEM tile, never the
+    # full HBM pool.
+    values = jnp.broadcast_to(fill_ref[0], pool_out_ref.shape)
+    pool_out_ref[...] = values.astype(pool_out_ref.dtype)
+
+
+def pallas_fill_slots(pool: jax.Array, indices: jax.Array,
+                      fill_value: jax.Array) -> jax.Array:
+    """Set ``pool[indices]`` to one scalar value in place.
+
+    This is the constant-fill counterpart of :func:`pallas_scatter_slots`.
+    Its work and temporary storage scale with the number of selected slots,
+    not with pool capacity.  Rank-2 pools are deliberately excluded: all TPU
+    attention and recurrent-state cache layouts supported by the decode bench
+    connector have a leading slot dimension plus at least two tiled trailing
+    dimensions.
+    """
+    if pool.ndim < 3:
+        raise ValueError(
+            f"constant slot fill requires pool ndim >= 3, got {pool.ndim}")
+    if indices.ndim != 1 or indices.shape[0] == 0:
+        raise ValueError("indices must be a non-empty rank-1 array")
+    if fill_value.shape != (1, ):
+        raise ValueError(
+            f"fill_value must have shape (1,), got {fill_value.shape}")
+    if not jnp.issubdtype(fill_value.dtype, jnp.floating):
+        raise ValueError(
+            f"fill_value must have floating dtype, got {fill_value.dtype}")
+
+    indices = indices.astype(jnp.int32)
+    num_updates = indices.shape[0]
+    padding = (0, ) * (pool.ndim - 1)
+    block_shape = (1, ) + pool.shape[1:]
+    return pl.pallas_call(
+        _fill_slots_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(num_updates, ),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(
+                block_shape,
+                lambda i, slots, _fill: (slots[i], ) + padding,
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={2: 0},
+    )(indices, fill_value, pool)
+
+
+def _normal_fill_slots_kernel(sidx_ref, mean_std_ref, seed_ref, _pool_in_ref,
+                              pool_out_ref):
+    """Write one normally-distributed slot per grid step.
+
+    Random values are generated in the selected one-slot VMEM tile.  As with
+    the constant kernel, no slot-shaped update tensor exists in HBM.
+    """
+    del _pool_in_ref
+    step = pl.program_id(0)
+    # Include the physical slot in the seed so output is stable under index
+    # reordering and duplicate indices remain idempotent.
+    pltpu.prng_seed(seed_ref[0], sidx_ref[step])
+    mean = mean_std_ref[0].astype(jnp.float32)
+    std = mean_std_ref[1].astype(jnp.float32)
+    # Mosaic TPU only exposes 32-bit PRNG words. Asking JAX for a bf16 normal
+    # distribution selects its 8-bit path and fails lowering, so sample in
+    # fp32 and cast only the one-slot VMEM result at the store boundary.
+    samples = pltpu.stateful_normal(pool_out_ref.shape, dtype=jnp.float32)
+    pool_out_ref[...] = (samples * std + mean).astype(pool_out_ref.dtype)
+
+
+def pallas_normal_fill_slots(pool: jax.Array, indices: jax.Array,
+                             mean_std: jax.Array,
+                             seed: jax.Array) -> jax.Array:
+    """Set ``pool[indices]`` to samples from ``Normal(mean, std)`` in place.
+
+    ``mean_std`` contains ``[mean, std]`` as float32 values and ``seed`` is a
+    one-element integer array. Work and temporary storage scale with selected
+    slots, while the pool remains donated to the output.
+    """
+    if pool.ndim < 3:
+        raise ValueError(
+            f"normal slot fill requires pool ndim >= 3, got {pool.ndim}")
+    if indices.ndim != 1 or indices.shape[0] == 0:
+        raise ValueError("indices must be a non-empty rank-1 array")
+    if mean_std.shape != (2, ):
+        raise ValueError(
+            f"mean_std must have shape (2,), got {mean_std.shape}")
+    if not jnp.issubdtype(mean_std.dtype, jnp.floating):
+        raise ValueError(
+            f"mean_std must have floating dtype, got {mean_std.dtype}")
+    if seed.shape != (1, ):
+        raise ValueError(f"seed must have shape (1,), got {seed.shape}")
+    if not jnp.issubdtype(seed.dtype, jnp.integer):
+        raise ValueError(f"seed must have integer dtype, got {seed.dtype}")
+
+    indices = indices.astype(jnp.int32)
+    seed = seed.astype(jnp.int32)
+    num_updates = indices.shape[0]
+    padding = (0, ) * (pool.ndim - 1)
+    block_shape = (1, ) + pool.shape[1:]
+    return pl.pallas_call(
+        _normal_fill_slots_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(num_updates, ),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(
+                block_shape,
+                lambda i, slots, _mean_std, _seed: (slots[i], ) + padding,
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={3: 0},
+    )(indices, mean_std, seed, pool)
+
+
+# A unified hybrid page can be selected by its attention group, its GDN state
+# group, or both. The worker ORs these bits for each manager block so one Pallas
+# program owns every write to that donated page.
+_HYBRID_FILL_ATTENTION = 1
+_HYBRID_FILL_STATE = 2
+
+
+def _typed_values(shape: tuple[int, ...], dtype, params_ref, *, normal: bool):
+    mean = params_ref[0].astype(jnp.float32)
+    if normal:
+        std = params_ref[1].astype(jnp.float32)
+        values = pltpu.stateful_normal(shape, dtype=jnp.float32) * std + mean
+    else:
+        values = jnp.full(shape, mean, dtype=jnp.float32)
+    return values.astype(dtype)
+
+
+def _store_typed_live_rows(block_ref, num_rows: int, dtype, params_ref, *,
+                           normal: bool) -> None:
+    typed_ref = typed_ldst.view_typed(block_ref, dtype)
+    if num_rows <= 0 or num_rows > typed_ref.shape[0]:
+        raise ValueError(
+            f"invalid typed live-row count {num_rows} for {typed_ref.shape}")
+    values = _typed_values(typed_ref.shape, dtype, params_ref, normal=normal)
+    rows = jax.lax.broadcasted_iota(jnp.int32, typed_ref.shape, 0)
+    typed_ref[...] = jnp.where(rows < num_rows, values, typed_ref[...])
+
+
+def _hybrid_state_segments(pool: jax.Array, *, split: int, ssm_bytes: int,
+                           conv_bytes: int):
+    """Static per-kernel-block live segments for the pooled GDN ABI."""
+    if ssm_bytes == 0 and conv_bytes == 0:
+        return (), ()
+    if min(ssm_bytes, conv_bytes) <= 0:
+        raise ValueError("ssm_bytes and conv_bytes must both be positive")
+
+    token_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
+    manager_tokens = split * pool.shape[1]
+    layout = derive_pooled_gdn_state_layout(ssm_bytes=ssm_bytes,
+                                            conv_bytes=conv_bytes,
+                                            token_bytes=token_bytes)
+    if layout.required_tokens > manager_tokens:
+        raise ValueError(
+            "pooled GDN state exceeds a unified manager page: "
+            f"required={layout.required_tokens}, available={manager_tokens}")
+
+    kernel_block_bytes = pool.shape[1] * token_bytes
+    lanes = pool.shape[-1]
+
+    def segments(start_bytes: int, live_bytes: int, itemsize: int):
+        result = []
+        end_bytes = start_bytes + live_bytes
+        for block in range(split):
+            block_start = block * kernel_block_bytes
+            block_end = block_start + kernel_block_bytes
+            live_start = max(start_bytes, block_start)
+            live_end = min(end_bytes, block_end)
+            if live_start >= live_end:
+                continue
+            local_start = live_start - block_start
+            segment_bytes = live_end - live_start
+            if local_start % token_bytes:
+                raise ValueError(
+                    "pooled state segment must start on a token row")
+            row_bytes = itemsize * lanes
+            if segment_bytes % row_bytes:
+                raise ValueError(
+                    "pooled state live bytes must contain complete typed rows: "
+                    f"bytes={segment_bytes}, row_bytes={row_bytes}")
+            token_row = local_start // token_bytes
+            token_rows = (segment_bytes + token_bytes - 1) // token_bytes
+            result.append(
+                (block, token_row, token_rows, segment_bytes // row_bytes))
+        return tuple(result)
+
+    ssm_segments = segments(0, ssm_bytes, jnp.dtype(jnp.float32).itemsize)
+    conv_start = layout.ssm_tokens * token_bytes
+    conv_segments = segments(conv_start, conv_bytes,
+                             jnp.dtype(jnp.bfloat16).itemsize)
+    return ssm_segments, conv_segments
+
+
+def _make_hybrid_fill_kernel(*, normal: bool, ssm_segments, conv_segments):
+
+    def _kernel(indices_ref, kinds_ref, params_ref, *refs):
+        if normal:
+            seed_ref, pool_in_ref, pool_out_ref = refs
+        else:
+            pool_in_ref, pool_out_ref = refs
+            seed_ref = None
+        step = pl.program_id(0)
+        block_id = indices_ref[step]
+        fill_kind = kinds_ref[step]
+        fill_attention = (fill_kind & _HYBRID_FILL_ATTENTION) != 0
+        fill_state = (fill_kind & _HYBRID_FILL_STATE) != 0
+        if normal:
+            assert seed_ref is not None
+            pltpu.prng_seed(seed_ref[0], block_id)
+
+        # Satisfy the full-write rule first. State-only pages copy through;
+        # attention pages receive a scalar/normal value in the pool dtype.
+        for block in range(pool_out_ref.shape[0]):
+            pool_out_ref.at[block][...] = pool_in_ref.at[block][...]
+
+            @pl.when(fill_attention)
+            def _fill_attention_block():
+                shape = pool_out_ref.at[block].shape
+                if normal:
+                    values = _typed_values(shape,
+                                           pool_out_ref.dtype,
+                                           params_ref,
+                                           normal=True)
+                else:
+                    values = _typed_values(shape,
+                                           pool_out_ref.dtype,
+                                           params_ref,
+                                           normal=False)
+                pool_out_ref.at[block][...] = values
+
+        # Typed stores run after the raw attention store, so an overlapping
+        # attention/state block ends with valid FP32 SSM and BF16 conv values.
+        @pl.when(fill_state)
+        def _fill_state_regions():
+            for block, token_row, token_rows, live_rows in ssm_segments:
+                region = pool_out_ref.at[block, pl.ds(token_row, token_rows)]
+                _store_typed_live_rows(region,
+                                       live_rows,
+                                       jnp.float32,
+                                       params_ref,
+                                       normal=normal)
+            for block, token_row, token_rows, live_rows in conv_segments:
+                region = pool_out_ref.at[block, pl.ds(token_row, token_rows)]
+                _store_typed_live_rows(region,
+                                       live_rows,
+                                       jnp.bfloat16,
+                                       params_ref,
+                                       normal=normal)
+
+    return _kernel
+
+
+def _pallas_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
+                              fill_kinds: jax.Array, params: jax.Array,
+                              seed: jax.Array | None, *, split: int,
+                              ssm_bytes: int, conv_bytes: int) -> jax.Array:
+    if pool.ndim < 3:
+        raise ValueError(
+            f"hybrid slot fill requires pool ndim >= 3, got {pool.ndim}")
+    if split <= 0 or pool.shape[0] % split:
+        raise ValueError(
+            f"invalid manager split {split} for {pool.shape[0]} pool rows")
+    if indices.ndim != 1 or indices.shape[0] == 0:
+        raise ValueError("indices must be a non-empty rank-1 array")
+    if fill_kinds.shape != indices.shape:
+        raise ValueError(
+            f"fill_kinds shape {fill_kinds.shape} != indices {indices.shape}")
+    normal = seed is not None
+    expected_params = (2, ) if normal else (1, )
+    if params.shape != expected_params:
+        raise ValueError(
+            f"fill parameters must have shape {expected_params}, got "
+            f"{params.shape}")
+    if normal and seed.shape != (1, ):
+        raise ValueError(f"seed must have shape (1,), got {seed.shape}")
+
+    indices = indices.astype(jnp.int32)
+    fill_kinds = fill_kinds.astype(jnp.int32)
+    ssm_segments, conv_segments = _hybrid_state_segments(pool,
+                                                         split=split,
+                                                         ssm_bytes=ssm_bytes,
+                                                         conv_bytes=conv_bytes)
+    kernel = _make_hybrid_fill_kernel(normal=normal,
+                                      ssm_segments=ssm_segments,
+                                      conv_segments=conv_segments)
+    padding = (0, ) * (pool.ndim - 1)
+    block_shape = (split, ) + pool.shape[1:]
+    num_updates = indices.shape[0]
+    if normal:
+        assert seed is not None
+        return pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=4,
+                grid=(num_updates, ),
+                in_specs=[
+                    pl.BlockSpec(
+                        block_shape, lambda i, ids, _kinds, _params, _seed:
+                        (ids[i], ) + padding)
+                ],
+                out_specs=pl.BlockSpec(
+                    block_shape, lambda i, ids, _kinds, _params, _seed:
+                    (ids[i], ) + padding),
+            ),
+            out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+            input_output_aliases={4: 0},
+        )(indices, fill_kinds, params, seed.astype(jnp.int32), pool)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(num_updates, ),
+            in_specs=[
+                pl.BlockSpec(
+                    block_shape, lambda i, ids, _kinds, _params:
+                    (ids[i], ) + padding)
+            ],
+            out_specs=pl.BlockSpec(
+                block_shape, lambda i, ids, _kinds, _params:
+                (ids[i], ) + padding),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={3: 0},
+    )(indices, fill_kinds, params, pool)
+
+
+def pallas_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
+                             fill_kinds: jax.Array, fill_value: jax.Array, *,
+                             split: int, ssm_bytes: int,
+                             conv_bytes: int) -> jax.Array:
+    """Fill attention and typed GDN regions with one donated pool update."""
+    return _pallas_fill_hybrid_slots(pool,
+                                     indices,
+                                     fill_kinds,
+                                     fill_value,
+                                     None,
+                                     split=split,
+                                     ssm_bytes=ssm_bytes,
+                                     conv_bytes=conv_bytes)
+
+
+def pallas_normal_fill_hybrid_slots(pool: jax.Array, indices: jax.Array,
+                                    fill_kinds: jax.Array, mean_std: jax.Array,
+                                    seed: jax.Array, *, split: int,
+                                    ssm_bytes: int,
+                                    conv_bytes: int) -> jax.Array:
+    """Normal-distribution variant of :func:`pallas_fill_hybrid_slots`."""
+    return _pallas_fill_hybrid_slots(pool,
+                                     indices,
+                                     fill_kinds,
+                                     mean_std,
+                                     seed,
+                                     split=split,
+                                     ssm_bytes=ssm_bytes,
+                                     conv_bytes=conv_bytes)
+
+
 # --- PyTorch bridge -------------------------------------------------------
 
 
@@ -214,5 +590,167 @@ def pallas_index_copy_(cache: torch.Tensor, indices: torch.Tensor,
     """
     new_cache, _ = _pallas_scatter_torch_op(cache, indices.to(torch.int32),
                                             updates)
+    cache.copy_(new_cache)
+    return cache
+
+
+def _jax_fill_op(pool: jax.Array, indices: jax.Array,
+                 fill_value: jax.Array) -> tuple[jax.Array, jax.Array]:
+    return pallas_fill_slots(pool, indices, fill_value), indices[0]
+
+
+_pallas_fill_torch_op = torch_pallas.jax_op("pallas::kv_pool_constant_fill",
+                                            _jax_fill_op,
+                                            donate_argnums=(0, ))
+
+
+def _fake_fill_op(
+        pool: torch.Tensor, indices: torch.Tensor,
+        fill_value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    del fill_value
+    return torch.empty_like(pool), torch.empty((),
+                                               dtype=indices.dtype,
+                                               device=indices.device)
+
+
+_pallas_fill_torch_op.register_fake(_fake_fill_op)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def pallas_fill_slots_(cache: torch.Tensor, indices: torch.Tensor,
+                       fill_value: torch.Tensor) -> torch.Tensor:
+    """Fill selected leading-dimension slots without copying the KV pool."""
+    new_cache, _ = _pallas_fill_torch_op(cache, indices.to(torch.int32),
+                                         fill_value)
+    cache.copy_(new_cache)
+    return cache
+
+
+def _jax_normal_fill_op(pool: jax.Array, indices: jax.Array,
+                        mean_std: jax.Array,
+                        seed: jax.Array) -> tuple[jax.Array, jax.Array]:
+    return pallas_normal_fill_slots(pool, indices, mean_std, seed), indices[0]
+
+
+_pallas_normal_fill_torch_op = torch_pallas.jax_op(
+    "pallas::kv_pool_normal_fill", _jax_normal_fill_op, donate_argnums=(0, ))
+
+
+def _fake_normal_fill_op(
+        pool: torch.Tensor, indices: torch.Tensor, mean_std: torch.Tensor,
+        seed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    del mean_std, seed
+    return torch.empty_like(pool), torch.empty((),
+                                               dtype=indices.dtype,
+                                               device=indices.device)
+
+
+_pallas_normal_fill_torch_op.register_fake(_fake_normal_fill_op)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def pallas_normal_fill_slots_(cache: torch.Tensor, indices: torch.Tensor,
+                              mean_std: torch.Tensor,
+                              seed: torch.Tensor) -> torch.Tensor:
+    """Normally fill selected leading slots without copying the KV pool."""
+    new_cache, _ = _pallas_normal_fill_torch_op(cache, indices.to(torch.int32),
+                                                mean_std, seed.to(torch.int32))
+    cache.copy_(new_cache)
+    return cache
+
+
+def _jax_hybrid_fill_op(pool: jax.Array, indices: jax.Array,
+                        fill_kinds: jax.Array, fill_value: jax.Array,
+                        split: int, ssm_bytes: int,
+                        conv_bytes: int) -> tuple[jax.Array, jax.Array]:
+    updated = pallas_fill_hybrid_slots(pool,
+                                       indices,
+                                       fill_kinds,
+                                       fill_value,
+                                       split=split,
+                                       ssm_bytes=ssm_bytes,
+                                       conv_bytes=conv_bytes)
+    return updated, indices[0]
+
+
+_pallas_hybrid_fill_torch_op = torch_pallas.jax_op(
+    "pallas::kv_pool_hybrid_constant_fill",
+    _jax_hybrid_fill_op,
+    donate_argnums=(0, ))
+
+
+def _fake_hybrid_fill_op(pool: torch.Tensor, indices: torch.Tensor,
+                         fill_kinds: torch.Tensor, fill_value: torch.Tensor,
+                         split: int, ssm_bytes: int,
+                         conv_bytes: int) -> tuple[torch.Tensor, torch.Tensor]:
+    del fill_kinds, fill_value, split, ssm_bytes, conv_bytes
+    return torch.empty_like(pool), torch.empty((),
+                                               dtype=indices.dtype,
+                                               device=indices.device)
+
+
+_pallas_hybrid_fill_torch_op.register_fake(_fake_hybrid_fill_op)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def pallas_fill_hybrid_slots_(cache: torch.Tensor, indices: torch.Tensor,
+                              fill_kinds: torch.Tensor,
+                              fill_value: torch.Tensor, *, split: int,
+                              ssm_bytes: int, conv_bytes: int) -> torch.Tensor:
+    """Fill selected unified attention/GDN manager pages in one donation."""
+    new_cache, _ = _pallas_hybrid_fill_torch_op(cache, indices.to(torch.int32),
+                                                fill_kinds.to(torch.int32),
+                                                fill_value, split, ssm_bytes,
+                                                conv_bytes)
+    cache.copy_(new_cache)
+    return cache
+
+
+def _jax_normal_hybrid_fill_op(pool: jax.Array, indices: jax.Array,
+                               fill_kinds: jax.Array, mean_std: jax.Array,
+                               seed: jax.Array, split: int, ssm_bytes: int,
+                               conv_bytes: int) -> tuple[jax.Array, jax.Array]:
+    updated = pallas_normal_fill_hybrid_slots(pool,
+                                              indices,
+                                              fill_kinds,
+                                              mean_std,
+                                              seed,
+                                              split=split,
+                                              ssm_bytes=ssm_bytes,
+                                              conv_bytes=conv_bytes)
+    return updated, indices[0]
+
+
+_pallas_normal_hybrid_fill_torch_op = torch_pallas.jax_op(
+    "pallas::kv_pool_hybrid_normal_fill",
+    _jax_normal_hybrid_fill_op,
+    donate_argnums=(0, ))
+
+
+def _fake_normal_hybrid_fill_op(
+        pool: torch.Tensor, indices: torch.Tensor, fill_kinds: torch.Tensor,
+        mean_std: torch.Tensor, seed: torch.Tensor, split: int, ssm_bytes: int,
+        conv_bytes: int) -> tuple[torch.Tensor, torch.Tensor]:
+    del fill_kinds, mean_std, seed, split, ssm_bytes, conv_bytes
+    return torch.empty_like(pool), torch.empty((),
+                                               dtype=indices.dtype,
+                                               device=indices.device)
+
+
+_pallas_normal_hybrid_fill_torch_op.register_fake(_fake_normal_hybrid_fill_op)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def pallas_normal_fill_hybrid_slots_(cache: torch.Tensor,
+                                     indices: torch.Tensor,
+                                     fill_kinds: torch.Tensor,
+                                     mean_std: torch.Tensor,
+                                     seed: torch.Tensor, *, split: int,
+                                     ssm_bytes: int,
+                                     conv_bytes: int) -> torch.Tensor:
+    """Normally fill unified attention/GDN pages in one donated update."""
+    new_cache, _ = _pallas_normal_hybrid_fill_torch_op(
+        cache, indices.to(torch.int32), fill_kinds.to(torch.int32), mean_std,
+        seed.to(torch.int32), split, ssm_bytes, conv_bytes)
     cache.copy_(new_cache)
     return cache

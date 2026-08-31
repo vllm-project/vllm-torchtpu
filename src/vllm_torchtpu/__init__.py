@@ -55,6 +55,9 @@ def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     This is the producer-only subset of the reconciliation merged upstream in
     vllm-project/vllm#48425. Keep it local to the coordinator instance so
     consumer-side divergent lookup and remote suffix transfer are unchanged.
+    TPU DecodeBenchConnector is the exception even with ``kv_both``: its
+    worker synthesizes final recurrent state for every external suffix, so an
+    attention-only local hit has the same safety property as a consumer hit.
     """
     from types import MethodType
 
@@ -62,8 +65,15 @@ def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
 
     kv_transfer_config = scheduler.vllm_config.kv_transfer_config
     coordinator = scheduler.kv_cache_manager.coordinator
+    is_tpu_decode_bench = (
+        kv_transfer_config is not None
+        and kv_transfer_config.kv_connector == "DecodeBenchConnector"
+        and getattr(kv_transfer_config, "kv_connector_module_path", None) in (
+            None,
+            "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector",
+        ))
     if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
-            or not scheduler.has_mamba_layers
+            or is_tpu_decode_bench or not scheduler.has_mamba_layers
             or not isinstance(coordinator, HybridKVCacheCoordinator)):
         return
 
@@ -760,7 +770,7 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
 
 
 def _patch_vllm_hybrid_pcp_block_sizes() -> None:
-    """Resolve full-attention + Mamba block sizes under TPU PCP.
+    """Resolve hybrid cache geometry under TPU context parallelism.
 
     Upstream vLLM rejects all multi-group KV cache configs when
     ``pcp_world_size > 1`` because it cannot infer the scheduler block size for
@@ -769,14 +779,19 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     cache coordinator operate on logical pages spanning all PCP ranks. Present
     those logical page sizes to the generic hybrid coordinator instead of
     rejecting the config.
+
+    Pinned vLLM also omits ``dcp_world_size`` from its independent per-group
+    connector lookup. Pass it to full attention so lookup uses the same logical
+    DCP pages that allocation and hashing materialized.
     """
     import math
     import sys
     from dataclasses import replace
 
     from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
-    from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec,
-                                            MambaSpec, UniformTypeKVCacheSpecs)
+    from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
+                                            KVCacheSpec, MambaSpec,
+                                            UniformTypeKVCacheSpecs)
 
     already_patched = getattr(kv_cache_utils,
                               "_tpu_hybrid_pcp_block_sizes_patch", False)
@@ -870,6 +885,42 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
 
     hybrid_coordinator = kv_cache_coordinator.HybridKVCacheCoordinator
+    if not getattr(hybrid_coordinator, "_tpu_dcp_per_group_prefix_hit_patch",
+                   False):
+        original_per_group_lookup = (
+            hybrid_coordinator.find_longest_cache_hit_per_group)
+
+        def _find_longest_cache_hit_per_group_with_dcp(self, block_hashes,
+                                                       max_cache_hit_length):
+            if self.dcp_world_size == 1:
+                return original_per_group_lookup(self, block_hashes,
+                                                 max_cache_hit_length)
+
+            hit_blocks = [[] for _ in self.kv_cache_config.kv_cache_groups]
+            hit_lengths = [0] * len(hit_blocks)
+            for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+                blocks, group_hit = manager_cls.find_longest_cache_hit(
+                    block_hashes=block_hashes,
+                    max_length=max_cache_hit_length,
+                    kv_cache_group_ids=group_ids,
+                    block_pool=self.block_pool,
+                    kv_cache_spec=spec,
+                    drop_eagle_block=use_eagle,
+                    alignment_tokens=self._cache_hit_alignment_tokens,
+                    dcp_world_size=(self.dcp_world_size if isinstance(
+                        spec, FullAttentionSpec) else 1),
+                )
+                for group_id, group_blocks in zip(group_ids, blocks):
+                    hit_blocks[group_id] = group_blocks
+                    hit_lengths[group_id] = group_hit
+            return tuple(hit_blocks), tuple(hit_lengths)
+
+        hybrid_coordinator.find_longest_cache_hit_per_group = (
+            _find_longest_cache_hit_per_group_with_dcp)
+        hybrid_coordinator._tpu_dcp_per_group_prefix_hit_patch = True
+        logger.info("Applied TPU patch: DCP-aware hybrid connector prefix "
+                    "lookup.")
+
     if not getattr(hybrid_coordinator, "_tpu_hybrid_pcp_coordinator_patch",
                    False):
         original_hybrid_init = hybrid_coordinator.__init__
@@ -888,11 +939,14 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                                  metrics_collector=None):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
-            if (pcp_world_size == 1 and _is_attention_mamba_hybrid(groups)):
+            if (pcp_world_size == 1 and dcp_world_size == 1
+                    and _is_attention_mamba_hybrid(groups)):
                 # vLLM 0.26's Scheduler already folds PCP into
                 # scheduler_block_size, but hard-codes pcp_world_size=1 when
                 # constructing KVCacheManager. Recover the folded PCP factor
                 # from the logical scheduler block and the rank-local specs.
+                # DCP also scales the scheduler block, so it must not enter
+                # this PCP-only inference path.
                 physical_scheduler_block_size = math.lcm(
                     *(_effective_block_size(group.kv_cache_spec, 1)
                       for group in groups))

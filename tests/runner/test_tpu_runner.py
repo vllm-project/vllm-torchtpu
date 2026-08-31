@@ -66,6 +66,24 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     }
 
 
+def test_decode_bench_connector_keeps_compact_mamba_layout():
+    assert not tpu_runner._uses_uniform_mamba_layout(
+        SimpleNamespace(kv_connector="DecodeBenchConnector",
+                        kv_connector_module_path=None))
+    assert not tpu_runner._uses_uniform_mamba_layout(
+        SimpleNamespace(
+            kv_connector="DecodeBenchConnector",
+            kv_connector_module_path=("vllm_torchtpu.distributed.kv_transfer."
+                                      "decode_bench_connector"),
+        ))
+    assert tpu_runner._uses_uniform_mamba_layout(
+        SimpleNamespace(kv_connector="DecodeBenchConnector",
+                        kv_connector_module_path="custom.decode_bench"))
+    assert tpu_runner._uses_uniform_mamba_layout(
+        SimpleNamespace(kv_connector="TPUConnector"))
+    assert not tpu_runner._uses_uniform_mamba_layout(None)
+
+
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
     connector = object()
 
@@ -593,8 +611,10 @@ class TestTPURunner:
             TPUModelRunner._available_kv_cache_hbm.__get__(self.runner))
         # Compact-mamba state starts unset (matches real __init__).
         self.runner._mamba_num_blocks = None
-        self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
-                                             is not None)
+        transfer_config = vllm_config.kv_transfer_config
+        self.runner._uniform_mamba_layout = (transfer_config is not None
+                                             and transfer_config.kv_connector
+                                             != "DecodeBenchConnector")
         self.runner._unified_kv_layout = False
         self.runner.kv_cache_raw_tensors = []
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
@@ -1707,6 +1727,8 @@ class TestCompactMambaSlotPool:
             TPUModelRunner._init_mamba_slot_pool.__get__(runner))
         runner._build_mamba_state_indices = (
             TPUModelRunner._build_mamba_state_indices.__get__(runner))
+        runner.ensure_mamba_slots_for_requests = (
+            TPUModelRunner.ensure_mamba_slots_for_requests.__get__(runner))
         return runner
 
     def _set_batch(self, runner, req_ids):
@@ -1730,6 +1752,25 @@ class TestCompactMambaSlotPool:
         assert idx[0] != idx[1]
         # Padded tail points at the null slot (0).
         assert idx[2] == 0 and idx[3] == 0
+
+    def test_connector_can_allocate_slot_before_input_preparation(self):
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a", "b"])
+
+        connector_slots = runner.ensure_mamba_slots_for_requests(["b"])
+        indices = runner._build_mamba_state_indices(0, 2, 4).cpu()
+
+        assert int(indices[1]) == connector_slots["b"]
+        assert int(indices[0]) != connector_slots["b"]
+
+    def test_connector_rejects_request_outside_persistent_batch(self):
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a"])
+
+        with pytest.raises(KeyError, match="not in the persistent batch"):
+            runner.ensure_mamba_slots_for_requests(["missing"])
 
     def test_idle_dp_rank_gets_all_null_slots(self):
         """An idle DP rank asks for the coordinated shape with an empty batch.

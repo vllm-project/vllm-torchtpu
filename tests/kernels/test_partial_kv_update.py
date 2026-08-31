@@ -18,8 +18,13 @@ them look redundant until you know what got through without them:
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 
-from vllm_torchtpu.kernels.partial_kv_update import pallas_scatter_slots
+from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.kernels.partial_kv_update import (
+    pallas_fill_hybrid_slots, pallas_fill_hybrid_slots_, pallas_fill_slots,
+    pallas_fill_slots_, pallas_normal_fill_hybrid_slots,
+    pallas_normal_fill_slots, pallas_normal_fill_slots_, pallas_scatter_slots)
 
 SUBLANES = 8
 LANES = 128
@@ -170,3 +175,370 @@ def test_dtype_mismatch_raises():
 def test_rank1_is_rejected():
     with pytest.raises(ValueError, match="ndim"):
         _scatter(_pool((4096, )), [0], jnp.zeros((1, ), dtype=jnp.bfloat16))
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (32, 16, 1, 128),
+        (16, 16, 1, 640),  # Kimi MLA attention page
+        (9, 3, 12, 128),
+        (9, 12, 128, 128),
+    ],
+)
+def test_constant_fill_updates_only_selected_slots(shape, dtype):
+    pool = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape)
+    pool = pool.astype(dtype)
+    before = np.asarray(pool).copy()
+    indices = jnp.asarray([1, 5, 7], dtype=jnp.int32)
+    fill_value = jnp.asarray([0.015], dtype=jnp.float32)
+
+    got = np.asarray(pallas_fill_slots(pool, indices, fill_value))
+
+    expected_value = np.asarray(0.015, dtype=np.dtype(dtype)).item()
+    np.testing.assert_array_equal(
+        got[np.asarray(indices)],
+        np.full(got[np.asarray(indices)].shape,
+                expected_value,
+                dtype=np.dtype(dtype)),
+    )
+    untouched = np.ones(shape[0], dtype=bool)
+    untouched[np.asarray(indices)] = False
+    np.testing.assert_array_equal(got[untouched], before[untouched])
+
+
+def test_constant_fill_duplicate_slots_are_idempotent():
+    pool = _pool((16, 8, 128))
+    indices = jnp.asarray([3, 3, 9], dtype=jnp.int32)
+
+    got = np.asarray(
+        pallas_fill_slots(pool, indices, jnp.asarray([2.0],
+                                                     dtype=jnp.float32)))
+
+    expected = np.full(got[3].shape, 2.0, dtype=np.dtype("bfloat16"))
+    np.testing.assert_array_equal(got[3], expected)
+    np.testing.assert_array_equal(got[9], expected)
+
+
+def test_constant_fill_supports_packed_fp8_attention_pages():
+    shape = (9, 4, 1, 4, LANES)
+    pool = jnp.full(shape, 0.5, dtype=jnp.float8_e4m3fn)
+    selected = np.asarray([1, 5, 7], dtype=np.int32)
+
+    got = np.asarray(
+        pallas_fill_slots(pool, jnp.asarray(selected),
+                          jnp.asarray([0.25],
+                                      dtype=jnp.float32))).astype(np.float32)
+
+    np.testing.assert_array_equal(
+        got[selected], np.full(got[selected].shape, 0.25, dtype=np.float32))
+    untouched = np.ones(shape[0], dtype=bool)
+    untouched[selected] = False
+    np.testing.assert_array_equal(
+        got[untouched], np.full(got[untouched].shape, 0.5, dtype=np.float32))
+
+
+def test_constant_fill_rejects_empty_indices():
+    with pytest.raises(ValueError, match="non-empty"):
+        pallas_fill_slots(_pool((16, 8, 128)), jnp.asarray([],
+                                                           dtype=jnp.int32),
+                          jnp.asarray([1.0], dtype=jnp.float32))
+
+
+def test_constant_fill_rejects_rank2_pool():
+    with pytest.raises(ValueError, match="ndim >= 3"):
+        pallas_fill_slots(_pool((16, 128)), jnp.asarray([1], dtype=jnp.int32),
+                          jnp.asarray([1.0], dtype=jnp.float32))
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    [
+        ((16, 16, 10, 1, 128), torch.bfloat16),
+        ((16, 16, 1, 640), torch.bfloat16),
+        ((9, 4, 1, 4, 128), torch.float8_e4m3fn),
+        ((9, 3, 12, 128), torch.float32),
+        ((9, 12, 128, 128), torch.bfloat16),
+    ],
+)
+def test_constant_fill_torch_bridge_donates_and_writes_back(shape, dtype):
+    source = torch.arange(np.prod(shape), dtype=torch.float32).reshape(shape)
+    cache = source.to(dtype).to("tpu")
+    before = cache.cpu().float().numpy()
+    selected = [2, shape[0] - 2]
+    indices = torch.tensor(selected, dtype=torch.int32, device="tpu")
+    fill_value = torch.tensor([0.25], dtype=torch.float32, device="tpu")
+
+    returned = pallas_fill_slots_(cache, indices, fill_value)
+    got = cache.cpu().float().numpy()
+
+    assert returned is cache
+    for slot in selected:
+        np.testing.assert_array_equal(
+            got[slot], np.full(shape[1:], 0.25, dtype=np.float32))
+    untouched = np.ones(shape[0], dtype=bool)
+    untouched[selected] = False
+    np.testing.assert_array_equal(got[untouched], before[untouched])
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    [
+        ((16, 16, 1, 640), jnp.bfloat16),  # Kimi MLA attention page
+        ((9, 3, 12, 128), jnp.float32),  # compact KDA conv state
+        ((9, 12, 128, 128), jnp.float32),  # compact KDA recurrent state
+    ],
+)
+def test_normal_fill_updates_only_selected_slots(shape, dtype):
+    pool = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape)
+    pool = pool.astype(dtype)
+    before = np.asarray(pool).copy()
+    selected = np.asarray([1, 5, 7], dtype=np.int32)
+    mean = 0.4
+    std = 0.2
+
+    got = np.asarray(
+        pallas_normal_fill_slots(
+            pool,
+            jnp.asarray(selected),
+            jnp.asarray([mean, std], dtype=jnp.float32),
+            jnp.asarray([1234], dtype=jnp.int32),
+        ))
+
+    samples = got[selected].astype(np.float32).reshape(-1)
+    assert samples.mean() == pytest.approx(mean, abs=0.015)
+    assert samples.std() == pytest.approx(std, abs=0.015)
+    untouched = np.ones(shape[0], dtype=bool)
+    untouched[selected] = False
+    np.testing.assert_array_equal(got[untouched], before[untouched])
+
+
+def test_normal_fill_is_seeded_and_slot_stable():
+    pool = jnp.zeros((16, 8, 128), dtype=jnp.bfloat16)
+    indices = jnp.asarray([9, 3], dtype=jnp.int32)
+    params = jnp.asarray([0.0, 1.0], dtype=jnp.float32)
+
+    first = np.asarray(
+        pallas_normal_fill_slots(pool, indices, params,
+                                 jnp.asarray([7], dtype=jnp.int32)))
+    reordered = np.asarray(
+        pallas_normal_fill_slots(pool, indices[::-1], params,
+                                 jnp.asarray([7], dtype=jnp.int32)))
+    different_seed = np.asarray(
+        pallas_normal_fill_slots(pool, indices, params,
+                                 jnp.asarray([8], dtype=jnp.int32)))
+
+    np.testing.assert_array_equal(first[3], reordered[3])
+    np.testing.assert_array_equal(first[9], reordered[9])
+    assert not np.array_equal(first[3], different_seed[3])
+
+
+def test_normal_fill_validates_parameters():
+    pool = _pool((16, 8, 128))
+    indices = jnp.asarray([1], dtype=jnp.int32)
+    with pytest.raises(ValueError, match="mean_std"):
+        pallas_normal_fill_slots(pool, indices,
+                                 jnp.asarray([0.0], dtype=jnp.float32),
+                                 jnp.asarray([1], dtype=jnp.int32))
+    with pytest.raises(ValueError, match="seed"):
+        pallas_normal_fill_slots(pool, indices,
+                                 jnp.asarray([0.0, 1.0], dtype=jnp.float32),
+                                 jnp.asarray([1.0], dtype=jnp.float32))
+
+
+def test_unified_hybrid_fill_preserves_null_padding_and_unrelated_bytes():
+    shape = (8, 4, 2, LANES)
+    pool = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape)
+    pool = pool.astype(jnp.bfloat16)
+    before = np.asarray(pool).copy()
+
+    manager_indices = jnp.asarray([1, 2], dtype=jnp.int32)
+    updated = pallas_fill_hybrid_slots(
+        pool,
+        manager_indices,
+        # manager 1: attention + state; manager 2: state only
+        jnp.asarray([3, 2], dtype=jnp.int32),
+        jnp.asarray([0.25], dtype=jnp.float32),
+        split=2,
+        ssm_bytes=512,
+        conv_bytes=256,
+    )
+    got = np.asarray(updated)
+    ssm = np.asarray(
+        pool_adapters.gather_region(updated,
+                                    manager_indices,
+                                    tok0=0,
+                                    ntok=1,
+                                    out_dtype=jnp.float32,
+                                    split=2))
+
+    # Manager block zero is the null page and was not selected.
+    np.testing.assert_array_equal(got[:2], before[:2])
+    # State-only manager 2 preserves everything outside its two live regions.
+    np.testing.assert_array_equal(ssm[1],
+                                  np.full((1, LANES), 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(
+        got[4, 1, 0], np.full((LANES, ), 0.25, dtype=np.dtype("bfloat16")))
+    np.testing.assert_array_equal(got[4, 1, 1], before[4, 1, 1])
+    np.testing.assert_array_equal(got[4, 2:], before[4, 2:])
+    np.testing.assert_array_equal(got[5], before[5])
+    # The overlapping manager has typed state over a raw attention fill.
+    np.testing.assert_array_equal(ssm[0],
+                                  np.full((1, LANES), 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(
+        got[2, 1, 0], np.full((LANES, ), 0.25, dtype=np.dtype("bfloat16")))
+    np.testing.assert_array_equal(
+        got[2, 1, 1], np.full((LANES, ), 0.25, dtype=np.dtype("bfloat16")))
+    np.testing.assert_array_equal(
+        got[3], np.full(shape[1:], 0.25, dtype=np.dtype("bfloat16")))
+
+
+def test_unified_hybrid_normal_fill_uses_typed_state_distributions():
+    pool = jnp.zeros((8, 4, 2, LANES), dtype=jnp.bfloat16)
+    manager_indices = jnp.asarray([1], dtype=jnp.int32)
+    updated = pallas_normal_fill_hybrid_slots(
+        pool,
+        manager_indices,
+        jnp.asarray([3], dtype=jnp.int32),
+        jnp.asarray([0.4, 0.2], dtype=jnp.float32),
+        jnp.asarray([1234], dtype=jnp.int32),
+        split=2,
+        ssm_bytes=512,
+        conv_bytes=256,
+    )
+    got = np.asarray(updated)
+
+    ssm = np.asarray(
+        pool_adapters.gather_region(updated,
+                                    manager_indices,
+                                    tok0=0,
+                                    ntok=1,
+                                    out_dtype=jnp.float32,
+                                    split=2)).reshape(-1)
+    conv = got[2, 1, 0].astype(np.float32).reshape(-1)
+    assert ssm.mean() == pytest.approx(0.4, abs=0.05)
+    assert ssm.std() == pytest.approx(0.2, abs=0.05)
+    assert conv.mean() == pytest.approx(0.4, abs=0.05)
+    assert conv.std() == pytest.approx(0.2, abs=0.05)
+
+
+def test_unified_hybrid_fp8_pool_uses_typed_state_abi():
+    # Real FP8 attention caches keep their four-byte pack as its own payload
+    # dimension: (blocks, tokens, packed KV heads, pack, lanes).
+    shape = (8, 4, 1, 4, LANES)
+    pool = jnp.full(shape, 0.5, dtype=jnp.float8_e4m3fn)
+    manager_indices = jnp.asarray([1], dtype=jnp.int32)
+    updated = pallas_fill_hybrid_slots(
+        pool,
+        manager_indices,
+        jnp.asarray([3], dtype=jnp.int32),
+        jnp.asarray([0.25], dtype=jnp.float32),
+        split=2,
+        ssm_bytes=512,
+        conv_bytes=256,
+    )
+
+    got = np.asarray(updated).astype(np.float32)
+    ssm = np.asarray(
+        pool_adapters.gather_region(updated,
+                                    manager_indices,
+                                    tok0=0,
+                                    ntok=1,
+                                    out_dtype=jnp.float32,
+                                    split=2))
+    conv = np.asarray(
+        pool_adapters.gather_region(updated,
+                                    manager_indices,
+                                    tok0=1,
+                                    ntok=1,
+                                    out_dtype=jnp.bfloat16,
+                                    split=2)).astype(np.float32)
+
+    np.testing.assert_array_equal(got[:2], np.full_like(got[:2], 0.5))
+    np.testing.assert_array_equal(
+        ssm, np.full((1, 1, LANES), 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(conv[0, 0],
+                                  np.full((LANES, ), 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(got[3],
+                                  np.full(shape[1:], 0.25, dtype=np.float32))
+
+
+def test_unified_hybrid_torch_bridge_donates_and_writes_back():
+    shape = (8, 4, 2, LANES)
+    cache = torch.zeros(shape, dtype=torch.bfloat16, device="tpu")
+    indices = torch.tensor([1], dtype=torch.int32, device="tpu")
+    fill_kinds = torch.tensor([3], dtype=torch.int32, device="tpu")
+    fill_value = torch.tensor([0.25], dtype=torch.float32, device="tpu")
+
+    returned = pallas_fill_hybrid_slots_(cache,
+                                         indices,
+                                         fill_kinds,
+                                         fill_value,
+                                         split=2,
+                                         ssm_bytes=512,
+                                         conv_bytes=256)
+    got = cache.cpu().float().numpy()
+
+    assert returned is cache
+    np.testing.assert_array_equal(got[:2], np.zeros_like(got[:2]))
+    np.testing.assert_array_equal(got[2, 0, 0],
+                                  np.zeros((LANES, ), dtype=np.float32))
+    np.testing.assert_array_equal(got[2, 0, 1],
+                                  np.full((LANES, ), 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(
+        got[2, 1:], np.full(got[2, 1:].shape, 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(got[3],
+                                  np.full(shape[1:], 0.25, dtype=np.float32))
+
+
+def test_unified_hybrid_fp8_torch_bridge_donates_and_writes_back():
+    shape = (8, 4, 1, 4, LANES)
+    cache = torch.full(shape, 0.5, dtype=torch.float8_e4m3fn, device="tpu")
+    indices = torch.tensor([1], dtype=torch.int32, device="tpu")
+    fill_kinds = torch.tensor([3], dtype=torch.int32, device="tpu")
+    fill_value = torch.tensor([0.25], dtype=torch.float32, device="tpu")
+
+    returned = pallas_fill_hybrid_slots_(cache,
+                                         indices,
+                                         fill_kinds,
+                                         fill_value,
+                                         split=2,
+                                         ssm_bytes=512,
+                                         conv_bytes=256)
+    got = cache.cpu().float().numpy()
+
+    assert returned is cache
+    np.testing.assert_array_equal(
+        got[:2], np.full(got[:2].shape, 0.5, dtype=np.float32))
+    np.testing.assert_array_equal(got[3],
+                                  np.full(shape[1:], 0.25, dtype=np.float32))
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    [
+        ((16, 16, 1, 640), torch.bfloat16),
+        ((9, 3, 12, 128), torch.float32),
+        ((9, 12, 128, 128), torch.float32),
+    ],
+)
+def test_normal_fill_torch_bridge_donates_and_writes_back(shape, dtype):
+    cache = torch.arange(np.prod(shape), dtype=torch.float32).reshape(shape)
+    cache = cache.to(dtype).to("tpu")
+    before = cache.cpu().float().numpy()
+    selected = [2, shape[0] - 2]
+    indices = torch.tensor(selected, dtype=torch.int32, device="tpu")
+    params = torch.tensor([0.4, 0.2], dtype=torch.float32, device="tpu")
+    seed = torch.tensor([1234], dtype=torch.int32, device="tpu")
+
+    returned = pallas_normal_fill_slots_(cache, indices, params, seed)
+    got = cache.cpu().float().numpy()
+
+    assert returned is cache
+    samples = got[selected].reshape(-1)
+    assert samples.mean() == pytest.approx(0.4, abs=0.015)
+    assert samples.std() == pytest.approx(0.2, abs=0.015)
+    untouched = np.ones(shape[0], dtype=bool)
+    untouched[selected] = False
+    np.testing.assert_array_equal(got[untouched], before[untouched])

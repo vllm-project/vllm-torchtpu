@@ -274,16 +274,40 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker = TPUWorker.__new__(TPUWorker)
     worker.cache_config = MagicMock(num_gpu_blocks=None)
     worker.vllm_config = MagicMock()
+    worker.vllm_config.kv_transfer_config = None
     worker.model_runner = MagicMock()
     kv_cache_config = MagicMock(num_blocks=2048)
 
-    with patch("vllm_torchtpu.worker.tpu_worker."
-               "ensure_kv_transfer_initialized"):
+    with patch("vllm_torchtpu.platforms.tpu_platform."
+               "_register_tpu_kv_connectors"), patch(
+                   "vllm_torchtpu.worker.tpu_worker."
+                   "ensure_kv_transfer_initialized"):
         worker.initialize_from_config(kv_cache_config)
 
     assert worker.cache_config.num_gpu_blocks == 2048
     worker.model_runner.initialize_kv_cache.assert_called_once_with(
         kv_cache_config)
+
+
+def test_initialize_from_config_routes_default_decode_bench_module():
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = MagicMock(num_gpu_blocks=None)
+    transfer_config = MagicMock(kv_connector="DecodeBenchConnector",
+                                kv_connector_module_path=None)
+    worker.vllm_config = MagicMock(kv_transfer_config=transfer_config)
+    worker.model_runner = MagicMock()
+    kv_cache_config = MagicMock(num_blocks=2048)
+
+    with patch("vllm_torchtpu.platforms.tpu_platform."
+               "_register_tpu_kv_connectors") as register, patch(
+                   "vllm_torchtpu.worker.tpu_worker."
+                   "ensure_kv_transfer_initialized") as initialize:
+        worker.initialize_from_config(kv_cache_config)
+
+    register.assert_called_once_with()
+    assert transfer_config.kv_connector_module_path == (
+        "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector")
+    initialize.assert_called_once_with(worker.vllm_config, kv_cache_config)
 
 
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")

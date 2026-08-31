@@ -674,6 +674,23 @@ class TPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        # This is the final worker-local boundary before vLLM constructs the
+        # connector. Forkserver startup can decouple platform/factory module
+        # state, so make the default module path explicit here as well as in
+        # the platform config hook. User-supplied module paths remain intact.
+        from vllm_torchtpu.platforms.tpu_platform import (
+            TPU_DECODE_BENCH_CONNECTOR_MODULE, _register_tpu_kv_connectors)
+        _register_tpu_kv_connectors()
+        transfer_config = self.vllm_config.kv_transfer_config
+        if (transfer_config is not None
+                and transfer_config.kv_connector == "DecodeBenchConnector"):
+            if transfer_config.kv_connector_module_path is None:
+                transfer_config.kv_connector_module_path = \
+                    TPU_DECODE_BENCH_CONNECTOR_MODULE
+            if (transfer_config.kv_connector_module_path ==
+                    TPU_DECODE_BENCH_CONNECTOR_MODULE):
+                logger.info("Routing DecodeBenchConnector to %s",
+                            TPU_DECODE_BENCH_CONNECTOR_MODULE)
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 

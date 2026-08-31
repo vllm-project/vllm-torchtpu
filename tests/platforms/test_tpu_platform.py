@@ -350,9 +350,48 @@ class TestTpuPlatform:
         with pytest.raises(NotImplementedError, match="unified KV pool"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_bench_allows_compact_hybrid_state_with_apc(
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
+        del mock_prepare_env, mock_apply_patches
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.model_config.architecture = "KimiLinearForCausalLM"
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.mamba_cache_mode = "align"
+        vllm_config.kv_transfer_config = MagicMock(
+            kv_connector="DecodeBenchConnector",
+            kv_connector_module_path=None,
+        )
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.kv_transfer_config.kv_connector_module_path == (
+            "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector")
+
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    def test_decode_bench_rejects_speculative_decoding(self,
+                                                       mock_apply_patches,
+                                                       vllm_config):
+        del mock_apply_patches
+        vllm_config.kv_transfer_config = MagicMock(
+            kv_connector="DecodeBenchConnector",
+            kv_connector_module_path=None,
+        )
+        vllm_config.speculative_config = MagicMock()
+
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         "connector_name",
-        ["TPUConnector", "TPURaidenConnector", "TPUMultiConnector"],
+        [
+            "TPUConnector", "TPURaidenConnector", "TPUMultiConnector",
+            "DecodeBenchConnector"
+        ],
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
@@ -363,9 +402,34 @@ class TestTpuPlatform:
             connector_name):
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = connector_name
+        vllm_config.kv_transfer_config.kv_connector_module_path = None
+        vllm_config.cache_config.block_size = 16
+        if connector_name == "DecodeBenchConnector":
+            vllm_config.cache_config.enable_prefix_caching = True
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        if connector_name == "DecodeBenchConnector":
+            assert vllm_config.kv_transfer_config.kv_connector_module_path == (
+                "vllm_torchtpu.distributed.kv_transfer."
+                "decode_bench_connector")
+
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_bench_preserves_explicit_module_path(
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
+        del mock_prepare_env, mock_apply_patches
+        transfer_config = MagicMock()
+        transfer_config.kv_connector = "DecodeBenchConnector"
+        transfer_config.kv_connector_module_path = "custom.decode_bench"
+        vllm_config.kv_transfer_config = transfer_config
         vllm_config.cache_config.block_size = 16
 
         TpuPlatform.check_and_update_config(vllm_config)
+
+        assert transfer_config.kv_connector_module_path == "custom.decode_bench"
 
     @pytest.mark.parametrize(
         ("compile_sizes", "shapes_type", "expected_type"),
@@ -435,6 +499,43 @@ class TestTpuPlatform:
                     TpuPlatform.check_and_update_config(vllm_config)
             else:
                 TpuPlatform.check_and_update_config(vllm_config)
+
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_bench_accepts_unified_hybrid_pool(self, mock_prepare_env,
+                                                      mock_apply_patches,
+                                                      vllm_config,
+                                                      monkeypatch):
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.cache_config.block_size = 16
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.mamba_cache_mode = "align"
+        vllm_config.kv_transfer_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector = "DecodeBenchConnector"
+        vllm_config.kv_transfer_config.kv_connector_module_path = None
+        monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+
+        with patch("vllm_torchtpu.platforms.tpu_platform."
+                   "update_tpu_block_size_and_slot_config"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_bench_requires_prefix_caching(self, mock_prepare_env,
+                                                  mock_apply_patches,
+                                                  vllm_config):
+        vllm_config.cache_config.block_size = 16
+        vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.kv_transfer_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector = "DecodeBenchConnector"
+        vllm_config.kv_transfer_config.kv_connector_module_path = None
+
+        with pytest.raises(ValueError, match="requires prefix caching"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
@@ -621,7 +722,62 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
     _register_tpu_kv_connectors(
     )  # Idempotent: repeated registrations must succeed.
 
-    for name in ("TPURaidenConnector", "TPUMultiConnector",
-                 "TPURaidenOffloadingConnector"):
+    for name in ("DecodeBenchConnector", "TPURaidenConnector",
+                 "TPUMultiConnector", "TPURaidenOffloadingConnector"):
         cls = KVConnectorFactory.get_connector_class_by_name(name)
         assert cls.__name__ == name
+
+    decode_bench = KVConnectorFactory.get_connector_class_by_name(
+        "DecodeBenchConnector")
+    assert decode_bench.__module__ == (
+        "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector")
+
+
+def test_apply_tpu_patches_registers_connectors_before_patch_guard(
+        monkeypatch):
+    register_connectors = MagicMock()
+    monkeypatch.setattr(tpu_platform, "_register_tpu_kv_connectors",
+                        register_connectors)
+    monkeypatch.setattr(tpu_platform, "_tpu_patches_applied", True)
+
+    tpu_platform.apply_tpu_patches()
+
+    register_connectors.assert_called_once_with()
+
+
+def test_connector_registration_refreshes_inherited_decode_bench_mapping(
+        monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+    from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import \
+        DecodeBenchConnector as UpstreamDecodeBenchConnector
+
+    monkeypatch.setitem(KVConnectorFactory._registry, "DecodeBenchConnector",
+                        lambda: UpstreamDecodeBenchConnector)
+    monkeypatch.setattr(tpu_platform, "_tpu_kv_connectors_registered", True)
+
+    tpu_platform._register_tpu_kv_connectors()
+
+    connector = KVConnectorFactory.get_connector_class_by_name(
+        "DecodeBenchConnector")
+    assert connector.__module__ == (
+        "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector")
+
+
+def test_decode_bench_factory_resolves_tpu_module_path():
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    from vllm_torchtpu.distributed.kv_transfer.decode_bench_connector import \
+        DecodeBenchConnector
+
+    config = SimpleNamespace(
+        kv_connector="DecodeBenchConnector",
+        kv_connector_module_path=(
+            "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector"),
+    )
+
+    assert KVConnectorFactory.get_connector_class(
+        config) is DecodeBenchConnector

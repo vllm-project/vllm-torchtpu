@@ -181,6 +181,20 @@ def _hybrid_mamba_state_layout(
     )
 
 
+def get_tpu_pooled_gdn_state_layout(
+    vllm_config: VllmConfig,
+    fa_physical_bytes_per_token: int,
+) -> PooledGDNStateLayout | None:
+    """Return the exact typed GDN layout used inside a unified TPU pool.
+
+    This is the shared public entry point for consumers that already know the
+    physical attention-token stride. It intentionally delegates to the same
+    model/PCP-aware derivation used to size the pool, so materializers cannot
+    drift from the bytes read and written by the GDN kernels.
+    """
+    return _hybrid_mamba_state_layout(vllm_config, fa_physical_bytes_per_token)
+
+
 def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
     model_config = vllm_config.model_config
     dtype_size = torch.empty(
@@ -203,8 +217,8 @@ def _derive_tpu_block_slot_config(
     fa_layout_padding_bytes_per_token = (fa_physical_bytes_per_token -
                                          fa_raw_payload_bytes_per_token)
 
-    mamba_layout = _hybrid_mamba_state_layout(vllm_config,
-                                              fa_physical_bytes_per_token)
+    mamba_layout = get_tpu_pooled_gdn_state_layout(
+        vllm_config, fa_physical_bytes_per_token)
     mamba_raw_state_bytes = (None if mamba_layout is None else
                              mamba_layout.conv_bytes + mamba_layout.ssm_bytes)
     mamba_required_state_bytes = (None if mamba_layout is None else

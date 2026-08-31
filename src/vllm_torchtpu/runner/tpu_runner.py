@@ -96,7 +96,8 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.platforms.tpu_platform import (
+    TPU_DECODE_BENCH_CONNECTOR_MODULE, TpuPlatform)
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
@@ -117,6 +118,19 @@ from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+
+
+def _uses_uniform_mamba_layout(kv_transfer_config: Any | None) -> bool:
+    """Whether a connector requires manager-block-addressed Mamba state."""
+    if kv_transfer_config is None:
+        return False
+    is_tpu_decode_bench = (
+        kv_transfer_config.kv_connector == "DecodeBenchConnector"
+        and getattr(kv_transfer_config, "kv_connector_module_path", None) in (
+            None,
+            TPU_DECODE_BENCH_CONNECTOR_MODULE,
+        ))
+    return not is_tpu_decode_bench
 
 
 @dataclass
@@ -562,10 +576,13 @@ class TPUModelRunner(GPUModelRunner):
                                         tuple[torch.Tensor, torch.Tensor,
                                               torch.Tensor,
                                               torch.Tensor]] = {}
-        # Use uniform Mamba layout for disagg until compact cache is supported
-        # for disagg serving.
-        self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
-                                            is not None)
+        # Real disaggregated connectors and explicit external implementations
+        # transfer manager block IDs and still need the uniform Mamba layout.
+        # The TPU DecodeBenchConnector transfers nothing: it fills the runner's
+        # compact request slots directly.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        self._uniform_mamba_layout: bool = _uses_uniform_mamba_layout(
+            kv_transfer_config)
         # Unified layout: attention KV and mamba state are fungible
         # block-table blocks in one attention-shaped pool per cache tensor.
         self._unified_kv_layout: bool = unified_kv_layout_enabled(
@@ -573,6 +590,10 @@ class TPUModelRunner(GPUModelRunner):
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
         # Set by initialize_kv_cache; None until then (dummy runs check this).
         self.kv_cache_config: KVCacheConfig | None = None
+        # Physical attention-kernel block size for each manager cache group.
+        # DecodeBenchConnector uses this to expand one scheduler block ID into
+        # every physical cache row when vLLM virtual block splitting is active.
+        self._kernel_block_size_by_group_id: dict[int, int] = {}
         # Layout plan of the most recent prepared batch; None before the
         # first execute_model.
         self._last_sequence_layout_plan = None
@@ -1955,6 +1976,51 @@ class TPUModelRunner(GPUModelRunner):
         ]
         self._has_mamba_state = True
 
+    def ensure_mamba_slots_for_requests(self,
+                                        req_ids: list[str]) -> dict[str, int]:
+        """Return stable compact-state slots for live request IDs.
+
+        The decode benchmark connector calls this before input preparation to
+        populate recurrent state. `_build_mamba_state_indices` subsequently
+        observes the same mapping, so the first decode token reads exactly the
+        slot filled by the connector.
+        """
+        if not self._has_mamba_state:
+            raise RuntimeError("compact Mamba slot pool is not initialized")
+
+        live_req_ids = set(self.input_batch.req_id_to_index.keys())
+        for request_id in list(self._mamba_slot_by_req_id):
+            if request_id not in live_req_ids:
+                self._free_mamba_slots.append(
+                    self._mamba_slot_by_req_id.pop(request_id))
+
+        unique_req_ids = list(dict.fromkeys(req_ids))
+        missing_from_batch = [
+            request_id for request_id in unique_req_ids
+            if request_id not in live_req_ids
+        ]
+        if missing_from_batch:
+            raise KeyError(
+                "cannot allocate compact Mamba slots for requests not in the "
+                f"persistent batch: {missing_from_batch}")
+
+        unallocated = [
+            request_id for request_id in unique_req_ids
+            if request_id not in self._mamba_slot_by_req_id
+        ]
+        if len(unallocated) > len(self._free_mamba_slots):
+            raise RuntimeError(
+                "compact Mamba slot pool exhausted: "
+                f"need {len(unallocated)}, have {len(self._free_mamba_slots)}")
+        for request_id in unallocated:
+            self._mamba_slot_by_req_id[request_id] = \
+                self._free_mamba_slots.pop()
+
+        return {
+            request_id: self._mamba_slot_by_req_id[request_id]
+            for request_id in unique_req_ids
+        }
+
     def _build_mamba_state_indices(self, start_index: int, num_reqs: int,
                                    target_num_reqs: int) -> torch.Tensor:
         """Build the device `mamba_state_indices` for the current chunk.
@@ -1980,28 +2046,18 @@ class TPUModelRunner(GPUModelRunner):
         condense/swap reordering automatically because the map is keyed on the
         stable req_id, not the moving persistent-batch position.
         """
-        live_req_ids = set(self.input_batch.req_id_to_index.keys())
-        # Free slots for requests that left the batch.
-        for req_id in list(self._mamba_slot_by_req_id.keys()):
-            if req_id not in live_req_ids:
-                self._free_mamba_slots.append(
-                    self._mamba_slot_by_req_id.pop(req_id))
-
         indices = self.mamba_state_indices_cpu[:target_num_reqs]
         indices.fill_(0)
         req_ids = self.input_batch.req_ids
         num_live = max(0, min(num_reqs, len(req_ids) - start_index))
+        chunk_req_ids: list[str] = []
         for i in range(num_live):
             req_id = req_ids[start_index + i]
             assert req_id is not None
-            slot = self._mamba_slot_by_req_id.get(req_id)
-            if slot is None:
-                # New request: take a fresh unique slot. The pool is sized to
-                # max_num_reqs + 1, so it can never be exhausted while the
-                # batch holds at most max_num_reqs requests.
-                slot = self._free_mamba_slots.pop()
-                self._mamba_slot_by_req_id[req_id] = slot
-            indices[i] = slot
+            chunk_req_ids.append(req_id)
+        slots = self.ensure_mamba_slots_for_requests(chunk_req_ids)
+        for i, req_id in enumerate(chunk_req_ids):
+            indices[i] = slots[req_id]
         return indices.to(self.device, non_blocking=True)
 
     def _build_mamba_copy_plan(
@@ -5610,6 +5666,7 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_config=kv_cache_config,
             kernel_block_sizes=kernel_block_sizes,
         )
+        self._kernel_block_size_by_group_id = kernel_block_size_by_gid.copy()
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
 
         for group_list in self.attn_groups:
@@ -5941,6 +5998,8 @@ class TPUModelRunner(GPUModelRunner):
             group.kv_cache_spec.block_size
             for group in kv_cache_config.kv_cache_groups
         ]
+        # This allocation path uses manager-sized physical rows directly.
+        self._kernel_block_size_by_group_id = dict(enumerate(block_sizes))
 
         self.may_reinitialize_input_batch(kv_cache_config, block_sizes)
 

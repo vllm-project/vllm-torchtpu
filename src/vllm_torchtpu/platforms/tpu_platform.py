@@ -179,6 +179,8 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 _dynamic_compile_unwrapped = False
 _tpu_patches_applied = False
 _tpu_kv_connectors_registered = False
+TPU_DECODE_BENCH_CONNECTOR_MODULE = (
+    "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector")
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -304,17 +306,24 @@ def _register_tpu_kv_connectors() -> None:
     Without registry registration, the first metrics collection triggers an unhandled
     exception in the AsyncLLM output handler, causing HTTP 500 errors on subsequent requests.
 
-    Invoked from check_and_update_config() in every process that builds a VllmConfig
-    (including the API server). Defers imports lazily until connector names are accessed.
+    Invoked by ``apply_tpu_patches()`` in every TPU process, including spawned
+    workers. Defers connector module imports until a connector is resolved.
     """
-    global _tpu_kv_connectors_registered
-    if _tpu_kv_connectors_registered:
-        return
-    _tpu_kv_connectors_registered = True
-
     from vllm.distributed.kv_transfer.kv_connector.factory import \
         KVConnectorFactory
 
+    # A forkserver can inherit this module's registration marker before it
+    # imports vLLM's connector factory. Refresh the default mapping on every
+    # invocation instead of trusting that independent module state. Explicit
+    # custom module paths still take precedence in the factory.
+    KVConnectorFactory._registry.pop("DecodeBenchConnector", None)
+    KVConnectorFactory.register_connector("DecodeBenchConnector",
+                                          TPU_DECODE_BENCH_CONNECTOR_MODULE,
+                                          "DecodeBenchConnector")
+
+    global _tpu_kv_connectors_registered
+    if _tpu_kv_connectors_registered:
+        return
     for name, module_path in (
         ("TPURaidenConnector",
          "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
@@ -324,6 +333,7 @@ def _register_tpu_kv_connectors() -> None:
          "vllm_torchtpu.offload.raiden_connector"),
     ):
         KVConnectorFactory.register_connector(name, module_path, name)
+    _tpu_kv_connectors_registered = True
 
 
 def apply_tpu_patches() -> None:
@@ -333,6 +343,11 @@ def apply_tpu_patches() -> None:
     module-level state is re-initialized on import in spawned processes.
     All patches are idempotent.
     """
+    # Connector factories run in spawned workers after this hook. Register
+    # outside the patch guard because a process may inherit the patch marker
+    # without inheriting vLLM's lazily initialized connector registry.
+    _register_tpu_kv_connectors()
+
     global _tpu_patches_applied
     if _tpu_patches_applied:
         return
@@ -849,6 +864,26 @@ class TpuPlatform(Platform):
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
         _register_tpu_kv_connectors()
+        requested_connector = vllm_config.kv_transfer_config
+        if (requested_connector is not None
+                and requested_connector.kv_connector == "DecodeBenchConnector"
+                and requested_connector.kv_connector_module_path is None):
+            # EngineCore constructs its scheduler connector before it
+            # necessarily activates the platform plugin. Propagate an
+            # explicit module path in VllmConfig so every spawned process
+            # resolves the TPU implementation independently of that ordering.
+            # An explicit external module path remains authoritative.
+            requested_connector.kv_connector_module_path = \
+                TPU_DECODE_BENCH_CONNECTOR_MODULE
+        is_tpu_decode_bench = (requested_connector is not None
+                               and requested_connector.kv_connector
+                               == "DecodeBenchConnector"
+                               and requested_connector.kv_connector_module_path
+                               == TPU_DECODE_BENCH_CONNECTOR_MODULE)
+        if is_tpu_decode_bench and vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "TPU DecodeBenchConnector does not support speculative "
+                "decoding")
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -954,7 +989,13 @@ class TpuPlatform(Platform):
         # Hybrid (attention + Mamba) models with prefix caching enabled need
         # the pool's align-mode mamba state seed copies; other cache modes
         # must be rejected up front instead of failing partway through warmup.
-        if is_hybrid and cache_config.enable_prefix_caching:
+        # Ordinary hybrid execution must restore real recurrent state from
+        # cached manager blocks. DecodeBenchConnector is different by design:
+        # it installs synthetic final recurrent state for every new request,
+        # including a fully local hit, so its compact state pool is complete
+        # without unified block-addressed restoration.
+        if (is_hybrid and cache_config.enable_prefix_caching
+                and not is_tpu_decode_bench):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
@@ -1105,6 +1146,7 @@ class TpuPlatform(Platform):
                 "TPUMultiConnector",
                 "OffloadingConnector",
                 "TPURaidenOffloadingConnector",
+                "DecodeBenchConnector",
             }
             assert kv_transfer_config.kv_connector in \
                 _TPU_SUPPORTED_KV_CONNECTORS, (
@@ -1116,6 +1158,11 @@ class TpuPlatform(Platform):
                                     in ("OffloadingConnector",
                                         "TPURaidenOffloadingConnector")
                                     and is_hybrid)
+            if (is_tpu_decode_bench
+                    and not vllm_config.cache_config.enable_prefix_caching):
+                raise ValueError(
+                    "TPU DecodeBenchConnector requires prefix caching; pass "
+                    "--enable-prefix-caching")
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):
                 # Hybrid model offloading transfers uniform pool rows; the non-unified

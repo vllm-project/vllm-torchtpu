@@ -27,11 +27,19 @@ class _FakeHybridCoordinator(HybridKVCacheCoordinator):
         return ("divergent-blocks", ), (0, 0, 0, 2304)
 
 
-def _scheduler(*, is_kv_producer: bool):
+def _scheduler(
+    *,
+    is_kv_producer: bool,
+    connector: str = "NixlConnector",
+    module_path: str | None = None,
+):
     coordinator = _FakeHybridCoordinator()
     return SimpleNamespace(
         vllm_config=SimpleNamespace(kv_transfer_config=SimpleNamespace(
-            is_kv_producer=is_kv_producer)),
+            is_kv_producer=is_kv_producer,
+            kv_connector=connector,
+            kv_connector_module_path=module_path,
+        )),
         has_mamba_layers=True,
         kv_cache_manager=SimpleNamespace(coordinator=coordinator),
     )
@@ -55,6 +63,52 @@ def test_only_producer_reconciles_divergent_hybrid_prefix_hits():
     assert producer_hits == (0, 0, 0, 0)
     assert consumer_blocks == ("divergent-blocks", )
     assert consumer_hits == (0, 0, 0, 2304)
+
+
+def test_tpu_decode_bench_keeps_divergent_attention_prefix_hit():
+    scheduler = _scheduler(
+        is_kv_producer=True,
+        connector="DecodeBenchConnector",
+        module_path=(
+            "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector"),
+    )
+
+    _reconcile_hybrid_producer_prefix_hits(scheduler)
+
+    coordinator = scheduler.kv_cache_manager.coordinator
+    blocks, hits = coordinator.find_longest_cache_hit_per_group([], 3089)
+    assert blocks == ("divergent-blocks", )
+    assert hits == (0, 0, 0, 2304)
+
+
+def test_default_decode_bench_path_keeps_divergent_attention_prefix_hit():
+    scheduler = _scheduler(
+        is_kv_producer=True,
+        connector="DecodeBenchConnector",
+        module_path=None,
+    )
+
+    _reconcile_hybrid_producer_prefix_hits(scheduler)
+
+    coordinator = scheduler.kv_cache_manager.coordinator
+    blocks, hits = coordinator.find_longest_cache_hit_per_group([], 3089)
+    assert blocks == ("divergent-blocks", )
+    assert hits == (0, 0, 0, 2304)
+
+
+def test_external_decode_bench_still_reconciles_producer_hit():
+    scheduler = _scheduler(
+        is_kv_producer=True,
+        connector="DecodeBenchConnector",
+        module_path="custom_decode_bench",
+    )
+
+    _reconcile_hybrid_producer_prefix_hits(scheduler)
+
+    coordinator = scheduler.kv_cache_manager.coordinator
+    blocks, hits = coordinator.find_longest_cache_hit_per_group([], 3089)
+    assert blocks == ("common-blocks", )
+    assert hits == (0, 0, 0, 0)
 
 
 def test_patch_reconciles_first_scheduler(monkeypatch):
