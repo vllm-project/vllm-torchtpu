@@ -45,6 +45,7 @@ trap cleanup EXIT
 # Export public TorchTPU compilation cache configuration
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${CACHE_DIR}/torch_tpu_tier3"
 export VLLM_CACHE_ROOT="${CACHE_DIR}/vllm_cache"
+export VLLM_TORCH_TPU_EXPERIMENTAL_ENABLE_LAYER_STITCHING="${VLLM_TORCH_TPU_EXPERIMENTAL_ENABLE_LAYER_STITCHING:-1}"
 export VLLM_TARGET_DEVICE="tpu"
 export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
 # Log which graphs each run compiled, so the warm-run log of Test 3 names

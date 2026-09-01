@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    VLLM_TORCH_TPU_EXPERIMENTAL_ENABLE_LAYER_STITCHING: bool = False
 
 
 def env_with_choices(
@@ -435,6 +436,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Experimental: Enable Transformer layer FX template stitching to eliminate
+    # O(N) Python tracing overhead (PR 722). Off by default during the
+    # experimental phase; will be deleted once formalized.
+    "VLLM_TORCH_TPU_EXPERIMENTAL_ENABLE_LAYER_STITCHING":
+    env_bool("VLLM_TORCH_TPU_EXPERIMENTAL_ENABLE_LAYER_STITCHING",
+             default=False),
 }
 
 

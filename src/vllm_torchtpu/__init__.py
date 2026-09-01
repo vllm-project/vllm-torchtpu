@@ -1176,11 +1176,19 @@ def _patch_vllm_piecewise_backend() -> None:
 
     def patched_call(self, *args, **kwargs):
         if self.sym_shape_indices:
-            runtime_shape = args[self.sym_shape_indices[0]]
+            val = args[self.sym_shape_indices[0]]
+            if isinstance(val, torch.Tensor):
+                runtime_shape = val.shape[0] if val.ndim > 0 else int(
+                    val.item())
+            elif isinstance(val, (int, torch.SymInt)):
+                runtime_shape = int(val)
+            else:
+                runtime_shape = val
             range_entry = self._find_range_for_shape(runtime_shape)
             assert range_entry is not None, (
                 f"Shape: {runtime_shape} out of considered ranges: "
                 f"{self.compile_ranges}")
+
         elif len(self.range_entries) > 1 or (self.compile_sizes
                                              and len(self.compile_sizes) > 1):
             # Dynamic token count from tensor dimension 0
@@ -1258,6 +1266,29 @@ def _patch_vllm_compile_prefix_isolation() -> None:
         original_init(self,
                       compile_prefix=compile_prefix,
                       is_encoder=is_encoder)
+
+        if hasattr(self, "vllm_config"):
+            try:
+                self._backend = self.vllm_config.compilation_config.init_backend(
+                    self.vllm_config,
+                    prefix=compile_prefix,
+                    is_encoder=is_encoder)
+            except Exception as e:
+                logger.debug("Could not initialize backend for stitching: %s",
+                             e)
+
+        # Transparently wrap _compiled_callable with FX layer template stitching if enabled
+        if hasattr(self, "_compiled_callable") and not is_encoder:
+            from vllm_torchtpu import envs
+            if envs.VLLM_TORCH_TPU_EXPERIMENTAL_ENABLE_LAYER_STITCHING:
+                try:
+                    from vllm_torchtpu.compilation.layer_stitcher import \
+                        wrap_callable_with_stitching
+                    self._compiled_callable = wrap_callable_with_stitching(
+                        self, self._compiled_callable)
+                except Exception as e:
+                    logger.debug(
+                        "Could not attach layer stitching wrapper: %s", e)
 
     patched_init._tpu_compile_prefix_isolation_patch = True
     TorchCompileWithNoGuardsWrapper.__init__ = patched_init
