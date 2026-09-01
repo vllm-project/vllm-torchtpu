@@ -26,11 +26,12 @@ Enable it via:
 
 Core mechanisms:
 
-- Save fence: Store jobs only read HBM after the forward pass writing those
-  blocks has fully completed. Store jobs ship as `fence_job_ids`. Each rank
-  executes a post-forward `synchronize_tensors` scoped to the registered KV pool buffers
-  and acknowledges via `fenced_jobs`. The scheduler launches `save()` only
-  after all ranks have acked.
+- Save fence: Guarantees background store jobs read HBM only after the forward
+  pass writing those KV blocks completes, without inducing device idle bubbles.
+  Store jobs ship as `fence_job_ids`. Each rank records a TPU event on the
+  stream, polls its retirement across engine steps, and acknowledges via
+  `fenced_jobs` once device execution succeeds. The scheduler launches
+  `save()` only after all ranks have acknowledged.
 
 - Completion echoes: Terminal jobs discovered by the scheduler manager ship
   down to workers, which echo them back as `completed_jobs` / `finished_recving`
@@ -73,9 +74,32 @@ from vllm_torchtpu.offload.raiden_store import (AdmissionOp,
                                                 RaidenLoadStoreSpec,
                                                 RaidenOffloadingManager,
                                                 TPURaidenStoreOffloadingSpec)
-from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _record_fence_event() -> torch.Event:
+    """Records a TPU event ordered after every program enqueued on the stream.
+
+    `record` materializes the current stream, so the event also forces
+    compilation and dispatch of any still-deferred work at the record point.
+    """
+    event = torch.tpu.Event()
+    event.record()
+    return event
+
+
+def _event_is_retired(event: torch.Event) -> bool:
+    """Non-blockingly verifies fence event completion and surfaces deferred errors.
+
+    `query` reports terminal device execution for both successful and failed
+    runs. Once ready, `synchronize` returns immediately, raising any
+    asynchronous execution error before the fence is acknowledged.
+    """
+    if not event.query():
+        return False
+    event.synchronize()
+    return True
 
 
 @dataclass
@@ -280,13 +304,13 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # Worker wrapper is only used for KV buffer registration; job dicts remain empty.
             self.connector_worker = OffloadingConnectorWorker(
                 spec, vllm_config, kv_cache_config)
-            # Track per-step fence acks and completion echoes for worker metadata.
+            # Track per-step fence acknowledgments and completion echoes for worker metadata.
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}
             self._load_error_block_ids: set[int] = set()
-            # KV pool byte views registered in register_kv_caches; the save
-            # fence waits on exactly these buffers.
-            self._pool_sync_tensors: list[torch.Tensor] = []
+            # In-flight fence events awaiting device retirement before
+            # acknowledging store jobs, recorded as (fence_job_ids, event).
+            self._pending_fences: list[tuple[set[int], torch.Event]] = []
 
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
@@ -335,10 +359,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 CanonicalKVCacheTensor(tensor=int8_view,
                                        page_size_bytes=page_size_bytes))
 
-        self._pool_sync_tensors = [
-            pool_tensor.tensor for pool_tensor in pool_tensors
-        ]
-
         group_data_refs = [[
             CanonicalKVCacheRef(tensor_idx=idx,
                                 page_size_bytes=pool_tensor.page_size_bytes)
@@ -356,13 +376,22 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
         if meta.fence_job_ids:
-            # Run device fence: ensure previous forward writes to HBM are complete
-            # before the controller's background save reads them.
-            assert self._pool_sync_tensors, (
-                "KV pool tensors must be registered before the save fence")
-            synchronize_tensors(self._pool_sync_tensors)
-            for job_id in meta.fence_job_ids:
-                self._fenced_jobs[job_id] = 1
+            # Defer acknowledgment behind a device fence: background saves may
+            # read HBM blocks only after the forward pass writing them completes.
+            # The event establishes that ordering without blocking the host thread.
+            self._pending_fences.append(
+                (set(meta.fence_job_ids), _record_fence_event()))
+
+        if self._pending_fences:
+            # Drain retired events non-blockingly and acknowledge completed fences.
+            still_pending: list[tuple[set[int], torch.Event]] = []
+            for job_ids, event in self._pending_fences:
+                if _event_is_retired(event):
+                    for job_id in job_ids:
+                        self._fenced_jobs[job_id] = 1
+                else:
+                    still_pending.append((job_ids, event))
+            self._pending_fences = still_pending
 
         finished_recving: set[str] = set()
         for job_id in meta.finished_store_job_ids:

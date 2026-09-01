@@ -1052,7 +1052,7 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._fenced_jobs = {}
         conn._completed_jobs = {}
         conn._load_error_block_ids = set()
-        conn._pool_sync_tensors = []
+        conn._pending_fences = []
         return conn
 
     def _meta(self, **kwargs):
@@ -1062,40 +1062,52 @@ class TestWorkerSideConnector(unittest.TestCase):
                                                  store_jobs={},
                                                  **kwargs)
 
-    def test_fence_syncs_device_and_acks(self):
+    def test_fence_acks_only_after_event_retires(self):
         conn = self._make_worker_connector()
-        kv_tensors = [MagicMock()]
-        conn._pool_sync_tensors = kv_tensors
         conn._connector_metadata = self._meta(fence_job_ids={7, 8})
+        event = object()
 
-        with patch("vllm_torchtpu.offload.raiden_connector.synchronize_tensors"
-                   ) as sync:
+        # In-flight event: fence remains pending without acknowledging store jobs.
+        with patch("vllm_torchtpu.offload.raiden_connector."
+                   "_record_fence_event", return_value=event) as rec, \
+             patch("vllm_torchtpu.offload.raiden_connector."
+                   "_event_is_retired", return_value=False):
             sending, recving = conn.get_finished(set())
-        sync.assert_called_once_with(kv_tensors)
-        self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
+        rec.assert_called_once_with()
+        self.assertEqual(conn._fenced_jobs, {})
+        self.assertEqual(conn._pending_fences, [({7, 8}, event)])
         self.assertEqual((sending, recving), (set(), set()))
 
-    def test_fence_requires_registered_pool_tensors(self):
-        conn = self._make_worker_connector()
-        conn._connector_metadata = self._meta(fence_job_ids={7})
-
-        with patch("vllm_torchtpu.offload.raiden_connector.synchronize_tensors"
-                   ) as sync:
-            with self.assertRaises(AssertionError):
-                conn.get_finished(set())
-        sync.assert_not_called()
-        self.assertEqual(conn._fenced_jobs, {})
-
-    def test_fence_scopes_sync_to_registered_pool_tensors(self):
-        conn = self._make_worker_connector()
-        kv_tensors = [MagicMock(), MagicMock()]
-        conn._pool_sync_tensors = kv_tensors
-        conn._connector_metadata = self._meta(fence_job_ids={7})
-
-        with patch("vllm_torchtpu.offload.raiden_connector.synchronize_tensors"
-                   ) as sync:
+        # Retired event: acknowledge fenced jobs and clear completed fence state.
+        conn._connector_metadata = self._meta()
+        with patch(
+                "vllm_torchtpu.offload.raiden_connector."
+                "_event_is_retired",
+                return_value=True):
             conn.get_finished(set())
-        sync.assert_called_once_with(kv_tensors)
+        self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
+        self.assertEqual(conn._pending_fences, [])
+
+    def test_event_retirement_propagates_execution_errors(self):
+        from vllm_torchtpu.offload.raiden_connector import _event_is_retired
+        event = MagicMock()
+
+        # In-flight execution: report not retired and avoid blocking synchronization.
+        event.query.return_value = False
+        self.assertFalse(_event_is_retired(event))
+        event.synchronize.assert_not_called()
+
+        # Successful completion: synchronize returns immediately on the ready
+        # event and surfaces deferred errors.
+        event.query.return_value = True
+        self.assertTrue(_event_is_retired(event))
+        event.synchronize.assert_called_once_with()
+
+        # Asynchronous execution failure: propagate the error rather than
+        # acknowledging the fence as completed.
+        event.synchronize.side_effect = RuntimeError("async failure")
+        with self.assertRaises(RuntimeError):
+            _event_is_retired(event)
 
     def test_echoes_completions_and_finished_recving(self):
         conn = self._make_worker_connector()
