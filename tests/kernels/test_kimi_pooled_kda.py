@@ -3,11 +3,12 @@
 
 Phase 1.1 of KIMI_LINEAR_POOLED_APC_PLAN.md: the pooled op gathers each
 request's conv/SSM regions out of its pool block into dense batch-local
-buffers, runs the unmodified dispatched KDA core, and scatters the updated
-states back. The dense core with identity indices over null-slot-prepended
-buffers is the reference: identical values in, so the paths agree up to
-fusion reassociation of the non-Pallas f32 sums (the conv state update is
-pure data movement and stays bitwise exact).
+buffers, runs the fused conv1d + GDN v3 kernel, and scatters the updated
+states back. The dense reference is the same fused core with identity
+indices over null-slot-prepended buffers: identical values into the same
+kernel, so the paths agree up to any reassociation XLA applies around the
+gather-fed buffers (the conv state update is pure data movement and stays
+bitwise exact).
 """
 
 import jax.numpy as jnp
@@ -17,7 +18,7 @@ import pytest
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
-    _dispatched_kda_core, _pooled_kda_core)
+    _build_fused_core, _pooled_kda_core)
 
 # Kimi-Linear TP8 shard geometry on an MLA pool.
 NUM_HEADS, HEAD_DIM, KERNEL_SIZE = 4, 128, 4
@@ -130,18 +131,22 @@ def _unpack_pool(pool, block_ids, split=1):
     return conv, ssm
 
 
-def _dispatched_kda_core_dense(inputs, conv_init, ssm_init, distribution):
+def _fused_kda_core_dense(inputs, conv_init, ssm_init, distribution):
+    """The dense reference: the fused conv1d + GDN v3 core over
+    null-slot-prepended dense buffers, exactly what the pooled op runs after
+    gathering its regions (including the flat conv-state layout the kernel
+    expects)."""
     num_seqs = inputs["seq_lens"].shape[0]
     conv_buf = jnp.concatenate([jnp.zeros_like(conv_init[:1]), conv_init],
                                axis=0)
     ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_init[:1]), ssm_init], axis=0)
     identity = jnp.arange(1, num_seqs + 1, dtype=jnp.int32)
-    return _dispatched_kda_core(
+    output, new_conv, new_ssm = _build_fused_core(LOWER_BOUND, EPS)(
         inputs["mixed_qkv"],
         inputs["raw_gate"],
         inputs["beta"],
         inputs["output_gate"],
-        conv_buf,
+        conv_buf.reshape(num_seqs + 1, KERNEL_SIZE - 1, -1),
         ssm_buf,
         inputs["conv_weight"],
         inputs["a_log"],
@@ -151,9 +156,9 @@ def _dispatched_kda_core_dense(inputs, conv_init, ssm_init, distribution):
         identity,
         inputs["seq_lens"],
         distribution,
-        lower_bound=LOWER_BOUND,
-        eps=EPS,
     )
+    return output, new_conv.reshape(num_seqs + 1, KERNEL_SIZE - 1, 3,
+                                    NUM_HEADS, HEAD_DIM), new_ssm
 
 
 def _run_pooled(inputs, pool, block_ids, distribution, pool_block_tokens):
@@ -198,7 +203,7 @@ def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end):
                                dtype=jnp.int32)
     block_ids = [1, 2, 3][:num_seqs]
 
-    out_dense, conv_dense, ssm_dense = _dispatched_kda_core_dense(
+    out_dense, conv_dense, ssm_dense = _fused_kda_core_dense(
         inputs, conv_init, ssm_init, distribution)
 
     pool = _pack_pool(conv_init, ssm_init, block_ids)
@@ -338,30 +343,13 @@ def test_pooled_kda_multistep_state_evolution():
     ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_init[:1]), ssm_init], axis=0)
     # Pooled: the request's state lives in pool block 1.
     pool = _pack_pool(conv_init, ssm_init, [1])
-    identity = jnp.asarray([1], dtype=jnp.int32)
 
     for step_idx, (query_len, seq_len, decode_end) in enumerate(steps):
         inputs = _inputs(rng, [query_len], [seq_len])
         distribution = jnp.asarray([decode_end, 1, 1], dtype=jnp.int32)
 
-        out_dense, conv_buf, ssm_buf = _dispatched_kda_core(
-            inputs["mixed_qkv"],
-            inputs["raw_gate"],
-            inputs["beta"],
-            inputs["output_gate"],
-            conv_buf,
-            ssm_buf,
-            inputs["conv_weight"],
-            inputs["a_log"],
-            inputs["dt_bias"],
-            inputs["norm_weight"],
-            inputs["query_start_loc"],
-            identity,
-            inputs["seq_lens"],
-            distribution,
-            lower_bound=LOWER_BOUND,
-            eps=EPS,
-        )
+        out_dense, conv_buf, ssm_buf = _fused_kda_core_dense(
+            inputs, conv_buf[1:], ssm_buf[1:], distribution)
         out_pool, pool = _run_pooled(inputs,
                                      pool, [1],
                                      distribution,

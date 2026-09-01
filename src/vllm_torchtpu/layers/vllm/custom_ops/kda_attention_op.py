@@ -778,7 +778,6 @@ def _pooled_kda_core(
     lower_bound: float | None,
     eps: float,
     pool_block_tokens: int,
-    use_mega_prefill: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     num_heads = a_log.shape[0]
@@ -838,19 +837,26 @@ def _pooled_kda_core(
     conv_local = conv_gathered.reshape(num_reqs, -1)[:, :conv_elems].reshape(
         num_reqs, kernel_size - 1, 3, num_heads, head_dim)
 
-    # Dense slot 0 is scratch for the kernels' idempotent null-block writes.
+    # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
     conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local],
                                axis=0)
     ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local],
                               axis=0)
     identity = jnp.arange(1, num_reqs + 1, dtype=jnp.int32)
 
-    output, new_conv_buf, new_ssm_buf = _dispatched_kda_core(
+    # The fused conv1d + GDN v3 kernel takes the conv state flat
+    # [slots, K - 1, 3*H*D]; the buffers here lay their channels out as
+    # (K - 1, 3, H, D) in row-major order, so both reshapes are free. Padded
+    # and zero-length sequences are safe under identity indices because the
+    # kernel gates their state DMAs to zero size rather than redirecting them
+    # to the null slot.
+    fused_core = _build_fused_core(lower_bound, eps)
+    output, new_conv_buf, new_ssm_buf = fused_core(
         mixed_qkv,
         raw_gate,
         beta,
         output_gate,
-        conv_buf,
+        conv_buf.reshape(num_reqs + 1, kernel_size - 1, -1),
         ssm_buf,
         conv_weight,
         a_log,
@@ -860,10 +866,9 @@ def _pooled_kda_core(
         identity,
         seq_lens,
         distribution,
-        lower_bound=lower_bound,
-        eps=eps,
-        use_mega_prefill=use_mega_prefill,
     )
+    new_conv_buf = new_conv_buf.reshape(num_reqs + 1, kernel_size - 1, 3,
+                                        num_heads, head_dim)
 
     # Scatter the real slots back; the padding rows/elems of each region are
     # zero-filled so the pool bytes stay deterministic.
@@ -903,6 +908,9 @@ def build_kimi_pooled_kda_op(
 
     Same torch-level contract as the dense dispatched op, except the two
     state caches are replaced by the single attention-shaped pool buffer.
+    The state regions are gathered out of the pool, run through the fused
+    conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
+    unfused core is not available here), and scattered back.
 
     ``pool_block_tokens`` is the MANAGER block size in tokens
     (``cache_config.block_size``); the op converts it to pool rows to size
@@ -910,8 +918,11 @@ def build_kimi_pooled_kda_op(
     manager->pool-block split for the state-index remap.
     """
 
-    prefill_kernel = _get_kda_prefill_kernel()
-    use_mega_prefill = prefill_kernel == "mega"
+    if not _use_fused_kda():
+        logger.warning(
+            "VLLM_TORCHTPU_KDA_FUSED=0 does not apply to the pooled KDA op "
+            "%s: the unified pool only supports the fused conv1d + GDN v3 "
+            "kernel.", prefix)
 
     def pooled_core(
         mixed_qkv: jax.Array,
@@ -945,10 +956,13 @@ def build_kimi_pooled_kda_op(
                                 distribution,
                                 lower_bound=lower_bound,
                                 eps=eps,
-                                pool_block_tokens=pool_block_tokens,
-                                use_mega_prefill=use_mega_prefill)
+                                pool_block_tokens=pool_block_tokens)
 
-    op_name = f"pallas::kimi_pooled_kda_{prefix.replace('.', '_')}"
+    # vLLM's compile cache is keyed on the model config and not on the op
+    # body, so the kernel variant goes in the op name (see
+    # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
+    # era would otherwise be served stale.
+    op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4, ))
 
     def _fake_pooled(mixed_qkv, _raw_gate, _beta, _output_gate, pool,
