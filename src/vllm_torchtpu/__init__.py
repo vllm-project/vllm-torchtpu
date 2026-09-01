@@ -780,6 +780,42 @@ def _patch_vllm_offloading_connector_spec() -> None:
             self.connector_worker = OffloadingConnectorWorker(
                 spec, vllm_config, kv_cache_config)
 
+            def _register_kv_caches(kv_caches):
+                import torch
+                from vllm.v1.kv_offload.base import (CanonicalKVCacheRef,
+                                                     CanonicalKVCaches,
+                                                     CanonicalKVCacheTensor)
+
+                assert self.connector_worker is not None
+                num_blocks = self.connector_worker.kv_cache_config.num_blocks
+                storages = {
+                    t.untyped_storage().data_ptr():
+                    (t.untyped_storage(), t.device)
+                    for v in kv_caches.values()
+                    for t in ([v] if isinstance(v, torch.Tensor) else v)
+                }
+                pool_tensors = [
+                    CanonicalKVCacheTensor(
+                        tensor=torch.empty(0, dtype=torch.int8,
+                                           device=dev).set_(storage).view(
+                                               num_blocks,
+                                               storage.nbytes() // num_blocks),
+                        page_size_bytes=storage.nbytes() // num_blocks,
+                    ) for storage, dev in storages.values()
+                ]
+                group_refs = [
+                    [
+                        CanonicalKVCacheRef(idx, p.page_size_bytes)
+                        for idx, p in enumerate(pool_tensors)
+                    ] for _ in
+                    self.connector_worker.kv_cache_config.kv_cache_groups
+                ]
+                self.connector_worker._init_worker(
+                    CanonicalKVCaches(tensors=pool_tensors,
+                                      group_data_refs=group_refs))
+
+            self.register_kv_caches = _register_kv_caches
+
     OffloadingConnector.__init__ = _init_with_tpu_spec
     OffloadingConnector._tpu_offloading_spec_patch = True
     logger.info("Applied TPU patch: OffloadingConnector TPU spec "
