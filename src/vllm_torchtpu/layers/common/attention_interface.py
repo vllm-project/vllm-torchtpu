@@ -1,5 +1,6 @@
 import functools
 import math
+import os
 from typing import Any, Callable, Optional, Tuple
 
 import jax
@@ -40,9 +41,16 @@ MAX_ALLOWED_PAGE_INDICES_N = (
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
 #
-if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not envs.USE_BATCHED_RPA_LONGCTX:
+# USE_BATCHED_RPA_SEQ_ON_LANE was replaced by VLLM_KV_CACHE_LAYOUT=HND, which
+# now selects SEQ_ALONG_LANE on both the mainline and longctx kernels. Fail
+# loudly rather than let a deployment that still sets it quietly fall back to
+# HEAD_ALONG_SUBLANE and lose half its KV cache capacity.
+if os.getenv("USE_BATCHED_RPA_SEQ_ON_LANE") is not None:
     raise ValueError(
-        "USE_BATCHED_RPA_SEQ_ON_LANE requires USE_BATCHED_RPA_LONGCTX=1.")
+        "USE_BATCHED_RPA_SEQ_ON_LANE has been removed; the SEQ_ALONG_LANE KV "
+        "cache layout is now selected with VLLM_KV_CACHE_LAYOUT=HND, which "
+        "applies to both the mainline and longctx batched-RPA kernels. Unset "
+        "USE_BATCHED_RPA_SEQ_ON_LANE and set VLLM_KV_CACHE_LAYOUT=HND.")
 
 # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
 if envs.USE_BATCHED_RPA_LONGCTX:
@@ -329,11 +337,10 @@ def sharded_ragged_paged_attention(
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
-    # The longctx fork announces seq-along-lane through
-    # `USE_BATCHED_RPA_SEQ_ON_LANE`, the mainline fork through `kv_layout`;
-    # this is the one site both share.
+    # The longctx fork resolves its layout from the env, the mainline fork
+    # passes `kv_layout` explicitly; this is the one site both share.
     seq_along_lane = ((kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-                       or envs.USE_BATCHED_RPA_SEQ_ON_LANE) and not use_hd64)
+                       or envs.SEQ_ALONG_LANE_KV_LAYOUT) and not use_hd64)
     # The sharded KV-head axis is dim 1 under SEQ_ALONG_LANE and dim 2 under
     # HEAD_ALONG_SUBLANE.
     kv_cache_spec = (P(None, "model", None, None, None)
@@ -399,9 +406,10 @@ def sharded_ragged_paged_attention(
                 rpa_default.RpaCase.PREFILL)
 
     # Only the batched kernel takes a layout; v3 and hd64 have no such
-    # parameter, and longctx resolves its own from
-    # `USE_BATCHED_RPA_SEQ_ON_LANE`, which an explicit `kv_layout` would
-    # override.
+    # parameter. longctx resolves its own from the same env var this fork
+    # derives `kv_layout` from, so the two agree -- and it must, because its
+    # `KVLayout` is a distinct enum class that would not compare equal to a
+    # mainline member passed in here.
     pass_layout = (kv_layout is not None and not use_hd64
                    and not envs.USE_BATCHED_RPA_LONGCTX)
     layout_kwargs = {"kv_layout": kv_layout} if pass_layout else {}

@@ -104,19 +104,12 @@ def resolve_batched_rpa_kv_layout() -> batched_rpa_configs.KVLayout:
 
     HND selects SEQ_ALONG_LANE, which packs head_dim rather than KV heads into
     the 32-bit words, so an fp8 page is genuinely half a bf16 one
-    (b/510425663). Reads the env var directly instead of
-    `get_kv_cache_layout()`, whose unset-fallback answers a different question
-    (the KV connector's preferred head ordering) and needs a config context.
+    (b/510425663). The longctx fork reads `envs.SEQ_ALONG_LANE_KV_LAYOUT`
+    directly and maps it onto its own `KVLayout`; both forks therefore answer
+    to the same env var.
     """
-    from vllm import envs as vllm_envs
-    if vllm_envs.VLLM_KV_CACHE_LAYOUT != "HND":
+    if not envs.SEQ_ALONG_LANE_KV_LAYOUT:
         return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
-    if envs.USE_BATCHED_RPA_LONGCTX:
-        raise NotImplementedError(
-            "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV layout on "
-            "the mainline batched-RPA kernel, but USE_BATCHED_RPA_LONGCTX "
-            "routes attention to the longctx fork, which takes its layout "
-            "from USE_BATCHED_RPA_SEQ_ON_LANE instead. Set one or the other.")
     return batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
 
 
@@ -549,11 +542,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     `--attention-backend CUSTOM`. The Impl subclass sets `use_batched_rpa=True`,
     which plumbs through `_pallas_rpa_kernel` → `attention()` →
     `sharded_ragged_paged_attention()` to pick the batched kernel function.
-    Any multiple of 128 is a valid page size for this kernel (with or without
-    `USE_BATCHED_RPA_SEQ_ON_LANE`); `get_preferred_block_size` is overridden
-    so the auto-selected default (no `--block-size` given) stays at 256. Under
-    `VLLM_KV_CACHE_LAYOUT=HND` a page is one 128-lane tile and 128 is the only
-    accepted size.
+    Any multiple of 128 is a valid page size for this kernel;
+    `get_preferred_block_size` is overridden so the auto-selected default (no
+    `--block-size` given) stays at 256. Under `VLLM_KV_CACHE_LAYOUT=HND` a page
+    is one 128-lane tile and 128 is the only accepted size.
     """
 
     @staticmethod
@@ -583,10 +575,14 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         """
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
-        if is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            raise ValueError(
-                "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'."
-            )
+        # Dtype-less probe from vLLM's offloading connector, which only
+        # locates the num_blocks axis (dim 0 in every layout). Without a dtype
+        # there is no kv_packing, so dims 2-3 are placeholders; what this fixes
+        # is the axis *order*, which is the layout's own -- block_size last for
+        # SEQ_ALONG_LANE, not dim 1 as HEAD_ALONG_SUBLANE would report.
+        # Hoisted above the fork split because it holds for both kernels.
+        if is_auto and envs.SEQ_ALONG_LANE_KV_LAYOUT and head_size != 64:
+            return (num_blocks, num_kv_heads * 2, head_size, 1, block_size)
         if envs.USE_BATCHED_RPA_LONGCTX:
             if head_size == 64 or is_auto:
                 return PallasAttentionBackend.get_kv_cache_shape(
@@ -616,11 +612,6 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 "implement; unset it or use NHD for this model.")
 
         num_kv_heads_x2 = num_kv_heads * 2
-        # Dtype-less probe from vLLM's offloading connector: it only locates
-        # the num_blocks axis, which stays at dim 0 in both layouts.
-        if is_auto:
-            return (num_blocks, num_kv_heads_x2, head_size, 1, block_size)
-
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         kv_packing = get_dtype_packing(kv_dtype)
         sublane_group = TPU_SUBLANE_COUNT * kv_packing
@@ -882,8 +873,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            unsupported_features.append("USE_BATCHED_RPA_SEQ_ON_LANE")
+        if envs.SEQ_ALONG_LANE_KV_LAYOUT:
+            unsupported_features.append("VLLM_KV_CACHE_LAYOUT=HND")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:
@@ -1242,11 +1233,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
 
     def _cache_head_width(self, kv_cache: torch.Tensor) -> int:
         # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
-        # The longctx fork selects that layout with USE_BATCHED_RPA_SEQ_ON_LANE
-        # and the mainline fork with VLLM_KV_CACHE_LAYOUT=HND; check the env
-        # var first, since the resolver rejects the two set together.
-        if (envs.USE_BATCHED_RPA_SEQ_ON_LANE
-                or resolve_batched_rpa_kv_layout()
+        if (resolve_batched_rpa_kv_layout()
                 is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
             return kv_cache.shape[2] * kv_cache.shape[3]
         return kv_cache.shape[-1]

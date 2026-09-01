@@ -21,8 +21,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config,
-    validate_kv_layout_supports_unified_pool)
+    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -1165,7 +1164,6 @@ class TpuPlatform(Platform):
                 cache_config.block_size = (  # type: ignore[assignment]
                     backend_cls.get_preferred_block_size(default))
         if unified_kv_layout_enabled(vllm_config):
-            validate_kv_layout_supports_unified_pool(backend_cls)
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
         min_page_size = backend_cls.get_min_page_size(vllm_config)

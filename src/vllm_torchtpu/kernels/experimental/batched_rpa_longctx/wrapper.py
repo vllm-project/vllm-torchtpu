@@ -153,7 +153,7 @@ def get_kv_cache_shape(
     kv_layout: configs.KVLayout | None = None,
 ):
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        if envs.SEQ_ALONG_LANE_KV_LAYOUT:
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
         else:
             kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
@@ -487,7 +487,7 @@ def ragged_paged_attention(
     """
 
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        if envs.SEQ_ALONG_LANE_KV_LAYOUT:
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
         else:
             kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE

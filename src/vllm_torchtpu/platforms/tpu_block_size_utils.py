@@ -33,35 +33,6 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
         vllm_config.model_config.architecture)
 
 
-def validate_kv_layout_supports_unified_pool(backend_cls) -> None:
-    """Reject KV layouts whose pages cannot host pooled GDN state.
-
-    The pooled layout reserves whole FA token rows in the tail of each page, so
-    a token's bytes must be contiguous — true for HEAD_ALONG_SUBLANE, whose
-    token axis is outermost, but not for SEQ_ALONG_LANE, where a token is one
-    lane strided across the whole page. Making the pool layout-aware is
-    b/545917884.
-    """
-    from vllm_torchtpu.kernels.experimental.batched_rpa import configs
-    from vllm_torchtpu.layers.vllm.attention import (
-        PallasBatchedRPAAttentionBackend, resolve_batched_rpa_kv_layout)
-
-    if resolve_batched_rpa_kv_layout() is not configs.KVLayout.SEQ_ALONG_LANE:
-        return
-    # Only the batched-RPA backend reads the layout.
-    if not (isinstance(backend_cls, type)
-            and issubclass(backend_cls, PallasBatchedRPAAttentionBackend)):
-        return
-    raise NotImplementedError(
-        "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache layout, "
-        "which cannot back the unified block pool: pooled GDN state is "
-        "addressed as whole token rows inside a page, and SEQ_ALONG_LANE "
-        "spreads each token across the page's lane axis. Use "
-        "VLLM_KV_CACHE_LAYOUT=NHD for this model, or run it with "
-        "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 if its architecture does not "
-        "need the pool.")
-
-
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,

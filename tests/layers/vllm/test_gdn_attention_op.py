@@ -89,7 +89,11 @@ class TestVllmGatedDeltaNetAttention:
     def test_seq_on_lane_preserves_manager_physical_page_split(
             self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim,
             dtype):
-        monkeypatch.setenv("USE_BATCHED_RPA_SEQ_ON_LANE", "1")
+        # Patched as a module attribute, not via os.environ: the value is
+        # derived from VLLM_KV_CACHE_LAYOUT and cached by
+        # `vllm_torchtpu.envs.enable_envs_cache()`, which has no way back.
+        from vllm_torchtpu import envs
+        monkeypatch.setattr(envs, "SEQ_ALONG_LANE_KV_LAYOUT", True)
         manager_block_size = 4096 if page_size == 512 else 4352
         vllm_config = _vllm_config(block_size=manager_block_size)
 

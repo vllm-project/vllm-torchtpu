@@ -16,8 +16,6 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import \
 from vllm_torchtpu.layers.vllm.attention import (
     PallasAttentionBackend, PallasBatchedRPAAttentionBackend,
     resolve_batched_rpa_kv_layout)
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    validate_kv_layout_supports_unified_pool
 
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
@@ -39,14 +37,25 @@ def _layout_env(monkeypatch, value):
     process-wide; `tests/entrypoints/` sorts before this file and would leave
     these tests asserting against a stale value. The cache is restored only
     after `monkeypatch.undo()`, so it can never re-cache a patched value.
+
+    `vllm_torchtpu.envs.SEQ_ALONG_LANE_KV_LAYOUT` derives from the same env var
+    but is cached by `vllm_torchtpu.envs.enable_envs_cache()`, which has no way
+    back, so patch it as a module attribute as well -- the same reason the
+    `longctx` fixture below does.
     """
     from vllm import envs as vllm_envs
+
+    from vllm_torchtpu import envs as tpu_envs
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
     if value is None:
         monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     else:
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", value)
+    monkeypatch.setattr(tpu_envs,
+                        "SEQ_ALONG_LANE_KV_LAYOUT",
+                        value == "HND",
+                        raising=False)
     try:
         yield
     finally:
@@ -234,27 +243,50 @@ def test_head_dim_64_still_works_by_default(nhd):
 # --------------------------------------------------------------------------
 
 
-def test_unified_pool_rejects_seq_along_lane(hnd):
-    with pytest.raises(NotImplementedError, match="unified block pool"):
-        validate_kv_layout_supports_unified_pool(BATCHED)
+def test_unified_pool_accepts_seq_along_lane(hnd):
+    """SEQ_ALONG_LANE can back the unified pool: the GDN custom op reshapes
+    the attention pool into its own row view at the op boundary rather than
+    requiring token-contiguous pages.
+
+    This pins the removal of `validate_kv_layout_supports_unified_pool`, which
+    rejected exactly this combination."""
+    from vllm_torchtpu.platforms import tpu_block_size_utils
+    assert not hasattr(tpu_block_size_utils,
+                       "validate_kv_layout_supports_unified_pool")
 
 
-def test_unified_pool_allows_the_default_layout(nhd):
-    validate_kv_layout_supports_unified_pool(BATCHED)
+def test_pooled_gdn_state_view_reshapes_under_hnd(hnd):
+    """The pool reshape is keyed on the layout, not on a fork-local flag, so
+    it fires for the mainline kernel too."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
+        _pooled_gdn_state_view
+
+    # (num_blocks, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
+    state = jnp.zeros((1, 2, 64, 4, 128), dtype=jnp.float8_e4m3fn)
+    viewed = _pooled_gdn_state_view(state)
+    assert viewed.shape != state.shape
+    assert viewed.size == state.size
 
 
-def test_unified_pool_ignores_other_backends(hnd):
-    """Only the batched-RPA backend reads the layout; the guard must not fire
-    for a backend that cannot select it."""
-    validate_kv_layout_supports_unified_pool(BASE)
+def test_pooled_gdn_state_view_is_identity_without_hnd(nhd):
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
+        _pooled_gdn_state_view
+
+    state = jnp.zeros((1, 2, 64, 4, 128), dtype=jnp.float8_e4m3fn)
+    assert _pooled_gdn_state_view(state).shape == state.shape
 
 
 # --------------------------------------------------------------------------
 # Coexistence with the longctx fork
 # --------------------------------------------------------------------------
 #
-# `USE_BATCHED_RPA_LONGCTX` swaps in the longctx fork, which has its own
-# seq-along-lane switch. `VLLM_KV_CACHE_LAYOUT` drives the mainline fork only.
+# `USE_BATCHED_RPA_LONGCTX` swaps in the longctx fork. Both forks now take
+# their layout from `VLLM_KV_CACHE_LAYOUT`; the longctx fork maps it onto its
+# own `KVLayout` enum inside its wrapper.
 
 
 @pytest.fixture
@@ -270,10 +302,23 @@ def longctx(monkeypatch):
     yield
 
 
-def test_hnd_under_longctx_is_refused(hnd, longctx):
-    with pytest.raises(NotImplementedError,
-                       match="USE_BATCHED_RPA_SEQ_ON_LANE"):
-        resolve_batched_rpa_kv_layout()
+def test_hnd_selects_seq_along_lane_under_longctx(hnd, longctx):
+    """HND drives both forks. Previously refused, because the longctx fork
+    took its layout from a separate flag."""
+    assert resolve_batched_rpa_kv_layout() is KVLayout.SEQ_ALONG_LANE
+
+
+def test_longctx_wrapper_reads_the_same_layout_env(hnd, longctx):
+    """The longctx fork resolves HND onto its own `KVLayout` enum, which is a
+    distinct class from the mainline one -- so the two must be compared by
+    name, not identity."""
+    from vllm_torchtpu import envs as tpu_envs
+    from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
+        configs as longctx_configs
+    assert tpu_envs.SEQ_ALONG_LANE_KV_LAYOUT
+    assert (longctx_configs.KVLayout.SEQ_ALONG_LANE.name ==
+            KVLayout.SEQ_ALONG_LANE.name)
+    assert longctx_configs.KVLayout is not KVLayout
 
 
 def test_longctx_block_sizes_are_untouched(nhd, longctx):
@@ -396,3 +441,38 @@ def test_narrow_head_is_not_spuriously_padded(hnd):
     shape = BATCHED.get_kv_cache_shape(4, 128, 2, 80, BF16)
     assert _width(BATCHED_IMPL, shape) == 80
     assert shape[-1] > 80  # what the bug read
+
+
+def test_cache_head_width_under_longctx_seq_along_lane(hnd, longctx):
+    """The longctx fork reaches `_cache_head_width` too, and its pages are
+    SEQ_ALONG_LANE under HND just like the mainline fork's.
+
+    Regression guard for the rebase onto #608: that PR keyed this branch on
+    `USE_BATCHED_RPA_SEQ_ON_LANE`, so resolving the width purely from the
+    mainline layout would silently return `shape[-1]` here and pad q/k/v
+    against a cache that is not that wide."""
+    from vllm_torchtpu.layers.vllm.attention import \
+        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
+
+    # (num_blocks, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
+    shape = (4, 2, 64, 4, 128)
+    assert _width(BATCHED_IMPL, shape) == 256
+    assert shape[-1] == 128  # what reading the last axis would have returned
+
+
+# --------------------------------------------------------------------------
+# Migration off the removed flag
+# --------------------------------------------------------------------------
+
+
+def test_removed_flag_is_rejected_at_import(monkeypatch):
+    """A deployment still setting `USE_BATCHED_RPA_SEQ_ON_LANE` must fail
+    loudly: silently ignoring it would halve KV cache capacity with no
+    signal."""
+    import importlib
+    monkeypatch.setenv("USE_BATCHED_RPA_SEQ_ON_LANE", "1")
+    import vllm_torchtpu.layers.common.attention_interface as ai
+    with pytest.raises(ValueError, match="has been removed"):
+        importlib.reload(ai)
+    monkeypatch.delenv("USE_BATCHED_RPA_SEQ_ON_LANE")
+    importlib.reload(ai)

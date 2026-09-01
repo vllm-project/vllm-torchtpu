@@ -64,8 +64,8 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
-    USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
+    SEQ_ALONG_LANE_KV_LAYOUT: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
@@ -167,6 +167,16 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
         return int(value)
 
     return _get_optional_int_env
+
+
+def _vllm_kv_cache_layout() -> str | None:
+    """Upstream vLLM's configured KV cache layout, or None if unset.
+
+    Imported inside the function: this module has no module-scope vLLM
+    dependency, and kernel modules import it.
+    """
+    from vllm import envs as vllm_envs
+    return vllm_envs.VLLM_KV_CACHE_LAYOUT
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -442,14 +452,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
-    "USE_BATCHED_RPA_SEQ_ON_LANE":
-    env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
     "TPU_PCP_TOPOLOGY_AWARE_MESH":
     lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower(
     ) not in ("0", "false", "off", "no"),
+    # SEQ_ALONG_LANE KV cache layout, derived from upstream's
+    # VLLM_KV_CACHE_LAYOUT rather than a flag of our own. Read by both the
+    # mainline and longctx batched-RPA kernels.
+    "SEQ_ALONG_LANE_KV_LAYOUT":
+    lambda: _vllm_kv_cache_layout() == "HND",
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
