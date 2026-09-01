@@ -5,7 +5,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import \
 
 class TPUMultiConnector(MultiConnector):
     """MultiConnector combining TPURaidenConnector (disaggregation) with
-    OffloadingConnector (offloading).
+    TPURaidenOffloadingConnector (offloading).
 
     Children must be listed explicitly in
     ``kv_connector_extra_config["connectors"]``. No defaults are synthesized:

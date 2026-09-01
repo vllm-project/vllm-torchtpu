@@ -1114,7 +1114,6 @@ class TpuPlatform(Platform):
                 "TPUConnector",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "OffloadingConnector",
                 "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
@@ -1124,8 +1123,7 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    in ("OffloadingConnector",
-                                        "TPURaidenOffloadingConnector")
+                                    == "TPURaidenOffloadingConnector"
                                     and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):

@@ -438,7 +438,8 @@ class TestTpuPlatform:
             # rejected earlier, by its own gate, and would mask this one.
             vllm_config.cache_config.mamba_cache_mode = "align"
         vllm_config.kv_transfer_config = MagicMock()
-        vllm_config.kv_transfer_config.kv_connector = "OffloadingConnector"
+        vllm_config.kv_transfer_config.kv_connector = (
+            "TPURaidenOffloadingConnector")
 
         if pool_env:
             monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
