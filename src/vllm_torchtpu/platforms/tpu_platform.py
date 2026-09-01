@@ -955,10 +955,14 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
-        # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # the pool's align-mode mamba state seed copies; other cache modes
-        # must be rejected up front instead of failing partway through warmup.
-        if is_hybrid and cache_config.enable_prefix_caching:
+        # Real hybrid prefix hits need pooled Mamba state seed copies.
+        # DecodeBench installs synthetic state for each request instead.
+        transfer_config = vllm_config.kv_transfer_config
+        is_decode_bench = (transfer_config is not None
+                           and transfer_config.kv_connector
+                           == "DecodeBenchConnector")
+        if (is_hybrid and cache_config.enable_prefix_caching
+                and not is_decode_bench):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
@@ -1104,6 +1108,7 @@ class TpuPlatform(Platform):
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
+                "DecodeBenchConnector",
                 "TPUConnector",
                 "TPURaidenConnector",
                 "TPUMultiConnector",

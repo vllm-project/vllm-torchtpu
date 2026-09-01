@@ -563,10 +563,12 @@ class TPUModelRunner(GPUModelRunner):
                                         tuple[torch.Tensor, torch.Tensor,
                                               torch.Tensor,
                                               torch.Tensor]] = {}
-        # Use uniform Mamba layout for disagg until compact cache is supported
-        # for disagg serving.
-        self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
-                                            is not None)
+        # DecodeBench fills local state instead of transferring manager blocks,
+        # so it can retain the compact request-indexed Mamba layout.
+        transfer_config = self.vllm_config.kv_transfer_config
+        self._uniform_mamba_layout: bool = (transfer_config is not None
+                                            and transfer_config.kv_connector
+                                            != "DecodeBenchConnector")
         # Unified layout: attention KV and mamba state are fungible
         # block-table blocks in one attention-shaped pool per cache tensor.
         self._unified_kv_layout: bool = unified_kv_layout_enabled(
