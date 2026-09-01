@@ -71,6 +71,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.parallel_precompile import parallel_precompile
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
@@ -4725,57 +4726,70 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        items = []
+        for num_tokens in self.num_tokens_paddings:
+            for num_reqs in self.num_reqs_paddings:
+                items.append((num_tokens, num_reqs))
+                if num_reqs >= min(num_tokens, self.max_num_reqs):
+                    break
+
+        def _compile_item(item):
+            num_tokens, num_reqs = item
+            dummy_hidden = torch.zeros((num_tokens, hsize),
+                                       device=self.device,
+                                       dtype=self._hidden_states_dtype)
+            indices = torch.zeros(num_reqs,
+                                  dtype=torch.int32,
+                                  device=self.device)
+            out = self.compute_selected_logits(dummy_hidden, indices)
+            synchronize_tensors(out)
+            logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens,
+                        num_reqs)
+
         with self._precompile_timed("compute_selected_logits"):
-            for num_tokens in self.num_tokens_paddings:
-                dummy_hidden = torch.zeros((num_tokens, hsize),
-                                           device=self.device,
-                                           dtype=self._hidden_states_dtype)
-                for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(num_reqs,
-                                          dtype=torch.int32,
-                                          device=self.device)
-                    out = self.compute_selected_logits(dummy_hidden, indices)
-                    synchronize_tensors(out)
-                    logger.info("  -- num_tokens: %d, num_seqs: %d",
-                                num_tokens, num_reqs)
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
+            parallel_precompile(items, _compile_item)
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
+
+        def _compile_item(num_reqs):
+            dummy_hidden = torch.zeros((num_reqs, hsize),
+                                       device=self.device,
+                                       dtype=self._hidden_states_dtype)
+            out = self.compute_logits_from_hidden_states(dummy_hidden)
+            synchronize_tensors(out)
+            logger.info("  -- num_seqs: %d", num_reqs)
+
         with self._precompile_timed("compute_logits_from_hidden_states"):
-            for num_reqs in self.num_reqs_paddings:
-                dummy_hidden = torch.zeros((num_reqs, hsize),
-                                           device=self.device,
-                                           dtype=self._hidden_states_dtype)
-                out = self.compute_logits_from_hidden_states(dummy_hidden)
-                synchronize_tensors(out)
-                logger.info("  -- num_seqs: %d", num_reqs)
+            parallel_precompile(self.num_reqs_paddings, _compile_item)
 
     def _precompile_structured_decoding(self) -> None:
+        arange = self.structured_decoding_manager.structured_decode_arange.to(
+            self.device)
+
+        def _compile_item(num_reqs):
+            out = self.structured_decoding_manager.structured_decode(
+                self.structured_decoding_manager.
+                require_structured_out_cpu[:num_reqs].to(self.device),
+                self.structured_decoding_manager.
+                grammar_bitmask_cpu[:num_reqs].to(self.device),
+                self._dummy_logits(num_reqs),
+                arange,
+            )
+            synchronize_tensors(out)
+            logger.info("  -- num_seqs: %d", num_reqs)
+
         with self._precompile_timed("structured_decoding"):
-            arange = self.structured_decoding_manager.structured_decode_arange
-            for num_reqs in self.num_reqs_paddings:
-                out = self.structured_decoding_manager.structured_decode(
-                    self.structured_decoding_manager.
-                    require_structured_out_cpu[:num_reqs].to(self.device),
-                    self.structured_decoding_manager.
-                    grammar_bitmask_cpu[:num_reqs].to(self.device),
-                    self._dummy_logits(num_reqs),
-                    arange,
-                )
-                synchronize_tensors(out)
-                logger.info("  -- num_seqs: %d", num_reqs)
-            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
-            # we skip it here as well.
+            parallel_precompile(self.num_reqs_paddings, _compile_item)
             if self.speculative_config is None or self._pcp_mtp_k1_enabled:
                 return
-            # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[
                 0]
-            for num_tokens in self.num_tokens_paddings:
-                if num_tokens > max_target_rows:
-                    break
+            target_tokens = [
+                n for n in self.num_tokens_paddings if n <= max_target_rows
+            ]
+
+            def _compile_target_item(num_tokens):
                 out = self.structured_decoding_manager.structured_decode(
                     self.structured_decoding_manager.
                     require_structured_out_target_cpu[:num_tokens].to(
@@ -4788,78 +4802,82 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
 
+            parallel_precompile(target_tokens, _compile_target_item)
+
     def _precompile_sample_from_logits(self) -> None:
+
+        def _compile_item(num_reqs):
+            dummy_logits = self._dummy_logits(num_reqs)
+            dummy_temperatures = torch.ones((num_reqs, 1),
+                                            dtype=self._hidden_states_dtype,
+                                            device=self.device)
+            dummy_u = torch.rand_like(dummy_logits)
+            dummy_top_k = torch.zeros((num_reqs, 1),
+                                      dtype=torch.int32,
+                                      device=self.device)
+            dummy_top_p = torch.ones((num_reqs, 1),
+                                     dtype=torch.float32,
+                                     device=self.device)
+            for all_greedy in [False, True]:
+                out = self.sample_from_logits_func(dummy_logits,
+                                                   dummy_temperatures,
+                                                   dummy_u,
+                                                   dummy_top_k,
+                                                   dummy_top_p,
+                                                   all_greedy=all_greedy)
+                synchronize_tensors(out)
+            logger.info("  -- num_seqs: %d", num_reqs)
+
         with self._precompile_timed("sample_from_logits"):
-            for num_reqs in self.num_reqs_paddings:
-                dummy_logits = self._dummy_logits(num_reqs)
-                dummy_temperatures = torch.ones(
-                    (num_reqs, 1),
-                    dtype=self._hidden_states_dtype,
-                    device=self.device)
-                dummy_u = torch.rand_like(dummy_logits)
-                dummy_top_k = torch.zeros((num_reqs, 1),
-                                          dtype=torch.int32,
-                                          device=self.device)
-                dummy_top_p = torch.ones((num_reqs, 1),
-                                         dtype=torch.float32,
-                                         device=self.device)
-                for all_greedy in [False, True]:
-                    out = self.sample_from_logits_func(dummy_logits,
-                                                       dummy_temperatures,
-                                                       dummy_u,
-                                                       dummy_top_k,
-                                                       dummy_top_p,
-                                                       all_greedy=all_greedy)
-                    synchronize_tensors(out)
-                logger.info("  -- num_seqs: %d", num_reqs)
+            parallel_precompile(self.num_reqs_paddings, _compile_item)
 
     def _precompile_gather_logprobs(self) -> None:
+
+        def _compile_item(num_reqs):
+            out = self.gather_logprobs(
+                self._dummy_logits(num_reqs),
+                torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device),
+            )
+            synchronize_tensors(out.logprobs)
+            logger.info("  -- num_seqs: %d", num_reqs)
+
         with self._precompile_timed("gather_logprobs"):
-            for num_reqs in self.num_reqs_paddings:
-                out = self.gather_logprobs(
-                    self._dummy_logits(num_reqs),
-                    torch.zeros((num_reqs, 1),
-                                dtype=torch.int64).to(self.device),
-                )
-                synchronize_tensors(out.logprobs)
-                logger.info("  -- num_seqs: %d", num_reqs)
+            parallel_precompile(self.num_reqs_paddings, _compile_item)
 
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-        # next_tokens source lengths the runtime produces: stride-1 num_reqs
-        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
-        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
-        # substitute doesn't recompile per real num_reqs.
         next_lens = list(self.num_reqs_paddings)
         if (self._is_async_drafter):
             next_lens.append(
                 self.max_num_reqs *
                 (1 + self.speculative_config.num_speculative_tokens))
+        items = [(num_tokens, nlen) for num_tokens in self.num_tokens_paddings
+                 for nlen in next_lens]
+
+        def _compile_item(item):
+            num_tokens, nlen = item
+            input_ids = torch.zeros(num_tokens,
+                                    dtype=torch.int32,
+                                    device=self.device)
+            cur_input_indices = torch.zeros(num_tokens,
+                                            dtype=torch.int32,
+                                            device=self.device)
+            pre_next_tokens_indices = torch.full((num_tokens, ),
+                                                 -1,
+                                                 dtype=torch.int32,
+                                                 device=self.device)
+            next_tokens = torch.zeros(nlen,
+                                      dtype=torch.int64,
+                                      device=self.device)
+            out = _substitute_placeholder_token(input_ids, cur_input_indices,
+                                                pre_next_tokens_indices,
+                                                next_tokens)
+            synchronize_tensors(out)
+            logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
+
         with self._precompile_timed("substitute_placeholder_token"):
-            for num_tokens in self.num_tokens_paddings:
-                input_ids = torch.zeros(num_tokens,
-                                        dtype=torch.int32,
-                                        device=self.device)
-                cur_input_indices = torch.zeros(num_tokens,
-                                                dtype=torch.int32,
-                                                device=self.device)
-                # -1 sentinel marks every slot as padding so the precompiled
-                # program is byte-identical to the runtime JIT call.
-                pre_next_tokens_indices = torch.full((num_tokens, ),
-                                                     -1,
-                                                     dtype=torch.int32,
-                                                     device=self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen,
-                                              dtype=torch.int64,
-                                              device=self.device)
-                    out = _substitute_placeholder_token(
-                        input_ids, cur_input_indices, pre_next_tokens_indices,
-                        next_tokens)
-                    synchronize_tensors(out)
-                    logger.info("  -- num_tokens: %d, next_len: %d",
-                                num_tokens, nlen)
+            parallel_precompile(items, _compile_item)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.

@@ -384,17 +384,20 @@ def _patch_vllm_disable_compile_ranges() -> None:
 
 
 def _patch_vllm_compile_all_ranges() -> None:
-    """Patch vllm compile all ranges to support compilation rotation.
+    """Patch vllm compile all ranges to support parallel precompilation.
 
-    Compilation rotation allows vllm to compile multiple sizes at the same time,
-    which greatly reduce the vllm startup time.
+    Parallel precompilation partitions compile ranges across DP/TP ranks so each
+    rank compiles distinct batch sizes concurrently during cold start, and then
+    loads peer ranks' artifacts from disk cache without redundant recompilation.
     """
     import os
-    from collections import deque
 
     from vllm.compilation.piecewise_backend import (PiecewiseBackend,
                                                     create_concrete_args,
                                                     get_fake_args_from_graph)
+
+    from vllm_torchtpu.compilation.parallel_precompile import \
+        parallel_precompile
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -403,45 +406,63 @@ def _patch_vllm_compile_all_ranges() -> None:
             "When loading from cache/AOT artifacts, "
             "compile_all_ranges should not be called.")
 
-        local_rank = int(os.environ["LOCAL_RANK"])
         range_entry_list = list(self.range_entries.values())
 
-        range_entry_len = len(range_entry_list)
+        def _compile_entry(entry):
+            if entry.compiled:
+                return
+            self._log_compile_start(entry.compile_range)
 
-        expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
-        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
-        d.rotate(-local_rank * (len(d) // 8))
-        indexes = list(d)
-
-        for i in indexes:
-            if i >= len(range_entry_list):
-                continue
-
-            range_entry = range_entry_list[i]
-
-            if range_entry.compiled:
-                continue
-
-            self._log_compile_start(range_entry.compile_range)
-
-            if range_entry.compile_range.is_single_size():
-                args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start)
+            if entry.compile_range.is_single_size():
+                args_list = create_concrete_args(self.graph,
+                                                 entry.compile_range.start)
             else:
                 args_list = get_fake_args_from_graph(self.graph)
 
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+            entry.runnable = self.vllm_backend.compiler_manager.compile(
                 self.graph,
                 args_list,
                 self.vllm_backend.inductor_config,
                 self.compilation_config,
-                compile_range=range_entry.compile_range,
+                compile_range=entry.compile_range,
                 graph_index=self.piecewise_compile_index,
                 num_graphs=self.total_piecewise_compiles,
                 is_encoder=self.vllm_backend.is_encoder,
             )
+            entry.compiled = True
 
-            range_entry.compiled = True
+        adapter = getattr(self.vllm_backend.compiler_manager, "adapter", None)
+        cache_dir = getattr(adapter, "cache_dir", None) if adapter else None
+        cache_enabled = not bool(
+            os.environ.get("VLLM_DISABLE_COMPILE_CACHE", "0") in ("1", "true",
+                                                                  "True"))
+
+        def _get_peer_cache_file(entry):
+            if not cache_enabled or not adapter or not cache_dir:
+                return None
+            try:
+                if entry.compile_range.is_single_size():
+                    concrete_args = create_concrete_args(
+                        self.graph, entry.compile_range.start)
+                else:
+                    concrete_args = get_fake_args_from_graph(self.graph)
+                key = adapter.key(
+                    self.graph,
+                    concrete_args,
+                    self.vllm_backend.inductor_config,
+                    self.compilation_config,
+                    self.piecewise_compile_index,
+                    entry.compile_range,
+                )
+                return os.path.join(cache_dir, key) if key else None
+            except Exception:
+                return None
+
+        parallel_precompile(
+            items=range_entry_list,
+            compile_fn=_compile_entry,
+            poll_cache_fn=_get_peer_cache_file,
+        )
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
