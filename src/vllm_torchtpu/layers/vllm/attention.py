@@ -104,11 +104,11 @@ def resolve_batched_rpa_kv_layout() -> batched_rpa_configs.KVLayout:
 
     HND selects SEQ_ALONG_LANE, which packs head_dim rather than KV heads into
     the 32-bit words, so an fp8 page is genuinely half a bf16 one
-    (b/510425663). The longctx fork reads `envs.SEQ_ALONG_LANE_KV_LAYOUT`
+    (b/510425663). The longctx fork reads `envs.seq_along_lane_enabled()`
     directly and maps it onto its own `KVLayout`; both forks therefore answer
     to the same env var.
     """
-    if not envs.SEQ_ALONG_LANE_KV_LAYOUT:
+    if not envs.seq_along_lane_enabled():
         return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     return batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
 
@@ -581,7 +581,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         # is the axis *order*, which is the layout's own -- block_size last for
         # SEQ_ALONG_LANE, not dim 1 as HEAD_ALONG_SUBLANE would report.
         # Hoisted above the fork split because it holds for both kernels.
-        if is_auto and envs.SEQ_ALONG_LANE_KV_LAYOUT and head_size != 64:
+        if is_auto and envs.seq_along_lane_enabled() and head_size != 64:
             return (num_blocks, num_kv_heads * 2, head_size, 1, block_size)
         if envs.USE_BATCHED_RPA_LONGCTX:
             if head_size == 64 or is_auto:
@@ -873,7 +873,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
-        if envs.SEQ_ALONG_LANE_KV_LAYOUT:
+        if envs.seq_along_lane_enabled():
             unsupported_features.append("VLLM_KV_CACHE_LAYOUT=HND")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")

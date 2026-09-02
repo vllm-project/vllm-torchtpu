@@ -38,24 +38,16 @@ def _layout_env(monkeypatch, value):
     these tests asserting against a stale value. The cache is restored only
     after `monkeypatch.undo()`, so it can never re-cache a patched value.
 
-    `vllm_torchtpu.envs.SEQ_ALONG_LANE_KV_LAYOUT` derives from the same env var
-    but is cached by `vllm_torchtpu.envs.enable_envs_cache()`, which has no way
-    back, so patch it as a module attribute as well -- the same reason the
-    `longctx` fixture below does.
+    `envs.seq_along_lane_enabled()` reads this env var live on each call, so
+    setting it here is enough -- nothing on our side caches the derived value.
     """
     from vllm import envs as vllm_envs
-
-    from vllm_torchtpu import envs as tpu_envs
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
     if value is None:
         monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     else:
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", value)
-    monkeypatch.setattr(tpu_envs,
-                        "SEQ_ALONG_LANE_KV_LAYOUT",
-                        value == "HND",
-                        raising=False)
     try:
         yield
     finally:
@@ -315,7 +307,7 @@ def test_longctx_wrapper_reads_the_same_layout_env(hnd, longctx):
     from vllm_torchtpu import envs as tpu_envs
     from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
         configs as longctx_configs
-    assert tpu_envs.SEQ_ALONG_LANE_KV_LAYOUT
+    assert tpu_envs.seq_along_lane_enabled()
     assert (longctx_configs.KVLayout.SEQ_ALONG_LANE.name ==
             KVLayout.SEQ_ALONG_LANE.name)
     assert longctx_configs.KVLayout is not KVLayout

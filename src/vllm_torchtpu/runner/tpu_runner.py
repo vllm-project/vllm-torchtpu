@@ -2141,7 +2141,7 @@ class TPUModelRunner(GPUModelRunner):
         for raw in raw_tensors:
             if raw.dim() > 1:
                 kernel_block_size = (raw.shape[-1]
-                                     if envs.SEQ_ALONG_LANE_KV_LAYOUT else
+                                     if envs.seq_along_lane_enabled() else
                                      raw.shape[1])
                 self._pool_block_split = (self.cache_config.block_size //
                                           kernel_block_size)

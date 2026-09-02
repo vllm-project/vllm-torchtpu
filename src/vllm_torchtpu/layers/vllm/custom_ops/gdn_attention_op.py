@@ -67,7 +67,7 @@ def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     into GDN's expected standard 5D layout:
       (num_blocks, gdn_kernel_block_size, packed_num_heads, kv_packing, padded_head_size)
     """
-    if not envs.SEQ_ALONG_LANE_KV_LAYOUT:
+    if not envs.seq_along_lane_enabled():
         return recurrent_state
     if recurrent_state.ndim != 5:
         raise ValueError("SEQ_ALONG_LANE unified pool must be rank 5, got "
@@ -118,7 +118,7 @@ def _pooled_gdn_block_tokens(vllm_config: VllmConfig,
     with the GDN rows per page (pooled_state.shape[1]).
     """
     manager_block_tokens = vllm_config.cache_config.block_size
-    if not envs.SEQ_ALONG_LANE_KV_LAYOUT:
+    if not envs.seq_along_lane_enabled():
         return manager_block_tokens
     kernel_block_size = recurrent_state.shape[-1]
     if manager_block_tokens % kernel_block_size != 0:
@@ -715,7 +715,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"local GDN V heads {local_num_v_heads} must be divisible "
                 f"by pcp_size={pcp_size}.")
 
-        if envs.SEQ_ALONG_LANE_KV_LAYOUT:
+        if envs.seq_along_lane_enabled():
             raise NotImplementedError(
                 "GDN pooled PCP prefill is not supported with "
                 "VLLM_KV_CACHE_LAYOUT=HND.")

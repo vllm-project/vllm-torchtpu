@@ -340,7 +340,7 @@ def sharded_ragged_paged_attention(
     # The longctx fork resolves its layout from the env, the mainline fork
     # passes `kv_layout` explicitly; this is the one site both share.
     seq_along_lane = ((kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-                       or envs.SEQ_ALONG_LANE_KV_LAYOUT) and not use_hd64)
+                       or envs.seq_along_lane_enabled()) and not use_hd64)
     # The sharded KV-head axis is dim 1 under SEQ_ALONG_LANE and dim 2 under
     # HEAD_ALONG_SUBLANE.
     kv_cache_spec = (P(None, "model", None, None, None)
