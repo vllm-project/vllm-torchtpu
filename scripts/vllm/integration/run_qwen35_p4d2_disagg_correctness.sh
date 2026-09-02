@@ -26,6 +26,10 @@ PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
 DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
+# P4D4 uses a smaller per-worker premapped pool than the plugin-wide Raiden
+# default to reduce libtpu startup reservation time for this bounded case.
+TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-8589934592}"
+TPU_PARALLEL_PRECOMPILE="${TPU_PARALLEL_PRECOMPILE:-1}"
 # Match the large-cache PCP prefill compilation geometry. An empty override
 # makes vLLM derive the block count from available HBM.
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE-}"
@@ -100,6 +104,8 @@ export PREFILL_BLOCK_SIZE
 export DECODE_BLOCK_SIZE
 export ENABLE_PREFIX_CACHING
 export MAMBA_CACHE_MODE
+export TPU_PREMAPPED_BUFFER_SIZE
+export TPU_PARALLEL_PRECOMPILE
 export NUM_GPU_BLOCKS_OVERRIDE
 export GPU_MEMORY_UTILIZATION
 export MAX_MODEL_LEN

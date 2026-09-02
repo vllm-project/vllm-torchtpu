@@ -97,6 +97,48 @@ def _patch_vllm_hybrid_producer_prefix_hits() -> None:
     logger.info("Applied TPU patch: reconcile hybrid producer prefix hits.")
 
 
+def _patch_vllm_mamba_split_scheduler_block_size() -> None:
+    """Align Mamba prefill splits to the scheduler block size.
+
+    vLLM 0.27.0 uses the rank-local physical ``CacheConfig.block_size`` in
+    ``Scheduler._mamba_block_aligned_split``.  Under hybrid PCP, prefix hashes
+    and reusable Mamba states instead advance at ``Scheduler.block_size``, the
+    logical block spanning all PCP ranks.  Calling the upstream method with a
+    scheduler-local cache-config view backports the corresponding one-line fix
+    without mutating the shared ``VllmConfig.cache_config`` or copying the
+    scheduling algorithm into this plugin.
+    """
+    import copy
+    from functools import wraps
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original_split = Scheduler._mamba_block_aligned_split
+    if getattr(original_split, "_tpu_scheduler_block_size_patch", False):
+        return
+
+    @wraps(original_split)
+    def split_with_scheduler_block_size(self, *args, **kwargs):
+        physical_cache_config = self.cache_config
+        if physical_cache_config.block_size == self.block_size:
+            return original_split(self, *args, **kwargs)
+
+        scheduler_cache_config = copy.copy(physical_cache_config)
+        scheduler_cache_config.block_size = self.block_size
+        # schedule() calls this method synchronously on the EngineCore thread,
+        # and the upstream implementation contains no callback or await point.
+        self.cache_config = scheduler_cache_config
+        try:
+            return original_split(self, *args, **kwargs)
+        finally:
+            self.cache_config = physical_cache_config
+
+    split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
+    Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size
+    logger.info(
+        "Applied TPU patch: align Mamba prefill splits to scheduler blocks.")
+
+
 def _patch_vllm_aot_compile_cache_key() -> None:
     """Include the TPU compiler hash, and the trace ordinal, in vLLM's outer
     AOT cache key."""
@@ -631,6 +673,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_mamba_split_scheduler_block_size()
     _patch_vllm_offloading_config_build()
     _patch_vllm_offloading_connector_spec()
     # Platform activation can happen from inside the first Scheduler.__init__.
