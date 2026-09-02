@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+import vllm.envs as vllm_envs
 from jax.sharding import PartitionSpec
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -228,7 +229,6 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pooled_pcp_seq_on_lane_uses_standard_gdn_pool_view(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, monkeypatch):
-        import vllm.envs as vllm_envs
         vllm_envs.disable_envs_cache()
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         attn = _qwen35_397b_gdn_attn("seq_on_lane_test_layer")

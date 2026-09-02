@@ -346,8 +346,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     rank_indices = jnp.arange(pcp_size, dtype=jnp.int32)
 
     q_len_raw = cu_q_lens[1:] - cu_q_lens[:-1]
-    req_active = jnp.logical_and(request_indices < active_num_reqs,
-                                 q_len_raw > 0)
+    req_active = jnp.logical_and(request_indices < active_num_reqs, q_len_raw
+                                 > 0)
     q_len = jnp.where(req_active, q_len_raw, 0)
     kv_len = jnp.where(req_active, kv_lens, 0)
     request_absolute_query_start = jnp.where(req_active, kv_len - q_len, 0)
@@ -388,21 +388,20 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         tile_indices[None, :, None],
     )
     q_last_row = jnp.maximum(q_sizes - 1, 0)
-    q_global_last = (
-        q_global_starts +
-        (q_last_row // interleave_size_i32) * cycle_i32 +
-        (q_last_row % interleave_size_i32))
-    request_relative_end = (
-        q_global_last - request_absolute_query_start[:, None, None] + 1)
+    q_global_last = (q_global_starts +
+                     (q_last_row // interleave_size_i32) * cycle_i32 +
+                     (q_last_row % interleave_size_i32))
+    request_relative_end = (q_global_last -
+                            request_absolute_query_start[:, None, None] + 1)
     request_relative_end = jnp.where(q_sizes > 0, request_relative_end, 0)
     current_effective_lens = jnp.max(request_relative_end, axis=-1)
 
     tile_active = current_effective_lens > 0
     owner_cycle_offset = jnp.mod(token_owner_start, cycle_i32)[:, None]
-    has_history_boundary = (
-        request_absolute_query_start % virtual_page_size_i32 != 0)[:, None]
-    full_history_num_groups = (
-        request_absolute_query_start // virtual_page_size_i32)[:, None]
+    has_history_boundary = (request_absolute_query_start %
+                            virtual_page_size_i32 != 0)[:, None]
+    full_history_num_groups = (request_absolute_query_start //
+                               virtual_page_size_i32)[:, None]
     current_num_groups = jnp.where(
         tile_active,
         (owner_cycle_offset + current_effective_lens + cycle_i32 - 1) //
@@ -420,8 +419,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         request_indices[:, None],
         (max_num_seqs, max_q_tiles),
     ).reshape(num_request_tiles)
-    tile_q_global_starts = q_global_starts.reshape(num_request_tiles,
-                                                   pcp_size)
+    tile_q_global_starts = q_global_starts.reshape(num_request_tiles, pcp_size)
     tile_q_sizes = q_sizes.reshape(num_request_tiles, pcp_size)
     tile_q_hbm_offsets = q_hbm_offsets.reshape(num_request_tiles, pcp_size)
     tile_token_owner_starts = jnp.broadcast_to(

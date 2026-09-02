@@ -711,9 +711,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         max_model_len = (vllm_config.model_config.max_model_len
                          if use_pcp_streaming and vllm_config is not None else
                          None)
-        pcp_kv_layout = (
-            self.kv_layout if use_pcp_streaming else
-            batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE)
+        pcp_kv_layout = (self.kv_layout if use_pcp_streaming else
+                         batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale, v_scale, use_pcp_streaming,
                       cp_kv_cache_interleave_size, max_model_len,
