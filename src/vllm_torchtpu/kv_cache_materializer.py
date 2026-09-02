@@ -157,8 +157,17 @@ def allocate_raw_kv_cache_tensors(
             raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
         fa_page_bytes = (raw.numel() * raw.element_size() //
                          (num_blocks * split))
-        assert fa_page_bytes * split == pool_page_bytes, (fa_page_bytes, split,
-                                                          pool_page_bytes)
+        if fa_page_bytes * split != pool_page_bytes:
+            group_pages = [
+                (type(g.kv_cache_spec).__name__, g.kv_cache_spec.block_size,
+                 g.kv_cache_spec.page_size_bytes)
+                for g in kv_cache_config.kv_cache_groups
+            ]
+            raise AssertionError(
+                f"pool page mismatch: fa_page_bytes={fa_page_bytes} "
+                f"split={split} pool_page_bytes={pool_page_bytes} "
+                f"kernel_block_size={kernel_block_size} "
+                f"pool_shape={tuple(raw.shape)} group_pages={group_pages}")
         raw_tensors.append(raw)
         for layer_name in kv_cache_tensor.shared_by:
             layer_to_raw[layer_name] = raw
