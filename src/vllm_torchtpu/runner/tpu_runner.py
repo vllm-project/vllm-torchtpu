@@ -115,7 +115,8 @@ from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              normalize_draft_config)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
-from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
+from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
+                                         extract_request_ids_for_tracing)
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
@@ -3614,6 +3615,10 @@ class TPUModelRunner(GPUModelRunner):
 
             trace_kwargs = extract_request_ids_for_tracing(
                 self.input_batch.req_ids, start_index, num_reqs)
+            trace_kwargs.update(
+                extract_kv_lens_for_tracing(
+                    self.input_batch.num_computed_tokens_cpu, start_index,
+                    num_reqs))
 
             if self.phase_based_profiler and 'batch_composition_stats' in locals(
             ):
@@ -3631,8 +3636,14 @@ class TPUModelRunner(GPUModelRunner):
                     trace_kwargs[target_key] = batch_composition_stats.get(
                         src_key, "UNKNOWN" if src_key == "phase" else 0)
 
+            trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
+            if "min_kv_len" in trace_kwargs:
+                trace_name += (f", kv_len min={trace_kwargs['min_kv_len']} "
+                               f"avg={trace_kwargs['avg_kv_len']} "
+                               f"max={trace_kwargs['max_kv_len']}")
+
             with TraceAnnotation(
-                    name="ModelForward",
+                    name=trace_name,
                     num_reqs=num_reqs,
                     **trace_kwargs,
             ), set_forward_context(
