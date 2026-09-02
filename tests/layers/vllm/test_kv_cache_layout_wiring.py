@@ -424,6 +424,31 @@ def test_cache_head_width_under_longctx_seq_along_lane(hnd, longctx):
     assert shape[-1] == 128  # what reading the last axis would have returned
 
 
+# Only a layout-aware backend may be paired with HND
+
+
+@pytest.mark.parametrize("backend,ok", [(BATCHED, True), (BASE, False)])
+def test_hnd_requires_a_layout_aware_backend(hnd, backend, ok):
+    """The layout is read globally (pooled GDN view, mamba block split) but
+    only the batched-RPA backend allocates SEQ_ALONG_LANE pages. Pairing HND
+    with any other backend would reinterpret pages in a layout nobody
+    allocated -- silently, so this must fail at config time."""
+    from vllm_torchtpu.platforms.tpu_block_size_utils import \
+        validate_backend_supports_kv_layout
+    if ok:
+        validate_backend_supports_kv_layout(backend)
+    else:
+        with pytest.raises(NotImplementedError, match="does not"):
+            validate_backend_supports_kv_layout(backend)
+
+
+def test_default_layout_accepts_any_backend(nhd):
+    from vllm_torchtpu.platforms.tpu_block_size_utils import \
+        validate_backend_supports_kv_layout
+    validate_backend_supports_kv_layout(BASE)
+    validate_backend_supports_kv_layout(BATCHED)
+
+
 # Migration off the removed flag
 
 

@@ -21,7 +21,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
+    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config,
+    validate_backend_supports_kv_layout)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -1143,6 +1144,8 @@ class TpuPlatform(Platform):
 
         if backend_cls is None:
             return
+
+        validate_backend_supports_kv_layout(backend_cls)
 
         architectures = getattr(
             getattr(vllm_config.model_config, "hf_config", None),

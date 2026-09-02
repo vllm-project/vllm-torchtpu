@@ -33,6 +33,36 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
         vllm_config.model_config.architecture)
 
 
+def validate_backend_supports_kv_layout(backend_cls) -> None:
+    """Reject `VLLM_KV_CACHE_LAYOUT=HND` when the selected backend ignores it.
+
+    SEQ_ALONG_LANE is implemented only by the batched-RPA kernels; every other
+    backend allocates HEAD_ALONG_SUBLANE pages whatever the env var says. The
+    layout is read globally, though -- the pooled GDN state view and the mamba
+    block split both derive their geometry from it -- so a backend that does
+    not honour it would have its pages reinterpreted in a layout nobody
+    allocated. Fail at config time instead, since the mismatch is otherwise
+    silent: wrong GDN state and wrong block accounting, no error.
+
+    tpu-inference pairs the same two conditions (`USE_BATCHED_RPA_KERNEL and
+    USE_BATCHED_RPA_SEQ_ON_LANE` in `layers/common/sharding.py`).
+    """
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.vllm.attention import \
+        PallasBatchedRPAAttentionBackend
+
+    if not envs.seq_along_lane_enabled():
+        return
+    if isinstance(backend_cls, type) and issubclass(
+            backend_cls, PallasBatchedRPAAttentionBackend):
+        return
+    raise NotImplementedError(
+        "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache layout, "
+        f"which {getattr(backend_cls, '__name__', backend_cls)} does not "
+        "implement -- only the batched-RPA kernels do. Run with "
+        "--attention-backend CUSTOM, or use VLLM_KV_CACHE_LAYOUT=NHD.")
+
+
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
