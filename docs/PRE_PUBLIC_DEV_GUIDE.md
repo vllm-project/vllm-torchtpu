@@ -106,13 +106,12 @@ All contributions during this pre-public phase must strictly follow this 4-step 
   ```
 
 - **UI Override (Temporary Pre-Public Option):** During this pre-public stage, repository collaborators can also manually click the DCO check details in the GitHub PR UI and click "Set DCO to PASS" to manually override and pass the check when necessary.
-1. **Push & Open PR with Assignees:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`:
+1. **Push & Open PR with Assignees & Reviewers:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`, or add multiple reviewers using comma-separated handles:
 
    ```bash
    git push origin HEAD
    gh pr create --fill --assignee reviewer1,reviewer2
-   gh pr edit --add-reviewer reviewer3
-
+   gh pr edit --add-reviewer reviewer3,reviewer4
    ```
 
 1. **Start CI with the `ready` Label:** Opening a PR does **NOT** start the test suite. Buildkite runs a short bootstrap job that stops unless the PR carries the `ready` label, so work-in-progress branches no longer occupy TPU agents:
@@ -234,6 +233,7 @@ In urgent situations where you must unblock yourself immediately:
 | Objective | Command / Direct Link |
 | :--- | :--- |
 | **Phase 1: Create PR & Assign** | `gh pr create --fill --assignee reviewer1,reviewer2` |
+| **Phase 1: Add Multiple Reviewers** | `gh pr edit <PR_NUMBER> --add-reviewer reviewer3,reviewer4` |
 | **Phase 1: Start CI (`ready` label)** | `gh pr edit <PR_NUMBER> --add-label ready` |
 | **Phase 2: Check PR Approval** | `gh pr view <PR_NUMBER> --json latestReviews --jq 'if ([.latestReviews[] \| select(.state == "APPROVED")] \| length > 0) then "APPROVED ✅" else "NOT APPROVED ❌" end'` |
 | **Phase 2: Check Resolved Discussions** | `gh api graphql -F owner='vllm-project' -F repo='vllm-torchtpu' -F pr=<PR_NUMBER> -f query='query($owner: String!, $repo: String!, $pr: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $pr) { reviewThreads(first: 50) { nodes { isResolved } } } } }' --jq 'if ([.data.repository.pullRequest.reviewThreads.nodes[] \| select(.isResolved == false)] \| length == 0) then "RESOLVED ✅" else "UNRESOLVED ❌" end'` |
