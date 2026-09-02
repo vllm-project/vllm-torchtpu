@@ -2,7 +2,7 @@
 """Native byte-span declarations for Stage-3 resharding.
 
 The producer lowers the PCP kernel's token ownership directly to the byte
-ranges consumed by Raiden.  GDN state is head-sharded across PCP ranks, so its
+ranges consumed by Raiden. GDN state is head-sharded across PCP ranks, so its
 declaration similarly lowers each rank's compact local state into the
 corresponding head ranges of the full destination state.
 """
@@ -12,7 +12,9 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Sequence
 
-from .tags import TAG_GDN_CONV, TAG_GDN_SSM
+from vllm_torchtpu.distributed.kv_transfer.raiden.tags import TAG_GDN_CONV
+from vllm_torchtpu.distributed.kv_transfer.raiden.tags import TAG_GDN_SSM
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import pcp_layout
 
 # Physical granule of the admitted raw TPU FP8 pool layout: byte ranges
 # whose offsets and sizes are whole multiples of this are placement-exact
@@ -23,7 +25,19 @@ _TPU_PHYSICAL_TOKEN_BYTES = 1024
 
 @dataclasses.dataclass(frozen=True)
 class PoolByteSpan:
-    """One byte copy between a registered source and destination block."""
+    """Represents a single byte copy between source and destination blocks.
+
+    Attributes:
+        src_block_ordinal: Zero-based index into the rank's allocated block_ids.
+        src_offset_bytes: Byte offset within the source block.
+        dst_block_index: Block index within destination space (0 for FA).
+        dst_offset_bytes: Byte offset within the destination block or space.
+        size_bytes: Number of contiguous bytes to copy.
+        src_stride_bytes: Stride between successive source rows in 2D copies.
+        dst_stride_bytes: Stride between successive destination rows in 2D
+          copies.
+        count: Number of 2D stride repetitions (1 for flat 1D copies).
+    """
 
     src_block_ordinal: int
     src_offset_bytes: int
@@ -37,28 +51,63 @@ class PoolByteSpan:
 
 @dataclasses.dataclass(frozen=True)
 class PoolSpanRegistration:
-    """One rank's byte declarations for one exact pool tag."""
+    """Represents one rank's byte copy declarations for an exact pool tag.
+
+    Attributes:
+        tag: Pool tag identifier (e.g. 'fa', 'gdn.conv', 'gdn.ssm').
+        block_ids: Tuple of physical block IDs allocated on this rank.
+        spans: Tuple of PoolByteSpan descriptors defining data transfers.
+        declared_bytes: Total number of live bytes transferred across all spans.
+        dst_space_version: Destination space addressing mode. 0: page-indexed
+          destination spans (state classes). 1: request-global compact
+          destination byte space (FA) where the controller splits at destination
+          pages (T3.4).
+    """
 
     tag: str
     block_ids: tuple[int, ...]
     spans: tuple[PoolByteSpan, ...]
     declared_bytes: int
-    # 0: page-indexed destination spans (state classes). 1: request-global
-    # compact destination byte space (FA) — the controller splits at
-    # destination pages (T3.4).
     dst_space_version: int = 0
 
 
 def owned_token_ranges(
     *,
+    token_base: int = 0,
     num_tokens: int,
     transfer_rank: int,
     parallelism: int,
     interleave_tokens: int,
 ) -> list[tuple[int, int]]:
-    """Return this producer rank's PCP-owned destination token ranges."""
-    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import pcp_layout
+    """Returns this producer rank's PCP-owned destination token ranges.
 
+    Calculates the contiguous sub-intervals of prompt tokens owned by the
+    specified Context Parallel (PCP) transfer rank. When token_base > 0, the
+    ranges are offset into the global request sequence coordinates, enabling
+    sub-chunk span lowering for pipelined KV cache transfers.
+
+    Args:
+        token_base: Global token index offset for this chunk (must align with
+          the PCP interleave cycle: parallelism * interleave_tokens).
+        num_tokens: Number of prompt tokens in this chunk to partition.
+        transfer_rank: Zero-based Context Parallel rank of the producer.
+        parallelism: Context Parallelism degree (PCP size).
+        interleave_tokens: Number of consecutive tokens assigned per rank
+          before striding to the next rank in the PCP cycle.
+
+    Returns:
+        A list of (start_token, end_token) half-open index pairs representing
+        the token ranges owned by transfer_rank within [token_base, token_base +
+        num_tokens).
+
+    Raises:
+        ValueError: If token_base < 0, num_tokens <= 0, parallelism <= 0,
+          transfer_rank is outside [0, parallelism), interleave_tokens <= 0,
+          or token_base is not an exact multiple of (parallelism *
+          interleave_tokens).
+    """
+    if token_base < 0:
+        raise ValueError(f"token_base must be non-negative, got {token_base}")
     if num_tokens <= 0:
         raise ValueError("num_tokens must be positive")
     if parallelism <= 0:
@@ -66,18 +115,32 @@ def owned_token_ranges(
     if not 0 <= transfer_rank < parallelism:
         raise ValueError(
             f"transfer_rank {transfer_rank} is outside parallelism "
-            f"{parallelism}")
+            f"{parallelism}"
+        )
     if parallelism == 1:
-        return [(0, num_tokens)]
+        return [(token_base, token_base + num_tokens)]
     if interleave_tokens <= 0:
         raise ValueError("interleave_tokens must be positive")
+    cycle = parallelism * interleave_tokens
+    if token_base % cycle != 0:
+        raise ValueError(
+            f"token_base {token_base} must be aligned to PCP cycle "
+            f"({parallelism} * {interleave_tokens} = {cycle})"
+        )
     return list(
-        pcp_layout.pcp_query_chunk_ranges(num_tokens, 0, transfer_rank,
-                                          parallelism, interleave_tokens))
+        pcp_layout.pcp_query_chunk_ranges(
+            num_tokens,
+            token_base,
+            transfer_rank,
+            parallelism,
+            interleave_tokens,
+        )
+    )
 
 
 def lower_fa_spans(
     *,
+    token_base: int = 0,
     num_tokens: int,
     transfer_rank: int,
     parallelism: int,
@@ -86,13 +149,35 @@ def lower_fa_spans(
     token_bytes: int,
     block_ids: Sequence[int],
 ) -> PoolSpanRegistration:
-    """Lower PCP ownership to source-page / global-destination byte ranges.
+    """Lowers PCP ownership to source-page / global-destination byte ranges.
 
-    T3.4: spans are destination-page-agnostic — dst offsets address the
-    request-global compact live byte space (dst_space_version=1) and the
-    controller, which holds the destination manifest, splits them at
-    destination page boundaries at plan build. The producer only splits at
-    its OWN page boundaries (source geometry it authoritatively knows).
+    Translates the rank's PCP-owned token ranges into physical memory byte
+    spans for Raiden DMA transfers. Destination byte offsets address the
+    request-global compact live byte space (dst_space_version=1) offset by
+    token_base, while source byte offsets map to the rank's local KV cache
+    blocks (block_ids). Spans are split across local source page boundaries
+    as needed.
+
+    Args:
+        token_base: Global token index offset for this chunk (must align with
+          the PCP interleave cycle). Defaults to 0.
+        num_tokens: Number of prompt tokens in this chunk.
+        transfer_rank: Zero-based Context Parallel rank of the producer.
+        parallelism: Context Parallelism degree (PCP size).
+        interleave_tokens: Number of consecutive tokens per rank stride.
+        page_tokens: Number of tokens stored per physical KV cache page block.
+        token_bytes: Size of a single token's KV cache representation in bytes.
+        block_ids: Sequence of physical block IDs allocated locally on this
+          rank.
+
+    Returns:
+        A PoolSpanRegistration containing the list of PoolByteSpan copy
+        descriptors and total declared bytes for the 'fa' pool tag.
+
+    Raises:
+        ValueError: If page_tokens <= 0, token_bytes <= 0, or if the number of
+          provided block_ids does not match the number of local source pages
+          required to store the owned tokens.
     """
     if page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
@@ -100,6 +185,7 @@ def lower_fa_spans(
         raise ValueError("token_bytes must be positive")
 
     ranges = owned_token_ranges(
+        token_base=token_base,
         num_tokens=num_tokens,
         transfer_rank=transfer_rank,
         parallelism=parallelism,
@@ -110,8 +196,9 @@ def lower_fa_spans(
     for start, end in ranges:
         cursor = start
         while cursor < end:
-            block_ordinal, block_token_offset = divmod(local_cursor,
-                                                       page_tokens)
+            block_ordinal, block_token_offset = divmod(
+                local_cursor, page_tokens
+            )
             source_end = min(end, cursor + page_tokens - block_token_offset)
             spans.append(
                 PoolByteSpan(
@@ -120,7 +207,8 @@ def lower_fa_spans(
                     dst_block_index=0,
                     dst_offset_bytes=cursor * token_bytes,
                     size_bytes=(source_end - cursor) * token_bytes,
-                ))
+                )
+            )
             local_cursor += source_end - cursor
             cursor = source_end
 
@@ -129,7 +217,8 @@ def lower_fa_spans(
         raise ValueError(
             "block_ids do not match dense PCP rank packing: "
             f"got {len(block_ids)}, expected {expected_blocks} for "
-            f"{local_cursor} owned tokens")
+            f"{local_cursor} owned tokens"
+        )
     return PoolSpanRegistration(
         tag="fa",
         block_ids=tuple(int(block_id) for block_id in block_ids),
@@ -140,6 +229,16 @@ def lower_fa_spans(
 
 
 def _region_value(region: object, name: str) -> int | str:
+    """Extracts a named attribute or dictionary value from a region object.
+
+    Args:
+        region: Dictionary or object representing a state region.
+        name: Field name to look up.
+
+    Returns:
+        The field value converted to str if name is 'name', else converted to
+        int.
+    """
     if isinstance(region, dict):
         value = region[name]
     else:
@@ -155,7 +254,7 @@ def lower_gdn_state_shard_spans(
     parallelism: int,
     regions: Sequence[object],
 ) -> PoolSpanRegistration:
-    """Lower one rank's GDN head shard into a full destination state.
+    """Lowers one rank's GDN head shard into a full destination state.
 
     Under the QK pair-blocked conv layout the rank-local conv row is
     ``[QK | V]`` where the QK block shares whole pool tokens (Q and K
@@ -173,6 +272,23 @@ def lower_gdn_state_shard_spans(
     ``regions`` comes from the admitted source pool manifest.  The legacy
     ``gdn_conv_q``/``gdn_conv_k`` vocabulary is rejected: its half-token
     Q/K extents are not placement-exact under the raw tiled layout.
+
+    Args:
+        tag: State pool tag identifying the GDN component (e.g. TAG_GDN_CONV
+          or TAG_GDN_SSM).
+        block_id: Physical memory block ID holding the local state tensor.
+        transfer_rank: Zero-based Context Parallel rank of the producer.
+        parallelism: Context Parallelism degree (PCP size).
+        regions: Sequence of region descriptors specifying layout geometries.
+
+    Returns:
+        A PoolSpanRegistration containing the lowered state byte spans.
+
+    Raises:
+        ValueError: If tag is empty or unsupported, block_id < 0, parallelism
+          <= 0, transfer_rank is outside [0, parallelism), or if region
+          geometries fail alignment, density, or
+          placement-exactness constraints.
     """
     if not tag:
         raise ValueError("state pool tag must not be empty")
@@ -183,7 +299,8 @@ def lower_gdn_state_shard_spans(
     if not 0 <= transfer_rank < parallelism:
         raise ValueError(
             f"transfer_rank {transfer_rank} is outside parallelism "
-            f"{parallelism}")
+            f"{parallelism}"
+        )
 
     is_conv = tag == TAG_GDN_CONV or tag.startswith(f"{TAG_GDN_CONV}.")
     is_ssm = tag == TAG_GDN_SSM or tag.startswith(f"{TAG_GDN_SSM}.")
@@ -196,47 +313,60 @@ def lower_gdn_state_shard_spans(
         if name in normalized:
             raise ValueError(f"duplicate GDN state region {name!r} ({tag})")
         values = tuple(
-            int(_region_value(region, field)) for field in (
+            int(_region_value(region, field))
+            for field in (
                 "offset_bytes",
                 "stride_bytes",
                 "unit_bytes",
                 "num_units",
                 "units_per_stride",
-            ))
-        if min(values
-               ) < 0 or values[2] <= 0 or values[3] <= 0 or values[4] <= 0:
+            )
+        )
+        if (
+            min(values) < 0
+            or values[2] <= 0
+            or values[3] <= 0
+            or values[4] <= 0
+        ):
             raise ValueError(f"invalid GDN state region {name!r} ({tag})")
         normalized[name] = values
 
     if is_ssm:
         if set(normalized) != {"gdn_ssm"}:
-            raise ValueError(f"GDN SSM layout requires exactly gdn_ssm, got "
-                             f"{sorted(normalized)}")
+            raise ValueError(
+                f"GDN SSM layout requires exactly gdn_ssm, got "
+                f"{sorted(normalized)}"
+            )
         offset, stride, unit, heads, units_per_stride = normalized["gdn_ssm"]
         packed_head_bytes = unit * units_per_stride
         if offset != 0 or stride != packed_head_bytes:
             raise ValueError(
                 "GDN SSM compact layout must be dense and head-major: "
                 f"offset={offset}, stride={stride}, "
-                f"head_bytes={packed_head_bytes}")
+                f"head_bytes={packed_head_bytes}"
+            )
         local_live = heads * packed_head_bytes
         if local_live % _TPU_PHYSICAL_TOKEN_BYTES:
             raise ValueError(
                 "raw TPU GDN SSM shard must contain whole physical tokens: "
-                f"bytes={local_live}")
+                f"bytes={local_live}"
+            )
         if (transfer_rank * local_live) % _TPU_PHYSICAL_TOKEN_BYTES:
             raise ValueError(
-                "raw TPU GDN SSM destination must be token aligned")
+                "raw TPU GDN SSM destination must be token aligned"
+            )
         return PoolSpanRegistration(
             tag=tag,
-            block_ids=(int(block_id), ),
-            spans=(PoolByteSpan(
-                src_block_ordinal=0,
-                src_offset_bytes=0,
-                dst_block_index=0,
-                dst_offset_bytes=transfer_rank * local_live,
-                size_bytes=local_live,
-            ), ),
+            block_ids=(int(block_id),),
+            spans=(
+                PoolByteSpan(
+                    src_block_ordinal=0,
+                    src_offset_bytes=0,
+                    dst_block_index=0,
+                    dst_offset_bytes=transfer_rank * local_live,
+                    size_bytes=local_live,
+                ),
+            ),
             declared_bytes=local_live,
         )
 
@@ -263,14 +393,18 @@ def lower_gdn_state_shard_spans(
         taps = q[3]
         if k[3] != taps or v[3] != taps:
             raise ValueError("GDN conv q/k/v regions disagree on tap count")
-        segments = (("q", q, q[2] * q[4]), ("k", k, k[2] * k[4]),
-                    ("v", v, v[2] * v[4]))
+        segments = (
+            ("q", q, q[2] * q[4]),
+            ("k", k, k[2] * k[4]),
+            ("v", v, v[2] * v[4]),
+        )
     else:
         raise ValueError(
             "GDN conv regions must be {gdn_conv_qk, gdn_conv_v} "
             "(QK pair-blocked layout, TPU_GDN_CONV_QK_PAIR_LAYOUT) or "
             "{gdn_conv_q, gdn_conv_k, gdn_conv_v}: got "
-            f"{sorted(names)}")
+            f"{sorted(names)}"
+        )
 
     local_row_bytes = sum(size for _, _, size in segments)
     expected_offset = 0
@@ -278,21 +412,25 @@ def lower_gdn_state_shard_spans(
         if region[0] != expected_offset:
             raise ValueError(
                 "GDN conv compact layout must be dense tap-major: "
-                f"{name} offset={region[0]}, expected={expected_offset}")
+                f"{name} offset={region[0]}, expected={expected_offset}"
+            )
         if region[1] != local_row_bytes:
             raise ValueError(
                 "GDN conv regions must share the tap row stride: "
-                f"{name} stride={region[1]}, row={local_row_bytes}")
+                f"{name} stride={region[1]}, row={local_row_bytes}"
+            )
         expected_offset += size
     dst_row_bytes = parallelism * local_row_bytes
-    for name, value in ([(name, size) for name, _, size in segments] +
-                        [("row", local_row_bytes),
-                         ("dst_row", dst_row_bytes)]):
+    for name, value in (
+        [(name, size) for name, _, size in segments]
+        + [("row", local_row_bytes), ("dst_row", dst_row_bytes)]
+    ):
         if value % _TPU_PHYSICAL_TOKEN_BYTES:
             raise ValueError(
                 "raw TPU GDN conv extents must be whole physical tokens "
                 "(sub-token Q/K segments need the QK pair-blocked layout): "
-                f"{name}={value}")
+                f"{name}={value}"
+            )
 
     spans = []
     src_offset = 0
@@ -308,12 +446,13 @@ def lower_gdn_state_shard_spans(
                 src_stride_bytes=local_row_bytes,
                 dst_stride_bytes=dst_row_bytes,
                 count=taps,
-            ))
+            )
+        )
         src_offset += size
         dst_segment_base += parallelism * size
     return PoolSpanRegistration(
         tag=tag,
-        block_ids=(int(block_id), ),
+        block_ids=(int(block_id),),
         spans=tuple(spans),
         declared_bytes=taps * local_row_bytes,
     )
@@ -330,11 +469,31 @@ def lower_glm_row_spans(
     row_bytes: int,
     block_ids: Sequence[int],
 ) -> PoolSpanRegistration:
-    """Lower a TP-replicated GLM cache to round-robin per-page byte spans.
+    """Lowers a TP-replicated GLM cache to round-robin per-page byte spans.
 
     The caches are replicated, so page ownership is striped round-robin
     across the producer TP ranks. The final page's span is trimmed to whole
     packed rows (``row_bytes`` each).
+
+    Args:
+        tag: Pool tag identifying the GLM cache component.
+        num_tokens: Number of prompt tokens.
+        transfer_rank: Zero-based Tensor Parallel rank of the producer.
+        parallelism: Tensor Parallelism degree.
+        page_tokens: Number of tokens stored per physical page block.
+        live_bytes_per_block: Total byte capacity per physical page block.
+        row_bytes: Byte size of a single packed row.
+        block_ids: Sequence of physical block IDs covering the request page
+          set.
+
+    Returns:
+        A PoolSpanRegistration containing the round-robin page byte spans.
+
+    Raises:
+        ValueError: If tag is empty, num_tokens <= 0, page_tokens <= 0,
+          parallelism <= 0, transfer_rank is outside [0, parallelism), row_bytes
+          <= 0, live_bytes_per_block <= 0, or if alignment/page count invariants
+          are violated.
     """
     if not tag:
         raise ValueError("pool tag must not be empty")
@@ -347,38 +506,50 @@ def lower_glm_row_spans(
     if not 0 <= transfer_rank < parallelism:
         raise ValueError(
             f"transfer_rank {transfer_rank} is outside parallelism "
-            f"{parallelism}")
+            f"{parallelism}"
+        )
     if row_bytes <= 0 or live_bytes_per_block <= 0:
-        raise ValueError("row_bytes and live_bytes_per_block must be "
-                         "positive")
+        raise ValueError(
+            "row_bytes and live_bytes_per_block must be positive"
+        )
     if live_bytes_per_block % row_bytes:
-        raise ValueError("page live bytes must be whole rows: "
-                         f"live={live_bytes_per_block}, row_bytes={row_bytes}")
+        raise ValueError(
+            "page live bytes must be whole rows: "
+            f"live={live_bytes_per_block}, row_bytes={row_bytes}"
+        )
     rows_per_page = live_bytes_per_block // row_bytes
     if page_tokens % rows_per_page:
         raise ValueError(
             "page tokens must spread evenly over the page's rows: "
-            f"page_tokens={page_tokens}, rows_per_page={rows_per_page}")
+            f"page_tokens={page_tokens}, rows_per_page={rows_per_page}"
+        )
     tokens_per_row = page_tokens // rows_per_page
 
     num_pages = (num_tokens + page_tokens - 1) // page_tokens
     if len(block_ids) != num_pages:
-        raise ValueError("block_ids must cover the complete request page set: "
-                         f"got {len(block_ids)}, expected {num_pages} for "
-                         f"{num_tokens} tokens at {page_tokens} per page")
+        raise ValueError(
+            "block_ids must cover the complete request page set: "
+            f"got {len(block_ids)}, expected {num_pages} for "
+            f"{num_tokens} tokens at {page_tokens} per page"
+        )
     # Full pages, then a tail rounded up to whole rows.
     tail_tokens = num_tokens - (num_pages - 1) * page_tokens
     tail_bytes = (
-        (tail_tokens + tokens_per_row - 1) // tokens_per_row) * row_bytes
+        (tail_tokens + tokens_per_row - 1) // tokens_per_row
+    ) * row_bytes
     spans = tuple(
         PoolByteSpan(
             src_block_ordinal=page,
             src_offset_bytes=0,
             dst_block_index=0,
             dst_offset_bytes=page * live_bytes_per_block,
-            size_bytes=(tail_bytes if page == num_pages -
-                        1 else live_bytes_per_block),
-        ) for page in range(num_pages) if page % parallelism == transfer_rank)
+            size_bytes=(
+                tail_bytes if page == num_pages - 1 else live_bytes_per_block
+            ),
+        )
+        for page in range(num_pages)
+        if page % parallelism == transfer_rank
+    )
     return PoolSpanRegistration(
         tag=tag,
         block_ids=tuple(int(block_id) for block_id in block_ids),
