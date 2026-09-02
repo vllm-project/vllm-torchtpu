@@ -1,16 +1,21 @@
 #!/bin/bash
-# Full evaluation flow script: supports manual and CI execution
-set -euo pipefail
+# End-to-end evaluation flow:
+# 1. Runs benchmarks (starts server, measures TTFT/TPOT, keeps server alive)
+# 2. Checks perf regression against baseline
+# 3. Runs lm_eval / evalscope tasks against the running server
+# 4. Checks eval regression against baseline
+# 5. Always tears down the server on exit
 
-PORT="${PORT:-8000}"
-HOST=""
-CONFIG_NAME=""
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RESULTS_DIR=""
+CONFIG_NAME=""
 RUN_LM_EVAL=0
 RUN_CODE_EVAL=0
 RUN_MM_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
+UPLOAD_TO_GCS="${UPLOAD_TO_GCS:-0}"
+UPLOADER="${UPLOADER:-}"
 EVAL_NUM_CONCURRENT_OVERRIDE=""
 
 # Parse arguments
@@ -36,17 +41,28 @@ while [[ $# -gt 0 ]]; do
             RUN_MM_EVAL=1
             shift
             ;;
-        --num-concurrent)
-            EVAL_NUM_CONCURRENT_OVERRIDE="$2"
-            shift 2
+        --no-start-server)
+            START_SERVER=0
+            shift
             ;;
         --host)
             HOST="$2"
-            START_SERVER=0
             shift 2
             ;;
         --port)
             PORT="$2"
+            shift 2
+            ;;
+        --num-concurrent)
+            EVAL_NUM_CONCURRENT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --upload-to-gcs)
+            UPLOAD_TO_GCS=1
+            shift
+            ;;
+        --uploader)
+            UPLOADER="$2"
             shift 2
             ;;
         --skip-db-upload)
@@ -54,68 +70,50 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--num-concurrent N] [--host HOST] [--port PORT] [--skip-db-upload]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--num-concurrent N] [--host HOST] [--port PORT] [--upload-to-gcs] [--uploader USER] [--skip-db-upload]"
             exit 0
             ;;
-
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--num-concurrent N] [--host HOST] [--port PORT] [--skip-db-upload]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--num-concurrent N] [--host HOST] [--port PORT] [--upload-to-gcs] [--uploader USER] [--skip-db-upload]"
             exit 1
             ;;
     esac
 done
 
-if [ -z "$HOST" ]; then
-    HOST="localhost"
-fi
-
 if [ -z "$CONFIG_NAME" ]; then
-    echo "ERROR: --config is required"
+    echo "Error: --config is required"
     exit 1
 fi
 
-# If running in Buildkite CI, only upload to Spanner/BigQuery if on main branch and not a PR.
-if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
-    echo "Running on PR or non-main branch in Buildkite. Skipping database upload."
-    SKIP_DB_UPLOAD_FLAG=1
+if [ -z "$RESULTS_DIR" ]; then
+    RESULTS_DIR="results/${CONFIG_NAME}_$(date +%Y%m%d_%H%M%S)"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOST=${HOST:-127.0.0.1}
+PORT=${PORT:-8000}
+PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/${CONFIG_NAME}.baseline.json"
+PERF_LOG="${RESULTS_DIR}/perf_check.md"
 
-# Register cleanup trap
+# Always clean up server on exit if we started it
 if [ "$START_SERVER" = "1" ]; then
     trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT TERM
 fi
 
-if [ -z "$RESULTS_DIR" ]; then
-    RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
-fi
-mkdir -p "$RESULTS_DIR"
-
-PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$CONFIG_NAME.baseline.json"
-
-PERF_LOG="$RESULTS_DIR/regression_check.md"
-
+# Run an lm_eval task against the running server
 run_lm_eval() {
     local task="$1"
     local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
-    local num_concurrent="${EVAL_NUM_CONCURRENT:-4}"
+    local num_concurrent="${EVAL_NUM_CONCURRENT_OVERRIDE:-${EVAL_NUM_CONCURRENT:-8}}"
 
     local lm_eval_args=(
-        --tasks "$task"
-        --seed "0,1234,None,1234"
         --output_path "$RESULTS_DIR"
+        --tasks "$task"
     )
 
-    case "$task" in
+    case $task in
         humaneval_plus_tpu|mbpp_plus_tpu)
-            # Python code generation: needs HF_ALLOW_CODE_EVAL=1 in the env on
-            # top of lm-eval's --confirm_run_unsafe_code. No --limit: the
-            # full EvalPlus datasets (164 + 378 problems), like the evalplus
-            # CLI ran them.
-            export HF_ALLOW_CODE_EVAL=1
             lm_eval_args+=(
                 --include_path "$SCRIPT_DIR/lm_eval_tasks"
                 --model local-chat-completions
@@ -309,7 +307,21 @@ if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "
     UPLOAD_ARGS+=("--skip-db-upload")
 fi
 
-
 python3 scripts/vllm/benchmarking/upload_results.py "${UPLOAD_ARGS[@]}" || echo "Warning: results upload failed"
+
+if [ "$UPLOAD_TO_GCS" = "1" ] || [ "${UPLOAD_TO_GCS:-0}" = "true" ]; then
+    echo "=== Staging evaluation payload to GCS ==="
+    INJECT_ARGS=(
+      --results-dir "$RESULTS_DIR"
+      --gcs-bucket "${GCS_STAGING_BUCKET:-cloud-tpu-inference-eval-staging}"
+    )
+    if [ -n "${UPLOADER:-}" ]; then
+      INJECT_ARGS+=(--uploader "$UPLOADER")
+    fi
+    if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "$SKIP_DB_UPLOAD_FLAG" = "1" ]; then
+      INJECT_ARGS+=(--skip-db-upload)
+    fi
+    python3 scripts/vllm/benchmarking/inject_eval_to_db.py "${INJECT_ARGS[@]}" || echo "Warning: GCS payload staging failed"
+fi
 
 exit "$fail"

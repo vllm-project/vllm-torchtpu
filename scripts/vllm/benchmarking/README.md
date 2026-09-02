@@ -77,7 +77,38 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --mode eval \
   --results-dir <DIR> \
   --baseline scripts/vllm/benchmarking/baselines/eval/<config>.baseline.json
+```
 
+## Evaluation Results Ingestion & GCS Uploader
+
+`inject_eval_to_db.py` parses benchmark and evaluation results into the canonical Test Plan Run JSON format and uploads them to user-namespaced GCS staging (`gs://cloud-tpu-inference-eval-staging/incoming/${USER}/${TestPlanRunID}.json`).
+
+### Example Commands (Gemma-4-31B-it)
+
+#### 1. Run Eval Flow with GCS Staging Upload
+
+```bash
+bash scripts/vllm/benchmarking/run_eval_flow.sh \
+  --config gemma-4-31b-it \
+  --run-lm-eval \
+  --upload-to-gcs \
+  --uploader zijianz
+```
+
+*(If `--uploader` is omitted, it defaults to `$USER` or system user).*
+
+#### 2. Standalone Ingestion Script
+
+```bash
+# Upload results from an existing results directory
+python3 scripts/vllm/benchmarking/inject_eval_to_db.py \
+  --results-dir /tmp/perf_eval_gemma-4-31b-it \
+  --uploader zijianz
+
+# Dry run (print JSON payload to stdout without uploading)
+python3 scripts/vllm/benchmarking/inject_eval_to_db.py \
+  --results-dir /tmp/perf_eval_gemma-4-31b-it \
+  --dry-run
 ```
 
 ## Prerequisites
@@ -100,5 +131,7 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8000` | Server port |
+| `UPLOADER` | `$USER` | Username / LDAP for staging GCS payloads under `incoming/${UPLOADER}/` |
+| `GCS_STAGING_BUCKET` | `cloud-tpu-inference-eval-staging` | Target GCS bucket for evaluation payloads |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
 | `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |
