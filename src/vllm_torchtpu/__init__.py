@@ -717,7 +717,6 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_mamba_split_scheduler_block_size()
     _patch_vllm_offloading_config_build()
-    _patch_vllm_offloading_connector_spec()
     # Platform activation can happen from inside the first Scheduler.__init__.
     # Install this constructor patch at the engine-core boundary instead, before
     # the first scheduler is created.
@@ -808,67 +807,6 @@ def _patch_vllm_offloading_config_build() -> None:
         connector_module.build_offloading_config = build_offloading_config_tpu
 
     logger.info("Applied TPU patch: PCP-aware OffloadingConfig build.")
-
-
-def _patch_vllm_offloading_connector_spec() -> None:
-    """Construct TPUCPUOffloadingSpec with the raw cache metadata.
-
-    vLLM 0.26 narrows OffloadingConnector's spec construction to
-    ``OffloadingSpecFactory.create_spec(OffloadingConfig)`` -- one
-    normalized, frozen argument. TPUCPUOffloadingSpec must rebuild the
-    physical TPU cache view (per-group kv_cache_specs for the hybrid pool
-    row layout, PCP/DCP page scaling, HBM reserve sizing), which that
-    config no longer carries, so intercept the connector constructor --
-    the one surface that still holds VllmConfig and KVCacheConfig -- and
-    hand the spec all three. Non-TPU specs keep the stock construction
-    path untouched.
-    """
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
-        OffloadingConnector
-
-    if getattr(OffloadingConnector, "_tpu_offloading_spec_patch", False):
-        return
-    original_init = OffloadingConnector.__init__
-
-    def _init_with_tpu_spec(self, vllm_config, role, kv_cache_config):
-        extra_config = (
-            vllm_config.kv_transfer_config.kv_connector_extra_config)
-        if extra_config.get("spec_name") != "TPUCPUOffloadingSpec":
-            original_init(self, vllm_config, role, kv_cache_config)
-            return
-
-        from vllm.distributed.kv_transfer.kv_connector.v1 import (
-            KVConnectorBase_V1, KVConnectorRole)
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import \
-            build_offloading_config
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
-            OffloadingConnectorScheduler
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
-            OffloadingConnectorWorker
-
-        # Deferred: pulls in torch_tpu, which must not load in processes
-        # that never construct the TPU spec.
-        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
-
-        KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
-        offloading_config = build_offloading_config(vllm_config,
-                                                    kv_cache_config)
-        spec = TPUCPUOffloadingSpec(offloading_config, vllm_config,
-                                    kv_cache_config)
-
-        self.connector_scheduler = None
-        self.connector_worker = None
-        if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = OffloadingConnectorScheduler(
-                spec, vllm_config, kv_cache_config)
-        elif role == KVConnectorRole.WORKER:
-            self.connector_worker = OffloadingConnectorWorker(
-                spec, vllm_config, kv_cache_config)
-
-    OffloadingConnector.__init__ = _init_with_tpu_spec
-    OffloadingConnector._tpu_offloading_spec_patch = True
-    logger.info("Applied TPU patch: OffloadingConnector TPU spec "
-                "construction.")
 
 
 def _patch_vllm_kimi_kda_layer_counts() -> None:
