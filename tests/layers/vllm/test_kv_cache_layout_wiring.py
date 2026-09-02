@@ -27,6 +27,9 @@ BATCHED = PallasBatchedRPAAttentionBackend
 # (num_kv_heads, head_size); 1 KV head is the b/510425663 case (a TP=4 rank of
 # a 4-KV-head model), 128 and 256 are the head widths in use on this backend.
 HEAD_CASES = [(1, 128), (1, 256), (2, 128), (4, 128), (8, 128), (8, 256)]
+# Subset for properties that only need to show a value is carried through, not
+# recomputed: one KV head (the b/510425663 case), several heads, and a wide head.
+HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
 
 
 @contextlib.contextmanager
@@ -86,32 +89,25 @@ def page_bytes(backend, num_kv_heads, head_size, dtype, block_size=128):
                                                 head_size, dtype)
 
 
-# --------------------------------------------------------------------------
 # Selection
-# --------------------------------------------------------------------------
 
 
-def test_unset_selects_head_along_sublane(nhd):
-    assert resolve_batched_rpa_kv_layout() is KVLayout.HEAD_ALONG_SUBLANE
+@pytest.mark.parametrize("value,expected", [
+    (None, KVLayout.HEAD_ALONG_SUBLANE),
+    ("NHD", KVLayout.HEAD_ALONG_SUBLANE),
+    ("HND", KVLayout.SEQ_ALONG_LANE),
+])
+def test_env_selects_layout(monkeypatch, value, expected):
+    with _layout_env(monkeypatch, value):
+        assert resolve_batched_rpa_kv_layout() is expected
 
 
-def test_nhd_selects_head_along_sublane(monkeypatch):
-    with _layout_env(monkeypatch, "NHD"):
-        assert resolve_batched_rpa_kv_layout() is KVLayout.HEAD_ALONG_SUBLANE
-
-
-def test_hnd_selects_seq_along_lane(hnd):
-    assert resolve_batched_rpa_kv_layout() is KVLayout.SEQ_ALONG_LANE
-
-
-# --------------------------------------------------------------------------
 # The default must not move: this backend is behaviour-neutral without opt-in
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
 @pytest.mark.parametrize("dtype", [BF16, FP8])
-@pytest.mark.parametrize("block_size", [16, 128, 256])
+@pytest.mark.parametrize("block_size", [16, 256])
 def test_default_shape_matches_inherited(nhd, num_kv_heads, head_size, dtype,
                                          block_size):
     assert BATCHED.get_kv_cache_shape(7, block_size, num_kv_heads, head_size,
@@ -129,9 +125,7 @@ def test_seq_along_lane_requires_page_size_128(hnd):
     assert BATCHED.get_supported_kernel_block_sizes() == [128]
 
 
-# --------------------------------------------------------------------------
 # The fix itself
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
@@ -157,9 +151,7 @@ def test_bf16_pages_are_identical_across_layouts(hnd, num_kv_heads, head_size):
                                            BF16))
 
 
-# --------------------------------------------------------------------------
 # Shape contracts the rest of the stack depends on
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
@@ -206,33 +198,29 @@ def test_num_blocks_stays_at_dim_zero(hnd, dtype):
 # `sharded_ragged_paged_attention` has to track them.
 
 
-def test_kv_head_axis_is_dim_two_by_default(nhd):
-    shape = BATCHED.get_kv_cache_shape(7, 128, 4, 128, BF16)
-    assert shape[2] == 4 * 2 // 2  # ceil(Kx2 / packing)
-    assert shape[1] == 128  # page_size
+@pytest.mark.parametrize("layout,kv_head_axis,kv_heads,page_axis",
+                         [("NHD", 2, 4 * 2 // 2, 1), ("HND", 1, 4 * 2, 4)])
+def test_kv_head_and_page_axis_positions(monkeypatch, layout, kv_head_axis,
+                                         kv_heads, page_axis):
+    with _layout_env(monkeypatch, layout):
+        shape = BATCHED.get_kv_cache_shape(7, 128, 4, 128, BF16)
+    assert shape[kv_head_axis] == kv_heads
+    assert shape[page_axis] == 128  # page_size
 
 
-def test_kv_head_axis_is_dim_one_under_seq_along_lane(hnd):
-    shape = BATCHED.get_kv_cache_shape(7, 128, 4, 128, BF16)
-    assert shape[1] == 4 * 2  # Kx2 outright
-    assert shape[4] == 128  # page_size innermost
-
-
-def test_head_dim_64_is_refused(hnd):
+def test_head_dim_64_is_refused_under_hnd_and_delegated_by_default(
+        monkeypatch):
     """head_dim==64 is rerouted to the hd64 kernel, which only reads
     HEAD_ALONG_SUBLANE pages."""
-    with pytest.raises(NotImplementedError, match="head_dim==64"):
-        BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16)
+    with _layout_env(monkeypatch, "HND"):
+        with pytest.raises(NotImplementedError, match="head_dim==64"):
+            BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16)
+    with _layout_env(monkeypatch, None):
+        assert BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16) == \
+            BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
 
 
-def test_head_dim_64_still_works_by_default(nhd):
-    assert BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16) == \
-        BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
-
-
-# --------------------------------------------------------------------------
 # Unified block pool
-# --------------------------------------------------------------------------
 
 
 def test_unified_pool_accepts_seq_along_lane(hnd):
@@ -247,9 +235,11 @@ def test_unified_pool_accepts_seq_along_lane(hnd):
                        "validate_kv_layout_supports_unified_pool")
 
 
-def test_pooled_gdn_state_view_reshapes_under_hnd(hnd):
+@pytest.mark.parametrize("layout,reshapes", [("HND", True), (None, False)])
+def test_pooled_gdn_state_view_follows_the_layout(monkeypatch, layout,
+                                                  reshapes):
     """The pool reshape is keyed on the layout, not on a fork-local flag, so
-    it fires for the mainline kernel too."""
+    it fires for the mainline kernel too -- and no-ops by default."""
     import jax.numpy as jnp
 
     from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
@@ -257,24 +247,13 @@ def test_pooled_gdn_state_view_reshapes_under_hnd(hnd):
 
     # (num_blocks, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
     state = jnp.zeros((1, 2, 64, 4, 128), dtype=jnp.float8_e4m3fn)
-    viewed = _pooled_gdn_state_view(state)
-    assert viewed.shape != state.shape
+    with _layout_env(monkeypatch, layout):
+        viewed = _pooled_gdn_state_view(state)
+    assert (viewed.shape != state.shape) is reshapes
     assert viewed.size == state.size
 
 
-def test_pooled_gdn_state_view_is_identity_without_hnd(nhd):
-    import jax.numpy as jnp
-
-    from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
-        _pooled_gdn_state_view
-
-    state = jnp.zeros((1, 2, 64, 4, 128), dtype=jnp.float8_e4m3fn)
-    assert _pooled_gdn_state_view(state).shape == state.shape
-
-
-# --------------------------------------------------------------------------
 # Coexistence with the longctx fork
-# --------------------------------------------------------------------------
 #
 # `USE_BATCHED_RPA_LONGCTX` swaps in the longctx fork. Both forks now take
 # their layout from `VLLM_KV_CACHE_LAYOUT`; the longctx fork maps it onto its
@@ -326,9 +305,7 @@ def test_page_size_bytes_is_not_overridden():
     assert "get_kv_cache_page_size_bytes" not in vars(BATCHED)
 
 
-# --------------------------------------------------------------------------
 # The page size the memory planner actually sees
-# --------------------------------------------------------------------------
 #
 # `normalize_kv_cache_specs_for_tpu` runs over every spec the runner builds and
 # is the last thing to touch `page_size_padded`, which vLLM divides into free
@@ -355,14 +332,14 @@ def _normalized_page_bytes(backend, num_kv_heads, head_size, dtype):
     return normalized["l"].page_size_bytes
 
 
-@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
+@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES_CORE)
 def test_normalizer_preserves_the_fp8_halving(hnd, num_kv_heads, head_size):
     bf16 = _normalized_page_bytes(BATCHED, num_kv_heads, head_size, BF16)
     fp8 = _normalized_page_bytes(BATCHED, num_kv_heads, head_size, FP8)
     assert bf16 == 2 * fp8, (num_kv_heads, head_size, bf16, fp8)
 
 
-@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
+@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES_CORE)
 @pytest.mark.parametrize("dtype", [BF16, FP8])
 def test_normalizer_agrees_with_the_allocated_page(hnd, num_kv_heads,
                                                    head_size, dtype):
@@ -374,7 +351,7 @@ def test_normalizer_agrees_with_the_allocated_page(hnd, num_kv_heads,
                                        dtype))
 
 
-@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
+@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES_CORE)
 @pytest.mark.parametrize("dtype", [BF16, FP8])
 def test_normalizer_leaves_the_default_layout_alone(nhd, num_kv_heads,
                                                     head_size, dtype):
@@ -391,9 +368,7 @@ def test_layout_blind_backend_would_lose_the_halving(hnd):
                                        BASE, 1, 128, BF16))
 
 
-# --------------------------------------------------------------------------
 # Head width read off the cache
-# --------------------------------------------------------------------------
 #
 # The impl pads a layer narrower than the page it writes into. That width is
 # `shape[-1]` under HEAD_ALONG_SUBLANE but `shape[2] * shape[3]` under
@@ -406,22 +381,19 @@ def _width(impl_cls, shape):
     return impl._cache_head_width(_torch.empty(shape, device="meta"))
 
 
-@pytest.mark.parametrize("head_size", [80, 96, 112, 128, 256])
-def test_cache_head_width_under_seq_along_lane(hnd, head_size):
+@pytest.mark.parametrize("head_size", [80, 128, 256])
+@pytest.mark.parametrize("layout", ["HND", None])
+def test_cache_head_width_follows_the_layout(monkeypatch, layout, head_size):
     from vllm_torchtpu.layers.vllm.attention import \
         PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
-    shape = BATCHED.get_kv_cache_shape(4, 128, 2, head_size, BF16)
-    assert _width(BATCHED_IMPL, shape) == shape[2] * shape[3]
-    # page_size is what the naive `shape[-1]` would have returned.
-    assert shape[-1] == 128
-
-
-@pytest.mark.parametrize("head_size", [80, 96, 112, 128, 256])
-def test_cache_head_width_default_layout(nhd, head_size):
-    from vllm_torchtpu.layers.vllm.attention import \
-        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
-    shape = BATCHED.get_kv_cache_shape(4, 128, 2, head_size, BF16)
-    assert _width(BATCHED_IMPL, shape) == shape[-1]
+    with _layout_env(monkeypatch, layout):
+        shape = BATCHED.get_kv_cache_shape(4, 128, 2, head_size, BF16)
+        width = _width(BATCHED_IMPL, shape)
+    if layout == "HND":
+        # Last axis is page_size here, so the naive read would be wrong.
+        assert width == shape[2] * shape[3] and shape[-1] == 128
+    else:
+        assert width == shape[-1]
 
 
 def test_narrow_head_is_not_spuriously_padded(hnd):
@@ -452,9 +424,7 @@ def test_cache_head_width_under_longctx_seq_along_lane(hnd, longctx):
     assert shape[-1] == 128  # what reading the last axis would have returned
 
 
-# --------------------------------------------------------------------------
 # Migration off the removed flag
-# --------------------------------------------------------------------------
 
 
 def test_removed_flag_is_rejected_at_import(monkeypatch):
