@@ -94,6 +94,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
     # Upstream vLLM must count them in the block-aligned split boundary.
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
+        block_size=16,
         use_eagle=False,
         mamba_partial_cache_hit=False,
         hash_block_size=16,
