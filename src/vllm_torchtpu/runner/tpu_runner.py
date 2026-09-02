@@ -5785,8 +5785,12 @@ class TPUModelRunner(GPUModelRunner):
                 )
             ])
 
-        kernel_block_sizes = prepare_kernel_block_sizes(
-            kv_cache_config, self.attn_groups)
+        # The HND batched-RPA backend distinguishes its generic 128-token page
+        # from the wider page sizes supported by PCP streaming via the active
+        # vLLM config. Cache initialization normally runs outside that context.
+        with set_current_vllm_config(self.vllm_config):
+            kernel_block_sizes = prepare_kernel_block_sizes(
+                kv_cache_config, self.attn_groups)
         self._kernel_block_sizes = kernel_block_sizes
         kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
             kv_cache_config=kv_cache_config,

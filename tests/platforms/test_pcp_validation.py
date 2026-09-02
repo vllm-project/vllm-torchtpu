@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 # Initialize vLLM's plugin registry before importing the plugin package.
 import vllm  # noqa: F401
+import vllm.envs as vllm_envs
 
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 
@@ -116,6 +117,42 @@ def test_static_validator_accepts_pcp_async_non_speculative_config():
 
     assert config.enabled
     assert config.async_scheduling is True
+
+
+def test_pcp_hnd_accepts_aligned_pcp_config(monkeypatch):
+    vllm_envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pcp_size=8, interleave_size=128),
+        multihost_backend="",
+    )
+
+    assert config.enabled
+    assert config.pcp_size == 8
+
+
+def test_pcp_hnd_rejects_unaligned_interleave(monkeypatch):
+    vllm_envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+
+    with pytest.raises(ValueError, match="multiple of 128"):
+        PcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(pcp_size=8, interleave_size=64),
+            multihost_backend="",
+        )
+
+
+def test_hnd_without_pcp_remains_valid(monkeypatch):
+    vllm_envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pcp_size=1, interleave_size=64),
+        multihost_backend="",
+    )
+
+    assert not config.enabled
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])

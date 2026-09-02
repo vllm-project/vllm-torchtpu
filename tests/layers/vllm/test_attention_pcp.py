@@ -4,11 +4,16 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import vllm.envs as vllm_envs
+from vllm.config import set_current_vllm_config
 
 import vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter as pcp_adapter
+from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackendImpl
+from vllm_torchtpu.layers.vllm.attention import (
+    PallasAttentionBackendImpl, PallasBatchedRPAAttentionBackend,
+    PallasBatchedRPAAttentionBackendImpl)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
@@ -29,6 +34,19 @@ def _vllm_config(pcp_size=2, interleave_size=4):
 
 def _impl(kv_cache_dtype="bfloat16", **kwargs):
     return PallasAttentionBackendImpl(
+        num_heads=2,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype=kv_cache_dtype,
+        **kwargs,
+    )
+
+
+def _batched_impl(kv_cache_dtype="bfloat16", **kwargs):
+    return PallasBatchedRPAAttentionBackendImpl(
         num_heads=2,
         head_size=128,
         scale=1.0,
@@ -359,6 +377,81 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
 
     assert len(captured["op_args"]) == 8
     assert captured["op_args"][7] is metadata.request_distribution
+
+
+def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(monkeypatch):
+    vllm_envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+    impl = _batched_impl(kv_cache_dtype="fp8_e4m3")
+    fake_mesh = object()
+    captured = {}
+
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl,
+        "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (fake_mesh, fake_mesh, None)),
+    )
+
+    def fake_make_kernel(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    class FakeOp:
+
+        def register_fake(self, _fake_impl):
+            pass
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.vllm.attention."
+        "make_pcp_streaming_rpa_kernel",
+        fake_make_kernel,
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.vllm.attention.pcp_streaming_jax_op",
+        lambda *_args, **_kwargs: FakeOp(),
+    )
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        impl._build_rpa_kernel(
+            None,
+            0.125,
+            0.25,
+            use_pcp_streaming=True,
+            cp_kv_cache_interleave_size=128,
+        )
+
+    assert captured["kv_layout"] == KVLayout.SEQ_ALONG_LANE
+
+
+def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
+        monkeypatch):
+    vllm_envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+    shape = PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
+        8, 256, 1, 128, torch.float8_e4m3fn)
+
+    assert shape == (8, 2, 32, 4, 256)
+    with set_current_vllm_config(_vllm_config(pcp_size=8,
+                                              interleave_size=256)):
+        assert (PallasBatchedRPAAttentionBackend.
+                get_supported_kernel_block_sizes() == [
+                    128, 256, 512, 1024, 2048, 4096
+                ])
+
+
+def test_pcp_hnd_layout_requires_custom_backend_and_fp8(monkeypatch):
+    vllm_envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+
+    with pytest.raises(NotImplementedError, match="non-CUSTOM"):
+        _impl(kv_cache_dtype="fp8_e4m3")._validate_pcp_streaming_support(False)
+    with pytest.raises(NotImplementedError, match="without an FP8"):
+        _batched_impl()._validate_pcp_streaming_support(False)
+
+    _batched_impl(
+        kv_cache_dtype="fp8_e4m3")._validate_pcp_streaming_support(False)
 
 
 def test_adapter_make_streaming_kernel_has_eight_tensor_signature_and_calls_wrapper(

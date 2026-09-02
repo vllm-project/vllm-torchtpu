@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 import jax
 import torch
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
@@ -535,8 +535,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     `sharded_ragged_paged_attention()` to pick the batched kernel function.
     Any multiple of 128 is a valid page size for this kernel;
     `get_preferred_block_size` is overridden so the auto-selected default (no
-    `--block-size` given) stays at 256. Under `VLLM_KV_CACHE_LAYOUT=HND` a page
-    is one 128-lane tile and 128 is the only accepted size.
+    `--block-size` given) stays at 256. Under `VLLM_KV_CACHE_LAYOUT=HND`, the
+    non-PCP kernel accepts only page size 128; PCP streaming retains support
+    for every multiple of 128 listed below.
     """
 
     @staticmethod
@@ -587,8 +588,15 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         # connector when `VLLM_KV_CACHE_LAYOUT` is unset.
         if envs.USE_BATCHED_RPA_LONGCTX:
             return [128, 256, 512, 1024, 2048, 4096]
-        # SEQ_ALONG_LANE maps a page onto one 128-lane tile.
+        # SEQ_ALONG_LANE maps a page onto one 128-lane tile; `RpaConfigs`
+        # rejects any other page size in non-PCP mode. PCP streaming supports
+        # each 128-aligned page size listed below.
         if get_kv_cache_layout() == "HND":
+            vllm_config = get_current_vllm_config_or_none()
+            parallel_config = getattr(vllm_config, "parallel_config", None)
+            if (getattr(parallel_config, "prefill_context_parallel_size", 1)
+                    > 1):
+                return [128, 256, 512, 1024, 2048, 4096]
             return [128]
         return [256]
 
@@ -703,9 +711,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
         max_model_len = (vllm_config.model_config.max_model_len
                          if use_pcp_streaming and vllm_config is not None else
                          None)
+        pcp_kv_layout = (
+            self.kv_layout if use_pcp_streaming else
+            batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale, v_scale, use_pcp_streaming,
-                      cp_kv_cache_interleave_size, max_model_len)
+                      cp_kv_cache_interleave_size, max_model_len,
+                      pcp_kv_layout)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -722,7 +734,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         self.sliding_window, self.scale, self.logits_soft_cap,
                         id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
                         use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask)
+                        max_model_len, self.use_causal_mask, pcp_kv_layout)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -742,6 +754,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                kv_layout=pcp_kv_layout,
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
@@ -840,7 +853,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
         if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
-            unsupported_features.append("VLLM_KV_CACHE_LAYOUT=HND")
+            if not isinstance(self, PallasBatchedRPAAttentionBackendImpl):
+                unsupported_features.append(
+                    "VLLM_KV_CACHE_LAYOUT=HND with a non-CUSTOM backend")
+            if self.kv_cache_quantized_dtype is None:
+                unsupported_features.append(
+                    "VLLM_KV_CACHE_LAYOUT=HND without an FP8 KV cache")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:

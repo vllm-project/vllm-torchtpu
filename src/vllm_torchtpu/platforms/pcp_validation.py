@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+import vllm.envs as vllm_envs
+
 
 @dataclass(frozen=True)
 class PcpStaticConfig:
@@ -84,6 +86,12 @@ class PcpStaticSupportValidator:
         multihost_backend: str | None,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
+        if (config.enabled and vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND"
+                and config.interleave_size % 128 != 0):
+            raise ValueError(
+                "PCP with VLLM_KV_CACHE_LAYOUT=HND requires "
+                "cp_kv_cache_interleave_size to be a multiple of 128, "
+                f"got {config.interleave_size}.")
         if not config.enabled:
             return config
 

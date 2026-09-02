@@ -191,6 +191,7 @@ class TestVllmGatedDeltaNetAttention:
                  "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
                  "run_jax_gdn_attention_pooled_pcp_prefill_projection",
              ) as mock_run:
+            mock_run.return_value = (MagicMock(), MagicMock(), MagicMock())
             pooled_pcp_impl = attn._build_pooled_pcp_gdn_op()
             mock_pcp_jax_op.call_args.args[1](*([MagicMock()] * 14))
 
@@ -218,6 +219,54 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.all(pool_alias == 7)
         assert torch.all(output == 1)
         assert torch.all(z == 2)
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=8)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_pooled_pcp_seq_on_lane_uses_standard_gdn_pool_view(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size, monkeypatch):
+        import vllm.envs as vllm_envs
+        vllm_envs.disable_envs_cache()
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        attn = _qwen35_397b_gdn_attn("seq_on_lane_test_layer")
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        vllm_config = _vllm_config(pcp_size=8, block_size=4096)
+        captured = {}
+
+        def fake_pcp_jax_op(_name, wrapped_fn, **_kwargs):
+            captured["wrapped_fn"] = wrapped_fn
+            return MagicMock()
+
+        raw_pool = jnp.zeros((8, 2, 32, 4, 256), dtype=jnp.float8_e4m3fn)
+
+        def fake_run(*args, **kwargs):
+            captured["pooled_state"] = args[5]
+            captured["pool_block_tokens"] = kwargs["pool_block_tokens"]
+            return args[5], MagicMock(), MagicMock()
+
+        with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                            vllm_config=vllm_config), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "pcp_streaming_jax_op",
+                 side_effect=fake_pcp_jax_op,
+             ), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+                 side_effect=fake_run,
+             ):
+            attn._build_pooled_pcp_gdn_op()
+            args = [MagicMock()] * 14
+            args[5] = raw_pool
+            new_pool, _, _ = captured["wrapped_fn"](*args)
+
+        assert captured["pooled_state"].shape == (8, 128, 1, 4, 128)
+        assert captured["pool_block_tokens"] == 2048
+        assert new_pool.shape == raw_pool.shape
 
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
         attn = _qwen35_397b_gdn_attn(
