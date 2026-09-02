@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
+from vllm.config import VllmConfig
 
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
@@ -902,7 +903,7 @@ def build_kimi_pooled_kda_op(
     *,
     lower_bound: float | None,
     eps: float,
-    pool_block_tokens: int,
+    vllm_config: VllmConfig,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -912,10 +913,14 @@ def build_kimi_pooled_kda_op(
     conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
     unfused core is not available here), and scattered back.
 
-    ``pool_block_tokens`` is the MANAGER block size in tokens
-    (``cache_config.block_size``); the op converts it to pool rows to size
-    the state regions against the manager block and to derive the
-    manager->pool-block split for the state-index remap.
+    The manager block size (``cache_config.block_size``) lets the op size
+    the state regions against the manager block and derive the
+    manager->pool-block split for the state-index remap. It is read PER
+    CALL, not at build time: the platform's block-size derivation for the
+    pool runs after model construction (hybrid layers are built before the
+    adjusted value exists), so a value captured at build time is the
+    pre-adjustment one (16) and the op would size its regions against the
+    wrong manager block.
     """
 
     if not _use_fused_kda():
@@ -941,22 +946,23 @@ def build_kimi_pooled_kda_op(
     ) -> tuple[jax.Array, jax.Array]:
         # Explicit annotated signature: pallas.jax_op's _verify_signature
         # rejects unannotated *args.
-        return _pooled_kda_core(mixed_qkv,
-                                raw_gate,
-                                beta,
-                                output_gate,
-                                pool,
-                                conv_weight,
-                                a_log,
-                                dt_bias,
-                                norm_weight,
-                                query_start_loc,
-                                state_indices,
-                                seq_lens,
-                                distribution,
-                                lower_bound=lower_bound,
-                                eps=eps,
-                                pool_block_tokens=pool_block_tokens)
+        return _pooled_kda_core(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            distribution,
+            lower_bound=lower_bound,
+            eps=eps,
+            pool_block_tokens=vllm_config.cache_config.block_size)
 
     # vLLM's compile cache is keyed on the model config and not on the op
     # body, so the kernel variant goes in the op name (see

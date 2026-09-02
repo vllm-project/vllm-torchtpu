@@ -485,12 +485,15 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # the single attention-shaped buffer; used when the runner binds the
         # pool instead of the per-layer conv/recurrent caches. The manager
         # block size lets the op derive the manager->pool-block split for
-        # its state-index remap.
+        # its state-index remap. It is NOT final yet: the platform's
+        # block-size derivation for the pool runs after model construction
+        # (hybrid layers are built before the adjusted value exists), so the
+        # op reads cache_config.block_size per call, not here.
         self.pooled_kda_op = build_kimi_pooled_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
-            pool_block_tokens=vllm_config.cache_config.block_size,
+            vllm_config=vllm_config,
         )
 
         context = vllm_config.compilation_config.static_forward_context
