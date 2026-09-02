@@ -32,6 +32,7 @@ physical TPU hardware or native C++ wheels:
 """
 import enum
 import os
+import sys
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -1053,6 +1054,7 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._completed_jobs = {}
         conn._load_error_block_ids = set()
         conn._pool_sync_tensors = []
+        conn._pending_fences = []
         return conn
 
     def _meta(self, **kwargs):
@@ -1062,40 +1064,89 @@ class TestWorkerSideConnector(unittest.TestCase):
                                                  store_jobs={},
                                                  **kwargs)
 
-    def test_fence_syncs_device_and_acks(self):
+    def test_fence_acks_only_after_event_retires(self):
         conn = self._make_worker_connector()
-        kv_tensors = [MagicMock()]
-        conn._pool_sync_tensors = kv_tensors
+        conn._pool_sync_tensors = [MagicMock()]
         conn._connector_metadata = self._meta(fence_job_ids={7, 8})
+        event = object()
+        order = []
 
-        with patch("vllm_torchtpu.offload.raiden_connector.synchronize_tensors"
-                   ) as sync:
+        # While the event is in flight, retain the fence as pending without
+        # acknowledging store jobs. Verify that pool writes are enqueued before
+        # recording the event to guarantee ordering in the stream.
+        with patch("vllm_torchtpu.offload.raiden_connector."
+                   "_enqueue_pool_writes",
+                   side_effect=lambda pools: order.append("enqueue")) as enq, \
+             patch("vllm_torchtpu.offload.raiden_connector."
+                   "_record_fence_event",
+                   side_effect=lambda: order.append("record") or event) as rec, \
+             patch("vllm_torchtpu.offload.raiden_connector."
+                   "_event_is_retired", return_value=False):
             sending, recving = conn.get_finished(set())
-        sync.assert_called_once_with(kv_tensors)
-        self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
+        enq.assert_called_once_with(conn._pool_sync_tensors)
+        rec.assert_called_once_with()
+        self.assertEqual(order, ["enqueue", "record"])
+        self.assertEqual(conn._fenced_jobs, {})
+        self.assertEqual(conn._pending_fences, [({7, 8}, event)])
         self.assertEqual((sending, recving), (set(), set()))
 
-    def test_fence_requires_registered_pool_tensors(self):
-        conn = self._make_worker_connector()
-        conn._connector_metadata = self._meta(fence_job_ids={7})
-
-        with patch("vllm_torchtpu.offload.raiden_connector.synchronize_tensors"
-                   ) as sync:
-            with self.assertRaises(AssertionError):
-                conn.get_finished(set())
-        sync.assert_not_called()
-        self.assertEqual(conn._fenced_jobs, {})
-
-    def test_fence_scopes_sync_to_registered_pool_tensors(self):
-        conn = self._make_worker_connector()
-        kv_tensors = [MagicMock(), MagicMock()]
-        conn._pool_sync_tensors = kv_tensors
-        conn._connector_metadata = self._meta(fence_job_ids={7})
-
-        with patch("vllm_torchtpu.offload.raiden_connector.synchronize_tensors"
-                   ) as sync:
+        # Once the event retires on-device, acknowledge the fenced jobs and
+        # clear the pending fence state.
+        conn._connector_metadata = self._meta()
+        with patch(
+                "vllm_torchtpu.offload.raiden_connector."
+                "_event_is_retired",
+                return_value=True):
             conn.get_finished(set())
-        sync.assert_called_once_with(kv_tensors)
+        self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
+        self.assertEqual(conn._pending_fences, [])
+
+    def test_event_retirement_propagates_execution_errors(self):
+        from vllm_torchtpu.offload.raiden_connector import _event_is_retired
+        event = MagicMock()
+
+        # In-flight execution: return False without issuing a blocking synchronization.
+        event.query.return_value = False
+        self.assertFalse(_event_is_retired(event))
+        event.synchronize.assert_not_called()
+
+        # Successful completion: synchronize returns immediately on the ready event
+        # to surface deferred errors.
+        event.query.return_value = True
+        self.assertTrue(_event_is_retired(event))
+        event.synchronize.assert_called_once_with()
+
+        # Asynchronous execution failure: propagate runtime exceptions rather than
+        # falsely acknowledging the fence.
+        event.synchronize.side_effect = RuntimeError("async failure")
+        with self.assertRaises(RuntimeError):
+            _event_is_retired(event)
+
+    def test_fence_requires_registered_pool_tensors(self):
+        # Enqueueing a save fence before KV cache pools are registered violates
+        # memory ordering preconditions and must raise AssertionError.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(fence_job_ids={7})
+
+        with self.assertRaises(AssertionError):
+            conn.get_finished(set())
+        self.assertEqual(conn._fenced_jobs, {})
+        self.assertEqual(conn._pending_fences, [])
+
+    def test_enqueue_pool_writes_is_non_blocking(self):
+        # Pool writes must be synchronized with wait=False to avoid host-side
+        # thread stalls that drain the scheduler's dispatch pipeline.
+        from vllm_torchtpu.offload.raiden_connector import _enqueue_pool_writes
+        fake_sync = MagicMock()
+        modules = {
+            "torch_tpu": MagicMock(),
+            "torch_tpu._internal": MagicMock(sync=fake_sync),
+            "torch_tpu._internal.sync": fake_sync,
+        }
+        pools = [object(), object()]
+        with patch.dict(sys.modules, modules):
+            _enqueue_pool_writes(pools)
+        fake_sync.synchronize.assert_called_once_with(pools, wait=False)
 
     def test_echoes_completions_and_finished_recving(self):
         conn = self._make_worker_connector()

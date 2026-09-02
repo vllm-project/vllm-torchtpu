@@ -8,6 +8,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
+from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
@@ -30,6 +31,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     def __init__(self) -> None:
         super().__init__()
+        apply_omni_tpu_patches()
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -45,6 +47,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_float64(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_cpu_offload(cls) -> bool:
         return False
 
     @classmethod

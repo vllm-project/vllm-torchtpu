@@ -422,6 +422,20 @@ if [ -n "$PROFILE_DIR" ]; then
 else
     profile_dir_json=null
 fi
+# Null outside Buildkite, where nothing performs the copy.
+if [ -n "${PROFILE_GCS_BASE:-}" ] && [ -n "${BUILDKITE_BUILD_NUMBER:-}" ]; then
+    if [ "$(printf '%s' "$ISL_OSL_CONFIGS" | wc -w)" -ne 1 ]; then
+        echo "ERROR: PROFILE_GCS_BASE needs exactly one ISL/OSL cell; got" \
+             "'$ISL_OSL_CONFIGS'. One profile directory serves every cell." >&2
+        exit 1
+    fi
+    profile_isl=${ISL_OSL_CONFIGS%%:*}
+    profile_osl=${ISL_OSL_CONFIGS##*:}
+    profile_cell="$((profile_isl / 1024))k-$((profile_osl / 1024))k"
+    profile_gcs_dir_json="\"$PROFILE_GCS_BASE/$profile_cell/$BUILDKITE_BUILD_NUMBER\""
+else
+    profile_gcs_dir_json=null
+fi
 if [ -n "$BENCHMARK_TEMPERATURE" ]; then
     benchmark_temperature_json=$BENCHMARK_TEMPERATURE
 else
@@ -454,6 +468,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "max_num_seqs": $max_num_seqs,
     "capture_profile": $capture_profile_json,
     "profile_dir": $profile_dir_json,
+    "profile_gcs_dir": $profile_gcs_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
     "perf_tolerance": $PERF_TOLERANCE,

@@ -209,7 +209,8 @@ steps:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/"
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep-profile --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep-profile"
           - |
-            profile_dir=perf_eval_results/deepseek-v4-flash-dp8-ep-profile/profile
+            results_dir=perf_eval_results/deepseek-v4-flash-dp8-ep-profile
+            profile_dir=$$results_dir/profile
             for phase in "$$profile_dir"/*/; do
               [ -d "$$phase" ] || continue
               echo "phase $$(basename "$$phase"): $$(find "$$phase" -name '*.xplane.pb' | wc -l) xplane files"
@@ -219,8 +220,12 @@ steps:
               exit 1
             fi
             # artifact_paths would upload the traces again, so drop them here.
-            gcloud storage cp -r "$$profile_dir"/* \
-              gs://tpu-commons-ci/xprof/deepseek-v4-flash/torchtpu/8k-1k/ \
+            dest=$$(jq -r '.profile_gcs_dir // ""' "$$results_dir/config.json")
+            if [ -z "$$dest" ]; then
+              echo "::error::config.json carries no profile_gcs_dir, so nothing states where these profiles belong."
+              exit 1
+            fi
+            gcloud storage cp -r "$$profile_dir"/* "$$dest/" \
               && rm -rf "$$profile_dir"
         artifact_paths:
           - "perf_eval_results/**/*"

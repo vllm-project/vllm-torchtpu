@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -27,8 +28,10 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
 from vllm_torchtpu.gdn_pool_layout import (
@@ -54,6 +57,77 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
         return jnp.dtype(jnp.bfloat16)
     raise ValueError(f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
                      f"{dtype}; expected float32 or bfloat16")
+
+
+def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
+    """Build GDN's packed byte view inside the donated custom-op boundary.
+
+    Dynamically transforms SEQ_ALONG_LANE 5D attention pool:
+      (num_blocks, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
+    into GDN's expected standard 5D layout:
+      (num_blocks, gdn_kernel_block_size, packed_num_heads, kv_packing, padded_head_size)
+    """
+    if not envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        return recurrent_state
+    if recurrent_state.ndim != 5:
+        raise ValueError("SEQ_ALONG_LANE unified pool must be rank 5, got "
+                         f"shape={recurrent_state.shape}.")
+
+    num_blocks = recurrent_state.shape[0]
+    num_kv_heads_x2 = recurrent_state.shape[1]
+    packed_head_dim = recurrent_state.shape[2]
+    kv_packing = recurrent_state.shape[3]
+
+    padded_head_size = packed_head_dim * kv_packing
+    packed_num_heads = cdiv(num_kv_heads_x2, kv_packing)
+
+    gdn_row_elements = packed_num_heads * kv_packing * padded_head_size
+    total_page_elements = math.prod(recurrent_state.shape[1:])
+
+    if total_page_elements % gdn_row_elements != 0:
+        raise ValueError(
+            "SEQ_ALONG_LANE pool cannot be evenly mapped to GDN token rows: "
+            f"shape={recurrent_state.shape}, page_elements={total_page_elements}, "
+            f"row_elements={gdn_row_elements}.")
+
+    gdn_kernel_block_size = total_page_elements // gdn_row_elements
+
+    return recurrent_state.reshape(
+        num_blocks,
+        gdn_kernel_block_size,
+        packed_num_heads,
+        kv_packing,
+        padded_head_size,
+    )
+
+
+def _pooled_gdn_block_tokens(vllm_config: VllmConfig,
+                             recurrent_state: jax.Array,
+                             pooled_state: jax.Array) -> int:
+    """Return manager-block capacity in the GDN alias's token rows.
+
+    Under SEQ_ALONG_LANE, the attention pool layout packs tokens along the lane
+    dimension without padding 1 local KV head to 2 heads. For example, with
+    head_dim=256, 1 local KV head, and FP8 dtype, each attention token stores
+    512 bytes (1 head * 2 (K+V) * 256 * 1B), while GDN's packed row view spans
+    1024 bytes (cdiv(2, 4) packed heads * 4 pack * 256 * 1B), mapping a
+    physical 256-token attention page to 128 GDN token rows.
+
+    The number of physical pages per manager block remains invariant across
+    backends, so the GDN manager block token capacity scales proportionally
+    with the GDN rows per page (pooled_state.shape[1]).
+    """
+    manager_block_tokens = vllm_config.cache_config.block_size
+    if not envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        return manager_block_tokens
+    kernel_block_size = recurrent_state.shape[-1]
+    if manager_block_tokens % kernel_block_size != 0:
+        raise ValueError(
+            "SEQ_ALONG_LANE manager block size must be divisible by the "
+            "batched RPA kernel block size: "
+            f"{manager_block_tokens} and {kernel_block_size}.")
+    split = manager_block_tokens // kernel_block_size
+    return split * pooled_state.shape[1]
 
 
 def gdn_attention_core_tpu(
@@ -516,11 +590,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
-            return gdn_attention_pooled_core_tpu(
+            pooled_state = _pooled_gdn_state_view(recurrent_state)
+            new_pooled_state, outputs = gdn_attention_pooled_core_tpu(
                 mixed_qkv,
                 b,
                 a,
-                recurrent_state,
+                pooled_state,
                 conv_weight,
                 conv_bias,
                 A_log,
@@ -543,10 +618,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # cache_config.block_size only AFTER load_model, and hybrid
                 # models construct GDN layers before the first
                 # full-attention layer would ever see the adjusted value.
-                pool_block_tokens=vllm_config.cache_config.block_size,
+                pool_block_tokens=_pooled_gdn_block_tokens(
+                    vllm_config, recurrent_state, pooled_state),
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
             )
+            return new_pooled_state.reshape(recurrent_state.shape), outputs
 
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
         # The recurrent state (arg 3) is the attention-shaped pool: the ssm
@@ -620,6 +697,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             raise ValueError(
                 f"local GDN V heads {local_num_v_heads} must be divisible "
                 f"by pcp_size={pcp_size}.")
+
+        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            raise NotImplementedError(
+                "GDN pooled PCP prefill is not supported with "
+                "USE_BATCHED_RPA_SEQ_ON_LANE=1.")
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim

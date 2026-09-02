@@ -36,6 +36,10 @@ MAX_ALLOWED_PAGE_INDICES_N = (
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
 #
+if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not envs.USE_BATCHED_RPA_LONGCTX:
+    raise ValueError(
+        "USE_BATCHED_RPA_SEQ_ON_LANE requires USE_BATCHED_RPA_LONGCTX=1.")
+
 # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
 if envs.USE_BATCHED_RPA_LONGCTX:
     import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched

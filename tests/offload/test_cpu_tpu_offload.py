@@ -36,6 +36,7 @@ without a TPU.
 import os
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -555,10 +556,9 @@ class TestWaitFlushDrain(unittest.TestCase):
         # resurrect it.
         self.assertEqual(h.get_finished(), [])
 
-    def test_h2d_wait_times_out_on_stalled_dma(self):
-        """A DMA that never completes must not hang the engine: wait()
-        returns after the timeout and leaves the job in `_transfer_map`
-        for a later get_finished to report."""
+    def test_h2d_wait_raises_on_stalled_dma(self):
+        """A DMA that has not completed by the timeout raises instead of
+        letting the caller overwrite the source blocks."""
         import threading
 
         h = self._make_h2d_handler()
@@ -570,9 +570,9 @@ class TestWaitFlushDrain(unittest.TestCase):
         with patch(
                 "vllm_torchtpu.offload.cpu_tpu._RAIDEN_OFFLOAD_WAIT_TIMEOUT_S",
                 0.05):
-            h.wait({1})  # must return, not hang
-
-        self.assertIn(1, h._transfer_map)
+            with self.assertRaisesRegex(RuntimeError,
+                                        "timed out.*jobs=\\[1\\]"):
+                h.wait({1})
 
     def test_h2d_wait_ignores_unknown_jobs(self):
         h = self._make_h2d_handler()
@@ -1130,6 +1130,37 @@ class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
         self.assertEqual(self._reserve(kv_transfer_config=kv_tc), 0)
 
 
+class _FakeTpuEvent:
+    """Stand-in for torch.tpu.Event: `ready` controls what query() reports."""
+
+    ready = True
+
+    def __init__(self):
+        self.recorded = False
+        self.synchronized = False
+
+    def record(self):
+        self.recorded = True
+        return self
+
+    def query(self):
+        return self.ready
+
+    def synchronize(self):
+        self.synchronized = True
+        self.ready = True
+
+
+def _patch_tpu_event():
+    # CPU-only torch has no `tpu` namespace at all; give it one for the test.
+    if not hasattr(torch, "tpu"):
+        return patch.object(torch,
+                            "tpu",
+                            SimpleNamespace(Event=_FakeTpuEvent),
+                            create=True)
+    return patch.object(torch.tpu, "Event", _FakeTpuEvent, create=True)
+
+
 class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
     """`_RaidenOffloadingHandler.transfer_async` must call the raiden
     wheel's public KVCacheManager wrapper methods, which are lowercase
@@ -1166,41 +1197,100 @@ class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
         fut = MagicMock()
         mgr.d2h.return_value = fut
 
-        with patch(
-                "vllm_torchtpu.offload.cpu_tpu.synchronize_tensors") as sync:
+        _FakeTpuEvent.ready = True
+        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"
+                   ) as sync, _patch_tpu_event():
             self.assertTrue(
                 handler.transfer_async(
                     7, (self._spec([3, 5]), self._spec([1, 2]))))
 
-        # The store must barrier on the forward step's in-place KV write
-        # before raiden reads the device blocks; without registered device
-        # tensors it falls back to a full device sync.
-        sync.assert_called_once_with(None)
+        # No device wait on the worker thread: the store is gated on a
+        # device-event snapshot, and this one already reports complete, so
+        # the DMA is issued at once.
+        sync.assert_not_called()
         mgr.d2h.assert_called_once_with([3, 5], [1, 2], [1, 1])
         mgr.h2d.assert_not_called()
         self.assertEqual(handler._pending[7], (fut, 2 * 64))
+        self.assertEqual(handler._deferred_d2h, {})
 
-    def test_d2h_store_scopes_sync_to_device_tensors(self):
-        from vllm_torchtpu.offload.cpu_tpu import _RaidenOffloadingHandler
+    def test_d2h_store_waits_for_device_snapshot(self):
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        fut = MagicMock()
+        mgr.d2h.return_value = fut
 
-        mgr = MagicMock(spec=["d2h", "h2d"])
-        kv_tensors = [MagicMock(), MagicMock()]
-        handler = _RaidenOffloadingHandler(mgr,
-                                           tpu_to_cpu=True,
-                                           src_block_size_factor=1,
-                                           dst_block_size_factor=1,
-                                           bytes_per_kernel_block=64,
-                                           device_tensors=kv_tensors)
-        mgr.d2h.return_value = MagicMock()
-
-        with patch(
-                "vllm_torchtpu.offload.cpu_tpu.synchronize_tensors") as sync:
+        _FakeTpuEvent.ready = False
+        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"
+                   ), _patch_tpu_event():
             self.assertTrue(
                 handler.transfer_async(
                     7, (self._spec([3, 5]), self._spec([1, 2]))))
+            # The forward that wrote the blocks is still running: no DMA,
+            # nothing reported finished.
+            mgr.d2h.assert_not_called()
+            self.assertEqual(handler.get_finished(), [])
+            self.assertIn(7, handler._deferred_d2h)
 
-        # The barrier is scoped to the KV tensors, not a global device sync.
-        sync.assert_called_once_with(kv_tensors)
+            # Once the snapshot drains, the next poll submits the DMA and
+            # its completion is reported like any other job.
+            _FakeTpuEvent.ready = True
+            fut.is_ready.return_value = True
+            fut.ok.return_value = True
+            results = handler.get_finished()
+        mgr.d2h.assert_called_once_with([3, 5], [1, 2], [1, 1])
+        self.assertEqual([r.job_id for r in results], [7])
+        self.assertEqual(handler._deferred_d2h, {})
+        self.assertEqual(handler._pending, {})
+
+    def test_d2h_stores_submit_in_order(self):
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        mgr.d2h.return_value = MagicMock()
+        _FakeTpuEvent.ready = False
+        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"
+                   ), _patch_tpu_event():
+            handler.transfer_async(1, (self._spec([3]), self._spec([1])))
+            handler.transfer_async(2, (self._spec([5]), self._spec([2])))
+            # Only the later snapshot drained: the earlier store still gates
+            # submission, so neither is issued.
+            handler._deferred_d2h[2][0].ready = True
+            handler.submit_deferred_d2h()
+            mgr.d2h.assert_not_called()
+            handler._deferred_d2h[1][0].ready = True
+            handler.submit_deferred_d2h()
+        self.assertEqual([c.args[0] for c in mgr.d2h.call_args_list],
+                         [[3], [5]])
+
+    def test_flush_wait_synchronizes_deferred_store(self):
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        fut = MagicMock()
+        fut.is_ready.return_value = True
+        mgr.d2h.return_value = fut
+        _FakeTpuEvent.ready = False
+        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"
+                   ), _patch_tpu_event():
+            handler.transfer_async(7, (self._spec([3]), self._spec([1])))
+            event = handler._deferred_d2h[7][0]
+            # The scheduler is about to reuse the source blocks: the flush
+            # waits for the snapshot, submits, then polls the DMA.
+            handler.wait({7})
+        self.assertTrue(event.synchronized)
+        mgr.d2h.assert_called_once_with([3], [1], [1])
+        self.assertIn(7, handler._pending)
+
+    def test_flush_wait_raises_on_stalled_raiden_dma(self):
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        fut = MagicMock()
+        fut.is_ready.return_value = False  # never completes
+        mgr.d2h.return_value = fut
+        _FakeTpuEvent.ready = True
+        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"
+                   ), _patch_tpu_event(), patch(
+                       "vllm_torchtpu.offload.cpu_tpu."
+                       "_RAIDEN_OFFLOAD_WAIT_TIMEOUT_S", 0.05):
+            handler.transfer_async(7, (self._spec([3]), self._spec([1])))
+            with self.assertRaisesRegex(RuntimeError,
+                                        r"timed out.*jobs=\[7\]"):
+                handler.wait({7})
+        self.assertIn(7, handler._pending)
 
     def test_h2d_load_uses_lowercase_wrapper_method(self):
         handler, mgr = self._make_handler(tpu_to_cpu=False)
@@ -1245,7 +1335,9 @@ class TestRaidenHybridPoolMapping(unittest.TestCase):
                                group_sizes=[3, 1],
                                block_indices=[0, 3])
         dst = CPULoadStoreSpec([10, 11, 12, 20])
-        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"):
+        _FakeTpuEvent.ready = True
+        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"
+                   ), _patch_tpu_event():
             self.assertTrue(handler.transfer_async(1, (src, dst)))
         mgr.d2h.assert_called_once_with([5, 9, 2, 40], [10, 11, 12, 20],
                                         [1, 1, 1, 1])

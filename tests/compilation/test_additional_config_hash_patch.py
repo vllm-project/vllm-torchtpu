@@ -15,8 +15,8 @@
 
 ``VllmConfig.compute_hash()`` folds the whole ``additional_config`` dict in,
 and that hash feeds both the AOT compile cache key and the piecewise cache dir.
-The phased profiler's remaining ``additional_config`` knob only steers
-profiling, so letting it into the hash would force needless recompiles.
+The phased profiler's remaining ``additional_config`` knobs only steer
+profiling, so letting them into the hash would force needless recompiles.
 """
 
 from types import SimpleNamespace
@@ -27,9 +27,11 @@ from vllm.config import VllmConfig
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
 from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
-    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY)
+    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+    PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY)
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
+PREFILL_KEY = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
@@ -173,4 +175,4 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert HASH_IGNORED_ADDITIONAL_CONFIG_KEYS == {KEY}
+    assert HASH_IGNORED_ADDITIONAL_CONFIG_KEYS == {KEY, PREFILL_KEY}

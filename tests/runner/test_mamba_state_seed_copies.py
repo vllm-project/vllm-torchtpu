@@ -110,8 +110,8 @@ def _sched(num_scheduled):
 
 
 def _real_pairs(staged):
-    """Non-padding (src, dst) pairs from one staged (raw, src_t, dst_t)."""
-    _raw, src_t, dst_t = staged
+    """Non-padding (src, dst) pairs from one staged (raws, src_t, dst_t)."""
+    _raws, src_t, dst_t = staged
     return [(int(s), int(d)) for s, d in zip(src_t.tolist(), dst_t.tolist())
             if (s, d) != (0, 0)]
 
@@ -338,12 +338,14 @@ def test_multiple_mamba_groups_get_independent_copies():
                             [[[5, 6, 7, 8]], [[15, 16, 17, 18]]],
                             state_pos={"a": 1})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
+    # Each group lives on its own raw buffer here, so each gets its own
+    # program; groups sharing a buffer set would be merged into one.
     staged = {
-        id(s[0]): _real_pairs(s)
+        tuple(id(r) for r in s[0]): _real_pairs(s)
         for s in fake._pending_mamba_state_copies
     }
-    assert staged[id(raws[0])] == [(6, 7)]
-    assert staged[id(raws[1])] == [(16, 17)]
+    assert staged[(id(raws[0]), )] == [(6, 7)]
+    assert staged[(id(raws[1]), )] == [(16, 17)]
 
 
 def test_pairs_padded_to_bucket_ladder():
@@ -356,7 +358,7 @@ def test_pairs_padded_to_bucket_ladder():
                              "c": 1
                          })
     _collect(fake, _sched({"a": BLOCK_SIZE, "b": BLOCK_SIZE, "c": BLOCK_SIZE}))
-    _raw, src_t, _dst_t = fake._pending_mamba_state_copies[0]
+    _raws, src_t, _dst_t = fake._pending_mamba_state_copies[0]
     assert len(src_t) == 8
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7),
                                                                 (10, 11),
@@ -370,14 +372,14 @@ def test_flush_applies_and_clears(monkeypatch):
     calls = []
     monkeypatch.setattr(
         runner_mod, "copy_mamba_state_blocks",
-        lambda raw, src, dst: calls.append(
-            (id(raw), src.tolist(), dst.tolist())))
+        lambda raws, src, dst: calls.append(
+            ([id(r) for r in raws], src.tolist(), dst.tolist())))
     fake, raws = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
                             state_pos={"a": 1})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
     TPUModelRunner._flush_mamba_state_seed_copies(fake)
     assert len(calls) == 1
-    assert calls[0][0] == id(raws[0])
+    assert calls[0][0] == [id(raws[0])]
     assert fake._pending_mamba_state_copies == []
 
 

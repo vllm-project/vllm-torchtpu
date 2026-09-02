@@ -317,6 +317,7 @@ def main():
             "device_type": device,
             "run_by": run_by,
             "job_reference": str(job_ref),
+            "profile_gcs_dir": config.get("profile_gcs_dir"),
             "backend": dataset,
             "engine_flags": {
                 "max_num_seqs": max_num_seqs,

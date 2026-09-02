@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.runner import \
     moe_runner as moe_runner_mod
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.vllm.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
 
 
 class _LocalExpertQuantMethod:
@@ -53,6 +54,34 @@ class _RankZeroExperts:
         del input_ids
         expert_weights = torch.softmax(router_logits, dim=-1)
         return x * expert_weights[:, 0:1] * 2.0
+
+
+class _FusedPcpExperts:
+    """Model of a fused layer that internally combines every PCP expert."""
+
+    def __init__(self):
+        self.quant_method = _LocalExpertQuantMethod()
+        self.quant_method.supports_internal_mk = True
+        setattr(self.quant_method, FUSED_MOE_EP_OP_ATTR, object())
+
+    def _ensure_moe_quant_config_init(self):
+        pass
+
+    def forward_monolithic(self, *, x, router_logits, input_ids=None):
+        del input_ids
+        expert_weights = torch.softmax(router_logits, dim=-1)
+        return x * (expert_weights[:, 0:1] * 2.0 +
+                    expert_weights[:, 1:2] * 3.0)
+
+
+class _ForbiddenPcpGroup:
+    """Any outer collective is a duplicate when fused EP owns transport."""
+
+    def all_gather(self, *_args, **_kwargs):
+        raise AssertionError("outer PCP all-gather must not run")
+
+    def reduce_scatter(self, *_args, **_kwargs):
+        raise AssertionError("outer PCP reduce-scatter must not run")
 
 
 class _TwoRankPcpGroup:
@@ -196,7 +225,35 @@ def test_vllm_moe_pcp_ep_combines_remote_expert_contributions(monkeypatch):
     runner = _make_rank_zero_runner()
     monkeypatch.setattr(moe_runner_mod, "get_layer_from_name",
                         lambda _layer_name: runner)
-    actual = runner(local_hidden_states, local_router_logits)
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
+        actual = runner(local_hidden_states, local_router_logits)
+
+    local_weights = torch.softmax(local_router_logits, dim=-1)
+    expected = local_hidden_states * (local_weights[:, 0:1] * 2.0 +
+                                      local_weights[:, 1:2] * 3.0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_armed_fused_ep_owns_pcp_dispatch_combine(monkeypatch):
+    """An armed layer skips outer PCP AG/RS even when chunking is disabled."""
+    from vllm_torchtpu import _patch_moe_explicit_pcp_collectives
+
+    _patch_moe_explicit_pcp_collectives()
+    monkeypatch.setattr(moe_runner_mod, "get_pcp_group",
+                        lambda: _ForbiddenPcpGroup())
+
+    runner = _make_rank_zero_runner()
+    runner.routed_experts = _FusedPcpExperts()
+    monkeypatch.setattr(moe_runner_mod, "get_layer_from_name",
+                        lambda _layer_name: runner)
+
+    local_hidden_states = torch.tensor([[1.0, 2.0, 4.0]])
+    local_router_logits = torch.log(torch.tensor([[0.25, 0.75]]))
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
+        # The global config still requests explicit PCP collectives.  The
+        # per-layer runner patch is what transfers ownership to fused EP.
+        assert not runner.moe_config.moe_parallel_config.use_all2all_kernels
+        actual = runner(local_hidden_states, local_router_logits)
 
     local_weights = torch.softmax(local_router_logits, dim=-1)
     expected = local_hidden_states * (local_weights[:, 0:1] * 2.0 +

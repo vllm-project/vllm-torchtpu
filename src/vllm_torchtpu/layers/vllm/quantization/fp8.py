@@ -657,7 +657,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         asked for the kernel, while `prebuild_fused_moe_ep` is what decides
         whether this layer was actually armed. Claiming ownership on the
         request would strip vLLM's collectives in every configuration prebuild
-        refuses -- TP, PCP, over the SMEM bound, under the token threshold, or
+        refuses -- TP, over the SMEM bound, under the token threshold, or
         a weight or routing layout the kernel cannot serve.
         """
         from vllm_torchtpu.layers.vllm.fused_moe_ep import \

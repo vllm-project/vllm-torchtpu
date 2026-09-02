@@ -2,6 +2,7 @@ import math
 from dataclasses import replace
 
 import torch
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec)
 
@@ -15,6 +16,7 @@ def normalize_kv_cache_specs_for_tpu(
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
+    attention_backend: type[AttentionBackend] | None = None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
 
@@ -27,7 +29,11 @@ def normalize_kv_cache_specs_for_tpu(
         if layer_name in exempt:
             normalized[layer_name] = spec
             continue
-        normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
+        normalized[layer_name] = _normalize_one_spec(
+            spec,
+            kv_cache_dtype,
+            attention_backend=attention_backend,
+        )
     if enable_unified_kv_layout:
         non_exempt_specs = {
             k: v
@@ -48,6 +54,8 @@ def normalize_kv_cache_specs_for_tpu(
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: str | torch.dtype,
+    *,
+    attention_backend: type[AttentionBackend] | None = None,
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
@@ -69,7 +77,8 @@ def _normalize_one_spec(
             kv_cache_dtype,
         )
     else:
-        page_size = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+        backend = attention_backend or PallasAttentionBackend
+        page_size = backend.get_kv_cache_page_size_bytes(
             spec.block_size,
             spec.num_kv_heads,
             spec.head_size,

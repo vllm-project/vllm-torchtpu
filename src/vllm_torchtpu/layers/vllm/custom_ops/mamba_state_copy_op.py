@@ -48,9 +48,18 @@ _copy_op.register_fake(_fake_copy)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def copy_mamba_state_blocks(pool: torch.Tensor, src: torch.Tensor,
+def copy_mamba_state_blocks(pools: list[torch.Tensor], src: torch.Tensor,
                             dst: torch.Tensor) -> torch.Tensor:
-    # Plain donation + copy_ writeback (aliased in-place by XLA).
-    new_pool, marker = _copy_op(pool, src, dst)
-    pool.copy_(new_pool)
+    """``pool[dst[i]] = pool[src[i]]`` on every pool, as one program.
+
+    A hybrid model's unified pool is split over several raw buffers, and a
+    state-block advance must be mirrored on each of them with the same
+    pairs; seeding them all from one program costs one dispatch per step
+    instead of one per buffer.
+    """
+    marker = None
+    for pool in pools:
+        # Plain donation + copy_ writeback (aliased in-place by XLA).
+        new_pool, marker = _copy_op(pool, src, dst)
+        pool.copy_(new_pool)
     return marker
