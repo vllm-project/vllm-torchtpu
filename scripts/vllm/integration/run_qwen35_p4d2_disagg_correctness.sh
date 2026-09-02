@@ -9,6 +9,8 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
 RUN_ROOT="${RUN_ROOT:-/tmp/qwen35_p4d2_disagg_ci}"
 RUN_DIR="${RUN_DIR:-${RUN_ROOT}/run}"
 P4D2_BIND_HOST="${P4D2_BIND_HOST:-127.0.0.1}"
+PREFILL_PORT="${PREFILL_PORT:-8400}"
+DECODE_PORT="${DECODE_PORT:-9400}"
 PROXY_PORT="${PROXY_PORT:-8000}"
 VLLM_SRC="${VLLM_SRC:-${repo_root}}"
 TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
@@ -20,6 +22,10 @@ PREFILL_PCP="${PREFILL_PCP:-4}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-256}"
 DECODE_TP="${DECODE_TP:-1}"
 DECODE_DP="${DECODE_DP:-4}"
+PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
+DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
+MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
 # Match the large-cache PCP prefill compilation geometry. An empty override
 # makes vLLM derive the block count from available HBM.
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE-}"
@@ -77,6 +83,8 @@ export SERVED_MODEL_NAME
 export RUN_ROOT
 export RUN_DIR
 export P4D2_BIND_HOST
+export PREFILL_PORT
+export DECODE_PORT
 export PROXY_PORT
 export VLLM_SRC
 export TORCHTPU_VLLM_SRC
@@ -88,6 +96,10 @@ export PREFILL_PCP
 export PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE
 export DECODE_TP
 export DECODE_DP
+export PREFILL_BLOCK_SIZE
+export DECODE_BLOCK_SIZE
+export ENABLE_PREFIX_CACHING
+export MAMBA_CACHE_MODE
 export NUM_GPU_BLOCKS_OVERRIDE
 export GPU_MEMORY_UTILIZATION
 export MAX_MODEL_LEN
@@ -101,6 +113,12 @@ export P4D2_SHORT_REPEAT_LINES="${P4D2_SHORT_REPEAT_LINES:-32}"
 export P4D2_SHORT_REPEAT_COUNT="${P4D2_SHORT_REPEAT_COUNT:-3}"
 export P4D2_LONG_REPEAT_LINES="${P4D2_LONG_REPEAT_LINES:-96}"
 export P4D2_LONG_REPEAT_COUNT="${P4D2_LONG_REPEAT_COUNT:-3}"
+# With the Qwen3.5 chat template this is about 8.7k prompt tokens.  After the
+# speculative-decoding tail reservation, 768-token alignment lands at 7680
+# (not a 3072-token scheduler boundary), while scheduler alignment lands at
+# 3072.  This makes the request sensitive to physical-vs-scheduler alignment.
+export P4D2_PREFIX_HIT_PROBE_LINES="${P4D2_PREFIX_HIT_PROBE_LINES:-272}"
+export P4D2_PREFIX_HIT_PROBE_COUNT="${P4D2_PREFIX_HIT_PROBE_COUNT:-3}"
 export P4D2_LONG_SHARED_LINES="${P4D2_LONG_SHARED_LINES:-72}"
 export P4D2_LONG_SHARED_ROUNDS="${P4D2_LONG_SHARED_ROUNDS:-2}"
 export P4D2_MIXED_LINES="${P4D2_MIXED_LINES:-72}"
@@ -112,6 +130,53 @@ cd "${repo_root}"
 
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
+
+expected_prefill_scheduler_block_size=$((PREFILL_BLOCK_SIZE * PREFILL_PCP))
+expected_decode_scheduler_block_size="${DECODE_BLOCK_SIZE}"
+prefill_resolution="scheduler_block_size=${expected_prefill_scheduler_block_size} hash_block_size=${expected_prefill_scheduler_block_size}"
+
+if ! grep -Fq "${prefill_resolution}" "${RUN_DIR}/logs/prefill.log"; then
+  echo "Expected Prefill ${prefill_resolution}, but it was not found in the server log" >&2
+  exit 1
+fi
+if ! grep -Fq "Using KV cache block size: ${DECODE_BLOCK_SIZE}" \
+    "${RUN_DIR}/logs/decode.log"; then
+  echo "Expected Decode physical/scheduler block size ${DECODE_BLOCK_SIZE}, but it was not found in the server log" >&2
+  exit 1
+fi
+echo "SCHEDULER_BLOCK_SIZE_OK prefill=${expected_prefill_scheduler_block_size} decode=${expected_decode_scheduler_block_size}"
+
+read_prefill_prefix_cache_hits() {
+  curl -fsS "http://${P4D2_BIND_HOST}:${PREFILL_PORT}/metrics" |
+    awk '/^vllm:prefix_cache_hits_total/ {sum += $2} END {printf "%.0f", sum}'
+}
+
+if ((P4D2_PREFIX_HIT_PROBE_COUNT < 2)); then
+  echo "P4D2_PREFIX_HIT_PROBE_COUNT must be at least 2" >&2
+  exit 2
+fi
+prefill_prefix_cache_hits_before="$(read_prefill_prefix_cache_hits)"
+python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
+  --host "${P4D2_BIND_HOST}" \
+  --port "${PROXY_PORT}" \
+  --model "${SERVED_MODEL_NAME}" \
+  --prefix-hit-probe-only \
+  --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
+  --long-repeat-count "${P4D2_PREFIX_HIT_PROBE_COUNT}" \
+  2>&1 | tee "${RUN_DIR}/logs/prefix_cache_hit_probe.log"
+prefill_prefix_cache_hits_after="$(read_prefill_prefix_cache_hits)"
+prefill_prefix_cache_hits_delta=$((
+  prefill_prefix_cache_hits_after - prefill_prefix_cache_hits_before
+))
+expected_prefill_prefix_cache_hits_delta=$((
+  expected_prefill_scheduler_block_size * (P4D2_PREFIX_HIT_PROBE_COUNT - 1)
+))
+echo "PREFILL_PREFIX_CACHE_HITS_DELTA ${prefill_prefix_cache_hits_delta}"
+if ((prefill_prefix_cache_hits_delta != expected_prefill_prefix_cache_hits_delta)); then
+  echo "Expected Prefill local prefix-cache hit delta ${expected_prefill_prefix_cache_hits_delta}, got ${prefill_prefix_cache_hits_delta}" >&2
+  exit 1
+fi
+echo "PREFILL_PREFIX_CACHE_HIT_OK 1"
 
 python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
@@ -125,6 +190,7 @@ if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
     --port "${PROXY_PORT}" \
     --model "${SERVED_MODEL_NAME}" \
     --max-tokens 1 \
+    --no-logprobs \
     2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
 else
   echo "RUN_PREFIX_CACHE_E2E_DIVERGENCE=${RUN_PREFIX_CACHE_E2E_DIVERGENCE}; skip prefix-cache E2E divergence smoke"
