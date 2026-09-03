@@ -24,9 +24,15 @@ from vllm.distributed.parallel_state import get_dp_group
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.core.quantization import dynamic_row_quantize_fp8
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Activation dtypes worth quantizing before the gather. fp8 halves what goes
+# on the wire against either of these; anything already narrower has nothing
+# to gain and would only be rounded twice.
+_FP8_ALL_GATHER_ACT_DTYPES = (torch.bfloat16, torch.float16)
 
 
 def enable_pipelined_collective_and_compute() -> bool:
@@ -41,6 +47,55 @@ def enable_pipelined_collective_and_compute() -> bool:
 
 # Alias for alternative naming convention
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
+
+
+def enable_fp8_all_gather() -> bool:
+    """Whether MoE activations cross the DP/PCP gather quantized to fp8.
+
+    This is a second, independent reason for a quantization method to claim
+    the dispatch/combine collectives from vLLM: the gather is only ours to
+    quantize if we are the ones issuing it. A method that turns this on must
+    therefore report `supports_internal_mk` and route through
+    `pipelined_fused_moe_gmm`, which degrades to a single chunk when chunk
+    pipelining is off.
+    """
+    return envs.TPU_MOE_FP8_ALL_GATHER
+
+
+def _fp8_all_gather_applies(act_dtype: torch.dtype,
+                            enabled: bool | None = None) -> bool:
+    """Whether this activation dtype is worth quantizing for the gather.
+
+    `enabled` lets a caller hand over the decision it has already made; left
+    out, the env is asked.
+    """
+    if enabled is None:
+        enabled = enable_fp8_all_gather()
+    return enabled and act_dtype in _FP8_ALL_GATHER_ACT_DTYPES
+
+
+def _quantized_all_gather(collective_group,
+                          hidden_states: torch.Tensor) -> torch.Tensor:
+    """All-gather activations over the wire as fp8, restored on arrival.
+
+    Only the collective sees the narrow form. The rows are rescaled back to
+    their own dtype the moment they land, so everything downstream -- the
+    permute, both grouped matmuls, the kernel's own activation quantization --
+    runs exactly as it does without the flag. What the flag buys is one byte
+    per element on the wire instead of two; what it costs is one rounding of
+    the activations, plus a second collective for the scales.
+
+    The rows travel bitcast to int8. They are the same eight bits either way,
+    and int8 is a dtype every collective backend carries, while fp8 is not one
+    they can be assumed to.
+    """
+    quantized, scale = dynamic_row_quantize_fp8(hidden_states)
+    ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
+    ag_scale = collective_group.all_gather(scale, dim=0)
+    # Rescale in f32, not in the row's dtype: `scale` was computed there, and
+    # a bf16 product would throw away most of what the fp8 rows still hold.
+    restored = ag_rows.view(torch.float8_e4m3fn).to(torch.float32) * ag_scale
+    return restored.to(hidden_states.dtype)
 
 
 def calculate_moe_chunks(seq_len: int, parallel_size: int,
@@ -119,6 +174,7 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    fp8_all_gather: bool = False,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -150,6 +206,8 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        fp8_all_gather: Row-quantize activations to fp8 for the gather and
+            restore them on arrival, so only the wire is narrowed.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
@@ -163,10 +221,19 @@ def pipelined_fused_moe_gmm(
     num_chunks, chunk_size_local = calculate_moe_chunks(
         seq_len, parallel_size, chunk_size)
 
+    # There is no gather to make cheaper on a single rank, so quantizing there
+    # would only round the activations for nothing.
+    quantize_ag = (parallel_size > 1 and _fp8_all_gather_applies(
+        hidden_states.dtype, fp8_all_gather))
+
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
-            ag_hidden_states = collective_group.all_gather(hidden_states,
-                                                           dim=0)
+            if quantize_ag:
+                ag_hidden_states = _quantized_all_gather(
+                    collective_group, hidden_states)
+            else:
+                ag_hidden_states = collective_group.all_gather(hidden_states,
+                                                               dim=0)
             ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
                                if topk_weights is not None else None)
             ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
@@ -213,8 +280,13 @@ def pipelined_fused_moe_gmm(
         for i in range(num_chunks)
     ] if topk_ids is not None else [None] * num_chunks
 
+    def _all_gather_hs(hs_slice):
+        if quantize_ag:
+            return _quantized_all_gather(collective_group, hs_slice)
+        return collective_group.all_gather(hs_slice, dim=0)
+
     # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
+    ag_hs_curr = _all_gather_hs(hs_slices[0])
     ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
                   if weights_slices[0] is not None else None)
     ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
@@ -225,7 +297,7 @@ def pipelined_fused_moe_gmm(
     for i in range(num_chunks):
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            ag_hs_next = _all_gather_hs(hs_slices[i + 1])
             ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
                                                       dim=0)
                           if weights_slices[i + 1] is not None else None)

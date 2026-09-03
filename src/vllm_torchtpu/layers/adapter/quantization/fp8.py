@@ -71,7 +71,8 @@ from vllm_torchtpu.layers.adapter.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
                                                         WEIGHT_FLIPPED_ATTR,
                                                         quantized_matmul)
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
+    enable_fp8_all_gather, enable_pipelined_collective_and_compute,
+    pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
@@ -707,11 +708,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         vLLM brackets `apply_monolithic` with an all-gather and a
         reduce-scatter unless the method claims them
-        (`MoERunner.do_naive_dispatch_combine`). Two independent paths claim
-        them, and either one alone has to suppress vLLM's pair:
+        (`MoERunner.do_naive_dispatch_combine`). Three independent paths claim
+        them, and any one alone has to suppress vLLM's pair:
 
         - chunk pipelining stages the same two collectives itself so they
           overlap the compute;
+        - fp8 all-gather quantizes the activations before the gather, which
+          is only ours to do if we are the one issuing it;
         - the fused EP kernel does the exchange inside its own program.
 
         The fused half asks `fused_moe_ep_supported` about this method, not
@@ -725,7 +728,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import \
             fused_moe_ep_supported
         return (enable_pipelined_collective_and_compute()
-                or fused_moe_ep_supported(self))
+                or enable_fp8_all_gather() or fused_moe_ep_supported(self))
 
     def maybe_roundup_sizes(
         self,
@@ -937,11 +940,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
+        # Either reason to take the collectives from vLLM leaves the routing
+        # tensors local here, still holding this rank's own tokens. (The third
+        # reason, the fused EP kernel, returned above.)
+        owns_collectives = (enable_pipelined_collective_and_compute()
+                            or enable_fp8_all_gather())
+
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                topk_ids,
-                topk_weights,
-                is_local_tensor=enable_pipelined_collective_and_compute())
+                topk_ids, topk_weights, is_local_tensor=owns_collectives)
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
@@ -959,8 +966,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+        if owns_collectives:
+            return pipelined_fused_moe_gmm(
+                **kwargs, fp8_all_gather=enable_fp8_all_gather())
 
         return fused_moe_gmm(**kwargs)
 

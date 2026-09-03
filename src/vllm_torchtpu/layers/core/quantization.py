@@ -85,6 +85,41 @@ def static_per_tensor_quantize_tensor(
     return quantized.to(quant_dtype)
 
 
+def dynamic_row_quantize_fp8(
+        tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-quantize activations to fp8 e4m3, one f32 scale per row.
+
+    Returns the quantized rows and their scales ``[rows, 1]``, so that
+    ``q * scale`` recovers the row. Mirrors the fused EP kernel's
+    ``rowquant_fp8``, including how it answers a row it cannot scale: a row of
+    all zeros, or one holding an infinity, has no usable scale, and rather than
+    send a zero or infinite scale on to whoever multiplies it back, the row is
+    zeroed whole and its scale left at zero. An empty row is obviously empty;
+    a row quietly rescaled by zero or NaN is not.
+    """
+    amax = tensor.abs().amax(dim=-1, keepdim=True).to(torch.float32)
+    scale = amax / FP8_E4M3_MAX
+    # A row is only scalable if the reciprocal below stays finite, which puts
+    # the floor a long way above zero: 1/scale overflows f32 once the row's
+    # values fall under ~1e-36. Such a row is zero for every purpose the model
+    # has, and taking it as zero here is what keeps it from coming out as the
+    # NaN that `0 * inf` would otherwise write into every one of its elements.
+    min_scale = 1.0 / torch.finfo(torch.float32).max
+    usable = torch.isfinite(scale) & (scale >= min_scale)
+    ones = torch.ones_like(scale)
+    zeros = torch.zeros_like(scale)
+    scale = torch.where(usable, scale, zeros)
+    scale_inv = torch.where(usable, 1.0 / torch.where(usable, scale, ones),
+                            zeros)
+    # The rescale runs in f32, not in the row's own dtype. `scale_inv` is
+    # routinely far outside the input's range -- an f16 row peaking at 1e-3
+    # needs a multiplier of 4.5e5, which is already an infinity in f16 -- so
+    # narrowing it first would destroy the very rows it is meant to preserve.
+    quantized = torch.where(usable, tensor.to(torch.float32) * scale_inv,
+                            torch.zeros_like(scale))
+    return quantized.to(torch.float8_e4m3fn), scale
+
+
 def quantize_kv(
     quant_dtype: torch.dtype,
     key: torch.Tensor,
