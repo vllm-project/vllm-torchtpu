@@ -171,11 +171,30 @@ if ((P4D2_PREFIX_HIT_PROBE_COUNT < 2)); then
   echo "P4D2_PREFIX_HIT_PROBE_COUNT must be at least 2" >&2
   exit 2
 fi
+prefix_hit_probe_namespace="pc-retention-${BUILDKITE_JOB_ID:-local}-$$"
+if [[ "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" == "0" ]]; then
+  # Zero retention starts with no periodic Mamba checkpoints. Prime the full
+  # attention cache once so the next request discovers the shared-prefix
+  # junction and materializes the adaptive Mamba checkpoint. Keep this setup
+  # request outside the measured interval: the existing assertion then still
+  # requires every repeat after the adaptive request to hit one scheduler block.
+  python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
+    --host "${P4D2_BIND_HOST}" \
+    --port "${PROXY_PORT}" \
+    --model "${SERVED_MODEL_NAME}" \
+    --namespace "${prefix_hit_probe_namespace}" \
+    --prefix-hit-probe-only \
+    --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
+    --long-repeat-count 1 \
+    2>&1 | tee "${RUN_DIR}/logs/prefix_cache_retention_warmup.log"
+  echo "PREFIX_CACHE_RETENTION_WARMUP_OK 1"
+fi
 prefill_prefix_cache_hits_before="$(read_prefill_prefix_cache_hits)"
 python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
+  --namespace "${prefix_hit_probe_namespace}" \
   --prefix-hit-probe-only \
   --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
   --long-repeat-count "${P4D2_PREFIX_HIT_PROBE_COUNT}" \

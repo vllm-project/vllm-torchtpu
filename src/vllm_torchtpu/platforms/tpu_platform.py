@@ -347,7 +347,6 @@ def apply_tpu_patches() -> None:
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_hybrid_producer_prefix_hits,
                                _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
@@ -374,7 +373,6 @@ def apply_tpu_patches() -> None:
     _patch_vllm_mamba_split_scheduler_block_size()
     _patch_vllm_offloading_config_build()
     _patch_vllm_kimi_kda_layer_counts()
-    _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
     tpu_plugin._patch_vllm_vocab_parallel_embedding()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
