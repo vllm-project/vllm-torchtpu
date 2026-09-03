@@ -136,7 +136,8 @@ def main():
         )
         return 0
 
-    code_hash = os.getenv("BUILDKITE_COMMIT")
+    code_hash = os.getenv("BUILDKITE_COMMIT") or subprocess.getoutput(
+        "git rev-parse HEAD")
     if not code_hash:
         print("Error: BUILDKITE_COMMIT environment variable is not set.",
               file=sys.stderr)
