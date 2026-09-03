@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -42,23 +43,6 @@ def get_dtype_bitwidth(dtype):
 def get_dtype_packing(dtype):
     bits = get_dtype_bitwidth(dtype)
     return 32 // bits
-
-
-def get_kv_cache_shape(
-    total_num_pages,
-    page_size,
-    kv_dim,
-    kv_dtype,
-    kv_packing: int | None = None,
-):
-    if kv_packing is None:
-        kv_packing = get_dtype_packing(kv_dtype)
-    return (
-        total_num_pages,
-        align_to(page_size, kv_packing) // kv_packing,
-        kv_packing,
-        align_to(kv_dim, 128),
-    )
 
 
 def _largest_divisor(x: int, cap: int) -> int:
@@ -145,13 +129,13 @@ def _attention_kernel(
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     # Input
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    # [num_tokens, topk * TILE_SUBROWS, TILE_LANE_BYTES] (gathered, raw tiles)
+    # [num_tokens, topk * WORD_BYTES, TILE_LANE_BYTES] (gathered, raw tiles)
     cache_kv_nope_hbm_ref,
     cache_kv_rope_hbm_ref,  # [num_tokens, topk, rope_dim] (gathered)
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     # Scratch
-    bkv_nope_x2_ref,  # [2, batch_size, topk * TILE_SUBROWS, TILE_LANE_BYTES]
+    bkv_nope_x2_ref,  # [2, batch_size, topk * WORD_BYTES, TILE_LANE_BYTES]
     bkv_rope_x2_ref,  # [2, batch_size, topk, rope_dim]
     bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
@@ -164,9 +148,9 @@ def _attention_kernel(
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
-    nope_dim = dsa_gather.TILE_SUBROWS * dsa_gather.TILE_LANE_BYTES
+    nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
-    bkv_sz = cache_kv_nope_hbm_ref.shape[1] // dsa_gather.TILE_SUBROWS
+    bkv_sz = cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -223,6 +207,8 @@ def _attention_kernel(
 
         # We use `k_scale` for the PV step as well since MLA uses a shared
         # compressed latent for k/v and k_scale ~= v_scale.
+        # TODO(b/539630772): Add a separate v_scale param and apply it to the
+        # PV step.
         if k_scale != 1.0:
             pv *= k_scale
 
@@ -506,8 +492,9 @@ def sparse_ragged_paged_attention(
   """
     # Opaque uint8 tiles (see dsa_gather.py): nope encodes 512 fp8 values
     # (gathered as raw (4, 128) tiles, then folded to 512 lanes and dequantized
-    # in-kernel with the per-tensor k_scale), rope encodes 64 bf16 as high/low
-    # byte planes (dequantized by the shim).
+    # in-kernel with the per-tensor k_scale), rope encodes 128 fp8 values, (64)
+    # fp8 is token's rope, the rest 64 are padding.
+
     assert cache_kv_nope.dtype == jnp.uint8
     assert cache_kv_rope.dtype == jnp.uint8
 
@@ -525,7 +512,7 @@ def sparse_ragged_paged_attention(
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
-        # [num_tokens, topk * TILE_SUBROWS, TILE_LANE_BYTES] (gathered raw tiles)
+        # [num_tokens, topk * WORD_BYTES, TILE_LANE_BYTES] (gathered raw tiles)
         cache_kv_nope: jax.Array,
         cache_kv_rope: jax.Array,  # [num_tokens, topk, rope_dim] (gathered)
         kv_lens: jax.Array,  # i32[max_num_tokens]
@@ -669,8 +656,8 @@ def sparse_ragged_paged_attention(
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size,
-            topk * dsa_gather.TILE_SUBROWS,
-            dsa_gather.TILE_LANE_BYTES,
+            topk * kv_cache_utils.WORD_BYTES,
+            kv_cache_utils.TILE_LANE_BYTES,
         )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             chunk_size, topk, -1)
