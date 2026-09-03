@@ -26,6 +26,7 @@ PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
 DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-0}"
 # P4D4 uses a smaller per-worker premapped pool than the plugin-wide Raiden
 # default to reduce libtpu startup reservation time for this bounded case.
 TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-8589934592}"
@@ -104,6 +105,7 @@ export PREFILL_BLOCK_SIZE
 export DECODE_BLOCK_SIZE
 export ENABLE_PREFIX_CACHING
 export MAMBA_CACHE_MODE
+export VLLM_PREFIX_CACHE_RETENTION_INTERVAL
 export TPU_PREMAPPED_BUFFER_SIZE
 export TPU_PARALLEL_PRECOMPILE
 export NUM_GPU_BLOCKS_OVERRIDE
@@ -136,6 +138,14 @@ cd "${repo_root}"
 
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
+
+if ! grep -Fqx \
+    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" \
+    "${RUN_DIR}/launch_params.txt"; then
+  echo "Expected VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL} in launch_params.txt" >&2
+  exit 1
+fi
+echo "PREFIX_CACHE_RETENTION_INTERVAL_OK ${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}"
 
 expected_prefill_scheduler_block_size=$((PREFILL_BLOCK_SIZE * PREFILL_PCP))
 expected_decode_scheduler_block_size="${DECODE_BLOCK_SIZE}"
