@@ -36,20 +36,18 @@ def extract_kv_lens_for_tracing(num_computed_tokens: Any,
                                 start_index: int = 0,
                                 num_reqs: int = -1) -> dict[str, int]:
     end_index = start_index + num_reqs if num_reqs != -1 else None
-    active_lens = num_computed_tokens[start_index:end_index]
-    kv_len_kwargs = {
-        f"kv_len{i+1}": int(kv_len)
-        for i, kv_len in enumerate(active_lens)
+    active_lens = [
+        int(kv_len) for kv_len in num_computed_tokens[start_index:end_index]
+    ]
+    if not active_lens:
+        return {}
+
+    return {
+        **{
+            f"kv_len{i+1}": kv_len
+            for i, kv_len in enumerate(active_lens)
+        },
+        "min_kv_len": min(active_lens),
+        "max_kv_len": max(active_lens),
+        "avg_kv_len": sum(active_lens) // len(active_lens),
     }
-
-    kv_len_kwargs.update({
-        key: value
-        for _ in active_lens[:1]
-        for key, value in (
-            ("min_kv_len", int(min(active_lens))),
-            ("max_kv_len", int(max(active_lens))),
-            ("avg_kv_len", int(sum(active_lens)) // len(active_lens)),
-        )
-    })
-
-    return kv_len_kwargs
