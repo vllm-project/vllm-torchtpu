@@ -3613,12 +3613,14 @@ class TPUModelRunner(GPUModelRunner):
                                  inputs_embeds).shape[0]
             self._token_padding_update(num_tokens_padded)
 
-            trace_kwargs = extract_request_ids_for_tracing(
-                self.input_batch.req_ids, start_index, num_reqs)
-            trace_kwargs.update(
-                extract_kv_lens_for_tracing(
-                    self.input_batch.num_computed_tokens_cpu, start_index,
-                    num_reqs))
+            trace_kwargs = {}
+            if TraceAnnotation.is_enabled():
+                trace_kwargs = extract_request_ids_for_tracing(
+                    self.input_batch.req_ids, start_index, num_reqs)
+                trace_kwargs.update(
+                    extract_kv_lens_for_tracing(
+                        self.input_batch.num_computed_tokens_cpu, start_index,
+                        num_reqs))
 
             if self.phase_based_profiler and 'batch_composition_stats' in locals(
             ):

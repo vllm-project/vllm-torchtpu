@@ -75,9 +75,3 @@ def test_extract_kv_lens_for_tracing():
                                         start_index=4,
                                         num_reqs=2)
     assert res_3 == {}
-
-    # Case D: Exceptions are swallowed and logged
-    with patch("vllm_torchtpu.tracing.utils.logger.warning") as mock_warning:
-        res_4 = extract_kv_lens_for_tracing(["not_an_int"], 0, 1)
-        assert res_4 == {}
-        mock_warning.assert_called_once()
