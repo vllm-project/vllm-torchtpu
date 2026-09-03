@@ -1,0 +1,33 @@
+# Sweep: 3 runs (2 traced, 1 untraced) with minimal token lengths
+# Model: Gemma 4 31B-IT (TP=4, BF16)
+# Hardware: Cloud TPU v6e (4 chips)
+
+mode: profile
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 2048
+
+engine_args:
+  enable_prefix_caching: false
+  gpu_memory_utilization: 0.85
+
+env_vars:
+  VLLM_ENABLE_V1_MULTIPROCESSING: '0'
+  XPROF_COMPRESS_JFTRACE: 'true'
+  xprof_compress_jftrace: 'true'
+
+# Only the first two coordinates (input_len=32 and input_len=64) are traced
+trace_configs:
+  - batch_size: 1
+    input_len: 32
+    output_len: 16
+  - batch_size: 1
+    input_len: 64
+    output_len: 16
+
+sweep_matrix:
+  model: [google/gemma-4-31B-it]
+  batch_size: [1]
+  input_len: [32, 64, 128]
+  output_len: [16]
