@@ -1,0 +1,22 @@
+# Goal: Fast 5-sample verification of standard Dense Gemma 4 (31B) on MMLU-Pro Biology
+mode: eval
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+
+engine_args:
+  kv_cache_dtype: bfloat16
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+
+evaluation:
+  limit: 0.05
+  batch_size: auto
+
+sweep_matrix:
+  model: [google/gemma-4-31B-it]
+  tasks: [gsm8k]
