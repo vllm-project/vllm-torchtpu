@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
@@ -721,6 +722,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
     ),
+    # Row-quantize MoE activations to fp8 before the DP/PCP all-gather and
+    # restore them on arrival, so the gather moves one byte per element
+    # instead of two while everything downstream of it is unchanged. Costs one
+    # rounding of the activations plus a second collective for the row scales;
+    # only takes effect on the grouped-matmul MoE path (the fused EP kernel
+    # already carries fp8 on its own wire).
+    "TPU_MOE_FP8_ALL_GATHER": env_bool("TPU_MOE_FP8_ALL_GATHER"),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
