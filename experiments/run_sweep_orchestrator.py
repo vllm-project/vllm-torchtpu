@@ -220,6 +220,12 @@ class SweepOrchestrator:
         print(f">>> Experiment Directory: {self.exp_dir}")
         print("=======================================================")
 
+        runner_names = ["profile", "eval"] if mode == "both" else [mode]
+        runners = {
+            r_name: RunnerRegistry.get(r_name)
+            for r_name in runner_names
+        }
+
         for combo in cross_product:
             current_config = dict(zip(sweep_keys, combo))
 
@@ -254,23 +260,20 @@ class SweepOrchestrator:
                                        eval_cfg.get("tasks", "mmlu_pro"))
             limit = current_config.get("limit", eval_cfg.get("limit", None))
 
-            # Resolve trace configuration and advanced JAX profiler options
-            trace_configs = self.config.get("trace_configs", [])
-            trace = bool(trace_configs)
+            # Check if this coordinate matches a trace configuration
+            trace = bool(self.config.get("trace"))
             matching_jax_config = {}
-            for tc in trace_configs:
-                matches = True
-                for k in ("batch_size", "input_len", "output_len"):
-                    if k in tc and str(tc[k]) != str(current_config.get(k)):
-                        matches = False
-                        break
-                if matches:
+            for tc in self.config.get("trace_configs", []):
+                if all(
+                        tc.get(k) == current_config.get(k)
+                        for k in ("batch_size", "input_len", "output_len")
+                        if k in tc):
+                    trace = True
                     matching_jax_config = tc.get("jax_advanced_configuration",
                                                  {})
                     break
-            if trace and not matching_jax_config and trace_configs:
-                matching_jax_config = trace_configs[0].get(
-                    "jax_advanced_configuration", {})
+
+            combined_metadata["trace"] = trace
 
             context = ExecutionContext(
                 model_path=target_model,
@@ -296,10 +299,8 @@ class SweepOrchestrator:
             )
 
             # 3. Execute benchmark via polymorphic runner (profile, eval, or both)
-            runner_names = ["profile", "eval"] if mode == "both" else [mode]
             for r_name in runner_names:
-                runner = RunnerRegistry.get(r_name)
-                result: BenchmarkResult = runner.execute(context)
+                result: BenchmarkResult = runners[r_name].execute(context)
 
                 # 4. Persist trial metrics to CSV and JSON
                 cmd_repro = f"python3 run_sweep_orchestrator.py --config {self.config_path}"
@@ -308,6 +309,11 @@ class SweepOrchestrator:
                     metrics=result.metrics,
                     reproduction_cmd=cmd_repro,
                 )
+
+        # Cleanup runner resources (e.g. vLLM engine)
+        for runner in runners.values():
+            if hasattr(runner, "close") and callable(getattr(runner, "close")):
+                runner.close()
 
         # Finalize recorders (e.g. stamp completed_at in sweep.json)
         if hasattr(self.recorder, "finalize") and callable(
