@@ -123,6 +123,9 @@ class TpuEvalRunner(BaseVllmRunner):
             ]
             if context.limit is not None:
                 eval_cmd.extend(["--limit", str(context.limit)])
+            if "humaneval_instruct" in context.tasks or "mbpp_plus_instruct" in context.tasks:
+                eval_env["HF_ALLOW_CODE_EVAL"] = "1"
+                eval_cmd.append("--confirm_run_unsafe_code")
 
             print(
                 f">>> [EVALUATION] Executing lm_eval command: {' '.join(eval_cmd)}"

@@ -19,4 +19,4 @@ evaluation:
 
 sweep_matrix:
   model: [google/gemma-4-31B-it]
-  tasks: [mmlu_pro]
+  tasks: [mmlu_pro, mmlu_llama, gsm8k]
