@@ -60,6 +60,20 @@ else:
 
 ragged_paged_attention = rpa_default.ragged_paged_attention
 ragged_paged_attention_batched = rpa_batched.ragged_paged_attention
+
+
+def kv_layout_for_active_fork(layout: batched_rpa_configs.KVLayout):
+    """Map a mainline `KVLayout` member onto the active fork's own enum.
+
+    The two batched-RPA forks ship separate `configs` modules, so their
+    `KVLayout` classes are distinct types. Both are `StrEnum`s with the same
+    values, so `==` would happen to work, but the classes are not otherwise
+    interchangeable: longctx's members carry a `symbol` property (used to build
+    the kernel cache name) that mainline's lack. Members are matched by name.
+    """
+    return getattr(rpa_batched.configs.KVLayout, layout.name)
+
+
 get_kv_cache_shape = rpa_default.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
@@ -339,8 +353,8 @@ def sharded_ragged_paged_attention(
     use_hd64 = q.shape[-1] == 64
     # The longctx fork resolves its layout from the env, the mainline fork
     # passes `kv_layout` explicitly; this is the one site both share.
-    seq_along_lane = ((kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-                       or envs.seq_along_lane_enabled()) and not use_hd64)
+    seq_along_lane = (kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+                      and not use_hd64)
     # The sharded KV-head axis is dim 1 under SEQ_ALONG_LANE and dim 2 under
     # HEAD_ALONG_SUBLANE.
     kv_cache_spec = (P(None, "model", None, None, None)
@@ -406,13 +420,12 @@ def sharded_ragged_paged_attention(
                 rpa_default.RpaCase.PREFILL)
 
     # Only the batched kernel takes a layout; v3 and hd64 have no such
-    # parameter. longctx resolves its own from the same env var this fork
-    # derives `kv_layout` from, so the two agree -- and it must, because its
-    # `KVLayout` is a distinct enum class that would not compare equal to a
-    # mainline member passed in here.
-    pass_layout = (kv_layout is not None and not use_hd64
-                   and not envs.USE_BATCHED_RPA_LONGCTX)
-    layout_kwargs = {"kv_layout": kv_layout} if pass_layout else {}
+    # parameter. Both forks are handed the layout explicitly, translated into
+    # whichever `KVLayout` class the active fork defines.
+    pass_layout = kv_layout is not None and not use_hd64
+    layout_kwargs = ({
+        "kv_layout": kv_layout_for_active_fork(kv_layout)
+    } if pass_layout else {})
 
     def _ragged_paged_attention(*args):
         return func(

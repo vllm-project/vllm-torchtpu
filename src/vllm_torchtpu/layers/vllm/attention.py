@@ -28,8 +28,8 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       SparseMLAKVCacheSpec)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
-    attention, attention_bundled, mla_attention, ragged_paged_attention,
-    ragged_paged_attention_batched)
+    attention, attention_bundled, kv_layout_for_active_fork, mla_attention,
+    ragged_paged_attention, ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_kv
 from vllm_torchtpu.layers.common.sequence_layout import \
@@ -104,9 +104,9 @@ def resolve_batched_rpa_kv_layout() -> batched_rpa_configs.KVLayout:
 
     HND selects SEQ_ALONG_LANE, which packs head_dim rather than KV heads into
     the 32-bit words, so an fp8 page is genuinely half a bf16 one
-    (b/510425663). The longctx fork reads `envs.seq_along_lane_enabled()`
-    directly and maps it onto its own `KVLayout`; both forks therefore answer
-    to the same env var.
+    (b/510425663). Callers translate the result into whichever `KVLayout`
+    class the active fork defines (`kv_layout_for_active_fork`), so the kernels
+    themselves never read the environment.
     """
     if not envs.seq_along_lane_enabled():
         return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
@@ -566,9 +566,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         """Shape of one batched-RPA KV cache, honouring the selected layout.
 
-        The longctx fork resolves its own layout inside
-        `rpa_batched_wrapper.get_kv_cache_shape`; the mainline fork is driven
-        from here by `VLLM_KV_CACHE_LAYOUT`. The SEQ_ALONG_LANE arithmetic
+        Both forks are handed the layout explicitly; the mainline
+        arithmetic is inlined here. The SEQ_ALONG_LANE arithmetic
         mirrors `batched_rpa.wrapper.get_kv_cache_shape` but is inlined,
         because that wrapper needs a TPU and vLLM calls this while resolving
         config.
@@ -597,6 +596,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 actual_head_dim=head_size,
                 # pyrefly: ignore [unexpected-keyword]
                 kv_packing=kv_packing,
+                kv_layout=kv_layout_for_active_fork(
+                    resolve_batched_rpa_kv_layout()),
             )
 
         if (resolve_batched_rpa_kv_layout()
