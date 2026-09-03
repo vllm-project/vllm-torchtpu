@@ -14,6 +14,7 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.attention.backend import AttentionBackend
 else:
     VllmConfig = None
 
@@ -33,7 +34,8 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
         vllm_config.model_config.architecture)
 
 
-def validate_backend_supports_kv_layout(backend_cls) -> None:
+def validate_backend_supports_kv_layout(
+        backend_cls: "type[AttentionBackend]") -> None:
     """Reject `VLLM_KV_CACHE_LAYOUT=HND` when the selected backend ignores it.
 
     SEQ_ALONG_LANE is implemented only by the batched-RPA kernels; every other
