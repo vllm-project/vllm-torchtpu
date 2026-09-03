@@ -6319,8 +6319,8 @@ class TPUModelRunner(GPUModelRunner):
                     attn_module = (self.vllm_config.compilation_config.
                                    static_forward_context.get(layer_name))
                     if getattr(attn_module, "use_sparse", False):
-                        # Split (nope, rope) cache in uint8 dtype
-                        # (expected by `dsa_gather`).
+                        # Split (nope, rope) cache; each half's shape and dtype
+                        # come from its own layout spec.
                         specs = (
                             PallasMLAttentionBackend.get_sparse_kv_cache_specs(
                                 num_blocks,
@@ -6330,7 +6330,7 @@ class TPUModelRunner(GPUModelRunner):
                             ))
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = tuple(
-                            torch.zeros(spec.shape, dtype=torch.uint8).to(
+                            torch.zeros(spec.shape, dtype=spec.dtype).to(
                                 self.device) for spec in specs)
                         continue
                     # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):

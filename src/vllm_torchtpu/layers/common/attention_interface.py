@@ -757,8 +757,8 @@ def sparse_mla_attention(
       q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      kv_cache_nope: Paged uint8 nope cache, shaped by `nope_spec`.
-      kv_cache_rope: Paged uint8 rope cache, shaped by `rope_spec`.
+      kv_cache_nope: Paged nope cache, shaped and typed by `nope_spec`.
+      kv_cache_rope: Paged rope cache, shaped and typed by `rope_spec`.
       topk_indices: Indexer output specifying tokens to gather (`[num_tokens, topk]`).
       seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
       block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).

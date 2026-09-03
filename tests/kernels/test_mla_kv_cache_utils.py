@@ -31,22 +31,41 @@ ROPE_DIM = 64
 PAGE_SIZE = 32
 PAGES_PER_SEQ = 4
 TOTAL_PAGES = 16
+WORD_BYTES = 4
 
 # Layouts pinned explicitly rather than read from the environment: these
 # tests check the exact geometry dsa_gather is written against.
 KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
 NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
-                                        KVCacheLayout.SPARSECORE, TOTAL_PAGES,
+                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
                                         PAGE_SIZE, LKV_DIM, KV_PACKING)
 ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
                                         KVCacheLayout.TENSORCORE, TOTAL_PAGES,
                                         PAGE_SIZE, ROPE_DIM, KV_PACKING)
 
 
-def _empty_pair():
-    """Zeroed uint8 (nope, rope) caches in dsa_gather's native tiled layouts."""
-    return (jnp.zeros(NOPE_SPEC.shape,
-                      jnp.uint8), jnp.zeros(ROPE_SPEC.shape, jnp.uint8))
+def _empty(spec: SparseMLAKVCacheSpec) -> jax.Array:
+    return jnp.zeros(spec.shape, spec.jax_dtype)
+
+
+def _token_bytes(cache: jax.Array, spec: SparseMLAKVCacheSpec) -> np.ndarray:
+    """Decode any layout to `[num_pages, page_size, head_dim]` uint8.
+
+    Decoding is written from the layout contract, not from the writer: a
+    sparsecore word `w` holds byte `b` of feature band `b`, so recovering
+    token-major bytes needs the band axis transposed back in front of the
+    feature axis. A writer that packed in any other order fails the
+    comparisons below.
+    """
+    arr = np.asarray(cache)
+    rows = arr.reshape(spec.num_pages, spec.page_size, -1)
+    if spec.layout is KVCacheLayout.TENSORCORE:
+        # nope [P, S, 4, 128] and rope [P, S // 4, 4, 128] are both already
+        # byte images -- the flatten above is the whole decode.
+        return rows
+    bands = rows.view(np.uint8).reshape(*rows.shape, WORD_BYTES)
+    return bands.transpose(0, 1, 3, 2).reshape(spec.num_pages, spec.page_size,
+                                               spec.head_dim)
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -91,8 +110,8 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         block_tables[1, 0] = 9
 
         nope_cache, rope_cache = update_sparse_mla_kv_cache(
-            jnp.zeros(nope_spec.shape, jnp.uint8),
-            jnp.zeros(rope_spec.shape, jnp.uint8),
+            _empty(nope_spec),
+            _empty(rope_spec),
             kv_c,
             k_pe,
             jnp.asarray(seq_lens, jnp.int32),
@@ -101,9 +120,9 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
             nope_spec=nope_spec,
             rope_spec=rope_spec)
 
-        # Both layouts are token-major once flattened to [page, slot, bytes].
-        nope_rows = np.asarray(nope_cache).reshape(TOTAL_PAGES, PAGE_SIZE, -1)
-        rope_rows = np.asarray(rope_cache).reshape(TOTAL_PAGES, PAGE_SIZE, -1)
+        # Every layout is token-major once decoded to [page, slot, bytes].
+        nope_rows = _token_bytes(nope_cache, nope_spec)
+        rope_rows = _token_bytes(rope_cache, rope_spec)
         exp_nope = np.asarray(jax.lax.bitcast_convert_type(kv_c, jnp.uint8))
         exp_rope = np.asarray(jax.lax.bitcast_convert_type(k_pe, jnp.uint8))
         # seq 0: positions 32..36 -> page 2 slots 0..4; seq 1: page 9 slots 0..2.
@@ -137,7 +156,8 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         block_tables[1, 0] = 2
 
         nope_cache, rope_cache = update_sparse_mla_kv_cache(
-            *_empty_pair(),
+            _empty(NOPE_SPEC),
+            _empty(ROPE_SPEC),
             kv_c,
             k_pe,
             jnp.asarray([4, 2], jnp.int32),
@@ -146,12 +166,74 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
             nope_spec=NOPE_SPEC,
             rope_spec=ROPE_SPEC)
 
-        nope_rows = np.asarray(
-            jax.lax.bitcast_convert_type(nope_cache,
-                                         jnp.uint8)).reshape(-1, LKV_DIM)
-        rope_rows = np.asarray(
-            jax.lax.bitcast_convert_type(rope_cache, jnp.uint8)).reshape(
-                -1, rope_cache.shape[-1])
+        nope_rows = _token_bytes(nope_cache, NOPE_SPEC).reshape(-1, LKV_DIM)
+        rope_rows = _token_bytes(rope_cache,
+                                 ROPE_SPEC).reshape(-1, ROPE_SPEC.head_dim)
         # Exactly the valid tokens landed, nothing else.
         self.assertEqual(int(nope_rows.any(axis=1).sum()), valid_tokens)
         self.assertEqual(int(rope_rows.any(axis=1).sum()), valid_tokens)
+
+    @parameterized.named_parameters(
+        dict(testcase_name="nope",
+             cache_type=KVCacheType.NOPE,
+             head_dim=LKV_DIM),
+        dict(testcase_name="rope",
+             cache_type=KVCacheType.ROPE,
+             head_dim=ROPE_DIM),
+    )
+    def test_sparsecore_words_are_little_endian_pack4(self, cache_type,
+                                                      head_dim):
+        """Each sparsecore word is pack4 of the token's four byte bands."""
+        specs = {
+            layout:
+            SparseMLAKVCacheSpec.create(cache_type, layout, TOTAL_PAGES,
+                                        PAGE_SIZE, head_dim, KV_PACKING)
+            for layout in KVCacheLayout
+        }
+        is_nope = cache_type is KVCacheType.NOPE
+        rng = np.random.default_rng(11)
+        num_tokens = 6
+        kv_c = _quantize_fp8(
+            rng.standard_normal((num_tokens, LKV_DIM)).astype(np.float32), 1.0)
+        k_pe = _quantize_fp8(
+            rng.standard_normal((num_tokens, ROPE_DIM)).astype(np.float32),
+            1.0)
+        values = kv_c if is_nope else k_pe
+        block_tables = np.full((1, PAGES_PER_SEQ), 3, np.int32)
+
+        caches = {}
+        for layout, spec in specs.items():
+            nope_spec = spec if is_nope else NOPE_SPEC
+            rope_spec = ROPE_SPEC if is_nope else spec
+            nope, rope = update_sparse_mla_kv_cache(
+                _empty(nope_spec),
+                _empty(rope_spec),
+                kv_c,
+                k_pe,
+                jnp.asarray([num_tokens], jnp.int32),
+                jnp.asarray(block_tables.reshape(-1)),
+                jnp.asarray([0, num_tokens], jnp.int32),
+                nope_spec=nope_spec,
+                rope_spec=rope_spec)
+            caches[layout] = nope if is_nope else rope
+
+        # Reference: pack the four bands of each written token by hand.
+        sc_spec = specs[KVCacheLayout.SPARSECORE]
+        sc_words = np.asarray(caches[KVCacheLayout.SPARSECORE]).reshape(
+            TOTAL_PAGES, PAGE_SIZE, -1)
+        raw = np.asarray(jax.lax.bitcast_convert_type(values, jnp.uint8))
+        padded = np.zeros((num_tokens, sc_spec.head_dim), np.uint8)
+        padded[:, :raw.shape[1]] = raw
+        bands = padded.reshape(num_tokens, WORD_BYTES, -1).astype(np.uint32)
+        expected = (bands[:, 0] | (bands[:, 1] << 8) | (bands[:, 2] << 16)
+                    | (bands[:, 3] << 24))
+        for token in range(num_tokens):
+            np.testing.assert_array_equal(sc_words[3, token], expected[token])
+
+        # ...and the two layouts hold the same bytes, differing only in how
+        # the 32-bit packing is expressed.
+        np.testing.assert_array_equal(
+            _token_bytes(caches[KVCacheLayout.SPARSECORE],
+                         specs[KVCacheLayout.SPARSECORE]),
+            _token_bytes(caches[KVCacheLayout.TENSORCORE],
+                         specs[KVCacheLayout.TENSORCORE]))

@@ -47,7 +47,7 @@ TOKEN_PAD = 16  # attention kernel batch size; token count must be a multiple
 # tests check the exact geometry dsa_gather is written against.
 KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
 NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
-                                        KVCacheLayout.SPARSECORE, TOTAL_PAGES,
+                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
                                         PAGE_SIZE, LKV_DIM, KV_PACKING)
 ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
                                         KVCacheLayout.TENSORCORE, TOTAL_PAGES,
@@ -55,9 +55,9 @@ ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
 
 
 def _empty_pair():
-    """Zeroed uint8 (nope, rope) caches in dsa_gather's native tiled layouts."""
-    return (jnp.zeros(NOPE_SPEC.shape,
-                      jnp.uint8), jnp.zeros(ROPE_SPEC.shape, jnp.uint8))
+    """Zeroed (nope, rope) caches in dsa_gather's native tiled layouts."""
+    return (jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
+            jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype))
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
