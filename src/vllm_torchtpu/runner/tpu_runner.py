@@ -2139,12 +2139,10 @@ class TPUModelRunner(GPUModelRunner):
                 state_block_size = group.kv_cache_spec.block_size
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
-        # The kernel-block axis follows the layout these pages were given.
-        seq_along_lane = get_kv_cache_layout() == "HND"
         for raw in raw_tensors:
             if raw.dim() > 1:
-                kernel_block_size = (raw.shape[-1]
-                                     if seq_along_lane else raw.shape[1])
+                kernel_block_size = (raw.shape[-1] if get_kv_cache_layout()
+                                     == "HND" else raw.shape[1])
                 self._pool_block_split = (self.cache_config.block_size //
                                           kernel_block_size)
                 break
