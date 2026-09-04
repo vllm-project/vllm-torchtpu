@@ -143,7 +143,7 @@ steps:
       # through run_multihost.sh (Ray head+worker containers) and weights
       # stream from gs://tpu-commons-ci/glm/GLM-5.2-FP8 via runai
       # (MODEL_URI set in the config).
-      - label: "Perf: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
+      - label: "Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
         key: "perf_nightly_glm_5_2_fp8_dp16_ep"
         if: 'build.env("NIGHTLY") == "1"'
         agents:
@@ -153,7 +153,7 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
-          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --results-dir /perf_eval_results/glm-5.2-fp8-dp16-ep"
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval --results-dir /perf_eval_results/glm-5.2-fp8-dp16-ep"
         artifact_paths:
           - "perf_eval_results/**/*"
 

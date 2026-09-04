@@ -49,13 +49,22 @@ the same live server:
   calibrated with `--gate-ttft-max-concurrency 0` to omit it.
 - `--mode eval` compares `lm_eval` accuracy to
   `baselines/eval/<config>.<task>.baseline.json` (1.5pp tolerance). Only keys
-  present in the baseline are gated. MMLU tasks (`mmlu_llama`, `mmlu_pro`) run
-  against the chat-completions endpoint; code-generation tasks
+  present in the baseline are gated. `--run-lm-eval` walks `LM_EVAL_TASKS`
+  (default `mmlu_llama mmlu_pro`; configs may narrow it). MMLU tasks
+  (`mmlu_llama`, `mmlu_pro`) run against the chat-completions endpoint;
+  code-generation tasks
   (`humaneval_plus_tpu`, `mbpp_plus_tpu` — the full EvalPlus datasets,
   nightly only via `--run-code-eval`) also run against the chat-completions
   endpoint with evalplus-style instruct prompting + code-block extraction
   (see `lm_eval_tasks/`) and gate pass@1. Each task gates only when its
   baseline file exists.
+
+Two config vars tune the `lm_eval` invocation, for matching an external
+reference run: `EXTRA_LM_EVAL_MODEL_ARGS` (`key=value` pairs merged into
+`--model_args`, last-wins per key) and `LM_EVAL_GEN_KWARGS` (*replaces* the
+per-task `--gen_kwargs`, which is a merging action in lm-eval). A generation
+cap goes in the latter as `max_gen_toks`: the `--model_args` value is only a
+fallback for tasks whose yaml omits the key, and `mmlu_pro` sets 2048 itself.
 
 ## What It Does
 
