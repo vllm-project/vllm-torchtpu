@@ -31,13 +31,18 @@ def _vllm_config(
     speculative_method=None,
     num_speculative_tokens=0,
     kv_role=None,
+    is_moe_model=None,
+    enable_expert_parallel=False,
 ):
     return SimpleNamespace(
+        model_config=None,
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
             cp_kv_cache_interleave_size=interleave_size,
             decode_context_parallel_size=dcp_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            enable_expert_parallel=enable_expert_parallel,
+            is_moe_model=is_moe_model,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         speculative_config=(None
@@ -87,6 +92,8 @@ def test_from_vllm_config_records_kv_role():
         (_vllm_config(), "ray", NotImplementedError, "multihost"),
         (_vllm_config(interleave_size=0), "", ValueError,
          "cp_kv_cache_interleave_size > 0"),
+        (_vllm_config(is_moe_model=True), "", NotImplementedError,
+         "requires --enable-expert-parallel"),
     ],
 )
 def test_static_validator_rejects_unsupported_platform_config(
@@ -106,6 +113,35 @@ def test_static_validator_accepts_supported_pcp_platform_config():
 
     assert config.enabled
     assert config.pcp_size == 4
+
+
+def test_static_validator_accepts_moe_pcp_with_expert_parallel():
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(is_moe_model=True, enable_expert_parallel=True),
+        multihost_backend="",
+    )
+
+    assert config.is_moe is True
+    assert config.expert_parallel is True
+
+
+def test_static_validator_ignores_expert_parallel_without_pcp():
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pcp_size=1, is_moe_model=True),
+        multihost_backend="",
+    )
+
+    assert config.enabled is False
+
+
+@pytest.mark.parametrize("is_moe_model", [None, False])
+def test_static_validator_accepts_pcp_when_model_is_not_moe(is_moe_model):
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(is_moe_model=is_moe_model),
+        multihost_backend="",
+    )
+
+    assert config.is_moe is False
 
 
 def test_static_validator_accepts_pcp_async_non_speculative_config():

@@ -543,60 +543,6 @@ def _patch_disable_sequence_parallel_moe() -> None:
     logger.info("Applied TPU patch: disable sequence-parallel MoE.")
 
 
-def _patch_moe_no_ep_tp_scope() -> None:
-    """Keep non-EP MoE tensor parallelism scoped to each DP engine.
-
-    Upstream vLLM flattens TP across DP for MoE when expert parallelism is
-    disabled. This temporary TPU patch avoids that path until the TPU dummy
-    batch path can keep no-EP MoE ranks in the same lockstep as upstream
-    model-internal DP.
-    """
-    from vllm.distributed import parallel_state
-    from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
-
-    if getattr(FusedMoEParallelConfig, "_tpu_no_ep_tp_scope_patch", False):
-        return
-
-    original_make = FusedMoEParallelConfig.make
-
-    # TODO: Remove this patch in a follow-up PR. TorchTPU should match vLLM's
-    # no-EP MoE convention by flattening DP*TP and extending the coordinated
-    # dummy/lockstep execution used for EP to no-EP MoE as well.
-    def patched_make(tp_size_, pcp_size_, dp_size_, sp_size_,
-                     vllm_parallel_config):
-        use_ep = (dp_size_ * pcp_size_ * tp_size_ > 1
-                  and vllm_parallel_config.enable_expert_parallel)
-        if use_ep:
-            return original_make(tp_size_, pcp_size_, dp_size_, sp_size_,
-                                 vllm_parallel_config)
-
-        dp_rank = (parallel_state.get_dp_group().rank_in_group
-                   if dp_size_ > 1 else 0)
-        pcp_rank = (parallel_state.get_pcp_group().rank_in_group
-                    if pcp_size_ > 1 else 0)
-        tp_rank = (0 if tp_size_ == 1 else
-                   parallel_state.get_tensor_model_parallel_rank())
-        return FusedMoEParallelConfig(
-            tp_size=tp_size_,
-            tp_rank=tp_rank,
-            pcp_size=pcp_size_,
-            pcp_rank=pcp_rank,
-            dp_size=dp_size_,
-            dp_rank=dp_rank,
-            ep_size=1,
-            ep_rank=0,
-            sp_size=sp_size_,
-            use_ep=False,
-            all2all_backend=vllm_parallel_config.all2all_backend,
-            enable_eplb=vllm_parallel_config.enable_eplb,
-        )
-
-    FusedMoEParallelConfig.make = staticmethod(patched_make)
-    FusedMoEParallelConfig._tpu_no_ep_tp_scope_patch = True
-    logger.info(
-        "Applied TPU patch: scope non-EP MoE TP inside each DP engine.")
-
-
 def _patch_multiproc_worker_global_rank_env() -> None:
     """Set TorchTPU binding env on spawned workers before torch_tpu import.
 
