@@ -543,22 +543,6 @@ def _patch_disable_sequence_parallel_moe() -> None:
     logger.info("Applied TPU patch: disable sequence-parallel MoE.")
 
 
-def _patch_disable_dp_ubatch() -> None:
-    """Disable DP microbatching (DBO) on TPU.
-
-    TPU does not support vLLM DP microbatching yet. Force the post-sync ubatch
-    decision off so DP uses one forward per engine step.
-    """
-    from vllm.v1.worker import dp_utils
-
-    if getattr(dp_utils, "_tpu_no_ubatch_patch", False):
-        return
-
-    dp_utils._post_process_ubatch = lambda tensor, num_ubatches: False
-    dp_utils._tpu_no_ubatch_patch = True
-    logger.info("Applied TPU patch: disable DP microbatching.")
-
-
 def _patch_moe_no_ep_tp_scope() -> None:
     """Keep non-EP MoE tensor parallelism scoped to each DP engine.
 
