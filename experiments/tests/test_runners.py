@@ -169,11 +169,21 @@ class TestTpuEvalRunner(unittest.TestCase):
         with open(results_file, "w") as f:
             json.dump(sample_results, f)
 
-        # 1. Mock server process
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None  # Running process
-        mock_proc.returncode = 0
-        mock_subproc_popen.return_value = mock_proc
+        # 1. Mock server process and lm_eval process
+        mock_server_proc = MagicMock()
+        mock_server_proc.poll.return_value = None  # Running process
+        mock_server_proc.returncode = 0
+
+        mock_eval_proc = MagicMock()
+        mock_eval_proc.stdout.readline.side_effect = [
+            "Processed prompts:  50%|█████     | 300/608 [01:00, est. speed input: 4000.00 toks/s, output: 500.00 toks/s]\n",
+            "Processed prompts: 100%|██████████| 608/608 [02:00, est. speed input: 6000.00 toks/s, output: 800.00 toks/s]\n",
+            ""
+        ]
+        mock_eval_proc.wait.return_value = 0
+
+        # Return mock_server_proc for server launch, and mock_eval_proc for lm_eval execution
+        mock_subproc_popen.side_effect = [mock_server_proc, mock_eval_proc]
 
         # 2. Mock /health endpoint response
         mock_resp = MagicMock()
@@ -209,8 +219,14 @@ class TestTpuEvalRunner(unittest.TestCase):
         self.assertIn("Eval_Duration_s", result.metrics)
 
         # Verify server shutdown was invoked in finally
-        mock_proc.terminate.assert_called_once()
-        self.assertGreaterEqual(mock_subproc_run.call_count, 2)
+        mock_server_proc.terminate.assert_called_once()
+        self.assertGreaterEqual(mock_subproc_run.call_count, 1)
+        self.assertIn("Eval_E2E_Latency_s", result.metrics)
+        self.assertIn("Eval_Input_Throughput_tok_s", result.metrics)
+        self.assertEqual(result.metrics["Eval_Input_Throughput_tok_s"],
+                         "6000.00")
+        self.assertEqual(result.metrics["Eval_Output_Throughput_tok_s"],
+                         "800.00")
 
 
 if __name__ == "__main__":
