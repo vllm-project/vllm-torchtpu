@@ -6,6 +6,7 @@ Unit tests for JsonResultRecorder, CompositeResultRecorder, and JSON schema vali
 
 import json
 import os
+import unittest.mock
 
 import jsonschema
 import pytest
@@ -241,3 +242,27 @@ def test_composite_result_recorder(tmp_path, loaded_schema):
     assert len(json_data["experiments"]) == 1
     assert json_data["status"] == "COMPLETED"
     jsonschema.validate(instance=json_data, schema=loaded_schema)
+
+
+def test_json_result_recorder_upload_gcs_disabled(tmp_path, loaded_schema):
+    """Tests that upload_gcs=False bypasses GCS upload calls on finalize."""
+    json_file = str(tmp_path / "sweep.json")
+    recorder = JsonResultRecorder(
+        json_file=json_file,
+        sweep_id="20260828_130000",
+        metadata={
+            "description": "Test no upload",
+            "mode": "profile"
+        },
+        upload_gcs=False,
+    )
+    with unittest.mock.patch.object(recorder, "_upload_to_gcs_unlocked") as mock_upload, \
+         unittest.mock.patch.object(recorder, "_upload_traces_unlocked") as mock_traces:
+        recorder.finalize("COMPLETED")
+        mock_upload.assert_not_called()
+        mock_traces.assert_not_called()
+
+    with open(json_file, "r") as f:
+        data = json.load(f)
+    assert data["status"] == "COMPLETED"
+    jsonschema.validate(instance=data, schema=loaded_schema)

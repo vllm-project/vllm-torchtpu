@@ -42,7 +42,9 @@ class JsonResultRecorder(IResultRecorder):
         metadata: Optional[Dict[str, Any]] = None,
         user: str = "",
         hardware: Optional[Dict[str, Any]] = None,
+        upload_gcs: bool = True,
     ):
+        self.upload_gcs = upload_gcs
         self.json_file = os.path.abspath(json_file)
         self.json_dir = os.path.dirname(self.json_file)
         if self.json_dir:
@@ -204,11 +206,13 @@ class JsonResultRecorder(IResultRecorder):
                 self.data["error_message"] = error_message
 
             traces_dir = os.path.join(self.json_dir, "traces")
-            if self._is_tracing_enabled() and os.path.isdir(traces_dir):
+            if self.upload_gcs and self._is_tracing_enabled(
+            ) and os.path.isdir(traces_dir):
                 self._upload_traces_unlocked(traces_dir)
 
             self._flush_unlocked()
-            self._upload_to_gcs_unlocked()
+            if self.upload_gcs:
+                self._upload_to_gcs_unlocked()
 
     def _upload_traces_unlocked(self,
                                 traces_dir: Optional[str] = None) -> List[str]:

@@ -61,6 +61,7 @@ class SweepOrchestrator:
         experiment_id: Optional[str] = None,
         message: Optional[str] = None,
         resume: bool = False,
+        upload_gcs: bool = True,
     ):
         """Initializes the sweep orchestrator and prepares output directory and recorders."""
         self.config_path = config_path
@@ -68,6 +69,7 @@ class SweepOrchestrator:
         self.experiment_id = experiment_id
         self.message = message
         self.resume = resume
+        self.upload_gcs = upload_gcs
         self.config = self._load_config(config_path)
 
         self.exp_id = (self.experiment_id if self.experiment_id else
@@ -91,6 +93,7 @@ class SweepOrchestrator:
             sweep_id=self.exp_id,
             metadata=getattr(self, "metadata_content", self.config),
             hardware=hardware_info,
+            upload_gcs=self.upload_gcs,
         )
         self.recorder = CompositeResultRecorder(
             [self.csv_recorder, self.json_recorder])
@@ -364,6 +367,13 @@ def main():
         default=None,
         help="Description of the experiment we are running",
     )
+    parser.add_argument(
+        "--no-upload-gcs",
+        dest="no_upload_gcs",
+        action="store_true",
+        default=False,
+        help="Disable uploading traces and sweep metadata to GCS",
+    )
     args = parser.parse_args()
 
     orchestrator = SweepOrchestrator(
@@ -372,6 +382,7 @@ def main():
         experiment_id=args.experiment_id,
         message=args.message,
         resume=args.resume,
+        upload_gcs=not args.no_upload_gcs,
     )
     orchestrator.run()
 
