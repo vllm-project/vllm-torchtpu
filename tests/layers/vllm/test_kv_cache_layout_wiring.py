@@ -14,8 +14,7 @@ import torch
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.layers.vllm.attention import (
-    PallasAttentionBackend, PallasBatchedRPAAttentionBackend,
-    resolve_batched_rpa_kv_layout)
+    PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
 
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
@@ -99,7 +98,22 @@ def page_bytes(backend, num_kv_heads, head_size, dtype, block_size=128):
 ])
 def test_env_selects_layout(monkeypatch, value, expected):
     with _layout_env(monkeypatch, value):
-        assert resolve_batched_rpa_kv_layout() is expected
+        assert PallasBatchedRPAAttentionBackend.kv_layout() is expected
+
+
+def test_backends_without_the_layout_ignore_hnd(hnd):
+    """Only the batched-RPA backend implements SEQ_ALONG_LANE, so the others
+    must keep answering HEAD_ALONG_SUBLANE under HND.
+
+    Load-bearing: `TPUModelRunner._build_mamba_copy_plan` and the pooled GDN
+    view ask whichever backend is live, so a base or MLA backend that echoed
+    the env var would have its pages read in a layout it never allocated --
+    the failure `validate_backend_supports_kv_layout` exists to prevent."""
+    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
+    assert PallasAttentionBackend.kv_layout() is KVLayout.HEAD_ALONG_SUBLANE
+    assert PallasMLAttentionBackend.kv_layout() is KVLayout.HEAD_ALONG_SUBLANE
+    assert (PallasBatchedRPAAttentionBackend.kv_layout()
+            is KVLayout.SEQ_ALONG_LANE)
 
 
 # The default must not move: this backend is behaviour-neutral without opt-in
@@ -276,7 +290,8 @@ def longctx(monkeypatch):
 def test_hnd_selects_seq_along_lane_under_longctx(hnd, longctx):
     """HND drives both forks. Previously refused, because the longctx fork
     took its layout from a separate flag."""
-    assert resolve_batched_rpa_kv_layout() is KVLayout.SEQ_ALONG_LANE
+    assert (PallasBatchedRPAAttentionBackend.kv_layout()
+            is KVLayout.SEQ_ALONG_LANE)
 
 
 def test_longctx_wrapper_reads_the_same_layout_env(hnd, longctx):

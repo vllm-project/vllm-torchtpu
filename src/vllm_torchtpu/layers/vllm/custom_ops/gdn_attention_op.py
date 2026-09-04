@@ -31,7 +31,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import \
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
 from vllm_torchtpu.gdn_pool_layout import (
@@ -59,6 +58,28 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
                      f"{dtype}; expected float32 or bfloat16")
 
 
+def _pool_is_seq_along_lane() -> bool:
+    """Whether the attention pool GDN aliases is in the SEQ_ALONG_LANE layout.
+
+    Asks the backend that allocated the pages rather than re-deriving the
+    layout from the environment, so this view cannot disagree with whoever
+    allocated.
+
+    Names the batched-RPA backend directly instead of resolving the live one
+    (`TpuPlatform._find_non_ssm_backend`, as the runner does): reaching
+    `vllm_torchtpu.platforms` from here pulls TpuPlatform back into the layers
+    (see `unified_kv_layout_enabled_for_architecture`), and it is unnecessary
+    -- the pooled path runs only for `POOLED_GDN_ARCHITECTURES`, all of which
+    serve attention on this backend.
+    """
+    from vllm_torchtpu.kernels.experimental.batched_rpa import \
+        configs as batched_rpa_configs
+    from vllm_torchtpu.layers.vllm.attention import \
+        PallasBatchedRPAAttentionBackend
+    return (PallasBatchedRPAAttentionBackend.kv_layout()
+            is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE)
+
+
 def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     """Build GDN's packed byte view inside the donated custom-op boundary.
 
@@ -67,7 +88,7 @@ def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     into GDN's expected standard 5D layout:
       (num_blocks, gdn_kernel_block_size, packed_num_heads, kv_packing, padded_head_size)
     """
-    if not envs.seq_along_lane_enabled():
+    if not _pool_is_seq_along_lane():
         return recurrent_state
     if recurrent_state.ndim != 5:
         raise ValueError("SEQ_ALONG_LANE unified pool must be rank 5, got "
@@ -118,7 +139,7 @@ def _pooled_gdn_block_tokens(vllm_config: VllmConfig,
     with the GDN rows per page (pooled_state.shape[1]).
     """
     manager_block_tokens = vllm_config.cache_config.block_size
-    if not envs.seq_along_lane_enabled():
+    if not _pool_is_seq_along_lane():
         return manager_block_tokens
     kernel_block_size = recurrent_state.shape[-1]
     if manager_block_tokens % kernel_block_size != 0:
@@ -715,7 +736,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"local GDN V heads {local_num_v_heads} must be divisible "
                 f"by pcp_size={pcp_size}.")
 
-        if envs.seq_along_lane_enabled():
+        if _pool_is_seq_along_lane():
             raise NotImplementedError(
                 "GDN pooled PCP prefill is not supported with "
                 "VLLM_KV_CACHE_LAYOUT=HND.")

@@ -72,6 +72,8 @@ from vllm.v1.worker.utils import (AttentionGroup,
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    configs as batched_rpa_configs
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
     materialize_kv_cache_tensors)
@@ -2138,11 +2140,21 @@ class TPUModelRunner(GPUModelRunner):
                 state_block_size = group.kv_cache_spec.block_size
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
+        # Which axis carries the kernel block is a property of the layout the
+        # attention backend allocated these pages in, so ask that backend
+        # rather than re-deriving it from the environment here. None means a
+        # pure-SSM model with no attention pages at all, so no SEQ_ALONG_LANE
+        # pool exists whatever `VLLM_KV_CACHE_LAYOUT` says -- that config also
+        # never reaches `validate_backend_supports_kv_layout`, which
+        # `update_block_size_for_backend` skips when there is no backend.
+        attn_backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+        seq_along_lane = (attn_backend_cls is not None
+                          and attn_backend_cls.kv_layout()
+                          is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE)
         for raw in raw_tensors:
             if raw.dim() > 1:
                 kernel_block_size = (raw.shape[-1]
-                                     if envs.seq_along_lane_enabled() else
-                                     raw.shape[1])
+                                     if seq_along_lane else raw.shape[1])
                 self._pool_block_split = (self.cache_config.block_size //
                                           kernel_block_size)
                 break

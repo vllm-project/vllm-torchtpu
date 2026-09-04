@@ -99,20 +99,6 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
     return packing_bits // bits
 
 
-def resolve_batched_rpa_kv_layout() -> batched_rpa_configs.KVLayout:
-    """Map `VLLM_KV_CACHE_LAYOUT` onto a mainline batched-RPA KV layout.
-
-    HND selects SEQ_ALONG_LANE, which packs head_dim rather than KV heads into
-    the 32-bit words, so an fp8 page is genuinely half a bf16 one
-    (b/510425663). Callers translate the result into whichever `KVLayout`
-    class the active fork defines (`kv_layout_for_active_fork`), so the kernels
-    themselves never read the environment.
-    """
-    if not envs.seq_along_lane_enabled():
-        return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
-    return batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-
-
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     max_num_page_per_req = (1024 * 1024 // 2 //
                             vllm_config.scheduler_config.max_num_seqs // 4)
@@ -388,7 +374,7 @@ def _pallas_rpa_kernel_batched(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
-        kv_layout=resolve_batched_rpa_kv_layout(),
+        kv_layout=PallasBatchedRPAAttentionBackend.kv_layout(),
     )
 
 
@@ -414,6 +400,17 @@ class PallasAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["PallasAttentionBackendImpl"]:
         return PallasAttentionBackendImpl
+
+    @classmethod
+    def kv_layout(cls) -> batched_rpa_configs.KVLayout:
+        """The layout of the pages this backend allocates.
+
+        The source of truth for anything that reads those pages. This backend
+        packs KV heads into the 32-bit words regardless of
+        `VLLM_KV_CACHE_LAYOUT`; only the batched-RPA subclass implements
+        SEQ_ALONG_LANE, and it overrides this.
+        """
+        return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
 
     @staticmethod
     def get_kv_cache_shape(
@@ -556,6 +553,25 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     def get_impl_cls() -> type["PallasBatchedRPAAttentionBackendImpl"]:
         return PallasBatchedRPAAttentionBackendImpl
 
+    @classmethod
+    def kv_layout(cls) -> batched_rpa_configs.KVLayout:
+        """The layout of the pages this backend allocates.
+
+        `VLLM_KV_CACHE_LAYOUT=HND` selects SEQ_ALONG_LANE, which packs head_dim
+        rather than KV heads into the 32-bit words, so an fp8 page is genuinely
+        half a bf16 one (b/510425663).
+
+        The one place the layout is decided. Anything that reads these pages
+        asks here rather than re-deriving it from the environment, so a
+        consumer cannot disagree with whoever allocated. Callers translate the
+        result into whichever `KVLayout` class the active fork defines
+        (`kv_layout_for_active_fork`), so the kernels never read the
+        environment either.
+        """
+        if not envs.seq_along_lane_enabled():
+            return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+        return batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -597,10 +613,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 # pyrefly: ignore [unexpected-keyword]
                 kv_packing=kv_packing,
                 kv_layout=kv_layout_for_active_fork(
-                    resolve_batched_rpa_kv_layout()),
+                    PallasBatchedRPAAttentionBackend.kv_layout()),
             )
 
-        if (resolve_batched_rpa_kv_layout()
+        if (PallasBatchedRPAAttentionBackend.kv_layout()
                 is batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE):
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
@@ -631,7 +647,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             return [128, 256, 512, 1024, 2048, 4096]
         # SEQ_ALONG_LANE maps a page onto one 128-lane tile; `RpaConfigs`
         # rejects any other page size.
-        if (resolve_batched_rpa_kv_layout()
+        if (PallasBatchedRPAAttentionBackend.kv_layout()
                 is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
             return [128]
         return [256]
@@ -1234,7 +1250,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
 
     def _cache_head_width(self, kv_cache: torch.Tensor) -> int:
         # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
-        if (resolve_batched_rpa_kv_layout()
+        if (PallasBatchedRPAAttentionBackend.kv_layout()
                 is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
             return kv_cache.shape[2] * kv_cache.shape[3]
         return kv_cache.shape[-1]
@@ -1256,6 +1272,16 @@ class PallasMLAttentionBackend(AttentionBackend):
     # DeepSeek-V4 MLA packed-cache constants (64-dim RoPE tail, 64-wide UE8M0 blocks).
     _DS_MLA_ROPE_HEAD_DIM = 64
     _DS_MLA_QUANT_BLOCK = 64
+
+    @classmethod
+    def kv_layout(cls) -> batched_rpa_configs.KVLayout:
+        """MLA pages are token-packed by `kernels/mla`, never SEQ_ALONG_LANE.
+
+        Defined so a caller holding whichever backend `_find_non_ssm_backend`
+        returned can ask it without a type check; MLA does not inherit
+        `PallasAttentionBackend`.
+        """
+        return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
 
     @staticmethod
     def _ds_mla_packed_width(nope_dim: int, rope_head_dim: int,
