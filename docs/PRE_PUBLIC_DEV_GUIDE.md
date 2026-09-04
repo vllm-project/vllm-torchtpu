@@ -175,7 +175,7 @@ After the PR is merged into `main`:
 1. **Inspect Nightly & Scheduled Build Results (Buildkite):**
    To verify that your change runs successfully in scheduled nightly TPU benchmarks:
    🔗 **Buildkite Dashboard URL:**
-   [Buildkite Scheduled Builds](https://buildkite.com/tpu-commons/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build)
+   [Buildkite Scheduled Builds](https://buildkite.com/vllm/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build)
 2. **Verify Main Branch CI Runs (GitHub CLI):** Confirm that recent workflow runs on `main` remain green and stable:
 
    ```bash
@@ -274,7 +274,7 @@ In urgent situations where you must unblock yourself immediately:
 | **Phase 2: Update Outdated Branch** | `gh pr update-branch <PR_NUMBER>` |
 | **Phase 3: Guarded Merge (Approved + Green)** | `[ "$(gh pr view <PR_NUMBER> --json latestReviews \| jq '[.latestReviews[] \| select(.state == "APPROVED")] \| length')" -gt 0 ] && gh pr checks <PR_NUMBER> && gh pr merge <PR_NUMBER> --squash --delete-branch` |
 | **Phase 4: Main Branch CI Check (CLI)** | `gh run list --branch main --limit 5` |
-| **Phase 4: Buildkite Nightly URL** | [Buildkite Scheduled Builds](https://buildkite.com/tpu-commons/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build) |
+| **Phase 4: Buildkite Nightly URL** | [Buildkite Scheduled Builds](https://buildkite.com/vllm/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build) |
 | **Fix Missing DCO (CLI)** | `git commit --amend --signoff --no-edit && git push origin HEAD --force-with-lease` |
 | **Fix Missing DCO (UI Override)** | Click DCO check details in GitHub PR UI -> Click "Set DCO to PASS" |
 
