@@ -43,6 +43,56 @@ def _patch_vllm_pcp_v2_validation() -> None:
     logger.info("Applied TPU patch: allow PCP through GPU-specific V2 checks.")
 
 
+def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
+    """Use a common local prefix boundary for hybrid TPU producers.
+
+    vLLM 0.27.0 assumes every KV connector can complete a divergent local
+    hybrid hit by restoring the recurrent state missing at the deeper
+    full-attention boundary. TPU connectors do not provide that contract.
+    Backport the conservative behavior from vLLM #50344 at the manager
+    instance boundary, while preserving ``shared_prefix_boundary`` for
+    adaptive Mamba checkpoint retention.
+    """
+    from types import MethodType
+
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
+    kv_transfer_config = scheduler.vllm_config.kv_transfer_config
+    manager = scheduler.kv_cache_manager
+    if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
+            or not scheduler.has_mamba_layers
+            or not isinstance(manager.coordinator, HybridKVCacheCoordinator)):
+        return
+
+    def get_common_prefix_hit_for_connector(self, request):
+        blocks, hit_length, shared_prefix_boundary = self.get_computed_blocks(
+            request)
+        return blocks, hit_length, shared_prefix_boundary, False
+
+    manager.get_computed_blocks_for_connector = MethodType(
+        get_common_prefix_hit_for_connector, manager)
+    logger.info(
+        "Reconciled hybrid TPU producer prefix hits to a common boundary.")
+
+
+def _patch_vllm_hybrid_producer_prefix_hits() -> None:
+    """Backport connector-scoped hybrid hit handling from vLLM #50344."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if Scheduler.__dict__.get("_tpu_hybrid_producer_prefix_hit_patch", False):
+        return
+
+    original_init = Scheduler.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _reconcile_hybrid_producer_prefix_hits(self)
+
+    Scheduler.__init__ = patched_init
+    Scheduler._tpu_hybrid_producer_prefix_hit_patch = True
+    logger.info("Applied TPU patch: reconcile hybrid producer prefix hits.")
+
+
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     """Align Mamba prefill splits to the scheduler block size.
 
@@ -663,6 +713,10 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_mamba_split_scheduler_block_size()
     _patch_vllm_offloading_config_build()
+    # Platform activation can happen from inside the first Scheduler.__init__.
+    # Install this constructor patch at the engine-core boundary instead, before
+    # the first scheduler is created.
+    _patch_vllm_hybrid_producer_prefix_hits()
     _patch_vllm_merge_multimodal_embeddings()
 
     from vllm.v1.engine.core import EngineCoreProc
