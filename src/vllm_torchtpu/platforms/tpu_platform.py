@@ -357,7 +357,6 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
-    tpu_plugin._patch_vllm_pcp_v2_validation()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
     _patch_vllm_tpu_group_custom_ops()
