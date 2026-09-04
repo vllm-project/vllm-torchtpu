@@ -48,10 +48,11 @@ def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
 
     vLLM 0.27.0 assumes every KV connector can complete a divergent local
     hybrid hit by restoring the recurrent state missing at the deeper
-    full-attention boundary. TPU connectors do not provide that contract.
-    Backport the conservative behavior from vLLM #50344 at the manager
-    instance boundary, while preserving ``shared_prefix_boundary`` for
-    adaptive Mamba checkpoint retention.
+    full-attention boundary. The Raiden offloading path used by GPC does not
+    provide that contract. Backport the conservative behavior from vLLM
+    #50344 at the producer manager instance boundary, while preserving
+    ``shared_prefix_boundary`` for adaptive Mamba checkpoint retention.
+    Stage-3 Raiden consumers support divergent hits and are unaffected.
     """
     from types import MethodType
 
