@@ -1,0 +1,26 @@
+# Experiment results and data logs
+results/
+*.csv
+*.log
+*.jsonl
+traces/
+perf_eval_results/
+
+# Scratch & Plot scripts
+scratch/
+plot_scripts/
+plots/
+scripts/
+
+# Python & Test caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.coverage
+dist/
+build/
+*.egg-info/
