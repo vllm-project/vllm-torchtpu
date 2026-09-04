@@ -692,7 +692,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype,
                        **extra_weight_attrs):
-        self.moe = layer
+        self.moe = getattr(layer, "moe_config", layer)
         if not hasattr(layer, "has_bias") and hasattr(layer, "moe_config"):
             layer.has_bias = layer.moe_config.has_bias
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -974,6 +974,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                        output_partition_sizes, input_size, output_size,
                        params_dtype, **extra_weight_attrs):
         if self.quant_config.is_checkpoint_fp8_serialized:
+            layer.allow_fp8_block_shape_mismatch = True
             Fp8LinearMethod.create_weights(self, layer,
                                            input_size_per_partition,
                                            output_partition_sizes, input_size,
