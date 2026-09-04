@@ -99,7 +99,9 @@ class TestEndToEndPipelineIntegration(unittest.TestCase):
         with patch("runners.registry.RunnerRegistry.get",
                    return_value=mock_runner):
             orchestrator = run_sweep.SweepOrchestrator(
-                config_path=self.config_path, result_dir=self.results_dir)
+                config_path=self.config_path,
+                result_dir=self.results_dir,
+                upload_gcs=False)
             orchestrator.run()
 
             # Assert: Validate resulting CSV format and recorded values
