@@ -42,6 +42,7 @@ even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
 usual story for anything that scales with hidden size.
 """
 
+import math
 from typing import Any
 
 import jax
@@ -53,7 +54,8 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
+from vllm_torchtpu.kernels.fused_moe.v2.host import (WeightFormat,
+                                                     token_gather_smem_bytes)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -92,7 +94,7 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # -- read things that are not in it. So prebuild hands the op back to the caller
 # and the caller records it on the layer's own quant method; see
 # `fused_moe_ep_supported`.
-_OPS: dict[tuple[int, bool, str, tuple[int, ...] | None, bool], Any] = {}
+_OPS: dict[tuple[Any, ...], Any] = {}
 # This is a fact about the mesh, not about a layer, so one copy for the process
 # is what it is: every layer in a deployment sees the same EP group.
 # This rank's mesh index, as a device tensor. The kernel needs it as data;
@@ -127,6 +129,27 @@ def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
     return s.contiguous()
 
 
+def fp4_block_scale_for_fused_ep(scale: torch.Tensor, experts: int,
+                                 channels: int) -> torch.Tensor | None:
+    """Return a fused-EP FP4 scale view, or None for a foreign layout.
+
+    Native FP4 GMM keeps its per-contraction-block scales as ``[E, B, 1, N]``.
+    ``fused_ep_moe_v2`` takes ``[E, B, N]``.  The singleton is a layout-only
+    axis, so squeezing it once at weight load is free and preserves the GMM
+    parameter for the fallback path.
+    """
+    if scale is None:
+        return None
+    s = scale
+    if s.ndim == 4:
+        if s.shape[2] != 1:
+            return None
+        s = s.squeeze(2)
+    if s.ndim != 3 or s.shape[0] != experts or s.shape[-1] != channels:
+        return None
+    return s.contiguous()
+
+
 def fused_moe_ep_supported(owner: Any) -> bool:
     """Whether `prebuild_fused_moe_ep` armed the fused path for this layer.
 
@@ -152,12 +175,22 @@ def fused_moe_ep_supported(owner: Any) -> bool:
 
 
 def _build_op(mesh, topk: int, renormalize: bool, activation: str,
-              mesh_expert_order: tuple[int, ...] | None, sharded_plan: bool):
+              mesh_expert_order: tuple[int, ...] | None, sharded_plan: bool,
+              weight_format: WeightFormat = WeightFormat.FP8,
+              rhs_qb: int | None = None,
+              clamp_limit: float | None = None,
+              scoring_fn: str = "softmax",
+              routed_scaling_factor: float = 1.0,
+              hash_routing: bool = False,
+              correction_bias: bool = False):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
-    key = (topk, renormalize, activation, mesh_expert_order, sharded_plan)
+    key = (topk, renormalize, activation, mesh_expert_order, sharded_plan,
+           weight_format, rhs_qb, clamp_limit, scoring_fn,
+           float(routed_scaling_factor), bool(hash_routing),
+           bool(correction_bias))
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -172,7 +205,9 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
     # from the signature and refuses an unannotated one.
     def moe(x: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: jax.Array,
             w2_scale: jax.Array, gating: jax.Array,
-            rank: jax.Array) -> jax.Array:
+            rank: jax.Array, input_ids: jax.Array,
+            hash_indices_table: jax.Array,
+            e_score_correction_bias: jax.Array) -> jax.Array:
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -181,6 +216,10 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
         # schema `-> ((Tensor))`, and torch guard_ints every symbolic input dim
         # of an op with that schema, which specializes the model's dynamic token
         # count to whichever bucket compiled first.
+        # FP4_PACKED is native-GMM's K-major uint8 ABI [E, K/2, N].  Do not
+        # restore a logical f4 view here: that whole-array JAX transform
+        # materializes model-sized HBM temporaries.  The Pallas kernel instead
+        # bitcasts only the current contraction block after its DMA arrives.
         return fused_ep_moe_v2(x,
                                w1,
                                w2,
@@ -194,8 +233,17 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
                                capacity=_TILE_M,
                                block=None,
                                ragged_stride=None,
-                               weight_format=WeightFormat.FP8,
+                               weight_format=weight_format,
+                               rhs_qb=rhs_qb,
                                act_fn=activation,
+                               clamp_limit=clamp_limit,
+                               scoring_fn=scoring_fn,
+                               routed_scaling_factor=routed_scaling_factor,
+                               hash_routing=hash_routing,
+                               correction_bias=correction_bias,
+                               input_ids=input_ids,
+                               hash_indices_table=hash_indices_table,
+                               e_score_correction_bias=e_score_correction_bias,
                                mesh_ep_ranks=mesh_expert_order,
                                sharded_plan=sharded_plan)
 
@@ -208,9 +256,13 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
         name,
         moe,
         mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank -- every operand is
-        # sharded on axis 0 over the EP axis, and so is the single output.
-        input_partition_specs=(spec, ) * 7,
+        # x, w1, w2, scales, gate and rank are sharded over EP. DeepSeek
+        # supplies input_ids as a replicated batch vector; local_fn takes the
+        # matching token slice for its mesh shard. The hash table and
+        # correction bias are likewise model-wide routing parameters.
+        input_partition_specs=((spec, ) * 7 +
+                               (PartitionSpec(), PartitionSpec(),
+                                PartitionSpec())),
         output_partition_specs=spec,
     )
 
@@ -234,6 +286,11 @@ def fused_moe_ep(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    *,
+    weight_format: WeightFormat = WeightFormat.FP8,
+    input_ids: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -243,10 +300,41 @@ def fused_moe_ep(
     quant method, the same object `fused_moe_ep_supported` was asked about;
     only call this when that said yes.
     """
+    weight_format = WeightFormat(weight_format)
+    if weight_format == WeightFormat.FP8:
+        w1_scale = _squeeze_channel_scale_checked(w1_scale)
+        w2_scale = _squeeze_channel_scale_checked(w2_scale)
+    elif weight_format in (WeightFormat.FP4, WeightFormat.FP4_PACKED):
+        # Native FP4 GMM parameters include a singleton axis
+        # ([E, blocks, 1, N]) that is not part of fused_ep_moe_v2's ABI.  The
+        # check was done while prebuilding; this is only its static layout
+        # conversion, kept in the bridge so a caller need not mutate the
+        # fallback GMM parameters at load time.
+        w1_scale = w1_scale.squeeze(2) if w1_scale.ndim == 4 else w1_scale
+        w2_scale = w2_scale.squeeze(2) if w2_scale.ndim == 4 else w2_scale
+    else:
+        raise ValueError("the fused EP bridge only wires FP8 and FP4 scales")
+    # All exported fused-EP ops use this stable routing ABI.  A conventional
+    # layer supplies cheap placeholders; DeepSeek-V4 supplies its real token
+    # ids, hash table and/or correction bias.  Which fields matter is static
+    # in the op built for the layer, so placeholders never change routing.
+    device = hidden_states.device
+    if input_ids is None:
+        input_ids = torch.zeros(hidden_states.shape[0],
+                                dtype=torch.int32,
+                                device=device)
+    if hash_indices_table is None:
+        hash_indices_table = torch.zeros((1, 1),
+                                         dtype=torch.int32,
+                                         device=device)
+    if e_score_correction_bias is None:
+        e_score_correction_bias = torch.zeros(router_logits.shape[-1],
+                                               dtype=torch.float32,
+                                               device=device)
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
-    return op(hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
-              _squeeze_channel_scale_checked(w2_scale), router_logits,
-              _RANK_BUFFER)
+    return op(hidden_states, w1, w2, w1_scale, w2_scale, router_logits,
+              _RANK_BUFFER, input_ids, hash_indices_table,
+              e_score_correction_bias)
 
 
 def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
@@ -290,7 +378,10 @@ def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:
 
 
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
-                          activation: str) -> Any | None:
+                          activation: str,
+                          weight_format: WeightFormat = WeightFormat.FP8,
+                          rhs_qb: int | None = None,
+                          clamp_limit: float | None = None) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
     Called once per layer from `process_weights_after_loading`. Everything here
@@ -302,6 +393,18 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     several of the refusals below read things that vary by layer.
     """
     if not envs.USE_MOE_FUSED_EP_KERNEL:
+        return None
+    try:
+        weight_format = WeightFormat(weight_format)
+    except (TypeError, ValueError):
+        logger.warning_once("Fused EP MoE not engaged: unsupported weight "
+                            "format %r in the serving bridge.", weight_format)
+        return None
+    if weight_format not in (WeightFormat.FP8, WeightFormat.FP4,
+                             WeightFormat.FP4_PACKED):
+        logger.warning_once("Fused EP MoE not engaged: the serving bridge "
+                            "only wires FP8 and native FP4 weights, got %s.",
+                            weight_format)
         return None
 
     # The experts have to actually be expert-parallel. vLLM builds an EP group
@@ -399,10 +502,21 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     mesh_expert_order = _mesh_expert_order(ep)
 
     w1, w2 = layer.w13_weight, layer.w2_weight
-    w1_scale = layer.w13_weight_scale_inv
-    w2_scale = layer.w2_weight_scale_inv
-    local_experts, hidden = w1.shape[0], w1.shape[1]
-    inter = w1.shape[2] // 2
+    if weight_format == WeightFormat.FP8:
+        w1_scale = layer.w13_weight_scale_inv
+        w2_scale = layer.w2_weight_scale_inv
+        local_experts, hidden = w1.shape[0], w1.shape[1]
+        inter = w1.shape[2] // 2
+    else:
+        w1_scale = getattr(layer, "w13_weight_scale", None)
+        w2_scale = getattr(layer, "w2_weight_scale", None)
+        # Native torch FP4 stores two logical values in one physical element,
+        # so infer logical H/I from the scale output channels, not weight shape.
+        local_experts = w1.shape[0]
+        hidden = w2_scale.shape[-1] if w2_scale is not None else 0
+        inter = (w1_scale.shape[-1] // 2 if w1_scale is not None else 0)
+        if w1.dtype == torch.uint8 and w2.dtype == torch.uint8:
+            weight_format = WeightFormat.FP4_PACKED
 
     # The threshold is applied here rather than per step: the op is shape
     # agnostic, so the only place a token count is known outside the traced
@@ -434,19 +548,39 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
             local_experts)
         return None
 
+    scoring_fn = getattr(layer, "scoring_func", "softmax")
+    routed_scaling_factor = float(
+        getattr(layer, "routed_scaling_factor", 1.0) or 1.0)
+    hash_routing = getattr(layer, "hash_indices_table", None) is not None
+    correction_bias = (getattr(layer, "e_score_correction_bias", None)
+                       is not None)
+
     reason = _unsupported_reason(layer, w1, w2, w1_scale, w2_scale,
-                                 local_experts, hidden, inter, activation)
+                                 local_experts, hidden, inter, activation,
+                                 weight_format=weight_format,
+                                 rhs_qb=rhs_qb,
+                                 clamp_limit=clamp_limit)
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
-    op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
-                   sharded_plan)
+    if (weight_format == WeightFormat.FP8 and clamp_limit is None
+            and scoring_fn == "softmax" and routed_scaling_factor == 1.0
+            and not hash_routing and not correction_bias):
+        # Keep the legacy call shape: tests and out-of-tree users that stub
+        # this builder predate the FP4-specific static arguments.
+        op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
+                       sharded_plan)
+    else:
+        op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
+                       sharded_plan, weight_format, rhs_qb,
+                       clamp_limit, scoring_fn, routed_scaling_factor,
+                       hash_routing, correction_bias)
     logger.info_once(
-        "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "topk=%d capacity=%d sharded_plan=%s", hidden, inter, local_experts,
-        ep, topk, _TILE_M, sharded_plan)
+        "Fused EP MoE armed | format=%s hidden=%d inter=%d local_experts=%d "
+        "ep=%d topk=%d capacity=%d sharded_plan=%s", weight_format, hidden,
+        inter, local_experts, ep, topk, _TILE_M, sharded_plan)
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either
     # the padding mask or the chunked path. Padding costs expert work and
@@ -463,23 +597,83 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
 
 
 def _unsupported_reason(layer, w1, w2, w1_scale, w2_scale, local_experts,
-                        hidden, inter, activation) -> str | None:
+                        hidden, inter, activation, *, weight_format,
+                        rhs_qb, clamp_limit) -> str | None:
     """Why this layer cannot use the fused kernel, or None if it can."""
     if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != local_experts:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
-    if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
-        return (f"the kernel's fp8 form takes float8_e4m3fn expert weights, "
-                f"got {w1.dtype} / {w2.dtype}")
-    if w2.shape[1] != inter or w2.shape[2] != hidden:
-        return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
-    if activation != "silu":
+    if weight_format == WeightFormat.FP8:
+        if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+            return ("the kernel's fp8 form takes float8_e4m3fn expert "
+                    f"weights, got {w1.dtype} / {w2.dtype}")
+    else:
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        native_fp4 = (fp4_dtype is not None and w1.dtype == fp4_dtype
+                      and w2.dtype == fp4_dtype)
+        packed_fp4 = w1.dtype == torch.uint8 and w2.dtype == torch.uint8
+        if not (native_fp4 or packed_fp4):
+            return ("the kernel's fp4 form takes native "
+                    "torch.float4_e2m1fn_x2 weights or the native-GMM "
+                    "packed uint8 form, got " f"{w1.dtype} / {w2.dtype}")
+    if weight_format == WeightFormat.FP8:
+        if w2.shape[1] != inter or w2.shape[2] != hidden:
+            return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
+    # A torch float4 element stores two logical values, while the GMM loader
+    # stores the same two values as one uint8 on K.  The latter reaches the
+    # fused kernel as FP4_PACKED and is unpacked only per contraction tile.
+    elif native_fp4 and (w2.shape[1] != inter or w2.shape[2] * 2 != hidden):
+        return (f"native FP4 w2 {tuple(w2.shape)} is not physical "
+                f"[E, {inter}, {hidden // 2}] for logical [E, {inter}, "
+                f"{hidden}]")
+    elif packed_fp4 and (w2.shape[1] * 2 != inter or w2.shape[2] != hidden):
+        return (f"packed FP4 w2 {tuple(w2.shape)} is not physical "
+                f"[E, {inter // 2}, {hidden}] for logical [E, {inter}, "
+                f"{hidden}]")
+    if weight_format in (WeightFormat.FP4, WeightFormat.FP4_PACKED):
+        if native_fp4 and (w1.shape[1] != hidden or w1.shape[2] * 2 !=
+                           2 * inter):
+            return (f"native FP4 w1 {tuple(w1.shape)} is not physical "
+                    f"[E, {hidden}, {inter}] for logical [E, {hidden}, "
+                    f"{2 * inter}]")
+        if packed_fp4 and (w1.shape[1] * 2 != hidden or w1.shape[2] !=
+                           2 * inter):
+            return (f"packed FP4 w1 {tuple(w1.shape)} is not physical "
+                    f"[E, {hidden // 2}, {2 * inter}] for logical "
+                    f"[E, {hidden}, {2 * inter}]")
+    if activation not in ("silu", "swigluoai", "silu_and_mul_with_clamp"):
         return f"activation {activation!r} is not wired to the kernel's ACT_FNS"
-    if _squeeze_channel_scale(w1_scale, local_experts, 2 * inter) is None:
-        return (
-            "w1_scale is not the per-output-channel form the kernel takes; "
-            "a block-scaled weight is a different kernel format")
-    if _squeeze_channel_scale(w2_scale, local_experts, hidden) is None:
-        return "w2_scale is not the per-output-channel form the kernel takes"
+    if activation == "silu_and_mul_with_clamp":
+        if clamp_limit is None or float(clamp_limit) <= 0:
+            return ("silu_and_mul_with_clamp requires layer.swiglu_limit "
+                    "to be a positive static value")
+    elif clamp_limit is not None:
+        return f"activation {activation!r} does not use a clamp_limit"
+    if weight_format == WeightFormat.FP8:
+        if _squeeze_channel_scale(w1_scale, local_experts, 2 * inter) is None:
+            return (
+                "w1_scale is not the per-output-channel form the kernel takes; "
+                "a block-scaled weight is a different kernel format")
+        if _squeeze_channel_scale(w2_scale, local_experts, hidden) is None:
+            return "w2_scale is not the per-output-channel form the kernel takes"
+    else:
+        w1s = fp4_block_scale_for_fused_ep(w1_scale, local_experts, 2 * inter)
+        w2s = fp4_block_scale_for_fused_ep(w2_scale, local_experts, hidden)
+        if w1s is None or w2s is None:
+            return ("FP4 scales must be [E, blocks, 1, N] or [E, blocks, N] "
+                    "in the native K-major layout")
+        if rhs_qb is None or rhs_qb < 1:
+            return "FP4 requires its contraction-block size (rhs_qb)"
+        if rhs_qb % 64:
+            return (f"FP4 rhs_qb={rhs_qb} is not a multiple of 64, the "
+                    "packed-weight row tile; requantize with "
+                    "MOE_REQUANTIZE_BLOCK_SIZE=64 or 512")
+        if hidden % rhs_qb or inter % rhs_qb:
+            return (f"FP4 rhs_qb={rhs_qb} must divide hidden={hidden} and "
+                    f"inter={inter}")
+        if (w1s.shape[1] != hidden // rhs_qb
+                or w2s.shape[1] != inter // rhs_qb):
+            return ("FP4 scale block counts do not match rhs_qb: expected "
+                    f"{hidden // rhs_qb} for w1 and {inter // rhs_qb} for w2")
     # The kernel takes expert biases (`has_w1_bias`/`has_w2_bias`) but this
     # bridge does not pass them, and dropping a bias is silent: the output is
     # simply wrong by the bias term on every routed token. Refuse until they
@@ -493,14 +687,11 @@ def _unsupported_reason(layer, w1, w2, w1_scale, w2_scale, local_experts,
 def _unsupported_routing_reason(layer) -> str | None:
     """Why this layer's ROUTING cannot go through the kernel, or None.
 
-    The fused path never calls `moe_routing.route`: the kernel scores with a
-    plain softmax and selects top-k itself, with `renormalize` as its only
-    option. Everything else `select_experts` can do -- a different scoring
-    function, an expert-score correction bias, expert grouping, hash routing,
-    a routed scaling factor, a supplied `custom_routing_function` -- is not
-    that, and taking the fused path anyway routes tokens to a DIFFERENT set of
-    experts with different gate weights, with nothing raised and nothing
-    logged. Each of these is a refusal rather than a silent divergence.
+    The fused path never calls `moe_routing.route`, so it must implement a
+    layer's routing semantics itself.  It supports softmax and DeepSeek-V4's
+    sqrt-softplus scoring, correction-bias selection, token-id hash routing,
+    and scaling after optional normalization.  Other router extensions stay
+    explicit refusals rather than silently changing selected experts.
     """
     from vllm_torchtpu.layers.vllm import moe_routing
 
@@ -508,19 +699,31 @@ def _unsupported_routing_reason(layer) -> str | None:
         return ("the layer supplies a custom_routing_function; the kernel "
                 "routes with its own softmax top-k")
     scoring_fn = getattr(layer, "scoring_func", "softmax")
-    if scoring_fn != "softmax":
-        return f"scoring_func {scoring_fn!r}; the kernel scores with softmax"
-    if getattr(layer, "e_score_correction_bias", None) is not None:
-        return "e_score_correction_bias is not applied inside the kernel"
+    if scoring_fn not in ("softmax", "sqrtsoftplus"):
+        return (f"scoring_func {scoring_fn!r}; the kernel supports only "
+                "softmax and sqrtsoftplus")
     if (getattr(layer, "use_grouped_topk", False)
             and getattr(layer, "num_expert_group", 1) > 1
             and getattr(layer, "topk_group", 1) < layer.num_expert_group):
         return "grouped top-k routing is not implemented in the kernel"
-    if getattr(layer, "hash_indices_table", None) is not None:
-        return "hash routing is not implemented in the kernel"
+    table = getattr(layer, "hash_indices_table", None)
+    if table is not None:
+        if table.ndim != 2 or table.shape[-1] != layer.moe_config.experts_per_token:
+            return ("hash_indices_table must be [vocab_size, topk], got "
+                    f"{tuple(table.shape)} for topk="
+                    f"{layer.moe_config.experts_per_token}")
+        if table.dtype not in (torch.int32, torch.int64, torch.uint32,
+                               torch.uint64):
+            return f"hash_indices_table must contain integer expert ids, got {table.dtype}"
+    correction_bias = getattr(layer, "e_score_correction_bias", None)
+    if correction_bias is not None:
+        if correction_bias.ndim != 1 or correction_bias.shape[0] != layer.global_num_experts:
+            return ("e_score_correction_bias must be [global_experts], got "
+                    f"{tuple(correction_bias.shape)} for "
+                    f"{layer.global_num_experts} experts")
     scale = float(getattr(layer, "routed_scaling_factor", 1.0) or 1.0)
-    if scale != 1.0:
-        return f"routed_scaling_factor {scale} is not applied by the kernel"
+    if not math.isfinite(scale):
+        return f"routed_scaling_factor must be finite, got {scale}"
     # The routing simulator replaces the routing output wholesale, so a run
     # that asked for it and got real routing is a profiling result that is
     # quietly not the thing it claims to measure.

@@ -92,11 +92,13 @@ N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
 # The FFN activations this kernel can fuse. "silu" is the default and the
 # only one the kernel carried before the selector existed; "swigluoai" is
 # the clamped GPT-OSS form, whose math is the grouped-matmul kernel's
-# function imported above rather than a second copy.
-ACT_FNS = ("silu", "swigluoai")
+# function imported above rather than a second copy. DeepSeek-V4 keeps the
+# ordinary SiLU coefficients but clamps both input halves with a model-owned
+# limit, so it is deliberately a separate form rather than an alias.
+ACT_FNS = ("silu", "swigluoai", "silu_and_mul_with_clamp")
 
 
-def _apply_act(gate, up, act_fn):
+def _apply_act(gate, up, act_fn, clamp_limit=None):
     """The FFN activation, on the POST-SCALE gate and up halves.
 
     Both weight forms reach here with the accumulator already multiplied
@@ -107,6 +109,13 @@ def _apply_act(gate, up, act_fn):
         return jax.nn.silu(gate) * up
     if act_fn == "swigluoai":
         return swigluoai(gate, up)
+    if act_fn == "silu_and_mul_with_clamp":
+        if clamp_limit is None:
+            raise ValueError(
+                "silu_and_mul_with_clamp requires a static clamp_limit")
+        gate = jnp.minimum(gate, clamp_limit)
+        up = jnp.clip(up, -clamp_limit, clamp_limit)
+        return jax.nn.silu(gate) * up
     raise NotImplementedError(
         f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
 
@@ -200,6 +209,7 @@ def _intermediate_rows(acc1,
                        *,
                        w1s,
                        act_fn,
+                       clamp_limit,
                        w1b,
                        requantize=True):
     """acc1's gate and up halves through the activation, as the second
@@ -240,7 +250,8 @@ def _intermediate_rows(acc1,
         if w1b is not None:
             gate = gate + w1b[:, c0:c1]
             up = up + w1b[:, inter + c0:inter + c1]
-        chunk = _apply_act(gate, up, act_fn).astype(jnp.bfloat16)
+        chunk = _apply_act(gate, up, act_fn,
+                           clamp_limit=clamp_limit).astype(jnp.bfloat16)
         mid_chunks.append(chunk)
         if requantize:
             chunk_amax = _absmax_rows(chunk)
@@ -275,7 +286,14 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     return acc
 
 
-def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
+def expert_ffn_fp8(act_q,
+                   act_scale,
+                   w1,
+                   w2,
+                   w1s,
+                   act_fn="silu",
+                   clamp_limit=None,
+                   w1b=None):
     """One expert's FFN on eight-bit weights: the gate/up matmul, the
     activation, the intermediate requantization and the down matmul.
 
@@ -290,6 +308,7 @@ def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
                                           inter,
                                           w1s=w1s,
                                           act_fn=act_fn,
+                                          clamp_limit=clamp_limit,
                                           w1b=w1b)
     acc2 = lax.dot_general(mid_q, w2, DN, preferred_element_type=jnp.float32)
     return acc2, mid_scale
@@ -304,6 +323,7 @@ def expert_ffn_blockscale(act_q,
                           *,
                           qb=QB4,
                           act_fn="silu",
+                          clamp_limit=None,
                           w1b=None):
     """One expert's FFN on block-scaled weights: the same body as
     expert_ffn_fp8 with each matmul summed over contraction blocks carrying
@@ -335,6 +355,7 @@ def expert_ffn_blockscale(act_q,
                                           inter,
                                           w1s=None,
                                           act_fn=act_fn,
+                                          clamp_limit=clamp_limit,
                                           w1b=w1b)
     acc2 = None
     for b in range(n_blocks2):
@@ -347,7 +368,12 @@ def expert_ffn_blockscale(act_q,
     return acc2, mid_scale
 
 
-def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
+def expert_ffn_bf16(act,
+                    w1,
+                    w2,
+                    act_fn="silu",
+                    clamp_limit=None,
+                    w1b=None):
     """One expert's FFN on unquantized sixteen-bit weights.
 
     Nothing here is quantized and nothing is dequantized. The rows arrive as
@@ -366,6 +392,7 @@ def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
                                 inter,
                                 w1s=None,
                                 act_fn=act_fn,
+                                clamp_limit=clamp_limit,
                                 w1b=w1b,
                                 requantize=False)
     acc2 = lax.dot_general(mid, w2, DN, preferred_element_type=jnp.float32)
@@ -381,6 +408,7 @@ def expert_ffn_int8(act,
                     n_chunks2,
                     kb=host.WIDEN_KCHUNK,
                     act_fn="silu",
+                    clamp_limit=None,
                     w1b=None):
     """One expert's FFN on eight-bit INTEGER weights with per-channel scales.
 
@@ -408,6 +436,7 @@ def expert_ffn_int8(act,
                                 inter,
                                 w1s=w1s,
                                 act_fn=act_fn,
+                                clamp_limit=clamp_limit,
                                 w1b=w1b,
                                 requantize=False)
     acc2 = _chunked_dot(mid, w2_chunk, n_chunks2, kb)
@@ -484,19 +513,27 @@ def _build_fused_ep_moe_kernel(*,
                                rhs_qb=QB4,
                                ragged_rows_alloc=None,
                                act_fn="silu",
+                               clamp_limit=None,
                                has_w1_bias=False,
                                has_w2_bias=False):
     """Build the pallas_call and the function that invokes it."""
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
+    if act_fn == "silu_and_mul_with_clamp":
+        if clamp_limit is None or float(clamp_limit) <= 0:
+            raise ValueError(
+                "silu_and_mul_with_clamp requires clamp_limit > 0")
+        clamp_limit = float(clamp_limit)
+    elif clamp_limit is not None:
+        raise ValueError(f"{act_fn!r} does not take clamp_limit")
     # The kernel fetches lhs rows by index from the ungathered token buffer
     # [tokens, lane blocks, 128], using the token-gather table, and ships
     # results over an all-to-all carrying unweighted rows; it returns
     # (arrival rows, arrival scales f32). The element type of the staging and
     # of the wire is the weight format's, not a literal here.
     form = host.weight_form(weight_format)
-    rhs_packed4 = weight_format == host.WeightFormat.FP4
+    rhs_packed4 = host.is_fp4_format(weight_format)
     assert 0 < WEIGHT_PREFETCH_DISTANCE < NBUF, (
         f"weight prefetch distance {WEIGHT_PREFETCH_DISTANCE} must satisfy "
         f"0 < distance < NBUF={NBUF}, so that distance + 1 consecutive "
@@ -1061,6 +1098,7 @@ def _build_fused_ep_moe_kernel(*,
                                                             w2s_blocks,
                                                             qb=rhs_qb,
                                                             act_fn=act_fn,
+                                                            clamp_limit=clamp_limit,
                                                             w1b=w1b_row)
                 elif weight_format == host.WeightFormat.INT8:
                     w1_chunk, w2_chunk = _int8_chunk_readers(slot)
@@ -1072,12 +1110,14 @@ def _build_fused_ep_moe_kernel(*,
                         n_chunks1=hidden // host.WIDEN_KCHUNK,
                         n_chunks2=inter // host.WIDEN_KCHUNK,
                         act_fn=act_fn,
+                        clamp_limit=clamp_limit,
                         w1b=w1b_row)
                 elif weight_format == host.WeightFormat.BF16:
                     acc2, mid_scale = expert_ffn_bf16(act_rows,
                                                       w1_vm[slot],
                                                       w2_vm[slot],
                                                       act_fn=act_fn,
+                                                      clamp_limit=clamp_limit,
                                                       w1b=w1b_row)
                 else:
                     acc2, mid_scale = expert_ffn_fp8(act_rows,
@@ -1086,6 +1126,7 @@ def _build_fused_ep_moe_kernel(*,
                                                      w2_vm[slot],
                                                      w1s_vm[pl.ds(e, 1), :],
                                                      act_fn=act_fn,
+                                                     clamp_limit=clamp_limit,
                                                      w1b=w1b_row)
                 # The destination applies the router weight, not this. Four-bit
                 # weights carry w2s inside the block sums; the formats whose
@@ -1328,14 +1369,19 @@ def _build_fused_ep_moe_kernel(*,
         format_tag = {
             host.WeightFormat.FP8: "",
             host.WeightFormat.FP4: "_fp4w",
+            host.WeightFormat.FP4_PACKED: "_fp4packedw",
             host.WeightFormat.INT8: "_int8w",
             host.WeightFormat.BF16: "_bf16w",
         }[weight_format]
         bias_tag = (("_w13bias" if has_w1_bias else "") +
                     ("_w2bias" if has_w2_bias else ""))
+        clamp_tag = ("" if clamp_limit is None else
+                     f"_clamp{clamp_limit:g}".replace(".", "p").replace(
+                         "-", "m"))
         name = (f"fused_ep_moe_v2"
                 f"{format_tag}"
                 f"{'' if act_fn == 'silu' else '_' + act_fn}"
+                f"{clamp_tag}"
                 f"{bias_tag}"
                 f"_g{g_local}_c{capacity}_nb{NBUF}")
         return pl.pallas_call(

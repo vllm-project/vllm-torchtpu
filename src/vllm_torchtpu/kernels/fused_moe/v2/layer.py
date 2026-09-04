@@ -136,6 +136,14 @@ def fused_ep_moe_v2(x,
                     weight_format=WeightFormat.FP8,
                     rhs_qb=None,
                     act_fn="silu",
+                    clamp_limit=None,
+                    scoring_fn="softmax",
+                    routed_scaling_factor=1.0,
+                    hash_routing=False,
+                    correction_bias=False,
+                    input_ids=None,
+                    hash_indices_table=None,
+                    e_score_correction_bias=None,
                     rank=None,
                     mesh_ep_ranks=None,
                     sharded_plan=False):
@@ -252,6 +260,13 @@ def fused_ep_moe_v2(x,
             f"next. Pass {stride_bound} or more.")
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
+    if scoring_fn not in ("softmax", "sqrtsoftplus"):
+        raise ValueError(f"unsupported fused-EP scoring function {scoring_fn!r}")
+    if hash_routing and (input_ids is None or hash_indices_table is None):
+        raise ValueError("hash routing requires input_ids and hash_indices_table")
+    if correction_bias and e_score_correction_bias is None:
+        raise ValueError("correction-bias routing requires e_score_correction_bias")
+
     kfn = build_fused_ep_moe_kernel(g_local=g_local,
                                     capacity=capacity,
                                     hidden=hidden,
@@ -261,19 +276,25 @@ def fused_ep_moe_v2(x,
                                     weight_format=weight_format,
                                     rhs_qb=rhs_qb,
                                     act_fn=act_fn,
+                                    clamp_limit=clamp_limit,
                                     has_w1_bias=has_w1_bias,
                                     has_w2_bias=has_w2_bias)
 
-    def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
+    def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases_routing):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
         # The scales come before the gating logits and the biases after
         # them, which is the operand order the scaled formats have always
         # had: a format that supplies no scales drops them out of the middle
         # rather than moving anything that stayed.
-        operands = iter(scales_gating_biases)
+        operands = iter(scales_gating_biases_routing)
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
         gate_l = next(operands)
+        # Routing operands are deliberately part of every exported op's ABI;
+        # static flags below decide whether their values participate.
+        input_ids_l = next(operands)
+        hash_table_l = next(operands)
+        correction_bias_l = next(operands)
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
@@ -291,13 +312,45 @@ def fused_ep_moe_v2(x,
                              axis=0,
                              tiled=True)
 
-        scores = jax.nn.softmax(gate_l, axis=-1)
+        if scoring_fn == "softmax":
+            scores = jax.nn.softmax(gate_l, axis=-1)
+        else:
+            # DeepSeek-V4 scores experts by sqrt(softplus(logit)), not by a
+            # normalized distribution.  This is deliberately f32: its router
+            # logits are f32 and the reference router widens before softplus.
+            scores = jnp.sqrt(jax.nn.softplus(gate_l))
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
-        topk_weights, topk_idx = pallas_select(scores,
-                                               topk=topk,
-                                               block_rows=select_rows)
+        if hash_routing:
+            # Hash-MoE fixes the experts from token ids but still takes their
+            # weights from the *unbiased* transformed scores.  The table and
+            # ids are operands rather than JAX constants so every model's
+            # vocabulary table remains a model parameter, not a compiled blob.
+            # DeepSeek passes the batch's input ids replicated to every EP
+            # rank, unlike hidden states/router logits which are sharded. Pick
+            # this mesh shard's token range explicitly before the hash lookup.
+            # Treating the replicated vector as P(axis)-sharded expands it by
+            # ep at the Torch/JAX boundary and turns [T, topk] into
+            # [ep*T, topk] here.
+            flat_ids = lax.dynamic_slice(input_ids_l.reshape(-1),
+                                         (me * t_local, ),
+                                         (t_local, )).astype(jnp.int32)
+            topk_idx = hash_table_l[flat_ids].reshape(t_local, topk)
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
+        else:
+            choice_scores = (scores + correction_bias_l[None, :]
+                             if correction_bias else scores)
+            _, topk_idx = pallas_select(choice_scores,
+                                         topk=topk,
+                                         block_rows=select_rows)
+            # DeepSeek's correction bias affects expert *selection* only.
+            # Its routed weights are always gathered from uncorrected scores.
+            topk_weights = (jnp.take_along_axis(scores, topk_idx, axis=-1)
+                            if correction_bias else
+                            jnp.take_along_axis(choice_scores,
+                                                topk_idx,
+                                                axis=-1))
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks)
         # A row of scores carrying no real value routes nowhere. It was
@@ -312,8 +365,10 @@ def fused_ep_moe_v2(x,
         row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
         if renormalize:
             denom = topk_weights.sum(axis=-1, keepdims=True)
-            topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
-        topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+            topk_weights = topk_weights / jnp.where(
+                row_routes, jnp.maximum(denom, 1.0e-20), 1.0)
+        topk_weights = jnp.where(row_routes,
+                                 topk_weights * routed_scaling_factor, 0.0)
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
@@ -461,18 +516,35 @@ def fused_ep_moe_v2(x,
     # default keeps the device tests and any JAX-native caller working.
     if rank is None:
         rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
-    in_specs = (P(ax), ) * (5 + len(scale_args) + len(bias_args))
-    args = (x, rank, w1, w2) + scale_args + (gating, ) + bias_args
+    if input_ids is None:
+        input_ids = jnp.zeros((T, ), dtype=jnp.int32)
+    if hash_indices_table is None:
+        hash_indices_table = jnp.zeros((1, topk), dtype=jnp.int32)
+    if e_score_correction_bias is None:
+        e_score_correction_bias = jnp.zeros((e_total, ), dtype=jnp.float32)
+    # input_ids is model-batch metadata replicated by vLLM on each EP rank;
+    # the router slices this rank's T/ep rows inside local_fn.  The hash table
+    # and correction bias are also global routing parameters.
+    in_specs = ((P(ax), ) * (5 + len(scale_args)) +
+                (P(), P(), P()) + (P(ax), ) * len(bias_args))
+    args = ((x, rank, w1, w2) + scale_args +
+            (gating, input_ids, hash_indices_table, e_score_correction_bias) +
+            bias_args)
     NS = jax.sharding.NamedSharding
     args = tuple(
         jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (mesh, T, hidden, e_total, inter, topk, bool(renormalize), capacity,
-           block, ragged_stride, weight_format, rhs_qb, act_fn, mesh_ep_ranks,
-           bool(sharded_plan), x.dtype, w1.dtype, w2.dtype, form.has_scales
+           block, ragged_stride, weight_format, rhs_qb, act_fn, clamp_limit,
+           scoring_fn, float(routed_scaling_factor), bool(hash_routing),
+           bool(correction_bias),
+           mesh_ep_ranks, bool(sharded_plan), x.dtype, w1.dtype, w2.dtype,
+           form.has_scales
            and w1_scale.dtype, gating.dtype, has_w1_bias
-           and w1_bias.dtype, has_w2_bias and w2_bias.dtype)
+           and w1_bias.dtype, has_w2_bias and w2_bias.dtype,
+           input_ids.dtype, hash_indices_table.dtype,
+           e_score_correction_bias.dtype)
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
         with _LAYER_SM_CACHE_LOCK:

@@ -188,6 +188,10 @@ class WeightFormat(str, enum.Enum):
     """
     FP8 = "fp8"
     FP4 = "fp4"
+    # Physical K-major native-GMM storage.  Unlike FP4, whose JAX aval is a
+    # logical f4 array, this is the already-packed [E, K/2, N] uint8 ABI.
+    # It lets the bridge hand the Pallas call parameter bytes directly.
+    FP4_PACKED = "fp4_packed"
     INT8 = "int8"
     BF16 = "bf16"
 
@@ -256,6 +260,9 @@ WEIGHT_FORMS = {
     WeightFormat.FP4:
     WeightForm(WeightFormat.FP4, FP4, FP8, FP8_MAX, "per_contraction_block",
                FP8),
+    WeightFormat.FP4_PACKED:
+    WeightForm(WeightFormat.FP4_PACKED, jnp.uint8, FP8, FP8_MAX,
+               "per_contraction_block", FP8),
     WeightFormat.INT8:
     WeightForm(WeightFormat.INT8, INT8, BF16, None, "per_channel", BF16),
     WeightFormat.BF16:
@@ -263,6 +270,12 @@ WEIGHT_FORMS = {
 }
 
 WEIGHT_FORMAT_NAMES = tuple(WEIGHT_FORMS)
+
+
+def is_fp4_format(weight_format):
+    """Whether ``weight_format`` uses the FP4 blockscale kernel body."""
+    return WeightFormat(weight_format) in (WeightFormat.FP4,
+                                            WeightFormat.FP4_PACKED)
 
 
 def weight_form(weight_format):
@@ -1017,7 +1030,7 @@ def vmem_scratch_arrays(g_local,
     tile_blocks = tile_m // ROWBLK
     # Every local expert's scale table is resident. At four-bit block scales
     # that makes the two scale tables some of the largest buffers here.
-    if weight_format == WeightFormat.FP4:
+    if is_fp4_format(weight_format):
         # Four-bit weights stream as PACKED u32 words ([K/8, N]), so the
         # transfer moves half the bytes an eight-bit slab would.
         weights = [
@@ -1120,7 +1133,7 @@ def vmem_tile_body_arrays(capacity,
     # sixteen-bit wire ships down_bf16 itself and materializes nothing.
     if form.wire_dtype is FP8:
         arrays.append(("wire_rows", (tile_m, hidden), FP8))
-    if weight_format == WeightFormat.FP4:
+    if is_fp4_format(weight_format):
         arrays.append(("widened_weight_block", (WIDENED_BLOCK_BUFFERS, rhs_qb,
                                                 max(2 * inter, hidden)), FP8))
     elif weight_format == WeightFormat.INT8:

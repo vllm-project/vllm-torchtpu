@@ -97,7 +97,9 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                     raise NotImplementedError("NVFP4 is not supported yet.")
 
                 moe_config = self.get_moe_config(layer)
-                return VllmDeepseekV4Mxfp4MoEMethod(moe_config)
+                method = VllmDeepseekV4Mxfp4MoEMethod(moe_config)
+                method._native_fp4_cache_prefix = prefix
+                return method
             else:
                 return VllmFp8MoEMethodTPU(self, layer)
 

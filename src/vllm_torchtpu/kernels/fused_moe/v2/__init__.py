@@ -41,6 +41,7 @@ WEIGHT_FORMS = host.WEIGHT_FORMS
 WEIGHT_FORMAT_NAMES = host.WEIGHT_FORMAT_NAMES
 weight_form = host.weight_form
 weight_format_of_dtype = host.weight_format_of_dtype
+is_fp4_format = host.is_fp4_format
 routing_block = host.routing_block
 ragged_stride_bound = host.ragged_stride_bound
 vmem_estimate_bytes = host.vmem_estimate_bytes

@@ -45,6 +45,9 @@ scaling.
    - Returns output tensor
 """
 
+import hashlib
+import os
+from pathlib import Path
 from typing import Any, Optional
 
 import jax.numpy as jnp
@@ -74,6 +77,7 @@ from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel,
                                                  quantize_native_fp4_kmajor)
+from vllm_torchtpu.kernels.fused_moe.v2.host import WeightFormat
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
@@ -326,6 +330,136 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
     rhs_quant_dtype = jnp.float4_e2m1fn
 
+    _NATIVE_FP4_CACHE_VERSION = 1
+
+    def _native_fp4_cache_path(self, layer: RoutedExperts) -> Path | None:
+        cache_dir = os.getenv("VLLM_FP4_CACHE_DIR")
+        if not cache_dir:
+            return None
+
+        prefix = getattr(self, "_native_fp4_cache_prefix", None)
+        if not prefix:
+            logger.warning_once(
+                "VLLM_FP4_CACHE_DIR is set, but the MoE layer has no stable "
+                "prefix; native-FP4 caching is disabled for that layer.")
+            return None
+
+        ep_rank = int(getattr(layer.moe_config, "ep_rank", 0))
+        ep_size = int(getattr(layer.moe_config, "ep_size", 1))
+        prefix_hash = hashlib.sha256(prefix.encode()).hexdigest()[:16]
+        filename = (f"native-fp4-v{self._NATIVE_FP4_CACHE_VERSION}-"
+                    f"b{REQUANTIZED_BLOCK_SIZE}-ep{ep_rank:04d}of{ep_size:04d}-"
+                    f"{prefix_hash}.pt")
+        return Path(cache_dir) / filename
+
+    def _native_fp4_cache_metadata(self,
+                                   layer: RoutedExperts) -> dict[str, Any]:
+        return {
+            "version": self._NATIVE_FP4_CACHE_VERSION,
+            "prefix": getattr(self, "_native_fp4_cache_prefix", None),
+            "block_size": REQUANTIZED_BLOCK_SIZE,
+            "ep_rank": int(getattr(layer.moe_config, "ep_rank", 0)),
+            "ep_size": int(getattr(layer.moe_config, "ep_size", 1)),
+            "num_local_experts": int(layer.w13_weight.shape[0]),
+        }
+
+    def _load_native_fp4_cache(
+        self,
+        layer: RoutedExperts,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor | None, torch.Tensor | None] | None:
+        path = self._native_fp4_cache_path(layer)
+        mode = os.getenv("VLLM_FP4_CACHE_MODE", "auto").lower()
+        if path is None or mode in ("off", "write"):
+            return None
+        if mode not in ("auto", "read"):
+            raise ValueError("VLLM_FP4_CACHE_MODE must be one of "
+                             "auto, read, write, or off")
+        if not path.is_file():
+            if mode == "read":
+                raise FileNotFoundError(
+                    f"Required native-FP4 cache file is missing: {path}")
+            return None
+
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        expected = self._native_fp4_cache_metadata(layer)
+        if payload.get("metadata") != expected:
+            message = (f"Native-FP4 cache metadata mismatch for {path}: "
+                       f"expected {expected}, got {payload.get('metadata')}")
+            if mode == "read":
+                raise ValueError(message)
+            logger.warning(message)
+            return None
+
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4_dtype is None:
+            raise RuntimeError(
+                "Native-FP4 cache requires torch.float4_e2m1fn_x2")
+
+        def restore_weight(name: str) -> torch.Tensor:
+            packed = payload[name]
+            if packed.dtype != torch.uint8:
+                raise ValueError(f"{path}: {name} must contain uint8 bytes")
+            return packed.contiguous().view(fp4_dtype).to(device)
+
+        def restore_optional(name: str) -> torch.Tensor | None:
+            value = payload.get(name)
+            return None if value is None else value.to(device)
+
+        logger.info("Loading native-FP4 MoE cache %s", path)
+        return (
+            restore_weight("w13_weight"),
+            restore_weight("w2_weight"),
+            payload["w13_weight_scale"].to(device),
+            payload["w2_weight_scale"].to(device),
+            restore_optional("w13_bias"),
+            restore_optional("w2_bias"),
+        )
+
+    def _save_native_fp4_cache(
+        self,
+        layer: RoutedExperts,
+        w13_weight: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w13_weight_scale: torch.Tensor,
+        w2_weight_scale: torch.Tensor,
+        w13_bias: torch.Tensor | None,
+        w2_bias: torch.Tensor | None,
+    ) -> None:
+        path = self._native_fp4_cache_path(layer)
+        mode = os.getenv("VLLM_FP4_CACHE_MODE", "auto").lower()
+        if path is None or mode in ("off", "read"):
+            return
+        if mode not in ("auto", "write"):
+            raise ValueError("VLLM_FP4_CACHE_MODE must be one of "
+                             "auto, read, write, or off")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "metadata": self._native_fp4_cache_metadata(layer),
+            # safetensors does not yet describe torch's packed native FP4
+            # dtype. Persist its exact bytes and restore the dtype on load.
+            "w13_weight": w13_weight.detach().view(torch.uint8).cpu(),
+            "w2_weight": w2_weight.detach().view(torch.uint8).cpu(),
+            "w13_weight_scale": w13_weight_scale.detach().cpu(),
+            "w2_weight_scale": w2_weight_scale.detach().cpu(),
+            "w13_bias": None if w13_bias is None else w13_bias.detach().cpu(),
+            "w2_bias": None if w2_bias is None else w2_bias.detach().cpu(),
+        }
+        temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+        logger.info("Saved native-FP4 MoE cache %s", path)
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        """Claim dispatch/combine only for a fused-EP layer that was armed."""
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            fused_moe_ep_supported
+        return (enable_pipelined_collective_and_compute()
+                or fused_moe_ep_supported(self))
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -458,11 +592,27 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation_str = "silu_and_mul_with_clamp"
         layer._tpu_activation_str = activation_str
 
-        (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
-         orig_intermediate) = self._dequantize_and_pad(layer)
-        (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-         w2_weight_scale) = self._requantize_native_fp4(
-             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+        cached = self._load_native_fp4_cache(layer, device)
+        if cached is None:
+            (w13_weight_padded, w2_weight_padded, w13_bias_padded,
+             w2_bias_padded, orig_intermediate) = self._dequantize_and_pad(
+                 layer)
+            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+             w2_weight_scale) = self._requantize_native_fp4(
+                 w13_weight_padded, w2_weight_padded, orig_intermediate,
+                 device)
+            self._save_native_fp4_cache(
+                layer,
+                w13_weight_processed,
+                w2_weight_processed,
+                w13_weight_scale,
+                w2_weight_scale,
+                w13_bias_padded,
+                w2_bias_padded,
+            )
+        else:
+            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+             w2_weight_scale, w13_bias_padded, w2_bias_padded) = cached
         self._release_source_weights(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
@@ -498,3 +648,48 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
         )
+        # The bridge owns the FP4 storage/layout adaptation; it decides per
+        # layer whether its storage, routing, and activation semantics can use
+        # the fused kernel.  The bridge owns FP4 unpacking and DeepSeek-V4's
+        # clamped SwiGLU/sqrt-softplus/hash-router adaptation.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
+        setattr(
+            self, FUSED_MOE_EP_OP_ATTR,
+            prebuild_fused_moe_ep(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+                weight_format=WeightFormat.FP4,
+                rhs_qb=REQUANTIZED_BLOCK_SIZE,
+                clamp_limit=getattr(layer, "swiglu_limit", None),
+            ))
+
+    def _forward_monolithic_tpu(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Use fused EP only after its semantic compatibility check passed."""
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            fused_moe_ep, fused_moe_ep_supported)
+        if fused_moe_ep_supported(self):
+            return fused_moe_ep(
+                self,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                weight_format=WeightFormat.FP4,
+                input_ids=input_ids,
+                hash_indices_table=getattr(layer, "hash_indices_table", None),
+                e_score_correction_bias=getattr(
+                    layer, "e_score_correction_bias", None),
+            )
+        return super()._forward_monolithic_tpu(layer, x, router_logits,
+                                               input_ids=input_ids)

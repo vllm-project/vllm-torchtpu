@@ -22,6 +22,7 @@ op is built, and the one path that does build stops at `_build_op`.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ import torch
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
+from vllm_torchtpu.kernels.fused_moe.v2 import kernel as fused_ep_kernel
 from vllm_torchtpu.layers.vllm import fused_moe_ep as bridge
 
 # The width of the mesh `_prebuild` stubs in. `_layer` sizes the global expert
@@ -105,12 +107,88 @@ def test_arms_on_a_supported_layer():
     assert _prebuild(_layer()) == "op"
 
 
+def test_arms_native_fp4_with_a_compatible_block_scale_layout():
+    """FP4 keeps packed N/2 weights and a real contraction-block scale."""
+    layer = _layer(
+        hidden=128,
+        inter=64,
+        w13_weight=torch.zeros(4, 128, 64, dtype=torch.float8_e4m3fn),
+        w2_weight=torch.zeros(4, 64, 64, dtype=torch.float8_e4m3fn),
+        w13_weight_scale=torch.ones(4, 2, 1, 128),
+        w2_weight_scale=torch.ones(4, 1, 1, 128),
+    )
+    seen = []
+    # CPU PyTorch lacks torch_tpu's native FP4 dtype. The prebuild gate only
+    # compares the dtype object, so use FP8 as a stand-in for this unit test;
+    # the device test owns the actual Torch-to-JAX FP4 export.
+    with patch.object(bridge.torch,
+                      "float4_e2m1fn_x2",
+                      torch.float8_e4m3fn,
+                      create=True):
+        assert _prebuild(
+            layer,
+            weight_format=bridge.WeightFormat.FP4,
+            rhs_qb=64,
+            build_op=lambda *args: seen.append(args) or "fp4-op",
+        ) == "fp4-op"
+    assert seen and seen[0][6:9] == (bridge.WeightFormat.FP4, 64, None)
+
+
+def test_arms_packed_native_gmm_fp4_with_a_compatible_layout():
+    """The DeepSeek-V4 GMM stores two K values in each uint8."""
+    layer = _layer(
+        hidden=128,
+        inter=64,
+        w13_weight=torch.zeros(4, 64, 128, dtype=torch.uint8),
+        w2_weight=torch.zeros(4, 32, 128, dtype=torch.uint8),
+        w13_weight_scale=torch.ones(4, 2, 1, 128),
+        w2_weight_scale=torch.ones(4, 1, 1, 128),
+    )
+    seen = []
+    assert _prebuild(
+        layer,
+        weight_format=bridge.WeightFormat.FP4,
+        rhs_qb=64,
+        build_op=lambda *args: seen.append(args) or "packed-fp4-op",
+    ) == "packed-fp4-op"
+    assert seen and seen[0][6:9] == (bridge.WeightFormat.FP4_PACKED, 64,
+                                      None)
+
+
+def test_arms_deepseek_clamped_silu_with_its_static_limit():
+    seen = []
+    assert _prebuild(
+        _layer(),
+        activation="silu_and_mul_with_clamp",
+        clamp_limit=7.0,
+        build_op=lambda *args: seen.append(args) or "clamped-op",
+    ) == "clamped-op"
+    assert seen and seen[0][8] == 7.0
+
+
+def test_refuses_deepseek_clamped_silu_without_its_limit():
+    assert _prebuild(_layer(), activation="silu_and_mul_with_clamp") is None
+
+
+def test_deepseek_clamped_silu_matches_vllm_semantics():
+    gate = jnp.array([[-9.0, -1.0, 2.0, 9.0]], dtype=jnp.float32)
+    up = jnp.array([[-9.0, -1.0, 2.0, 9.0]], dtype=jnp.float32)
+    limit = 3.0
+    actual = fused_ep_kernel._apply_act(gate,
+                                        up,
+                                        "silu_and_mul_with_clamp",
+                                        clamp_limit=limit)
+    expected = jax.nn.silu(jnp.minimum(gate, limit)) * jnp.clip(
+        up, -limit, limit)
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected))
+
+
 def test_sharded_plan_flag_reaches_the_built_op():
     seen = []
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
         assert _prebuild(
             _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-1] is True
+    assert seen and seen[0][5] is True
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
@@ -119,7 +197,7 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
     assert _prebuild(_layer(),
                      ep_order=order,
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-2] == order
+    assert seen and seen[0][4] == order
 
 
 def test_refused_without_the_env_flag():
@@ -204,15 +282,34 @@ def test_refused_when_the_layer_carries_expert_biases():
 @pytest.mark.parametrize("routing", [
     dict(custom_routing_function=lambda **_: None),
     dict(scoring_func="sigmoid"),
-    dict(e_score_correction_bias=torch.zeros(8)),
     dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
-    dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
-    dict(routed_scaling_factor=2.5),
 ])
 def test_refused_on_routing_the_kernel_does_not_implement(routing):
-    """The fused path never calls `moe_routing.route`: the kernel scores with
-    a plain softmax and selects top-k itself. Anything else routes tokens to a
-    different set of experts, so it is refused rather than run."""
+    """Unsupported router extensions must still refuse rather than diverge."""
+    assert _prebuild(_layer(**routing)) is None
+
+
+def test_arms_deepseek_v4_routing_and_closes_its_static_semantics():
+    """DSv4 needs sqrt-softplus, bias selection, hash lookup, and scale."""
+    seen = []
+    layer = _layer(
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=torch.zeros(8),
+        hash_indices_table=torch.zeros(32, 2, dtype=torch.int32),
+        routed_scaling_factor=1.5,
+    )
+    assert _prebuild(
+        layer, build_op=lambda *args: seen.append(args) or "dsv4-op") == "dsv4-op"
+    assert seen[0][-4:] == ("sqrtsoftplus", 1.5, True, True)
+
+
+@pytest.mark.parametrize("routing", [
+    dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
+    dict(hash_indices_table=torch.zeros(8, 3, dtype=torch.int32)),
+    dict(e_score_correction_bias=torch.zeros(7)),
+    dict(routed_scaling_factor=float("nan")),
+])
+def test_refuses_malformed_supported_routing_operands(routing):
     assert _prebuild(_layer(**routing)) is None
 
 
@@ -286,6 +383,61 @@ def test_forward_passes_router_logits_without_a_full_expert_gather():
     assert bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales,
                                logits) is hidden
     assert seen[0][5] is logits
+    assert len(seen[0]) == 10
+
+
+def test_fp4_forward_passes_block_scales_in_the_kernel_layout():
+    """The generic bridge must not flatten a real FP4 block-scale axis."""
+    seen = []
+    owner = SimpleNamespace()
+
+    def op(*args):
+        seen.append(args)
+        return args[0]
+
+    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR, op)
+    hidden = torch.zeros(1, 8)
+    weights = torch.empty(0)
+    w1_scale = torch.ones(1, 2, 16)
+    w2_scale = torch.ones(1, 1, 8)
+    logits = torch.zeros(1, 8)
+    assert bridge.fused_moe_ep(owner,
+                               hidden,
+                               weights,
+                               weights,
+                               w1_scale,
+                               w2_scale,
+                               logits,
+                               weight_format=bridge.WeightFormat.FP4) is hidden
+    assert seen[0][3] is w1_scale
+    assert seen[0][4] is w2_scale
+
+
+def test_fp4_forward_strips_the_native_gmm_scale_singleton_axis():
+    """GMM's [E, B, 1, N] parameter becomes the kernel's [E, B, N]."""
+    seen = []
+    owner = SimpleNamespace()
+
+    def op(*args):
+        seen.append(args)
+        return args[0]
+
+    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR, op)
+    hidden = torch.zeros(1, 8)
+    weights = torch.empty(0)
+    w1_scale = torch.ones(1, 2, 1, 16)
+    w2_scale = torch.ones(1, 1, 1, 8)
+    logits = torch.zeros(1, 8)
+    assert bridge.fused_moe_ep(owner,
+                               hidden,
+                               weights,
+                               weights,
+                               w1_scale,
+                               w2_scale,
+                               logits,
+                               weight_format=bridge.WeightFormat.FP4) is hidden
+    assert tuple(seen[0][3].shape) == (1, 2, 16)
+    assert tuple(seen[0][4].shape) == (1, 1, 8)
 
 
 @pytest.mark.parametrize("order,expected", [
