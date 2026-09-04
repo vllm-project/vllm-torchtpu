@@ -168,22 +168,6 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
     return _get_optional_int_env
 
 
-def seq_along_lane_enabled() -> bool:
-    """Whether the batched-RPA KV cache uses the SEQ_ALONG_LANE layout.
-
-    Not an environment variable of ours: this is derived from upstream vLLM's
-    `VLLM_KV_CACHE_LAYOUT`, which is the only switch. Deliberately a function
-    rather than an `environment_variables` entry so it cannot be mistaken for
-    a flag that can be set directly. Read by both the mainline and longctx
-    kernels.
-
-    vLLM is imported inside the function: this module has no module-scope vLLM
-    dependency, and kernel modules import it.
-    """
-    from vllm import envs as vllm_envs
-    return vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND"
-
-
 environment_variables: dict[str, Callable[[], Any]] = {
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps

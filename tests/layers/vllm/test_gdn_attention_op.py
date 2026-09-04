@@ -185,7 +185,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
-            expected_dtype):
+            expected_dtype, vllm_config_context):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
@@ -352,7 +352,8 @@ class TestVllmGatedDeltaNetAttention:
         ],
     )
     def test_pooled_op_reads_block_size_at_call_time(self, ssm_cache_dtype,
-                                                     expected_dtype):
+                                                     expected_dtype,
+                                                     vllm_config_context):
         """The pooled op must not freeze cache_config.block_size at build.
 
         Hybrid models construct GDN layers during load_model(), but the
@@ -532,7 +533,8 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pcp_compact_and_unified_ops_construct_with_mtp_k1(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
+            vllm_config_context):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
         attn.num_spec = 1

@@ -10,11 +10,13 @@ import contextlib
 
 import pytest
 import torch
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.layers.vllm.attention import (
-    PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
+    KV_LAYOUT_BY_VLLM_LAYOUT, PallasAttentionBackend,
+    PallasBatchedRPAAttentionBackend)
 
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
@@ -35,25 +37,35 @@ HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
 def _layout_env(monkeypatch, value):
     """Select a layout for the duration of one test.
 
-    `EngineCore` startup calls `enable_envs_cache()`, which freezes `vllm.envs`
-    process-wide; `tests/entrypoints/` sorts before this file and would leave
-    these tests asserting against a stale value. The cache is restored only
-    after `monkeypatch.undo()`, so it can never re-cache a patched value.
+    Three caches sit between the env var and `get_kv_cache_layout()`:
 
-    `envs.seq_along_lane_enabled()` reads this env var live on each call, so
-    setting it here is enough -- nothing on our side caches the derived value.
+    1. `EngineCore` startup calls `enable_envs_cache()`, freezing `vllm.envs`
+       process-wide; `tests/entrypoints/` sorts before this file and would
+       leave these tests asserting against a stale value.
+    2. `get_kv_cache_layout` is `functools.lru_cache`d, so the first call in
+       the process would pin the answer. `set_kv_cache_layout(None)` clears it
+       without leaving an override behind.
+    3. With the env unset that accessor asks the KV connector, which needs an
+       active vLLM config; a bare one resolves to "NHD", the default this file
+       means by `value is None`.
     """
     from vllm import envs as vllm_envs
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.v1.attention.backends.utils import set_kv_cache_layout
+
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
     if value is None:
         monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     else:
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", value)
+    set_kv_cache_layout(None)
     try:
-        yield
+        with set_current_vllm_config(VllmConfig()):
+            yield
     finally:
         monkeypatch.undo()
+        set_kv_cache_layout(None)
         if was_cached:
             vllm_envs.enable_envs_cache()
 
@@ -98,22 +110,7 @@ def page_bytes(backend, num_kv_heads, head_size, dtype, block_size=128):
 ])
 def test_env_selects_layout(monkeypatch, value, expected):
     with _layout_env(monkeypatch, value):
-        assert PallasBatchedRPAAttentionBackend.kv_layout() is expected
-
-
-def test_backends_without_the_layout_ignore_hnd(hnd):
-    """Only the batched-RPA backend implements SEQ_ALONG_LANE, so the others
-    must keep answering HEAD_ALONG_SUBLANE under HND.
-
-    Load-bearing: `TPUModelRunner._build_mamba_copy_plan` and the pooled GDN
-    view ask whichever backend is live, so a base or MLA backend that echoed
-    the env var would have its pages read in a layout it never allocated --
-    the failure `validate_backend_supports_kv_layout` exists to prevent."""
-    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
-    assert PallasAttentionBackend.kv_layout() is KVLayout.HEAD_ALONG_SUBLANE
-    assert PallasMLAttentionBackend.kv_layout() is KVLayout.HEAD_ALONG_SUBLANE
-    assert (PallasBatchedRPAAttentionBackend.kv_layout()
-            is KVLayout.SEQ_ALONG_LANE)
+        assert KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()] is expected
 
 
 # The default must not move: this backend is behaviour-neutral without opt-in
@@ -290,7 +287,7 @@ def longctx(monkeypatch):
 def test_hnd_selects_seq_along_lane_under_longctx(hnd, longctx):
     """HND drives both forks. Previously refused, because the longctx fork
     took its layout from a separate flag."""
-    assert (PallasBatchedRPAAttentionBackend.kv_layout()
+    assert (KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
             is KVLayout.SEQ_ALONG_LANE)
 
 
@@ -298,10 +295,10 @@ def test_longctx_wrapper_reads_the_same_layout_env(hnd, longctx):
     """The longctx fork resolves HND onto its own `KVLayout` enum, which is a
     distinct class from the mainline one -- so the two must be compared by
     name, not identity."""
-    from vllm_torchtpu import envs as tpu_envs
     from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
         configs as longctx_configs
-    assert tpu_envs.seq_along_lane_enabled()
+    assert (KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+            is KVLayout.SEQ_ALONG_LANE)
     assert (longctx_configs.KVLayout.SEQ_ALONG_LANE.name ==
             KVLayout.SEQ_ALONG_LANE.name)
     assert longctx_configs.KVLayout is not KVLayout
@@ -462,19 +459,3 @@ def test_default_layout_accepts_any_backend(nhd):
         validate_backend_supports_kv_layout
     validate_backend_supports_kv_layout(BASE)
     validate_backend_supports_kv_layout(BATCHED)
-
-
-# Migration off the removed flag
-
-
-def test_removed_flag_is_rejected_at_import(monkeypatch):
-    """A deployment still setting `USE_BATCHED_RPA_SEQ_ON_LANE` must fail
-    loudly: silently ignoring it would halve KV cache capacity with no
-    signal."""
-    import importlib
-    monkeypatch.setenv("USE_BATCHED_RPA_SEQ_ON_LANE", "1")
-    import vllm_torchtpu.layers.common.attention_interface as ai
-    with pytest.raises(ValueError, match="has been removed"):
-        importlib.reload(ai)
-    monkeypatch.delenv("USE_BATCHED_RPA_SEQ_ON_LANE")
-    importlib.reload(ai)

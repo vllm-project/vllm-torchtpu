@@ -15,6 +15,7 @@ from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
@@ -28,8 +29,8 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       SparseMLAKVCacheSpec)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
-    attention, attention_bundled, kv_layout_for_active_fork, mla_attention,
-    ragged_paged_attention, ragged_paged_attention_batched)
+    attention, attention_bundled, mla_attention, ragged_paged_attention,
+    ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_kv
 from vllm_torchtpu.layers.common.sequence_layout import \
@@ -97,6 +98,15 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
             f"The bit width must divide {packing_bits}, but got {bits} for "
             f"dtype={dtype}.")
     return packing_bits // bits
+
+
+# vLLM resolves the layout; this only names it in the batched-RPA enum. HND is
+# SEQ_ALONG_LANE, which packs head_dim rather than KV heads into the 32-bit
+# words, so an fp8 page is genuinely half a bf16 one (b/510425663).
+KV_LAYOUT_BY_VLLM_LAYOUT: dict[str, batched_rpa_configs.KVLayout] = {
+    "NHD": batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    "HND": batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
+}
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
@@ -374,7 +384,7 @@ def _pallas_rpa_kernel_batched(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
-        kv_layout=PallasBatchedRPAAttentionBackend.kv_layout(),
+        kv_layout=KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()],
     )
 
 
@@ -400,17 +410,6 @@ class PallasAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["PallasAttentionBackendImpl"]:
         return PallasAttentionBackendImpl
-
-    @classmethod
-    def kv_layout(cls) -> batched_rpa_configs.KVLayout:
-        """The layout of the pages this backend allocates.
-
-        The source of truth for anything that reads those pages. This backend
-        packs KV heads into the 32-bit words regardless of
-        `VLLM_KV_CACHE_LAYOUT`; only the batched-RPA subclass implements
-        SEQ_ALONG_LANE, and it overrides this.
-        """
-        return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
 
     @staticmethod
     def get_kv_cache_shape(
@@ -553,25 +552,6 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     def get_impl_cls() -> type["PallasBatchedRPAAttentionBackendImpl"]:
         return PallasBatchedRPAAttentionBackendImpl
 
-    @classmethod
-    def kv_layout(cls) -> batched_rpa_configs.KVLayout:
-        """The layout of the pages this backend allocates.
-
-        `VLLM_KV_CACHE_LAYOUT=HND` selects SEQ_ALONG_LANE, which packs head_dim
-        rather than KV heads into the 32-bit words, so an fp8 page is genuinely
-        half a bf16 one (b/510425663).
-
-        The one place the layout is decided. Anything that reads these pages
-        asks here rather than re-deriving it from the environment, so a
-        consumer cannot disagree with whoever allocated. Callers translate the
-        result into whichever `KVLayout` class the active fork defines
-        (`kv_layout_for_active_fork`), so the kernels never read the
-        environment either.
-        """
-        if not envs.seq_along_lane_enabled():
-            return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
-        return batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -582,21 +562,23 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         """Shape of one batched-RPA KV cache, honouring the selected layout.
 
-        Both forks are handed the layout explicitly; the mainline
-        arithmetic is inlined here. The SEQ_ALONG_LANE arithmetic
-        mirrors `batched_rpa.wrapper.get_kv_cache_shape` but is inlined,
-        because that wrapper needs a TPU and vLLM calls this while resolving
-        config.
+        Longctx delegates to its wrapper; the mainline SEQ_ALONG_LANE
+        arithmetic is inlined below rather than calling
+        `batched_rpa.wrapper.get_kv_cache_shape`, because that wrapper needs a
+        TPU and vLLM calls this while resolving config.
         """
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+        seq_along_lane = (kv_layout
+                          is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE)
         # Dtype-less probe from vLLM's offloading connector, which only
         # locates the num_blocks axis (dim 0 in every layout). Without a dtype
         # there is no kv_packing, so dims 2-3 are placeholders; what this fixes
         # is the axis *order*, which is the layout's own -- block_size last for
         # SEQ_ALONG_LANE, not dim 1 as HEAD_ALONG_SUBLANE would report.
         # Hoisted above the fork split because it holds for both kernels.
-        if is_auto and envs.seq_along_lane_enabled() and head_size != 64:
+        if is_auto and head_size != 64 and seq_along_lane:
             return (num_blocks, num_kv_heads * 2, head_size, 1, block_size)
         if envs.USE_BATCHED_RPA_LONGCTX:
             if head_size == 64 or is_auto:
@@ -612,12 +594,12 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 actual_head_dim=head_size,
                 # pyrefly: ignore [unexpected-keyword]
                 kv_packing=kv_packing,
-                kv_layout=kv_layout_for_active_fork(
-                    PallasBatchedRPAAttentionBackend.kv_layout()),
+                # Re-construct in the active fork's own `KVLayout` class; the
+                # forks ship separate `configs` modules (a no-op on mainline).
+                kv_layout=rpa_batched_wrapper.configs.KVLayout(kv_layout),
             )
 
-        if (PallasBatchedRPAAttentionBackend.kv_layout()
-                is batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE):
+        if not seq_along_lane:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
                 cache_dtype_str)
@@ -647,8 +629,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             return [128, 256, 512, 1024, 2048, 4096]
         # SEQ_ALONG_LANE maps a page onto one 128-lane tile; `RpaConfigs`
         # rejects any other page size.
-        if (PallasBatchedRPAAttentionBackend.kv_layout()
-                is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
+        if get_kv_cache_layout() == "HND":
             return [128]
         return [256]
 
@@ -890,7 +871,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
-        if envs.seq_along_lane_enabled():
+        if get_kv_cache_layout() == "HND":
             unsupported_features.append("VLLM_KV_CACHE_LAYOUT=HND")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
@@ -1250,8 +1231,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
 
     def _cache_head_width(self, kv_cache: torch.Tensor) -> int:
         # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
-        if (PallasBatchedRPAAttentionBackend.kv_layout()
-                is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
+        if get_kv_cache_layout() == "HND":
             return kv_cache.shape[2] * kv_cache.shape[3]
         return kv_cache.shape[-1]
 
@@ -1272,16 +1252,6 @@ class PallasMLAttentionBackend(AttentionBackend):
     # DeepSeek-V4 MLA packed-cache constants (64-dim RoPE tail, 64-wide UE8M0 blocks).
     _DS_MLA_ROPE_HEAD_DIM = 64
     _DS_MLA_QUANT_BLOCK = 64
-
-    @classmethod
-    def kv_layout(cls) -> batched_rpa_configs.KVLayout:
-        """MLA pages are token-packed by `kernels/mla`, never SEQ_ALONG_LANE.
-
-        Defined so a caller holding whichever backend `_find_non_ssm_backend`
-        returned can ask it without a type check; MLA does not inherit
-        `PallasAttentionBackend`.
-        """
-        return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
 
     @staticmethod
     def _ds_mla_packed_width(nope_dim: int, rope_head_dim: int,

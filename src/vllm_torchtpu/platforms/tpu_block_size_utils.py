@@ -38,22 +38,18 @@ def validate_backend_supports_kv_layout(
         backend_cls: "type[AttentionBackend]") -> None:
     """Reject `VLLM_KV_CACHE_LAYOUT=HND` when the selected backend ignores it.
 
-    SEQ_ALONG_LANE is implemented only by the batched-RPA kernels; every other
-    backend allocates HEAD_ALONG_SUBLANE pages whatever the env var says. The
-    layout is read globally, though -- the pooled GDN state view and the mamba
-    block split both derive their geometry from it -- so a backend that does
-    not honour it would have its pages reinterpreted in a layout nobody
-    allocated. Fail at config time instead, since the mismatch is otherwise
-    silent: wrong GDN state and wrong block accounting, no error.
-
-    tpu-inference pairs the same two conditions (`USE_BATCHED_RPA_KERNEL and
-    USE_BATCHED_RPA_SEQ_ON_LANE` in `layers/common/sharding.py`).
+    Only the batched-RPA kernels implement SEQ_ALONG_LANE; every other backend
+    allocates HEAD_ALONG_SUBLANE pages whatever the env var says. Consumers
+    (pooled GDN state view, mamba block split) would then read those pages in a
+    layout nobody allocated, silently. tpu-inference pairs the same two
+    conditions in `layers/common/sharding.py`.
     """
-    from vllm_torchtpu import envs
+    from vllm.v1.attention.backends.utils import get_kv_cache_layout
+
     from vllm_torchtpu.layers.vllm.attention import \
         PallasBatchedRPAAttentionBackend
 
-    if not envs.seq_along_lane_enabled():
+    if get_kv_cache_layout() != "HND":
         return
     if isinstance(backend_cls, type) and issubclass(
             backend_cls, PallasBatchedRPAAttentionBackend):

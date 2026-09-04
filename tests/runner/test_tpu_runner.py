@@ -2716,7 +2716,7 @@ def _block_size_for(architecture, backend_page_size=256, preferred=None):
     return vllm_config.cache_config.block_size
 
 
-def test_tpu_platform_block_size_override_is_dsv4_only():
+def test_tpu_platform_block_size_override_is_dsv4_only(vllm_config_context):
     """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
 
     DSv4's own backend does not define get_page_size, so its size comes from

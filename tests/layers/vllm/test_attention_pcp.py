@@ -107,7 +107,8 @@ def _capture_kernel(monkeypatch):
     return captured
 
 
-def test_forward_routes_partial_layout_to_streaming_kernel(monkeypatch):
+def test_forward_routes_partial_layout_to_streaming_kernel(
+        monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -126,7 +127,8 @@ def test_forward_routes_partial_layout_to_streaming_kernel(monkeypatch):
     assert torch.all(outputs == 7)
 
 
-def test_forward_routes_fp8_partial_layout_with_kv_scales(monkeypatch):
+def test_forward_routes_fp8_partial_layout_with_kv_scales(
+        monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -147,7 +149,8 @@ def test_forward_routes_fp8_partial_layout_with_kv_scales(monkeypatch):
     assert torch.all(outputs == 7)
 
 
-def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(monkeypatch):
+def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(
+        monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -179,7 +182,7 @@ def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(monkeypatch):
     ],
 )
 def test_forward_rejects_unsupported_pcp_streaming_features(
-        impl_kwargs, expected_message):
+        impl_kwargs, expected_message, vllm_config_context):
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
 
@@ -190,7 +193,8 @@ def test_forward_rejects_unsupported_pcp_streaming_features(
                                          metadata)
 
 
-def test_initialize_kernel_rejects_unsupported_pcp_streaming_features():
+def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
+        vllm_config_context):
     with set_vllm_model_wrapper_context(mesh=_mesh(),
                                         vllm_config=_vllm_config()):
         with pytest.raises(NotImplementedError, match="logits soft cap"):
@@ -211,7 +215,7 @@ def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch):
 
 
 def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
-        monkeypatch):
+        monkeypatch, vllm_config_context):
     calls = []
 
     def fake_build(self,

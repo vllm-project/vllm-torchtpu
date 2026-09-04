@@ -61,23 +61,11 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
 def _pool_is_seq_along_lane() -> bool:
     """Whether the attention pool GDN aliases is in the SEQ_ALONG_LANE layout.
 
-    Asks the backend that allocated the pages rather than re-deriving the
-    layout from the environment, so this view cannot disagree with whoever
-    allocated.
-
-    Names the batched-RPA backend directly instead of resolving the live one
-    (`TpuPlatform._find_non_ssm_backend`, as the runner does): reaching
-    `vllm_torchtpu.platforms` from here pulls TpuPlatform back into the layers
-    (see `unified_kv_layout_enabled_for_architecture`), and it is unnecessary
-    -- the pooled path runs only for `POOLED_GDN_ARCHITECTURES`, all of which
-    serve attention on this backend.
+    Reads vLLM's resolved layout, the same source the attention backend sizes
+    its pages from, so this view cannot disagree with whoever allocated.
     """
-    from vllm_torchtpu.kernels.experimental.batched_rpa import \
-        configs as batched_rpa_configs
-    from vllm_torchtpu.layers.vllm.attention import \
-        PallasBatchedRPAAttentionBackend
-    return (PallasBatchedRPAAttentionBackend.kv_layout()
-            is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE)
+    from vllm.v1.attention.backends.utils import get_kv_cache_layout
+    return get_kv_cache_layout() == "HND"
 
 
 def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:

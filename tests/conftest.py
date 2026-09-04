@@ -60,6 +60,34 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.fixture(autouse=True)
+def _clear_kv_cache_layout_cache():
+    """Stop `get_kv_cache_layout()`'s `lru_cache` leaking between tests.
+
+    It is memoized process-wide, so the first test to call it would pin the
+    answer for every test after, and a later `monkeypatch.setenv` of
+    `VLLM_KV_CACHE_LAYOUT` would be silently ignored.
+    """
+    from vllm.v1.attention.backends.utils import set_kv_cache_layout
+    set_kv_cache_layout(None)
+    yield
+    set_kv_cache_layout(None)
+
+
+@pytest.fixture
+def vllm_config_context():
+    """Run a test body inside an active vLLM config.
+
+    `get_kv_cache_layout()` asks the KV connector when `VLLM_KV_CACHE_LAYOUT`
+    is unset, and that needs a current config. Production paths always have
+    one (the runner and vLLM's own platform hooks establish it); tests that
+    call attention impls or platform helpers directly do not.
+    """
+    from vllm.config import VllmConfig, set_current_vllm_config
+    with set_current_vllm_config(VllmConfig()):
+        yield
+
+
 @pytest.fixture
 def device(request):
     """Get the device to run tests on (CPU or TPU).
