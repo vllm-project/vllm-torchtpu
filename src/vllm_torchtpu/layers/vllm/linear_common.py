@@ -10,7 +10,6 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -55,40 +54,52 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array,
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
     `w_q` is `[n_in, n_out]`, so this is a plain `(m, k) @ (k, n)` contraction
-    rather than the `(m, k) @ (n, k).T` the N-major layout forced. The
-    blockwise path routes through `gmm_v2` (single group), which consumes a
-    K-major rhs natively; the per-channel path uses the shared
-    `xla_quantized_matmul`, which takes the same (k, n) layout.
+    rather than the `(m, k) @ (n, k).T` the N-major layout forced.
+
+    Both scale granularities route through `gmm_v2` (single group), which
+    consumes a K-major rhs natively and via `maybe_quantize_lhs` fuses
+    the activation quantization into the matmul.
+
+    Per-channel quantization is blockwise with a single block: one scale per
+    output channel, covering all of K. Normalizing its `[n_out]` scale to the
+    `[1, 1, 1, n_out]` form the kernel asserts on lets both granularities share
+    one call.
     """
     if x.shape[1] != w_q.shape[0]:
         raise ValueError(
             f"Input hidden dim {x.shape[1]} must match weight hidden dim "
             f"{w_q.shape[0]}.")
-    if len(w_s.shape) == 4:
-        k_dim, n_out = w_q.shape
-        _, sharded_num_blocks, mid, scale_n_out = w_s.shape
-        if mid != 1:
+    k_dim, n_out = w_q.shape
+    if len(w_s.shape) != 4:
+        # Per-channel: one block spanning all of K.
+        flat = w_s.reshape(-1)
+        if flat.shape[0] != n_out:
             raise ValueError(
-                f"Blockwise weight scale axis 2 must be 1, got {w_s.shape=}")
-        if scale_n_out != n_out:
-            raise ValueError(
-                f"Blockwise weight scale output dim {scale_n_out} must match "
-                f"weight output dim {n_out}.")
-        if sharded_num_blocks <= 0 or k_dim % sharded_num_blocks != 0:
-            raise ValueError(
-                f"Input hidden dim {k_dim} must be divisible by block scale "
-                f"count {sharded_num_blocks}.")
-        return gmm_v2(
-            lhs=x,
-            rhs=w_q[None],  # [n_in, n_out] -> [1, n_in, n_out]
-            group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
-            rhs_scale=w_s,
-            group_offset=jnp.array([0], dtype=jnp.int32),
-            preferred_element_type=x.dtype,
-            maybe_quantize_lhs=True,
-            zero_initialize=True,
-        )
-    return xla_quantized_matmul(x, w_q, w_s)
+                f"Per-channel weight scale must have {n_out} entries, got "
+                f"{w_s.shape=}")
+        w_s = flat.reshape(1, 1, 1, n_out)
+    _, sharded_num_blocks, mid, scale_n_out = w_s.shape
+    if mid != 1:
+        raise ValueError(
+            f"Blockwise weight scale axis 2 must be 1, got {w_s.shape=}")
+    if scale_n_out != n_out:
+        raise ValueError(
+            f"Blockwise weight scale output dim {scale_n_out} must match "
+            f"weight output dim {n_out}.")
+    if sharded_num_blocks <= 0 or k_dim % sharded_num_blocks != 0:
+        raise ValueError(
+            f"Input hidden dim {k_dim} must be divisible by block scale "
+            f"count {sharded_num_blocks}.")
+    return gmm_v2(
+        lhs=x,
+        rhs=w_q[None],  # [n_in, n_out] -> [1, n_in, n_out]
+        group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+        rhs_scale=w_s,
+        group_offset=jnp.array([0], dtype=jnp.int32),
+        preferred_element_type=x.dtype,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+    )
 
 
 _quantized_matmul_kernel_op: Callable | None = None

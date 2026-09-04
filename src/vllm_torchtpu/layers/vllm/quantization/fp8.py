@@ -30,11 +30,19 @@ contracting dimension.
 The checkpoint stores FP8 weights with either block scales or tensor/channel
 scales. At load time we dequantize those weights to float32, then requantize
 them into the runtime FP8 layout consumed by the Pallas matmul bridge in
-`vllm_torchtpu/layers/vllm/linear_common.py`. Activations are quantized
-dynamically inside the bridge. By default the bridge dispatches to a pure-JAX
-`dot_general`-based per-channel FP8 matmul (`xla_quantized_matmul`); setting
-ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
-the blockwise Pallas kernel path instead.
+`vllm_torchtpu/layers/vllm/linear_common.py`.
+
+Both scale granularities take the same path through that bridge: `gmm_v2` as a
+single group, which quantizes the activation *inside* the matmul
+(`maybe_quantize_lhs`) rather than as a separate op that would round-trip it
+through HBM. Per-channel is expressed as blockwise with one block spanning the
+whole contracting dimension.
+
+ENABLE_QUANTIZED_MATMUL_KERNEL and REQUANTIZE_BLOCK_SIZE therefore select the
+weight *scale granularity* -- blockwise when both are set, per-channel
+otherwise -- not which matmul implementation runs. (The `ENABLE_..._KERNEL`
+name predates that: it used to choose between the Pallas kernel and a pure-JAX
+`dot_general`, and the latter no longer has a caller.)
 """
 
 from typing import Optional
