@@ -43,6 +43,9 @@ def _patch_vllm_pcp_v2_validation() -> None:
     logger.info("Applied TPU patch: allow PCP through GPU-specific V2 checks.")
 
 
+# TODO: After the pinned vLLM includes
+# https://github.com/vllm-project/vllm/pull/50344, adapt the Raiden connector
+# composition to its divergent-local-hit capability and remove this backport.
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     """Use a common local prefix boundary for hybrid TPU producers.
 
