@@ -343,7 +343,6 @@ def apply_tpu_patches() -> None:
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
                                _patch_moe_runner_fused_output_is_reduced,
-                               _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
                                _patch_vllm_hybrid_producer_prefix_hits)
@@ -363,7 +362,6 @@ def apply_tpu_patches() -> None:
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
-    _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_mamba_split_scheduler_block_size()
