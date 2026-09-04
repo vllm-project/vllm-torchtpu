@@ -181,33 +181,6 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS))
 
 
-def _patch_vllm_tpu_group_custom_ops() -> None:
-    """Disable vLLM custom collective ops for TPU in this TorchTPU integration.
-
-    vLLM's `torch.ops.vllm.all_reduce/all_gather` custom ops are not available
-    on the TorchTPU backend in this repo. Force GroupCoordinator to use
-    communicator-backed collectives instead.
-
-    TODO (geyuhao): Do we actually need to support torch.ops.vllm.* on TPU? Currently
-    this patch will use torch.distributed.all_reduce/all_gather.
-    """
-
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    if getattr(GroupCoordinator, "_tpu_no_custom_collective_patch", False):
-        return
-
-    original_init = GroupCoordinator.__init__
-
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self.use_custom_op_call = False
-
-    GroupCoordinator.__init__ = patched_init
-    GroupCoordinator._tpu_no_custom_collective_patch = True
-    logger.info("Applied TPU patch: disable vLLM custom collective ops.")
-
-
 def _patch_default_moe_runner_select_forward() -> None:
     """Keep DefaultMoERunner on the direct ``_moe_forward`` path under OOT.
 
