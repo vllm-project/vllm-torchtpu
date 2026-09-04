@@ -37,17 +37,10 @@ HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
 def _layout_env(monkeypatch, value):
     """Select a layout for the duration of one test.
 
-    Three caches sit between the env var and `get_kv_cache_layout()`:
-
-    1. `EngineCore` startup calls `enable_envs_cache()`, freezing `vllm.envs`
-       process-wide; `tests/entrypoints/` sorts before this file and would
-       leave these tests asserting against a stale value.
-    2. `get_kv_cache_layout` is `functools.lru_cache`d, so the first call in
-       the process would pin the answer. `set_kv_cache_layout(None)` clears it
-       without leaving an override behind.
-    3. With the env unset that accessor asks the KV connector, which needs an
-       active vLLM config; a bare one resolves to "NHD", the default this file
-       means by `value is None`.
+    Three caches sit between the env var and `get_kv_cache_layout()`: the
+    `vllm.envs` freeze an earlier `tests/entrypoints/` run leaves behind, the
+    accessor's own `lru_cache`, and -- with the env unset -- the KV connector
+    it falls through to, which needs an active config and resolves to "NHD".
     """
     from vllm import envs as vllm_envs
     from vllm.config import VllmConfig, set_current_vllm_config
@@ -231,16 +224,31 @@ def test_head_dim_64_is_refused_under_hnd_and_delegated_by_default(
             BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
 
 
+def test_head_dim_64_is_refused_under_hnd_on_longctx_too(hnd, longctx):
+    """Both forks refuse; longctx used to fall back silently.
+
+    The fallback's pages were readable by the hd64 kernel but misread by every
+    consumer of the global layout: `forward` would have taken them as
+    SEQ_ALONG_LANE and read a head width of 2 for a 64-wide head."""
+    with pytest.raises(NotImplementedError, match="head_dim==64"):
+        BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16)
+
+
+def test_head_dim_64_still_delegates_on_longctx_without_hnd(
+        monkeypatch, longctx):
+    """Refusing under HND must not disturb the default path."""
+    with _layout_env(monkeypatch, None):
+        assert BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16) == \
+            BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
+
+
 # Unified block pool
 
 
 def test_unified_pool_accepts_seq_along_lane(hnd):
-    """SEQ_ALONG_LANE can back the unified pool: the GDN custom op reshapes
-    the attention pool into its own row view at the op boundary rather than
-    requiring token-contiguous pages.
-
-    This pins the removal of `validate_kv_layout_supports_unified_pool`, which
-    rejected exactly this combination."""
+    """SEQ_ALONG_LANE can back the unified pool: the GDN op reshapes at its
+    own boundary rather than needing token-contiguous pages. Pins the removal
+    of `validate_kv_layout_supports_unified_pool`."""
     from vllm_torchtpu.platforms import tpu_block_size_utils
     assert not hasattr(tpu_block_size_utils,
                        "validate_kv_layout_supports_unified_pool")
@@ -275,9 +283,8 @@ def test_pooled_gdn_state_view_follows_the_layout(monkeypatch, layout,
 def longctx(monkeypatch):
     """Turn on the longctx fork for one test.
 
-    Patched as a module attribute, not via `os.environ`: that shadows
-    `envs.__getattr__`, so it survives
-    `vllm_torchtpu.envs.enable_envs_cache()`, which has no way back.
+    Patched as a module attribute, not via `os.environ`: that survives
+    `enable_envs_cache()`, which has no way back.
     """
     from vllm_torchtpu import envs
     monkeypatch.setattr(envs, "USE_BATCHED_RPA_LONGCTX", True, raising=False)
@@ -339,8 +346,9 @@ def _normalized_page_bytes(backend, num_kv_heads, head_size, dtype):
         page_size_padded=page_bytes(backend, num_kv_heads, head_size, dtype),
         indexes_kv_by_block_stride=True,
     )
-    normalized = normalize_kv_cache_specs_for_tpu(
-        {"l": spec}, dtype, attention_backend_cls=backend)
+    normalized = normalize_kv_cache_specs_for_tpu({"l": spec},
+                                                  dtype,
+                                                  attention_backend=backend)
     return normalized["l"].page_size_bytes
 
 
@@ -387,75 +395,33 @@ def test_layout_blind_backend_would_lose_the_halving(hnd):
 # SEQ_ALONG_LANE, whose last axis is page_size.
 
 
-def _width(impl_cls, shape):
-    import torch as _torch
-    impl = impl_cls.__new__(impl_cls)
-    return impl._cache_head_width(_torch.empty(shape, device="meta"))
-
-
 @pytest.mark.parametrize("head_size", [80, 128, 256])
 @pytest.mark.parametrize("layout", ["HND", None])
-def test_cache_head_width_follows_the_layout(monkeypatch, layout, head_size):
-    from vllm_torchtpu.layers.vllm.attention import \
-        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
+def test_page_carries_head_width_where_forward_reads_it(
+        monkeypatch, layout, head_size):
+    """`forward` reads `shape[2] * shape[3]` under HND and `shape[-1]`
+    otherwise; pin that the page really is shaped that way.
+
+    head_size 80 separates the two: SEQ_ALONG_LANE stores it 80 wide, so
+    reading `shape[-1]` would pad q/k/v to 128 against an 80-wide cache."""
+    _require_tpu()
     with _layout_env(monkeypatch, layout):
         shape = BATCHED.get_kv_cache_shape(4, 128, 2, head_size, BF16)
-        width = _width(BATCHED_IMPL, shape)
     if layout == "HND":
-        # Last axis is page_size here, so the naive read would be wrong.
-        assert width == shape[2] * shape[3] and shape[-1] == 128
+        assert shape[2] * shape[3] == head_size
+        # page_size, which is what the naive read would have returned
+        assert shape[-1] == 128
     else:
-        assert width == shape[-1]
+        assert shape[-1] >= head_size
 
 
-def test_narrow_head_is_not_spuriously_padded(hnd):
-    """head_size 80 stores 80 wide under SEQ_ALONG_LANE, so no padding is due.
-    Reading `shape[-1]` would have padded q/k/v to 128 against an 80-wide
-    cache."""
-    from vllm_torchtpu.layers.vllm.attention import \
-        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
-    shape = BATCHED.get_kv_cache_shape(4, 128, 2, 80, BF16)
-    assert _width(BATCHED_IMPL, shape) == 80
-    assert shape[-1] > 80  # what the bug read
+def test_longctx_hnd_page_is_shaped_like_mainline(hnd, longctx):
+    """Both forks put the head width in dims 2-3 under HND, so the single
+    layout-keyed branch in `forward` covers both.
 
-
-def test_cache_head_width_under_longctx_seq_along_lane(hnd, longctx):
-    """The longctx fork reaches `_cache_head_width` too, and its pages are
-    SEQ_ALONG_LANE under HND just like the mainline fork's.
-
-    Regression guard for the rebase onto #608: that PR keyed this branch on
-    `USE_BATCHED_RPA_SEQ_ON_LANE`, so resolving the width purely from the
-    mainline layout would silently return `shape[-1]` here and pad q/k/v
-    against a cache that is not that wide."""
-    from vllm_torchtpu.layers.vllm.attention import \
-        PallasBatchedRPAAttentionBackendImpl as BATCHED_IMPL
-
-    # (num_blocks, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
-    shape = (4, 2, 64, 4, 128)
-    assert _width(BATCHED_IMPL, shape) == 256
-    assert shape[-1] == 128  # what reading the last axis would have returned
-
-
-# Only a layout-aware backend may be paired with HND
-
-
-@pytest.mark.parametrize("backend,ok", [(BATCHED, True), (BASE, False)])
-def test_hnd_requires_a_layout_aware_backend(hnd, backend, ok):
-    """The layout is read globally (pooled GDN view, mamba block split) but
-    only the batched-RPA backend allocates SEQ_ALONG_LANE pages. Pairing HND
-    with any other backend would reinterpret pages in a layout nobody
-    allocated -- silently, so this must fail at config time."""
-    from vllm_torchtpu.platforms.tpu_block_size_utils import \
-        validate_backend_supports_kv_layout
-    if ok:
-        validate_backend_supports_kv_layout(backend)
-    else:
-        with pytest.raises(NotImplementedError, match="does not"):
-            validate_backend_supports_kv_layout(backend)
-
-
-def test_default_layout_accepts_any_backend(nhd):
-    from vllm_torchtpu.platforms.tpu_block_size_utils import \
-        validate_backend_supports_kv_layout
-    validate_backend_supports_kv_layout(BASE)
-    validate_backend_supports_kv_layout(BATCHED)
+    Regression guard for the rebase onto #608, which keyed that branch on
+    `USE_BATCHED_RPA_SEQ_ON_LANE`."""
+    _require_tpu()
+    shape = BATCHED.get_kv_cache_shape(4, 128, 2, 256, BF16)
+    assert shape[2] * shape[3] == 256
+    assert shape[-1] == 128

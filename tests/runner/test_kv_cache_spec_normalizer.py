@@ -24,7 +24,7 @@ def test_attention_spec_with_bf16_normalizes_to_fp8_without_inflation():
     normalized = normalize_kv_cache_specs_for_tpu(
         {"layer": bf16_spec},
         torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
     spec = normalized["layer"]
 
@@ -53,7 +53,7 @@ def test_mla_attention_spec_with_bf16_normalizes_to_fp8_without_inflation():
     normalized = normalize_kv_cache_specs_for_tpu(
         {"mla_layer": mla_bf16_spec},
         torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
     spec = normalized["mla_layer"]
     pallas_mla_page_size = (
@@ -80,7 +80,7 @@ def test_attention_spec_uses_tpu_dtype_for_fp8_page_size():
     normalized = normalize_kv_cache_specs_for_tpu(
         {"layer": gpu_spec},
         torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
     spec = normalized["layer"]
 
@@ -107,7 +107,7 @@ def test_mamba_spec_is_left_unchanged():
     normalized = normalize_kv_cache_specs_for_tpu(
         {"layer": mamba_spec},
         torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
 
     assert normalized["layer"] is mamba_spec
@@ -134,7 +134,7 @@ def test_hybrid_specs_keep_separate_page_size_by_default():
             "mamba": mamba_spec,
         },
         torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
 
     assert normalized["attn"].page_size_bytes != normalized[
@@ -163,7 +163,7 @@ def test_hybrid_specs_use_uniform_page_size_when_unified_enabled():
             "mamba": mamba_spec,
         },
         torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
         enable_unified_kv_layout=True,
     )
 
@@ -198,7 +198,7 @@ def test_hybrid_specs_with_smaller_mamba_padded_size_normalizes_safely(
         },
         torch.float8_e4m3fn,
         enable_unified_kv_layout=True,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
 
     assert normalized["attn"].page_size_bytes == normalized[
@@ -234,7 +234,7 @@ def test_hybrid_specs_preserve_attention_pallas_padding_workload_a() -> None:
         },
         torch.float8_e4m3fn,
         enable_unified_kv_layout=True,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
 
     pallas_expected_page_size = PallasAttentionBackend.get_kv_cache_page_size_bytes(
@@ -273,7 +273,7 @@ def test_hybrid_specs_pad_attention_when_mamba_is_larger() -> None:
         },
         torch.float8_e4m3fn,
         enable_unified_kv_layout=True,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
 
     assert normalized["attn"].page_size_bytes == 1000000
@@ -322,7 +322,7 @@ def test_exempt_layers_pass_through_untouched_under_unified_layout() -> None:
         torch.float8_e4m3fn,
         enable_unified_kv_layout=True,
         exempt_layers={"ds_v4"},
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
 
     assert normalized["ds_v4"] is ds_v4_spec
@@ -357,7 +357,7 @@ def test_exempt_attention_does_not_trigger_hybrid_unification_with_mamba(
         torch.float8_e4m3fn,
         enable_unified_kv_layout=True,
         exempt_layers={"ds_v4"},
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
     )
 
     assert normalized["ds_v4"] is ds_v4_spec

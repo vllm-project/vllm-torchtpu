@@ -325,12 +325,10 @@ def sharded_ragged_paged_attention(
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
-    # Both forks are handed `kv_layout` explicitly; hd64 has no batched
-    # variant, so it is always HEAD_ALONG_SUBLANE whatever the layout says.
+    # hd64 has no batched variant, so it is always HEAD_ALONG_SUBLANE.
     seq_along_lane = (kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
                       and not use_hd64)
-    # The sharded KV-head axis is dim 1 under SEQ_ALONG_LANE and dim 2 under
-    # HEAD_ALONG_SUBLANE.
+    # The sharded KV-head axis: dim 1 under SEQ_ALONG_LANE, dim 2 otherwise.
     kv_cache_spec = (P(None, "model", None, None, None)
                      if seq_along_lane else P(None, None, "model", None, None))
     in_specs = (
@@ -393,10 +391,8 @@ def sharded_ragged_paged_attention(
             block_kwargs["p_block_sizes"] = _capped(
                 rpa_default.RpaCase.PREFILL)
 
-    # Only the batched kernel takes a layout; v3 and hd64 have no such
-    # parameter. `kv_layout` is a mainline member, and the forks ship separate
-    # `configs` modules, so re-construct it in whichever `KVLayout` class the
-    # active fork defines (a no-op on mainline).
+    # Only the batched kernel takes a layout. Re-construct it in the active
+    # fork's own `KVLayout` class; the forks ship separate `configs` modules.
     pass_layout = kv_layout is not None and not use_hd64
     layout_kwargs = ({
         "kv_layout": rpa_batched.configs.KVLayout(kv_layout)

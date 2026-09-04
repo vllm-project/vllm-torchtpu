@@ -280,11 +280,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                                     vllm_config: VllmConfig) -> str | None:
         """No layout preference, unlike the `OffloadingConnector` this extends.
 
-        Upstream hardcodes "HND" because on CUDA that is the flash-attention
-        layout NIXL transfers fastest. On TPU "HND" names SEQ_ALONG_LANE
-        instead, so inheriting it would have `get_kv_cache_layout()` select a
-        layout no operator asked for. The pages this connector moves are opaque
-        bytes; their layout is the attention backend's business.
+        Upstream hardcodes "HND" for NIXL on CUDA. On TPU "HND" names
+        SEQ_ALONG_LANE, so inheriting it would select a layout nobody asked
+        for; these pages are opaque bytes to this connector.
         """
         return None
 

@@ -1382,9 +1382,9 @@ class TPUModelRunner(GPUModelRunner):
         return normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
-            attention_backend_cls=backend_cls,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
+            attention_backend=backend_cls,
         )
 
     def _build_attention_metadata(
@@ -2139,8 +2139,7 @@ class TPUModelRunner(GPUModelRunner):
                 state_block_size = group.kv_cache_spec.block_size
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
-        # Which axis carries the kernel block follows the layout these pages
-        # were allocated in.
+        # The kernel-block axis follows the layout these pages were given.
         seq_along_lane = get_kv_cache_layout() == "HND"
         for raw in raw_tensors:
             if raw.dim() > 1:

@@ -29,6 +29,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
 from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
@@ -58,16 +59,6 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
                      f"{dtype}; expected float32 or bfloat16")
 
 
-def _pool_is_seq_along_lane() -> bool:
-    """Whether the attention pool GDN aliases is in the SEQ_ALONG_LANE layout.
-
-    Reads vLLM's resolved layout, the same source the attention backend sizes
-    its pages from, so this view cannot disagree with whoever allocated.
-    """
-    from vllm.v1.attention.backends.utils import get_kv_cache_layout
-    return get_kv_cache_layout() == "HND"
-
-
 def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     """Build GDN's packed byte view inside the donated custom-op boundary.
 
@@ -76,7 +67,9 @@ def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     into GDN's expected standard 5D layout:
       (num_blocks, gdn_kernel_block_size, packed_num_heads, kv_packing, padded_head_size)
     """
-    if not _pool_is_seq_along_lane():
+    # The layout the attention backend sized these pages in; this view cannot
+    # disagree with whoever allocated them.
+    if get_kv_cache_layout() != "HND":
         return recurrent_state
     if recurrent_state.ndim != 5:
         raise ValueError("SEQ_ALONG_LANE unified pool must be rank 5, got "
@@ -127,7 +120,7 @@ def _pooled_gdn_block_tokens(vllm_config: VllmConfig,
     with the GDN rows per page (pooled_state.shape[1]).
     """
     manager_block_tokens = vllm_config.cache_config.block_size
-    if not _pool_is_seq_along_lane():
+    if get_kv_cache_layout() != "HND":
         return manager_block_tokens
     kernel_block_size = recurrent_state.shape[-1]
     if manager_block_tokens % kernel_block_size != 0:
@@ -724,7 +717,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"local GDN V heads {local_num_v_heads} must be divisible "
                 f"by pcp_size={pcp_size}.")
 
-        if _pool_is_seq_along_lane():
+        if get_kv_cache_layout() == "HND":
             raise NotImplementedError(
                 "GDN pooled PCP prefill is not supported with "
                 "VLLM_KV_CACHE_LAYOUT=HND.")

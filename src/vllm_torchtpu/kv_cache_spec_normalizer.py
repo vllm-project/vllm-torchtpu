@@ -13,15 +13,15 @@ def normalize_kv_cache_specs_for_tpu(
     kv_cache_specs: dict[str, KVCacheSpec],
     kv_cache_dtype: str | torch.dtype,
     *,
-    attention_backend_cls: type[PallasAttentionBackend],
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
+    attention_backend: type[PallasAttentionBackend],
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
 
-    `attention_backend_cls` must be the backend that will actually allocate
-    these caches: page geometry varies by KV layout, so a fixed base class here
-    would floor the spec at a page size nobody allocates.
+    `attention_backend` must be the backend that will actually allocate: page
+    geometry varies by layout, so a fixed base class would floor the spec at a
+    page size nobody allocates.
 
     `exempt_layers` pass through untouched: their packed, compressed layout is
     not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
@@ -32,8 +32,11 @@ def normalize_kv_cache_specs_for_tpu(
         if layer_name in exempt:
             normalized[layer_name] = spec
             continue
-        normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype,
-                                                     attention_backend_cls)
+        normalized[layer_name] = _normalize_one_spec(
+            spec,
+            kv_cache_dtype,
+            attention_backend=attention_backend,
+        )
     if enable_unified_kv_layout:
         non_exempt_specs = {
             k: v
@@ -54,7 +57,8 @@ def normalize_kv_cache_specs_for_tpu(
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: str | torch.dtype,
-    attention_backend_cls: type[PallasAttentionBackend],
+    *,
+    attention_backend: type[PallasAttentionBackend],
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
@@ -77,7 +81,7 @@ def _normalize_one_spec(
             kv_cache_dtype,
         )
     else:
-        page_size = attention_backend_cls.get_kv_cache_page_size_bytes(
+        page_size = attention_backend.get_kv_cache_page_size_bytes(
             spec.block_size,
             spec.num_kv_heads,
             spec.head_size,

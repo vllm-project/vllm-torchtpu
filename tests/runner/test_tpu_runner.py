@@ -2514,7 +2514,7 @@ def test_dsv4_specs_are_exempt_from_tpu_normalization():
     out = normalize_kv_cache_specs_for_tpu(
         specs,
         torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend,
+        attention_backend=PallasAttentionBackend,
         exempt_layers=set(specs),
     )
 
@@ -2526,9 +2526,7 @@ def test_dsv4_specs_are_exempt_from_tpu_normalization():
     # Without the exemption the same specs are rewritten -- guards against the
     # exemption silently becoming a no-op.
     unexempt = normalize_kv_cache_specs_for_tpu(
-        specs,
-        torch.float8_e4m3fn,
-        attention_backend_cls=PallasAttentionBackend)
+        specs, torch.float8_e4m3fn, attention_backend=PallasAttentionBackend)
     assert unexempt["model.layers.0.attn"] is not ds_v4_spec
     assert unexempt["model.layers.0.attn"].page_size_padded is not None
     # A page sized from the logical block, not from the compressed rows: this
