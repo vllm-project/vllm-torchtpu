@@ -147,17 +147,14 @@ def get_kv_cache_shape(
     page_size,
     actual_num_kv_heads,
     actual_head_dim,
-    kv_dtype=None,
-    kv_packing: int | None = None,
+    kv_dtype,
     kv_layout: configs.KVLayout | None = None,
 ):
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
-
-    if kv_packing is None:
-        kv_packing = utils.get_dtype_packing(kv_dtype)
+    kv_packing = utils.get_dtype_packing(kv_dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         return (
             total_num_pages,

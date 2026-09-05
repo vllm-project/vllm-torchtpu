@@ -553,43 +553,20 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
-        """Shape of one batched-RPA KV cache, honouring the selected layout.
-
-        The wrapper owns the arithmetic and the import-time fork switch already
-        picked which fork's; only the two cases it cannot answer -- head_dim 64
-        and a dtype-less probe -- are handled here.
-        """
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
-        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
-
-        # hd64 keeps this backend but swaps kernels later, and that kernel
-        # reads only HEAD_ALONG_SUBLANE pages. Refuse rather than allocate
-        # those while `get_kv_cache_layout()` answers "HND" for everyone else.
-        if head_size == 64:
-            if kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
-                raise NotImplementedError(
-                    "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV "
-                    "layout, which the head_dim==64 RPA kernel does not "
-                    "implement; unset it or use NHD for this model.")
-        # No dtype means no kv_packing, so the wrapper cannot answer. vLLM's
-        # offloading connector probes this only to find num_blocks, which is
-        # dim 0 in either layout.
         if head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
                 cache_dtype_str)
-
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
         torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        kv_packing = get_dtype_packing(torch_dtype)
         return rpa_batched_wrapper.get_kv_cache_shape(
             total_num_pages=num_blocks,
             page_size=block_size,
             actual_num_kv_heads=num_kv_heads,
             actual_head_dim=head_size,
-            # `kv_packing`, not `kv_dtype`: the wrapper speaks jax dtypes.
-            kv_packing=kv_packing,
-            # The forks ship separate `configs` modules (no-op on mainline).
+            kv_dtype=pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
             kv_layout=rpa_batched_wrapper.configs.KVLayout(kv_layout),
         )
 
@@ -601,8 +578,6 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         if get_kv_cache_layout() == "HND":
             return [128]
         return [256]
-
-    # `get_kv_cache_page_size_bytes` is inherited: it sizes itself from `cls`.
 
 
 class PallasAttentionBackendImpl(AttentionImpl):

@@ -325,12 +325,14 @@ def sharded_ragged_paged_attention(
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
-    # hd64 has no batched variant, so it is always HEAD_ALONG_SUBLANE.
-    seq_along_lane = (kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-                      and not use_hd64)
-    # The sharded KV-head axis: dim 1 under SEQ_ALONG_LANE, dim 2 otherwise.
-    kv_cache_spec = (P(None, "model", None, None, None)
-                     if seq_along_lane else P(None, None, "model", None, None))
+    layout_kwargs: dict[str, Any] = {}
+    kv_cache_spec = P(None, None, "model", None, None)
+    page_size_axis = 1
+    if kv_layout is not None and not use_hd64:
+        layout_kwargs["kv_layout"] = rpa_batched.configs.KVLayout(kv_layout)
+        if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+            kv_cache_spec = P(None, "model", None, None, None)
+            page_size_axis = 4
     in_specs = (
         qkv_spec,  # q
         qkv_spec,  # k
@@ -363,7 +365,7 @@ def sharded_ragged_paged_attention(
     # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the local path.
     block_kwargs: dict[str, Any] = {}
     if not shard and kv_block_cap is not None and not use_hd64:
-        page_size = kv_cache.shape[4] if seq_along_lane else kv_cache.shape[1]
+        page_size = kv_cache.shape[page_size_axis]
         max_num_seqs = kv_lens.shape[0]
         pages_per_seq = page_indices.shape[0] // max_num_seqs
         cap_tokens = max(page_size, (kv_block_cap // page_size) * page_size)
@@ -390,13 +392,6 @@ def sharded_ragged_paged_attention(
         if attention_chunk_size is not None:
             block_kwargs["p_block_sizes"] = _capped(
                 rpa_default.RpaCase.PREFILL)
-
-    # Only the batched kernel takes a layout. Re-construct it in the active
-    # fork's own `KVLayout` class; the forks ship separate `configs` modules.
-    pass_layout = kv_layout is not None and not use_hd64
-    layout_kwargs = ({
-        "kv_layout": rpa_batched.configs.KVLayout(kv_layout)
-    } if pass_layout else {})
 
     def _ragged_paged_attention(*args):
         return func(

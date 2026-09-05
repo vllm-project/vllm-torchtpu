@@ -67,8 +67,6 @@ def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     into GDN's expected standard 5D layout:
       (num_blocks, gdn_kernel_block_size, packed_num_heads, kv_packing, padded_head_size)
     """
-    # The layout the attention backend sized these pages in; this view cannot
-    # disagree with whoever allocated them.
     if get_kv_cache_layout() != "HND":
         return recurrent_state
     if recurrent_state.ndim != 5:

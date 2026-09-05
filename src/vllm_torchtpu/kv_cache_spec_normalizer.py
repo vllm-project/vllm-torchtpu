@@ -73,7 +73,6 @@ def _normalize_one_spec(
         kv_cache_dtype = spec.dtype
 
     if isinstance(spec, MLAAttentionSpec):
-        # MLA has one layout, so its backend is not a caller's choice.
         page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
             spec.block_size,
             spec.num_kv_heads,

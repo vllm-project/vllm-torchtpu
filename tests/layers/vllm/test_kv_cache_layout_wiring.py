@@ -28,8 +28,7 @@ BATCHED = PallasBatchedRPAAttentionBackend
 # (num_kv_heads, head_size); 1 KV head is the b/510425663 case (a TP=4 rank of
 # a 4-KV-head model), 128 and 256 are the head widths in use on this backend.
 HEAD_CASES = [(1, 128), (1, 256), (2, 128), (4, 128), (8, 128), (8, 256)]
-# Subset for properties that only need to show a value is carried through, not
-# recomputed: one KV head (the b/510425663 case), several heads, and a wide head.
+# Subset for properties that only carry a value through rather than recompute it.
 HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
 
 
@@ -198,8 +197,7 @@ def test_num_blocks_stays_at_dim_zero(hnd, dtype):
     assert BATCHED.get_kv_cache_shape(4242, 128, 2, 128, "auto")[0] == 4242
 
 
-# Both KV-head axis positions are pinned here, because the partition spec in
-# `sharded_ragged_paged_attention` has to track them.
+# Pinned because `sharded_ragged_paged_attention`'s partition spec tracks them.
 
 
 @pytest.mark.parametrize("layout,kv_head_axis,kv_heads,page_axis",
@@ -212,34 +210,24 @@ def test_kv_head_and_page_axis_positions(monkeypatch, layout, kv_head_axis,
     assert shape[page_axis] == 128  # page_size
 
 
-def test_head_dim_64_is_refused_under_hnd_and_delegated_by_default(
-        monkeypatch):
-    """head_dim==64 is rerouted to the hd64 kernel, which only reads
-    HEAD_ALONG_SUBLANE pages."""
-    with _layout_env(monkeypatch, "HND"):
-        with pytest.raises(NotImplementedError, match="head_dim==64"):
-            BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16)
-    with _layout_env(monkeypatch, None):
+@pytest.mark.parametrize("layout", ["HND", None])
+def test_head_dim_64_delegates_whatever_the_layout(monkeypatch, layout):
+    """head_dim==64 is rerouted to the hd64 kernel, which reads only
+    HEAD_ALONG_SUBLANE pages, so the shape comes from the base class.
+
+    HND + head_dim 64 is refused at config time instead (#825): the pages are
+    fine for the hd64 kernel, but `get_kv_cache_layout()` still answers "HND"
+    process-wide, so `forward` reads a head width of 2 for a 64-wide head and
+    skips the padding it owes."""
+    with _layout_env(monkeypatch, layout):
         assert BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16) == \
             BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
 
 
-def test_head_dim_64_is_refused_under_hnd_on_longctx_too(hnd, longctx):
-    """Both forks refuse; longctx used to fall back silently.
-
-    The fallback's pages were readable by the hd64 kernel but misread by every
-    consumer of the global layout: `forward` would have taken them as
-    SEQ_ALONG_LANE and read a head width of 2 for a 64-wide head."""
-    with pytest.raises(NotImplementedError, match="head_dim==64"):
-        BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16)
-
-
-def test_head_dim_64_still_delegates_on_longctx_without_hnd(
-        monkeypatch, longctx):
-    """Refusing under HND must not disturb the default path."""
-    with _layout_env(monkeypatch, None):
-        assert BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16) == \
-            BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
+def test_head_dim_64_delegates_on_longctx_too(hnd, longctx):
+    """The longctx fork takes the same escape."""
+    assert BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16) == \
+        BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
 
 
 # Unified block pool
@@ -273,10 +261,6 @@ def test_pooled_gdn_state_view_follows_the_layout(monkeypatch, layout,
 
 
 # Coexistence with the longctx fork
-#
-# `USE_BATCHED_RPA_LONGCTX` swaps in the longctx fork. Both forks now take
-# their layout from `VLLM_KV_CACHE_LAYOUT`; the longctx fork maps it onto its
-# own `KVLayout` enum inside its wrapper.
 
 
 @pytest.fixture
@@ -325,12 +309,6 @@ def test_page_size_bytes_is_not_overridden():
 
 
 # The page size the memory planner actually sees
-#
-# `normalize_kv_cache_specs_for_tpu` runs over every spec the runner builds and
-# is the last thing to touch `page_size_padded`, which vLLM divides into free
-# memory to get `num_blocks`. It used to recompute that from a hardcoded
-# `PallasAttentionBackend`, discarding the layout-aware value the runner had
-# just set.
 
 
 def _normalized_page_bytes(backend, num_kv_heads, head_size, dtype):
@@ -389,10 +367,6 @@ def test_layout_blind_backend_would_lose_the_halving(hnd):
 
 
 # Head width read off the cache
-#
-# The impl pads a layer narrower than the page it writes into. That width is
-# `shape[-1]` under HEAD_ALONG_SUBLANE but `shape[2] * shape[3]` under
-# SEQ_ALONG_LANE, whose last axis is page_size.
 
 
 @pytest.mark.parametrize("head_size", [80, 128, 256])
