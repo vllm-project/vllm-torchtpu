@@ -224,6 +224,7 @@ def stage3_fa_raiden_id_fields(
     dp_rank: int,
     transfer_rank: int = 0,
     is_producer: bool = True,
+    has_multi_ranks: bool = False,
 ) -> dict[str, Any]:
     """Build the canonical Stage-3 FA work-unit identity."""
     job_name = str(job_name).strip()
@@ -238,8 +239,8 @@ def stage3_fa_raiden_id_fields(
         raise ValueError("Stage-3 Raiden dp_rank must be non-negative")
     if transfer_rank < 0:
         raise ValueError("Stage-3 Raiden transfer_rank must be non-negative")
-    replica_id = (f"{engine_id}-rank{transfer_rank}"
-                  if is_producer else engine_id)
+    replica_id = (f"{engine_id}-rank{transfer_rank}" if
+                  (is_producer or has_multi_ranks) else engine_id)
     return {
         "job_name": job_name,
         "job_replica_id": replica_id,
@@ -1851,7 +1852,7 @@ class TPURaidenConnectorWorker:
     def _validate_stage3_transfer_parallelism(
             self, transfer_parallelism: int) -> None:
         """The producer must shard the transfer over exactly the rank set its
-        byte-span lowering assumes: TP ranks for GLM, PCP ranks otherwise."""
+        byte-span lowering assumes: TP ranks for GLM, PCP ranks otherwise (unless TP > 1 and PCP = 1)."""
         if _use_raiden_glm_admission():
             if transfer_parallelism != self.tp_size:
                 raise ValueError(
@@ -1863,11 +1864,19 @@ class TPURaidenConnectorWorker:
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
             or 1)
-        if transfer_parallelism != pcp_size:
+        tp_size = int(self.vllm_config.parallel_config.tensor_parallel_size
+                      or self.tp_size)
+        if tp_size > 1 and pcp_size == 1:
+            expected_parallelism = tp_size
+        else:
+            expected_parallelism = pcp_size
+
+        if transfer_parallelism != expected_parallelism:
             raise ValueError(
                 "Producer transfer parallelism must equal the complete "
-                "PCP rank count: "
-                f"parallelism={transfer_parallelism}, pcp_size={pcp_size}")
+                f"{'TP' if expected_parallelism == tp_size else 'PCP'} rank count: "
+                f"parallelism={transfer_parallelism}, expected={expected_parallelism}"
+            )
 
     @staticmethod
     def _new_raiden_controller_facade(controller_address: str) -> Any:
@@ -1898,10 +1907,16 @@ class TPURaidenConnectorWorker:
         return parallelism
 
     def _local_raiden_transfer_rank(self) -> int:
-        if not self.is_producer:
-            return 0
         if _use_raiden_glm_admission():
             return int(self.tp_rank)
+        parallel_config = self.vllm_config.parallel_config
+        pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
+        tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
+        if tp_size > 1 and pcp_size == 1:
+            return int(self.tp_rank)
+
+        if not self.is_producer:
+            return 0
         from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
 
         return int(get_pcp_cache_rank())
@@ -1968,6 +1983,9 @@ class TPURaidenConnectorWorker:
         if not self.is_producer or transfer_parallelism == 1:
             return page_tokens
         parallel_config = self.vllm_config.parallel_config
+        pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
+        if pcp_size == 1:
+            return page_tokens
         interleave_tokens = int(parallel_config.cp_kv_cache_interleave_size
                                 or 0)
         if interleave_tokens <= 0:
@@ -1985,12 +2003,15 @@ class TPURaidenConnectorWorker:
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job
         engine_id = self._raiden_engine_id()
+        transfer_parallelism = self._raiden_transfer_parallelism()
+        has_multi_ranks = transfer_parallelism > 1
         return stage3_fa_raiden_id_fields(
             job_name=job_name,
             engine_id=engine_id,
             dp_rank=self.dp_rank,
             transfer_rank=transfer_rank,
             is_producer=self.is_producer,
+            has_multi_ranks=has_multi_ranks,
         )
 
     def _register_raiden_stage3_work_unit(
@@ -2101,22 +2122,32 @@ class TPURaidenConnectorWorker:
                 return f"pcp{pcp_size}_prefill"
             if tp_size == 1 and pcp_size == 1 and dp_size in (4, 8, 16):
                 return f"dp{dp_size}_prefill"
+            if tp_size == 2 and pcp_size == 1 and dp_size == 4:
+                return "tp2dp4_prefill"
             raise ValueError(
                 "Raiden Qwen3.5 admission topology pcp8_prefill, "
-                "pcp4_prefill, dp8_prefill, dp4_prefill, or dp16_prefill requires "
+                "pcp4_prefill, dp8_prefill, dp4_prefill, dp16_prefill, "
+                "or tp2dp4_prefill requires "
                 "kv_producer with tensor_parallel_size=1 and either "
                 "prefill_context_parallel_size in (4, 8), "
                 "data_parallel_size=1 or "
                 "prefill_context_parallel_size=1, "
-                "data_parallel_size in (4, 8, 16); got "
+                "data_parallel_size in (4, 8, 16); OR "
+                "symmetric tp2dp4 with prefill_context_parallel_size=1, "
+                "tensor_parallel_size=2, data_parallel_size=4; got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}")
+        if tp_size == 2 and pcp_size == 1 and dp_size == 4:
+            return "tp2dp4_decode"
         if pcp_size != 1 or tp_size != 1 or dp_size not in (4, 8, 16):
             raise ValueError(
-                "Raiden Qwen3.5 admission topology dp8_decode, dp4_decode, or dp16_decode requires "
+                "Raiden Qwen3.5 admission topology dp8_decode, dp4_decode, "
+                "dp16_decode, or tp2dp4_decode requires "
                 "kv_consumer with prefill_context_parallel_size=1, "
-                "tensor_parallel_size=1, data_parallel_size in (4, 8, 16); got "
+                "tensor_parallel_size=1, data_parallel_size in (4, 8, 16); OR "
+                "symmetric tp2dp4 with prefill_context_parallel_size=1, "
+                "tensor_parallel_size=2, data_parallel_size=4; got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}")

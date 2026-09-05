@@ -1814,22 +1814,24 @@ class TestTPURaidenConnectorWorker:
 
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
-            # role, dp rank, transfer rank, unit replica, data/listener hosts
-            (True, 0, 3, "engine7-rank3", "10.30.0.3"),
-            (False, 5, 0, "engine7", "10.40.0.5"),
+            # is_producer, dp_rank, tp_rank, tp_size, dp_size, pcp_size, transfer_parallelism, transfer_rank, replica_id, host, interleave_tokens
+            (True, 0, 0, 1, 1, 8, 8, 3, "engine7-rank3", "10.30.0.3", 4),
+            (False, 5, 0, 1, 8, 1, 1, 0, "engine7", "10.40.0.5", 8),
+            (True, 0, 1, 2, 4, 1, 2, 1, "engine7-rank1", "10.30.0.3", 8),
+            (False, 5, 1, 2, 4, 1, 2, 1, "engine7-rank1", "10.40.0.5", 8),
         )
-        for is_producer, dp_rank, transfer_rank, replica_id, host in cases:
+        for is_producer, dp_rank, tp_rank, tp_size, dp_size, pcp_size, transfer_parallelism, transfer_rank, replica_id, host, interleave_tokens in cases:
             worker = _make_raiden_worker(
-                tp_rank=0,
-                tp_size=1,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
                 is_producer=is_producer,
                 dp_rank=dp_rank,
-                dp_size=1 if is_producer else 8,
-                pcp_size=8 if is_producer else 1,
+                dp_size=dp_size,
+                pcp_size=pcp_size,
                 interleave_size=4,
             )
             named, groups = _synthetic_qwen35_materialization(
-                tp_size=1, pcp_size=8 if is_producer else 1)
+                tp_size=tp_size, pcp_size=pcp_size)
             runner = SimpleNamespace(
                 kv_caches=list(named.values()),
                 kv_cache_raw_tensors=[],
@@ -1885,7 +1887,7 @@ class TestTPURaidenConnectorWorker:
                                         create=True), patch(
                                             f"{_MOD}.tpu_envs."
                                             "TPU_RAIDEN_TRANSFER_PARALLELISM",
-                                            8,
+                                            transfer_parallelism,
                                             create=True):
                 worker.register_runner(runner)
 
@@ -1903,7 +1905,7 @@ class TestTPURaidenConnectorWorker:
             assert call["layout_fingerprint"] == "layout-fingerprint-golden"
             assert call["page_tokens"] == 8
             assert "page_slice_tokens" not in call
-            assert call["transfer_parallelism"] == 8
+            assert call["transfer_parallelism"] == transfer_parallelism
             assert call["transfer_rank"] == transfer_rank
             assert call["pool_manifest"] == engine.registered_pools
             assert len(call["pool_manifest"]) == 105
@@ -1915,8 +1917,7 @@ class TestTPURaidenConnectorWorker:
             assert registration["unit"] == vars(unit)
             assert registration["shards"] == [f"{host}:31001"]
             assert registration["control_plane_rpc_address"] == f"{host}:31002"
-            assert registration["interleave_tokens"] == (4
-                                                         if is_producer else 8)
+            assert registration["interleave_tokens"] == interleave_tokens
             assert worker._raiden_controller_facade is facade
             assert worker._raiden_work_unit is unit
 
@@ -2946,16 +2947,43 @@ class TestTPURaidenConnectorWorker:
         assert worker._raiden_transfer_engine is engine
         assert worker.raiden_admission_summary() == {"admitted": False}
 
-    def test_v1_admission_rejects_the_v2_tp2dp4_decode_topology(self):
+    def test_v1_admission_accepts_the_v2_tp2dp4_decode_topology(self):
         worker = _make_raiden_worker(tp_rank=0,
                                      tp_size=2,
                                      is_producer=False,
                                      dp_size=4,
                                      pcp_size=1)
 
+        assert worker._raiden_qwen35_admission_topology() == "tp2dp4_decode"
+
+    def test_v1_admission_accepts_the_v2_tp2dp4_prefill_topology(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=2,
+                                     is_producer=True,
+                                     dp_size=4,
+                                     pcp_size=1)
+
+        assert worker._raiden_qwen35_admission_topology() == "tp2dp4_prefill"
+
+    def test_v1_admission_rejects_unsupported_tp_topologies(self):
+        # TP=4 is not supported for admission (only symmetric tp2dp4 is admitted)
+        worker_tp4 = _make_raiden_worker(tp_rank=0,
+                                         tp_size=4,
+                                         is_producer=False,
+                                         dp_size=2,
+                                         pcp_size=1)
         with unittest.TestCase().assertRaisesRegex(ValueError,
-                                                   "dp8_decode.*requires"):
-            worker._raiden_qwen35_admission_topology()
+                                                   "Raiden Qwen3.5 admission"):
+            worker_tp4._raiden_qwen35_admission_topology()
+
+        worker_tp2dp8 = _make_raiden_worker(tp_rank=0,
+                                            tp_size=2,
+                                            is_producer=True,
+                                            dp_size=8,
+                                            pcp_size=1)
+        with unittest.TestCase().assertRaisesRegex(ValueError,
+                                                   "Raiden Qwen3.5 admission"):
+            worker_tp2dp8._raiden_qwen35_admission_topology()
 
     @pytest.mark.parametrize("dp_size", [4, 8])
     def test_v1_admission_accepts_dp_prefill_topology(self, dp_size):
