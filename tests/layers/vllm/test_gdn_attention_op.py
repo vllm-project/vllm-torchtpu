@@ -105,7 +105,7 @@ class TestVllmGatedDeltaNetAttention:
         raw_values = (
             np.arange(1, total_elements + 1, dtype=np.float32) % 120 + 1)
         recurrent_state = jnp.array(raw_values.reshape(shape), dtype=dtype)
-        pooled_state = _pooled_gdn_state_view(recurrent_state)
+        pooled_state = _pooled_gdn_state_view(recurrent_state, True)
 
         packed_num_heads = cdiv(num_kv_heads_x2, kv_packing)
         expected_gdn_kernel_block_size = (
@@ -116,7 +116,7 @@ class TestVllmGatedDeltaNetAttention:
         expected_tokens = (manager_block_size //
                            page_size) * expected_gdn_kernel_block_size
         assert _pooled_gdn_block_tokens(vllm_config, recurrent_state,
-                                        pooled_state) == expected_tokens
+                                        pooled_state, True) == expected_tokens
 
         # Assert values: verify that the underlying flattened memory buffer is
         # bitwise-identical and that round-trip reshape restores exact values.
@@ -399,7 +399,8 @@ class TestVllmGatedDeltaNetAttention:
         assert mock_core.call_args.kwargs[
             "recurrent_state_dtype"] == jnp.dtype(expected_dtype)
 
-    def test_pooled_impl_forwards_every_operand_the_forward_passes(self):
+    def test_pooled_impl_forwards_every_operand_the_forward_passes(
+            self, vllm_config_context):
         """`gdn_impl` must accept exactly what `forward` calls it with.
 
         The pooled operand list is threaded through four layers (forward ->

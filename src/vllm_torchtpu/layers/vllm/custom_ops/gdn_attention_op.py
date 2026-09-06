@@ -59,7 +59,8 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
                      f"{dtype}; expected float32 or bfloat16")
 
 
-def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
+def _pooled_gdn_state_view(recurrent_state: jax.Array,
+                           seq_along_lane: bool) -> jax.Array:
     """Build GDN's packed byte view inside the donated custom-op boundary.
 
     Dynamically transforms SEQ_ALONG_LANE 5D attention pool:
@@ -67,7 +68,7 @@ def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     into GDN's expected standard 5D layout:
       (num_blocks, gdn_kernel_block_size, packed_num_heads, kv_packing, padded_head_size)
     """
-    if get_kv_cache_layout() != "HND":
+    if not seq_along_lane:
         return recurrent_state
     if recurrent_state.ndim != 5:
         raise ValueError("SEQ_ALONG_LANE unified pool must be rank 5, got "
@@ -103,7 +104,8 @@ def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
 
 def _pooled_gdn_block_tokens(vllm_config: VllmConfig,
                              recurrent_state: jax.Array,
-                             pooled_state: jax.Array) -> int:
+                             pooled_state: jax.Array,
+                             seq_along_lane: bool) -> int:
     """Return manager-block capacity in the GDN alias's token rows.
 
     Under SEQ_ALONG_LANE, the attention pool layout packs tokens along the lane
@@ -118,7 +120,7 @@ def _pooled_gdn_block_tokens(vllm_config: VllmConfig,
     with the GDN rows per page (pooled_state.shape[1]).
     """
     manager_block_tokens = vllm_config.cache_config.block_size
-    if get_kv_cache_layout() != "HND":
+    if not seq_along_lane:
         return manager_block_tokens
     kernel_block_size = recurrent_state.shape[-1]
     if manager_block_tokens % kernel_block_size != 0:
@@ -588,6 +590,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
 
+        # The layout is resolved here, not inside `wrapped_fn`:
+        # `get_kv_cache_layout()` asks the KV connector, which needs a current
+        # vLLM config, and the op body runs at forward time where there is
+        # none. `pool_block_tokens` still has to be read per call (below).
+        pool_is_seq_along_lane = get_kv_cache_layout() == "HND"
+
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
         # fully annotated signature, so the operands are spelled out.
@@ -607,7 +615,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
-            pooled_state = _pooled_gdn_state_view(recurrent_state)
+            pooled_state = _pooled_gdn_state_view(recurrent_state,
+                                                  pool_is_seq_along_lane)
             new_pooled_state, outputs = gdn_attention_pooled_core_tpu(
                 mixed_qkv,
                 b,
@@ -636,7 +645,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # models construct GDN layers before the first
                 # full-attention layer would ever see the adjusted value.
                 pool_block_tokens=_pooled_gdn_block_tokens(
-                    vllm_config, recurrent_state, pooled_state),
+                    vllm_config, recurrent_state, pooled_state,
+                    pool_is_seq_along_lane),
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
             )

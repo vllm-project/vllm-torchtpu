@@ -356,6 +356,7 @@ def _pallas_rpa_kernel_batched(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -378,7 +379,7 @@ def _pallas_rpa_kernel_batched(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
-        kv_layout=KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()],
+        kv_layout=kv_layout,
     )
 
 
@@ -592,6 +593,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # as a method. Subclasses override this to select a different kernel.
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
+    # Only the batched entry takes a layout; v3 and hd64 have no such argument.
+    _kernel_takes_kv_layout: ClassVar[bool] = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -650,6 +653,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
+        # Resolved here, not in `forward`: `get_kv_cache_layout()` asks the KV
+        # connector, which needs a current vLLM config. Model construction has
+        # one, a compiled forward does not, and Dynamo traces into the
+        # accessor so its `lru_cache` does not spare us.
+        self.kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+        self._pool_is_seq_along_lane = (
+            isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+            and self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE)
         self.rpa_kernel = None
         # Populated by initialize_kernel() before torch.compile traces the
         # model. Forward can then reuse the custom op without resolving a PCP
@@ -736,6 +747,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
                 use_causal_mask=self.use_causal_mask,
+                **({
+                    "kv_layout": self.kv_layout
+                } if self._kernel_takes_kv_layout else {}),
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -814,7 +828,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
-        if get_kv_cache_layout() == "HND":
+        if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
             unsupported_features.append("VLLM_KV_CACHE_LAYOUT=HND")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
@@ -1063,8 +1077,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
         # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
-        if (isinstance(self, PallasBatchedRPAAttentionBackendImpl)
-                and get_kv_cache_layout() == "HND"):
+        if self._pool_is_seq_along_lane:
             pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
         else:
             pool_head_dim = kv_cache.shape[-1]
@@ -1171,6 +1184,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+    _kernel_takes_kv_layout = True
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

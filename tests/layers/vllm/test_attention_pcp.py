@@ -201,7 +201,8 @@ def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
             _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
 
 
-def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch):
+def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch,
+                                                      vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata()
@@ -239,7 +240,7 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
 
 
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
-        monkeypatch):
+        monkeypatch, vllm_config_context):
     impl = _impl()
     fake_mesh = object()
 
@@ -292,7 +293,8 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     assert cached is prebuilt
 
 
-def test_build_streaming_kernel_registers_eight_tensor_custom_op(monkeypatch):
+def test_build_streaming_kernel_registers_eight_tensor_custom_op(
+        monkeypatch, vllm_config_context):
     impl = _impl()
     fake_mesh = object()
     captured = {}
