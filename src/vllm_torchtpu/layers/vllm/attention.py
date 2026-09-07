@@ -557,11 +557,20 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
-        if head_size == 64 or is_auto:
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+        # Only a real SEQ_ALONG_LANE allocation needs the wrapper, which reads
+        # lane/sublane geometry off the device and so needs a JAX TPU client --
+        # the scheduler process calls this and owns no chip.
+        #   is_auto         -> vLLM's dtype-less probe for the num_blocks axis
+        #   head_size == 64 -> hd64 kernel, allocates HEAD_ALONG_SUBLANE anyway
+        #   HEAD_ALONG_SUBLANE -> inherited shape is byte-identical
+        seq_along_lane = batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+        needs_wrapper = (kv_layout is seq_along_lane and not is_auto
+                         and head_size != 64)
+        if not needs_wrapper:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
                 cache_dtype_str)
-        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
         torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         return rpa_batched_wrapper.get_kv_cache_shape(
             total_num_pages=num_blocks,

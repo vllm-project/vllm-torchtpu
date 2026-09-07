@@ -466,3 +466,28 @@ def test_raiden_geometry_resolves_the_layout_under_a_config():
                                                  ) else getattr(f, "id", None))
 
     assert {"select_common_block_size", "get_kv_cache_shape"} <= guarded
+
+
+@pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES_CORE)
+@pytest.mark.parametrize("dtype", [BF16, FP8])
+def test_default_layout_shape_needs_no_tpu_client(nhd, monkeypatch,
+                                                  num_kv_heads, head_size,
+                                                  dtype):
+    """The shape must be arithmetic, not a device query.
+
+    `resolve_kernel_geometry` calls this from the scheduler process, which owns
+    no chip -- the workers hold them all. The batched wrapper reads lane and
+    sublane geometry via `pltpu.get_tpu_info()`, so routing the default layout
+    through it made engine startup die with
+    `TPU initialization failed: open(/dev/vfio/N): Device or resource busy`.
+    """
+    from jax.experimental.pallas import tpu as pltpu
+
+    def no_device(*_args, **_kwargs):
+        raise AssertionError("get_kv_cache_shape queried the TPU")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", no_device)
+    assert BATCHED.get_kv_cache_shape(4, 128, num_kv_heads, head_size,
+                                      dtype) == BASE.get_kv_cache_shape(
+                                          4, 128, num_kv_heads, head_size,
+                                          dtype)
