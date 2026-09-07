@@ -7,7 +7,7 @@
 # Analysis includes full history from tpu_commons, tpu_inference, and torchtpu-vllm paths.
 
 # Default owners for everything in the repo (fallback)
-* @qizzzh @Geyuhao @angelayi @colin2328 @QiliangCui
+* @qizzzh @Geyuhao @angelayi @colin2328 @kyuyeunk
 
 # CI/CD and Build Configuration
 /.buildkite/ @QiliangCui @theminghuang
@@ -35,3 +35,6 @@
 
 # Docker Configuration
 /docker/ @QiliangCui @theminghuang
+
+# Tests
+/tests/ @QiliangCui
