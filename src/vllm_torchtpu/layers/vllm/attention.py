@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import inspect
 from typing import Any, ClassVar
 
 import jax
@@ -573,6 +574,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
+        # Needs a current vLLM config: the layout falls through to the KV
+        # connector when `VLLM_KV_CACHE_LAYOUT` is unset.
         if envs.USE_BATCHED_RPA_LONGCTX:
             return [128, 256, 512, 1024, 2048, 4096]
         # SEQ_ALONG_LANE maps a page onto one 128-lane tile.
@@ -593,8 +596,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # as a method. Subclasses override this to select a different kernel.
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
-    # Only the batched entry takes a layout; v3 and hd64 have no such argument.
-    _kernel_takes_kv_layout: ClassVar[bool] = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -749,7 +750,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 use_causal_mask=self.use_causal_mask,
                 **({
                     "kv_layout": self.kv_layout
-                } if self._kernel_takes_kv_layout else {}),
+                } if "kv_layout" in inspect.signature(
+                    self._kernel_entry).parameters else {}),
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -1184,7 +1186,6 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
-    _kernel_takes_kv_layout = True
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

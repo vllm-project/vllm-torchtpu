@@ -432,3 +432,37 @@ def test_no_layout_lookup_on_the_compiled_forward_path():
         if "get_kv_cache_layout" in inspect.getsource(fn)
     ]
     assert not offenders, f"{offenders} resolve the KV layout at forward time"
+
+
+def test_raiden_geometry_resolves_the_layout_under_a_config():
+    """`resolve_kernel_geometry` runs in the EngineCore, where no config is set.
+
+    Both calls resolve the KV cache layout, which falls through to the KV
+    connector and asserts without one.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm_torchtpu.offload import raiden_store
+
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(
+            raiden_store.resolve_kernel_geometry)))
+    guarded = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        if not any(
+                isinstance(i.context_expr, ast.Call)
+                and getattr(i.context_expr.func, "id",
+                            None) == "set_current_vllm_config"
+                for i in node.items):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                f = inner.func
+                guarded.add(f.attr if isinstance(f, ast.Attribute
+                                                 ) else getattr(f, "id", None))
+
+    assert {"select_common_block_size", "get_kv_cache_shape"} <= guarded

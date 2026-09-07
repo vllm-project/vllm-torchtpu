@@ -1150,12 +1150,13 @@ def resolve_kernel_geometry(
         ), ("TPURaidenOffloadingConnector: unified pool groups must share one "
             "padded page size")
 
+    from vllm.config import set_current_vllm_config
+
     attn_backend = TpuPlatform._find_non_ssm_backend(vllm_config)
     if attn_backend is None:
         # In the EngineCore process, the model is not instantiated, so
         # _find_non_ssm_backend returns None. Resolve the attention backend
         # directly via get_attn_backend using the model configuration.
-        from vllm.config import set_current_vllm_config
         from vllm.v1.attention.selector import get_attn_backend
         model_config = vllm_config.model_config
         with set_current_vllm_config(vllm_config):
@@ -1170,15 +1171,18 @@ def resolve_kernel_geometry(
     assert not attn_backend.is_ssm(), (
         "TPURaidenOffloadingConnector: resolved attention backend is SSM: "
         f"{attn_backend.get_name()}")
-    kernel_block_size = select_common_block_size(spec0.block_size,
-                                                 [attn_backend])
-    full_5d_shape = attn_backend.get_kv_cache_shape(
-        num_blocks=1,
-        block_size=kernel_block_size,
-        num_kv_heads=spec0.num_kv_heads,
-        head_size=spec0.head_size,
-        cache_dtype_str=spec0.dtype,
-    )
+    # Both calls resolve the KV cache layout, which falls through to the KV
+    # connector and so needs a current config.
+    with set_current_vllm_config(vllm_config):
+        kernel_block_size = select_common_block_size(spec0.block_size,
+                                                     [attn_backend])
+        full_5d_shape = attn_backend.get_kv_cache_shape(
+            num_blocks=1,
+            block_size=kernel_block_size,
+            num_kv_heads=spec0.num_kv_heads,
+            head_size=spec0.head_size,
+            cache_dtype_str=spec0.dtype,
+        )
     per_block_shape = tuple(full_5d_shape[1:])
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
