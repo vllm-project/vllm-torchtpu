@@ -21,25 +21,23 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
     PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
-    PCP_AXIS_NAME,
-    sharded_pcp_ragged_paged_attention,
-)
+    PCP_AXIS_NAME, TP_AXIS_NAME, sharded_pcp_ragged_paged_attention)
 
 _PCP_STREAMING_RPA_TENSOR_ARG_COUNT = 9
 
 PCP_STREAMING_RPA_INPUT_PARTITION_SPECS = (
-    PartitionSpec(PCP_AXIS_NAME),  # kv_cache: local cache blocks
-    PartitionSpec(PCP_AXIS_NAME),  # query: local prefill tokens
-    PartitionSpec(PCP_AXIS_NAME),  # key: local prefill tokens
-    PartitionSpec(PCP_AXIS_NAME),  # value: local prefill tokens
+    PartitionSpec(PCP_AXIS_NAME, None, TP_AXIS_NAME),  # kv_cache
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # query: local prefill tokens
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # key: local prefill tokens
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # value: local prefill tokens
     PartitionSpec(),  # seq_lens
     PartitionSpec(),  # block_tables
     PartitionSpec(),  # query_start_loc
     PartitionSpec(),  # request_distribution
 )
 PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS = (
-    PartitionSpec(PCP_AXIS_NAME),  # new_kv_cache
-    PartitionSpec(PCP_AXIS_NAME),  # output
+    PartitionSpec(PCP_AXIS_NAME, None, TP_AXIS_NAME),  # new_kv_cache
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # output
 )
 
 
@@ -172,7 +170,8 @@ def pcp_streaming_jax_op(
 
 
 def get_pcp_streaming_mesh():
-    return get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME)
+    return get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME,
+                                  tp_axis_name=TP_AXIS_NAME)
 
 
 def make_pcp_streaming_rpa_kernel(

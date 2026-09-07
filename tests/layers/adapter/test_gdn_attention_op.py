@@ -53,16 +53,16 @@ def _mesh():
     return SimpleNamespace(shape={"attn_dp": 1, "expert": 1, "model": 1})
 
 
-def _vllm_config(
-    *,
-    pcp_size: int = 1,
-    interleave_size: int = 16,
-    block_size: int = 16,
-    mamba_page_size_padded: int | None = None,
-):
+def _vllm_config(*,
+                 pcp_size: int = 1,
+                 tp_size: int = 1,
+                 interleave_size: int = 16,
+                 block_size: int = 16,
+                 mamba_page_size_padded: int | None = None):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
+            tensor_parallel_size=tp_size,
             cp_kv_cache_interleave_size=interleave_size,
             data_parallel_size=1,
         ),
@@ -78,13 +78,16 @@ def _vllm_config(
     )
 
 
-def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
+def _qwen35_397b_gdn_attn(prefix: str,
+                          *,
+                          bias: bool = False,
+                          tp_size: int = 1):
     attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
     attn.prefix = prefix
     attn.num_k_heads = 64
     attn.gqa_interleaved_layout = False
     attn.num_v_heads = 64
-    attn.tp_size = 1
+    attn.tp_size = tp_size
     attn.head_k_dim = 128
     attn.head_v_dim = 128
     attn.conv_kernel_size = 4
@@ -102,8 +105,8 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
     return attn
 
 
-def _qwen38_gdn_attn(prefix: str):
-    attn = _qwen35_397b_gdn_attn(prefix)
+def _qwen38_gdn_attn(prefix: str, *, tp_size: int = 1):
+    attn = _qwen35_397b_gdn_attn(prefix, tp_size=tp_size)
     attn.num_k_heads = 4
     attn.num_v_heads = 32
     return attn
@@ -223,7 +226,10 @@ class TestVllmGatedDeltaNetAttention:
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
         attn.gqa_interleaved_layout = interleaved
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
-        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={
+            "pcp": 8,
+            "tp": 1
+        })
         pool = torch.zeros((4, 8), dtype=torch.float32)
         pool_alias = pool.view_as(pool)
         original_storage = pool.untyped_storage().data_ptr()
@@ -622,7 +628,7 @@ class TestVllmGatedDeltaNetAttention:
         attn0 = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn1 = _qwen35_397b_gdn_attn("language_model.model.layers.30.linear_attn")
         fake_jax_op = MagicMock()
-        pcp_mesh = SimpleNamespace(shape={"pcp": 8})
+        pcp_mesh = SimpleNamespace(shape={"pcp": 8, "tp": 1})
         mock_get_pcp_mesh.return_value = pcp_mesh
 
         with (
@@ -647,18 +653,21 @@ class TestVllmGatedDeltaNetAttention:
         )
         assert mock_pcp_jax_op.call_args_list[0].kwargs["mesh"] is pcp_mesh
         assert mock_pcp_jax_op.call_args_list[1].kwargs["mesh"] is pcp_mesh
-        assert mock_pcp_jax_op.call_args_list[0].kwargs["input_partition_specs"][
-            3
-        ] == PartitionSpec(None, None, "pcp")
-        assert mock_pcp_jax_op.call_args_list[0].kwargs["input_partition_specs"][
-            4
-        ] == PartitionSpec(None, "pcp", None, None)
-        assert mock_pcp_jax_op.call_args_list[0].kwargs["output_partition_specs"][
-            :2
-        ] == (
-            PartitionSpec(None, None, "pcp"),
-            PartitionSpec(None, "pcp", None, None),
-        )
+        assert mock_pcp_jax_op.call_args_list[0].kwargs[
+            "input_partition_specs"][3] == PartitionSpec(
+                None, None, ("tp", "pcp"))
+        assert mock_pcp_jax_op.call_args_list[0].kwargs[
+            "input_partition_specs"][4] == PartitionSpec(
+                None, ("tp", "pcp"), None, None)
+        assert mock_pcp_jax_op.call_args_list[0].kwargs[
+            "output_partition_specs"][:2] == (
+                PartitionSpec(None, None, ("tp", "pcp")),
+                PartitionSpec(None, ("tp", "pcp"), None, None),
+            )
+        mock_get_pcp_mesh.assert_has_calls([
+            call(axis_name="pcp", tp_axis_name="tp"),
+            call(axis_name="pcp", tp_axis_name="tp"),
+        ])
         assert fake_jax_op.register_fake.call_count == 2
 
     @patch(
@@ -673,7 +682,10 @@ class TestVllmGatedDeltaNetAttention:
     ):
         attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn.num_spec = 1
-        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={
+            "pcp": 8,
+            "tp": 1
+        })
         fake_jax_op = MagicMock()
 
         with (
@@ -700,10 +712,13 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pcp_ops_construct_with_replicated_kq_heads(
-        self, mock_get_pcp_mesh, _mock_get_pcp_world_size
-    ):
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
+            cpu_vllm_config_context):
         attn = _qwen38_gdn_attn("language_model.model.layers.0.linear_attn")
-        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={
+            "pcp": 8,
+            "tp": 1
+        })
         fake_jax_op = MagicMock()
 
         with (
@@ -726,6 +741,62 @@ class TestVllmGatedDeltaNetAttention:
         assert compact_wrapped_fn.keywords["n_kq"] == 4
         assert compact_wrapped_fn.keywords["n_v"] == 32
         assert compact_wrapped_fn.keywords["pcp_size"] == 8
+
+    @patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=4)
+    @patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_pcp4_tp2_ops_preserve_replicated_kq_geometry(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
+            cpu_vllm_config_context):
+        attn = _qwen38_gdn_attn("language_model.model.layers.0.linear_attn",
+                                tp_size=2)
+        pcp_mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+        mock_get_pcp_mesh.return_value = pcp_mesh
+        fake_jax_op = MagicMock()
+
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(),
+                vllm_config=_vllm_config(pcp_size=4, tp_size=2)), patch(
+                    "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                    "pallas.jax_op",
+                    return_value=fake_jax_op,
+                ) as mock_pcp_jax_op:
+            compact_op = attn._build_gdn_op(pcp_streaming=True)
+            unified_op = attn._build_pooled_pcp_gdn_op()
+
+        assert callable(compact_op)
+        assert callable(unified_op)
+        assert mock_pcp_jax_op.call_count == 2
+        compact_wrapped_fn = mock_pcp_jax_op.call_args_list[0].args[1]
+        assert compact_wrapped_fn.keywords["n_kq"] == 2
+        assert compact_wrapped_fn.keywords["n_v"] == 16
+        assert compact_wrapped_fn.keywords["pcp_size"] == 4
+        pooled_specs = mock_pcp_jax_op.call_args_list[1].kwargs
+        assert pooled_specs["mesh"] is pcp_mesh
+        assert pooled_specs["input_partition_specs"] == (
+            PartitionSpec("pcp", None),
+            PartitionSpec("tp"),
+            PartitionSpec("tp"),
+            PartitionSpec("pcp", "tp"),
+            PartitionSpec("pcp", "tp"),
+            PartitionSpec(("tp", "pcp")),
+            PartitionSpec("tp"),
+            None,
+            PartitionSpec("tp"),
+            PartitionSpec("tp"),
+            PartitionSpec(),
+            PartitionSpec(),
+            PartitionSpec(),
+            PartitionSpec(),
+        )
+        assert pooled_specs["output_partition_specs"] == (
+            PartitionSpec(("tp", "pcp")),
+            PartitionSpec("pcp", "tp", None),
+            PartitionSpec("pcp", "tp", None),
+        )
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"

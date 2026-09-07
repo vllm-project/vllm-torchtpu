@@ -183,6 +183,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # `build_ep_mesh` chooses, but the file still decides the axis and the
     # shape the kernel exports against.
     "vllm_torchtpu/distributed/ep_mesh.py",
+    "vllm_torchtpu/distributed/pcp.py",
+    "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",

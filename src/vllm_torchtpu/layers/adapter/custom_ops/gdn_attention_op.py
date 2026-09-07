@@ -68,6 +68,10 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
 
+_GDN_PCP_AXIS_NAME = "pcp"
+_GDN_TP_AXIS_NAME = "tp"
+_GDN_PCP_TP_STATE_AXIS = (_GDN_TP_AXIS_NAME, _GDN_PCP_AXIS_NAME)
+
 
 def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
     if dtype == torch.float32:
@@ -531,18 +535,25 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             parallel_config = vllm_context.vllm_config.parallel_config
             interleave_size = parallel_config.cp_kv_cache_interleave_size
             if not isinstance(interleave_size, int) or interleave_size <= 0:
-                raise ValueError(
-                    "GDN PCP streaming requires cp_kv_cache_interleave_size > 0."
-                )
-            pcp_mesh = get_or_create_pcp_mesh(axis_name="pcp")
+                raise ValueError("GDN PCP streaming requires "
+                                 "cp_kv_cache_interleave_size > 0.")
+            pcp_mesh = get_or_create_pcp_mesh(
+                axis_name=_GDN_PCP_AXIS_NAME,
+                tp_axis_name=_GDN_TP_AXIS_NAME,
+            )
             pcp_size = get_pcp_world_size()
-            if pcp_size != pcp_mesh.shape["pcp"]:
+            if pcp_size != pcp_mesh.shape[_GDN_PCP_AXIS_NAME]:
                 raise ValueError(
                     f"PCP world size {pcp_size} does not match mesh shape "
-                    f"{pcp_mesh.shape['pcp']}."
-                )
-            derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
-            op_name = f"pallas::gdn_attention_pcp_{self.prefix.replace('.', '_')}"
+                    f"{pcp_mesh.shape[_GDN_PCP_AXIS_NAME]}.")
+            if self.tp_size != pcp_mesh.shape[_GDN_TP_AXIS_NAME]:
+                raise ValueError(
+                    f"TP size {self.tp_size} does not match mesh shape "
+                    f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}.")
+            derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
+                                         pcp_size)
+            op_name = ("pallas::gdn_attention_pcp_"
+                       f"{self.prefix.replace('.', '_')}")
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu_pcp_prefill,
                 mesh=pcp_mesh,
@@ -555,24 +566,31 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 interleave_size=interleave_size,
             )
             input_partition_specs = (
-                PartitionSpec("pcp"),  # mixed_qkv
-                PartitionSpec("pcp"),  # b
-                PartitionSpec("pcp"),  # a
-                PartitionSpec(None, None, "pcp"),  # conv_state
-                PartitionSpec(None, "pcp", None, None),  # recurrent_state
-                PartitionSpec(),  # conv_weight
-                PartitionSpec() if has_conv_bias else None,  # conv_bias
-                PartitionSpec(),  # A_log
-                PartitionSpec(),  # dt_bias
+                PartitionSpec(_GDN_PCP_AXIS_NAME,
+                              _GDN_TP_AXIS_NAME),  # mixed_qkv
+                PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # b
+                PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # a
+                PartitionSpec(None, None,
+                              _GDN_PCP_TP_STATE_AXIS),  # conv_state
+                PartitionSpec(None, _GDN_PCP_TP_STATE_AXIS, None,
+                              None),  # recurrent_state
+                PartitionSpec(_GDN_TP_AXIS_NAME),  # conv_weight
+                (PartitionSpec(_GDN_TP_AXIS_NAME)
+                 if has_conv_bias else None),  # conv_bias
+                PartitionSpec(_GDN_TP_AXIS_NAME),  # A_log
+                PartitionSpec(_GDN_TP_AXIS_NAME),  # dt_bias
                 PartitionSpec(),  # state_indices
                 PartitionSpec(),  # query_start_loc
                 PartitionSpec(),  # request_distribution
                 PartitionSpec(),  # seq_lens
             )
             output_partition_specs = (
-                PartitionSpec(None, None, "pcp"),  # new_conv_state
-                PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec("pcp"),  # output
+                PartitionSpec(None, None,
+                              _GDN_PCP_TP_STATE_AXIS),  # new_conv_state
+                PartitionSpec(None, _GDN_PCP_TP_STATE_AXIS, None,
+                              None),  # new_recurrent_state
+                PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME,
+                              None),  # output
             )
             # Torchtpu native jax_op. The pcp_streaming wrapper adds only
             # kernel_reload's dispatcher, which GDN does not use.
@@ -786,17 +804,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         parallel_config = vllm_context.vllm_config.parallel_config
         interleave_size = parallel_config.cp_kv_cache_interleave_size
         if not isinstance(interleave_size, int) or interleave_size <= 0:
-            raise ValueError(
-                "GDN pooled PCP prefill requires cp_kv_cache_interleave_size > 0."
-            )
-        pcp_mesh = get_or_create_pcp_mesh(axis_name="pcp")
+            raise ValueError("GDN pooled PCP prefill requires "
+                             "cp_kv_cache_interleave_size > 0.")
+        pcp_mesh = get_or_create_pcp_mesh(
+            axis_name=_GDN_PCP_AXIS_NAME,
+            tp_axis_name=_GDN_TP_AXIS_NAME,
+        )
         pcp_size = get_pcp_world_size()
-        if pcp_size != pcp_mesh.shape["pcp"]:
+        if pcp_size != pcp_mesh.shape[_GDN_PCP_AXIS_NAME]:
             raise ValueError(
                 f"PCP world size {pcp_size} does not match mesh shape "
-                f"{pcp_mesh.shape['pcp']}."
-            )
-        derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
+                f"{pcp_mesh.shape[_GDN_PCP_AXIS_NAME]}.")
+        if self.tp_size != pcp_mesh.shape[_GDN_TP_AXIS_NAME]:
+            raise ValueError(
+                f"TP size {self.tp_size} does not match mesh shape "
+                f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}.")
+        derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
+                                     pcp_size)
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim
@@ -858,25 +882,28 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             f"{'_bm' if block_major else ''}"
         )
         input_partition_specs = (
-            PartitionSpec("pcp"),  # hidden states
-            PartitionSpec(),  # QKVZ weight
-            PartitionSpec("pcp"),  # b
-            PartitionSpec("pcp"),  # a
-            PartitionSpec("pcp"),  # recurrent_state pool (rank-local, axis 0)
-            PartitionSpec(),  # conv_weight
-            PartitionSpec() if has_conv_bias else None,  # conv_bias
-            PartitionSpec(),  # A_log
-            PartitionSpec(),  # dt_bias
+            PartitionSpec(_GDN_PCP_AXIS_NAME, None),  # hidden states
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # QKVZ weight
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # b
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # a
+            PartitionSpec(
+                _GDN_PCP_TP_STATE_AXIS),  # recurrent_state pool (rank-local)
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # conv_weight
+            (PartitionSpec(_GDN_TP_AXIS_NAME)
+             if has_conv_bias else None),  # conv_bias
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # A_log
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # dt_bias
             PartitionSpec(),  # state_indices
             PartitionSpec(),  # query_start_loc
             PartitionSpec(),  # request_distribution
             PartitionSpec(),  # seq_lens
-            PartitionSpec(),  # optional QKVZ weight scale
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # optional QKVZ weight scale
         )
         output_partition_specs = (
-            PartitionSpec("pcp"),  # new pool
-            PartitionSpec("pcp"),  # output
-            PartitionSpec("pcp"),  # z
+            PartitionSpec(_GDN_PCP_TP_STATE_AXIS),  # new pool
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME,
+                          None),  # output
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME, None),  # z
         )
         # Torchtpu native jax_op. The pcp_streaming wrapper adds only
         # kernel_reload's dispatcher, which GDN does not use.
