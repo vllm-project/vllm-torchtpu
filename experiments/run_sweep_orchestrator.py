@@ -35,6 +35,7 @@ try:
 except Exception:
     pass
 from core.env import setup_tpu_env  # noqa: E402
+from core.model_utils import resolve_model_path  # noqa: E402
 from core.models import BenchmarkResult, ExecutionContext  # noqa: E402
 from resolvers.registry import ResolverRegistry  # noqa: E402
 from runners.registry import RunnerRegistry  # noqa: E402
@@ -157,10 +158,13 @@ class SweepOrchestrator:
         """Resolves target model path using ResolverRegistry or falls back to static model path."""
         spec = self.config.get("model_resolver")
 
-        # For normal inference parameter sweeps without sparsity or modifying model, we can just return the model path from the config
+        # For normal inference parameter sweeps without dynamic resolvers, resolve the model identifier
+        # through resolve_model_path to automatically handle HF repo IDs, snapshot cache lookups,
+        # or downloading missing weights if not present locally.
         if not spec:
-            return current_config.get("model", self.config.get("model",
-                                                               "")), set()
+            raw_model = current_config.get("model",
+                                           self.config.get("model", ""))
+            return resolve_model_path(raw_model), set()
 
         # Otherwise if we need to resolve a model dynamically (e.g., sparsity, pruning, etc.), we use the resolver registry
         resolver = ResolverRegistry.get(spec.get("module", "sparsegpt"))

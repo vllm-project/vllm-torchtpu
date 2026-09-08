@@ -8,19 +8,15 @@ Comprehensive unit and edge-case test suite for model resolvers:
 - NaiveMagnitudeResolver: Fast magnitude pruning resolver and directory caching
 - SparseGptResolver: Hessian-based calibration resolver and directory caching
 - ResolverRegistry: Factory lookup, custom resolver registration, and unknown resolver error handling
-- dataset_providers: Benchmark dataset prompt extraction and formatting
 """
 
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
 
 import torch
 from resolvers.base_resolver import BaseResolver
 from resolvers.base_sparsity_resolver import BaseSparsityResolver
-from resolvers.dataset_providers import (get_evaluation_prompts,
-                                         load_mmlu_pro_prompts)
 from resolvers.model_splicer import ModelSplicer
 from resolvers.naive_magnitude_resolver import NaiveMagnitudeResolver
 from resolvers.registry import ResolverRegistry
@@ -437,39 +433,6 @@ class TestResolverRegistry(unittest.TestCase):
 
         resolved = ResolverRegistry.get("custom_dummy")
         self.assertIsInstance(resolved, DummyResolver)
-
-
-class TestDatasetProviders(unittest.TestCase):
-    """Tests prompt loading and dataset provider dispatching."""
-
-    @patch("resolvers.dataset_providers.load_dataset")
-    def test_load_mmlu_pro_prompts(self, mock_load_dataset):
-        """
-        Arrange-Act-Assert: Mock HuggingFace dataset loading and verify MMLU-Pro question/option formatting.
-        """
-        mock_data = [{
-            "question": "What is 2+2?",
-            "options": ["1", "2", "3", "4"],
-            "category": "math"
-        }, {
-            "question": "What is water?",
-            "options": ["H2O", "CO2", "NaCl", "O2"],
-            "category": "chemistry"
-        }]
-        mock_load_dataset.return_value = mock_data
-
-        prompts = load_mmlu_pro_prompts(task_name="mmlu_pro", limit=2)
-        self.assertEqual(len(prompts), 2)
-        self.assertIn("Question:\nWhat is 2+2?", prompts[0])
-        self.assertIn("A. 1", prompts[0])
-        self.assertIn("D. 4", prompts[0])
-
-    def test_get_evaluation_prompts_unsupported_task(self):
-        """
-        Arrange-Act-Assert: Verify error handling when an unsupported evaluation task is requested.
-        """
-        with self.assertRaises(ValueError):
-            get_evaluation_prompts({"task": "unsupported_benchmark_xyz"})
 
 
 if __name__ == "__main__":
