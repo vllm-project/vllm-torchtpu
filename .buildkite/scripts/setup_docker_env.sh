@@ -21,11 +21,11 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
+IMAGE_TAG="${IMAGE_TAG:-${IMAGE_REPO}:${COMMIT_HASH}}"
 
 echo "--- Building Docker Image: ${IMAGE_TAG}"
-# Run the existing build_image.sh script with target dev
-./docker/build_image.sh --target dev -t "${IMAGE_TAG}"
+# Run the existing build_image.sh script with target dev, forwarding any extra arguments
+./docker/build_image.sh --target dev -t "${IMAGE_TAG}" "$@"
 
 echo "--- Pushing Docker Image to Registry"
 docker push "${IMAGE_TAG}"

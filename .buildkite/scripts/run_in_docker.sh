@@ -34,7 +34,7 @@ fi
 
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
+IMAGE_TAG="${IMAGE_TAG:-${IMAGE_REPO}:${COMMIT_HASH}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

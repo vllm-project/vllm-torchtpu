@@ -81,6 +81,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra test \
       --extra benchmarking
 
+# When UPREV_TORCH_TPU=1 is set, upgrade torch-tpu to the latest nightly dev wheel
+# from torch-tpu-virtual-registry for uprev target validation.
+ARG UPREV_TORCH_TPU=0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gcloud_token \
+    set -eu; \
+    if [ "$UPREV_TORCH_TPU" = "1" ]; then \
+      TOKEN=""; \
+      if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
+      if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for uprev mode" >&2; exit 1; fi; \
+      export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
+      export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
+      echo "===> [UPREV] Upgrading torch-tpu to latest nightly dev wheel..."; \
+      uv pip install --system --upgrade --pre \
+        --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-best-match \
+        torch-tpu; \
+      echo "===> [UPREV] Installed torch-tpu version:"; \
+      pip show torch-tpu; \
+    fi
+
 COPY . .
 # Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.

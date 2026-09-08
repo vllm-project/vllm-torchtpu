@@ -1,0 +1,95 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+env:
+  IMAGE_TAG: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu:${BUILDKITE_COMMIT:-latest}-uprev"
+
+steps:
+  - group: "Build Uprev Docker Image"
+    key: "build_docker_uprev_group"
+    steps:
+      - label: ":docker: Build and Push Uprev Image (Latest torch-tpu)"
+        key: "build_docker_uprev"
+        agents:
+          queue: cpu_64_core
+        commands:
+          - bash .buildkite/scripts/setup_docker_env.sh --uprev-torchtpu
+
+  - group: "Critical Uprev Verification on TPU"
+    depends_on: "build_docker_uprev"
+    steps:
+      - label: "Unit Tests: TPU Runner"
+        key: "uprev_test_tpu_runner"
+        agents:
+          queue: tpu_v7x_2_queue
+        commands:
+          - .buildkite/scripts/run_in_docker.sh pytest -sv --timeout=600 tests/runner/test_tpu_runner.py
+
+      - label: "Unit Tests: Speculative Decoding"
+        key: "uprev_test_spec_decode"
+        agents:
+          queue: tpu_v7x_2_queue
+        commands:
+          - .buildkite/scripts/run_in_docker.sh pytest -sv --timeout=1200 -m 'not nightly and not multichip' tests/entrypoints/llm/test_speculative_decoding.py
+
+      - label: "Unit Tests: Multichip"
+        key: "uprev_test_multichip"
+        agents:
+          queue: tpu_v7x_8_queue
+        commands:
+          - .buildkite/scripts/run_in_docker.sh pytest -sv --timeout=1200 -m 'not nightly and multichip' tests/entrypoints/llm/test_speculative_decoding.py
+
+      - label: "Integration: qwen35-pcp4-dp4-disagg-correctness (PR #763 Check)"
+        key: "uprev_integration_disagg_correctness"
+        agents:
+          queue: tpu_v7x_8_queue
+        env:
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "/perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
+        commands:
+          - bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      - label: "Smoke: Offline Inference (Qwen3-0.6B)"
+        key: "uprev_smoke_offline_inference"
+        agents:
+          queue: tpu_v7x_2_queue
+        commands:
+          - |
+            .buildkite/scripts/run_in_docker.sh python3 examples/offline_inference.py \
+              --model Qwen/Qwen3-0.6B \
+              --max-model-len 256 \
+              --max-num-batched-tokens 256 \
+              --max-tokens 32
+
+  - label: ":white_check_mark: Record Torch-TPU LKG"
+    key: "record_torchtpu_lkg"
+    depends_on:
+      - "uprev_test_tpu_runner"
+      - "uprev_test_spec_decode"
+      - "uprev_test_multichip"
+      - "uprev_integration_disagg_correctness"
+      - "uprev_smoke_offline_inference"
+    agents:
+      queue: cpu_64_core
+    commands:
+      - |
+        echo "--- Extracting verified torch-tpu version from image"
+        TORCH_TPU_VER=$$(docker run --rm "$${IMAGE_TAG}" python3 -c "import importlib.metadata; print(importlib.metadata.version('torch-tpu'))" 2>/dev/null || echo "unknown")
+        echo "Verified Stable Torch-TPU Version: $${TORCH_TPU_VER}"
+        if [ "$${TORCH_TPU_VER}" != "unknown" ]; then
+          echo "$${TORCH_TPU_VER}" > .buildkite/torchtpu_lkg.version
+          buildkite-agent annotate ":white_check_mark: All critical tests passed! Verified stable LKG: **torch-tpu==$${TORCH_TPU_VER}**" --style "success" || true
+        fi

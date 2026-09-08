@@ -17,6 +17,7 @@ IMAGE_TAG="vllm-torchtpu-local"
 BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
 VLLM_SOURCE=""
 TARGET="prod"
+UPREV_TORCH_TPU="${UPREV_TORCH_TPU:-0}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
     --target)
       TARGET="$2"
       shift 2
+      ;;
+    --uprev-torchtpu)
+      UPREV_TORCH_TPU="1"
+      shift
       ;;
     *)
       echo "Unknown argument: $1"
@@ -95,6 +100,7 @@ DOCKER_ARGS=(
   --target "${TARGET}" \
   --build-arg BASE_IMAGE="${BASE_IMAGE}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
+  --build-arg UPREV_TORCH_TPU="${UPREV_TORCH_TPU}" \
 )
 
 if [ -n "${ACCESS_TOKEN:-}" ]; then
