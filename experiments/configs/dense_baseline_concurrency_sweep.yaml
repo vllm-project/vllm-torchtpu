@@ -1,0 +1,25 @@
+# Goal: Unsparsified baseline throughput and latency curves across concurrency
+# Models: google/gemma-4-31B-it, google/gemma-4-12B-it, google/gemma-4-26B-A4B-it
+# Workloads: 1K/1K and 8K/1K at concurrency 4..64
+# Hardware: Cloud TPU v6e-4 (4 chips, TP=4)
+
+mode: profile
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 16384
+
+engine_args:
+  kv_cache_dtype: fp8
+  gpu_memory_utilization: 0.90
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+
+sweep_matrix:
+  model:
+    - google/gemma-4-31B-it
+    - google/gemma-4-12B-it
+    - google/gemma-4-26B-A4B-it
+  input_len: [1024, 8192]
+  output_len: [1024]
+  batch_size: [4, 8, 16, 32, 64]

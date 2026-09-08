@@ -1,0 +1,34 @@
+mode: eval
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+evaluation:
+  tasks: mmlu_pro
+  batch_size: auto
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: google/gemma-4-12B-it
+    reference_sparse_model: gemma4_12b_2of4_canonical_256c4_full
+    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    strategy: first_to_last
+    prunen: 2
+    prunem: 4
+    nsamples: 256
+sweep_matrix:
+  num_sparse_layers:
+  - 0
+  - 8
+  - 16
+  - 24
+  - 32
+  - 40
+  - 48
