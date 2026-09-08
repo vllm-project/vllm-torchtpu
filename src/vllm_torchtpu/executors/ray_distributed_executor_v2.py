@@ -106,8 +106,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
         from `ray.nodes()` and ordering by address gives every engine the same
         answer without any of them having to agree on anything.
         """
-        hosts: list[tuple[str, int]] = []
+        hosts: list[tuple[int, str, int]] = []
+        has_worker_id = True
         for node in ray.nodes():
+            if not node.get("Alive", True):
+                continue
             resources = node.get("Resources", {})
             if device_str not in resources:
                 continue
@@ -118,10 +121,52 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 raise RuntimeError(
                     f"Ray node {node.get('NodeID')} reports {device_str} but "
                     "no address to reach it by.")
-            hosts.append((node_ip, int(resources[device_str])))
 
-        hosts.sort()
-        return [ip for ip, _ in hosts], {ip: count for ip, count in hosts}
+            labels = node.get("labels") or node.get("Labels") or {}
+            raw_worker_id = labels.get("ray.io/tpu-worker-id")
+            if raw_worker_id is not None:
+                try:
+                    w_id = int(raw_worker_id)
+                except (ValueError, TypeError):
+                    w_id = 0
+                    has_worker_id = False
+            else:
+                w_id = 0
+                has_worker_id = False
+
+            hosts.append((w_id, node_ip, int(resources[device_str])))
+
+        ordered_by = "IP"
+        if has_worker_id and len(hosts) > 0:
+            hosts.sort(key=lambda x: (x[0], x[1]))
+            actual_w_ids = [w_id for w_id, _, _ in hosts]
+            expected_w_ids = list(range(len(hosts)))
+            if actual_w_ids != expected_w_ids:
+                logger.warning(
+                    "RayDistributedExecutorV2 | TPU worker IDs are not "
+                    "contiguous 0-indexed: got %s, expected %s. Falling back "
+                    "to IP sorting.", actual_w_ids, expected_w_ids)
+                hosts.sort(key=lambda x: x[1])
+            else:
+                ordered_by = "ray.io/tpu-worker-id"
+        else:
+            if len(hosts) > 1:
+                logger.warning(
+                    "RayDistributedExecutorV2 | Multi-host TPU detected (%d "
+                    "hosts) but 'ray.io/tpu-worker-id' label is missing on "
+                    "one or more nodes. Falling back to IP sorting, which may "
+                    "mismatch ICI hardware topology.", len(hosts))
+            hosts.sort(key=lambda x: x[1])
+
+        logger.info(
+            "RayDistributedExecutorV2 | Resolved %d TPU slice hosts "
+            "(ordered by %s): %s", len(hosts), ordered_by,
+            [(w_id, ip) for w_id, ip, _ in hosts])
+
+        return [ip for _, ip, _ in hosts], {
+            ip: count
+            for _, ip, count in hosts
+        }
 
     def _get_actor_resource_kwargs(self) -> dict[str, Any]:
         """Return Ray actor resource kwargs for the TPU platform.
