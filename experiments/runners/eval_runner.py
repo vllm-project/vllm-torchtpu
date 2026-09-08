@@ -75,9 +75,11 @@ class TpuEvalRunner(BaseVllmRunner):
         captured_output = ""
 
         try:
-            # 2. Poll /health endpoint until server is ready
+            # 2. Poll /health endpoint until server is ready.
+            # Timeout increased to 1800s (30m) to accommodate large models (e.g. Gemma 4 26B-A4B / 31B)
+            # undergoing initial torch.compile FX graph capture and TPU compilation across batch sizes.
             poll_start = time.time()
-            while time.time() - poll_start < 600:
+            while time.time() - poll_start < 1800:
                 if server_proc.poll() is not None:
                     raise RuntimeError(
                         f"vLLM server exited prematurely with code {server_proc.returncode}"
@@ -93,7 +95,7 @@ class TpuEvalRunner(BaseVllmRunner):
                     time.sleep(5)
             else:
                 raise TimeoutError(
-                    "vLLM server failed to become healthy within 600s")
+                    "vLLM server failed to become healthy within 1800s")
 
             # 3. Assemble and execute lm_eval CLI (CPU client with chat templates)
             eval_env = {

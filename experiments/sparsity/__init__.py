@@ -80,9 +80,25 @@ def prune_gemma4(model_path: str,
         print(
             f">>> [SPARSITY ENGINE] Saving pruned checkpoint to {save_path}..."
         )
+        import shutil
         model.save_pretrained(save_path)
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        tokenizer.save_pretrained(save_path)
+        # Ensure multimodal processor and tokenizer configs are saved alongside sparse weights.
+        # Gemma 4 uses AutoProcessor (multimodal) which serializes processor_config.json,
+        # fallback to AutoTokenizer for text-only backends.
+        try:
+            from transformers import AutoProcessor
+            AutoProcessor.from_pretrained(model_path).save_pretrained(
+                save_path)
+        except Exception:
+            AutoTokenizer.from_pretrained(model_path).save_pretrained(
+                save_path)
+        # Preserve original base model config.json and processor_config.json to retain
+        # exact architecture specifications (e.g. Gemma4ForConditionalGeneration) that
+        # AutoModel.save_pretrained might otherwise overwrite or omit.
+        for cfg_name in ["config.json", "processor_config.json"]:
+            src_cfg = os.path.join(model_path, cfg_name)
+            if os.path.exists(src_cfg):
+                shutil.copy2(src_cfg, os.path.join(save_path, cfg_name))
         print(">>> [SPARSITY ENGINE] Checkpoint successfully saved.")
 
     return save_path
