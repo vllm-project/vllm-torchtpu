@@ -193,8 +193,14 @@ def stage3_fa_raiden_id_fields(
     dp_rank: int,
     transfer_rank: int = 0,
     is_producer: bool = True,
+    rank_in_replica_id: bool | None = None,
 ) -> dict[str, Any]:
-    """Build the canonical Stage-3 FA work-unit identity."""
+    """Build the canonical Stage-3 FA work-unit identity.
+
+    Multi-rank producers and consumers need one distinct work unit per
+    transfer rank.  ``rank_in_replica_id`` defaults to the historical
+    producer-only behavior so TP1 consumers retain their existing identity.
+    """
     job_name = str(job_name).strip()
     engine_id = str(engine_id).strip()
     dp_rank = int(dp_rank)
@@ -207,8 +213,10 @@ def stage3_fa_raiden_id_fields(
         raise ValueError("Stage-3 Raiden dp_rank must be non-negative")
     if transfer_rank < 0:
         raise ValueError("Stage-3 Raiden transfer_rank must be non-negative")
+    if rank_in_replica_id is None:
+        rank_in_replica_id = bool(is_producer)
     replica_id = (f"{engine_id}-rank{transfer_rank}"
-                  if is_producer else engine_id)
+                  if rank_in_replica_id else engine_id)
     return {
         "job_name": job_name,
         "job_replica_id": replica_id,
@@ -262,6 +270,17 @@ def _use_raiden_glm_admission() -> bool:
                 and tpu_envs.TPU_RAIDEN_GLM_ADMISSION)
 
 
+def _is_kimi_k3(vllm_config: VllmConfig) -> bool:
+    return getattr(vllm_config.model_config, "architecture",
+                   None) in ("KimiK3ForConditionalGeneration",
+                             "KimiLinearForCausalLM")
+
+
+def _uses_tp_stage3_source(vllm_config: VllmConfig) -> bool:
+    """Whether producer cache ownership follows TP ranks rather than PCP."""
+    return _use_raiden_glm_admission() or _is_kimi_k3(vllm_config)
+
+
 def _prefix_aware_load_requested() -> bool:
     return bool(tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD)
 
@@ -281,6 +300,17 @@ def _prefix_aware_load_supported() -> bool:
         logger.warning(
             "Could not probe tpu-sync dst_skip_bytes support; prefix-aware "
             "loads will fall back to decode-local computation: %s", exc)
+        return False
+
+
+@lru_cache(maxsize=1)
+def _routed_destination_spans_supported() -> bool:
+    """Whether Raiden preserves a span's destination-unit ordinal."""
+    try:
+        from tpu_sync.api.torch import reshard_client as _reshard_client
+
+        return hasattr(_reshard_client, "_dst_unit_ordinal")
+    except (ImportError, OSError):
         return False
 
 
@@ -1230,7 +1260,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
-        if not _use_raiden_glm_admission():
+        if not _uses_tp_stage3_source(self.vllm_config):
             # The interleave minimum applies to PCP sources only.
             interleave_size = int(
                 getattr(parallel_config, "cp_kv_cache_interleave_size", 256)
@@ -1287,11 +1317,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if src_parallelism <= 0:
             raise ValueError(
                 "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
-        if _use_raiden_glm_admission():
+        if _uses_tp_stage3_source(self.vllm_config):
             tp_size = int(parallel_config.tensor_parallel_size or 1)
             if src_parallelism != tp_size:
                 raise ValueError(
-                    "Stage-3 GLM producer transfer parallelism must equal "
+                    "Stage-3 TP producer transfer parallelism must equal "
                     f"TP size: parallelism={src_parallelism}, "
                     f"tp_size={tp_size}")
         elif src_parallelism != pcp_size:
@@ -1374,10 +1404,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # Preserve the legacy connector's model-runner-world aggregation.
             return 0
         if not self.is_producer:
-            # DP8 routes one request to one decode engine.
-            return 1
+            # One request is routed to one decode engine. Each TP worker of a
+            # sharded engine receives and reports its own cache shard; TP1
+            # retains the existing single vote.
+            return int(self.vllm_config.parallel_config.tensor_parallel_size
+                       or 1)
         parallel_config = self.vllm_config.parallel_config
-        if _use_raiden_glm_admission():
+        if _uses_tp_stage3_source(self.vllm_config):
             return int(parallel_config.tensor_parallel_size or 1)
         return int(parallel_config.prefill_context_parallel_size or 1)
 
@@ -1393,6 +1426,7 @@ class TPURaidenConnectorWorker:
         self.vllm_config = vllm_config
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
+        self._stage3_kimi = _is_kimi_k3(vllm_config)
         self.runner: Optional[TPUModelRunner] = None
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -1521,22 +1555,36 @@ class TPURaidenConnectorWorker:
 
     def register_runner(self, runner: TPUModelRunner) -> None:
         self.runner = runner
+        manager_enabled = bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER)
+        qwen_admission = (manager_enabled
+                          and tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION)
+        kimi_admission = (manager_enabled
+                          and tpu_envs.TPU_RAIDEN_KIMIK3_ADIMISSION)
+        glm_admission = _use_raiden_glm_admission()
+        if sum((qwen_admission, kimi_admission, glm_admission)) > 1:
+            raise RuntimeError(
+                "TPU_RAIDEN_QWEN35_ADMISSION, TPU_RAIDEN_KIMIK3_ADIMISSION, "
+                "and TPU_RAIDEN_GLM_ADMISSION are mutually exclusive")
         if (self._raiden_stage3_enabled()
-                and not (self._raiden_qwen35_admission_enabled()
-                         or _use_raiden_glm_admission())):
+                and not (qwen_admission or kimi_admission or glm_admission)):
             raise RuntimeError(
                 "TPU_KV_RESHARD_TRANSPORT=raiden requires explicit pool "
                 "admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and one of "
-                "TPU_RAIDEN_QWEN35_ADMISSION=1 or TPU_RAIDEN_GLM_ADMISSION=1)")
-        if (self._raiden_qwen35_admission_enabled()
-                and _use_raiden_glm_admission()):
-            raise RuntimeError(
-                "TPU_RAIDEN_QWEN35_ADMISSION and TPU_RAIDEN_GLM_ADMISSION "
-                "are mutually exclusive")
-        if self._raiden_qwen35_admission_enabled():
-            self._admit_raiden_qwen35_kv_cache(runner)
+                "TPU_RAIDEN_KIMIK3_ADIMISSION=1, "
+                "TPU_RAIDEN_QWEN35_ADMISSION=1, or TPU_RAIDEN_GLM_ADMISSION=1)"
+            )
+        if kimi_admission and not self._stage3_kimi:
+            raise ValueError("TPU_RAIDEN_KIMIK3_ADIMISSION requires "
+                             "KimiK3ForConditionalGeneration or "
+                             "KimiLinearForCausalLM")
+        if self._stage3_kimi and (qwen_admission or glm_admission):
+            raise ValueError(
+                "Kimi K3 requires TPU_RAIDEN_KIMIK3_ADIMISSION=1; "
+                "Qwen and GLM admission cannot admit Kimi")
+        if qwen_admission or kimi_admission:
+            self._admit_raiden_hybrid_kv_cache(runner)
             return
-        if _use_raiden_glm_admission():
+        if glm_admission:
             self._admit_raiden_glm_kv_cache(runner)
             return
         self._ensure_raiden_transfer_engine()
@@ -1545,13 +1593,8 @@ class TPURaidenConnectorWorker:
     def _raiden_stage3_enabled() -> bool:
         return _use_raiden_stage3_transport()
 
-    @staticmethod
-    def _raiden_qwen35_admission_enabled() -> bool:
-        return bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
-                    and tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION)
-
-    def _admit_raiden_qwen35_kv_cache(self, runner: TPUModelRunner) -> None:
-        """Constructs the v1 Raiden engine over the explicit Qwen3.5 pools."""
+    def _admit_raiden_hybrid_kv_cache(self, runner: TPUModelRunner) -> None:
+        """Construct the Raiden engine over the model's hybrid pools."""
         if self._raiden_transfer_engine is not None:
             return
 
@@ -1569,7 +1612,7 @@ class TPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.kv_transfer.raiden import \
             pool_manifest as rpm
 
-        topology = self._raiden_qwen35_admission_topology()
+        topology = self._raiden_hybrid_admission_topology()
         role = "kv_producer" if self.is_producer else "kv_consumer"
         named_kv_caches = self.named_kv_caches
         if not named_kv_caches:
@@ -1591,12 +1634,16 @@ class TPURaidenConnectorWorker:
             if group_ordinals:
                 mamba_group_ordinal_by_layer = group_ordinals
                 self._stage3_state_group_count = ordinal
-        manifest = rpm.build_qwen35_pool_manifest(
+        manifest_args = dict(
             named_kv_caches=named_kv_caches,
             kv_cache_groups=kv_cache_groups,
             raw_tensors=raw_tensors,
             mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
-            gdn_geometry=rpm.GdnHeadGeometry(
+        )
+        if self._stage3_kimi:
+            manifest = rpm.build_kimi_k3_pool_manifest(**manifest_args)
+        else:
+            gdn_geometry = rpm.GdnHeadGeometry(
                 local_key_heads=self._local_gdn_head_count(
                     self._model_config_int("linear_num_key_heads", 0)),
                 local_value_heads=self._local_gdn_head_count(
@@ -1607,8 +1654,9 @@ class TPURaidenConnectorWorker:
                     self._model_config_int("linear_key_head_dim", 1)),
                 conv_kernel_size=self._model_config_int(
                     "linear_conv_kernel_dim", 4),
-            ),
-        )
+            )
+            manifest = rpm.build_qwen35_pool_manifest(
+                **manifest_args, gdn_geometry=gdn_geometry)
         # Hard-fail before manager construction if the pools point at storage
         # that the model kernels do not actually use.
         verified_storages = rpm.verify_storage_binding(
@@ -1644,9 +1692,16 @@ class TPURaidenConnectorWorker:
 
         self._raiden_transfer_engine = engine
         self._raiden_manifest = manifest
-
         counts = manifest.tag_counts()
         geometry = manifest.geometry_by_tag()
+        if self._stage3_kimi:
+            fa_pool = next(pool for pool in manifest.pools
+                           if pool.tag == rpm.TAG_FA)
+            self._stage3_glm_geometry = {
+                rpm.TAG_FA: (int(geometry[rpm.TAG_FA]["live_bytes_per_block"]),
+                             int(fa_pool.regions[0].unit_bytes))
+            }
+
         gdn_conv_count = sum(count for tag, count in counts.items()
                              if str(tag).startswith(rpm.TAG_GDN_CONV))
         gdn_ssm_count = sum(count for tag, count in counts.items()
@@ -1817,6 +1872,27 @@ class TPURaidenConnectorWorker:
     def _measure_stage3_layout(
             self, manifest: Any) -> tuple[str, dict[str, Any], int]:
         """Layout identity and page geometry of the admitted model."""
+        if self._stage3_kimi:
+            from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import \
+                measured_kimi_k3_layout_fingerprint
+
+            page_tokens = int(self.vllm_config.cache_config.block_size)
+            config = self.vllm_config.model_config.hf_text_config
+            total_heads = int(config.linear_attn_config.get("num_heads", 0))
+            source_tp = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
+            if (total_heads <= 0 or source_tp <= 0 or total_heads % source_tp
+                    or source_tp % self.tp_size):
+                raise ValueError(
+                    "Kimi source and destination TP must form complete KDA "
+                    f"head shards: heads={total_heads}, "
+                    f"source_tp={source_tp}, destination_tp={self.tp_size}")
+            fingerprint, payload = measured_kimi_k3_layout_fingerprint(
+                manifest,
+                page_tokens=page_tokens,
+                state_fragment_heads=total_heads // source_tp,
+                state_fragments=source_tp // self.tp_size,
+            )
+            return fingerprint, payload, page_tokens
         if _use_raiden_glm_admission():
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
@@ -1831,10 +1907,10 @@ class TPURaidenConnectorWorker:
             self, transfer_parallelism: int) -> None:
         """The producer must shard the transfer over exactly the rank set its
         byte-span lowering assumes: TP ranks for GLM, PCP ranks otherwise."""
-        if _use_raiden_glm_admission():
+        if _uses_tp_stage3_source(self.vllm_config):
             if transfer_parallelism != self.tp_size:
                 raise ValueError(
-                    "GLM producer transfer parallelism must equal the "
+                    "TP producer transfer parallelism must equal the "
                     "complete TP rank count: "
                     f"parallelism={transfer_parallelism}, "
                     f"tp_size={self.tp_size}")
@@ -1878,8 +1954,8 @@ class TPURaidenConnectorWorker:
 
     def _local_raiden_transfer_rank(self) -> int:
         if not self.is_producer:
-            return 0
-        if _use_raiden_glm_admission():
+            return int(self.tp_rank)
+        if _uses_tp_stage3_source(self.vllm_config):
             return int(self.tp_rank)
         from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
 
@@ -1947,6 +2023,8 @@ class TPURaidenConnectorWorker:
         if not self.is_producer or transfer_parallelism == 1:
             return page_tokens
         parallel_config = self.vllm_config.parallel_config
+        if self._stage3_kimi:
+            return page_tokens
         interleave_tokens = int(parallel_config.cp_kv_cache_interleave_size
                                 or 0)
         if interleave_tokens <= 0:
@@ -1970,6 +2048,7 @@ class TPURaidenConnectorWorker:
             dp_rank=self.dp_rank,
             transfer_rank=transfer_rank,
             is_producer=self.is_producer,
+            rank_in_replica_id=(self.is_producer or int(self.tp_size) > 1),
         )
 
     def _register_raiden_stage3_work_unit(
@@ -2070,11 +2149,31 @@ class TPURaidenConnectorWorker:
             return {"admitted": False}
         return dict(self._raiden_admission_summary)
 
-    def _raiden_qwen35_admission_topology(self) -> str:
+    def _raiden_hybrid_admission_topology(self) -> str:
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
+        if self._stage3_kimi:
+            source_parallelism = self._raiden_transfer_parallelism()
+            dst_shards = int(tpu_envs.TPU_RAIDEN_DST_SHARDS)
+            if (dst_shards > 1 and not _routed_destination_spans_supported()):
+                raise RuntimeError(
+                    "Kimi Stage-3 with a TP-sharded destination requires a "
+                    "Raiden build with destination-routed byte spans")
+            expected_tp = source_parallelism if self.is_producer else dst_shards
+            if (dst_shards <= 0 or pcp_size != 1 or tp_size != expected_tp
+                    or (self.is_producer and dp_size != 1)
+                    or source_parallelism % dst_shards):
+                raise ValueError(
+                    "Kimi Stage-3 requires PCP1, producer TP equal to "
+                    "TPU_RAIDEN_TRANSFER_PARALLELISM, destination TP equal "
+                    "to TPU_RAIDEN_DST_SHARDS, and producer DP1: "
+                    f"tp={tp_size}, pcp={pcp_size}, dp={dp_size}, "
+                    f"source_parallelism={source_parallelism}, "
+                    f"dst_shards={dst_shards}")
+            role = "prefill" if self.is_producer else "decode"
+            return f"tp{tp_size}dp{dp_size}_{role}"
         if self.is_producer:
             if tp_size == 1 and pcp_size in (4, 8) and dp_size == 1:
                 return f"pcp{pcp_size}_prefill"
@@ -2149,7 +2248,7 @@ class TPURaidenConnectorWorker:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
             if self._raiden_stage3_enabled():
-                if _use_raiden_glm_admission():
+                if _uses_tp_stage3_source(self.vllm_config):
                     self._register_stage3_request_blocks_glm(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
@@ -2442,10 +2541,10 @@ class TPURaidenConnectorWorker:
 
     def _register_stage3_request_blocks_glm(
             self, metadata: TPUConnectorMetadata) -> None:
-        """Registers this producer rank's row-granular span stripe.
+        """Register this producer rank's row-granular span stripe.
 
-        The caches are TP-replicated: every producer rank shares the full
-        scheduler block table and owns a round-robin stripe of its pages.
+        Kimi reuses the GLM lowering for its replicated MLA cache and adds
+        one complete source fragment for each KDA state group.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
             lower_glm_row_spans
@@ -2482,6 +2581,8 @@ class TPURaidenConnectorWorker:
                     "expiration_time")
             scheduler_ids = tuple(
                 int(block_id) for block_id in req_meta.local_block_ids)
+            transfer_tags = (("fa", ) if self._stage3_kimi else
+                             _STAGE3_GLM_TRANSFER_POOL_TAGS)
             pool_spans = [
                 lower_glm_row_spans(
                     tag=tag,
@@ -2492,12 +2593,18 @@ class TPURaidenConnectorWorker:
                     live_bytes_per_block=tag_geometry[tag][0],
                     row_bytes=tag_geometry[tag][1],
                     block_ids=list(scheduler_ids),
-                ) for tag in _STAGE3_GLM_TRANSFER_POOL_TAGS
+                ) for tag in transfer_tags
             ]
+            if self._stage3_kimi:
+                pool_spans.extend(
+                    self._stage3_state_pool_spans(
+                        getattr(req_meta, "mamba_state_block_ids", None),
+                        transfer_rank, parallelism))
             # Every tag stripes identically, so one tag's span count is this
             # rank's page count.
             owned_pages = len(pool_spans[0].spans)
-            if not owned_pages:
+            has_work = any(registration.spans for registration in pool_spans)
+            if not has_work:
                 # Ranks owning no page publish a fully empty registration
                 # (only empty block_ids may complete before the claim) and
                 # self-complete below.
@@ -2555,7 +2662,7 @@ class TPURaidenConnectorWorker:
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
             )
-            if not owned_pages:
+            if not has_work:
                 # No pages owned: terminal immediately, no transfer.
                 self._stage3_send_outcomes.setdefault(req_id, "done")
             event = {
@@ -2600,6 +2707,29 @@ class TPURaidenConnectorWorker:
                     is_producer=True,
                 )) for rank in range(parallelism)
         ]
+
+    def _raiden_destination_work_units(self) -> list[Any]:
+        """Enumerate every TP shard of this destination engine."""
+        if self.tp_size <= 1:
+            return [self._raiden_work_unit]
+        return [
+            self._new_raiden_id(self._raiden_work_unit_fields(rank))
+            for rank in range(int(self.tp_size))
+        ]
+
+    def _stage3_sharded_consumer(self) -> bool:
+        """Whether one controller call targets every TP consumer worker."""
+        return (int(self.tp_size) > 1 and not self.is_producer
+                and not _use_raiden_glm_admission())
+
+    @staticmethod
+    def _stage3_tp_group() -> Any:
+        """Return the TP CPU group, or ``None`` in single-process tests."""
+        from vllm.distributed.parallel_state import get_tp_group
+        try:
+            return get_tp_group()
+        except AssertionError:
+            return None
 
     def _record_stage3_load_failure(self, req_id: str,
                                     block_ids: list[int]) -> None:
@@ -2687,15 +2817,15 @@ class TPURaidenConnectorWorker:
                 "GDN state registration group count disagrees with the "
                 f"manifest: blocks={len(mamba_state_block_ids)}, "
                 f"groups={self._stage3_state_group_count}")
-        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
-            lower_gdn_state_shard_spans
+        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+            lower_gdn_state_shard_spans, lower_kda_state_shard_spans)
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             EXPECTED_FA_MINOR_TO_MAJOR, EXPECTED_FA_TILES)
         from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
             BINDING_ALIASED_RAW
 
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
-        if aliased_raw:
+        if aliased_raw and not self._stage3_kimi:
             # Raw transfers move physical bytes; admit only the fingerprinted
             # tiled layout.  The whole-token QK pair-blocked conv layout is
             # enforced downstream: the span lowering rejects any other conv
@@ -2723,7 +2853,7 @@ class TPURaidenConnectorWorker:
         for tag in _STAGE3_STATE_CLASS_TAGS:
             for ordinal, block_id in enumerate(mamba_state_block_ids):
                 exact_tag = f"{tag}.g{ordinal}"
-                if aliased_raw:
+                if aliased_raw and not self._stage3_kimi:
                     matching_pools = tuple(
                         pool for pool in self._raiden_manifest.pools
                         if str(getattr(pool, "tag", "")) == exact_tag)
@@ -2734,14 +2864,32 @@ class TPURaidenConnectorWorker:
                         raise RuntimeError(
                             "aliased raw GDN pool base and block stride must "
                             f"be physical-token aligned ({exact_tag})")
-                registration = lower_gdn_state_shard_spans(
-                    tag=exact_tag,
-                    block_id=int(block_id),
-                    transfer_rank=transfer_rank,
-                    parallelism=parallelism,
-                    regions=self._stage3_state_regions(exact_tag),
-                )
                 admitted_live_bytes = self._stage3_state_live_bytes(exact_tag)
+                if self._stage3_kimi:
+                    kda_config = (self.vllm_config.model_config.hf_text_config.
+                                  linear_attn_config)
+                    registration = lower_kda_state_shard_spans(
+                        tag=exact_tag,
+                        block_id=int(block_id),
+                        transfer_rank=transfer_rank,
+                        parallelism=parallelism,
+                        dst_shards=int(tpu_envs.TPU_RAIDEN_DST_SHARDS),
+                        regions=self._stage3_state_regions(exact_tag),
+                        row_bytes=self._stage3_glm_geometry["fa"][1],
+                        conv_kernel_size=int(
+                            kda_config["short_conv_kernel_size"]),
+                        local_num_heads=int(kda_config["num_heads"]) //
+                        self.tp_size,
+                        head_dim=int(kda_config["head_dim"]),
+                    )
+                else:
+                    registration = lower_gdn_state_shard_spans(
+                        tag=exact_tag,
+                        block_id=int(block_id),
+                        transfer_rank=transfer_rank,
+                        parallelism=parallelism,
+                        regions=self._stage3_state_regions(exact_tag),
+                    )
                 if registration.declared_bytes != admitted_live_bytes:
                     raise RuntimeError(
                         "GDN state byte lowering disagrees with the admitted "
@@ -2927,135 +3075,74 @@ class TPURaidenConnectorWorker:
                 destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
-            controller_contacted = False
-            fa_accepted = False
-            submit_ms = None
-            try:
-                src_units = self._stage3_source_work_units(req_meta)
-                src_controller_address = str(
-                    req_meta.src_controller_address).strip()
-                if not src_controller_address:
-                    raise ValueError("empty Stage-3 source controller address")
-                source_facade = self._stage3_source_facades.get(
-                    src_controller_address)
-                if source_facade is None:
-                    source_facade = self._new_raiden_controller_facade(
-                        src_controller_address)
-                    self._stage3_source_facades[src_controller_address] = (
-                        source_facade)
-                # The facade RPC returns only after the source controller
-                # server has awaited its RaidenFuture (receiver arm + sender
-                # dispatch). Actual byte completion is deliberately *not*
-                # inferred from that acknowledgement; get_finished polls the
-                # local manager.
-                controller_contacted = True
-                # ONE transfer carries every replicated cache class; tag
-                # order fixes the H2D order ranks executor-side (the first
-                # tag = group 0 uploads first). Each tag replays over the
-                # same destination pages.
-                transfer_tags = list(_STAGE3_GLM_TRANSFER_POOL_TAGS
-                                     if _use_raiden_glm_admission(
-                                     ) else _STAGE3_TRANSFER_POOL_TAGS)
-                dst_blocks = list(local_blocks) * len(transfer_tags)
-                dst_counts = [len(local_blocks)] * len(transfer_tags)
-                mamba_state_block_ids = getattr(req_meta,
-                                                "mamba_state_block_ids", None)
-                if self._stage3_state_group_count:
-                    if not mamba_state_block_ids or len(
-                            mamba_state_block_ids
-                    ) != self._stage3_state_group_count:
-                        raise RuntimeError(
-                            "GDN state load requires one destination state "
-                            "block per mamba group")
-                    for tag in _STAGE3_STATE_CLASS_TAGS:
-                        for ordinal, slot in enumerate(mamba_state_block_ids):
-                            transfer_tags.append(f"{tag}.g{ordinal}")
-                            dst_blocks.append(int(slot))
-                            dst_counts.append(1)
-                # Prefix-aware suffix pull: clip the FA global destination
-                # byte space at the locally-cached prefix; GDN state classes
-                # are not prefix-decomposable and always transfer whole
-                # (skip 0). Omit the kwarg entirely when there is no clip so
-                # skip-free requests stay byte-identical on the wire.
-                skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
-                fa_skip_bytes = 0
-                clip_kwargs: dict[str, Any] = {}
-                if skip_tokens > 0:
-                    token_bytes = self._stage3_fa_token_bytes(
-                        int(self.vllm_config.cache_config.block_size))
-                    fa_skip_bytes = skip_tokens * token_bytes
-                    clip_kwargs["dst_skip_bytes"] = ([fa_skip_bytes] + [0] *
-                                                     (len(transfer_tags) - 1))
-                start_submit = time.perf_counter()
-                accepted = self._start_stage3_transfer_with_d5_retry(
-                    source_facade,
-                    src_units=src_units,
-                    dst_units=[self._raiden_work_unit],
-                    # D5 is keyed by the producer's internal request ID. The
-                    # destination's independently randomized ID is strictly a
-                    # local scheduler lifecycle key.
-                    req_id=source_req_id,
-                    dst_device_block_ids=dst_blocks,
-                    dst_mem_type=self._raiden_hbm_memory_type(),
-                    use_block_chunks=True,
-                    src_controller_address=src_controller_address,
-                    dst_controller_address=dst_controller_address,
+            sharded_consumer = self._stage3_sharded_consumer()
+            tp_group = self._stage3_tp_group() if sharded_consumer else None
+            outcome = None
+            if not sharded_consumer or self.tp_rank == 0 or tp_group is None:
+                outcome = self._submit_stage3_load_as_leader(
+                    req_meta=req_meta,
+                    source_req_id=source_req_id,
                     uuid=uuid,
-                    is_sender=True,
                     num_tokens=num_tokens,
-                    transfer_pool_tags=transfer_tags,
-                    dst_block_counts=dst_counts,
-                    **clip_kwargs,
+                    local_blocks=local_blocks,
+                    dst_controller_address=dst_controller_address,
+                    dst_units=(self._raiden_destination_work_units() if
+                               sharded_consumer else [self._raiden_work_unit]),
                 )
-                submit_ms = (time.perf_counter() - start_submit) * 1000
-                if accepted is not True:
-                    raise RuntimeError(
-                        "source controller rejected Stage-3 transfer")
-                fa_accepted = True
-            except Exception as exc:  # pylint: disable=broad-except
-                missing_d5 = "Missing producer block registration" in str(exc)
-                if not controller_contacted or (missing_d5
-                                                and not fa_accepted):
-                    # FA D5 lookup and local validation fail before receiver
-                    # arming, so no late H2D is possible.
-                    self._record_stage3_load_failure(destination_req_id,
-                                                     local_blocks)
-                    logger.error(
-                        "Stage-3 controller transfer failed before receiver "
-                        "arming req_id=%s destination_req_id=%s uuid=%d: %s",
-                        source_req_id, destination_req_id, uuid, exc)
-                else:
-                    # Generic RPC rejection can occur after receiver arming.
-                    # Keep the request blocked and accept native terminal
-                    # records; only surface recompute after manager failure or
-                    # a full post-RPC manager timeout.
-                    self._stage3_controller_accepted.add(destination_req_id)
-                    deadline = (time.perf_counter() +
-                                float(dist_utils.get_p2p_wait_pull_timeout()))
-                    self._stage3_pending_controller_failures[
-                        destination_req_id] = deadline
-                    logger.error(
-                        "Stage-3 controller transfer outcome uncertain; "
-                        "waiting for native terminal state req_id=%s "
-                        "destination_req_id=%s uuid=%d: %s", source_req_id,
-                        destination_req_id, uuid, exc)
+            if tp_group is not None:
+                outcome = tp_group.broadcast_object(outcome, src=0)
+            if outcome is None:
+                raise RuntimeError("Stage-3 TP leader produced no outcome")
+            status, submit_ms, error_text, skip_tokens, fa_skip_bytes = outcome
+            if status == "failed":
+                self._record_stage3_load_failure(destination_req_id,
+                                                 local_blocks)
+                logger.error(
+                    "Stage-3 controller transfer failed before receiver "
+                    "arming req_id=%s destination_req_id=%s uuid=%d: %s",
+                    source_req_id, destination_req_id, uuid, error_text)
+                continue
+            if status == "uncertain":
+                self._stage3_controller_accepted.add(destination_req_id)
+                deadline = (time.perf_counter() +
+                            float(dist_utils.get_p2p_wait_pull_timeout()))
+                self._stage3_pending_controller_failures[
+                    destination_req_id] = deadline
+                logger.error(
+                    "Stage-3 controller transfer outcome uncertain; waiting "
+                    "for native terminal state req_id=%s destination_req_id="
+                    "%s uuid=%d: %s", source_req_id, destination_req_id, uuid,
+                    error_text)
                 continue
             self._stage3_controller_accepted.add(destination_req_id)
             logger.info(
                 "%s",
                 json.dumps(
                     {
-                        "event": "raiden_stage3_transfer_submitted",
-                        "req_id": source_req_id,
-                        "destination_req_id": destination_req_id,
-                        "uuid": uuid,
-                        "num_tokens": num_tokens,
-                        "skip_tokens": skip_tokens,
-                        "fa_skip_bytes": fa_skip_bytes,
-                        "recv_armed_before_push": True,
-                        "state_group_count": self._stage3_state_group_count,
-                        "destination_pages": len(local_blocks),
-                        "controller_submit_ms": submit_ms,
+                        "event":
+                        "raiden_stage3_transfer_submitted",
+                        "req_id":
+                        source_req_id,
+                        "destination_req_id":
+                        destination_req_id,
+                        "uuid":
+                        uuid,
+                        "num_tokens":
+                        num_tokens,
+                        "skip_tokens":
+                        skip_tokens,
+                        "fa_skip_bytes":
+                        fa_skip_bytes,
+                        "recv_armed_before_push":
+                        True,
+                        "state_group_count":
+                        self._stage3_state_group_count,
+                        "destination_pages":
+                        len(local_blocks),
+                        "destination_units":
+                        (int(self.tp_size) if sharded_consumer else 1),
+                        "controller_submit_ms":
+                        submit_ms,
                     },
                     sort_keys=True,
                 ),
@@ -3070,16 +3157,110 @@ class TPURaidenConnectorWorker:
             )
             logger.debug(
                 "TPURaidenConnectorWorker rank%d --> submitted Stage-3 load "
-                "req_id=%s destination_req_id=%s uuid=%d src_units=%d "
+                "req_id=%s destination_req_id=%s uuid=%d dst_units=%d "
                 "destination_pages=%d num_tokens=%d",
                 self.tp_rank,
                 source_req_id,
                 destination_req_id,
                 uuid,
-                len(src_units),
+                int(self.tp_size) if sharded_consumer else 1,
                 len(local_blocks),
                 int(req_meta.num_tokens),
             )
+
+    def _submit_stage3_load_as_leader(
+        self,
+        *,
+        req_meta: _Stage3LoadMeta,
+        source_req_id: str,
+        uuid: int,
+        num_tokens: int,
+        local_blocks: list[int],
+        dst_controller_address: str,
+        dst_units: list[Any],
+    ) -> tuple[str, float | None, str, int, int]:
+        """Coordinate one transfer and return an outcome for TP broadcast."""
+        controller_contacted = False
+        fa_accepted = False
+        submit_ms = None
+        skip_tokens = 0
+        fa_skip_bytes = 0
+        try:
+            src_units = self._stage3_source_work_units(req_meta)
+            src_controller_address = str(
+                req_meta.src_controller_address).strip()
+            if not src_controller_address:
+                raise ValueError("empty Stage-3 source controller address")
+            source_facade = self._stage3_source_facades.get(
+                src_controller_address)
+            if source_facade is None:
+                source_facade = self._new_raiden_controller_facade(
+                    src_controller_address)
+                self._stage3_source_facades[src_controller_address] = (
+                    source_facade)
+            # This RPC returns after receiver arm + sender dispatch. Native
+            # manager terminals, not the acknowledgement, prove completion.
+            controller_contacted = True
+            transfer_tags = list(
+                ("fa",
+                 ) if self._stage3_kimi else _STAGE3_GLM_TRANSFER_POOL_TAGS
+                if _use_raiden_glm_admission() else _STAGE3_TRANSFER_POOL_TAGS)
+            dst_blocks = list(local_blocks) * len(transfer_tags)
+            dst_counts = [len(local_blocks)] * len(transfer_tags)
+            mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids",
+                                            None)
+            if self._stage3_state_group_count:
+                if not mamba_state_block_ids or len(
+                        mamba_state_block_ids
+                ) != self._stage3_state_group_count:
+                    raise RuntimeError(
+                        "GDN state load requires one destination state block "
+                        "per mamba group")
+                for tag in _STAGE3_STATE_CLASS_TAGS:
+                    for ordinal, slot in enumerate(mamba_state_block_ids):
+                        transfer_tags.append(f"{tag}.g{ordinal}")
+                        dst_blocks.append(int(slot))
+                        dst_counts.append(1)
+
+            # Full-attention state is prefix-decomposable; recurrent state is
+            # always copied whole. Keep skip-free calls wire-identical.
+            skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
+            clip_kwargs: dict[str, Any] = {}
+            if skip_tokens > 0:
+                token_bytes = self._stage3_fa_token_bytes(
+                    int(self.vllm_config.cache_config.block_size))
+                fa_skip_bytes = skip_tokens * token_bytes
+                clip_kwargs["dst_skip_bytes"] = ([fa_skip_bytes] + [0] *
+                                                 (len(transfer_tags) - 1))
+            start_submit = time.perf_counter()
+            accepted = self._start_stage3_transfer_with_d5_retry(
+                source_facade,
+                src_units=src_units,
+                dst_units=dst_units,
+                req_id=source_req_id,
+                dst_device_block_ids=dst_blocks,
+                dst_mem_type=self._raiden_hbm_memory_type(),
+                use_block_chunks=True,
+                src_controller_address=src_controller_address,
+                dst_controller_address=dst_controller_address,
+                uuid=uuid,
+                is_sender=True,
+                num_tokens=num_tokens,
+                transfer_pool_tags=transfer_tags,
+                dst_block_counts=dst_counts,
+                **clip_kwargs,
+            )
+            submit_ms = (time.perf_counter() - start_submit) * 1000
+            if accepted is not True:
+                raise RuntimeError("source controller rejected Stage-3 "
+                                   "transfer")
+            fa_accepted = True
+        except Exception as exc:  # pylint: disable=broad-except
+            missing_d5 = "Missing producer block registration" in str(exc)
+            if not controller_contacted or (missing_d5 and not fa_accepted):
+                return "failed", None, str(exc), 0, 0
+            return "uncertain", None, str(exc), 0, 0
+        return "accepted", submit_ms, "", skip_tokens, fa_skip_bytes
 
     def get_finished(
             self,

@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, MambaSpec)
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
@@ -105,6 +106,7 @@ def _make_vllm_config(*,
                       is_producer: bool = True,
                       block_size: int = 16,
                       enable_prefix_caching: bool = False,
+                      architecture: str | None = None,
                       dp_rank: int = 0,
                       dp_size: int = 1,
                       tp_size: int = 1,
@@ -116,6 +118,7 @@ def _make_vllm_config(*,
     cfg.cache_config.block_size = block_size
     cfg.cache_config.enable_prefix_caching = enable_prefix_caching
     cfg.model_config.max_model_len = 64
+    cfg.model_config.architecture = architecture
     cfg.model_config.hf_config = SimpleNamespace(
         num_key_value_heads=2,
         linear_num_key_heads=16,
@@ -123,6 +126,8 @@ def _make_vllm_config(*,
         linear_key_head_dim=2,
         linear_value_head_dim=2,
     )
+    cfg.model_config.hf_text_config = SimpleNamespace(
+        linear_attn_config={"num_heads": 96})
     cfg.parallel_config.data_parallel_rank = dp_rank
     cfg.parallel_config.data_parallel_size = dp_size
     cfg.parallel_config.tensor_parallel_size = tp_size
@@ -204,10 +209,12 @@ def _make_raiden_worker(*,
                         pcp_size: int = 1,
                         interleave_size: int = 1,
                         block_size: int = 16,
+                        architecture: str | None = None,
                         kv_ips: Any = "127.0.0.1",
                         kv_ports: Any = 9100) -> TPURaidenConnectorWorker:
     cfg = _make_vllm_config(is_producer=is_producer,
                             block_size=block_size,
+                            architecture=architecture,
                             dp_rank=dp_rank,
                             dp_size=dp_size,
                             tp_size=tp_size,
@@ -1765,6 +1772,229 @@ class TestTPURaidenConnectorWorker:
         assert [region["units_per_stride"]
                 for region in conv_pool["regions"]] == [2, 2, 4]
 
+    @pytest.mark.parametrize(
+        "architecture",
+        ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM"))
+    def test_kimi_registration_requires_its_own_admission_flag(
+            self, monkeypatch, architecture):
+        worker = _make_raiden_worker(architecture=architecture)
+        runner = SimpleNamespace()
+        worker._admit_raiden_hybrid_kv_cache = MagicMock()
+        for name, value in {
+                "TPU_USE_RAIDEN_KV_CACHE_MANAGER": True,
+                "TPU_RAIDEN_QWEN35_ADMISSION": True,
+                "TPU_RAIDEN_KIMIK3_ADIMISSION": False,
+                "TPU_RAIDEN_GLM_ADMISSION": False,
+                "TPU_KV_RESHARD_TRANSPORT": "raiden",
+        }.items():
+            monkeypatch.setattr(tpu_envs, name, value)
+
+        with pytest.raises(ValueError,
+                           match="Kimi K3 requires "
+                           "TPU_RAIDEN_KIMIK3_ADIMISSION=1"):
+            worker.register_runner(runner)
+        worker._admit_raiden_hybrid_kv_cache.assert_not_called()
+
+        monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_QWEN35_ADMISSION", False)
+        monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_KIMIK3_ADIMISSION", True)
+        worker.register_runner(runner)
+        worker._admit_raiden_hybrid_kv_cache.assert_called_once_with(runner)
+
+    def test_kimi_k3_uses_shared_stage3_admission_topology(self):
+        architecture = "KimiK3ForConditionalGeneration"
+        producer = _make_raiden_worker(tp_rank=11,
+                                       tp_size=32,
+                                       is_producer=True,
+                                       dp_size=1,
+                                       pcp_size=1,
+                                       architecture=architecture)
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   32,
+                   create=True), patch(
+                       f"{_MOD}._routed_destination_spans_supported",
+                       return_value=True):
+            assert producer._raiden_hybrid_admission_topology() == (
+                "tp32dp1_prefill")
+            assert producer._local_raiden_transfer_rank() == 11
+            for tp_size, dp_size, tp_rank in ((32, 1, 31), (8, 4, 3)):
+                consumer = _make_raiden_worker(
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    is_producer=False,
+                    dp_rank=0,
+                    dp_size=dp_size,
+                    pcp_size=1,
+                    architecture=architecture,
+                )
+                with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS",
+                           tp_size,
+                           create=True):
+                    assert consumer._raiden_hybrid_admission_topology() == (
+                        f"tp{tp_size}dp{dp_size}_decode")
+                assert consumer._local_raiden_transfer_rank() == tp_rank
+
+    def test_kimi_k3_fails_admission_without_routed_destination_spans(self):
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=32,
+            is_producer=True,
+            architecture="KimiK3ForConditionalGeneration",
+        )
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   32,
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS",
+                       8,
+                       create=True), patch(
+                           f"{_MOD}._routed_destination_spans_supported",
+                           return_value=False):
+            with pytest.raises(RuntimeError, match="destination-routed"):
+                worker._raiden_hybrid_admission_topology()
+
+    @pytest.mark.parametrize("tp_rank", [0, 31])
+    @pytest.mark.parametrize("dst_shards", [32, 8])
+    def test_kimi_short_prefill_keeps_every_state_shard_until_native_done(
+            self, tp_rank, dst_shards):
+        from .raiden_test_utils import kimi_pool_manifest
+
+        worker = _make_raiden_worker(
+            tp_rank=tp_rank,
+            tp_size=32,
+            block_size=162,
+            architecture="KimiK3ForConditionalGeneration")
+        worker.vllm_config.model_config.hf_text_config.linear_attn_config.update(
+            short_conv_kernel_size=4, head_dim=128)
+        worker._raiden_manifest = kimi_pool_manifest(3)
+        worker._stage3_glm_geometry = {"fa": (207360, 2560)}
+        worker._stage3_state_group_count = 1
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], []), (["short"], [], [])]
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "prefill.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(rank=tp_rank)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["short"] = SimpleNamespace(uuid=123,
+                                                     local_block_ids=[1],
+                                                     mamba_state_block_ids=[2],
+                                                     num_tokens=100,
+                                                     expiration_time=1e20)
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 32), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", dst_shards):
+            worker.process_send_load(meta)
+            worker.process_send_load(meta)
+            assert worker.get_finished() == (set(), set())
+            assert facade.complete_request_blocks_calls == []
+            assert worker.get_finished() == ({"short"}, set())
+
+        assert len(facade.register_request_blocks_calls) == 1
+        call = facade.register_request_blocks_calls[0]
+        fa, conv, ssm = call["pool_spans"]
+        assert fa.declared_bytes == (128000 if tp_rank == 0 else 0)
+        assert {conv.tag, ssm.tag} == {"gdn.conv.g0", "gdn.ssm.g0"}
+        for state in (conv, ssm):
+            assert state.block_ids == (2, )
+            assert state.declared_bytes > 0
+            assert {span.dst_unit_ordinal
+                    for span in state.spans
+                    } == {tp_rank // (32 // dst_shards)}
+        assert len(facade.complete_request_blocks_calls) == 1
+        assert worker._stage3_registered_sends == {}
+
+    def test_kimi_k3_enumerates_tp32_source_and_tp8_destination_units(self):
+        worker = _make_raiden_worker(
+            tp_rank=3,
+            tp_size=8,
+            is_producer=False,
+            dp_rank=2,
+            dp_size=4,
+            architecture="KimiK3ForConditionalGeneration",
+        )
+        worker._raiden_work_unit = SimpleNamespace(local=True)
+        worker._new_raiden_id = MagicMock(
+            side_effect=lambda fields: SimpleNamespace(**fields))
+        req_meta = _Stage3LoadMeta(
+            uuid=1,
+            source_req_id="prefill-request",
+            local_block_ids=[7],
+            num_tokens=16,
+            src_controller_address="prefill.test:27000",
+            src_job_name="prefill-job",
+            src_engine_id="prefill-engine",
+            src_data_replica_idx=0,
+            src_parallelism=32,
+        )
+
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   32,
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
+                       "decode-job",
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                           "decode-engine",
+                           create=True):
+            sources = worker._stage3_source_work_units(req_meta)
+            destinations = worker._raiden_destination_work_units()
+
+        assert [unit.job_replica_id for unit in sources
+                ] == [f"prefill-engine-rank{rank}" for rank in range(32)]
+        assert [unit.job_replica_id for unit in destinations
+                ] == [f"decode-engine-rank{rank}" for rank in range(8)]
+        assert {unit.data_replica_idx for unit in destinations} == {2}
+
+    @pytest.mark.parametrize("tp_rank,is_leader", [(0, True), (3, False)])
+    def test_kimi_k3_reuses_qwen_sharded_consumer_leader(
+            self, tp_rank, is_leader):
+        worker = _make_raiden_worker(
+            tp_rank=tp_rank,
+            tp_size=8,
+            is_producer=False,
+            dp_rank=2,
+            dp_size=4,
+            architecture="KimiK3ForConditionalGeneration",
+        )
+        worker._raiden_work_unit = SimpleNamespace(local=True)
+        destinations = [SimpleNamespace(rank=rank) for rank in range(8)]
+        worker._raiden_destination_work_units = MagicMock(
+            return_value=destinations)
+        leader = worker._submit_stage3_load_as_leader = MagicMock(
+            return_value=("accepted", 1.5, "", 0, 0))
+        tp_group = MagicMock()
+        tp_group.broadcast_object.return_value = ("accepted", 1.5, "", 0, 0)
+        worker._stage3_tp_group = MagicMock(return_value=tp_group)
+        metadata = TPUConnectorMetadata()
+        metadata.reqs_to_load["decode-request"] = _Stage3LoadMeta(
+            uuid=7,
+            source_req_id="prefill-request",
+            local_block_ids=[19],
+            num_tokens=16,
+            src_controller_address="prefill.test:27000",
+            src_job_name="prefill-job",
+            src_engine_id="prefill-engine",
+            src_data_replica_idx=0,
+            src_parallelism=32,
+        )
+
+        with patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "decode.test:28002")):
+            worker._submit_stage3_loads(metadata, MagicMock())
+
+        if is_leader:
+            leader.assert_called_once()
+            assert leader.call_args.kwargs["dst_units"] == destinations
+            tp_group.broadcast_object.assert_called_once_with(
+                ("accepted", 1.5, "", 0, 0), src=0)
+        else:
+            leader.assert_not_called()
+            worker._raiden_destination_work_units.assert_not_called()
+            tp_group.broadcast_object.assert_called_once_with(None, src=0)
+        assert worker._stage3_controller_accepted == {"decode-request"}
+
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
             # role, dp rank, transfer rank, unit replica, data/listener hosts
@@ -2908,7 +3138,7 @@ class TestTPURaidenConnectorWorker:
 
         with unittest.TestCase().assertRaisesRegex(ValueError,
                                                    "dp8_decode.*requires"):
-            worker._raiden_qwen35_admission_topology()
+            worker._raiden_hybrid_admission_topology()
 
     @pytest.mark.parametrize("dp_size", [4, 8])
     def test_v1_admission_accepts_dp_prefill_topology(self, dp_size):
@@ -2918,7 +3148,7 @@ class TestTPURaidenConnectorWorker:
                                      dp_size=dp_size,
                                      pcp_size=1)
 
-        assert worker._raiden_qwen35_admission_topology() == (
+        assert worker._raiden_hybrid_admission_topology() == (
             f"dp{dp_size}_prefill")
 
     def test_producer_registers_sends_with_raiden(self):

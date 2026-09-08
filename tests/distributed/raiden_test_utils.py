@@ -9,6 +9,8 @@ must exist exactly once (two copies would hand out colliding data_ptr()
 values and silently weaken the dead-storage check).
 """
 
+import types
+
 
 class FakeStorage:
     """Duck-typed untyped_storage() stand-in with a unique data pointer."""
@@ -50,6 +52,41 @@ class FakeTensor:
 
     def storage_offset(self):
         return self._storage_offset
+
+
+def kimi_pool_manifest(heads, pool=None):
+    """The stock full K3 unified pool for a local KDA head count."""
+    from vllm_torchtpu.distributed.kv_transfer.raiden import \
+        pool_manifest as rpm
+    from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+
+    state_shape = ((3, 3, heads, 128), (heads, 128, 128))
+    layout = derive_pooled_gdn_state_layout(ssm_bytes=heads * 128 * 128 * 4,
+                                            conv_bytes=3 * 3 * heads * 128 * 2,
+                                            token_bytes=2560)
+    rows = layout.required_tokens
+    if pool is None:
+        pool = FakeTensor((4, rows, 2, 640), 2, dtype="torch.bfloat16")
+    state_layer, fa_layer = "model.layers.1.kda", "model.layers.4.attn"
+    groups = [
+        types.SimpleNamespace(layer_names=[state_layer],
+                              kv_cache_spec=types.SimpleNamespace(
+                                  shapes=state_shape,
+                                  dtypes=("torch.float32", "torch.float32"),
+                                  page_size_bytes=rows * 2560)),
+        types.SimpleNamespace(layer_names=[fa_layer],
+                              kv_cache_spec=types.SimpleNamespace(
+                                  block_size=rows * 2,
+                                  page_size_bytes=rows * 2560)),
+    ]
+    return rpm.build_kimi_k3_pool_manifest(
+        named_kv_caches={
+            state_layer: [pool],
+            fa_layer: pool
+        },
+        kv_cache_groups=groups,
+        raw_tensors=[pool],
+        mamba_group_ordinal_by_layer={state_layer: 0})
 
 
 def glm_named_kv_caches(*,

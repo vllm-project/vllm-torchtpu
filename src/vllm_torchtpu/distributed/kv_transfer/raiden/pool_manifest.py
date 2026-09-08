@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Raiden pool-manifest builder for the Qwen3.5 hybrid KV cache.
+"""Raiden pool manifests for hybrid KV caches.
 
 Raiden's admission surface is model-agnostic (storages / pools / regions, see
 ``tpu_sync.api.torch.pool_layout``). Everything model- and kernel-specific
-about the Qwen3.5 hybrid layout is derived HERE, on the vLLM side, from the
+about the model's hybrid layout is derived HERE, on the vLLM side, from the
 **live materialization** (the typed KV cache tensors bound into the forward
 context plus their kv-cache-group specs) — never from pinned constants.
 
@@ -29,10 +29,12 @@ constructed.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any, Mapping, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import (pooled_gdn_conv_state_bytes,
+from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
+                                           pooled_gdn_conv_state_bytes,
                                            pooled_gdn_ssm_state_bytes,
                                            pooled_gdn_state_dtypes,
                                            pooled_gdn_state_itemsize)
@@ -479,6 +481,55 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
     return states[0], states[1]
 
 
+def _pooled_kda_regions(
+    *,
+    spec: Any,
+    row_bytes: int,
+    page_bytes: int,
+) -> dict[str, tuple[int, tuple[RegionSpec, ...]]]:
+    """Expose KDA's live state through Qwen's two state pool tags.
+
+    Both logical pools reference the same unified page. Their pool bases make
+    each live region start at byte zero, exactly like Qwen's ``gdn.ssm`` and
+    ``gdn.conv`` pools; the only KDA-specific fact is that both regions are
+    padded to complete packed rows. SSM padding can be omitted; convolution
+    retains its full row extent so every device DMA stays aligned.
+    """
+    shapes = tuple(getattr(spec, "shapes", ()))
+    dtypes = tuple(getattr(spec, "dtypes", ()))
+    if len(shapes) != 2 or len(dtypes) != 2:
+        raise ManifestError("pooled KDA cache requires conv and SSM specs")
+    conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    try:
+        conv_bytes = math.prod(
+            shapes[0]) * pooled_gdn_state_itemsize(conv_dtype)
+        ssm_bytes = math.prod(shapes[1]) * pooled_gdn_state_itemsize(ssm_dtype)
+        layout = derive_pooled_gdn_state_layout(
+            ssm_bytes=ssm_bytes,
+            conv_bytes=conv_bytes,
+            token_bytes=row_bytes,
+        )
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
+    if layout.required_bytes > page_bytes:
+        raise ManifestError("KDA state exceeds its pooled page: "
+                            f"state={layout.required_bytes}, "
+                            f"page={page_bytes}")
+    if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
+        raise ManifestError("KDA transfer requires f32 SSM and bf16 pool rows")
+    return {
+        TAG_GDN_SSM: (
+            0,
+            (RegionSpec("gdn_ssm", 0, ssm_bytes, ssm_bytes, 1), ),
+        ),
+        TAG_GDN_CONV: (
+            layout.ssm_tokens * row_bytes,
+            (RegionSpec("kda_conv_rows", 0, row_bytes, row_bytes,
+                        layout.conv_tokens), ),
+        ),
+    }
+
+
 class _StorageTable:
     """Ordered, pointer-deduplicated storage list."""
 
@@ -541,18 +592,11 @@ def build_qwen35_pool_manifest(
     transfers must address slots per group; the suffix is pure vLLM policy —
     raiden keeps treating tags as opaque. Both peers must configure it
     identically (enforced by the manifest identity check at plan time).
+
     """
-    if not named_kv_caches:
-        raise ManifestError("named_kv_caches is empty")
-
-    ordered_layers = sorted(named_kv_caches.keys(),
-                            key=lambda name:
-                            (layer_index_from_name(name) is None,
-                             layer_index_from_name(name) or 0, str(name)))
-
     # Flatten to (pool key, typed/logical tensor) in canonical order.
     flat: list[tuple[str, str, Any]] = []  # (tag, layer_name, tensor)
-    for layer_name in ordered_layers:
+    for layer_name in _ordered_layers(named_kv_caches):
         cache = named_kv_caches[layer_name]
         if isinstance(cache, (list, tuple)):
             if len(cache) == 1:
@@ -569,29 +613,19 @@ def build_qwen35_pool_manifest(
                     f"GDN layer {layer_name} must have a unified pool or "
                     f"(conv, ssm) states: "
                     f"got {len(cache)}")
-            suffix = ""
-            if mamba_group_ordinal_by_layer is not None:
-                ordinal = mamba_group_ordinal_by_layer.get(layer_name)
-                if ordinal is None:
-                    raise ManifestError(
-                        f"GDN layer {layer_name} has no mamba group ordinal")
-                suffix = f".g{int(ordinal)}"
+            suffix = _state_tag_suffix(layer_name,
+                                       mamba_group_ordinal_by_layer)
             flat.append((TAG_GDN_CONV + suffix, layer_name, states[0]))
             flat.append((TAG_GDN_SSM + suffix, layer_name, states[1]))
         else:
             flat.append((TAG_FA, layer_name, cache))
 
-    binding, raw_index_by_pos = _binding_for(
-        [(layer_name, tensor) for _, layer_name, tensor in flat], raw_tensors)
-
-    storages = _StorageTable()
-    pools: list[PoolEntry] = []
-    for pos, (tag, layer_name, tensor) in enumerate(flat):
+    entries: list[tuple[Any, PoolEntry]] = []
+    for tag, layer_name, tensor in flat:
         nbytes = _nbytes(tensor)
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
         itemsize = _element_size(tensor)
         dtype_tag = _dtype_tag(tensor)
-
         if tag == TAG_FA:
             spec = _group_spec_for_layer(kv_cache_groups, layer_name)
             block_size = int(spec.block_size)
@@ -635,10 +669,123 @@ def build_qwen35_pool_manifest(
             else:
                 regions = _gdn_ssm_regions(ssm_shape=shape, itemsize=itemsize)
 
+        entries.append((tensor,
+                        PoolEntry(tag=tag,
+                                  layer_name=layer_name,
+                                  storage_index=-1,
+                                  base_offset_bytes=0,
+                                  block_stride_bytes=live_stride,
+                                  num_blocks=num_blocks,
+                                  regions=regions,
+                                  dtype_tag=dtype_tag)))
+    return _bind_pool_manifest(entries, raw_tensors)
+
+
+def build_kimi_k3_pool_manifest(
+    *,
+    named_kv_caches: Mapping[str, Any],
+    kv_cache_groups: Sequence[Any],
+    raw_tensors: Sequence[Any],
+    mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
+) -> PoolManifest:
+    """Describe K3's packed MLA/KDA rows using the shared hybrid pool tags.
+
+    Only the layout differs from Qwen: storage binding, pool admission and
+    Stage-3 transfers all use the same model-independent machinery.
+    """
+    entries: list[tuple[Any, PoolEntry]] = []
+    for layer_name in _ordered_layers(named_kv_caches):
+        cache = named_kv_caches[layer_name]
+        is_state = isinstance(cache, (list, tuple))
+        if is_state and len(cache) != 1:
+            raise ManifestError(
+                f"Kimi state layer {layer_name} must expose one unified pool, "
+                f"got {len(cache)} tensors")
+        tensor = cache[0] if is_state else cache
+        shape = tuple(int(dim) for dim in tensor.shape)
+        spec = _group_spec_for_layer(kv_cache_groups, layer_name)
+        page_bytes = int(spec.page_size_bytes)
+        if len(shape) != 4 or _dtype_tag(tensor) != "bfloat16":
+            raise ManifestError(f"Kimi cache {layer_name} must be bf16 "
+                                f"[blocks, rows, packing, width], got {shape}")
+        num_blocks, rows, packing, width = shape
+        if min(shape) <= 0 or packing != 2:
+            raise ManifestError(
+                f"Kimi cache {layer_name} has invalid packed-row geometry")
+        declared_block_size = getattr(spec, "block_size", None)
+        if (declared_block_size is not None
+                and int(declared_block_size) != rows * packing):
+            raise ManifestError(
+                f"Kimi cache {layer_name} block size does not match its rows")
+        row_bytes = packing * width * _element_size(tensor)
+        if page_bytes != rows * row_bytes or _nbytes(
+                tensor) != num_blocks * page_bytes:
+            raise ManifestError(
+                f"Kimi cache {layer_name} page bytes {page_bytes} do not "
+                "match its packed-row stride")
+        if is_state:
+            layouts = _pooled_kda_regions(spec=spec,
+                                          row_bytes=row_bytes,
+                                          page_bytes=page_bytes)
+            suffix = _state_tag_suffix(layer_name,
+                                       mamba_group_ordinal_by_layer)
+            tags = (TAG_GDN_CONV, TAG_GDN_SSM)
+        else:
+            layouts = {
+                TAG_FA: (0, (RegionSpec("fa_rows", 0, row_bytes, row_bytes,
+                                        rows), ))
+            }
+            suffix = ""
+            tags = (TAG_FA, )
+        for tag in tags:
+            offset, regions = layouts[tag]
+            entries.append((tensor,
+                            PoolEntry(tag=tag + suffix,
+                                      layer_name=layer_name,
+                                      storage_index=-1,
+                                      base_offset_bytes=offset,
+                                      block_stride_bytes=page_bytes,
+                                      num_blocks=num_blocks,
+                                      regions=regions,
+                                      dtype_tag=_dtype_tag(tensor))))
+    return _bind_pool_manifest(entries, raw_tensors)
+
+
+def _ordered_layers(named_kv_caches: Mapping[str, Any]) -> list[str]:
+    if not named_kv_caches:
+        raise ManifestError("named_kv_caches is empty")
+    return sorted(named_kv_caches,
+                  key=lambda name:
+                  (layer_index_from_name(name) is None,
+                   layer_index_from_name(name) or 0, str(name)))
+
+
+def _state_tag_suffix(layer_name: str,
+                      group_ordinals: Mapping[str, int] | None) -> str:
+    if group_ordinals is None:
+        return ""
+    ordinal = group_ordinals.get(layer_name)
+    if ordinal is None:
+        raise ManifestError(
+            f"GDN layer {layer_name} has no mamba group ordinal")
+    return f".g{int(ordinal)}"
+
+
+def _bind_pool_manifest(entries: Sequence[tuple[Any, PoolEntry]],
+                        raw_tensors: Sequence[Any]) -> PoolManifest:
+    """Resolve logical pool layouts to live storages and validate page bounds."""
+    binding, raw_index_by_pos = _binding_for([(entry.layer_name, tensor)
+                                              for tensor, entry in entries],
+                                             raw_tensors)
+    storages = _StorageTable()
+    pools = []
+    for pos, (tensor, entry) in enumerate(entries):
+        layer_name = entry.layer_name
+        num_blocks = entry.num_blocks
         if binding == BINDING_PRIVATE_TYPED:
             storage_index = storages.index_for(tensor)
             base_offset = 0
-            stride = live_stride
+            stride = entry.block_stride_bytes
         else:
             raw = raw_tensors[raw_index_by_pos[pos]]
             storage_index = storages.index_for(raw)
@@ -655,8 +802,10 @@ def build_qwen35_pool_manifest(
                     f"typed cache {layer_name} offset {base_offset} is "
                     f"outside one raw page of {stride} bytes")
 
+        base_offset += entry.base_offset_bytes
+
         last_live_byte = base_offset + max(region.extent_end_bytes
-                                           for region in regions)
+                                           for region in entry.regions)
         if last_live_byte > stride:
             raise ManifestError(
                 f"logical cache {layer_name} extends through byte "
@@ -664,16 +813,10 @@ def build_qwen35_pool_manifest(
                 "bytes")
 
         pools.append(
-            PoolEntry(
-                tag=tag,
-                layer_name=layer_name,
-                storage_index=storage_index,
-                base_offset_bytes=base_offset,
-                block_stride_bytes=stride,
-                num_blocks=num_blocks,
-                regions=regions,
-                dtype_tag=dtype_tag,
-            ))
+            dataclasses.replace(entry,
+                                storage_index=storage_index,
+                                base_offset_bytes=base_offset,
+                                block_stride_bytes=stride))
 
     manifest = PoolManifest(binding=binding,
                             storages=storages.storages,

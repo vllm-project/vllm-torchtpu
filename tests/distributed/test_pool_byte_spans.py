@@ -9,10 +9,18 @@ for the legacy segment-major vocabulary. For GLM-5.2 the granule is the
 packed row (4 tokens: 2560 B of latent, 1024 B of indexer).
 """
 
+import numpy as np
+import pytest
+
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
-    PoolByteSpan, lower_gdn_state_shard_spans, lower_glm_row_spans)
+    PoolByteSpan, lower_gdn_state_shard_spans, lower_glm_row_spans,
+    lower_kda_state_shard_spans)
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
     RegionSpec
+
+from .raiden_test_utils import kimi_pool_manifest
+from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
+from .test_raiden_pool_liveness_tpu import _extent_bytes, _live_extents
 
 # Qwen3.5-35B TP8 shard, QK pair-blocked: one 1024-byte QK token plus one
 # 1024-byte V token per tap.
@@ -92,6 +100,75 @@ def _copy_registration(destination: bytearray, source: bytes,
             dst = span.dst_offset_bytes + repeat * span.dst_stride_bytes
             destination[dst:dst + span.size_bytes] = source[src:src +
                                                             span.size_bytes]
+
+
+def _kda_physical_state(state, pool):
+    if pool.tag.startswith("gdn.ssm"):
+        return state.astype("<f4").tobytes()
+    # Independent XLA nested-tiling oracle over the kernel's logical conv
+    # tensor. Every tap, Q/K/V, head and lane carries different data.
+    flat = state.astype("<u2").reshape(-1)
+    padded = np.pad(flat, (0, pool.live_bytes_per_block // 2 - flat.size))
+    padded = padded.reshape(-1, 2, 640)
+    return _apply_xla_tiled_layout(padded, (2, 1, 0),
+                                   ((2, 128), (2, 1))).tobytes()
+
+
+@pytest.mark.parametrize("parallelism,dst_shards", [(8, 8), (8, 4), (32, 32),
+                                                    (32, 8)])
+def test_kda_reshard_matches_dense_kernel_layout(parallelism, dst_shards):
+    local_heads = 96 // parallelism
+    source_manifest = kimi_pool_manifest(local_heads)
+    fan_in = parallelism // dst_shards
+    destination_manifest = kimi_pool_manifest(local_heads * fan_in)
+    for source_pool, dest_pool, shape in zip(source_manifest.pools[:2],
+                                             destination_manifest.pools[:2],
+                                             ((3, 3, 96, 128),
+                                              (96, 128, 128))):
+        global_state = np.arange(np.prod(shape),
+                                 dtype=np.uint32).reshape(shape)
+        destinations = [
+            bytearray(dest_pool.live_bytes_per_block)
+            for _ in range(dst_shards)
+        ]
+        coverage = [
+            np.zeros(dest_pool.live_bytes_per_block, dtype=np.uint8)
+            for _ in range(dst_shards)
+        ]
+        is_conv = source_pool.tag.startswith("gdn.conv")
+        for rank in range(parallelism):
+            head_slice = slice(rank * local_heads, (rank + 1) * local_heads)
+            state = (global_state[:, :, head_slice]
+                     if is_conv else global_state[head_slice])
+            raw = _kda_physical_state(state, source_pool)
+            source = _extent_bytes(raw, _live_extents(source_pool))
+            registration = lower_kda_state_shard_spans(
+                tag=source_pool.tag,
+                block_id=17,
+                transfer_rank=rank,
+                parallelism=parallelism,
+                dst_shards=dst_shards,
+                regions=source_pool.regions,
+                row_bytes=2560,
+                conv_kernel_size=4,
+                local_num_heads=local_heads,
+                head_dim=128)
+            dst_rank = rank // fan_in
+            assert registration.declared_bytes == len(source)
+            for span in registration.spans:
+                assert span.dst_unit_ordinal == dst_rank
+                for repeat in range(span.count):
+                    offset = span.dst_offset_bytes + repeat * span.dst_stride_bytes
+                    coverage[dst_rank][offset:offset + span.size_bytes] += 1
+            _copy_registration(destinations[dst_rank], source, registration)
+        for rank, destination in enumerate(destinations):
+            head_slice = slice(rank * local_heads * fan_in,
+                               (rank + 1) * local_heads * fan_in)
+            state = (global_state[:, :, head_slice]
+                     if is_conv else global_state[head_slice])
+            raw = _kda_physical_state(state, dest_pool)
+            assert destination == _extent_bytes(raw, _live_extents(dest_pool))
+            np.testing.assert_array_equal(coverage[rank], 1)
 
 
 def test_gdn_conv_pair_shards_reassemble_rank_blocks():

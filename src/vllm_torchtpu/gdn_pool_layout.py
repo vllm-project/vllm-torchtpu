@@ -16,9 +16,9 @@ POOLED_GDN_ARCHITECTURES = frozenset({
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     # Kimi-Linear's KDA layers run the gather/scatter pooled op
-    # (build_kimi_pooled_kda_op); Kimi-K3 stays opt-in until its TP32
-    # geometry is validated.
+    # (build_kimi_pooled_kda_op); Kimi-K3 uses the same pooled path.
     "KimiLinearForCausalLM",
+    "KimiK3ForConditionalGeneration",
 })
 
 # The pooled GDN kernel's state dtypes inside the unified pool are fixed for
