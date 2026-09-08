@@ -21,9 +21,12 @@ trace_configs:
     input_len: 8192
     output_len: 1024
     jax_advanced_configuration:
-      tpu_enable_periodic_counter_sampling: true
-      tpu_tc_perf_counter_sampling_options: "interval_us:10 scaling:0 counter_size_bits:1 indices:56 indices:57 indices:58 indices:38 indices:105"
-      tpu_cmn_perf_counter_sampling_options: "interval_us:32 scaling:0 counter_size_bits:2 indices:1 indices:2 indices:58"
+      tpu_num_chips_to_profile_per_task: 1
+      tpu_trace_mode: "TRACE_COMPUTE"
+      host_tracer_level: 0
+      python_tracer_level: 0
+      tpu_num_sparse_cores_to_trace: 0
+      tpu_num_sparse_core_tiles_to_trace: 0
 
 sweep_matrix:
   model: [google/gemma-4-31B-it]
