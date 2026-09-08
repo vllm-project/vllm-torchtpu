@@ -23,12 +23,14 @@ makes the first cases a dense-parity check of the full path
 """
 
 import math
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       KVCacheType,
                                                       SparseMLAKVCacheSpec)
@@ -167,6 +169,12 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         return out, mask
 
     def _check(self, output, expected, valid_mask):
+        # Anti-vacuity: `_reference` builds `valid_mask` from q_lens and
+        # query_start_loc, so a disagreement between them silently shrinks the
+        # comparison -- possibly to zero rows, which would pass.
+        self.assertGreater(
+            int(valid_mask.sum()), 0,
+            "valid_mask selected no rows; comparison is vacuous")
         got = np.asarray(output.astype(jnp.float32))[valid_mask]
         np.testing.assert_allclose(got,
                                    expected[valid_mask],
@@ -180,7 +188,27 @@ class SparseMlaAttentionTest(parameterized.TestCase):
     )
     def test_causal_matches_dense_reference(self, q_lens, topk):
         """Causal-arange topk == dense MLA; validates the full path."""
+        output, expected, valid = self._run_causal_case(q_lens, topk)
+        self.assertEqual(int(valid.sum()), sum(q_lens))
+        self._check(output, expected, valid)
+
+    def _run_causal_case(self, q_lens, topk, corrupt_token=None):
+        """Build and run one causal-topk case; returns (output, expected, mask).
+
+        Reseeds `self.rng` so repeated calls with the same arguments build
+        byte-identical inputs -- which is what lets the chunk-invariance test
+        below compare two runs elementwise.
+
+        Args:
+          q_lens: Per-sequence new-token counts.
+          topk: Width of the synthesized `topk_indices` rows.
+          corrupt_token: If set, point this token's first topk entry at a
+            different valid KV index. Used as a sensitivity control: the
+            reference is built from the *uncorrupted* indices, so `_check`
+            must fail.
+        """
         self._require_tpu()
+        self.rng = np.random.default_rng(1234)
         num_seqs = len(q_lens)
         total = sum(q_lens)
         num_tokens = math.ceil(total / TOKEN_PAD) * TOKEN_PAD
@@ -210,14 +238,23 @@ class SparseMlaAttentionTest(parameterized.TestCase):
 
         ql_nope, q_pe = self._random_queries(num_tokens)
         mesh = self._make_mesh()
+
+        # The reference is computed from the pristine indices; only the rows
+        # handed to the kernel are corrupted. See `corrupt_token`.
+        kernel_topk_rows = topk_rows
+        if corrupt_token is not None:
+            kernel_topk_rows = topk_rows.copy()
+            orig = kernel_topk_rows[corrupt_token, 0]
+            kernel_topk_rows[corrupt_token, 0] = 0 if orig != 0 else 1
+
         _, output = self._call(self._empty_cache(), ql_nope, q_pe, kv_c_fp8,
-                               k_pe_fp8, topk_rows, q_lens, query_start_loc,
-                               [0, num_seqs, num_seqs],
+                               k_pe_fp8, kernel_topk_rows, q_lens,
+                               query_start_loc, [0, num_seqs, num_seqs],
                                self._block_tables(num_seqs), mesh)
 
         expected, valid = self._reference(ql_nope, q_pe, topk_rows, q_lens,
                                           query_start_loc, kv_c_deq, k_pe_deq)
-        self._check(output, expected, valid)
+        return output, expected, valid
 
     def test_sparse_subset_selection(self):
         """Random (non-causal) subsets: topk selection is actually honored."""
@@ -314,3 +351,107 @@ class SparseMlaAttentionTest(parameterized.TestCase):
                                           list(range(num_seqs + 1)), kv_c_deq,
                                           k_pe_deq)
         self._check(output, expected, valid)
+
+    @parameterized.named_parameters(
+        # `num_tokens` is `ceil(sum(q_lens) / TOKEN_PAD) * TOKEN_PAD`.
+        # chunk 16 is the branch the bucket policy introduces; 64 is the
+        # shipping control. The others are kernel coverage the policy never
+        # asks for -- the point of this test is that the kernel is invariant
+        # to the knob across its whole range, not just across two values.
+        dict(testcase_name="chunk16", q_lens=[40, 24], topk=64, chunk=16),
+        dict(testcase_name="chunk32", q_lens=[40, 24], topk=64, chunk=32),
+        dict(testcase_name="chunk64", q_lens=[40, 24], topk=64, chunk=64),
+        # 2 full 128-token chunks; 2 seqs x 4 pages = 8 of TOTAL_PAGES.
+        dict(testcase_name="chunk128", q_lens=[128, 128], topk=128, chunk=128),
+        # 48 tokens at chunk 32 -> 32 + 16. This is the short-final-chunk path
+        # (kernel.py:681-700), which no test or sweep has ever executed: every
+        # chunk size swept so far divided its token count exactly.
+        dict(testcase_name="short_tail", q_lens=[48], topk=64, chunk=32),
+        # 64 tokens at chunk 24 -> 24, 24, 16. `_largest_divisor(24, 16)` is
+        # 12, so `kernel_batch_size` becomes a non-power-of-two value that no
+        # production path produces. Stresses the `batch_end` rounding.
+        dict(testcase_name="ragged_batch", q_lens=[64], topk=64, chunk=24),
+    )
+    def test_chunk_size_is_semantically_neutral(self, q_lens, topk, chunk):
+        """The chunk size is a pipelining knob; output must not depend on it.
+
+        Checked twice over: against the numpy reference, and elementwise
+        against the unpatched policy run on byte-identical inputs. The second
+        is the assertion that actually guards this change -- a test that only
+        compares to the reference fails just when the kernel was already
+        broken.
+        """
+        self._require_tpu()
+        with mock.patch.object(attention_interface,
+                               "sparse_mla_gather_chunk_size",
+                               lambda n: chunk):
+            output, expected, valid = self._run_causal_case(q_lens, topk)
+        self.assertEqual(int(valid.sum()), sum(q_lens))
+        self._check(output, expected, valid)
+
+        baseline, _, baseline_valid = self._run_causal_case(q_lens, topk)
+        np.testing.assert_array_equal(valid, baseline_valid)
+        np.testing.assert_allclose(
+            np.asarray(output.astype(jnp.float32))[valid],
+            np.asarray(baseline.astype(jnp.float32))[valid],
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg=f"chunk {chunk} disagrees with the policy default")
+
+    def test_reference_check_detects_a_single_wrong_key(self):
+        """Negative control: prove `_check` can fail at all.
+
+        Token 1 attends to exactly two keys, so redirecting its first topk
+        entry onto the second collapses it to a single key and moves ~half
+        that token's output. If the rtol=2e-2 comparison cannot see that, the
+        tolerance is too loose for this file to gate anything.
+        """
+        output, expected, valid = self._run_causal_case([40, 24],
+                                                        64,
+                                                        corrupt_token=1)
+        with self.assertRaises(AssertionError):
+            self._check(output, expected, valid)
+
+
+class SparseMlaGatherChunkPolicyTest(parameterized.TestCase):
+    """Pure-Python bucket policy; no TPU, runs everywhere."""
+
+    # The buckets `_get_token_paddings(16, 1024)` produces at the GLM-5.2
+    # serving config, plus the boundaries either side of the branch. Only the
+    # decode end is overridden; every larger bucket keeps the default, which
+    # is what makes 65 the interesting row.
+    EXPECTED_ON = {
+        15: 16,
+        16: 16,
+        32: 16,
+        64: 16,
+        65: 64,
+        128: 64,
+        256: 64,
+        511: 64,
+        512: 64,
+        1024: 64,
+        8192: 64,
+    }
+
+    def test_enabled_follows_the_threshold_rule(self):
+        with mock.patch.object(attention_interface, "DSA_CHUNK_BY_BUCKET",
+                               True):
+            got = {
+                n: attention_interface.sparse_mla_gather_chunk_size(n)
+                for n in self.EXPECTED_ON
+            }
+        self.assertEqual(got, self.EXPECTED_ON)
+
+    def test_disabled_is_the_shipping_default_everywhere(self):
+        with mock.patch.object(attention_interface, "DSA_CHUNK_BY_BUCKET",
+                               False):
+            got = {
+                n: attention_interface.sparse_mla_gather_chunk_size(n)
+                for n in self.EXPECTED_ON
+            }
+        self.assertEqual(set(got.values()), {64})
+
+    def test_defaults_off(self):
+        """The knob must be opt-in, or the control arm is not a control."""
+        self.assertFalse(envs.TPU_DSA_CHUNK_BY_BUCKET)

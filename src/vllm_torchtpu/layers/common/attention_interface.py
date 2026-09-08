@@ -56,6 +56,10 @@ get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
 
+# Read once at import, like USE_BATCHED_RPA_LONGCTX above. Tests that need the
+# other setting patch this name directly rather than the environment.
+DSA_CHUNK_BY_BUCKET = envs.TPU_DSA_CHUNK_BY_BUCKET
+
 
 def sharded_flash_attention(
     mesh: Mesh,
@@ -738,6 +742,65 @@ def mla_attention(
     return kv_cache, output_TNA
 
 
+# Default `gather_and_attention_chunk_size`, matching the kernel's own default
+# at kernels/mla/sparse/kernel.py:482.
+_DSA_DEFAULT_CHUNK = 64
+
+# Largest padded token count treated as a decode-shaped step. At or below this
+# the shipping default of 64 degenerates to a single chunk.
+_DSA_DECODE_MAX_TOKENS = 64
+_DSA_DECODE_CHUNK = 16
+
+
+def sparse_mla_gather_chunk_size(num_padded_tokens: int) -> int:
+    """Pick the sparse-MLA gather/attention chunk size for a token bucket.
+
+    This is a *pipelining* knob, not an arithmetic one: the kernel unrolls
+    `cdiv(q.shape[0], chunk)` iterations at trace time (kernel.py:647), each
+    issuing one SparseCore `dsa_gather` and one TensorCore attention call. It
+    decides how much gather latency hides behind attention; it never changes
+    how much work exists, so the kernel's output is invariant to it.
+
+    The mechanism this exists to fix: the shipping value of 64 makes a
+    decode-shaped step a *single-chunk* configuration, so the gather has
+    nothing to overlap against and is almost entirely exposed. Any smaller
+    chunk restores the pipeline. Going the other way costs more than it buys --
+    a small chunk at a full prefill bucket is a large regression -- so the
+    override is confined to the decode end and every larger bucket keeps the
+    default.
+
+    Only the decode direction is applied here. A symmetric large-bucket branch
+    (128 at >= 512 tokens) was measured and then withdrawn: under a faithful
+    harness the prefill effect could not be distinguished from zero. For the
+    deltas, the configurations they were taken at and their null floors, see
+    the experiment log at gs://vllm-opt-experiments/GLM-5.2-FP8/ -- microbench
+    job j-5a3e33c8, null replicates j-aada678c (which retracts the prefill
+    direction), and the end-to-end run of the two-branch bundle. Do not quote a
+    number from here; there isn't one, deliberately.
+
+    Keying on `q.shape[0]` rather than on the prefill/decode phase is both
+    necessary and free. Necessary because batches are unified: the runner packs
+    decodes and prefill into one forward pass and always writes
+    `distribution[0] == distribution[1]`, and `request_distribution` is a
+    device tensor, so phase is not a Python value at the call site. Free
+    because the runner pads every forward to a member of
+    `compilation_config.compile_sizes` and the Pallas export cache is already
+    keyed on input shapes -- a value that is a pure function of the padded
+    token count cannot create a cache entry that did not already exist.
+
+    Args:
+      num_padded_tokens: `q.shape[0]`, already padded to a compile bucket.
+
+    Returns:
+      The `gather_and_attention_chunk_size` to pass to the kernel.
+    """
+    if not DSA_CHUNK_BY_BUCKET:
+        return _DSA_DEFAULT_CHUNK
+    if num_padded_tokens <= _DSA_DECODE_MAX_TOKENS:
+        return _DSA_DECODE_CHUNK
+    return _DSA_DEFAULT_CHUNK
+
+
 def sparse_mla_attention(
         ql_nope: jax.Array,
         q_pe: jax.Array,
@@ -844,17 +907,28 @@ def sparse_mla_attention(
             rope_spec=rope_spec)
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        output = sparse_mla_ragged_paged_attention(
-            q,
-            kv_cache_nope,
-            kv_cache_rope,
-            topk_idx,
-            block_tables_,
-            query_start_loc_,
-            request_distribution_,
-            sm_scale=sm_scale or 1.0,
-            k_scale=dequant_scale,
-        )
+        # `q.shape[0]` is a static Python int here -- the token dim is
+        # unsharded (in_specs[0] above), the runner pads it to a compile
+        # bucket, and the Pallas export cache keys on concrete shapes -- so
+        # this resolves at trace time and is a valid kernel `static_argname`.
+        gather_chunk = sparse_mla_gather_chunk_size(q.shape[0])
+        # Names the chosen chunk size into the HLO op metadata so a profile can
+        # prove which branch fired. The kernel's own scope name cannot: its
+        # `gcz_` field is the KV page count (kernel.py:580) and its `bz_` field
+        # is 16 for chunk 16 and 64 alike.
+        with jax.named_scope(f"sparse-mla-gcs_{gather_chunk}"):
+            output = sparse_mla_ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                block_tables_,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                gather_and_attention_chunk_size=gather_chunk,
+            )
 
         lkv_dim = ql_nope.shape[-1]
         # The kernel's output is lkv_dim + rope_dim wide because it attends
