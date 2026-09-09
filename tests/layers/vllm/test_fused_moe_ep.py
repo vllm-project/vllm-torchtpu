@@ -458,3 +458,133 @@ class TestFusedOutputIsReducedPatch:
             first = cls.__dict__["_fused_output_is_reduced"]
             self._apply()
         assert cls.__dict__["_fused_output_is_reduced"] is first
+
+
+def _fp4_layer():
+    layer = _layer(experts=1, hidden=512, inter=512)
+    layer.w13_weight = torch.empty((1, 512, 1024),
+                                   dtype=torch.float4_e2m1fn_x2)
+    layer.w2_weight = torch.empty((1, 512, 512), dtype=torch.float4_e2m1fn_x2)
+    layer.w13_weight_scale = torch.ones(1, 1, 1, 1024)
+    layer.w2_weight_scale = torch.ones(1, 1, 1, 512)
+    del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+    return layer
+
+
+def test_nvfp4_block512_arms_and_passes_format():
+    seen = []
+    assert _prebuild(_fp4_layer(),
+                     weight_format="fp4",
+                     rhs_qb=512,
+                     build_op=lambda *args: seen.append(args) or "op") == "op"
+    assert seen[0][-2:] == ("fp4", 512)
+
+
+@pytest.mark.parametrize("block", [None, 16, 64, 256, 1024])
+def test_nvfp4_refuses_other_blocks(block):
+    assert _prebuild(_fp4_layer(), weight_format="fp4", rhs_qb=block) is None
+
+
+@pytest.mark.parametrize("fault", ["scale", "dtype", "routing", "bias"])
+def test_nvfp4_refuses_invalid_contract(fault):
+    layer = _fp4_layer()
+    if fault == "scale":
+        layer.w2_weight_scale = torch.ones(1, 32, 1, 512)
+    elif fault == "dtype":
+        layer.w2_weight = torch.empty((1, 512, 512), dtype=torch.float8_e4m3fn)
+    elif fault == "routing":
+        layer.scoring_func = "sigmoid"
+    else:
+        layer.w2_bias = torch.zeros(1, 512)
+    assert _prebuild(layer, weight_format="fp4", rhs_qb=512) is None
+
+
+def test_nvfp4_forward_preserves_single_block_scale_axis():
+    layer = _fp4_layer()
+    seen = []
+    owner = SimpleNamespace()
+    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR,
+            lambda *args: seen.append(args) or args[0])
+    s1 = layer.w13_weight_scale.squeeze(2)
+    s2 = layer.w2_weight_scale.squeeze(2)
+    x = torch.ones(2, 512)
+    assert bridge.fused_moe_ep(owner, x, layer.w13_weight, layer.w2_weight, s1,
+                               s2, torch.ones(2, 2)) is x
+    assert seen[0][3] is s1 and seen[0][4] is s2
+    assert seen[0][3].shape == (1, 1, 1024)
+
+
+@pytest.mark.parametrize("armed,pipelined", [(False, False), (True, False),
+                                             (False, True), (True, True)])
+def test_nvfp4_communication_ownership(armed, pipelined):
+    from vllm_torchtpu.layers.vllm.quantization import nvfp4
+    method = object.__new__(nvfp4.VllmNvfp4MoEMethod)
+    setattr(method, bridge.FUSED_MOE_EP_OP_ATTR, "op" if armed else None)
+    with patch.object(nvfp4,
+                      "enable_pipelined_collective_and_compute",
+                      return_value=pipelined):
+        assert method.supports_internal_mk == (armed or pipelined)
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
+        monkeypatch, admitted):
+    from vllm_torchtpu.layers.vllm.quantization import nvfp4
+    layer = torch.nn.Module()
+    for name, shape, dtype in (
+        ("w13_weight", (1, 1024, 256), torch.uint8),
+        ("w2_weight", (1, 512, 256), torch.uint8),
+        ("w13_weight_scale", (1, 1024, 32), torch.float8_e4m3fn),
+        ("w2_weight_scale", (1, 512, 32), torch.float8_e4m3fn),
+        ("w13_weight_scale_2", (1, 2), torch.float32),
+        ("w2_weight_scale_2", (1, ), torch.float32),
+    ):
+        layer.register_parameter(
+            name,
+            torch.nn.Parameter(torch.ones(shape, dtype=dtype),
+                               requires_grad=False))
+    layer.w13_weight_scale_2.data.copy_(torch.tensor([[2., 3.]]))
+    layer.w2_weight_scale_2.data.fill_(4.)
+    layer.activation = "silu"
+    layer.renormalize = True
+    layer.moe_config = SimpleNamespace(
+        experts_per_token=2, moe_parallel_config=SimpleNamespace(use_ep=False))
+    method = object.__new__(nvfp4.VllmNvfp4MoEMethod)
+    method.moe = SimpleNamespace(has_bias=False, is_act_and_mul=True)
+    method.group_size = 16
+    seen = []
+
+    def requant(w, scales, block):
+        seen.append((scales.clone(), block))
+        e, n, half_k = w.shape
+        return (torch.empty((e, half_k * 2, n), dtype=torch.float4_e2m1fn_x2),
+                torch.ones(e, half_k * 2 // block, 1, n))
+
+    def op(*args):
+        seen.append(args)
+        return args[0]
+
+    monkeypatch.setattr(nvfp4, "RoutedExperts", torch.nn.Module)
+    monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)
+    monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel", lambda **kw: None)
+    monkeypatch.setattr(nvfp4.moe_routing, "register_experts_start_buffer",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", lambda *a, **kw: op
+                        if admitted else None)
+    monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", 512)
+    method.process_weights_after_loading(layer)
+    assert seen[0][1] == seen[1][1] == 512
+    torch.testing.assert_close(seen[0][0][:, :512], torch.full((1, 512, 32),
+                                                               2.))
+    torch.testing.assert_close(seen[0][0][:, 512:], torch.full((1, 512, 32),
+                                                               3.))
+    torch.testing.assert_close(seen[1][0], torch.full((1, 512, 32), 4.))
+    assert bridge.fused_moe_ep_supported(method) == admitted
+    if admitted:
+        x = torch.ones(2, 512)
+        assert method.apply_monolithic(layer, x, torch.ones(2, 2)) is x
+        assert seen[-1][3].shape == (1, 1, 1024)
+        assert seen[-1][4].shape == (1, 1, 512)
+    else:
+        assert not hasattr(layer, "_tpu_fused_w13_scale")
+        assert layer.w13_weight_scale.ndim == 4

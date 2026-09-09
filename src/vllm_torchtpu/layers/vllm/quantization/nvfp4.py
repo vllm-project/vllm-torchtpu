@@ -196,7 +196,10 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            fused_moe_ep_supported
+        return (enable_pipelined_collective_and_compute()
+                or fused_moe_ep_supported(self))
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -255,11 +258,9 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
-        # MOE_REQUANTIZE_BLOCK_SIZE (e.g. 512) requantizes the block-16 fp4
-        # weights to that block (>= MXU). This cuts the scale data ~32x and skips
-        # the in-kernel weight dequant and enables dynamic FP8 activation
-        # quantization for both expert GMMs. Unset -> block-16 W4A16 with
-        # BF16 activations and weight dequantization inside the kernel.
+        # Requantization changes the checkpoint's block-16 weights and enables
+        # W4A8 in GMM. An admitted block-512 layer uses fused EP W4A8 instead.
+        # Unset retains the original block-16 W4A16 path.
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
         layer._tpu_quantize_fp4_lhs = bool(requant_block)
         already_kmajor = False
@@ -343,6 +344,32 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             quantize_fp4_lhs=layer._tpu_quantize_fp4_lhs,
         )
 
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
+        op = None
+        # Keep the existing block-16/default and other requant block paths.
+        # prebuild performs all per-layer routing/parallelism admission checks.
+        if requant_block == 512:
+            op = prebuild_fused_moe_ep(layer,
+                                       topk=layer.moe_config.experts_per_token,
+                                       renormalize=layer.renormalize,
+                                       activation=activation_str,
+                                       weight_format="fp4",
+                                       rhs_qb=512)
+        setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        if op is not None:
+            # Do the layout conversion once, outside compiled forward. Keep
+            # the original GMM scales for the fallback and its load contract.
+            layer.register_buffer(
+                "_tpu_fused_w13_scale",
+                layer.w13_weight_scale.squeeze(2).contiguous(),
+                persistent=False)
+            layer.register_buffer(
+                "_tpu_fused_w2_scale",
+                layer.w2_weight_scale.squeeze(2).contiguous(),
+                persistent=False)
+            logger.info_once("NVFP4 fused EP W4A8 enabled: block-512")
+
     def apply_monolithic(
         self,
         layer: RoutedExperts,
@@ -351,6 +378,13 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         activation_str = layer._tpu_activation_str
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            fused_moe_ep, fused_moe_ep_supported)
+        if fused_moe_ep_supported(self):
+            return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
+                                layer._tpu_fused_w13_scale,
+                                layer._tpu_fused_w2_scale, router_logits)
+
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
