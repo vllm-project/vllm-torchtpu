@@ -46,7 +46,6 @@ def prepare_inputs(
     q_dtype: jnp.dtype,
     kv_dtype: jnp.dtype,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
-    page_size: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
 
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
@@ -97,8 +96,7 @@ def prepare_inputs(
 
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        align_tokens = max(num_lanes, page_size)
-        padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
+        padded_total_tokens = utils.align_to(total_q_tokens, num_lanes)
         new_kv_hbm = (jnp.pad(
             jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
                                                      actual_num_kv_heads_x2,
@@ -148,8 +146,6 @@ def get_kv_cache_shape(
     kv_dtype,
     kv_layout: configs.KVLayout | None = None,
 ):
-    # Keep the legacy layout as the default. PCP passes SEQ_ALONG_LANE
-    # explicitly when VLLM_KV_CACHE_LAYOUT=HND.
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes
@@ -530,7 +526,6 @@ def ragged_paged_attention(
         queries.dtype,
         kv_cache.dtype,
         kv_layout=kv_layout,
-        page_size=page_size,
     )
 
     default_decode, default_prefill = calculate_block_sizes(

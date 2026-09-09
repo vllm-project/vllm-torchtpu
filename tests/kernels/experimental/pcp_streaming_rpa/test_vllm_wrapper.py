@@ -190,6 +190,33 @@ def test_prepare_packed_kv_accepts_equivalent_tail_layout(monkeypatch):
     np.testing.assert_array_equal(np.asarray(prepared), np.asarray(expected))
 
 
+def test_seq_along_lane_kv_packing_pads_inside_pcp_wrapper(monkeypatch):
+    packed_kv = jnp.ones((2, 32, 4, 384), dtype=jnp.bfloat16)
+    captured = {}
+
+    def fake_prepare_inputs(*_args, **kwargs):
+        captured["kwargs"] = kwargs
+        return None, packed_kv
+
+    monkeypatch.setattr(pcp_wrapper.batched_rpa_wrapper, "prepare_inputs",
+                        fake_prepare_inputs)
+
+    k = jnp.zeros((384, 1, 128), dtype=jnp.bfloat16)
+    padded = pcp_wrapper._pack_kv_for_cache(
+        k,
+        jnp.zeros_like(k),
+        jnp.float8_e4m3fn,
+        kv_layout=pcp_wrapper.KVLayout.SEQ_ALONG_LANE,
+        page_size=256,
+    )
+
+    assert "page_size" not in captured["kwargs"]
+    assert padded.shape == (2, 32, 4, 512)
+    np.testing.assert_array_equal(np.asarray(padded[..., :384]),
+                                  np.asarray(packed_kv))
+    np.testing.assert_array_equal(np.asarray(padded[..., 384:]), 0)
+
+
 def test_captured_kv_writeback_coalesces_contiguous_cache_slots():
     compact_slots = jnp.asarray([0, 1, 2, 8, 9, 20, -1, -1], dtype=jnp.int32)
     descriptors, num_segments = \

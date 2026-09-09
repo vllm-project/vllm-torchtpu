@@ -64,8 +64,17 @@ def _pack_kv_for_cache(
         k.dtype,
         cache_dtype,
         kv_layout=kv_layout,
-        page_size=page_size,
     )
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        if page_size is None or page_size <= 0:
+            raise ValueError(
+                "PCP SEQ_ALONG_LANE KV packing requires page_size > 0.")
+        padded_tokens = math.ceil(packed_kv.shape[-1] / page_size) * page_size
+        packed_kv = jnp.pad(
+            packed_kv,
+            ((0, 0), (0, 0), (0, 0), (0, padded_tokens - packed_kv.shape[-1])),
+            constant_values=0,
+        )
     return packed_kv
 
 
