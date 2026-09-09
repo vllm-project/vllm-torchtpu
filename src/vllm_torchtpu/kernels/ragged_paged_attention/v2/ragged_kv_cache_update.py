@@ -10,6 +10,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.utils import TPU_HEAD_SIZE_ALIGNMENT, get_dtype_packing
 
 
@@ -311,8 +312,11 @@ def kv_cache_update(
     | None = None,  # Only sharding along head_dim is supported
     dynamic_validate_inputs: bool = False,
     vmem_limit_bytes: int = 40 * 1024 * 1024,
-    pipelined_dma: bool = False,
+    pipelined_dma: bool | None = None,
 ):
+    if pipelined_dma is None:
+        pipelined_dma = envs.USE_RPA_PIPELINED_DMA_STAGING
+
     if num_slices_per_block is None:
         _, num_combined_kv_heads, head_dim = new_kv.shape
         page_size_bytes = _get_page_size_bytes(page_size,

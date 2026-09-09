@@ -28,6 +28,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
 
@@ -1151,8 +1152,10 @@ def prepare_inputs(
     k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
     v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
     *,
-    fuse_non_tiling_axis_swap: bool = False,
+    fuse_non_tiling_axis_swap: bool | None = None,
 ):
+    if fuse_non_tiling_axis_swap is None:
+        fuse_non_tiling_axis_swap = envs.USE_RPA_PIPELINED_DMA_STAGING
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
     assert actual_num_q_heads % actual_num_kv_heads == 0
@@ -1199,8 +1202,10 @@ def prepare_outputs(
     actual_num_q_heads_per_kv_head: int,
     actual_head_dim: int,
     *,
-    fuse_non_tiling_axis_swap: bool = False,
+    fuse_non_tiling_axis_swap: bool | None = None,
 ):
+    if fuse_non_tiling_axis_swap is None:
+        fuse_non_tiling_axis_swap = envs.USE_RPA_PIPELINED_DMA_STAGING
     if not fuse_non_tiling_axis_swap:
         (
             actual_num_kv_heads,
@@ -1727,7 +1732,7 @@ def ragged_paged_attention(
     actual_num_kv_heads = k.shape[1]
 
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
-    q, kv = prepare_inputs(q, k, v)
+    q, kv = prepare_inputs(q, k, v, fuse_non_tiling_axis_swap=False)
     (
         _,
         max_num_tokens,
@@ -1945,7 +1950,12 @@ def ragged_paged_attention(
     )
 
     return (
-        prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
+        prepare_outputs(
+            q,
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+            fuse_non_tiling_axis_swap=False,
+        ),
         kv_cache,
     )
 
