@@ -959,7 +959,24 @@ class Eagle3Proposer:
         self._precompile_compute_logits()
 
     def _draft_hidden_size(self) -> int:
-        return self.draft_model.config.hidden_size
+        """Width of the hidden state the draft's lm_head consumes.
+
+        Prefer the built draft's own config: that is the value every draft
+        resolved today already reports, so this stays a no-op for them.
+
+        Some drafts are loaded under a *wrapper* config that keeps the text
+        dims on a nested `text_config` and exposes no top-level `hidden_size`
+        at all -- Gemma-4 MTP's `Gemma4AssistantConfig` and Qwen3.5 MTP's
+        `Qwen3_5MoeConfig` are both like this. Reading `hidden_size` off the
+        wrapper raises AttributeError, and the one width it *does* expose
+        (`backbone_hidden_size`) is the TARGET's, not the draft's. Fall back
+        to vLLM's already-resolved text config for those.
+        """
+        hidden_size = getattr(self.draft_model.config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = (self.speculative_config.draft_model_config.
+                           hf_text_config.hidden_size)
+        return hidden_size
 
     def _draft_uses_aux_hidden_state(self) -> bool:
         """Whether this draft checkpoint feeds combine_hidden_states the
