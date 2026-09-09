@@ -127,6 +127,8 @@ class TpuEvalRunner(BaseVllmRunner):
             ]
             if context.limit is not None:
                 eval_cmd.extend(["--limit", str(context.limit)])
+            if any(k in str(context.tasks) for k in ["gpqa"]):
+                eval_cmd.extend(["--gen_kwargs", "max_tokens=4096"])
             if "humaneval_instruct" in context.tasks or "mbpp_plus_instruct" in context.tasks:
                 eval_env["HF_ALLOW_CODE_EVAL"] = "1"
                 eval_cmd.append("--confirm_run_unsafe_code")
