@@ -1147,11 +1147,11 @@ def merge_kv(
 
 
 def prepare_inputs(
-        q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
-        k: jax.
-    Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
-        v: jax.
-    Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    *,
+    fuse_non_tiling_axis_swap: bool = False,
 ):
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
@@ -1161,30 +1161,34 @@ def prepare_inputs(
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head,
                                        q_packing)
     head_dim = align_to(actual_head_dim, 128)
-    q = (
-        jnp.pad(
-            q.reshape(
-                max_num_tokens,
-                actual_num_kv_heads,
-                actual_num_q_heads_per_kv_head,
-                actual_head_dim,
-            ),
-            (
-                (0, 0),
-                (0, 0),
-                (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
-                (0, head_dim - actual_head_dim),
-            ),
-            constant_values=0,
-        ).reshape(
+    q_reshaped = (jnp.pad(
+        q.reshape(
             max_num_tokens,
             actual_num_kv_heads,
-            num_q_heads_per_kv_head // q_packing,
-            q_packing,
-            head_dim,
-        )
-        # TODO(jevinjiang): Explore fusing swapping non-tiling axis to DMA.
-        .swapaxes(0, 1))
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+        ),
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
+            (0, head_dim - actual_head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
+        max_num_tokens,
+        actual_num_kv_heads,
+        num_q_heads_per_kv_head // q_packing,
+        q_packing,
+        head_dim,
+    ))
+    if not fuse_non_tiling_axis_swap:
+        # Legacy path: Separate query axis swap emitting xlu.transpose (Transpose::Execute).
+        q = q_reshaped.swapaxes(0, 1)
+    else:
+        # Fused DMA layout path: Leave query in token-major layout [max_num_tokens, actual_num_kv_heads, ...]
+        # and carry axis permutation directly in Pallas strided DMA descriptors.
+        q = q_reshaped
     # TODO(kyuyeunk, chengjiyao): Add kv quantization here.
     kv = merge_kv(k, v)
     return q, kv
@@ -1194,22 +1198,42 @@ def prepare_outputs(
     out,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     actual_num_q_heads_per_kv_head: int,
     actual_head_dim: int,
+    *,
+    fuse_non_tiling_axis_swap: bool = False,
 ):
-    (
-        actual_num_kv_heads,
-        max_num_tokens,
-        num_q_heads_per_kv_head_per_q_packing,
-        q_packing,
-        head_dim,
-    ) = out.shape
-    actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
-    return (out.swapaxes(0, 1).reshape(
-        max_num_tokens,
-        actual_num_kv_heads,
-        num_q_heads_per_kv_head_per_q_packing * q_packing,
-        head_dim,
-    )[:, :, :actual_num_q_heads_per_kv_head, :actual_head_dim].reshape(
-        max_num_tokens, actual_num_q_heads, actual_head_dim))
+    if not fuse_non_tiling_axis_swap:
+        (
+            actual_num_kv_heads,
+            max_num_tokens,
+            num_q_heads_per_kv_head_per_q_packing,
+            q_packing,
+            head_dim,
+        ) = out.shape
+        actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+        return (out.swapaxes(0, 1).reshape(
+            max_num_tokens,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head_per_q_packing * q_packing,
+            head_dim,
+        )[:, :, :actual_num_q_heads_per_kv_head, :actual_head_dim].reshape(
+            max_num_tokens, actual_num_q_heads, actual_head_dim))
+    else:
+        # Direct reshape without redundant inverse axis swap
+        (
+            max_num_tokens,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head_per_q_packing,
+            q_packing,
+            head_dim,
+        ) = out.shape
+        actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+        return (out.reshape(
+            max_num_tokens,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head_per_q_packing * q_packing,
+            head_dim,
+        )[:, :, :actual_num_q_heads_per_kv_head, :actual_head_dim].reshape(
+            max_num_tokens, actual_num_q_heads, actual_head_dim))
 
 
 # Expect to run this validation during runtime.
