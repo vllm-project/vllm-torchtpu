@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
-    TPU_RAIDEN_KIMIK3_ADIMISSION: bool = False
+    TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
@@ -263,10 +263,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
     "TPU_RAIDEN_QWEN35_ADMISSION":
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
-    # Kimi K3 entry point to shared hybrid-pool admission. Keep the public
-    # ADIMISSION spelling used by the launch configuration.
-    "TPU_RAIDEN_KIMIK3_ADIMISSION":
-    env_bool("TPU_RAIDEN_KIMIK3_ADIMISSION"),
+    # Kimi K3 entry point to shared hybrid-pool admission.
+    "TPU_RAIDEN_KIMIK3_ADMISSION":
+    env_bool("TPU_RAIDEN_KIMIK3_ADMISSION"),
     "TPU_RAIDEN_GLM_ADMISSION":
     env_bool("TPU_RAIDEN_GLM_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves

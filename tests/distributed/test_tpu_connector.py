@@ -1848,7 +1848,7 @@ class TestTPURaidenConnectorWorker:
         for name, value in {
                 "TPU_USE_RAIDEN_KV_CACHE_MANAGER": True,
                 "TPU_RAIDEN_QWEN35_ADMISSION": True,
-                "TPU_RAIDEN_KIMIK3_ADIMISSION": False,
+                "TPU_RAIDEN_KIMIK3_ADMISSION": False,
                 "TPU_RAIDEN_GLM_ADMISSION": False,
                 "TPU_KV_RESHARD_TRANSPORT": "raiden",
         }.items():
@@ -1856,12 +1856,12 @@ class TestTPURaidenConnectorWorker:
 
         with pytest.raises(ValueError,
                            match="Kimi K3 requires "
-                           "TPU_RAIDEN_KIMIK3_ADIMISSION=1"):
+                           "TPU_RAIDEN_KIMIK3_ADMISSION=1"):
             worker.register_runner(runner)
         worker._admit_raiden_hybrid_kv_cache.assert_not_called()
 
         monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_QWEN35_ADMISSION", False)
-        monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_KIMIK3_ADIMISSION", True)
+        monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_KIMIK3_ADMISSION", True)
         worker.register_runner(runner)
         worker._admit_raiden_hybrid_kv_cache.assert_called_once_with(runner)
 

@@ -1647,28 +1647,27 @@ class TPURaidenConnectorWorker:
         qwen_admission = (manager_enabled
                           and tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION)
         kimi_admission = (manager_enabled
-                          and tpu_envs.TPU_RAIDEN_KIMIK3_ADIMISSION)
+                          and tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION)
         glm_admission = _use_raiden_glm_admission()
         if sum((qwen_admission, kimi_admission, glm_admission)) > 1:
             raise RuntimeError(
-                "TPU_RAIDEN_QWEN35_ADMISSION, TPU_RAIDEN_KIMIK3_ADIMISSION, "
+                "TPU_RAIDEN_QWEN35_ADMISSION, TPU_RAIDEN_KIMIK3_ADMISSION, "
                 "and TPU_RAIDEN_GLM_ADMISSION are mutually exclusive")
         if (self._raiden_stage3_enabled()
                 and not (qwen_admission or kimi_admission or glm_admission)):
             raise RuntimeError(
                 "TPU_KV_RESHARD_TRANSPORT=raiden requires explicit pool "
                 "admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and one of "
-                "TPU_RAIDEN_KIMIK3_ADIMISSION=1, "
+                "TPU_RAIDEN_KIMIK3_ADMISSION=1, "
                 "TPU_RAIDEN_QWEN35_ADMISSION=1, or TPU_RAIDEN_GLM_ADMISSION=1)"
             )
         if kimi_admission and not self._stage3_kimi:
-            raise ValueError("TPU_RAIDEN_KIMIK3_ADIMISSION requires "
+            raise ValueError("TPU_RAIDEN_KIMIK3_ADMISSION requires "
                              "KimiK3ForConditionalGeneration or "
                              "KimiLinearForCausalLM")
         if self._stage3_kimi and (qwen_admission or glm_admission):
-            raise ValueError(
-                "Kimi K3 requires TPU_RAIDEN_KIMIK3_ADIMISSION=1; "
-                "Qwen and GLM admission cannot admit Kimi")
+            raise ValueError("Kimi K3 requires TPU_RAIDEN_KIMIK3_ADMISSION=1; "
+                             "Qwen and GLM admission cannot admit Kimi")
         if qwen_admission or kimi_admission:
             self._admit_raiden_hybrid_kv_cache(runner)
             return
