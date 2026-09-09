@@ -506,7 +506,6 @@ def ragged_paged_attention(
     if vmem_limit_bytes is None:
         vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     max_num_seqs = kv_lens.shape[0]
-    kv_packing = utils.get_dtype_packing(kv_cache.dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
     else:
