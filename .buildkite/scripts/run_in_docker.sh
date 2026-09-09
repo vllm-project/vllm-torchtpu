@@ -88,6 +88,14 @@ done < <(env)
 if [ -n "${BUILDKITE_OIDC_TOKEN_PATH:-}" ]; then
   TEST_SUITE_VARS+=(-v "$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}"):$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}")")
 fi
+# Steps that shard one test file across parallel jobs set PYTEST_ADDOPTS so the
+# marker filter also applies to the `pytest --collect-only` bktec runs to
+# enumerate examples, not just to the test command. Passed through by name
+# (`-e VAR`) rather than by value: the value contains spaces and quotes, which
+# the unquoted `${VAR:+-e VAR=...}` expansions below would word-split.
+if [ -n "${PYTEST_ADDOPTS:-}" ]; then
+  TEST_SUITE_VARS+=(-e PYTEST_ADDOPTS)
+fi
 
 # BigQuery eval upload tracking & metadata variables
 BQ_EVAL_VARS=(

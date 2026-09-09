@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.fx.experimental._config as fx_config
 from torch import nn
+from torch._dynamo import mark_dynamic
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
@@ -23,6 +25,8 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from vllm_torchtpu.compilation.shape_variants import (trace_shape_env,
+                                                      unsupported_reason)
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.vllm.custom_ops import \
     kda_attention_op as kimi_custom_ops
@@ -888,3 +892,65 @@ def test_attention_residual_matches_reference(num_blocks: int) -> None:
     assert actual.shape == (num_tokens, hidden)
     assert actual.dtype == prefix_sum.dtype
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
+    # Same stubbing as test_attention_residual_matches_reference: the fold
+    # only reads the two weights.
+    module = AttentionResidual.__new__(AttentionResidual)
+    nn.Module.__init__(module)
+    module.eps = eps
+    module.norm = SimpleNamespace(weight=nn.Parameter(
+        torch.randn(hidden, dtype=torch.bfloat16) * 0.5 + 1))
+    module.proj = SimpleNamespace(weight=nn.Parameter(
+        torch.randn(1, hidden, dtype=torch.bfloat16) * 0.1))
+    module.process_weights_after_loading()
+    return module
+
+
+def test_attention_residual_single_token_matches_batched_rows() -> None:
+    """One token mixes the same way whether it is alone or in a batch."""
+    torch.manual_seed(0)
+    module = _attention_residual_stub(hidden=64, eps=1e-5)
+    prefix_sum = torch.randn(5, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(5, 8, 64, dtype=torch.bfloat16)
+
+    batched = module(prefix_sum, block_residuals)
+    for row in range(5):
+        alone = module(prefix_sum[row:row + 1], block_residuals[row:row + 1])
+        torch.testing.assert_close(alone, batched[row:row + 1])
+
+
+def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
+    """The one-token structure must not leak into other token buckets.
+
+    The layer decides its formulation from the token count, so the trace made
+    for one token has to carry a guard that refuses every other compile size;
+    shape_variants then gives those buckets their own trace.
+    """
+    torch.manual_seed(0)
+    module = _attention_residual_stub(hidden=64, eps=1e-5)
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    prefix_sum = torch.randn(1, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(1, 8, 64, dtype=torch.bfloat16)
+    mark_dynamic(prefix_sum, 0)
+    mark_dynamic(block_residuals, 0)
+    torch._dynamo.reset()
+    # The TPU platform switches to size-oblivious shapes when compile_sizes
+    # has 1; that is the mode the bucket-1 trace runs under.
+    with fx_config.patch(backed_size_oblivious=True):
+        compiled = torch.compile(module,
+                                 backend=capture,
+                                 fullgraph=True,
+                                 dynamic=False)
+        compiled(prefix_sum, block_residuals)
+
+    shape_env = trace_shape_env(graphs[0])
+    assert unsupported_reason(shape_env, 1) is None
+    assert unsupported_reason(shape_env, 2) is not None
+    assert unsupported_reason(shape_env, 512) is not None

@@ -138,10 +138,19 @@ def test_refused_when_experts_are_replicated():
     assert _prebuild(layer) is None
 
 
-def test_refused_under_prefill_context_parallelism():
+def test_arms_under_prefill_context_parallelism():
     layer = _layer()
     layer.moe_config.moe_parallel_config.pcp_size = 4
-    assert _prebuild(layer) is None
+    assert _prebuild(layer) == "op"
+
+
+def test_pcp_threshold_counts_one_logical_scheduler_batch():
+    """PCP partitions one batch; DP contributes independent batches."""
+    cfg = SimpleNamespace(scheduler_config=SimpleNamespace(
+        max_num_batched_tokens=4096))
+    with patch("vllm.config.get_current_vllm_config", return_value=cfg):
+        assert bridge._max_node_tokens(ep=8, pcp=8) == 4096
+        assert bridge._max_node_tokens(ep=8, pcp=1) == 32768
 
 
 def test_refused_under_tensor_parallelism():

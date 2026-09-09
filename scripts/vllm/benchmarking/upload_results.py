@@ -60,12 +60,12 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
     metrics = {}
 
     # 1. Parse LM-Eval results
-    eval_jsons = sorted(results_dir.rglob("results_*.json"))
-    if eval_jsons:
-        # Find latest file
-        latest = max(eval_jsons, key=lambda p: p.stat().st_mtime)
+    # Oldest-first so that if a task genuinely is re-run, the newer value wins.
+    eval_jsons = sorted(results_dir.rglob("results_*.json"),
+                        key=lambda p: p.stat().st_mtime)
+    for path in eval_jsons:
         try:
-            with open(latest, "r") as fh:
+            with open(path, "r") as fh:
                 data = json.load(fh)
             for task, task_metrics in (data.get("results") or {}).items():
                 if not isinstance(task_metrics, dict):
@@ -77,9 +77,8 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
                         metrics[task] = float(task_metrics[key])
                         break
         except Exception as e:
-            print(
-                f"Warning: Failed to parse lm-eval results from {latest}: {e}",
-                file=sys.stderr)
+            print(f"Warning: Failed to parse lm-eval results from {path}: {e}",
+                  file=sys.stderr)
 
     return metrics
 

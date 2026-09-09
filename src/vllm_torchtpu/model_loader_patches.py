@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""EP-sharded weight streaming for the Run:AI model-streamer load path.
+"""EP-sharded weight filtering for the Run:AI streamer and DefaultModelLoader.
 
 vLLM's ``--enable-ep-weight-filter`` skips non-local expert tensors during
 loading, but only in ``DefaultModelLoader`` (local files) and only for
@@ -26,17 +26,26 @@ serving from object storage:
   ``.weight_packed`` / ``.weight_scale``, which the upstream filter never
   matches.
 
-The patch below teaches the Run:AI path to build its fetch plan from the
-safetensors headers and REQUEST ONLY the byte ranges of tensors this rank
-keeps: dense weights, plus the packed weights AND scales of its own
+The Run:AI patch below teaches the Run:AI path to build its fetch plan from
+the safetensors headers and REQUEST ONLY the byte ranges of tensors this
+rank keeps: dense weights, plus the packed weights AND scales of its own
 experts. Skipped tensors are never fetched from storage at all.
+
+The DefaultModelLoader patch below fixes the matching gap in vLLM 0.27.0's
+local-files path: ``should_skip_weight`` only matches names ending in
+``.weight``, so for an MXFP4 checkpoint it keeps every expert's
+``.weight_packed`` and ``.weight_scale`` and the filter is a no-op for all
+per-expert tensors. The patch replaces the predicate with one whose suffix
+allowlist also covers ``.weight_packed`` and ``.weight_scale``.
 
 Divergence from upstream noted: upstream deliberately keeps every expert's
 scale tensors because some GPU backends reduce a global activation-scale
 max across experts. The TPU compressed-tensors MoE methods consume scales
 strictly per local expert (see ``compressed_tensors_moe/utils.py``), and at
 896 experts the scales alone are ~85 GB per rank, so they are filtered
-here like the packed weights.
+here like the packed weights. Per-expert activation ``.input_scale``
+tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
+in the allowlist and stay unfiltered.
 """
 
 import os
@@ -65,6 +74,20 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
     return expert_id not in local_expert_ids
+
+
+def _should_skip_weight_tpu(name: str,
+                            local_expert_ids: Optional[set[int]]) -> bool:
+    """Drop-in replacement for vLLM's ``should_skip_weight``.
+
+    Same contract as upstream (``local_expert_ids=None`` means no
+    filtering), but the suffix allowlist also covers the compressed-tensors
+    MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
+    experts are skipped before their bytes are read.
+    """
+    if local_expert_ids is None:
+        return False
+    return _should_skip(name, local_expert_ids)
 
 
 def _compute_local_expert_ids() -> Optional[set[int]]:
@@ -292,3 +315,25 @@ def patch_runai_sharded_expert_streaming() -> None:
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
     logger.info("Applied TPU patch: EP-sharded Run:AI weight streaming "
                 "(fetch only local experts when the EP weight filter is on).")
+
+
+def patch_default_loader_ep_weight_filter() -> None:
+    """Widen ``DefaultModelLoader``'s EP weight filter to MXFP4 names.
+
+    vLLM 0.27.0's ``should_skip_weight`` only skips names ending in
+    ``.weight``; a compressed-tensors MXFP4 checkpoint stores per-expert
+    tensors as ``.weight_packed``/``.weight_scale``, so the stock filter
+    reads all 896 experts on every rank. ``weight_utils`` imports the
+    predicate by value, so both module references are replaced. Inert when
+    the EP weight filter is off: ``safetensors_weights_iterator`` then
+    passes ``local_expert_ids=None`` and the predicate keeps everything.
+    """
+    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
+
+    if getattr(weight_utils, "_tpu_ep_filter_patch", False):
+        return
+    weight_utils.should_skip_weight = _should_skip_weight_tpu
+    ep_weight_filter.should_skip_weight = _should_skip_weight_tpu
+    weight_utils._tpu_ep_filter_patch = True
+    logger.info("Applied TPU patch: EP weight filter covers "
+                ".weight_packed/.weight_scale (DefaultModelLoader).")

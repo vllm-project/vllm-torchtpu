@@ -143,7 +143,7 @@ steps:
       # through run_multihost.sh (Ray head+worker containers) and weights
       # stream from gs://tpu-commons-ci/glm/GLM-5.2-FP8 via runai
       # (MODEL_URI set in the config).
-      - label: "Perf: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
+      - label: "Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
         key: "perf_nightly_glm_5_2_fp8_dp16_ep"
         if: 'build.env("NIGHTLY") == "1"'
         agents:
@@ -153,7 +153,7 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
-          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --results-dir /perf_eval_results/glm-5.2-fp8-dp16-ep"
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval --results-dir /perf_eval_results/glm-5.2-fp8-dp16-ep"
         artifact_paths:
           - "perf_eval_results/**/*"
 
@@ -256,5 +256,30 @@ steps:
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --results-dir /perf_eval_results/kimik-2.6-w4a16-tp8-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      # Kimi-K3 on the multihost tpu7x-32 pod (4 hosts x 8 chips): TP=32
+      # with EP, perf-only single-request latency probe at 8k in / 1k out.
+      # The 1561 GB checkpoint streams from GCS with EP-sharded runai
+      # streaming (--enable-ep-weight-filter, #373) — the pod has no data
+      # disk that fits it. Runs through run_multihost.sh (Ray head+worker
+      # containers), same as the GLM v7x-16 steps above. The generous
+      # timeout covers checkpoint stream + cold XLA compile; a warm run
+      # completes in about an hour. To validate or recalibrate, run this
+      # step from a branch-local dev yml (see pipeline_dev.yml) and feed
+      # two runs' perf_eval_results to check_regression.py --calibrate.
+      - label: "Perf: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
+        key: "perf_nightly_kimi_k3_tp32_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 420
+        agents:
+          queue: "tpu_v7x_32_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+          BENCHMARK_WARMUP_RUNS: "1"
+        commands:
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --results-dir /perf_eval_results/kimi-k3-tp32-ep"
         artifact_paths:
           - "perf_eval_results/**/*"

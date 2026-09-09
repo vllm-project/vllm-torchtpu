@@ -35,7 +35,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     kernel,
                                                                     schedule,
@@ -148,20 +147,14 @@ def get_kv_cache_shape(
     page_size,
     actual_num_kv_heads,
     actual_head_dim,
-    kv_dtype=None,
-    kv_packing: int | None = None,
+    kv_dtype,
     kv_layout: configs.KVLayout | None = None,
 ):
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            kv_layout = configs.KVLayout.SEQ_ALONG_LANE
-        else:
-            kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
-
-    if kv_packing is None:
-        kv_packing = utils.get_dtype_packing(kv_dtype)
+    kv_packing = utils.get_dtype_packing(kv_dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         return (
             total_num_pages,
@@ -343,9 +336,21 @@ def calculate_block_sizes(
 
         # Step 3: Given current tile size, calculate compute tile size.
 
-        # Fixed threshold value based on hardware spec.
-        # TODO(kyuyeunk): Use different threshold based on hardware and precision.
-        threshold = 1500
+        # Threshold value based on hardware generation and precision.
+        tpu_info = pltpu.get_tpu_info()
+        is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
+
+        match tpu_info.generation:
+            case 8 if "8i" in tpu_info.chip_version or "v8i" in tpu_info.chip_version:
+                threshold = 800
+            case 7:
+                threshold = 1500
+            case _:
+                threshold = 1500
+
+        if is_8bit:
+            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
+            threshold *= flops_ratio
 
         num_bq_c = 1
         last_valid_bq_c_sz = bq_c_sz = bq_sz
@@ -475,10 +480,7 @@ def ragged_paged_attention(
     """
 
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            kv_layout = configs.KVLayout.SEQ_ALONG_LANE
-        else:
-            kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
 
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")

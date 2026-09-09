@@ -109,6 +109,18 @@ def resolve_pcp_topology_order(
     mesh_shape = (dp_size, pcp_size, tp_size)
 
     import torch
+
+    from vllm_torchtpu import envs as tpu_envs
+    if not tpu_envs.TPU_PCP_TOPOLOGY_AWARE_MESH:
+        logger.info(
+            "Topology aware mesh not applied: TPU_PCP_TOPOLOGY_AWARE_MESH=0 "
+            "(device-order PCP/TP layout).")
+        return None
+    if not hasattr(torch.tpu, "topology_aware_mesh"):
+        raise RuntimeError(
+            "torch.tpu.topology_aware_mesh is not available in the installed "
+            "torch_tpu (needs >= 0.1.1.dev20260813160135); set "
+            "TPU_PCP_TOPOLOGY_AWARE_MESH=0 to use the device-order layout.")
     mesh = torch.tpu.topology_aware_mesh(mesh_shape)
 
     # Keyed by vLLM group_name so the caller can look up the groups for the

@@ -108,11 +108,16 @@ def resolve_block_major_contract(
         return None
 
     # Deferred import to avoid circular dependency with raiden_store.
-    from vllm_torchtpu.offload.raiden_store import resolve_kernel_geometry
+    from vllm_torchtpu.offload.raiden_store import (is_multi_shapes_geometry,
+                                                    resolve_kernel_geometry)
 
     kv_cache_tensors = kv_cache_config.kv_cache_tensors
     (kernel_block_size, per_block_shape, kv_dtype,
      device_block_size) = resolve_kernel_geometry(vllm_config, kv_cache_config)
+    if is_multi_shapes_geometry(per_block_shape):
+        raise ValueError(
+            "VLLM_TPU_BLOCK_MAJOR_KV=1 not yet supported for multi-shapes KV cache."
+        )
     assert device_block_size % kernel_block_size == 0
     factor = device_block_size // kernel_block_size
     if factor != 1:

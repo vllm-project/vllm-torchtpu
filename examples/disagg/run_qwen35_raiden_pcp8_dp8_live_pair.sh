@@ -559,6 +559,13 @@ configure_role_environment() {
   export TPU_KV_TRANSFER_NAMESPACE="${namespace}"
   export TPU_RAIDEN_JOB_NAME="${role}"
   export TPU_RAIDEN_ENGINE_ID="${run_id}-${role}-engine"
+
+  # Caller-specified role environment entries (--role-env KEY=VALUE), applied
+  # last so they can override the launcher defaults above.
+  local _role_env
+  for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
+    export "${_role_env?}"
+  done
 }
 
 record_child() {
@@ -1661,6 +1668,9 @@ RESHARD_SIDECAR_BIN="${RESHARD_SIDECAR_BIN:-}"
 # being root-caused upstream). The summary carries an explicit marker; a
 # skipped-oracle run is NEVER a golden accuracy verification.
 SKIP_ACCURACY_ORACLE=0
+# Extra KEY=VALUE environment entries exported into both role processes
+# (forwarded verbatim to the internal-role invocations on each host).
+ROLE_ENVS=()
 PREFILL_HOST=""
 DECODE_HOST=""
 MODEL="${DEFAULT_MODEL}"
@@ -1714,8 +1724,14 @@ while (($#)); do
     --side-channel-port) SIDE_CHANNEL_PORT="${2:?missing value for $1}"; shift 2 ;;
     --ssh-option) SSH_OPTIONS+=(-o "${2:?missing value for $1}"); shift 2 ;;
     --reshard-controller-impl) RESHARD_CONTROLLER_IMPL="${2:?missing value for $1}"; shift 2 ;;
-    --reshard-sidecar-bin) RESHARD_SIDECAR_BIN="${2:?missing value for $1}"; shift 2 ;;
+    # Forwarded to the internal roles verbatim; empty means "no sidecar"
+    # (store / python modes), so an empty value must parse.
+    --reshard-sidecar-bin) RESHARD_SIDECAR_BIN="${2-}"; shift 2 ;;
     --skip-accuracy-oracle) SKIP_ACCURACY_ORACLE=1; shift ;;
+    --role-env)
+      [[ "${2:?missing value for $1}" == *=* ]] \
+        || die "--role-env requires KEY=VALUE, got: $2"
+      ROLE_ENVS+=("$2"); shift 2 ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --no-performance-gate) PERFORMANCE_GATE=0; shift ;;
     --keep-cache) KEEP_CACHE=1; shift ;;
@@ -1845,6 +1861,10 @@ local_args_common=(
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
   --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
+for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
+  remote_args_common+=(--role-env "${_role_env}")
+  local_args_common+=(--role-env "${_role_env}")
+done
 
 log "checking installed decode environment"
 "${SCRIPT_PATH}" --internal-role preflight "${local_args_common[@]}" \

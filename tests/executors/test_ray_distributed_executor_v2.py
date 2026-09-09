@@ -173,6 +173,148 @@ class TestTpuRayDistributedExecutorV2:
 
         assert resource_kwargs == {"num_gpus": 0, "resources": {"TPU": 1.0}}
 
+    def test_slice_host_layout_sorts_by_tpu_worker_id(self,
+                                                      mock_wait_until_pg_ready,
+                                                      mock_get_ip,
+                                                      mock_platform, mock_ray):
+        mock_platform.ray_device_key = "TPU"
+        executor = RayDistributedExecutorV2(self.vllm_config)
+
+        # Node with IP 10.0.0.99 has worker_id "0"
+        # Node with IP 10.0.0.10 has worker_id "1"
+        # By IP sorting alone, 10.0.0.10 would come first.
+        # But by ray.io/tpu-worker-id, 10.0.0.99 must come first!
+        mock_ray.nodes.return_value = [
+            {
+                "NodeID": "node_b",
+                "NodeManagerAddress": "10.0.0.10",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {
+                    "ray.io/tpu-worker-id": "1"
+                },
+            },
+            {
+                "NodeID": "node_a",
+                "NodeManagerAddress": "10.0.0.99",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {
+                    "ray.io/tpu-worker-id": "0"
+                },
+            },
+        ]
+
+        host_order, chips_per_host = executor._slice_host_layout("TPU")
+        assert host_order == ["10.0.0.99", "10.0.0.10"]
+        assert chips_per_host == {"10.0.0.99": 4, "10.0.0.10": 4}
+
+    def test_slice_host_layout_ignores_dead_nodes(self,
+                                                  mock_wait_until_pg_ready,
+                                                  mock_get_ip, mock_platform,
+                                                  mock_ray):
+        mock_platform.ray_device_key = "TPU"
+        executor = RayDistributedExecutorV2(self.vllm_config)
+
+        mock_ray.nodes.return_value = [
+            {
+                "NodeID": "node_alive",
+                "NodeManagerAddress": "10.0.0.1",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {
+                    "ray.io/tpu-worker-id": "0"
+                },
+                "Alive": True,
+            },
+            {
+                "NodeID": "node_dead",
+                "NodeManagerAddress": "10.0.0.2",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {
+                    "ray.io/tpu-worker-id": "1"
+                },
+                "Alive": False,
+            },
+        ]
+
+        host_order, chips_per_host = executor._slice_host_layout("TPU")
+        assert host_order == ["10.0.0.1"]
+        assert chips_per_host == {"10.0.0.1": 4}
+
+    def test_slice_host_layout_non_contiguous_worker_id_fallback(
+            self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
+            mock_ray):
+        mock_platform.ray_device_key = "TPU"
+        executor = RayDistributedExecutorV2(self.vllm_config)
+
+        # Worker IDs 1 and 2 (missing 0, not 0-indexed)
+        # Should fallback to IP sorting: 10.0.0.10 < 10.0.0.99
+        mock_ray.nodes.return_value = [
+            {
+                "NodeID": "node_b",
+                "NodeManagerAddress": "10.0.0.99",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {
+                    "ray.io/tpu-worker-id": "1"
+                },
+            },
+            {
+                "NodeID": "node_a",
+                "NodeManagerAddress": "10.0.0.10",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {
+                    "ray.io/tpu-worker-id": "2"
+                },
+            },
+        ]
+
+        host_order, chips_per_host = executor._slice_host_layout("TPU")
+        assert host_order == ["10.0.0.10", "10.0.0.99"]
+        assert chips_per_host == {"10.0.0.10": 4, "10.0.0.99": 4}
+
+    def test_slice_host_layout_missing_label_fallback(self,
+                                                      mock_wait_until_pg_ready,
+                                                      mock_get_ip,
+                                                      mock_platform, mock_ray):
+        mock_platform.ray_device_key = "TPU"
+        executor = RayDistributedExecutorV2(self.vllm_config)
+
+        # One node has label, one doesn't. Should fallback to IP sorting.
+        mock_ray.nodes.return_value = [
+            {
+                "NodeID": "node_b",
+                "NodeManagerAddress": "10.0.0.99",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {
+                    "ray.io/tpu-worker-id": "0"
+                },
+            },
+            {
+                "NodeID": "node_a",
+                "NodeManagerAddress": "10.0.0.10",
+                "Resources": {
+                    "TPU": 4.0
+                },
+                "labels": {},
+            },
+        ]
+
+        host_order, chips_per_host = executor._slice_host_layout("TPU")
+        assert host_order == ["10.0.0.10", "10.0.0.99"]
+        assert chips_per_host == {"10.0.0.10": 4, "10.0.0.99": 4}
+
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
         return_value={})

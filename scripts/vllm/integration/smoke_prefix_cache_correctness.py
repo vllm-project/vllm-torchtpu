@@ -619,6 +619,11 @@ def parse_args() -> argparse.Namespace:
                         type=int,
                         default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600))
     parser.add_argument("--quick-probe-only", action="store_true")
+    parser.add_argument(
+        "--prefix-hit-probe-only",
+        action="store_true",
+        help="Run only the repeated long-prefix correctness probe.",
+    )
     parser.add_argument("--skip-short-qa", action="store_true")
     parser.add_argument("--short-repeat-lines",
                         type=int,
@@ -657,7 +662,23 @@ def main() -> int:
     if args.quick_probe_only:
         return run_quick_probe(url, args.model, args.timeout)
 
-    namespace = f"pc-correctness-{int(time.time())}"
+    namespace = f"pc-correctness-{time.time_ns()}"
+    if args.prefix_hit_probe_only:
+        requests, failures = run_repeat_consistency(
+            url,
+            args.model,
+            f"{namespace}-prefix-hit-probe",
+            args.long_repeat_lines,
+            args.long_repeat_count,
+            "NORTH-17",
+            8,
+            args.timeout,
+        )
+        print(f"PREFIX_CACHE_HIT_PROBE_REQUESTS {requests}")
+        print(f"PREFIX_CACHE_HIT_PROBE_FAILURES {failures}")
+        print(f"PREFIX_CACHE_HIT_PROBE_OK {int(failures == 0)}")
+        return 1 if failures else 0
+
     total_requests = 0
     failures = 0
 

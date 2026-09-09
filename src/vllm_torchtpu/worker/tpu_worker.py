@@ -33,6 +33,7 @@ from vllm_torchtpu.distributed.pcp_rank_order import (
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
@@ -90,6 +91,12 @@ class TPUWorker(WorkerBase):
                          rank=rank,
                          distributed_init_method=distributed_init_method,
                          is_driver_worker=is_driver_worker)
+
+        # Multi-host object-storage serve: ranks on hosts other than the API
+        # server's receive a model_config.model rewritten to a local aux-file
+        # dir that only exists on the head host — recreate it here before
+        # anything re-parses the config/tokenizer (see runai_repull).
+        ensure_runai_aux_files(self.model_config)
         # WorkerBase initializes self.device=None which makes vLLM's
         # MultiprocExecutor.async_output_busy_loop call
         # current_platform.set_device(None) → TPU has no torch device-switching

@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
-from vllm_torchtpu.tracing.utils import (extract_request_ids_for_tracing,
+from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
+                                         extract_request_ids_for_tracing,
                                          trim_request_id_suffix)
 
 
@@ -40,3 +41,37 @@ def test_extract_request_ids_for_tracing():
         assert res_3 == {
         }  # the list comprehension exception catches in outer try
         mock_warning.assert_called_once()
+
+
+def test_extract_kv_lens_for_tracing():
+    num_computed_tokens = [100, 200, 300, 400]
+
+    # Case A: Test pagination by passing start_index and num_reqs
+    res = extract_kv_lens_for_tracing(num_computed_tokens,
+                                      start_index=1,
+                                      num_reqs=2)
+    assert res == {
+        "kv_len1": 200,
+        "kv_len2": 300,
+        "min_kv_len": 200,
+        "max_kv_len": 300,
+        "avg_kv_len": 250,
+    }
+
+    # Case B: Default slicing (start_index=0, num_reqs=-1) uses the whole list
+    res_2 = extract_kv_lens_for_tracing(num_computed_tokens)
+    assert res_2 == {
+        "kv_len1": 100,
+        "kv_len2": 200,
+        "kv_len3": 300,
+        "kv_len4": 400,
+        "min_kv_len": 100,
+        "max_kv_len": 400,
+        "avg_kv_len": 250,
+    }
+
+    # Case C: Empty slice yields no kwargs and no summary stats
+    res_3 = extract_kv_lens_for_tracing(num_computed_tokens,
+                                        start_index=4,
+                                        num_reqs=2)
+    assert res_3 == {}

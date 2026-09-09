@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import inspect
 from typing import Any, ClassVar
 
 import jax
@@ -15,13 +16,18 @@ from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
-from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
+                                                      KVCacheType,
+                                                      SparseMLAKVCacheSpec)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, attention_bundled, mla_attention, ragged_paged_attention,
@@ -90,6 +96,14 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
     return packing_bits // bits
 
 
+# HND is SEQ_ALONG_LANE: head_dim, not KV heads, fills the 32-bit words, so an
+# fp8 page is genuinely half a bf16 one (b/510425663).
+KV_LAYOUT_BY_VLLM_LAYOUT: dict[str, batched_rpa_configs.KVLayout] = {
+    "NHD": batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    "HND": batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
+}
+
+
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     max_num_page_per_req = (1024 * 1024 // 2 //
                             vllm_config.scheduler_config.max_num_seqs // 4)
@@ -122,6 +136,7 @@ def _pallas_rpa_kernel_impl(
     shard: bool = True,
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -150,6 +165,7 @@ def _pallas_rpa_kernel_impl(
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
+        kv_layout=kv_layout,
     )
     return new_kv_cache, outputs
 
@@ -341,6 +357,7 @@ def _pallas_rpa_kernel_batched(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -363,6 +380,7 @@ def _pallas_rpa_kernel_batched(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
+        kv_layout=kv_layout,
     )
 
 
@@ -430,16 +448,20 @@ class PallasAttentionBackend(AttentionBackend):
             padded_head_size,
         )
 
-    @staticmethod
+    @classmethod
     def get_kv_cache_page_size_bytes(
+        cls,
         block_size: int,
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> int:
-        """Return one Pallas KV-cache page size including layout padding."""
+        """Return one Pallas KV-cache page size including layout padding.
+
+        Sized through `cls` so a subclass reports what it actually allocates.
+        """
         dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        shape = PallasAttentionBackend.get_kv_cache_shape(
+        shape = cls.get_kv_cache_shape(
             1,
             block_size,
             num_kv_heads,
@@ -511,9 +533,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     `--attention-backend CUSTOM`. The Impl subclass sets `use_batched_rpa=True`,
     which plumbs through `_pallas_rpa_kernel` → `attention()` →
     `sharded_ragged_paged_attention()` to pick the batched kernel function.
-    Any multiple of 128 is a valid page size for this kernel (with or without
-    `USE_BATCHED_RPA_SEQ_ON_LANE`); `get_preferred_block_size` is overridden
-    so the auto-selected default (no `--block-size` given) stays at 256.
+    Any multiple of 128 is a valid page size for this kernel;
+    `get_preferred_block_size` is overridden so the auto-selected default (no
+    `--block-size` given) stays at 256. Under `VLLM_KV_CACHE_LAYOUT=HND` a page
+    is one 128-lane tile and 128 is the only accepted size.
     """
 
     @staticmethod
@@ -534,51 +557,40 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
-        if is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            raise ValueError(
-                "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'."
-            )
-        if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+        # Only a real SEQ_ALONG_LANE allocation needs the wrapper, which reads
+        # lane/sublane geometry off the device and so needs a JAX TPU client --
+        # the scheduler process calls this and owns no chip.
+        #   is_auto         -> vLLM's dtype-less probe for the num_blocks axis
+        #   head_size == 64 -> hd64 kernel, allocates HEAD_ALONG_SUBLANE anyway
+        #   HEAD_ALONG_SUBLANE -> inherited shape is byte-identical
+        seq_along_lane = batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+        needs_wrapper = (kv_layout is seq_along_lane and not is_auto
+                         and head_size != 64)
+        if not needs_wrapper:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
                 cache_dtype_str)
         torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        kv_packing = get_dtype_packing(torch_dtype)
         return rpa_batched_wrapper.get_kv_cache_shape(
             total_num_pages=num_blocks,
             page_size=block_size,
             actual_num_kv_heads=num_kv_heads,
             actual_head_dim=head_size,
-            # pyrefly: ignore [unexpected-keyword]
-            kv_packing=kv_packing,
+            kv_dtype=pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
+            kv_layout=rpa_batched_wrapper.configs.KVLayout(kv_layout),
         )
 
     @staticmethod
     def get_supported_kernel_block_sizes():
+        # Needs a current vLLM config: the layout falls through to the KV
+        # connector when `VLLM_KV_CACHE_LAYOUT` is unset.
         if envs.USE_BATCHED_RPA_LONGCTX:
             return [128, 256, 512, 1024, 2048, 4096]
+        # SEQ_ALONG_LANE maps a page onto one 128-lane tile.
+        if get_kv_cache_layout() == "HND":
+            return [128]
         return [256]
-
-    @staticmethod
-    def get_kv_cache_page_size_bytes(
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str | torch.dtype = "auto",
-    ) -> int:
-        if not envs.USE_BATCHED_RPA_LONGCTX:
-            return PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                block_size, num_kv_heads, head_size, cache_dtype_str)
-        dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        shape = PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
-            1,
-            block_size,
-            num_kv_heads,
-            head_size,
-            dtype,
-        )
-        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
-        return num_elements * torch.empty((), dtype=dtype).element_size()
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
@@ -651,6 +663,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
+        # Resolved here, not in `forward`: `get_kv_cache_layout()` asks the KV
+        # connector, which needs a current vLLM config. Model construction has
+        # one, a compiled forward does not, and Dynamo traces into the
+        # accessor so its `lru_cache` does not spare us.
+        self.kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+        self._pool_is_seq_along_lane = (
+            isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+            and self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE)
         self.rpa_kernel = None
         # Populated by initialize_kernel() before torch.compile traces the
         # model. Forward can then reuse the custom op without resolving a PCP
@@ -737,6 +757,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
                 use_causal_mask=self.use_causal_mask,
+                **({
+                    "kv_layout": self.kv_layout
+                } if "kv_layout" in inspect.signature(
+                    self._kernel_entry).parameters else {}),
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -815,8 +839,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            unsupported_features.append("USE_BATCHED_RPA_SEQ_ON_LANE")
+        if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+            unsupported_features.append("VLLM_KV_CACHE_LAYOUT=HND")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:
@@ -1010,6 +1034,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                  kv_packing, padded_head_size] (preferred)
                 or legacy 4D
                 [num_blocks, block_size, num_kv_heads_x2, padded_head_size]
+                or, under SEQ_ALONG_LANE,
+                [num_blocks, num_kv_heads_x2, padded_head_size // kv_packing,
+                 kv_packing, block_size]
             attn_metadata: Metadata for attention.
             output: buffer written in place, shape
                 = [num_tokens, num_heads, head_size_v]
@@ -1060,8 +1087,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        if (isinstance(self, PallasBatchedRPAAttentionBackendImpl)
-                and envs.USE_BATCHED_RPA_SEQ_ON_LANE):
+        # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
+        if self._pool_is_seq_along_lane:
             pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
         else:
             pool_head_dim = kv_cache.shape[-1]
@@ -1262,27 +1289,34 @@ class PallasMLAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
-    def get_sparse_kv_cache_shapes(
+    def get_sparse_kv_cache_specs(
         num_blocks: int,
         block_size: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Native (nope, rope) cache shapes: the kernel's paged fp8 shapes,
-        nope regrouped into dsa_gather's lane-row tiles."""
-        from vllm_torchtpu.kernels.mla.sparse import dsa_gather
-
+    ) -> tuple[SparseMLAKVCacheSpec, SparseMLAKVCacheSpec]:
+        """The (nope, rope) specs for one sparse-MLA layer."""
         rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
-        lane_bytes = dsa_gather.TILE_LANE_BYTES
-        kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        kv_packing = get_dtype_packing(kv_dtype)
-        rope_shape = sparse_mla_kernel.get_kv_cache_shape(
-            num_blocks, block_size, rope_dim, kv_dtype, kv_packing)
-        nope_shape = sparse_mla_kernel.get_kv_cache_shape(
-            num_blocks, block_size, head_size - rope_dim, kv_dtype, kv_packing)
-        num_pages, page_size_div, kv_packing, nope_dim = nope_shape
-        return ((num_pages, page_size_div * kv_packing, nope_dim // lane_bytes,
-                 lane_bytes), rope_shape)
+        kv_packing = get_dtype_packing(
+            _resolve_kv_cache_dtype(cache_dtype_str))
+        return (
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.NOPE,
+                KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT),
+                num_blocks,
+                block_size,
+                head_size - rope_dim,
+                kv_packing,
+            ),
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT),
+                num_blocks,
+                block_size,
+                rope_dim,
+                kv_packing,
+            ),
+        )
 
     @staticmethod
     def get_kv_cache_page_size_bytes(
@@ -1527,6 +1561,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -1540,6 +1575,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc,
                 request_distribution,
                 vllm_context.mesh,
+                nope_spec,
+                rope_spec,
                 sm_scale=layer.scale,
                 k_scale=k_scale,
             )

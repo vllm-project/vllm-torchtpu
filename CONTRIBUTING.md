@@ -31,6 +31,21 @@ We choose to follow a similar directory structure as vLLM:
   * `jax` contains model implementations/functionalities that are only used by JAX models
   * `vllm` contains model implementations/functionalities that are only used by vLLM models
 
+## Finding Reviewers
+Not sure who to ask for a review? `scripts/find_owners.py` matches your changed files against [.github/CODEOWNERS](.github/CODEOWNERS) and prints the owners of each area you touched, plus the smallest set of reviewers that covers all of them.
+
+```bash
+# Owners of the changes on your current branch
+scripts/find_owners.py
+
+# Owners of an existing PR, or of specific paths
+scripts/find_owners.py --pr 123
+scripts/find_owners.py src/vllm_torchtpu/kernels/ docs/index.md
+
+# Request their review (uses the current branch's PR, or --pr 123)
+scripts/find_owners.py --request
+```
+
 ## Testing
 When checking in a new feature, we expect that you add relevant unit tests as well as CI tests. You can read more about the latter [here](https://github.com/vllm-project/vllm-torchtpu/tree/main/.buildkite#adding-a-new-feature-to-ci).
 

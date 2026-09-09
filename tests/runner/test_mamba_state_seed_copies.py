@@ -543,10 +543,10 @@ def test_copy_plan_split_from_kernel_granular_rpa_pool():
 
 
 def test_copy_plan_split_for_seq_on_lane_pool():
-    # SEQ_ALONG_LANE pool (USE_BATCHED_RPA_SEQ_ON_LANE): the token axis is
-    # LAST — (blocks, kv_heads*2, head_dim/packing, packing, tokens). The
-    # bytes-based split does not care which axis holds tokens: a 256-token
-    # manager block spans two 128-token kernel blocks either way.
+    # SEQ_ALONG_LANE / HND pool: the token axis is LAST — (blocks, kv_heads*2,
+    # head_dim/packing, packing, tokens). The bytes-based split does not care
+    # which axis holds tokens: a 256-token manager block spans two 128-token
+    # kernel blocks either way.
     kernel_block_bytes = 2 * 64 * 2 * 128 * 2  # (kv2, hd/2, packing, 128 tok)
     split = _copy_plan_split((16, 2, 64, 2, 128),
                              torch.bfloat16,

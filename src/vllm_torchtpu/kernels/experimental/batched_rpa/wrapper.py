@@ -146,8 +146,6 @@ def get_kv_cache_shape(
     kv_dtype,
     kv_layout: configs.KVLayout | None = None,
 ):
-    # No caller selects SEQ_ALONG_LANE yet; it is reachable only by passing
-    # `kv_layout` explicitly, which the tests do.
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes
@@ -327,9 +325,21 @@ def calculate_block_sizes(
 
         # Step 3: Given current tile size, calculate compute tile size.
 
-        # Fixed threshold value based on hardware spec.
-        # TODO(kyuyeunk): Use different threshold based on hardware and precision.
-        threshold = 1500
+        # Threshold value based on hardware generation and precision.
+        tpu_info = pltpu.get_tpu_info()
+        is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
+
+        match tpu_info.generation:
+            case 8 if "8i" in tpu_info.chip_version or "v8i" in tpu_info.chip_version:
+                threshold = 800
+            case 7:
+                threshold = 1500
+            case _:
+                threshold = 1500
+
+        if is_8bit:
+            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
+            threshold *= flops_ratio
 
         num_bq_c = 1
         last_valid_bq_c_sz = bq_c_sz = bq_sz

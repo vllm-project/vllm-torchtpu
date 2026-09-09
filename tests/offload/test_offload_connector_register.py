@@ -69,3 +69,39 @@ def test_register_kv_caches_canonicalizes_unified_pool():
     for refs in canonical.group_data_refs:
         assert [(r.tensor_idx, r.page_size_bytes) for r in refs] == \
             [(0, 128), (1, 128)]
+
+
+def test_register_kv_caches_ds_v4_alias_groups():
+    """DSv4's overlay: SWA and compressor-state caches alias MLA arrays.
+
+    What the Raiden worker consumes is `tensors`, so this pins the shape that
+    matters: four layer entries -- one of them a (NoPE, RoPE) tuple, two of
+    them aliases of arrays an earlier layer already bound -- collapse to three
+    canonical arrays of three different page sizes, in first-seen order, each
+    aliasing the model's own storage rather than copying it.
+    """
+    # uint8, [num_blocks, ...]: NoPE 256 B/page, RoPE 64 B/page,
+    # indexer 128 B/page -- the shape family _initialize_ds_v4_kv_cache builds.
+    nope = torch.zeros(NUM_BLOCKS, 8, 4, 8, dtype=torch.uint8)
+    rope = torch.zeros(NUM_BLOCKS, 2, 4, 8, dtype=torch.uint8)
+    indexer = torch.zeros(NUM_BLOCKS, 2, 4, 16, dtype=torch.uint8)
+
+    kv_caches = {
+        # A CSA layer binds a (NoPE, RoPE) pair under one block table.
+        "csa.attn": (nope, rope),
+        "csa.attn.indexer_k_cache": indexer,
+        # The SWA cache overlays the CSA NoPE array.
+        "swa.0.attn": nope,
+        # The compressor state is written through its own KV layer's buffer.
+        "csa.attn.compressor_state": nope,
+    }
+
+    # Groups: (CSA main + indexer), (SWA), (compressor state).
+    fake, captured = _fake_connector(num_groups=3)
+    TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+
+    canonical = captured[0]
+
+    # Aliases collapse: four layer entries, three distinct arrays.
+    assert len(canonical.tensors) == 3
+    assert [t.page_size_bytes for t in canonical.tensors] == [256, 64, 128]

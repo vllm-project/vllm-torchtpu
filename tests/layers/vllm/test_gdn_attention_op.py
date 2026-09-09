@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -21,13 +20,11 @@ import numpy as np
 import pytest
 import torch
 from jax.sharding import PartitionSpec
-from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
-    VllmGatedDeltaNetAttention, _pooled_gdn_block_tokens,
-    _pooled_gdn_state_view, gdn_attention_core_tpu_pcp_prefill)
+    VllmGatedDeltaNetAttention, gdn_attention_core_tpu_pcp_prefill)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
@@ -86,45 +83,34 @@ class TestVllmGatedDeltaNetAttention:
         (2, 2, 256, jnp.bfloat16),
         (4, 4, 256, jnp.float8_e4m3fn),
     ])
-    def test_seq_on_lane_preserves_manager_physical_page_split(
-            self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim,
-            dtype):
-        monkeypatch.setenv("USE_BATCHED_RPA_SEQ_ON_LANE", "1")
-        manager_block_size = 4096 if page_size == 512 else 4352
-        vllm_config = _vllm_config(block_size=manager_block_size)
+    def test_seq_on_lane_native_pool_plan(self, monkeypatch, page_size,
+                                          num_kv_heads, kv_packing, head_dim,
+                                          dtype):
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        from vllm_torchtpu.layers.common.gdn_attention import \
+            _build_v3_pool_state_plan
 
+        manager_block_size = 4096 if page_size == 512 else 4352
         num_kv_heads_x2 = num_kv_heads * 2
         packed_head_dim = head_dim // kv_packing
-        shape = (1, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
-        total_elements = math.prod(shape)
-        # Use structured, distinct non-zero values fitting in FP8 / BF16 ranges
-        raw_values = (
-            np.arange(1, total_elements + 1, dtype=np.float32) % 120 + 1)
-        recurrent_state = jnp.array(raw_values.reshape(shape), dtype=dtype)
-        pooled_state = _pooled_gdn_state_view(recurrent_state)
+        shape = (10, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
+        pool = jnp.zeros(shape, dtype=dtype)
 
-        packed_num_heads = cdiv(num_kv_heads_x2, kv_packing)
-        expected_gdn_kernel_block_size = (
-            (num_kv_heads_x2 * packed_head_dim * kv_packing * page_size) //
-            (packed_num_heads * kv_packing * head_dim))
-        assert pooled_state.shape == (1, expected_gdn_kernel_block_size,
-                                      packed_num_heads, kv_packing, head_dim)
-        expected_tokens = (manager_block_size //
-                           page_size) * expected_gdn_kernel_block_size
-        assert _pooled_gdn_block_tokens(vllm_config, recurrent_state,
-                                        pooled_state) == expected_tokens
-
-        # Assert values: verify that the underlying flattened memory buffer is
-        # bitwise-identical and that round-trip reshape restores exact values.
-        np.testing.assert_array_equal(
-            np.array(pooled_state).reshape(-1),
-            np.array(recurrent_state).reshape(-1),
+        plan = _build_v3_pool_state_plan(
+            pool,
+            conv_dim=1536,
+            n_v=8,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            pool_block_tokens=manager_block_size,
+            qk_pair_layout=False,
+            recurrent_state_dtype=jnp.float32,
         )
-        restored = pooled_state.reshape(recurrent_state.shape)
-        np.testing.assert_array_equal(
-            np.array(restored),
-            np.array(recurrent_state),
-        )
+        assert plan.stride == manager_block_size // page_size
+        assert plan.recurrent.view_dtype == jnp.float32
+        assert plan.conv.view_dtype == jnp.bfloat16
+        assert plan.whole_block_dma is True
 
     @patch("vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
            "run_jax_gdn_attention_pcp_tp_prefill")
@@ -181,7 +167,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
-            expected_dtype):
+            expected_dtype, vllm_config_context):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
@@ -348,7 +334,8 @@ class TestVllmGatedDeltaNetAttention:
         ],
     )
     def test_pooled_op_reads_block_size_at_call_time(self, ssm_cache_dtype,
-                                                     expected_dtype):
+                                                     expected_dtype,
+                                                     vllm_config_context):
         """The pooled op must not freeze cache_config.block_size at build.
 
         Hybrid models construct GDN layers during load_model(), but the
@@ -382,7 +369,6 @@ class TestVllmGatedDeltaNetAttention:
                  "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
                  "gdn_attention_pooled_core_tpu",
              ) as mock_core:
-            mock_core.return_value = (MagicMock(), MagicMock())
             attn._build_pooled_gdn_op()
 
             # The executor finalizes the manager block size only after
@@ -394,7 +380,8 @@ class TestVllmGatedDeltaNetAttention:
         assert mock_core.call_args.kwargs[
             "recurrent_state_dtype"] == jnp.dtype(expected_dtype)
 
-    def test_pooled_impl_forwards_every_operand_the_forward_passes(self):
+    def test_pooled_impl_forwards_every_operand_the_forward_passes(
+            self, vllm_config_context):
         """`gdn_impl` must accept exactly what `forward` calls it with.
 
         The pooled operand list is threaded through four layers (forward ->
@@ -528,7 +515,8 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pcp_compact_and_unified_ops_construct_with_mtp_k1(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
+            vllm_config_context):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
         attn.num_spec = 1
@@ -1175,3 +1163,23 @@ class TestVllmGatedDeltaNetAttention:
         assert attn.out_proj.call_args[0][0].shape == (num_tokens, 64)
 
         assert torch.all(output == 5)
+
+
+class TestConvWeightReHome:
+    """process_weights_after_loading backs the 3-D conv weight, a view over
+    the 2-D ColumnParallelLinear buffer, with a buffer of its own shape."""
+
+    def test_weight_is_copied_into_its_own_buffer(self):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        base = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        weight = torch.nn.Parameter(base.unsqueeze(1), requires_grad=False)
+        attn.conv1d = SimpleNamespace(weight=weight)
+        aliased_ptr = weight.data_ptr()
+        VllmGatedDeltaNetAttention.process_weights_after_loading(
+            attn, torch.bfloat16)
+        w = attn.conv1d.weight
+        assert w is weight
+        assert tuple(w.shape) == (6, 1, 4)
+        assert w.dtype == torch.float32
+        assert w.data_ptr() != aliased_ptr
+        assert torch.equal(w.data.squeeze(1), base)

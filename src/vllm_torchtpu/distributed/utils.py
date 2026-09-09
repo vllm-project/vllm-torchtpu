@@ -116,6 +116,64 @@ def get_p2p_wait_pull_timeout() -> int:
     return int(timeout_str)
 
 
+def get_stage3_status_probe_s() -> float:
+    """Interval, in seconds, at which a Stage-3 producer worker probes the
+    source store's request-block registry for its registrations that have
+    not reached a native terminal. A consumer's release-only cancellation
+    retires only the registry row, so without the probe the registration
+    (and vLLM's delayed block free waiting on it) sits until
+    p2p_wait_pull_timeout. 0 disables the probe."""
+    val_str = os.getenv("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", "1.0")
+    try:
+        val = float(val_str)
+    except ValueError:
+        val = 1.0
+    return max(val, 0.0)
+
+
+def get_stage3_deferred_submit_enabled() -> bool:
+    """Per-step deferred re-attempt for Stage-3 loads whose producer
+    request-block registrations have not arrived yet (default on; the
+    registration is out-of-band and rides a later producer scheduler step,
+    so a consumer submit can legitimately race ahead of it), instead of the
+    legacy
+    bounded inline poll that blocks the worker step while waiting.
+
+    Inline-load mode keeps the legacy poll: the worker blocks in-step for
+    completion there, so nothing would re-drive a parked submit.
+    """
+    if get_raiden_inline_load():
+        return False
+    return os.getenv("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
+                     "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def get_stage3_registration_wait_s() -> float:
+    """Total budget for deferred Stage-3 submit re-attempts, bounded by the
+    overall pull timeout. The producer's registration rides a later producer
+    scheduler step, so under load this must cover multiple step times."""
+    val_str = os.getenv("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", "30")
+    try:
+        val = float(val_str)
+    except ValueError:
+        val = 30.0
+    if val <= 0:
+        val = 30.0
+    return min(val, float(get_p2p_wait_pull_timeout()))
+
+
+def get_stage3_test_registration_delay_s() -> float:
+    """TEST-ONLY fault injection: delay the producer's Stage-3 request-block
+    registration by this many seconds to widen the out-of-band
+    registration race (0 = disabled)."""
+    val_str = os.getenv("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", "0")
+    try:
+        val = float(val_str)
+    except ValueError:
+        return 0.0
+    return max(val, 0.0)
+
+
 def get_kv_stage_wait_timeout_secs() -> float:
     """Per-entry deadline for the async-D2H ``future.wait()`` in the stage
     waiter. ``TransferFuture.wait()`` is unbounded; this caps how long a

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -264,6 +265,14 @@ def _expected_matrix(expected_rows: list[list[int]], max_draft: int, device):
     return torch.tensor(padded, dtype=torch.int32, device=device)
 
 
+def _synthetic_sampler(rates: list[float], device) -> RejectionSampler:
+    speculative_config = SimpleNamespace(
+        rejection_sample_method="synthetic",
+        synthetic_acceptance_rates=rates,
+    )
+    return RejectionSampler(speculative_config, device)
+
+
 @pytest.mark.parametrize("case", GREEDY_CASES, ids=lambda c: c.name)
 def test_rejection_sampler_greedy_scenarios(case: RejectionSamplerCase,
                                             device):
@@ -296,6 +305,90 @@ def test_rejection_sampler_greedy_scenarios(case: RejectionSamplerCase,
         output,
         expected), (f"case '{case.name}': expected {expected.tolist()}, "
                     f"got {output.tolist()}")
+
+
+def test_rejection_sampler_synthetic_converts_to_conditional_rates(device):
+    sampler = _synthetic_sampler([0.8, 0.4, 0.0], device)
+
+    assert sampler.synthetic_mode
+    expected = torch.tensor([0.8, 0.5, 0.0], device=device)
+    assert torch.allclose(sampler.synthetic_conditional_rates, expected)
+
+
+def test_rejection_sampler_synthetic_greedy_uses_acceptance_schedule(device):
+    sampler = _synthetic_sampler([1.0, 0.5, 0.0], device)
+    draft_token_ids = torch.tensor([1, 2, 3], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([3], dtype=torch.int32, device=device)
+    target_logits = _target_logits_from_tokens([4, 5, 6], device)
+    bonus_token_ids = torch.tensor([7], dtype=torch.int32, device=device)
+    segment_ids, group_indices = _segment_info([3], device)
+    accept_u = torch.tensor([0.99, 0.6, 0.0], device=device)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=3,
+        accept_u=accept_u,
+    )
+
+    expected = torch.tensor([[1, 5, -1, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_synthetic_rejects_placeholder_draft(device):
+    sampler = _synthetic_sampler([1.0], device)
+    draft_token_ids = torch.tensor([-1], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
+    target_logits = _target_logits_from_tokens([3], device)
+    bonus_token_ids = torch.tensor([4], dtype=torch.int32, device=device)
+    segment_ids, group_indices = _segment_info([1], device)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        accept_u=torch.zeros(1, device=device),
+    )
+
+    expected = torch.tensor([[3, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("padding_token_id", [-1, 0])
+def test_rejection_sampler_greedy_ignores_padded_draft_slots(
+        device, padding_token_id):
+    """Ignore static-shape padding beyond the declared draft length."""
+    sampler = RejectionSampler()
+    draft_token_ids = torch.tensor([1, 2, padding_token_id, padding_token_id],
+                                   dtype=torch.int32,
+                                   device=device)
+    num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    # Mismatched padding must not replace the real bonus token.
+    target_logits = _target_logits_from_tokens([1, 2, 4, 5], device)
+    bonus_token_ids = torch.tensor([3], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 0, 0], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 2, 3],
+                                 dtype=torch.int64,
+                                 device=device)
+
+    output = sampler(draft_token_ids=draft_token_ids,
+                     num_draft_tokens=num_draft_tokens,
+                     target_logits=target_logits,
+                     bonus_token_ids=bonus_token_ids,
+                     segment_ids=segment_ids,
+                     group_indices=group_indices,
+                     max_draft_tokens=3)
+
+    expected = torch.tensor([[1, 2, 3, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
 
 
 def test_apply_top_k_top_p_top_k(device):
@@ -383,6 +476,43 @@ def test_rejection_sampler_random_all_accepted_uses_bonus(device):
     assert torch.equal(output, expected)
 
 
+@pytest.mark.parametrize("padding_token_id", [-1, 0])
+def test_rejection_sampler_random_ignores_padded_draft_slots(
+        device, padding_token_id):
+    """Ignore static-shape padding beyond the declared draft length."""
+    sampler = RejectionSampler()
+    draft_token_ids = torch.tensor([1, 2, padding_token_id, padding_token_id],
+                                   dtype=torch.int32,
+                                   device=device)
+    num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    target_logits = _target_logits_from_tokens([1, 2, 4, 5], device)
+    bonus_token_ids = torch.tensor([3], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 0, 0], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 2, 3],
+                                 dtype=torch.int64,
+                                 device=device)
+    temperatures = torch.ones((4, 1), dtype=torch.float32, device=device)
+    top_k = torch.zeros((4, 1), dtype=torch.int32, device=device)
+    top_p = torch.ones((4, 1), dtype=torch.float32, device=device)
+
+    output = sampler(draft_token_ids=draft_token_ids,
+                     num_draft_tokens=num_draft_tokens,
+                     target_logits=target_logits,
+                     bonus_token_ids=bonus_token_ids,
+                     segment_ids=segment_ids,
+                     group_indices=group_indices,
+                     max_draft_tokens=3,
+                     temperatures=temperatures,
+                     top_k=top_k,
+                     top_p=top_p,
+                     accept_u=torch.full((4, ), 0.01, device=device),
+                     recover_u=torch.full_like(target_logits, 0.5),
+                     do_sampling=True)
+
+    expected = torch.tensor([[1, 2, 3, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
 def test_rejection_sampler_random_rejects_and_recovers(device):
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([1, 2, 3], dtype=torch.int32, device=device)
@@ -418,6 +548,105 @@ def test_rejection_sampler_random_rejects_and_recovers(device):
                      do_sampling=True)
 
     expected = torch.tensor([[1, 4, -1, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_synthetic_random_uses_acceptance_schedule(device):
+    sampler = _synthetic_sampler([1.0, 0.0], device)
+    draft_token_ids = torch.tensor([1, 2], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    target_logits = torch.full((2, 6), -100.0, device=device)
+    target_logits[0, 3] = 100.0
+    target_logits[1, 4] = 100.0
+    bonus_token_ids = torch.tensor([5], dtype=torch.int32, device=device)
+    segment_ids, group_indices = _segment_info([2], device)
+    temperatures = torch.ones((2, 1), dtype=torch.float32, device=device)
+    top_k = torch.ones((2, 1), dtype=torch.int32, device=device)
+    top_p = torch.ones((2, 1), dtype=torch.float32, device=device)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=2,
+        temperatures=temperatures,
+        top_k=top_k,
+        top_p=top_p,
+        accept_u=torch.tensor([0.99, 0.0], device=device),
+        recover_u=torch.full_like(target_logits, 0.5),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor([[1, 4, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_synthetic_random_placeholder_recovers_target(
+        device):
+    sampler = _synthetic_sampler([0.0], device)
+    draft_token_ids = torch.tensor([-1], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
+    target_logits = torch.tensor([[-0.1053605, -2.3025851]],
+                                 dtype=torch.float32,
+                                 device=device)
+    bonus_token_ids = torch.tensor([1], dtype=torch.int32, device=device)
+    segment_ids, group_indices = _segment_info([1], device)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.ones((1, 1), device=device),
+        top_k=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((1, 1), device=device),
+        accept_u=torch.zeros(1, device=device),
+        recover_u=torch.full_like(target_logits, 0.5),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor([[0, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_synthetic_mixed_batch_recovers_greedy_argmax(
+        device):
+    sampler = _synthetic_sampler([0.0], device)
+    draft_token_ids = torch.tensor([3, 1], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([1, 1], dtype=torch.int32, device=device)
+    target_logits = torch.tensor(
+        [[-100.0, -100.0, -100.0, 100.0, -100.0],
+         [-100.0, -0.5108256, -100.0, -100.0, -0.9162907]],
+        device=device,
+    )
+    bonus_token_ids = torch.tensor([4, 3], dtype=torch.int32, device=device)
+    segment_ids, group_indices = _segment_info([1, 1], device)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.tensor([[0.0], [1.0]], device=device),
+        top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((2, 1), device=device),
+        accept_u=torch.zeros(2, device=device),
+        recover_u=torch.full_like(target_logits, 0.5),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor([[3, -1], [4, -1]],
+                            dtype=torch.int32,
+                            device=device)
     assert torch.equal(output, expected)
 
 
@@ -537,7 +766,8 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([1, 0], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([1, 0], dtype=torch.int32, device=device)
-    target_logits = _target_logits_from_tokens([1, 0], device)
+    # The mismatched out-of-range padding segment must be ignored.
+    target_logits = _target_logits_from_tokens([1, 7], device)
     bonus_token_ids = torch.tensor([9, 8], dtype=torch.int32, device=device)
     segment_ids = torch.tensor([0, 2], dtype=torch.int64, device=device)
     group_indices = torch.tensor([0, 0], dtype=torch.int64, device=device)

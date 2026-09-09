@@ -115,7 +115,8 @@ from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              normalize_draft_config)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
-from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
+from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
+                                         extract_request_ids_for_tracing)
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
@@ -761,6 +762,10 @@ class TPUModelRunner(GPUModelRunner):
         self._combined_request_distribution_cpu = torch.zeros(
             6, dtype=torch.int32)
         self._decode_device_cache_key: tuple | None = None
+        # Snapshot of the in-flight uploads from the host staging tensors
+        # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
+        # waits on it before rewriting them.
+        self._input_staging_fence: Any = None
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -946,7 +951,8 @@ class TPUModelRunner(GPUModelRunner):
         self.drafter = None
         self.rejection_sampler = None
         if self.speculative_config:
-            self.rejection_sampler = RejectionSampler()
+            self.rejection_sampler = RejectionSampler(self.speculative_config,
+                                                      self.device)
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
@@ -2138,11 +2144,11 @@ class TPUModelRunner(GPUModelRunner):
             if raw.dim() > 1:
                 # Manager blocks span whole pool pages. Which axis of the
                 # pool tensor carries tokens is backend-dependent — shape[1]
-                # for RPA pools, the last axis under
-                # USE_BATCHED_RPA_SEQ_ON_LANE, and for token-axis-packed
-                # caches (MLA) no single axis IS the kernel block's token
-                # count — so derive the manager-to-pool-block split from
-                # bytes, which is layout-agnostic: per-kernel-block bytes are
+                # for RPA pools, the last axis for the seq-on-lane (HND)
+                # layout, and for token-axis-packed caches (MLA) no single
+                # axis IS the kernel block's token count — so derive the
+                # manager-to-pool-block split from bytes, which is
+                # layout-agnostic: per-kernel-block bytes are
                 # prod(shape[1:]) * element_size in every layout, and the
                 # manager page comes from the mamba spec the platform
                 # derivation already sized against the backend's own
@@ -2892,6 +2898,7 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
         assert start_index < num_reqs
+        self._wait_input_staging_fence()
 
         # Get the number of scheduled tokens for each request.
         use_max_model_len = self.most_model_len is None
@@ -3291,6 +3298,25 @@ class TPUModelRunner(GPUModelRunner):
             layout_plan,
         )
 
+    def _record_input_staging_fence(self) -> None:
+        """Fence the uploads issued from the reusable host staging tensors.
+
+        Every `.to(self.device, non_blocking=True)` of a staging tensor keeps
+        reading its host memory until the transfer completes, and the same
+        tensors are rewritten by the next chunk's input preparation. The
+        event is recorded before the forward is dispatched, so waiting on it
+        never waits for the forward itself.
+        """
+        fence = torch.tpu.Event()
+        fence.record()
+        self._input_staging_fence = fence
+
+    def _wait_input_staging_fence(self) -> None:
+        fence = self._input_staging_fence
+        if fence is not None:
+            fence.synchronize()
+            self._input_staging_fence = None
+
     def _get_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -3616,6 +3642,7 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
+            self._record_input_staging_fence()
             input_ids, inputs_embeds = self._get_model_inputs(
                 input_ids, chunk_mm_inputs)
             # Run the decoder
@@ -3627,8 +3654,14 @@ class TPUModelRunner(GPUModelRunner):
                                  inputs_embeds).shape[0]
             self._token_padding_update(num_tokens_padded)
 
-            trace_kwargs = extract_request_ids_for_tracing(
-                self.input_batch.req_ids, start_index, num_reqs)
+            trace_kwargs = {}
+            if TraceAnnotation.is_enabled():
+                trace_kwargs = extract_request_ids_for_tracing(
+                    self.input_batch.req_ids, start_index, num_reqs)
+                trace_kwargs.update(
+                    extract_kv_lens_for_tracing(
+                        self.input_batch.num_computed_tokens_cpu, start_index,
+                        num_reqs))
 
             if self.phase_based_profiler and 'batch_composition_stats' in locals(
             ):
@@ -3646,8 +3679,14 @@ class TPUModelRunner(GPUModelRunner):
                     trace_kwargs[target_key] = batch_composition_stats.get(
                         src_key, "UNKNOWN" if src_key == "phase" else 0)
 
+            trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
+            if "min_kv_len" in trace_kwargs:
+                trace_name += (f", kv_len min={trace_kwargs['min_kv_len']} "
+                               f"avg={trace_kwargs['avg_kv_len']} "
+                               f"max={trace_kwargs['max_kv_len']}")
+
             with TraceAnnotation(
-                    name="ModelForward",
+                    name=trace_name,
                     num_reqs=num_reqs,
                     **trace_kwargs,
             ), set_forward_context(
@@ -3989,6 +4028,12 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_k,
                     req_top_p,
                     all_greedy=False).view(-1)
+        accept_u = None
+        if self.rejection_sampler.synthetic_mode or not all_greedy:
+            accept_u = torch.rand(md.draft_token_ids.shape,
+                                  dtype=torch.float32,
+                                  device=target_logits.device,
+                                  generator=sampling_generator)
         if all_greedy:
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
@@ -3999,11 +4044,9 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices=md.group_indices,
                 max_draft_tokens=self.speculative_config.
                 num_speculative_tokens,
+                accept_u=accept_u,
             )
-        accept_u = torch.rand(md.draft_token_ids.shape,
-                              dtype=torch.float32,
-                              device=target_logits.device,
-                              generator=sampling_generator)
+        assert accept_u is not None
         recover_u = torch.rand_like(target_logits,
                                     dtype=torch.float32,
                                     generator=sampling_generator)
@@ -4733,7 +4776,8 @@ class TPUModelRunner(GPUModelRunner):
                                    dtype=torch.int32,
                                    device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
-            synchronize_tensors(out)
+            if not dp_lockstep:
+                synchronize_tensors(out)
         self._hidden_states_dtype = out.dtype
 
     @contextlib.contextmanager
@@ -4953,6 +4997,9 @@ class TPUModelRunner(GPUModelRunner):
                     bonus_logits_indices = torch.zeros(num_reqs,
                                                        dtype=torch.int32,
                                                        device=self.device)
+                    warm_accept_u = torch.zeros(num_tokens,
+                                                dtype=torch.float32,
+                                                device=self.device)
                     # --- greedy verify path (do_sampling=False) ---
                     bonus_token_ids, target_logits_warm = (
                         self.spec_bonus_and_target_logits(
@@ -4966,6 +5013,9 @@ class TPUModelRunner(GPUModelRunner):
                         segment_ids=segment_ids,
                         group_indices=group_indices,
                         max_draft_tokens=k,
+                        accept_u=(warm_accept_u
+                                  if self.rejection_sampler.synthetic_mode else
+                                  None),
                     )
                     synchronize_tensors(out)
                     # --- non-greedy verify path (do_sampling=True) ---
@@ -4982,9 +5032,6 @@ class TPUModelRunner(GPUModelRunner):
                     warm_top_p = torch.ones((num_tokens, 1),
                                             dtype=torch.float32,
                                             device=self.device)
-                    warm_accept_u = torch.zeros(num_tokens,
-                                                dtype=torch.float32,
-                                                device=self.device)
                     warm_recover_u = torch.zeros((num_tokens, self.vocab_size),
                                                  dtype=torch.float32,
                                                  device=self.device)
@@ -6334,18 +6381,19 @@ class TPUModelRunner(GPUModelRunner):
                     attn_module = (self.vllm_config.compilation_config.
                                    static_forward_context.get(layer_name))
                     if getattr(attn_module, "use_sparse", False):
-                        # Split (nope, rope) cache in dsa_gather's tiled
-                        # layouts; uint8 bytes of the fp8 latents.
-                        shapes = (PallasMLAttentionBackend.
-                                  get_sparse_kv_cache_shapes(
-                                      num_blocks,
-                                      kv_cache_spec.block_size,
-                                      kv_cache_spec.head_size,
-                                      kv_cache_spec.dtype,
-                                  ))
+                        # Split (nope, rope) cache; each half's shape and dtype
+                        # come from its own layout spec.
+                        specs = (
+                            PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                                num_blocks,
+                                kv_cache_spec.block_size,
+                                kv_cache_spec.head_size,
+                                kv_cache_spec.dtype,
+                            ))
+                        attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = tuple(
-                            torch.zeros(shape, dtype=torch.uint8).to(
-                                self.device) for shape in shapes)
+                            torch.zeros(spec.shape, dtype=spec.dtype).to(
+                                self.device) for spec in specs)
                         continue
                     # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
                     # Because MLA maps all attention heads onto a single joint compressed latent key-value

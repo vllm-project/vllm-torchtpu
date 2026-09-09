@@ -80,8 +80,8 @@ def generated_logprobs(choice: dict) -> list[dict]:
     return items
 
 
-def chat(url: str, model: str, prompt: str, max_tokens: int,
-         timeout: int) -> dict:
+def chat(url: str, model: str, prompt: str, max_tokens: int, timeout: int,
+         request_logprobs: bool) -> dict:
     payload = {
         "model": model,
         "messages": [{
@@ -90,12 +90,16 @@ def chat(url: str, model: str, prompt: str, max_tokens: int,
         }],
         "max_tokens": max_tokens,
         "temperature": 0.0,
-        "logprobs": True,
-        "top_logprobs": 20,
+        "return_token_ids": True,
         "chat_template_kwargs": {
             "enable_thinking": False,
         },
     }
+    if request_logprobs:
+        payload.update({
+            "logprobs": True,
+            "top_logprobs": 20,
+        })
     status, parsed, elapsed = post_json(url, payload, timeout)
     result = {
         "status": status,
@@ -113,6 +117,7 @@ def chat(url: str, model: str, prompt: str, max_tokens: int,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "cached_tokens": cached_tokens_from_usage(usage),
+        "token_ids": choice.get("token_ids") or [],
         "logprobs": generated_logprobs(choice),
     })
     return result
@@ -143,6 +148,7 @@ def summarize(name: str, result: dict) -> dict:
         "completion_tokens": result.get("completion_tokens"),
         "cached_tokens": result.get("cached_tokens"),
         "text": result.get("text"),
+        "token_ids": result.get("token_ids"),
         "logprobs": result.get("logprobs"),
     }
 
@@ -150,8 +156,10 @@ def summarize(name: str, result: dict) -> dict:
 def output_diff(cold: dict, warm: dict, logprob_atol: float) -> dict:
     cold_items = cold.get("logprobs") or []
     warm_items = warm.get("logprobs") or []
-    cold_tokens = [item["token"] for item in cold_items]
-    warm_tokens = [item["token"] for item in warm_items]
+    cold_token_ids = cold.get("token_ids") or []
+    warm_token_ids = warm.get("token_ids") or []
+    cold_logprob_tokens = [item["token"] for item in cold_items]
+    warm_logprob_tokens = [item["token"] for item in warm_items]
     # Track token-match diffs (for logprob_equal gating on the happy path) and
     # first-divergent-position diffs separately so a partial mismatch (e.g.
     # tokens 0..1 match, tokens 2.. diverge) does not underreport magnitude in
@@ -169,13 +177,17 @@ def output_diff(cold: dict, warm: dict, logprob_atol: float) -> dict:
             continue
         if math.isfinite(left["logprob"]) and math.isfinite(right["logprob"]):
             logprob_diffs.append(abs(left["logprob"] - right["logprob"]))
-    if len(cold_tokens) != len(warm_tokens) and first_div_index is None:
-        first_div_index = min(len(cold_tokens), len(warm_tokens))
+    if (len(cold_logprob_tokens) != len(warm_logprob_tokens)
+            and first_div_index is None):
+        first_div_index = min(len(cold_logprob_tokens),
+                              len(warm_logprob_tokens))
     max_logprob_absdiff = max(logprob_diffs) if logprob_diffs else float("inf")
     return {
         "text_equal": cold.get("text") == warm.get("text"),
-        "tokens_equal": cold_tokens == warm_tokens,
+        "token_ids_equal": cold_token_ids == warm_token_ids,
+        "has_token_ids": bool(cold_token_ids) and bool(warm_token_ids),
         "has_logprobs": bool(cold_items) and bool(warm_items),
+        "logprob_tokens_equal": cold_logprob_tokens == warm_logprob_tokens,
         "max_logprob_absdiff": max_logprob_absdiff,
         "logprob_equal": max_logprob_absdiff <= logprob_atol,
         "first_divergent_index": first_div_index,
@@ -206,6 +218,13 @@ def parse_args() -> argparse.Namespace:
                         type=int,
                         default=env_int("PREFIX_E2E_DIVERGENCE_MAX_TOKENS",
                                         32))
+    parser.add_argument(
+        "--no-logprobs",
+        action="store_true",
+        help=("Compare text and returned token IDs without requesting "
+              "logprobs. Use this when the serving configuration does not "
+              "support logprobs, such as TPU speculative decoding."),
+    )
     # 1e-3 is loose enough to absorb the FP8/TPU numerical noise cold prefill
     # and warm cascade-attention produce on identical prompts (typically
     # 1e-5..1e-4), and still ~2 orders of magnitude tighter than the drift the
@@ -238,6 +257,7 @@ def main() -> int:
     print(f"ATTEMPTS {args.attempts}", flush=True)
     print(f"LINE_COUNT {args.line_count}", flush=True)
     print(f"MAX_TOKENS {args.max_tokens}", flush=True)
+    print(f"LOGPROBS_REQUESTED {int(not args.no_logprobs)}", flush=True)
 
     for attempt in range(args.attempts):
         salt = f"{args.salt_prefix}-{run_id}-{attempt:02d}"
@@ -245,14 +265,16 @@ def main() -> int:
 
         print(f"\n=== ATTEMPT {attempt + 1}/{args.attempts} salt={salt} ===",
               flush=True)
-        cold = chat(url, args.model, prompt, args.max_tokens, args.timeout)
+        cold = chat(url, args.model, prompt, args.max_tokens, args.timeout,
+                    not args.no_logprobs)
         print(json.dumps(summarize("cold", cold), ensure_ascii=False),
               flush=True)
         if cold.get("status") != 200:
             print("PREFIX_E2E_DIVERGENCE_COLD_FAILED")
             return 1
 
-        warm = chat(url, args.model, prompt, args.max_tokens, args.timeout)
+        warm = chat(url, args.model, prompt, args.max_tokens, args.timeout,
+                    not args.no_logprobs)
         print(json.dumps(summarize("warm", warm), ensure_ascii=False),
               flush=True)
         if warm.get("status") != 200:
@@ -279,8 +301,14 @@ def main() -> int:
             print("PREFIX_E2E_DIVERGENCE_LOCAL_HIT_MISSING")
             continue
 
-        if (not diff["text_equal"] or not diff["tokens_equal"]
-                or not diff["has_logprobs"] or not diff["logprob_equal"]):
+        output_mismatch = (not diff["text_equal"]
+                           or not diff["token_ids_equal"]
+                           or not diff["has_token_ids"])
+        logprob_mismatch = (not args.no_logprobs
+                            and (not diff["has_logprobs"]
+                                 or not diff["logprob_tokens_equal"]
+                                 or not diff["logprob_equal"]))
+        if output_mismatch or logprob_mismatch:
             print("PREFIX_E2E_DIVERGENCE_BUG_CONFIRMED 1")
             return 1
 

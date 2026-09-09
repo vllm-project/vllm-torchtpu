@@ -11,10 +11,11 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu.layers.vllm.latent_proj_intra_chip import \
+    make_latent_projection
 from vllm_torchtpu.layers.vllm.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
@@ -26,7 +27,8 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
-        up_proj: ReplicatedLinear,
+        # Replicated or intra-chip sharded; both return ``(output, bias)``.
+        up_proj: nn.Module,
     ) -> None:
         super().__init__()
         self.norm = norm
@@ -74,7 +76,10 @@ class KimiMoE(nn.Module):
         self.gate.e_score_correction_bias = nn.Parameter(
             torch.zeros(config.num_experts))
 
-        self.routed_expert_down_proj = (ReplicatedLinear(
+        # Replicated by default; sharded across a chip's cores under
+        # TPU_LATENT_PROJ_INTRA_CHIP_TP. These two are the model's largest
+        # unquantized weights and are read in full by every rank each step.
+        self.routed_expert_down_proj = (make_latent_projection(
             hidden_size,
             expert_hidden_size,
             bias=False,
@@ -85,7 +90,7 @@ class KimiMoE(nn.Module):
             RMSNorm(expert_hidden_size, config.rms_norm_eps)
             if self.routed_expert_down_proj is not None
             and getattr(config, "latent_moe_use_norm", False) else None)
-        self.routed_expert_up_proj = (ReplicatedLinear(
+        self.routed_expert_up_proj = (make_latent_projection(
             expert_hidden_size,
             hidden_size,
             bias=False,

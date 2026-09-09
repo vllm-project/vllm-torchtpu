@@ -512,6 +512,14 @@ def rpa_kernel(
             ),
         )
         def _run(final_allocs, schedule_ref, dma_sem, scratches):
+            # Initialize Q to zeros to prevent NaN pollution.
+            #
+            # When a query block is partially filled, tail slots in uninitialized VMEM
+            # may contain residual NaNs. In our implementation, invalid Q rows bypass
+            # invalid row masking and produce NaNs in p_rowsum and later pollute
+            # l_scratch and acc_scratch. Once l_scratch / acc_scratch becomes NaN,
+            # subsequent iterations cannot recover (0 * NaN = NaN).
+
             # Initialize KV cache to zeros.
             # When perfomring p * v, we perform causal masking on lhs (p) by zeroing
             # out columns that should not be processed for a given row. Even if we
@@ -523,14 +531,16 @@ def rpa_kernel(
             # not NaNs, there will be no numeric concerns.
 
             scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
-            scratches[1][...] = jnp.zeros_like(scratches[1])
-            scratches[2][...] = jnp.zeros_like(scratches[2])
 
             num_lanes = pltpu.get_tpu_info().num_lanes
-            kv_alloc = final_allocs[1]
-            kv_ref_flat = kv_alloc.window_ref.bitcast(jnp.uint32).reshape(
-                -1, num_lanes)
-            kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
+            q_ref_flat = final_allocs[0].window_ref.bitcast(
+                jnp.uint32).reshape(-1, num_lanes)
+            kv_ref_flat = final_allocs[1].window_ref.bitcast(
+                jnp.uint32).reshape(-1, num_lanes)
+
+            # Explicitly zero out scratches and Q/KV buffers.
+            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                ref[...] = jnp.zeros_like(ref)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the

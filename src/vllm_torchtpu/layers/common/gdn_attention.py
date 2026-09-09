@@ -728,13 +728,16 @@ def _build_v3_pool_state_plan(
     recurrent_state_dtype: jnp.dtype = jnp.float32,
 ):
     """Describe this rank's GDN state regions in the unified pool."""
-    if pool_block_tokens % pool.shape[1] != 0:
+    block_size, payload, lanes = pool_adapters._pool_geometry(pool)
+    if pool_block_tokens % block_size != 0:
         raise ValueError("Manager block size must be divisible by the unified "
                          f"pool kernel block size: {pool_block_tokens} and "
-                         f"{pool.shape[1]}.")
-    split = pool_block_tokens // pool.shape[1]
-    per_tok_elems = math.prod(pool.shape[2:])
-    tok_bytes = per_tok_elems * jnp.dtype(pool.dtype).itemsize
+                         f"{block_size}.")
+    split = pool_block_tokens // block_size
+    if pool_adapters.is_seq_along_lane_pool():
+        tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
+    else:
+        tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
     state_layout = derive_pooled_gdn_state_layout(
         ssm_bytes=pooled_gdn_ssm_state_bytes(
             num_v_heads=n_v,
@@ -913,7 +916,7 @@ def run_jax_gdn_attention_pooled(
         - The updated pool (the in-place written state regions).
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
-    pool_spec = P(None, None, None, None)  # attention-shaped pool
+    pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
         P(None, "model"),  # j_mixed_qkv
         P(None, "model"),  # j_b

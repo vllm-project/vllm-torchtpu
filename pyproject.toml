@@ -38,7 +38,7 @@ dependencies = [
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260819190323",
+    "tpu-raiden-torch==0.0.1.dev20260827124357",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -109,6 +109,7 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 markers = [
     "nightly: tests that only run in the nightly CI workflow",
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
+    "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
 ]
 
 [tool.pyrefly]
@@ -129,6 +130,7 @@ preset = "basic"
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
+    "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
     "numpy", "numpy.*",

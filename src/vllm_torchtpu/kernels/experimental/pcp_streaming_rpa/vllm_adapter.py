@@ -59,6 +59,15 @@ def _torch_placeholder_with_sharding(
 class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
     """JaxCallable variant that allocates shard-map outputs with out_shardings."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-specialization normalized-MLIR fingerprints (#549). Newer
+        # torch_tpu JaxCallable constructors create this map themselves;
+        # older builds (e.g. 0.1.1.dev20260804) do not, and __call__ below
+        # relies on it either way.
+        if getattr(self, "kernel_key_to_mlir_fingerprint", None) is None:
+            self.kernel_key_to_mlir_fingerprint = {}
+
     def __call__(self, *args, **kwargs):
         self._validate_args(*args)
 

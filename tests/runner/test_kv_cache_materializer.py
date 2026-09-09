@@ -452,6 +452,7 @@ def test_hybrid_materialization_workload_a_geometry() -> None:
         },
         torch.float8_e4m3fn,
         enable_unified_kv_layout=True,
+        attention_backend=PallasAttentionBackend,
     )
     norm_attn = norm_specs["model.layers.0.self_attn"]
     norm_mamba = norm_specs["model.layers.1.mamba"]

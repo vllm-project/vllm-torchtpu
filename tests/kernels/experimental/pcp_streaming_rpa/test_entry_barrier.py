@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.multichip
+pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
 WORLD_SIZE = 8
 PAGE_SIZE = 256

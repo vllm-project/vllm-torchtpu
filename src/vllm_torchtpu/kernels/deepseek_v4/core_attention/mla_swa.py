@@ -1017,12 +1017,6 @@ def _mla_batched_decode_kernel(
                                       seq_batch_sz, bkv_sz, head_dim)
         q_batch = q_batch_vmem
 
-        s_mat = jnp.einsum("snd,smd->snm",
-                           q_batch,
-                           bkv_batch,
-                           preferred_element_type=jnp.float32)
-        s_mat *= sm_scale
-
         cur_start_offset_batch = jnp.maximum(kv_lens_batch - sliding_window,
                                              jnp.int32(0))
         m_vec = lax.broadcasted_iota(jnp.int32, (1, 1, bkv_sz), 2)
@@ -1030,6 +1024,17 @@ def _mla_batched_decode_kernel(
         q_span_batch = (kv_lens_batch - 1)[:, None, None]
         keep_batch = ((q_span_batch - k_span_batch).astype(jnp.uint32)
                       < jnp.uint32(sliding_window)) | (m_vec == 0)
+
+        # Slots past kv_left were not written this step and still hold whatever
+        # the previous kernel left in VMEM. Masking their scores is not enough,
+        # since 0 * NaN is NaN in the PV matmul, so zero the values too.
+        bkv_batch = jnp.where(jnp.swapaxes(keep_batch, 1, 2), bkv_batch, 0)
+
+        s_mat = jnp.einsum("snd,smd->snm",
+                           q_batch,
+                           bkv_batch,
+                           preferred_element_type=jnp.float32)
+        s_mat *= sm_scale
 
         s_mat = jnp.where(keep_batch, s_mat, jnp.finfo(jnp.float32).min)
         s_max = jnp.max(s_mat, axis=2, keepdims=True)

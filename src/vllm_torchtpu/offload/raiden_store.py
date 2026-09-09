@@ -69,6 +69,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
@@ -85,6 +86,9 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract, resolve_block_major_contract)
 
+if TYPE_CHECKING:
+    import torch
+
 logger = init_logger(__name__)
 
 # Upper bound (seconds) on a scheduler-side drain of in-flight store/load
@@ -99,6 +103,24 @@ _DRAIN_TIMEOUT_S = float(
 _SAVE_RETRIES = int(os.environ.get("VLLM_TPU_OFFLOAD_SAVE_RETRIES", "1"))
 
 _DEFAULT_CONTROLLER_PORT = 51515
+
+
+def iter_leaf_kv_cache_specs(kv_cache_spec):
+    """Yield the per-layer specs behind a KV cache group spec."""
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        for leaf in kv_cache_spec.kv_cache_specs.values():
+            yield from iter_leaf_kv_cache_specs(leaf)
+    else:
+        yield kv_cache_spec
+
+
+def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
+    """Whether this model's KV cache consists of multiple tensors
+       of different shapes.
+    """
+    return (vllm_config.model_config.architecture
+            in ("DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"))
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):
@@ -437,9 +459,24 @@ class RaidenOffloadingManager(OffloadingManager):
                           self._block_status.HOST_AND_HBM):
                 continue
             if status == self._block_status.HBM:
-                # Save still in flight (should be covered by the in-flight
-                # set above; kept as a consistency net).
-                return LookupResult.HIT_PENDING
+                if sub_hash in self._hash_to_admission:
+                    # A save for this sub-hash is genuinely in flight; the
+                    # scheduler should come back for it. (The common case is
+                    # already caught by the per-key in-flight set above; this
+                    # is the sub-hash-level net.)
+                    return LookupResult.HIT_PENDING
+                # HBM with no live job behind it is not a pending save. It is
+                # the residue of a save that failed and exhausted its retries
+                # -- `prepare_store` documents the same state from the store
+                # side. The store has no removal API, so the entry outlives
+                # the job that made it, and a host pool that can no longer
+                # accept writes never reclaims it. Answering HIT_PENDING here
+                # would park the request on a save that will never complete:
+                # the scheduler re-looks-up every step, gets HIT_PENDING
+                # again, and the request defers forever. The bytes are not on
+                # the host, so a load could not serve it either. It is a miss
+                # -- recompute, and let `prepare_store` re-offer the key.
+                return LookupResult.MISS
             if status == self._block_status.REMOTE and allow_remote:
                 if sub_hash in self._hash_to_admission:
                     # A read_remote for this sub-hash is already in flight;
@@ -955,7 +992,7 @@ def derive_offload_namespace(
         vllm_config: VllmConfig,
         *,
         kernel_block_size: int,
-        per_block_shape: tuple[int, ...],
+        per_block_shape: tuple[int, ...] | set[tuple[int, ...]],
         kv_dtype: object,
         device_block_size: int,
         world_size: int,
@@ -979,9 +1016,20 @@ def derive_offload_namespace(
         A 16-byte SHA-256 digest unique to this engine and layout configuration.
     """
     model_config = vllm_config.model_config
+    # A multi-shape layout hands over sets, whose iteration order is not
+    # stable across processes -- `torch.dtype` hashes by identity, so
+    # `repr({torch.uint8, torch.bfloat16})` differs between runs. Canonicalize
+    # to sorted tuples: the namespace must be a pure function of the config,
+    # or every restart re-salts the registry keys.
+    shape_field: object = (tuple(sorted(per_block_shape)) if isinstance(
+        per_block_shape, (set, frozenset)) else per_block_shape)
+    dtype_field: object = (tuple(sorted(
+        str(d)
+        for d in kv_dtype)) if isinstance(kv_dtype,
+                                          (set, frozenset)) else str(kv_dtype))
     material_fields = (model_config.model, model_config.revision,
-                       model_config.quantization, str(kv_dtype),
-                       kernel_block_size, per_block_shape, device_block_size,
+                       model_config.quantization, dtype_field,
+                       kernel_block_size, shape_field, device_block_size,
                        world_size, num_kv_cache_groups, num_kv_cache_tensors,
                        vllm_config.cache_config.prefix_caching_hash_algo,
                        "tpu-raiden-offload-ns1") + cp_geometry
@@ -997,9 +1045,53 @@ def derive_offload_namespace(
     return hashlib.sha256(material.encode()).digest()[:16]
 
 
+def is_multi_shapes_geometry(per_block_shape: object) -> bool:
+    """True when `resolve_kernel_geometry` resolved a multi-shape KV layout.
+
+    A multi-shape layout answers with the *set* of its per-block shapes
+    rather than one shape.
+    """
+    return isinstance(per_block_shape, (set, frozenset))
+
+
+def _resolve_multi_shapes_kv_geometry(
+    kv_cache_config: KVCacheConfig
+) -> tuple[int, set[tuple[int, ...]], set[object], int]:
+    from vllm.v1.kv_cache_interface import (MLAAttentionSpec,
+                                            SlidingWindowMLASpec)
+
+    groups = kv_cache_config.kv_cache_groups
+    for group in groups:
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
+            assert isinstance(
+                leaf, (MLAAttentionSpec, SlidingWindowMLASpec)), (
+                    "TPURaidenOffloadingConnector: an aliased KV "
+                    "layout has only MLA-family layers; got "
+                    f"{type(leaf).__name__}")
+
+    mla_leaves = [
+        leaf for group in groups
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
+        if isinstance(leaf, MLAAttentionSpec)
+    ]
+    assert mla_leaves
+    anchor_block_sizes = sorted({leaf.block_size for leaf in mla_leaves})
+    assert len(anchor_block_sizes) == 1
+    block_size = anchor_block_sizes[0]
+
+    # One entry per full-attention MLA cache.
+    per_block_shapes: set[tuple[int, ...]] = set()
+    kv_dtypes: set[object] = set()
+    for leaf in mla_leaves:
+        shape = (leaf.storage_block_size, leaf.num_kv_heads, leaf.head_size)
+        per_block_shapes.add(shape)
+        kv_dtypes.add(leaf.dtype)
+    return block_size, per_block_shapes, kv_dtypes, block_size
+
+
 def resolve_kernel_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> tuple[int, tuple[int, ...], object, int]:
+) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
     """Resolve physical TPU kernel geometry: (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
 
     Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
@@ -1010,6 +1102,8 @@ def resolve_kernel_geometry(
     - Hybrid (Attention + Mamba) models: Requires TPU's unified block pool, where all
       groups share uniform, attention-sized page rows. Attention geometry defines the
       common row unit, allowing the dense sub-hash expansion to apply uniformly.
+    - Multi-kv-shape models: a model whose kv cache consists of multiple tensors with
+      different shapes, it's handled by `_resolve_multi_shapes_kv_geometry`.
     """
     from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.worker.utils import select_common_block_size
@@ -1018,6 +1112,10 @@ def resolve_kernel_geometry(
 
     groups = kv_cache_config.kv_cache_groups
     assert groups, "TPURaidenOffloadingConnector: no KV cache groups"
+
+    if has_multi_shapes_kv_caches(vllm_config):
+        return _resolve_multi_shapes_kv_geometry(kv_cache_config)
+
     if len(groups) == 1:
         spec0 = groups[0].kv_cache_spec
         assert isinstance(spec0, FullAttentionSpec), (
@@ -1052,12 +1150,13 @@ def resolve_kernel_geometry(
         ), ("TPURaidenOffloadingConnector: unified pool groups must share one "
             "padded page size")
 
+    from vllm.config import set_current_vllm_config
+
     attn_backend = TpuPlatform._find_non_ssm_backend(vllm_config)
     if attn_backend is None:
         # In the EngineCore process, the model is not instantiated, so
         # _find_non_ssm_backend returns None. Resolve the attention backend
         # directly via get_attn_backend using the model configuration.
-        from vllm.config import set_current_vllm_config
         from vllm.v1.attention.selector import get_attn_backend
         model_config = vllm_config.model_config
         with set_current_vllm_config(vllm_config):
@@ -1072,15 +1171,18 @@ def resolve_kernel_geometry(
     assert not attn_backend.is_ssm(), (
         "TPURaidenOffloadingConnector: resolved attention backend is SSM: "
         f"{attn_backend.get_name()}")
-    kernel_block_size = select_common_block_size(spec0.block_size,
-                                                 [attn_backend])
-    full_5d_shape = attn_backend.get_kv_cache_shape(
-        num_blocks=1,
-        block_size=kernel_block_size,
-        num_kv_heads=spec0.num_kv_heads,
-        head_size=spec0.head_size,
-        cache_dtype_str=spec0.dtype,
-    )
+    # Both calls resolve the KV cache layout, which falls through to the KV
+    # connector and so needs a current config.
+    with set_current_vllm_config(vllm_config):
+        kernel_block_size = select_common_block_size(spec0.block_size,
+                                                     [attn_backend])
+        full_5d_shape = attn_backend.get_kv_cache_shape(
+            num_blocks=1,
+            block_size=kernel_block_size,
+            num_kv_heads=spec0.num_kv_heads,
+            head_size=spec0.head_size,
+            cache_dtype_str=spec0.dtype,
+        )
     per_block_shape = tuple(full_5d_shape[1:])
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
@@ -1123,6 +1225,28 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                                                       kv_cache_config)
         assert device_block_size % kernel_block_size == 0
         device_block_size_factor = device_block_size // kernel_block_size
+
+        if is_multi_shapes_geometry(per_block_shape):
+            # Branch for models whose kv cache consists of multiple tensors
+            # with different shapes. The resolved shapes describe those
+            # arrays but do not tile a common row, so registration walks the
+            # canonical tensors instead of computing bytes per kernel block.
+            assert block_major_contract is None, (
+                "block-major bundling not yet implemented for this code path")
+            assert device_block_size_factor == 1
+            device_tensors: list[torch.Tensor] = []
+            for kv_cache_tensor in kv_caches.tensors:
+                int8_view = kv_cache_tensor.tensor
+                page_size_bytes = kv_cache_tensor.page_size_bytes
+                storage_bytes = int8_view.numel() * int8_view.element_size()
+                assert storage_bytes == int8_view.shape[0] * page_size_bytes, (
+                    "canonical KV array is not whole pages: "
+                    f"storage_bytes={storage_bytes}, "
+                    f"rows={int8_view.shape[0]}, page={page_size_bytes}")
+                device_tensors.append(int8_view)
+            self._init_registration(device_tensors, host_blocks_to_allocate,
+                                    controller_address, rank)
+            return
 
         bytes_per_kernel_block = (
             int(np.prod(per_block_shape)) *
@@ -1182,6 +1306,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                     int8_view.untyped_storage()).view((num_kernel_blocks, ) +
                                                       per_block_shape))
 
+        self._init_registration(device_tensors, host_blocks_to_allocate,
+                                controller_address, rank)
+
+    def _init_registration(self, device_tensors: list[torch.Tensor],
+                           host_blocks_to_allocate: int,
+                           controller_address: str, rank: int) -> None:
         # Hold strong references to ensure PyTorch tensors remain allocated
         # while Raiden C++ retains raw pointers to their underlying storage.
         self._device_tensors = [[t] for t in device_tensors]

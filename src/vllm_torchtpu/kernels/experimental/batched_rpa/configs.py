@@ -97,7 +97,7 @@ class ServingConfigs:
         if self.pages_per_seq * self.page_size > jnp.iinfo(jnp.int16).max:
             return jnp.int32
         match pltpu.get_tpu_info().generation:
-            case 6 | 7:
+            case 6 | 7 | 8:
                 return jnp.int16
             case _:
                 return jnp.int32

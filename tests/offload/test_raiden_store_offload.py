@@ -401,11 +401,26 @@ class TestLookup(unittest.TestCase):
         self.assertEqual(self.manager.lookup(_key(0), _ctx()),
                          LookupResult.MISS)
 
-    def test_hbm_status_is_hit_pending(self):
+    def test_hbm_status_with_live_job_is_hit_pending(self):
+        # A save really is in flight for these sub-hashes: come back later.
         for h in sub_hashes(_key(0)):
             self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
+            self.manager._hash_to_admission[h] = object()
         self.assertEqual(self.manager.lookup(_key(0), _ctx()),
                          LookupResult.HIT_PENDING)
+
+    def test_hbm_status_without_live_job_is_miss(self):
+        # Same HBM status, but no job owns these sub-hashes: this is the
+        # residue of a save that failed and exhausted its retries. The store
+        # has no removal API, so the entry persists, and a host pool that can
+        # no longer accept writes never reclaims it. Answering HIT_PENDING
+        # parks the request on a save that will never complete and the
+        # scheduler defers it forever (design notes 5.6). It must miss.
+        for h in sub_hashes(_key(0)):
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
+        self.assertFalse(self.manager._hash_to_admission)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
+                         LookupResult.MISS)
 
     def test_remote_status_is_miss_without_registry(self):
         for h in sub_hashes(_key(0)):
@@ -481,12 +496,13 @@ class TestStoreJobLifecycle(unittest.TestCase):
         self.assertEqual(self.store.pinned_hashes(), {})
         # The store offers no way to remove a directory entry, so the sub-hash
         # whose save failed stays behind as an unpinned HBM entry — evictable,
-        # but visible until the store reclaims it. That leaves key 0 with a
-        # broken chain (its first sub-hash reads as a save still in flight, so
-        # the key is re-offered) while key 1 is fully host-resident (HIT,
-        # skipped by the directory probe).
+        # but visible until the store reclaims it. Key 0 must read MISS, not
+        # HIT_PENDING: no job owns that sub-hash any more, so "pending" would
+        # park the request on a save that will never complete and the
+        # scheduler would defer it forever (design notes 5.6). Key 1 is fully
+        # host-resident (HIT, skipped by the directory probe).
         self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT_PENDING)
+                         LookupResult.MISS)
         self.assertEqual(self.manager.lookup(_key(1), _ctx()),
                          LookupResult.HIT)
         out = self.manager.prepare_store([_key(0), _key(1)], _ctx())

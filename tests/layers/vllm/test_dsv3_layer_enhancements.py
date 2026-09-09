@@ -12,7 +12,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
 
-def test_pallas_attention_init_kwargs():
+def test_pallas_attention_init_kwargs(vllm_config_context):
     """Test that PallasAttentionBackendImpl accepts arbitrary kwargs like q_lora_rank without raising TypeError."""
     backend = PallasAttentionBackendImpl(
         num_heads=16,
@@ -30,7 +30,7 @@ def test_pallas_attention_init_kwargs():
     assert backend.head_size == 256
 
 
-def test_pallas_attention_forward_2d_reshape():
+def test_pallas_attention_forward_2d_reshape(vllm_config_context):
     """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors to 3D and restores 2D output."""
     q_len = 10
     num_heads = 4

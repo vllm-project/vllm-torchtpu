@@ -338,31 +338,13 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # shard, so the kernel does ep_size times the expert work for one batch
     # of output. Lifting the refusal usefully needs the bridge to hand each
     # rank a distinct 1/ep slice, which also removes the SMEM inflation.
-    # Prefill context parallelism has to be refused for a different reason,
-    # and it is the more dangerous of the two because it is silent.
-    # `do_naive_dispatch_combine` is not what runs the PCP exchange. Something
-    # else always does, and which one depends on whether MoE chunking is on:
-    # with it off, `MoERunner._maybe_dispatch`/`_maybe_combine` bracket the
-    # layer with a PCP all-gather and reduce-scatter (`pcp_size > 1 and not
-    # use_all2all_kernels`, which this tree's own
-    # `_patch_moe_explicit_pcp_collectives` forces for `use_ep and pcp_size > 1
-    # and dp_size == 1`); with it on, that patch stands down and
-    # `pipelined_fused_moe_gmm` owns the exchange instead. Either way the layer
-    # is bracketed. At pcp>1/dp1/tp1 the TP refusal below does not fire --
-    # `_tensor_parallel_size()` is 1 -- so the kernel would arm, return each
-    # rank's tokens already combined over every expert, and then have that
-    # reduce-scattered against seven identical copies: every routed MoE output
-    # multiplied by pcp_size, with nothing raised and nothing logged. So the
-    # refusal is on `pcp_size > 1` alone, not on who owns the exchange.
+    # PCP is not replicated TP: every PCP rank already presents a distinct
+    # token shard, exactly like DP does for this kernel.  The TPU MoERunner
+    # patch suppresses its explicit PCP all-gather/reduce-scatter only for a
+    # layer this function actually arms; refused layers keep the old fallback.
+    # Consequently the kernel is the sole dispatch/combine owner under PCP,
+    # independent of whether the separate GMM chunk pipeline is enabled.
     pcp = _pcp_size(layer)
-    if pcp > 1:
-        logger.warning_once(
-            "Fused EP MoE not engaged: prefill context parallelism "
-            "(pcp_size=%d) keeps vLLM's own all-gather/reduce-scatter around "
-            "the layer, and this kernel already combines over every expert, "
-            "so arming both would multiply the MoE output by %d.", pcp, pcp)
-        return None
-
     tp = _tensor_parallel_size()
     if tp > 1:
         logger.warning_once(
@@ -409,7 +391,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # forward is the scheduler's cap. A deployment whose largest batch is below
     # the threshold never builds the op at all; one above it uses the kernel
     # for every step, decode included.
-    max_node_tokens = _max_node_tokens(ep)
+    max_node_tokens = _max_node_tokens(ep, pcp)
     if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
         logger.info_once(
             "Fused EP MoE not engaged: the largest node-wide batch is %d "
@@ -445,8 +427,8 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                    sharded_plan)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "topk=%d capacity=%d sharded_plan=%s", hidden, inter, local_experts,
-        ep, topk, _TILE_M, sharded_plan)
+        "pcp=%d topk=%d capacity=%d sharded_plan=%s", hidden, inter,
+        local_experts, ep, pcp, topk, _TILE_M, sharded_plan)
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either
     # the padding mask or the chunked path. Padding costs expert work and
@@ -548,8 +530,15 @@ def _tensor_parallel_size() -> int:
         return 1
 
 
-def _max_node_tokens(ep: int) -> int:
-    """The largest node-wide token count a step can carry, or 0 if unknown."""
+def _max_node_tokens(ep: int, pcp: int = 1) -> int:
+    """The largest node-wide token count a step can carry, or 0 if unknown.
+
+    A DP scheduler cap is per independent batch, so every DP rank contributes
+    another cap's worth of tokens.  PCP ranks partition one scheduler batch;
+    multiplying by the full flattened EP width would count the same logical
+    tokens once per PCP shard.  TP is refused before this helper is called, so
+    ``ep // pcp`` is the number of independent DP batches represented here.
+    """
     from vllm.config import get_current_vllm_config
 
     try:
@@ -557,7 +546,10 @@ def _max_node_tokens(ep: int) -> int:
     except Exception:  # noqa: BLE001 - no config outside a served model
         return 0
     cap = getattr(cfg.scheduler_config, "max_num_batched_tokens", None)
-    return int(cap) * ep if isinstance(cap, int) else 0
+    if not isinstance(cap, int):
+        return 0
+    pcp = max(int(pcp), 1)
+    return int(cap) * max(ep // pcp, 1)
 
 
 def _smem_capacity_bytes() -> int:

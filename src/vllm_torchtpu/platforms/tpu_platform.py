@@ -352,9 +352,9 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
+    from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size  # isort: skip
     from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
-    from vllm_torchtpu import _patch_vllm_offloading_connector_spec  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_pcp_v2_validation()
@@ -371,8 +371,8 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_mamba_split_scheduler_block_size()
     _patch_vllm_offloading_config_build()
-    _patch_vllm_offloading_connector_spec()
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
@@ -393,9 +393,11 @@ def apply_tpu_patches() -> None:
     _patch_vllm_force_v1_runner_tpu()
     _patch_dflash_bypass_v2_runner_check()
     _patch_vllm_config_triton_tpu()
-    from vllm_torchtpu.model_loader_patches import \
-        patch_runai_sharded_expert_streaming
+    from vllm_torchtpu.model_loader_patches import (
+        patch_default_loader_ep_weight_filter,
+        patch_runai_sharded_expert_streaming)
     patch_runai_sharded_expert_streaming()
+    patch_default_loader_ep_weight_filter()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -1114,7 +1116,6 @@ class TpuPlatform(Platform):
                 "TPUConnector",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "OffloadingConnector",
                 "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
@@ -1124,8 +1125,7 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    in ("OffloadingConnector",
-                                        "TPURaidenOffloadingConnector")
+                                    == "TPURaidenOffloadingConnector"
                                     and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):
@@ -1144,38 +1144,45 @@ class TpuPlatform(Platform):
         if backend_cls is None:
             return
 
-        architectures = getattr(
-            getattr(vllm_config.model_config, "hf_config", None),
-            "architectures", None) or []
-        is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+        # `get_supported_kernel_block_sizes` and
+        # `get_kv_cache_shape` resolve the KV layout, which falls through
+        # to the KV connector and so needs a current config. Upstream's
+        # `update_block_size_for_backend` wraps the same calls.
+        from vllm.config.vllm import set_current_vllm_config
+        with set_current_vllm_config(vllm_config):
+            architectures = getattr(
+                getattr(vllm_config.model_config, "hf_config", None),
+                "architectures", None) or []
+            is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
 
-        if is_ds_v4 and not cache_config.user_specified_block_size:
-            # DSv4 pages hold compressed rows. Its backend's
-            # get_preferred_block_size is a hardcoded 256, which does not fit
-            # the packed latent record, so take the MLA page size directly.
-            from vllm_torchtpu.layers.vllm.attention import \
-                PallasMLAttentionBackend
-            cache_config.block_size = (  # type: ignore[assignment]
-                PallasMLAttentionBackend.get_page_size(vllm_config))
-        else:
-            is_hybrid = vllm_config.model_config.is_hybrid
-            if not is_hybrid and not cache_config.user_specified_block_size:
-                default = backend_cls.get_page_size(vllm_config)
+            if is_ds_v4 and not cache_config.user_specified_block_size:
+                # DSv4 pages hold compressed rows. Its backend's
+                # get_preferred_block_size is a hardcoded 256, which does not fit
+                # the packed latent record, so take the MLA page size directly.
+                from vllm_torchtpu.layers.vllm.attention import \
+                    PallasMLAttentionBackend
                 cache_config.block_size = (  # type: ignore[assignment]
-                    backend_cls.get_preferred_block_size(default))
-        if unified_kv_layout_enabled(vllm_config):
-            update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
+                    PallasMLAttentionBackend.get_page_size(vllm_config))
+            else:
+                is_hybrid = vllm_config.model_config.is_hybrid
+                if not is_hybrid and not cache_config.user_specified_block_size:
+                    default = backend_cls.get_page_size(vllm_config)
+                    cache_config.block_size = (  # type: ignore[assignment]
+                        backend_cls.get_preferred_block_size(default))
+            if unified_kv_layout_enabled(vllm_config):
+                update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
-        min_page_size = backend_cls.get_min_page_size(vllm_config)
-        if min_page_size > cache_config.block_size:
-            logger.warning(
-                "Increase the page size from %s to %s to make sure there's"
-                "no SMEM OOM",
-                cache_config.block_size,
-                min_page_size,
-            )
-            cache_config.block_size = min_page_size  # type: ignore[assignment]
-        logger.info("Using KV cache block size: %s", cache_config.block_size)
+            min_page_size = backend_cls.get_min_page_size(vllm_config)
+            if min_page_size > cache_config.block_size:
+                logger.warning(
+                    "Increase the page size from %s to %s to make sure there's"
+                    "no SMEM OOM",
+                    cache_config.block_size,
+                    min_page_size,
+                )
+                cache_config.block_size = min_page_size  # type: ignore[assignment]
+            logger.info("Using KV cache block size: %s",
+                        cache_config.block_size)
 
     @classmethod
     def is_pin_memory_available(cls):
