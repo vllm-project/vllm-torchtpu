@@ -27,7 +27,6 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
@@ -640,7 +639,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"by pcp_size={pcp_size}.")
 
         vllm_config = vllm_context.vllm_config
-        pool_is_seq_along_lane = get_kv_cache_layout() == "HND"
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
@@ -663,39 +661,32 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             distribution: jax.Array,
             seq_lens: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            pooled_state = _pooled_gdn_state_view(recurrent_state,
-                                                  pool_is_seq_along_lane)
-            new_pooled_state, outputs, z = (
-                run_jax_gdn_attention_pooled_pcp_prefill_projection(
-                    hidden_states,
-                    qkvz_weight,
-                    qkvz_weight_scale,
-                    b,
-                    a,
-                    pooled_state,
-                    conv_weight,
-                    conv_bias,
-                    A_log,
-                    dt_bias,
-                    state_indices,
-                    query_start_loc,
-                    distribution,
-                    seq_lens,
-                    mesh=pcp_mesh,
-                    n_kq=local_num_kq_heads,
-                    n_v=local_num_v_heads,
-                    d_k=d_k,
-                    d_v=d_v,
-                    kernel_size=kernel_size,
-                    pool_block_tokens=_pooled_gdn_block_tokens(
-                        vllm_config, recurrent_state, pooled_state,
-                        pool_is_seq_along_lane),
-                    pcp_size=pcp_size,
-                    interleave_size=interleave_size,
-                    recurrent_state_dtype=recurrent_state_dtype,
-                ))
-            return (new_pooled_state.reshape(recurrent_state.shape), outputs,
-                    z)
+            return run_jax_gdn_attention_pooled_pcp_prefill_projection(
+                hidden_states,
+                qkvz_weight,
+                qkvz_weight_scale,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                mesh=pcp_mesh,
+                n_kq=local_num_kq_heads,
+                n_v=local_num_v_heads,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                pool_block_tokens=vllm_config.cache_config.block_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                recurrent_state_dtype=recurrent_state_dtype,
+            )
 
         op_name = ("pallas::gdn_attention_pooled_pcp_fused_"
                    f"{self.prefix.replace('.', '_')}")

@@ -227,7 +227,7 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
-    def test_pooled_pcp_seq_on_lane_uses_standard_gdn_pool_view(
+    def test_pooled_pcp_seq_on_lane_uses_native_pool_layout(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, monkeypatch):
         vllm_envs.disable_envs_cache()
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
@@ -264,8 +264,8 @@ class TestVllmGatedDeltaNetAttention:
             args[5] = raw_pool
             new_pool, _, _ = captured["wrapped_fn"](*args)
 
-        assert captured["pooled_state"].shape == (8, 128, 1, 4, 128)
-        assert captured["pool_block_tokens"] == 2048
+        assert captured["pooled_state"].shape == raw_pool.shape
+        assert captured["pool_block_tokens"] == 4096
         assert new_pool.shape == raw_pool.shape
 
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
