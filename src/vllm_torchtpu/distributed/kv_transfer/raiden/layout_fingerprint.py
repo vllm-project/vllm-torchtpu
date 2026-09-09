@@ -203,7 +203,7 @@ def measured_kimi_k3_layout_fingerprint(
     if set(state_layouts) != {TAG_GDN_CONV, TAG_GDN_SSM}:
         raise ValueError("Kimi layout requires gdn.conv and gdn.ssm pools")
     payload["gdn_state_layouts"] = state_layouts
-    payload["gdn_conv_layout"] = "kda-tap-qkv-head-dim-bf16-v1"
+    payload["gdn_conv_layout"] = "kda-rank-blocked-tap-qkv-head-dim-bf16-v1"
     payload["state_fragment_heads"] = int(state_fragment_heads)
     return canonical_layout_fingerprint(payload), payload
 

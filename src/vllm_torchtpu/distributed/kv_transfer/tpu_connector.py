@@ -2973,8 +2973,6 @@ class TPURaidenConnectorWorker:
                             f"be physical-token aligned ({exact_tag})")
                 admitted_live_bytes = self._stage3_state_live_bytes(exact_tag)
                 if self._stage3_kimi:
-                    kda_config = (self.vllm_config.model_config.hf_text_config.
-                                  linear_attn_config)
                     registration = lower_kda_state_shard_spans(
                         tag=exact_tag,
                         block_id=int(block_id),
@@ -2982,12 +2980,6 @@ class TPURaidenConnectorWorker:
                         parallelism=parallelism,
                         dst_shards=int(tpu_envs.TPU_RAIDEN_DST_SHARDS),
                         regions=self._stage3_state_regions(exact_tag),
-                        row_bytes=self._stage3_glm_geometry["fa"][1],
-                        conv_kernel_size=int(
-                            kda_config["short_conv_kernel_size"]),
-                        local_num_heads=int(kda_config["num_heads"]) //
-                        self.tp_size,
-                        head_dim=int(kda_config["head_dim"]),
                     )
                 else:
                     registration = lower_gdn_state_shard_spans(

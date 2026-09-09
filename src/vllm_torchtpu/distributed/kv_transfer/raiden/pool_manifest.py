@@ -493,7 +493,9 @@ def _pooled_kda_regions(
     each live region start at byte zero, exactly like Qwen's ``gdn.ssm`` and
     ``gdn.conv`` pools; the only KDA-specific fact is that both regions are
     padded to complete packed rows. SSM padding can be omitted; convolution
-    retains its full row extent so every device DMA stays aligned.
+    retains aligned, padded source-head shards in rank order. The KDA pool
+    adapter restores logical tap/QKV/head order on load and reverses it on
+    store, so each source shard transfers as one contiguous byte range.
     """
     shapes = tuple(getattr(spec, "shapes", ()))
     dtypes = tuple(getattr(spec, "dtypes", ()))
@@ -524,7 +526,7 @@ def _pooled_kda_regions(
         ),
         TAG_GDN_CONV: (
             layout.ssm_tokens * row_bytes,
-            (RegionSpec("kda_conv_rows", 0, row_bytes, row_bytes,
+            (RegionSpec("kda_conv_rank_blocks", 0, row_bytes, row_bytes,
                         layout.conv_tokens), ),
         ),
     }

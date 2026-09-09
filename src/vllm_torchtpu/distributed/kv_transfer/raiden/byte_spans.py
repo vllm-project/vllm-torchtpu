@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
-from functools import lru_cache
 
 from .tags import TAG_GDN_CONV, TAG_GDN_SSM
 
@@ -331,12 +330,8 @@ def lower_kda_state_shard_spans(
     parallelism: int,
     dst_shards: int,
     regions: Sequence[object],
-    row_bytes: int,
-    conv_kernel_size: int,
-    local_num_heads: int,
-    head_dim: int,
 ) -> PoolSpanRegistration:
-    """Reshard KDA heads, preserving the stock kernel's dense state layout."""
+    """Concatenate aligned KDA head shards in the rank-blocked pool layout."""
     if not tag:
         raise ValueError("state pool tag must not be empty")
     if block_id < 0:
@@ -360,16 +355,22 @@ def lower_kda_state_shard_spans(
                                                    parallelism=fan_in,
                                                    regions=regions)
     elif tag == TAG_GDN_CONV or tag.startswith(f"{TAG_GDN_CONV}."):
-        live_bytes = sum(
-            int(_region_value(r, "unit_bytes")) *
-            int(_region_value(r, "num_units")) *
-            int(_region_value(r, "units_per_stride")) for r in regions)
-        spans = _kda_conv_shard_spans(live_bytes, row_bytes,
-                                      3 * (conv_kernel_size - 1),
-                                      local_num_heads * head_dim, fan_in,
-                                      rank_in_dst)
-        registration = PoolSpanRegistration(tag, (int(block_id), ), spans,
-                                            live_bytes)
+        if len(regions) != 1:
+            raise ValueError("KDA conv requires one rank-blocked region")
+        region = regions[0]
+        row_bytes = int(_region_value(region, "unit_bytes"))
+        rows = int(_region_value(region, "num_units"))
+        if (_region_value(region, "name") != "kda_conv_rank_blocks"
+                or int(_region_value(region, "offset_bytes")) != 0
+                or int(_region_value(region, "stride_bytes")) != row_bytes
+                or int(_region_value(region, "units_per_stride")) != 1
+                or row_bytes <= 0 or row_bytes % 4 or rows <= 0):
+            raise ValueError("KDA conv requires aligned rank-blocked rows")
+        live_bytes = row_bytes * rows
+        registration = PoolSpanRegistration(
+            tag, (int(block_id), ),
+            (PoolByteSpan(0, 0, 0, rank_in_dst * live_bytes, live_bytes), ),
+            live_bytes)
     else:
         raise ValueError(f"unsupported KDA state tag {tag!r}")
     destination_ordinal = dst_rank if dst_shards > 1 else None
@@ -378,76 +379,6 @@ def lower_kda_state_shard_spans(
         spans=tuple(
             dataclasses.replace(span, dst_unit_ordinal=destination_ordinal)
             for span in registration.spans))
-
-
-@lru_cache(maxsize=128)
-def _kda_conv_shard_spans(live_bytes: int, row_bytes: int, segments: int,
-                          segment_elems: int, fan_in: int,
-                          rank_in_dst: int) -> tuple[PoolByteSpan, ...]:
-    """Map (tap, QKV, local head, dim) through the bf16 pool's lane packing.
-
-    The full padded region is staged with aligned device DMA. These spans
-    rearrange its half-words in host memory before the full destination
-    region is uploaded. Padding is mapped separately from actual state.
-    Cache this shape-only lowering; request block IDs do not affect it.
-    """
-    if (min(live_bytes, row_bytes, segments, segment_elems) <= 0
-            or row_bytes % 4 or live_bytes % row_bytes
-            or 2 * segments * segment_elems > live_bytes):
-        raise ValueError("invalid KDA convolution geometry")
-    if fan_in == 1:
-        return (PoolByteSpan(0, 0, 0, 0, live_bytes), )
-    lanes = row_bytes // 4
-    local_elems = segments * segment_elems
-
-    def physical_offsets(count):
-        physical = []
-        for i in range(count):
-            row, within = divmod(i, 2 * lanes)
-            subrow, lane = divmod(within, lanes)
-            physical.append(row * row_bytes + lane * 4 + subrow * 2)
-        return physical
-
-    src_offsets = physical_offsets(local_elems)
-    dst_offsets = physical_offsets(local_elems * fan_in)
-    copies = []
-    for i, src in enumerate(src_offsets):
-        segment, within = divmod(i, segment_elems)
-        dst = dst_offsets[(segment * fan_in + rank_in_dst) * segment_elems +
-                          within]
-        copies.append((src, dst))
-    src_padding = sorted(set(range(0, live_bytes, 2)) - set(src_offsets))
-    dst_padding = sorted(
-        set(range(0, live_bytes * fan_in, 2)) - set(dst_offsets))
-    padding_start = rank_in_dst * len(src_padding)
-    copies.extend(
-        zip(src_padding,
-            dst_padding[padding_start:padding_start + len(src_padding)]))
-    # Combine equal-stride half-word copies into the existing span IR.
-    spans = []
-    i = 0
-    while i < len(copies):
-        src, dst = copies[i]
-        end = i + 1
-        src_stride = dst_stride = 0
-        if end < len(copies):
-            src_stride = copies[end][0] - src
-            dst_stride = copies[end][1] - dst
-            if src_stride > 0 and dst_stride > 0:
-                while (end < len(copies)
-                       and copies[end] == (src + (end - i) * src_stride, dst +
-                                           (end - i) * dst_stride)):
-                    end += 1
-        if src_stride == dst_stride == 2:
-            # Avoid expanding contiguous padding into half-word schedule
-            # entries in the native planner.
-            spans.append(PoolByteSpan(0, src, 0, dst, 2 * (end - i)))
-        else:
-            spans.append(
-                PoolByteSpan(0, src, 0, dst, 2, max(src_stride, 0),
-                             max(dst_stride, 0), end - i))
-        i = end
-    return tuple(spans)
 
 
 def lower_glm_row_spans(

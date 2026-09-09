@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi Stage-3 declarations must reconstruct the state the KDA kernel reads.
 
-The stock pool adapters write real TPU source pools. Raiden stages their
+The rank-blocked pool adapters write real TPU source pools. Raiden stages their
 physical bytes, the declared spans reshard them, and Raiden uploads into a
-destination pool. The stock adapters must read the original dense states.
+destination pool. The adapters must read the original dense states.
 This isolates the layout contract from the controller and model weights.
 """
 
@@ -34,18 +34,24 @@ def _run_state_transfer(parallelism, dst_shards):
         measured_kimi_k3_layout_fingerprint
     from vllm_torchtpu.kernels import pool_adapters
 
+    src_heads = 96 // parallelism
+
     def ops(heads):
         layout = derive_pooled_gdn_state_layout(ssm_bytes=heads * 128 * 128 *
                                                 4,
                                                 conv_bytes=9 * heads * 128 * 2,
                                                 token_bytes=2560)
+        fragments = heads // src_heads
+        fragment_elems = layout.conv_tokens * 1280 // fragments
 
         def seed(pool: jax.Array, conv: jax.Array,
                  ssm: jax.Array) -> jax.Array:
             ids = jnp.array([1], jnp.int32)
-            conv = jnp.pad(conv.reshape(1, -1),
-                           ((0, 0),
-                            (0, layout.conv_tokens * 1280 - conv.size)))
+            parts = []
+            for start in range(0, heads, src_heads):
+                part = conv[:, :, start:start + src_heads].reshape(-1)
+                parts.append(jnp.pad(part, (0, fragment_elems - part.size)))
+            conv = jnp.concatenate(parts)
             pool = pool_adapters.scatter_region(pool,
                                                 conv.reshape(1, -1, 640),
                                                 ids,
@@ -62,12 +68,17 @@ def _run_state_transfer(parallelism, dst_shards):
 
         def read(pool: jax.Array) -> tuple[jax.Array, jax.Array]:
             ids = jnp.array([1], jnp.int32)
-            conv = pool_adapters.gather_region(
-                pool,
-                ids,
-                tok0=layout.ssm_tokens,
-                ntok=layout.conv_tokens,
-                out_dtype=jnp.bfloat16).reshape(-1)[:9 * heads * 128]
+            conv = pool_adapters.gather_region(pool,
+                                               ids,
+                                               tok0=layout.ssm_tokens,
+                                               ntok=layout.conv_tokens,
+                                               out_dtype=jnp.bfloat16).reshape(
+                                                   fragments, fragment_elems)
+            conv = jnp.concatenate([
+                conv[i, :9 * src_heads * 128].reshape(3, 3, src_heads, 128)
+                for i in range(fragments)
+            ],
+                                   axis=2)
             ssm = pool_adapters.gather_region(pool,
                                               ids,
                                               tok0=0,
@@ -82,7 +93,6 @@ def _run_state_transfer(parallelism, dst_shards):
                 pallas.jax_op(f"pallas::stage3_kda_read_{heads}",
                               read), layout)
 
-    src_heads = 96 // parallelism
     fan_in = parallelism // dst_shards
     dst_heads = src_heads * fan_in
     src_seed, src_read, src_layout = ops(src_heads)
@@ -136,17 +146,14 @@ def _run_state_transfer(parallelism, dst_shards):
             ref = engine.get_block_ref(index, 1)
             extent = max(r.extent_end_bytes for r in entry.regions)
             raw = ctypes.string_at(ref["ptr"], extent)
-            registration = lower_kda_state_shard_spans(
-                tag=entry.tag,
-                block_id=1,
-                transfer_rank=rank,
-                parallelism=parallelism,
-                dst_shards=dst_shards,
-                regions=entry.regions,
-                row_bytes=2560,
-                conv_kernel_size=4,
-                local_num_heads=src_heads,
-                head_dim=128)
+            registration = lower_kda_state_shard_spans(tag=entry.tag,
+                                                       block_id=1,
+                                                       transfer_rank=rank,
+                                                       parallelism=parallelism,
+                                                       dst_shards=dst_shards,
+                                                       regions=entry.regions)
+            assert len(registration.spans) == 1
+            assert registration.spans[0].count == 1
             _copy_registration(compact_destinations[index],
                                _extent_bytes(raw, _live_extents(entry)),
                                registration)

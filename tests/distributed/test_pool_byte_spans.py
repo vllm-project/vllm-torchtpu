@@ -102,21 +102,27 @@ def _copy_registration(destination: bytearray, source: bytes,
                                                             span.size_bytes]
 
 
-def _kda_physical_state(state, pool):
+def _kda_physical_state(state, pool, shard_heads=None):
     if pool.tag.startswith("gdn.ssm"):
         return state.astype("<f4").tobytes()
     # Independent XLA nested-tiling oracle over the kernel's logical conv
     # tensor. Every tap, Q/K/V, head and lane carries different data.
-    flat = state.astype("<u2").reshape(-1)
-    padded = np.pad(flat, (0, pool.live_bytes_per_block // 2 - flat.size))
-    padded = padded.reshape(-1, 2, 640)
+    heads = state.shape[2]
+    shard_heads = heads if shard_heads is None else shard_heads
+    shard_capacity = pool.live_bytes_per_block // 2 // (heads // shard_heads)
+    chunks = []
+    for start in range(0, heads, shard_heads):
+        flat = state[:, :, start:start + shard_heads].astype("<u2").reshape(-1)
+        chunks.append(np.pad(flat, (0, shard_capacity - flat.size)))
+    padded = np.concatenate(chunks).reshape(-1, 2, 640)
     return _apply_xla_tiled_layout(padded, (2, 1, 0),
                                    ((2, 128), (2, 1))).tobytes()
 
 
 @pytest.mark.parametrize("parallelism,dst_shards", [(8, 8), (8, 4), (32, 32),
                                                     (32, 8)])
-def test_kda_reshard_matches_dense_kernel_layout(parallelism, dst_shards):
+def test_kda_reshard_matches_rank_blocked_kernel_layout(
+        parallelism, dst_shards):
     local_heads = 96 // parallelism
     source_manifest = kimi_pool_manifest(local_heads)
     fan_in = parallelism // dst_shards
@@ -148,13 +154,13 @@ def test_kda_reshard_matches_dense_kernel_layout(parallelism, dst_shards):
                 transfer_rank=rank,
                 parallelism=parallelism,
                 dst_shards=dst_shards,
-                regions=source_pool.regions,
-                row_bytes=2560,
-                conv_kernel_size=4,
-                local_num_heads=local_heads,
-                head_dim=128)
+                regions=source_pool.regions)
             dst_rank = rank // fan_in
             assert registration.declared_bytes == len(source)
+            # One native chunk per source/pool/block, including heterogeneous
+            # convolution state: never a half-word list exceeding IOV_MAX.
+            assert len(registration.spans) == 1
+            assert registration.spans[0].count == 1
             for span in registration.spans:
                 assert span.dst_unit_ordinal == dst_rank
                 for repeat in range(span.count):
@@ -166,9 +172,21 @@ def test_kda_reshard_matches_dense_kernel_layout(parallelism, dst_shards):
                                (rank + 1) * local_heads * fan_in)
             state = (global_state[:, :, head_slice]
                      if is_conv else global_state[head_slice])
-            raw = _kda_physical_state(state, dest_pool)
+            raw = _kda_physical_state(state, dest_pool, local_heads)
             assert destination == _extent_bytes(raw, _live_extents(dest_pool))
             np.testing.assert_array_equal(coverage[rank], 1)
+
+
+def test_kda_conv_rejects_unblocked_layout():
+    # The old pool has identical sizes but incompatible head/lane order.
+    with pytest.raises(ValueError, match="rank-blocked"):
+        lower_kda_state_shard_spans(tag="gdn.conv.g0",
+                                    block_id=1,
+                                    transfer_rank=0,
+                                    parallelism=32,
+                                    dst_shards=8,
+                                    regions=(RegionSpec(
+                                        "kda_conv_rows", 0, 2560, 2560, 4), ))
 
 
 def test_gdn_conv_pair_shards_reassemble_rank_blocks():

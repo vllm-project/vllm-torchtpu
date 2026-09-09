@@ -153,6 +153,10 @@ def test_kimi_fingerprint_accepts_tp32_to_tp8_page_geometry():
         "gdn.ssm": 196608
     }
     assert payload["state_fragment_heads"] == 3
+    assert payload["gdn_conv_layout"] == (
+        "kda-rank-blocked-tap-qkv-head-dim-bf16-v1")
+    legacy = dict(payload, gdn_conv_layout="kda-tap-qkv-head-dim-bf16-v1")
+    assert rlf.canonical_layout_fingerprint(legacy) != fingerprint
     other, _ = rlf.measured_kimi_k3_layout_fingerprint(
         kimi_pool_manifest(12),
         page_tokens=648,
