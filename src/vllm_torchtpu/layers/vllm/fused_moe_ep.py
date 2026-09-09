@@ -406,7 +406,9 @@ def prebuild_fused_moe_ep(layer,
         w1_scale = layer.w13_weight_scale_inv
         w2_scale = layer.w2_weight_scale_inv
     local_experts, hidden = w1.shape[0], w1.shape[1]
-    inter = w1.shape[2] // 2
+    # Torch stores two FP4 output elements per byte; JAX sees the logical
+    # width after the bridge converts the native FP4 tensor.
+    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
 
     # The threshold is applied here rather than per step: the op is shape
     # agnostic, so the only place a token count is known outside the traced
@@ -495,7 +497,8 @@ def _unsupported_reason(layer,
     """Why this layer cannot use the fused kernel, or None if it can."""
     if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != local_experts:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
-    if w2.shape[1] != inter or w2.shape[2] != hidden:
+    packing = 2 if weight_format == "fp4" else 1
+    if w2.shape[1] != inter or w2.shape[2] * packing != hidden:
         return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
     if activation != "silu":
         return f"activation {activation!r} is not wired to the kernel's ACT_FNS"

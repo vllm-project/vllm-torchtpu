@@ -462,9 +462,8 @@ class TestFusedOutputIsReducedPatch:
 
 def _fp4_layer():
     layer = _layer(experts=1, hidden=512, inter=512)
-    layer.w13_weight = torch.empty((1, 512, 1024),
-                                   dtype=torch.float4_e2m1fn_x2)
-    layer.w2_weight = torch.empty((1, 512, 512), dtype=torch.float4_e2m1fn_x2)
+    layer.w13_weight = torch.empty((1, 512, 512), dtype=torch.float4_e2m1fn_x2)
+    layer.w2_weight = torch.empty((1, 512, 256), dtype=torch.float4_e2m1fn_x2)
     layer.w13_weight_scale = torch.ones(1, 1, 1, 1024)
     layer.w2_weight_scale = torch.ones(1, 1, 1, 512)
     del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
@@ -557,7 +556,8 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     def requant(w, scales, block):
         seen.append((scales.clone(), block))
         e, n, half_k = w.shape
-        return (torch.empty((e, half_k * 2, n), dtype=torch.float4_e2m1fn_x2),
+        return (torch.empty((e, half_k * 2, n // 2),
+                            dtype=torch.float4_e2m1fn_x2),
                 torch.ones(e, half_k * 2 // block, 1, n))
 
     def op(*args):
