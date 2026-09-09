@@ -1186,6 +1186,35 @@ def _compact_state_updates_shape(
                                 state_source.dtype)
 
 
+def _validate_compact_state_writeback_plan(
+        state_plan: config.StateSourcePlan) -> None:
+    """Reject whole-page state plans that cannot be scattered independently.
+
+    The PCP kernel emits separate compact Conv and recurrent updates. With HND
+    each update contains complete source pages, so both regions must start at a
+    page boundary and must not cover the same page. Otherwise the later
+    full-page scatter would overwrite state written by the earlier one.
+    """
+    if not state_plan.whole_block_dma:
+        return
+
+    regions = (("conv", state_plan.conv), ("recurrent", state_plan.recurrent))
+    for name, region in regions:
+        if region.row0 != 0:
+            raise NotImplementedError(
+                "PCP HND state writeback requires page-aligned state regions; "
+                f"{name} starts at row {region.row0}.")
+
+    conv_end = state_plan.conv.kb0 + state_plan.conv.nblocks
+    recurrent_end = (state_plan.recurrent.kb0 + state_plan.recurrent.nblocks)
+    regions_overlap = (state_plan.conv.kb0 < recurrent_end
+                       and state_plan.recurrent.kb0 < conv_end)
+    if regions_overlap:
+        raise NotImplementedError(
+            "PCP HND state writeback requires non-overlapping Conv and "
+            "recurrent state pages.")
+
+
 @functools.partial(
     jax.jit,
     donate_argnames=("state_source", ),
@@ -1352,6 +1381,7 @@ def fused_qkvz_projection_pcp_gdn(
     if state_source.ndim < 3:
         raise ValueError("The unified state source must have at least three "
                          f"dimensions, got {state_source.shape}.")
+    _validate_compact_state_writeback_plan(state_plan)
 
     global_stage_tokens = pcp_size * comm_chunk_size
     tile_size = min(mixed_tile_size, global_stage_tokens, global_batch_size)
