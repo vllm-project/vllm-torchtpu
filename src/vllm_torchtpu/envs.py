@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_ENABLE_WORKER_ERROR_MONITOR: bool = False
 
 
 def env_with_choices(
@@ -456,6 +457,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Monitor worker exceptions via dedicated error pipe to fail fast on
+    # worker exceptions and prevent collective deadlocks.
+    "TPU_ENABLE_WORKER_ERROR_MONITOR":
+    env_bool("TPU_ENABLE_WORKER_ERROR_MONITOR", default=False),
 }
 
 

@@ -675,6 +675,264 @@ def _patch_moe_no_ep_tp_scope() -> None:
         "Applied TPU patch: scope non-EP MoE TP inside each DP engine.")
 
 
+def _multiproc_make_worker_process(
+    vllm_config,
+    local_rank: int,
+    rank: int,
+    distributed_init_method: str,
+    input_shm_handle,
+    shared_worker_lock,
+    is_driver_worker: bool,
+    inherited_fds: list[int] | None = None,
+):
+    import multiprocessing
+
+    from vllm.v1.executor.multiproc_executor import UnreadyWorkerProcHandle
+    try:
+        from vllm.v1.utils import numa_utils
+    except ImportError:
+        from vllm.utils import numa_utils
+
+    context = multiprocessing.get_context()
+    ready_reader, ready_writer = context.Pipe(duplex=False)
+    death_reader, death_writer = context.Pipe(duplex=False)
+    error_reader, error_writer = context.Pipe(duplex=False)
+
+    if inherited_fds is not None:
+        inherited_fds = inherited_fds.copy()
+        inherited_fds.extend((
+            ready_reader.fileno(),
+            error_reader.fileno(),
+            death_writer.fileno(),
+        ))
+
+    process_kwargs = {
+        "vllm_config": vllm_config,
+        "local_rank": local_rank,
+        "rank": rank,
+        "distributed_init_method": distributed_init_method,
+        "input_shm_handle": input_shm_handle,
+        "ready_pipe": ready_writer,
+        "death_pipe": death_reader,
+        "error_pipe": error_writer,
+        "shared_worker_lock": shared_worker_lock,
+        "is_driver_worker": is_driver_worker,
+        "inherited_fds": inherited_fds if inherited_fds is not None else [],
+    }
+    proc = context.Process(
+        target=_multiproc_worker_main,
+        kwargs=process_kwargs,
+        name=f"VllmWorker-{rank}",
+        daemon=True,
+    )
+    with numa_utils.configure_subprocess(vllm_config,
+                                         local_rank,
+                                         process_kind="worker"):
+        proc.start()
+
+    ready_writer.close()
+    death_reader.close()
+    error_writer.close()
+
+    handle = UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+    handle.error_reader = error_reader
+    return handle
+
+
+def _multiproc_wait_for_response_handle_ready(handles, proc_handle):
+    from vllm.v1.executor.multiproc_executor import WorkerProc
+
+    orig = getattr(WorkerProc, "_tpu_orig_wait_for_response_handle_ready",
+                   WorkerProc.wait_for_response_handle_ready)
+    result = orig(handles, proc_handle)
+    result.error_reader = getattr(proc_handle, "error_reader", None)
+    return result
+
+
+def _multiproc_execute_worker_rpc(self, rpc_request):
+    import traceback
+    from functools import partial
+
+    import cloudpickle
+    method, args, kwargs, output_rank = rpc_request
+    try:
+        if isinstance(method, str):
+            func = getattr(self.worker, method)
+        elif isinstance(method, bytes):
+            func = partial(cloudpickle.loads(method), self.worker)
+
+        output = func(*args, **kwargs)
+
+        if output_rank is None or self.rank == output_rank:
+            self.handle_output(output)
+    except Exception as e:
+        if hasattr(e, "add_note"):
+            e.add_note(traceback.format_exc())
+        logger.exception("WorkerProc hit an exception.")
+        if getattr(self, "error_writer", None) is not None:
+            try:
+                self.error_writer.send((str(e), traceback.format_exc()))
+            except Exception:
+                pass
+        if output_rank is None or self.rank == output_rank:
+            self.handle_output(e)
+
+
+def _multiproc_worker_busy_loop(self):
+    """Main busy loop for Multiprocessing Workers with error reporting."""
+    assert self.rpc_broadcast_mq is not None
+    while True:
+        rpc_request = self.rpc_broadcast_mq.dequeue(indefinite=True)
+        self._execute_worker_rpc(rpc_request)
+
+
+def _multiproc_worker_main(*args, **kwargs):
+    import os as _os
+
+    from vllm.v1.executor.multiproc_executor import WorkerProc
+
+    from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
+
+    vllm_config = kwargs.get("vllm_config")
+    if vllm_config is not None:
+        rank = kwargs.get("rank", 0)
+        local_rank = kwargs.get("local_rank", 0)
+        pc = vllm_config.parallel_config
+        binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
+        _os.environ.update(binding.as_env())
+        logger.info(
+            "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
+            "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
+            "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
+            "init_local_rank=%d)", binding.rank, binding.local_rank,
+            binding.world_size, binding.local_world_size, rank, local_rank,
+            binding.dp_rank, binding.dp_size, binding.local_rank_offset,
+            binding.init_local_rank)
+
+    error_pipe = kwargs.pop("error_pipe", None)
+    orig_worker_init = WorkerProc.__init__
+
+    def patched_worker_init(self, *w_args, **w_kwargs):
+        orig_worker_init(self, *w_args, **w_kwargs)
+        self.error_writer = error_pipe
+
+    WorkerProc.__init__ = patched_worker_init
+    WorkerProc._execute_worker_rpc = _multiproc_execute_worker_rpc
+    WorkerProc.worker_busy_loop = _multiproc_worker_busy_loop
+    orig = getattr(WorkerProc, "_tpu_orig_worker_main", WorkerProc.worker_main)
+    try:
+        return orig(*args, **kwargs)
+    finally:
+        if error_pipe is not None:
+            error_pipe.close()
+
+
+def _multiproc_start_worker_monitor(self, inline=False) -> None:
+    import multiprocessing
+    import multiprocessing.connection
+    import weakref
+    from threading import Thread
+
+    workers = self.workers
+    self_ref = weakref.ref(self)
+
+    def monitor_workers():
+        handles = {
+            target: h
+            for h in workers
+            for target in (h.proc.sentinel, getattr(h, "error_reader", None))
+            if target is not None
+        }
+        ready = multiprocessing.connection.wait(handles.keys())
+        _self = self_ref()
+        if not _self or getattr(_self, "shutting_down", False):
+            logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
+            return
+        _self.is_failed = True
+        target = ready[0]
+        worker = handles[target]
+
+        if target == worker.proc.sentinel:
+            logger.error(
+                "Worker proc %s died unexpectedly (exit code: %s), "
+                "shutting down executor.",
+                worker.proc.name,
+                worker.proc.exitcode,
+            )
+        else:
+            try:
+                err_msg, tb = target.recv()
+                logger.error(
+                    "Worker proc %s encountered exception: %s\n%s",
+                    worker.proc.name,
+                    err_msg,
+                    tb,
+                )
+            except EOFError:
+                logger.error(
+                    "Worker proc %s error pipe closed unexpectedly, "
+                    "shutting down executor.",
+                    worker.proc.name,
+                )
+
+        _self.shutdown()
+        callback = _self.failure_callback
+        if callback is not None:
+            _self.failure_callback = None
+            callback()
+
+    if not inline:
+        Thread(target=monitor_workers,
+               daemon=True,
+               name="MultiprocWorkerMonitor").start()
+        return
+
+    monitor_workers()
+
+
+def _patch_multiproc_worker_error_monitor() -> None:
+    """Patch MultiprocExecutor to detect worker exceptions via error pipe in background monitor thread.
+
+    Workers report unhandled exceptions over a dedicated error pipe so the
+    background monitor thread can immediately interrupt blocked collective reads
+    via _spin_condition cancellation, eliminating collective deadlock without
+    altering the shared-memory reading sequence or adding hot-path polling overhead.
+    """
+    if not envs.TPU_ENABLE_WORKER_ERROR_MONITOR:
+        return
+
+    from vllm.v1.executor.multiproc_executor import (MultiprocExecutor,
+                                                     WorkerProc)
+
+    if getattr(MultiprocExecutor, "_tpu_worker_error_monitor_patch", False):
+        return
+
+    if not hasattr(WorkerProc, "_tpu_orig_worker_main"):
+        WorkerProc._tpu_orig_worker_main = WorkerProc.worker_main
+    if not hasattr(WorkerProc, "_tpu_orig_wait_for_response_handle_ready"):
+        WorkerProc._tpu_orig_wait_for_response_handle_ready = (
+            WorkerProc.wait_for_response_handle_ready)
+
+    was_rank_env_patched = getattr(WorkerProc, "_tpu_global_rank_env_patch",
+                                   False)
+
+    WorkerProc.make_worker_process = staticmethod(
+        _multiproc_make_worker_process)
+    WorkerProc.wait_for_response_handle_ready = staticmethod(
+        _multiproc_wait_for_response_handle_ready)
+    WorkerProc.worker_main = staticmethod(_multiproc_worker_main)
+    WorkerProc._execute_worker_rpc = _multiproc_execute_worker_rpc
+    WorkerProc.worker_busy_loop = _multiproc_worker_busy_loop
+    MultiprocExecutor.start_worker_monitor = _multiproc_start_worker_monitor
+    MultiprocExecutor._tpu_worker_error_monitor_patch = True
+    logger.info(
+        "Applied TPU patch: MultiprocExecutor worker error monitor thread.")
+
+    if was_rank_env_patched:
+        WorkerProc._tpu_global_rank_env_patch = False
+        _patch_multiproc_worker_global_rank_env()
+
+
 def _patch_multiproc_worker_global_rank_env() -> None:
     """Set TorchTPU binding env on spawned workers before torch_tpu import.
 

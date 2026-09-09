@@ -17,8 +17,10 @@ class TpuMultiprocExecutor(MultiprocExecutor):
 
     def _init_executor(self) -> None:
         # EngineCore does not run platform patch setup before spawning workers.
-        from vllm_torchtpu import _patch_multiproc_worker_global_rank_env
+        from vllm_torchtpu import (_patch_multiproc_worker_error_monitor,
+                                   _patch_multiproc_worker_global_rank_env)
         _patch_multiproc_worker_global_rank_env()
+        _patch_multiproc_worker_error_monitor()
         super()._init_executor()
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
