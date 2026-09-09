@@ -340,6 +340,38 @@ class KVCacheManager:
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
+
+        # Cross-model KV sharing (Gemma-4-style MTP) rides the same path as
+        # within-model sharing. The drafter is loaded before `get_kv_cache_spec`
+        # runs, so its `Attention` modules are already in the static forward
+        # context with `kv_sharing_target_layer_name` set and the loop above has
+        # registered them. Verify that rather than re-registering: a draft layer
+        # reaching this point unregistered would be allocated its own KV cache
+        # and would silently write there instead of into the target's.
+        drafter = getattr(self.runner, "drafter", None)
+        if (
+            self.runner._is_async_drafter
+            and getattr(drafter, "draft_model", None) is not None
+        ):
+            for draft_idx, layer in enumerate(drafter.draft_model.model.layers):
+                attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+                if attn is None or attn.kv_sharing_target_layer_name is None:
+                    continue
+                name = f"draft_model.layers.{draft_idx}.self_attn.attn"
+                target = attn.kv_sharing_target_layer_name
+                if self.runner.shared_kv_cache_layers.get(name) != target:
+                    raise RuntimeError(
+                        f"Draft layer {name} declares KV sharing with {target} "
+                        "but was not registered as a shared layer. It would be "
+                        "given its own KV cache and write there instead of the "
+                        "target's."
+                    )
+                if name in kv_cache_spec:
+                    raise RuntimeError(
+                        f"Draft layer {name} shares KV with {target} but still "
+                        "has its own KVCacheSpec."
+                    )
+
         kv_cache_spec = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.runner.kv_cache_dtype,

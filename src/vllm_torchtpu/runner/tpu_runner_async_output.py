@@ -208,7 +208,7 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return input_ids[logits_indices][target_logits_indices + 1]
+    return input_ids[logits_indices[target_logits_indices + 1]]
 
 
 def compute_num_rejected(

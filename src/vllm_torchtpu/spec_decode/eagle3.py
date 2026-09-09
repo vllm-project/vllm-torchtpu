@@ -15,11 +15,13 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -145,6 +147,12 @@ class Eagle3Proposer:
         # load_model by diffing the global attention-layer registry before
         # vs after the draft model loads.
         self._draft_attn_layer_names: set[str] | None = None
+        # True once load_model has wired this draft's attention layers to read
+        # the target's KV cache (cross-model KV sharing, Gemma-4-style MTP).
+        # Resolved from the draft model's own declaration, NOT from
+        # speculative_config.method: `mtp` also covers DeepSeek-V4 MTP, whose
+        # draft owns its KV cache. Drives `advance_draft_positions`.
+        self._draft_kv_shared: bool = False
         # Populated per-step by the runner with the per-chunk draft inputs
         # (token ids, positions, attn ctx, aux hidden states) captured
         # during the target verify forward.
@@ -164,6 +172,18 @@ class Eagle3Proposer:
         self._mtp_loop_model: torch.nn.Module | None = None
         # Whether that program has run once (its first run compiles it).
         self._mtp_loop_model_warm = False
+
+    @property
+    def advance_draft_positions(self) -> bool:
+        """Whether each propose step advances the draft's positions/seq_lens.
+
+        A draft that owns its KV cache (eagle3, DeepSeek-V4 MTP) appends one
+        token per step, so both advance by 1. A cross-model KV-sharing draft
+        (Gemma-4 MTP) is Q-only: it writes no KV slots, and every step re-reads
+        the same target prefix with only the query changing, so both stay
+        fixed. Mirrors `Gemma4Speculator.advance_draft_positions` upstream.
+        """
+        return not self._draft_kv_shared
 
     def load_model(self, target_model) -> None:
         """Load the draft model and share embeddings/lm_head with target.
@@ -211,10 +231,29 @@ class Eagle3Proposer:
                     "installed vLLM lacks it — check the vLLM version/checkout."
                 ) from e
             set_eagle3_aux_hidden_state_layers(target_model, self.speculative_config)
+
+        if self.speculative_config.method == "mtp":
+            self._setup_gemma4_kv_sharing(target_model, target_attn_layer_names)
+
         self._validate_mtp_layer_count()
         self._init_mtp_index_sharing()
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
+
+        # IndexShare assumes the draft owns its KV cache and advances
+        # positions once per step; cross-model KV sharing freezes them and
+        # makes every step re-read the same target prefix. Nothing today can
+        # set both — a DSA draft never takes the Gemma-4 wiring path, and a
+        # Gemma-4 draft has no topk_indices_buffer — but the propose loop
+        # guards the two independently, so pin the invariant here rather than
+        # let a future DSA+KV-sharing draft find it at runtime.
+        if self._share_mtp_indices and self._draft_kv_shared:
+            raise RuntimeError(
+                "IndexShare and cross-model KV sharing are both enabled on "
+                "this draft. IndexShare's saved top-k rows assume positions "
+                "advance per draft step, which cross-model KV sharing "
+                "freezes; the combination is unvalidated."
+            )
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
@@ -445,6 +484,135 @@ class Eagle3Proposer:
         """Put this chunk's step-0 rows back at the front before its forward."""
         for buf, rows in zip(self._mtp_topk_buffers, saved):
             buf[: rows.shape[0]] = rows
+
+    def _validate_kv_sharing_supported(self) -> None:
+        """Fail closed on TPU paths that cannot honour `skip_kv_update`.
+
+        A cross-model KV-sharing draft is only safe when the attention impl
+        actually skips the KV write — otherwise its zeroed dummy K/V lands in
+        the target's cache. Two TPU paths reject `skip_kv_update` when the
+        kernel is built (`PallasAttentionBackendImpl._validate_pcp_streaming_
+        support`, and the bundled block-major RPA); surface them here so the
+        failure is a startup error instead of silent corruption or a
+        mid-serving raise.
+        """
+        if envs.VLLM_TPU_BLOCK_MAJOR_KV:
+            raise NotImplementedError(
+                "Cross-model KV-sharing speculative decoding (Gemma-4 MTP) "
+                "requires skip_kv_update, which the block-major KV bundle "
+                "does not implement. Unset VLLM_TPU_BLOCK_MAJOR_KV."
+            )
+        if PcpStaticSupportValidator.from_vllm_config(self.vllm_config).enabled:
+            raise NotImplementedError(
+                "Cross-model KV-sharing speculative decoding (Gemma-4 MTP) "
+                "requires skip_kv_update, which PCP streaming attention does "
+                "not support."
+            )
+
+    def _setup_gemma4_kv_sharing(
+        self,
+        target_model,
+        target_attn_layer_names: set[str],
+    ) -> None:
+        """Wire Q-only draft layers to read the target model's KV cache.
+
+        Only draft layers that declare `is_kv_shared_layer` participate, so
+        this is a silent no-op for an MTP draft that owns its KV cache
+        (DeepSeek-V4). When any layer is wired, `self._draft_kv_shared` is set
+        and every declaring layer must resolve to a target — a partially wired
+        draft would write dummy K/V into the target's cache through its
+        unwired layers, so an unresolvable layer raises rather than warns.
+        """
+        from collections import defaultdict
+
+        # Decide participation before touching either config: this runs for
+        # every `mtp` draft, and one that owns its KV cache must not be
+        # required to expose a config shape it never needs.
+        if not (
+            hasattr(self.draft_model, "model")
+            and hasattr(self.draft_model.model, "layers")
+        ):
+            return
+
+        # The draft model declares whether its attention reads the target's
+        # cache; `speculative_config.method` cannot distinguish Gemma-4 MTP
+        # from DeepSeek-V4 MTP.
+        shared_layers = [
+            (idx, layer)
+            for idx, layer in enumerate(self.draft_model.model.layers)
+            if getattr(getattr(layer, "self_attn", None), "is_kv_shared_layer", False)
+        ]
+        if not shared_layers:
+            return
+        self._validate_kv_sharing_supported()
+
+        draft_text_config = self.draft_model.config.get_text_config()
+        target_text_config = target_model.config.get_text_config()
+        target_layer_types = getattr(target_text_config, "layer_types", [])
+        target_num_kv_shared = getattr(target_text_config, "num_kv_shared_layers", 0)
+        num_non_shared = len(target_layer_types) - target_num_kv_shared
+        type_to_target_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, lt in enumerate(target_layer_types[:num_non_shared]):
+            type_to_target_indices[lt].append(idx)
+
+        target_prefix = "model.layers"
+        # MUST BE SORTED to prevent hash-seed desyncs across TP workers
+        for name in sorted(target_attn_layer_names):
+            if ".layers." in name:
+                target_prefix = name.split(".layers.")[0] + ".layers"
+                break
+
+        draft_layer_types = getattr(draft_text_config, "layer_types", [])
+        for draft_idx, layer in shared_layers:
+            attn = getattr(layer.self_attn, "attn", None)
+            if attn is None:
+                raise RuntimeError(
+                    f"Draft layer {draft_idx} declares is_kv_shared_layer but "
+                    "exposes no self_attn.attn to wire; cannot guarantee it "
+                    "will not write into the target's KV cache."
+                )
+
+            draft_layer_type = (
+                draft_layer_types[draft_idx]
+                if draft_idx < len(draft_layer_types)
+                else "full_attention"
+            )
+            candidates = type_to_target_indices.get(draft_layer_type, [])
+            if not candidates:
+                raise RuntimeError(
+                    f"No target layer of type '{draft_layer_type}' to share KV "
+                    f"with for draft layer {draft_idx}. Leaving it unwired "
+                    "would let it write dummy K/V into the target's cache."
+                )
+
+            # MTP layers share the LAST target layer of the matching attention type
+            target_idx = candidates[-1]
+            target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
+            # Set BOTH: the module attribute is what get_kv_cache_spec reads to
+            # skip allocating a cache for this layer, while the Pallas impl
+            # derives `skip_kv_update` from its OWN copy (see
+            # PallasAttentionBackendImpl.initialize_kernel / forward). Setting
+            # only the module attr leaves the impl writing zeroed dummy K/V
+            # over the target's real entries.
+            attn.kv_sharing_target_layer_name = target_layer_name
+            impl = getattr(attn, "impl", None)
+            if impl is None:
+                raise RuntimeError(
+                    f"Draft attention layer {draft_idx} has no `impl`; cannot "
+                    "enable skip_kv_update for cross-model KV sharing."
+                )
+            impl.kv_sharing_target_layer_name = target_layer_name
+
+            logger.info(
+                "Gemma4 MTP (TPU): draft layer %d (%s) -> %s",
+                draft_idx,
+                draft_layer_type,
+                target_layer_name,
+            )
+
+        # Only now that every declaring layer is wired: the propose loop reads
+        # this to freeze positions/seq_lens across draft steps.
+        self._draft_kv_shared = True
 
     def _load_draft_model(self) -> None:
         logger.info(f"Loading {self.speculative_config.method} draft model...")
@@ -894,7 +1062,8 @@ class Eagle3Proposer:
                         # the chunk count. With a single chunk this is a
                         # self-copy of a few hundred KiB.
                         self._mtp_restore_topk(saved_topk_per_chunk[ci])
-                    loop_positions[ci] = loop_positions[ci] + 1
+                    if self.advance_draft_positions:
+                        loop_positions[ci] = loop_positions[ci] + 1
                     # Prev step's [p] tokens feed directly — already bucketed.
                     loop_input_ids = draft_tokens_per_chunk[ci][-1]
                     last_hidden, hidden = self._forward_draft(
@@ -903,7 +1072,7 @@ class Eagle3Proposer:
                         positions=loop_positions[ci],
                         target_hidden_states=loop_hidden[ci],
                         step_idx=step,
-                        seq_lens_delta=step,
+                        seq_lens_delta=(step if self.advance_draft_positions else 0),
                         num_rejected_np=(None if is_async else rejected_per_chunk[ci]),
                         num_tokens_padded=padded_nr_per_chunk[ci],
                         num_rejected_dev=rejected_dev_per_chunk[ci],
@@ -1308,13 +1477,40 @@ class Eagle3Proposer:
         assert self._draft_attn_layer_names is not None, (
             "draft attn layer names were not captured during load_model"
         )
-        result = {
-            name: md
-            for name, md in per_layer_attn_metadata.items()
-            if name in self._draft_attn_layer_names
-        }
+
+        # Draft layers sharing the target's KV cache were added to the target's
+        # KV cache group by `add_kv_sharing_layers_to_kv_cache_groups`, so
+        # `_build_attention_metadata` has already emitted an entry for each of
+        # them. Verify rather than re-alias: a missing entry means the layer
+        # never joined a group, and aliasing it to an arbitrary entry would hide
+        # that behind a plausible-looking forward.
+        missing = [
+            name
+            for name in self._draft_attn_layer_names
+            if name not in per_layer_attn_metadata
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Draft attention layers {missing} have no attention metadata; "
+                "they were not added to a KV cache group. Check that "
+                "get_kv_cache_spec registered them in shared_kv_cache_layers."
+            )
+
+        # A KV-sharing draft runs inside the target's cache group, so pass the
+        # group's entries through untouched. A draft that owns its cache keeps
+        # the historical draft-only filter.
+        if self._draft_kv_shared:
+            result = dict(per_layer_attn_metadata)
+        else:
+            result = {
+                name: md
+                for name, md in per_layer_attn_metadata.items()
+                if name in self._draft_attn_layer_names
+            }
+
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
+
         return result
 
     @staticmethod
@@ -1732,7 +1928,9 @@ class Eagle3Proposer:
                     positions=loop_positions,
                     target_hidden_states=loop_hidden,
                     step_idx=step,
-                    seq_lens_delta=step,
+                    # Mirror the real loop so the dummy traces the same
+                    # metadata program the peer ranks' propose emits.
+                    seq_lens_delta=(step if self.advance_draft_positions else 0),
                     num_rejected_np=None,
                     num_tokens_padded=p,
                     loop_query_start_loc=loop_qsl,
