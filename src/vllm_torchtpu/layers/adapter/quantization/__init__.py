@@ -93,5 +93,8 @@ def get_tpu_quantization_config(
     # Register the TPU quant method name so vLLM uses our custom config
     model_config.quantization = quant_methods.get_tpu_quant_method(
         quant_config_cls.get_name())
-    return VllmConfig.get_quantization_config(model_config,
-                                              vllm_config.load_config)
+    config = VllmConfig.get_quantization_config(model_config,
+                                                vllm_config.load_config)
+    from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+        attach_online_fp8
+    return attach_online_fp8(config, vllm_config)

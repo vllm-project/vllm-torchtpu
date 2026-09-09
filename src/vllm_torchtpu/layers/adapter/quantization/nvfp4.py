@@ -215,7 +215,19 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
     def get_name(cls) -> str:
         return NVFP4
 
-    def get_quant_method(
+    def apply_vllm_mapper(self, hf_to_vllm_mapper):
+        super().apply_vllm_mapper(hf_to_vllm_mapper)
+        from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+            map_online_fp8
+        map_online_fp8(self, hf_to_vllm_mapper)
+
+    def get_quant_method(self, layer, prefix):
+        from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+            resolve_online_fp8
+        base_method = self._get_checkpoint_quant_method(layer, prefix)
+        return resolve_online_fp8(self, layer, prefix, base_method)
+
+    def _get_checkpoint_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,

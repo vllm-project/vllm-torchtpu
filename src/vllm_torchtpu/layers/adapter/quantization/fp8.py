@@ -622,7 +622,19 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             store_dtype=store_dtype,
         )
 
-    def get_quant_method(
+    def apply_vllm_mapper(self, hf_to_vllm_mapper):
+        super().apply_vllm_mapper(hf_to_vllm_mapper)
+        from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+            map_online_fp8
+        map_online_fp8(self, hf_to_vllm_mapper)
+
+    def get_quant_method(self, layer, prefix):
+        from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+            resolve_online_fp8
+        base_method = self._get_checkpoint_quant_method(layer, prefix)
+        return resolve_online_fp8(self, layer, prefix, base_method)
+
+    def _get_checkpoint_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
@@ -989,6 +1001,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Skip Fp8LinearMethod.__init__ which has GPU-specific code
         # (CUDA capability, Marlin, cutlass, W8A8BlockFp8LinearOp).
         # Set only the attributes that create_weights() reads.
+        self.prefix = prefix
+        self.online_fp8 = False
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
@@ -1006,8 +1020,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
 
-        self._linear_quant_config = _get_linear_quant_config(
-            self.linear_config)
+        if quant_config.is_checkpoint_fp8_serialized:
+            self._linear_quant_config = _get_linear_quant_config(
+                self.linear_config)
+        else:
+            # Load-time quantization has its own fixed per-channel contract.
+            self._linear_quant_config = ("float8_e4m3fn", torch.float8_e4m3fn,
+                                         None, False)
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
@@ -1062,6 +1081,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert dense linear checkpoint weights to runtime FP8."""
+        if self.online_fp8:
+            if getattr(layer, "_tpu_online_fp8_processed", False):
+                return
+            if layer.weight.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"Online FP8 requires BF16 checkpoint weights: "
+                    f"{self.prefix} has {layer.weight.dtype}")
         if self.quant_config.is_checkpoint_fp8_serialized:
             weight, weight_scale, requant_dtype_name, requant_block_size = (
                 _process_fp8_linear_weights(
@@ -1147,6 +1173,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
         if layer.weight.device.type == "tpu":
             synchronize_tensors([layer.weight, layer.weight_scale])
+
+        if self.online_fp8:
+            layer._tpu_online_fp8_processed = True
 
         scale_desc = ("per-channel" if requant_block_size is None else
                       str(requant_block_size))

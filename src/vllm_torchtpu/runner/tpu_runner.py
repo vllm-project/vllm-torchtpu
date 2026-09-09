@@ -3744,6 +3744,9 @@ class TPUModelRunner(GPUModelRunner):
              set_current_vllm_config(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
+        from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+            validate_online_fp8
+        validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
