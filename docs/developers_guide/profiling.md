@@ -3,7 +3,7 @@
 `vllm-torchtpu` captures TPU traces with the PyTorch/XLA profiler. Every worker
 process drives its own profiler session and can only trace the chips it owns, so
 a whole-slice trace is assembled from one capture per worker (see
-[`src/vllm_torchtpu/profiler_trace.py`](../src/vllm_torchtpu/profiler_trace.py)).
+[`src/vllm_torchtpu/profiler_trace.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/profiler_trace.py)).
 Every mode writes XPlane protobuf (`*.xplane.pb`), readable in
 [XProf](https://github.com/openxla/xprof) / TensorBoard; the two non-phased
 modes also write Chrome-format JSON. See [Trace formats](#trace-formats) for
@@ -28,7 +28,7 @@ pip install xprof            # or: pip install tensorboard-plugin-profile
 
 ## Offline profiling with `examples/tpu_profiling.py`
 
-[`examples/tpu_profiling.py`](../examples/tpu_profiling.py) drives the offline
+[`examples/tpu_profiling.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/examples/tpu_profiling.py) drives the offline
 `LLM` API with a synthetic batch, warms up, and then captures a trace of
 `--num-iters` generate calls. Use it when you want a clean trace of one shape
 with no scheduler noise.
@@ -75,7 +75,7 @@ python3 examples/tpu_profiling.py \
   --profile-result-dir profiles/decode_bs256
 ```
 
-[`examples/run_profiling_suite.sh`](../examples/run_profiling_suite.sh) sweeps a
+[`examples/run_profiling_suite.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/examples/run_profiling_suite.sh) sweeps a
 matrix of these; uncomment the experiments you want and run it.
 
 ## Server-side capture (`vllm serve`)
@@ -127,7 +127,7 @@ and `--profiler-config.max_iterations` limits are honored only by the
 
 ### Through the benchmark harness
 
-[`scripts/vllm/benchmarking/run_benchmarks.sh`](../scripts/vllm/benchmarking/run_benchmarks.sh)
+[`scripts/vllm/benchmarking/run_benchmarks.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/run_benchmarks.sh)
 wires all of this up. Setting `CAPTURE_PROFILE=1` adds the profiler flags to the
 server and `--profile` to the bench client, writing traces to
 `<results-dir>/profile`:
@@ -242,7 +242,7 @@ Ratios that fall in the gaps (`0.2` – `0.4` and `0.6` – `0.9`) are classifie
 not represent either regime.
 
 Token accounting, from
-[`get_batch_composition_stats`](../src/vllm_torchtpu/runner/utils.py):
+[`get_batch_composition_stats`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/runner/utils.py):
 
 * A request with no computed tokens yet is prefill.
 * An ongoing request scheduled for more than one token is chunked prefill.

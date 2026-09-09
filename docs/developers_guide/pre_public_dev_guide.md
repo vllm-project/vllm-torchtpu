@@ -8,7 +8,7 @@
 ---
 
 > [!NOTE] Relationship to Standard Documentation
-> For all general contribution guidelines, bug reporting procedures, project directory structures, and general testing policies, please refer directly to [CONTRIBUTING.md](../CONTRIBUTING.md).
+> For all general contribution guidelines, bug reporting procedures, project directory structures, and general testing policies, please refer directly to [CONTRIBUTING.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/CONTRIBUTING.md).
 >
 > This document is **EXCLUSIVELY** a temporary, specialized governance supplement for the pre-public phase to handle missing GitHub repo branch rulesets due to private repo on github free account.
 
@@ -43,7 +43,7 @@ Welcome to the `vllm-project/vllm-torchtpu` pre-public development phase! Please
 
 ### Purpose of This Document
 
-Until the repository goes public (at which point standard automated GitHub Branch Protections will be activated and standard [CONTRIBUTING.md](../CONTRIBUTING.md) will take full effect), this document serves as our binding Developer Code of Conduct and Standard Operating Procedure (SOP).
+Until the repository goes public (at which point standard automated GitHub Branch Protections will be activated and standard [CONTRIBUTING.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/CONTRIBUTING.md) will take full effect), this document serves as our binding Developer Code of Conduct and Standard Operating Procedure (SOP).
 
 Compliance relies on every developer following these procedures strictly.
 
@@ -65,7 +65,7 @@ gh auth status
 ```
 
 > [!TIP] Formatting & Linting
-> For pre-commit formatting and linting setup, directory structures, and code style rules, refer directly to [CONTRIBUTING.md](../CONTRIBUTING.md).
+> For pre-commit formatting and linting setup, directory structures, and code style rules, refer directly to [CONTRIBUTING.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/CONTRIBUTING.md).
 
 ---
 
@@ -219,7 +219,7 @@ Unmarked tests remain eligible for TPU queues.
 
 ### Approval Gate (Advisory)
 
-- **Policy:** The `CODEOWNERS Approval` check reports whether every area a PR touches has at least one approval from an owner of that area in [.github/CODEOWNERS](../.github/CODEOWNERS). It resolves ownership with the same matcher as `scripts/find_owners.py`, so its verdict always agrees with what that command tells you to do. (The `Run Approval Gate` check next to it is the job that produces the verdict; it is green whenever the gate managed to run.)
+- **Policy:** The `CODEOWNERS Approval` check reports whether every area a PR touches has at least one approval from an owner of that area in [.github/CODEOWNERS](https://github.com/vllm-project/vllm-torchtpu/blob/main/.github/CODEOWNERS). It resolves ownership with the same matcher as `scripts/find_owners.py`, so its verdict always agrees with what that command tells you to do. (The `Run Approval Gate` check next to it is the job that produces the verdict; it is green whenever the gate managed to run.)
 - **Rationale:** GitHub applies CODEOWNERS automatically only on plans this repository is not on (see Section 1), so an approval from someone who happens to be available today does not mean the people who own the code have seen it. The gate makes that gap visible instead of leaving it to the reviewer's memory.
 - **It is advisory, not enforcing.** An unmet gate is reported **grey, not red**, so it stays out of the "some checks were not successful" banner and is never confused with a real test failure. Every PR is unmet for the whole window between opening it and being reviewed, and a red X across that window would just train everyone to ignore the check. Treat it as a line item on the Pre-Merge Verification Checklist. Making it block, once branch rulesets become available, takes two changes: set `MISSING_APPROVAL_CONCLUSION: failure` in the workflow, and mark the check required.
 - **Reading the result:** The check's details have a table of one row per owned area, who approved it, and who could. An unmet gate names the specific areas that are missing an approval and the handles that would satisfy each one — `scripts/find_owners.py --request` asks exactly those people. The check re-runs on every push and on every review, so approving a PR turns it green without anyone re-triggering CI.
