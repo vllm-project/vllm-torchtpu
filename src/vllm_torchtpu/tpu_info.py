@@ -1,7 +1,9 @@
+import functools
 import glob
 import os
 
 import requests
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -37,6 +39,30 @@ def get_tpu_type() -> str:
     if tpu_type is None:
         tpu_type = get_tpu_metadata(key="accelerator-type")
     return tpu_type
+
+
+@functools.cache
+def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
+    """Resolves the TPU chip version without initializing a TPU client.
+
+    `pltpu.get_tpu_info()` would initialize PJRT and claim the chips, so
+    host-side callers (the scheduler, KV offloading connectors) resolve the
+    chip from `TPU_ACCELERATOR_TYPE` instead. Falls back to TPU7x with a
+    warning when the accelerator type is unrecognized.
+    """
+    accelerator_type = accelerator_type or get_tpu_type() or ""
+    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
+    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    # v5litepod and v7x are the only two that still differ after stripping.
+    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    try:
+        return pltpu.ChipVersion(name)
+    except ValueError:
+        logger.warning(
+            "Unrecognized TPU accelerator type %r; defaulting to TPU7x "
+            "static geometry.", accelerator_type)
+        return pltpu.ChipVersion.TPU_7X
 
 
 def get_node_name() -> str:
