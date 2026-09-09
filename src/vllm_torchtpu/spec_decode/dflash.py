@@ -177,12 +177,19 @@ class DFlashProposer:
             raise RuntimeError(
                 "Draft model does not support get_draft_attn_causal")
 
-        with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
+        with set_vllm_model_wrapper_context(mesh=self.runner.mesh,
+                                            vllm_config=self.vllm_config):
             for i, layer in enumerate(self.draft_model.model.layers):
-                attn_impl = layer.self_attn.attn.impl
+                sub_attn = getattr(layer, "self_attn", None)
+                attn_obj = getattr(sub_attn, "attn",
+                                   None) if sub_attn is not None else None
+                if attn_obj is None:
+                    continue
+                attn_impl = attn_obj.impl
                 if isinstance(attn_impl, PallasAttentionBackendImpl):
+                    attn_impl.layer_idx = i
                     attn_impl.use_causal_mask = layer_causal_list[i]
-                    attn_impl.initialize_kernel(layer.self_attn.attn)
+                    attn_impl.initialize_kernel(attn_obj)
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
@@ -379,9 +386,19 @@ class DFlashProposer:
         the draft's KV through it would corrupt the cache silently instead of
         failing.
         """
+        # TODO: MLA draft model classes to set `owns_context_kv = True`
+        # to take this path -- DSparkDeepseekV4ForCausalLM (DSV4 DSpark) and
+        # K3DSparkForCausalLM (K3 DSpark). Without it they fall back to the
+        # dense _fused_kv_weight path, which doesn't work for latent-KV MLA drafts.
+        if getattr(type(self.draft_model), "owns_context_kv", False):
+            layer_names = self.draft_model.get_draft_kv_cache_layer_names()
+        else:
+            layer_names = [
+                getattr(layer.self_attn.attn, "layer_name", None)
+                for layer in self.draft_model.model.layers
+            ]
         draft_md_list = []
-        for layer in self.draft_model.model.layers:
-            layer_name = getattr(layer.self_attn.attn, "layer_name", None)
+        for layer_name in layer_names:
             md = attn_metadata.get(layer_name) if layer_name else None
             if md is None:
                 raise RuntimeError(
@@ -414,7 +431,8 @@ class DFlashProposer:
         positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
 
-        with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
+        with set_vllm_model_wrapper_context(mesh=self.runner.mesh,
+                                            vllm_config=self.vllm_config):
             self._tpu_precompute_and_update_kv_cache(target_hidden, positions,
                                                      draft_md_tuple)
 
@@ -492,7 +510,8 @@ class DFlashProposer:
                         num_tokens=padded_len,
                         num_tokens_across_dp=runner._dp_num_tokens_across_dp(
                             padded_len)),
-                    set_vllm_model_wrapper_context(mesh=self.runner.mesh),
+                    set_vllm_model_wrapper_context(
+                        mesh=self.runner.mesh, vllm_config=self.vllm_config),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                     input_ids, positions, block_size)
@@ -561,7 +580,11 @@ class DFlashProposer:
 
                 # The draft model only runs speculation on decode steps, so it never processes
                 # more tokens than the max batch size * speculation block size.
-                if num_tokens > max_draft_tokens:
+                if num_tokens < block_size or num_tokens > max_draft_tokens:
+                    if num_tokens < block_size:
+                        logger.info(
+                            "Skipping DFlash draft-forward bucket %d: "
+                            "query block size is %d.", num_tokens, block_size)
                     continue
 
                 self._dummy_draft_forward(num_tokens=num_tokens,
@@ -642,7 +665,8 @@ class DFlashProposer:
             num_tokens, num_reqs, num_blocks)
         dummy_positions = dummy_attn_metadata.input_positions
 
-        with set_vllm_model_wrapper_context(mesh=runner.mesh):
+        with set_vllm_model_wrapper_context(mesh=runner.mesh,
+                                            vllm_config=self.vllm_config):
             out = self._tpu_precompute_and_update_kv_cache(
                 dummy_hidden, dummy_positions,
                 tuple([dummy_attn_metadata] *
@@ -660,15 +684,19 @@ class DFlashProposer:
         runner = self.runner
         block_size = self.block_size
 
+        if num_tokens < block_size:
+            raise ValueError(
+                f"DFlash draft-forward bucket {num_tokens} is smaller than "
+                f"its query block size {block_size}")
+
         input_ids = torch.zeros((num_tokens),
                                 dtype=torch.int32).to(runner.device)
         positions = torch.zeros(num_tokens,
                                 dtype=torch.int32).to(runner.device)
 
-        # Map actual request count based on block allocations
+        # Map actual request count based on block allocations; the guard
+        # above makes this >= 1.
         actual_num_reqs = num_tokens // block_size
-        if actual_num_reqs == 0:
-            actual_num_reqs = 1
 
         num_tokens_per_req = num_tokens // actual_num_reqs
         query_lens = [num_tokens_per_req] * actual_num_reqs
@@ -704,7 +732,8 @@ class DFlashProposer:
                     num_tokens=num_tokens,
                     num_tokens_across_dp=runner._dp_num_tokens_across_dp(
                         num_tokens)),
-                set_vllm_model_wrapper_context(mesh=self.runner.mesh),
+                set_vllm_model_wrapper_context(mesh=self.runner.mesh,
+                                               vllm_config=self.vllm_config),
         ):
             draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                 input_ids, positions, block_size)
@@ -793,6 +822,15 @@ class DFlashProposer:
                 hidden_states) == 1 else torch.cat(hidden_states, dim=-1)
         else:
             target_hidden = hidden_states
+
+        # MLA-native drafts (K3/DSV4) own their latent-KV projection and
+        # paged cache insert.
+        # TODO: set `owns_context_kv = True` on the MLA draft model classes
+        # (DSparkDeepseekV4ForCausalLM, K3DSparkForCausalLM); see the matching
+        # gate in _build_draft_layer_metadata.
+        if getattr(type(self.draft_model), "owns_context_kv", False):
+            return self.draft_model.precompute_and_store_context_kv(
+                target_hidden, positions, draft_md_tuple)
 
         # Collapse the concatenated aux hidden states to the draft's width.
         # `combine_hidden_states` is the modern spelling; bare `fc` is what
