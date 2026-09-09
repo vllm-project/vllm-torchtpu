@@ -28,6 +28,32 @@ from vllm_torchtpu.layers.common.fused_moe_gmm import (
     fused_moe_func, moe_gmm, prepare_routed_gmm_inputs)
 
 
+def test_gmm_wrapper_fp4_lhs_quantization_is_opt_in(monkeypatch):
+    calls = []
+
+    def fake_gmm_v2(**kwargs):
+        calls.append(kwargs)
+        return kwargs["lhs"]
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_v2", fake_gmm_v2)
+    lhs = jnp.ones((2, 8), dtype=jnp.bfloat16)
+    rhs = types.SimpleNamespace(dtype=jnp.float4_e2m1fn)
+    common = dict(
+        lhs=lhs,
+        rhs=rhs,
+        rhs_scale=None,
+        rhs_bias=None,
+        group_sizes=jnp.array([2], dtype=jnp.int32),
+        group_offset=jnp.array([0], dtype=jnp.int32),
+    )
+
+    fused_moe_gmm.gmm_wrapper(**common)
+    fused_moe_gmm.gmm_wrapper(**common, quantize_fp4_lhs=True)
+
+    assert calls[0]["maybe_quantize_lhs"] is False
+    assert calls[1]["maybe_quantize_lhs"] is True
+
+
 @pytest.mark.parametrize("version", ["v1", "v2", "v3"])
 def test_select_ragged_gather_reduce(version):
     selected = fused_moe_gmm._select_ragged_gather_reduce(version)

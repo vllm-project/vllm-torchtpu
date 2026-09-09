@@ -15,8 +15,11 @@
 
 Loads NVIDIA ModelOpt NVFP4 checkpoints (packed E2M1 weights + per-16-block
 E4M3 scales + per-tensor FP32 global scale) and runs them on the TPU GMM /
-quantized-matmul kernels in **W4A16** mode (bf16 activations, fp4 weights
-dequantized per block inside the kernel).
+quantized-matmul kernels in W4A16 mode by default (bf16 activations, fp4
+weights dequantized per block inside the kernel). Setting
+``MOE_REQUANTIZE_BLOCK_SIZE`` enables the fused-MoE W4A8 path: MoE weights are
+requantized to the requested MXU-sized block and both GMM inputs are dynamically
+quantized to FP8.
 
 Design:
   - Reuse upstream `ModelOptNvFp4{LinearMethod,RoutedExperts}.create_weights` for
@@ -28,8 +31,8 @@ Design:
   - Unpack the packed uint8 weight to native fp4 (`torch.float4_e2m1fn_x2`) in
     the kernel's K-major layout once here at load (`load_kmajor_fp4`), so the
     forward hands native fp4 straight to the kernel with no per-forward unpack.
-    `maybe_quantize_lhs=False` keeps activations in bf16 (W4A16); the GMM
-    kernel's unquantized-lhs path dequantizes the fp4 weight per block.
+    The default path keeps activations in bf16 (W4A16); the opt-in fused-MoE
+    W4A8 path dynamically quantizes activations to FP8 inside each GMM.
 
 Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 (google-pytorch/torch_tpu#1560).
@@ -254,12 +257,11 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
 
         # MOE_REQUANTIZE_BLOCK_SIZE (e.g. 512) requantizes the block-16 fp4
         # weights to that block (>= MXU). This cuts the scale data ~32x and skips
-        # the in-kernel dequant, ~halving decode TPOT vs the block-16 default
-        # (480B-Coder: 54.7ms -> 29.6ms) at equal accuracy. Activations stay
-        # bf16 (the gmm keeps fp8 activations off for fp4 weights -- fp8xfp4
-        # collapses accuracy with no decode gain; see fused_moe_gmm.gmm_wrapper).
-        # Unset -> packed block-16 weights, dequant in kernel. See PR #306.
+        # the in-kernel weight dequant and enables dynamic FP8 activation
+        # quantization for both expert GMMs. Unset -> block-16 W4A16 with
+        # BF16 activations and weight dequantization inside the kernel.
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
+        layer._tpu_quantize_fp4_lhs = bool(requant_block)
         already_kmajor = False
         if requant_block:
             requant_block = int(requant_block)
@@ -275,14 +277,14 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 w2, w2_scale_4d = requant_load_kmajor_fp4(
                     _fresh(layer.w2_weight.data), w2_scale_f, requant_block)
                 already_kmajor = True
-                mode = f"W4 (jax requant block-{requant_block} + bf16 act)"
+                mode = f"W4A8 (jax requant block-{requant_block})"
             else:
                 # Contracting dim not divisible by the block (e.g. Qwen3-30B w2
                 # I=768): pad + requant in torch.
                 w13, w13_scale_4d, w2, w2_scale_4d = _requant_moe_w4a8(
                     layer.w13_weight.data, w13_scale_f, layer.w2_weight.data,
                     w2_scale_f, requant_block)
-                mode = f"W4 (torch requant block-{requant_block} + bf16 act)"
+                mode = f"W4A8 (torch requant block-{requant_block})"
         else:
             # Lay block-16 scales out for gmm_v2: [E, num_blocks_over_K, 1, N]
             # (already K-major-aligned). Weights are the checkpoint-layout packed
@@ -338,6 +340,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            quantize_fp4_lhs=layer._tpu_quantize_fp4_lhs,
         )
 
     def apply_monolithic(
@@ -373,6 +376,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
+            "quantize_fp4_lhs": layer._tpu_quantize_fp4_lhs,
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

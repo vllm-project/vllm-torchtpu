@@ -250,8 +250,10 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
     hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
     topk_weights = torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk
     topk_ids = torch.zeros(seq_len, topk, dtype=torch.int32)
+    quantize_fp4_lhs_values = []
 
     def mock_kernel_fn(hidden_states, *args, **kwargs):
+        quantize_fp4_lhs_values.append(kwargs["quantize_fp4_lhs"])
         return hidden_states * 2.0
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
@@ -271,9 +273,11 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
             experts_start=None,
             topk=topk,
             activation="silu",
+            quantize_fp4_lhs=True,
         )
 
     torch.testing.assert_close(out, hidden_states * 2.0)
+    assert quantize_fp4_lhs_values == [True, True]
     assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 6
     assert len([c for c in pcp_group.call_log
                 if c[0] == "reduce_scatter"]) == 2
@@ -465,6 +469,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w2_weight = torch.randn(4, 128, 64, dtype=torch.bfloat16)
         layer.w13_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.w2_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
+        layer._tpu_quantize_fp4_lhs = True
         layer.moe_config.experts_per_token = 2
 
         method = MagicMock(spec=VllmNvfp4MoEMethod)
@@ -500,6 +505,7 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        assert bound.arguments["quantize_fp4_lhs"] is True
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_w4a16_apply_monolithic_dispatches_with_exact_kwargs(
