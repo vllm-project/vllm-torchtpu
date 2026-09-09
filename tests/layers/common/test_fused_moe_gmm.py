@@ -59,8 +59,8 @@ def test_owner_output_mode_defaults_to_off(monkeypatch):
     assert getter() == "off"
 
 
-@pytest.mark.parametrize("value", ["off", "on", "OFF", "ON"])
-def test_owner_output_mode_accepts_off_and_on(monkeypatch, value):
+@pytest.mark.parametrize("value", ["off", "on", "fused", "OFF", "ON", "FUSED"])
+def test_owner_output_mode_accepts_three_modes(monkeypatch, value):
     monkeypatch.setenv("TPU_MOE_OWNER_OUTPUT_MODE", value)
     getter = envs.environment_variables["TPU_MOE_OWNER_OUTPUT_MODE"]
     assert getter().lower() == value.lower()
@@ -71,6 +71,86 @@ def test_owner_output_mode_rejects_invalid_value(monkeypatch):
     getter = envs.environment_variables["TPU_MOE_OWNER_OUTPUT_MODE"]
     with pytest.raises(ValueError, match="TPU_MOE_OWNER_OUTPUT_MODE"):
         getter()
+
+
+@pytest.mark.parametrize("use_ep,use_sparse_core", [(True, True),
+                                                    (True, False),
+                                                    (False, False)])
+@pytest.mark.parametrize("mode", [
+    "supported", "disabled", "standalone", "bias", "capacity", "output_dtype",
+    "legacy_reduce", "native_quant"
+])
+def test_gmm2_owner_dispatch_and_fallback(monkeypatch, use_ep, use_sparse_core,
+                                          mode):
+    # Protect opt-in/fallback semantics and generic top-k/shape admission.
+    from vllm_torchtpu.kernels.megablox import gmm_v2_owner as owner
+
+    tokens, topk, experts, k, n = 48, 6, 4, 256, 512
+    rows = tokens * topk
+    dtype = jnp.float32 if mode == "output_dtype" else jnp.bfloat16
+    expected = jnp.zeros((tokens, n), dtype)
+    info = types.SimpleNamespace(
+        vmem_capacity_bytes=1024 if mode == "capacity" else 64 * 1024 * 1024,
+        smem_capacity_bytes=1024 * 1024,
+        mxu_column_size=256,
+        num_lanes=128,
+        fp8_ops_per_second=1,
+        get_sublane_tiling=lambda dtype: 16)
+    monkeypatch.setattr(owner.pltpu, "get_tpu_info", lambda: info)
+    owner_mode = {"disabled": "off", "standalone": "on"}.get(mode, "fused")
+    monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", owner_mode)
+    calls = []
+
+    def fake_gmm(lhs, rhs, *args, **kwargs):
+        calls.append("gmm")
+        cols = k if kwargs.get("fuse_act") else n
+        return jnp.zeros((rows, cols), jnp.bfloat16)
+
+    def fake_owner(*args, **kwargs):
+        calls.append("owner")
+        return expected
+
+    def fake_standalone_owner(*args, **kwargs):
+        calls.append("standalone_owner")
+        return expected
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", fake_gmm)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_v2_owner", fake_owner)
+    monkeypatch.setattr(fused_moe_gmm, "can_use_blockwise_onehot_unpermute",
+                        lambda *args, **kwargs: True)
+    monkeypatch.setattr(fused_moe_gmm, "blockwise_onehot_unpermute",
+                        fake_standalone_owner)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce",
+                        lambda *args, **kwargs: expected)
+    actual = moe_gmm(
+        jnp.zeros((rows, n), dtype),
+        jnp.zeros((experts, n, k * 2), jnp.float8_e4m3fn),
+        None,
+        None,
+        jnp.zeros((experts, k, n), jnp.float8_e4m3fn),
+        jnp.ones((experts, 1, 1, n), jnp.float32),
+        jnp.zeros((experts, 1, n), jnp.float32) if mode == "bias" else None,
+        jnp.array([rows, 0, 0, 0], jnp.int32),
+        jnp.arange(rows, dtype=jnp.int32),
+        jnp.ones((rows, ), jnp.bfloat16),
+        jnp.ones((rows, ), jnp.bool_),
+        jnp.arange(rows, dtype=jnp.int32),
+        activation="silu",
+        num_tokens=tokens,
+        topk=topk,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        rhs_quant_dtype=jnp.float8_e4m3fn if mode == "native_quant" else None,
+        onehot_moe_permute_threshold=0 if mode == "legacy_reduce" else 32768)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == dtype
+    expected_calls = ["gmm", "gmm"]
+    if use_ep and use_sparse_core:
+        if mode in ("supported", "native_quant"):
+            expected_calls = ["gmm", "owner"]
+        elif mode == "standalone":
+            expected_calls.append("standalone_owner")
+    assert calls == expected_calls
 
 
 def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
@@ -197,7 +277,9 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
 
 
 @pytest.mark.parametrize(("mode", "owner_called"), [("on", True),
-                                                    ("off", False)])
+                                                    ("off", False),
+                                                    ("fused", False),
+                                                    ("FUSED", False)])
 def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     x = jnp.zeros((4, 2), dtype=jnp.bfloat16)
     w1 = jnp.zeros((2, 2, 4), dtype=jnp.bfloat16)

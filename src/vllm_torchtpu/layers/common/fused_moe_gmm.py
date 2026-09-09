@@ -20,6 +20,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2_owner import (can_use_gmm_v2_owner,
+                                                         gmm_v2_owner)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
@@ -291,6 +293,32 @@ def moe_gmm(
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
+
+    # Fuse the existing one-hot combine arithmetic. The ordinary gather/reduce
+    # path rounds products differently and must retain its numerical contract.
+    # Admission depends on input contracts and memory, not a model shape list.
+    # Check metadata shapes before materializing the sorted weights/owner IDs.
+    if (envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "fused" and use_ep
+            and use_sparse_core
+            and argsort_revert_indices.size <= onehot_moe_permute_threshold
+            and x.dtype == jnp.bfloat16 and w2_bias is None
+            and rhs_quant_dtype in (None, w2.dtype)
+            and can_use_gmm_v2_owner(gmm1_res,
+                                     w2,
+                                     group_sizes,
+                                     w2_scale,
+                                     sorted_indices,
+                                     topk_weights_flat,
+                                     num_tokens=num_tokens)):
+        logger.info_once("Selected GMM2 VMEM owner combine: tokens=%d",
+                         num_tokens)
+        return gmm_v2_owner(gmm1_res,
+                            w2,
+                            group_sizes,
+                            w2_scale,
+                            sorted_indices // topk,
+                            topk_weights_flat[sorted_indices],
+                            num_tokens=num_tokens)
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))

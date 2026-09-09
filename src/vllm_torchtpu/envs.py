@@ -329,13 +329,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
-    # Select the blockwise owner-output kernel after the outer one-hot MoE
-    # threshold has selected the TensorCore path. "off" keeps the dense
-    # one-hot combine; "on" enables the kernel for every shape that passes
-    # its dtype, alignment, and VMEM safety checks.
+    # Select owner combine after the one-hot MoE threshold selects the
+    # TensorCore path: "off" keeps dense combine, "on" uses a separate
+    # blockwise owner-output kernel, and "fused" combines within FP8 GMM2
+    # VMEM. Unsupported shapes retain the original path; "fused" does not
+    # fall back to the separate owner-output kernel.
     "TPU_MOE_OWNER_OUTPUT_MODE":
     env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
-                     "off", ["off", "on"],
+                     "off", ["off", "on", "fused"],
                      case_sensitive=False),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
