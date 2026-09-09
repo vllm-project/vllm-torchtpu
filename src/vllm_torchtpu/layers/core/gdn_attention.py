@@ -1003,7 +1003,7 @@ def run_jax_gdn_attention_pooled(
 def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     j_hidden_states: jnp.ndarray,
     j_qkvz_weight: jnp.ndarray,
-    j_qkvz_weight_scale: jnp.ndarray,
+    j_qkvz_weight_scale: jnp.ndarray | None,
     j_b: jnp.ndarray,
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -1053,7 +1053,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     in_specs = (
         token_spec,  # hidden states
         replicated_spec,  # QKVZ weight
-        replicated_spec,  # QKVZ scale
+        replicated_spec if j_qkvz_weight_scale is not None else None,
         token_spec,  # b
         token_spec,  # a
         pool_spec,  # rank-local unified pool
