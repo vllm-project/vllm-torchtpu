@@ -1126,6 +1126,7 @@ def _scatter_compact_state_updates(
     *,
     state_stride: int,
     region: config.StateRegion,
+    whole_block_dma: bool,
 ) -> jax.Array:
     """Apply raw per-sequence state tiles to a donated unified pool.
 
@@ -1149,8 +1150,11 @@ def _scatter_compact_state_updates(
         )
 
         def _write(pool):
-            start_indices = (block_start, region.row0,
-                             *(0, ) * (state_source.ndim - 2))
+            if whole_block_dma:
+                start_indices = (block_start, *(0, ) * (state_source.ndim - 1))
+            else:
+                start_indices = (block_start, region.row0,
+                                 *(0, ) * (state_source.ndim - 2))
             return lax.dynamic_update_slice(pool, updates[sequence_id],
                                             start_indices)
 
@@ -1159,6 +1163,27 @@ def _scatter_compact_state_updates(
     # A runtime loop scales the update work with the live request count rather
     # than the compile bucket's maximum sequence capacity.
     return lax.fori_loop(0, active_bound, _apply_one, state_source)
+
+
+def _compact_state_updates_shape(
+    state_source: jax.Array,
+    num_sequences: int,
+    region: config.StateRegion,
+    *,
+    whole_block_dma: bool,
+) -> jax.ShapeDtypeStruct:
+    """Shape of one compact external-state update per sequence.
+
+    NHD can address a token-row subregion directly. HND stores tokens on the
+    minormost lane, so the V3 state seam copies complete source pages and keeps
+    all of their inner dimensions, matching ``ExternalStateBufferedRef``.
+    """
+    if whole_block_dma:
+        region_shape = (region.nblocks, *state_source.shape[1:])
+    else:
+        region_shape = (region.nblocks, region.nrows, *state_source.shape[2:])
+    return jax.ShapeDtypeStruct((num_sequences, *region_shape),
+                                state_source.dtype)
 
 
 @functools.partial(
@@ -1451,24 +1476,17 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         act_out_dtype,
     )
-    state_update_tail = state_source.shape[2:]
-    conv_state_updates_shape = jax.ShapeDtypeStruct(
-        (
-            state_indices.shape[0],
-            state_plan.conv.nblocks,
-            state_plan.conv.nrows,
-            *state_update_tail,
-        ),
-        state_source.dtype,
+    conv_state_updates_shape = _compact_state_updates_shape(
+        state_source,
+        state_indices.shape[0],
+        state_plan.conv,
+        whole_block_dma=state_plan.whole_block_dma,
     )
-    recurrent_state_updates_shape = jax.ShapeDtypeStruct(
-        (
-            state_indices.shape[0],
-            state_plan.recurrent.nblocks,
-            state_plan.recurrent.nrows,
-            *state_update_tail,
-        ),
-        state_source.dtype,
+    recurrent_state_updates_shape = _compact_state_updates_shape(
+        state_source,
+        state_indices.shape[0],
+        state_plan.recurrent,
+        whole_block_dma=state_plan.whole_block_dma,
     )
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
@@ -1629,6 +1647,7 @@ def fused_qkvz_projection_pcp_gdn(
         num_active_seqs,
         state_stride=state_plan.stride,
         region=state_plan.conv,
+        whole_block_dma=state_plan.whole_block_dma,
     )
     state_source = _scatter_compact_state_updates(
         state_source,
@@ -1638,6 +1657,7 @@ def fused_qkvz_projection_pcp_gdn(
         num_active_seqs,
         state_stride=state_plan.stride,
         region=state_plan.recurrent,
+        whole_block_dma=state_plan.whole_block_dma,
     )
 
     packed_out = packed_out.reshape(local_num_tokens, n_v, d_v)
