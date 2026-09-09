@@ -19,6 +19,7 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -36,6 +37,10 @@ from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_kv
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
+from vllm_torchtpu.layers.vllm.cp_attention import \
+    build_dcp_kernels as _build_dcp_kernels
+from vllm_torchtpu.layers.vllm.cp_attention import \
+    forward_with_dcp as _forward_with_dcp
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
@@ -676,6 +681,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # model. Forward can then reuse the custom op without resolving a PCP
         # mesh from inside Dynamo's fullgraph capture.
         self._kernel_config_cache: dict = {}
+        # DCP (Decode Context Parallelism) state. Populated by initialize_kernel()
+        # when decode_context_parallel_size > 1.
+        self.dcp_world_size = 1
+        self.dcp_rank = 0
+        self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
+        self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
         # setup_bundled() after bundle allocation and prior to torch.compile tracing.
         # During profile_run, ctx.kv_cache_bundle is None and forward falls back to
@@ -836,6 +847,30 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self._kernel_registry[registry_key] = rpa_kernel_impl
         self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
+
+    def _run_dcp_forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        return _forward_with_dcp(
+            layer=layer,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            sliding_window=self.sliding_window,
+            sm_scale=self.scale,
+            logits_soft_cap=self.logits_soft_cap,
+            kv_cache_quantized_dtype=self.kv_cache_quantized_dtype,
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+        )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
@@ -999,6 +1034,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             return
 
+        dcp_configured = (parallel_config is not None and getattr(
+            parallel_config, 'decode_context_parallel_size', 1) > 1)
+        if dcp_configured:
+            dcp_group = _get_dcp_group()
+            if dcp_group is not None:
+                self.dcp_world_size = int(dcp_group.world_size)
+                self.dcp_rank = int(dcp_group.rank_in_group)
+                self.rpa_dcp_cache_kernel, self.rpa_dcp_new_kernel = (
+                    _build_dcp_kernels(sliding_window=self.sliding_window,
+                                       sm_scale=self.scale,
+                                       logits_soft_cap=self.logits_soft_cap,
+                                       q_scale=q_scale,
+                                       k_scale=k_scale,
+                                       v_scale=v_scale,
+                                       cp_group_size=self.dcp_world_size,
+                                       cp_rank=self.dcp_rank))
+            return
+
         self.rpa_kernel = self._build_rpa_kernel(q_scale,
                                                  k_scale,
                                                  v_scale,
@@ -1111,6 +1164,23 @@ class PallasAttentionBackendImpl(AttentionImpl):
         vllm_config = ctx.vllm_config
         parallel_config = (None if vllm_config is None else
                            vllm_config.parallel_config)
+
+        if self.dcp_world_size > 1:
+            if sink is not None or ctx.kv_cache_bundle is not None:
+                raise NotImplementedError(
+                    "DCP attention does not support attention sinks or "
+                    "the bundled KV cache path.")
+            outputs = self._run_dcp_forward(layer, query, key, value, kv_cache,
+                                            attn_metadata)
+            if outputs.shape[-1] > self.head_size:
+                outputs = outputs[..., :self.head_size]
+            if query_dim == 2:
+                outputs = outputs.reshape(q_len,
+                                          self.num_heads * self.head_size)
+            if output is not None:
+                output.copy_(outputs)
+            return outputs
+
         use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
         pcp_configured = (parallel_config is not None and
                           parallel_config.prefill_context_parallel_size > 1)
