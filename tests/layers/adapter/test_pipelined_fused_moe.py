@@ -35,6 +35,9 @@ from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import \
     VllmUnquantizedFusedMoEMethod
+from vllm_torchtpu.layers.core.quantization import (FP8_ACT_BLOCK_SIZE,
+                                                    dequantize_block_fp8,
+                                                    dynamic_block_quantize_fp8)
 
 
 def _make_mock_moe_config():
@@ -380,16 +383,18 @@ def _run_with_fp8_all_gather(hidden_states,
 
 def test_fp8_all_gather_puts_eight_bit_rows_on_the_wire():
     group = _MockCollectiveGroup(world_size=4, rank=0)
-    hidden_states = torch.randn(64, 128, dtype=torch.bfloat16)
+    # Three whole blocks of FP8_ACT_BLOCK_SIZE, so nothing here is padded.
+    hidden_states = torch.randn(64, 1536, dtype=torch.bfloat16)
 
     out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
 
     # The rows cross as int8 -- the same eight bits as fp8, in a dtype every
-    # collective backend carries -- next to their f32 scale. The routing
-    # tensors gathered after them keep their own dtypes and are not the point.
+    # collective backend carries -- next to one f32 scale per block. The
+    # routing tensors gathered after them keep their own dtypes and are not
+    # the point.
     gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
     assert gathers[0] == (hidden_states.shape, torch.int8)
-    assert gathers[1] == ((64, 1), torch.float32)
+    assert gathers[1] == ((64, 3), torch.float32)
     assert not [
         dtype for shape, dtype in gathers
         if shape == hidden_states.shape and dtype is not torch.int8
@@ -399,10 +404,56 @@ def test_fp8_all_gather_puts_eight_bit_rows_on_the_wire():
     # back in their own dtype and full width, exactly as it would be with the
     # flag off, so nothing downstream has to know the gather was quantized.
     kwargs = calls[0]
-    assert kwargs["hidden_states"].shape == (64 * 4, 128)
+    assert kwargs["hidden_states"].shape == (64 * 4, 1536)
     assert kwargs["hidden_states"].dtype is torch.bfloat16
 
     # e4m3 keeps four mantissa bits, so a round trip lands within 1/32.
+    torch.testing.assert_close(out,
+                               hidden_states,
+                               rtol=1.0 / 32,
+                               atol=float(hidden_states.abs().max()) / 32)
+
+
+def test_fp8_all_gather_hands_the_kernel_its_own_quantization_grid():
+    """The scales are per block so the kernel's own rounding comes out free.
+
+    The gmm re-quantizes its LHS in blocks of the same width, and a block's
+    amax survives its own quantization, so what the kernel is handed here
+    re-encodes to exactly the codes it would have produced from activations
+    that never crossed the wire quantized. `test_block_quantize_is_idempotent_
+    at_the_kernel_s_own_block_width` proves that end of it; this one checks the
+    gather actually delivers rows already sitting on that grid.
+    """
+    group = _MockCollectiveGroup(world_size=2, rank=0)
+    hidden_states = torch.randn(8, 2 * FP8_ACT_BLOCK_SIZE, dtype=torch.bfloat16)
+
+    _, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    delivered = calls[0]["hidden_states"]
+    requantized, scale = dynamic_block_quantize_fp8(
+        delivered, block_size=FP8_ACT_BLOCK_SIZE)
+    assert torch.equal(
+        dequantize_block_fp8(requantized, scale, torch.bfloat16), delivered)
+
+
+def test_fp8_all_gather_zero_pads_a_partial_block():
+    """A hidden size short of a whole block is padded, and the pad is dropped.
+
+    The pad is real traffic -- the gather carries 512 columns for 640 bits of
+    activation -- so this pins both halves of the bargain: the wire widens to
+    the block boundary, and nothing downstream ever sees the padding.
+    """
+    group = _MockCollectiveGroup(world_size=2, rank=0)
+    hidden_states = torch.randn(8, 640, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    # 640 rounds up to two blocks, hence 1024 columns and two scales.
+    assert gathers[0] == ((8, 2 * FP8_ACT_BLOCK_SIZE), torch.int8)
+    assert gathers[1] == ((8, 2), torch.float32)
+
+    assert calls[0]["hidden_states"].shape == (8 * 2, 640)
     torch.testing.assert_close(out,
                                hidden_states,
                                rtol=1.0 / 32,

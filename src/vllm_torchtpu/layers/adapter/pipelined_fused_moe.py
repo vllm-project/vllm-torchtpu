@@ -24,7 +24,9 @@ from vllm.distributed.parallel_state import get_dp_group
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
-from vllm_torchtpu.layers.core.quantization import dynamic_row_quantize_fp8
+from vllm_torchtpu.layers.core.quantization import (FP8_ACT_BLOCK_SIZE,
+                                                    dequantize_block_fp8,
+                                                    dynamic_block_quantize_fp8)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -85,17 +87,46 @@ def _quantized_all_gather(collective_group,
     per element on the wire instead of two; what it costs is one rounding of
     the activations, plus a second collective for the scales.
 
+    That rounding is why the scales are per `FP8_ACT_BLOCK_SIZE`-wide block of
+    the hidden axis rather than per whole row. The gmm re-quantizes its LHS in
+    blocks of the same width, and a block's amax survives its own quantization
+    -- the element that set it maps to e4m3's maximum exactly -- so rounding on
+    the same grid here leaves the kernel's own pass nothing left to do. What it
+    feeds the MXU comes out bit-identical to what it would have computed from
+    activations that never crossed the wire quantized: at a hidden size of 6144
+    the flag costs no accuracy at all. Per-row scales move the values off that
+    grid, and the kernel then rounds a second time for real.
+
+    The grids line up only when the kernel's `tile_k` is a whole number of
+    blocks. The kernel quantizes over `range(0, tile_k, 512)` within a tile
+    (`gmm_v2._call_gmm_kernel`), not over the global k axis, so a `tile_k` of,
+    say, 768 would split into 512 and 256 and the boundaries would drift. For
+    the shapes this path runs on -- k=6144, n=2048 with `fuse_act` -- the tile
+    search fits `tile_n` before it ever reduces `tile_k`, leaving `tile_k` at
+    6144 for every vmem budget, so the grids do line up. Nothing enforces that,
+    and a shape where they do not still computes the right answer; it just pays
+    the second rounding, the way per-row scales already do.
+
+    The scales stay small enough for this to be free on the wire -- twelve f32
+    per row at 6144, against the 6144 bytes the row itself costs.
+
+    A hidden size that is not a whole number of blocks is zero-padded, and that
+    pad does cross the wire. 6144 is twelve whole blocks, so nothing is padded
+    there; a size below one block is the case to watch, since it pays a full
+    block either way.
+
     The rows travel bitcast to int8. They are the same eight bits either way,
     and int8 is a dtype every collective backend carries, while fp8 is not one
     they can be assumed to.
     """
-    quantized, scale = dynamic_row_quantize_fp8(hidden_states)
+    quantized, scale = dynamic_block_quantize_fp8(
+        hidden_states, block_size=FP8_ACT_BLOCK_SIZE)
     ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
     ag_scale = collective_group.all_gather(scale, dim=0)
     # Rescale in f32, not in the row's dtype: `scale` was computed there, and
     # a bf16 product would throw away most of what the fp8 rows still hold.
-    restored = ag_rows.view(torch.float8_e4m3fn).to(torch.float32) * ag_scale
-    return restored.to(hidden_states.dtype)
+    return dequantize_block_fp8(ag_rows.view(torch.float8_e4m3fn), ag_scale,
+                                hidden_states.dtype, hidden_states.shape[-1])
 
 
 def calculate_moe_chunks(seq_len: int, parallel_size: int,
