@@ -88,6 +88,7 @@ from vllm_torchtpu.offload.block_major_layout import (
 
 if TYPE_CHECKING:
     import torch
+    from vllm.v1.kv_offload.base import OffloadingEvent
 
 logger = init_logger(__name__)
 
@@ -584,7 +585,16 @@ class RaidenOffloadingManager(OffloadingManager):
             evicted_keys=[],
         )
 
-    def take_events(self):
+    def _sub_hash_to_offload_key(self, sub_hash: bytes) -> OffloadKey | None:
+        """Helper to reverse a Raiden C++ sub_hash to an OffloadKey.
+
+        Structure of sub_hash:
+          [16-byte namespace] + [OffloadKey: block_hash (N bytes) + group_idx (4 bytes)] + [sub_idx (4 bytes)]
+        """
+        # Placeholder skeleton for Phase 1.
+        return None
+
+    def take_events(self) -> list["OffloadingEvent"]:
         # This manager produces no offloading events: Raiden's admission API
         # does not report which entries an insert displaced, and `prepare_store`
         # rediscovers them by probing the directory. Configurations that

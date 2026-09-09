@@ -46,9 +46,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Iterable
 
 import torch
 from vllm.config import VllmConfig
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_events import KVCacheEvent
+
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata)
@@ -347,6 +352,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             "TPURaidenOffloadingConnector: external cache reset is not "
             "supported by the Raiden offload store; reporting failure.")
         return False
+
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.take_events()
+        return []
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(self,

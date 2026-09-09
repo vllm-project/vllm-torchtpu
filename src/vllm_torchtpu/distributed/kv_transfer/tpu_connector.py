@@ -24,7 +24,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 from uuid import uuid4
 
 import torch
@@ -46,6 +46,7 @@ from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+    from vllm.distributed.kv_events import KVCacheEvent
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
@@ -610,6 +611,13 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                                              "update_connector_output"):
             scheduler.update_connector_output(connector_output)
 
+    def take_events(self) -> Iterable["KVCacheEvent"]:
+        """Collect and clear pending KV cache events."""
+        scheduler = self.connector_scheduler
+        if scheduler is not None and hasattr(scheduler, "take_events"):
+            return scheduler.take_events()
+        return []
+
 
 class TPURaidenConnector(TPUConnector):
     """Explicit Raiden connector class for callers that prefer connector name
@@ -953,6 +961,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             self.kv_port = int(port_base) + 2 * dp_rank * tp_size
         logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
+
+    def take_events(self) -> Iterable["KVCacheEvent"]:
+        """Drain pending KV cache events.
+
+        Placeholder skeleton for Phase 1.
+        """
+        return []
 
     def on_new_request(self, request: "Request") -> None:
         """Truncates a P-side Mamba prompt at admission, ahead of the
