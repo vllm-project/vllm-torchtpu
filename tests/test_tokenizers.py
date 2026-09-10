@@ -76,6 +76,9 @@ def _last_call(base):
 
 
 def test_trailing_assistant_turn_is_marked_wo_eos(tokenizer, base):
+    """The case the module exists for: a prefilled assistant turn is handed
+    to the encoder with wo_eos set, so it renders without eos_token and the
+    model continues that turn instead of starting a new one."""
     messages = [
         {
             "role": "user",
@@ -125,6 +128,8 @@ def test_trailing_user_turn_is_left_alone(tokenizer, base):
 
 
 def test_empty_conversation_does_not_index_out_of_range(tokenizer, base):
+    """conversation[-1] is only safe behind the emptiness check. A request
+    with no messages must not raise IndexError on its way to the encoder."""
     tokenizer.apply_chat_template([], continue_final_message=True)
 
     assert _last_call(base)["kwargs"]["conversation"] == []
@@ -136,6 +141,9 @@ def test_empty_conversation_does_not_index_out_of_range(tokenizer, base):
 
 
 def test_without_the_flag_nothing_is_added(tokenizer, base):
+    """The path every ordinary request takes. The messages list is forwarded
+    by identity and no conversation kwarg is invented, so a caller that never
+    asked for continuation sees stock vLLM behaviour."""
     messages = [{"role": "assistant", "content": "done"}]
 
     tokenizer.apply_chat_template(messages, thinking_mode="off")
@@ -148,6 +156,8 @@ def test_without_the_flag_nothing_is_added(tokenizer, base):
 
 
 def test_flag_set_false_behaves_like_absent(tokenizer, base):
+    """An explicit False must be indistinguishable from omitting the flag.
+    kwargs.pop returns False for both, so neither reaches the encoder."""
     tokenizer.apply_chat_template([{
         "role": "assistant",
         "content": "done"
@@ -160,6 +170,9 @@ def test_flag_set_false_behaves_like_absent(tokenizer, base):
 
 
 def test_tools_and_other_kwargs_reach_the_base_unchanged(tokenizer, base):
+    """The wrapper intercepts one keyword and must be transparent to the
+    rest: tools is positional in the super() call, and encoder settings like
+    reasoning_effort have to survive untouched."""
     tools = [{"type": "function", "function": {"name": "f"}}]
 
     tokenizer.apply_chat_template([{
@@ -181,6 +194,9 @@ def test_tools_and_other_kwargs_reach_the_base_unchanged(tokenizer, base):
 
 
 def test_the_caller_s_messages_are_not_mutated(tokenizer):
+    """wo_eos goes on a copy. vLLM reuses the request's message list after
+    rendering, so writing the marker in place would leak a private encoder
+    flag into the caller's data and into any later render of it."""
     messages = [{"role": "assistant", "content": "partial"}]
     before = copy.deepcopy(messages)
 
@@ -213,12 +229,17 @@ def test_an_explicit_conversation_kwarg_wins_over_messages(tokenizer, base):
 
 
 def test_wrapper_subclasses_the_tokenizer_it_was_given(tokenizer, base):
+    """The subclass is built per instance from whatever class the checkpoint
+    produced, so it inherits every method the real tokenizer has and only
+    overrides apply_chat_template."""
     assert isinstance(tokenizer, _FakeBaseTokenizer)
     assert type(tokenizer) is not type(base)
     assert type(tokenizer).__name__ == "_TpuDeepseekV4Tokenizer"
 
 
 def test_the_original_tokenizer_is_left_untouched(base):
+    """copy.copy then reassigning __class__ marks the copy, not the original.
+    The caller may still be holding and using the tokenizer it passed in."""
     _tpu_deepseek_v4_tokenizer(base)
 
     assert type(base) is _FakeBaseTokenizer
@@ -234,6 +255,10 @@ def test_reduce_rebuilds_through_the_factory(tokenizer, base):
 
 
 def test_pickle_round_trip_keeps_the_wrapping(tokenizer):
+    """vLLM sends the tokenizer to worker processes, so it must pickle. The
+    assertion is that the revived object still wraps: a __reduce__ that
+    returned the bare tokenizer would pickle cleanly and silently drop the
+    fix on every worker."""
     revived = pickle.loads(pickle.dumps(tokenizer))
 
     assert type(revived).__name__ == "_TpuDeepseekV4Tokenizer"
@@ -251,6 +276,8 @@ def test_pickle_round_trip_keeps_the_wrapping(tokenizer):
 
 
 def test_registration_is_skipped_unless_the_env_var_is_set(monkeypatch):
+    """Off by default, so tokenizer behaviour matches stock vLLM unless a
+    config opts in."""
     registry = MagicMock()
     monkeypatch.setattr("vllm.tokenizers.registry.TokenizerRegistry", registry)
     monkeypatch.delenv("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", raising=False)
@@ -261,6 +288,9 @@ def test_registration_is_skipped_unless_the_env_var_is_set(monkeypatch):
 
 
 def test_registration_binds_the_deepseek_v4_tokenizer_mode(monkeypatch):
+    """With the flag on, the entry point is registered under the
+    deepseek_v4 tokenizer mode by module path and class name, which is how
+    vLLM's registry resolves it in a worker process."""
     registry = MagicMock()
     monkeypatch.setattr("vllm.tokenizers.registry.TokenizerRegistry", registry)
     monkeypatch.setenv("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", "1")

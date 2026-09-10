@@ -42,11 +42,22 @@ def test_empty_worker_list():
     assert reconcile_num_gpu_blocks_override([]) is None
 
 
+# 5428 carries no meaning of its own. It is the block count the sibling
+# executor test has used since it was written, kept here so the two files
+# read as the same scenario. What does matter is its magnitude: at a block
+# count in the thousands the relative tolerance dominates
+# (int(5428 * 0.005) == 27), so the small spreads below are inside it. The
+# same spreads against a three-digit block count would raise, which is what
+# the absolute-floor tests further down cover.
+
+
 def test_single_worker_agrees_with_itself():
+    """One worker cannot disagree with anyone, so its own count is agreed."""
     assert reconcile_num_gpu_blocks_override([5428]) == 5428
 
 
 def test_identical_overrides_pass_through():
+    """The ordinary case: every worker measured the same budget."""
     assert reconcile_num_gpu_blocks_override([5428, 5428, 5428]) == 5428
 
 
@@ -75,6 +86,8 @@ def test_absolute_tolerance_accepts_a_spread_exactly_at_the_floor():
 
 
 def test_absolute_tolerance_rejects_one_block_past_the_floor():
+    """One block past the floor is the whole point of having a floor: at this
+    scale the relative tolerance is 0, so 4 is the entire allowance."""
     with pytest.raises(ValueError, match="workers disagree"):
         reconcile_num_gpu_blocks_override([100, 105])
 
@@ -116,6 +129,9 @@ def test_tolerance_constants_match_the_documented_rule():
 
 
 def test_error_names_the_spread_the_bounds_and_the_tolerance():
+    """6456 vs 8000 is a 24% disagreement, far outside any tolerance. The
+    numbers in the message are what tell an operator whether they are looking
+    at measurement jitter or at one worker with a different HBM budget."""
     with pytest.raises(ValueError) as exc:
         reconcile_num_gpu_blocks_override([6456, 8000, 6456])
 
