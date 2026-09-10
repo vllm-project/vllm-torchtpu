@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Load-time per-channel FP8 for selected unquantized TPU Linear layers."""
+"""Load-time configurable FP8 for selected unquantized TPU Linear layers."""
 
 import json
 from dataclasses import dataclass, field
@@ -31,6 +31,8 @@ logger = init_logger(__name__)
 class OnlineFp8Policy:
     targets: list[str]
     exclude: list[str]
+    weight_scheme: str = "per_channel"
+    weight_block_size: tuple[int, int] | None = None
     matched: set[str] = field(default_factory=set)
     selected: dict[str, list[str]] = field(default_factory=dict)
 
@@ -41,7 +43,8 @@ class OnlineFp8Policy:
         if not isinstance(value, dict):
             raise ValueError("tpu_online_fp8 must be an object")
         unknown = set(value) - {
-            "enabled", "weight_scheme", "targets", "exclude"
+            "enabled", "weight_scheme", "weight_block_size", "targets",
+            "exclude"
         }
         if unknown:
             raise ValueError(
@@ -51,9 +54,22 @@ class OnlineFp8Policy:
             raise ValueError("tpu_online_fp8.enabled must be a boolean")
         if not enabled:
             return None
-        if value.get("weight_scheme", "per_channel") != "per_channel":
-            raise ValueError(
-                "tpu_online_fp8 supports only per_channel weights")
+        scheme = value.get("weight_scheme", "per_channel")
+        if scheme not in ("per_channel", "per_tensor", "per_block"):
+            raise ValueError("tpu_online_fp8.weight_scheme must be "
+                             "per_channel, per_tensor, or per_block")
+        block = value.get("weight_block_size")
+        if scheme == "per_block":
+            if (not isinstance(block, list) or len(block) != 2
+                    or any(type(v) is not int or v <= 0 for v in block)):
+                raise ValueError("tpu_online_fp8.weight_block_size requires "
+                                 "two positive integers [N_out, K_in]")
+            if block[1] % 128:
+                raise ValueError("Online FP8 K block size must be a multiple "
+                                 "of 128 for TPU projection kernels")
+            block = tuple(block)
+        elif "weight_block_size" in value:
+            raise ValueError("weight_block_size is only valid for per_block")
         targets = value.get("targets", [])
         exclude = value.get("exclude", [])
         for name, patterns in (("targets", targets), ("exclude", exclude)):
@@ -64,7 +80,8 @@ class OnlineFp8Policy:
                                  "nonempty exact names or fnmatch patterns")
         if not targets:
             raise ValueError("tpu_online_fp8.targets must not be empty")
-        return cls(list(dict.fromkeys(targets)), list(dict.fromkeys(exclude)))
+        return cls(list(dict.fromkeys(targets)), list(dict.fromkeys(exclude)),
+                   scheme, block)
 
     def apply_mapper(self, mapper):
         self.targets = mapper.apply_list(self.targets)
@@ -132,6 +149,7 @@ def resolve_online_fp8(config, layer, prefix, base_method):
                                   weight_block_size=None)
     method = VllmFp8LinearMethodTPU(online_config, prefix=prefix)
     method.online_fp8 = True
+    method.online_fp8_policy = policy
     policy.selected[prefix] = aliases
     return method
 
@@ -158,8 +176,22 @@ def validate_online_fp8(model, config):
         weight, scale = layer.weight, layer.weight_scale
         keep_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
         n_out = weight.shape[0] if keep_layout else weight.shape[1]
+        k_in = weight.shape[1] if keep_layout else weight.shape[0]
+        if policy.weight_scheme == "per_tensor":
+            expected_shape = (1, )
+            expected_block = (n_out, k_in)
+        elif policy.weight_scheme == "per_block":
+            block_n, block_k = policy.weight_block_size
+            if n_out % block_n or k_in % block_k:
+                raise ValueError(f"Invalid online FP8 block size for {prefix}")
+            expected_shape = (1, k_in // block_k, 1, n_out)
+            expected_block = (block_n, block_k)
+        else:
+            expected_shape = (n_out, )
+            expected_block = (1, k_in)
         if (weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float32
-                or scale.shape != (n_out, )):
+                or scale.shape != expected_shape
+                or layer.weight_block_size != expected_block):
             raise ValueError(f"Invalid online FP8 runtime format for {prefix}")
         validated.add(prefix)
         logger.info(
@@ -171,7 +203,8 @@ def validate_online_fp8(model, config):
                 "runtime_dtype": "float8_e4m3fn",
                 "weight_shape": list(weight.shape),
                 "scale_shape": list(scale.shape),
-                "weight_scheme": "per_channel",
+                "weight_scheme": policy.weight_scheme,
+                "weight_block_size": list(layer.weight_block_size),
                 "converted": True,
             }))
     unmatched = set(policy.targets) - policy.matched
@@ -183,3 +216,42 @@ def validate_online_fp8(model, config):
                          f"converted={len(validated)}")
     logger.info("TPU online FP8 validated %d runtime Linear layers",
                 len(validated))
+
+
+def quantize_online_fp8(weight, policy):
+    """Quantize a loaded local [N, K] shard; expand only scales along N."""
+    from vllm_torchtpu.layers.core.quantization import quantize_tensor
+
+    n_out, k_in = weight.shape
+    scheme = policy.weight_scheme
+    weight = weight.to(torch.float32)
+    if scheme == "per_tensor":
+        from vllm_torchtpu.layers.core.quantization import _safe_inverse_scale
+
+        # Keep the matrix layout: flattening tens of millions of elements
+        # into one TPU lane dimension makes load-time compilation expensive.
+        abs_max = weight.abs().amax(dim=1, keepdim=True).amax(dim=0,
+                                                              keepdim=True)
+        scale = abs_max * torch.tensor(
+            1.0 / 448, dtype=torch.float32, device=weight.device)
+        quantized = (weight * _safe_inverse_scale(scale)).clamp(-448, 448)
+        return quantized.to(torch.float8_e4m3fn), scale.reshape(1), (n_out,
+                                                                     k_in)
+    if scheme == "per_channel":
+        quantized, scale = quantize_tensor(weight, torch.float8_e4m3fn)
+        return quantized, scale.reshape(n_out), (1, k_in)
+    block_n, block_k = policy.weight_block_size
+    if n_out % block_n or k_in % block_k:
+        raise ValueError(
+            f"Online FP8 block {policy.weight_block_size} must divide local "
+            f"weight shape {(n_out, k_in)} after tensor-parallel sharding")
+    grid = weight.reshape(n_out // block_n, block_n, k_in // block_k,
+                          block_k).permute(0, 2, 1, 3)
+    quantized, scale = quantize_tensor(
+        grid.reshape(n_out // block_n, k_in // block_k, -1),
+        torch.float8_e4m3fn)
+    quantized = quantized.reshape(grid.shape).permute(0, 2, 1,
+                                                      3).reshape(n_out, k_in)
+    scale = scale.squeeze(-1).repeat_interleave(block_n, dim=0)
+    scale = scale.t().unsqueeze(0).unsqueeze(2).contiguous()
+    return quantized, scale, (block_n, block_k)
