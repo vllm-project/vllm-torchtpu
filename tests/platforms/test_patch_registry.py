@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks staged patch execution without importing the TPU runtime."""
 
+import contextlib
 import importlib.util
 import logging
 import multiprocessing
@@ -41,7 +42,34 @@ def _patch(registry, callbacks, name, stages, **kwargs):
     return patch
 
 
-def test_order_and_idempotence_across_stages(registry, caplog):
+@contextlib.contextmanager
+def captured_records(logger):
+    """Collect the INFO records emitted on `logger`.
+
+    Deliberately not pytest's `caplog`: vLLM's dictConfig sets
+    `propagate=False` on the `vllm` logger, so records from its children never
+    reach the root logger where `caplog` installs its handler. Any test that
+    imports vLLM first leaves this one capturing nothing.
+    """
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(logging.INFO)
+    handler.emit = records.append
+    old_level = logger.level
+    # Another test may have raised the level or called logging.disable();
+    # either drops the record before any handler runs.
+    old_disable = logging.root.manager.disable
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logging.disable(logging.NOTSET)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logging.disable(old_disable)
+
+
+def test_order_and_idempotence_across_stages(registry):
     reg, callbacks = registry
     seen = []
     callbacks.first = lambda: seen.append("first")
@@ -50,13 +78,13 @@ def test_order_and_idempotence_across_stages(registry, caplog):
     _patch(reg, callbacks, "first", ("platform_activation", "worker_init"))
     _patch(reg, callbacks, "second", ("platform_activation", "engine_core"))
     _patch(reg, callbacks, "worker", ("worker_init", ))
-    with caplog.at_level(logging.INFO, logger=reg._logger.name):
+    with captured_records(reg._logger) as records:
         reg.apply("platform_activation")
         reg.apply("engine_core")
         reg.apply("worker_init")
         reg.apply("worker_init")
     assert seen == ["first", "second", "worker"]
-    assert len(caplog.records) == 2
+    assert len(records) == 2
 
 
 def test_failed_patch_retries_without_repeating_completed_patches(registry):
