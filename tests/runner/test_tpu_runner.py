@@ -40,6 +40,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
+from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
@@ -580,7 +581,10 @@ class TestTPURunner:
         # Slots per request in the mamba pool (1 without spec decode).
         self.runner._mamba_slot_stride = 1
 
-        # Bind the actual methods to our mock
+        # Bind the actual methods to our mock. The KV-cache spec/sizing bodies
+        # live on KVCacheManager, which reads all of its state back off the
+        # runner, so a real manager over the mock exercises the real code.
+        self.runner.kv_cache_manager = KVCacheManager(self.runner)
         self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
             self.runner)
         self.runner._maybe_set_num_blocks_override = TPUModelRunner._maybe_set_num_blocks_override.__get__(
@@ -905,7 +909,7 @@ class TestTPURunner:
         self.runner._init_mamba_slot_pool.assert_called_once_with(
             mamba_num_blocks)
 
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -952,7 +956,7 @@ class TestTPURunner:
     @patch.object(TpuPlatform,
                   '_find_non_ssm_backend',
                   return_value=PallasMLAttentionBackend)
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=8192)
@@ -981,7 +985,7 @@ class TestTPURunner:
                     expected_padded_size)
         mock_get_page_size.assert_called()
 
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -997,12 +1001,12 @@ class TestTPURunner:
         layers = {'layer.0': mock_attn}
         mock_get_layers.return_value = layers
 
-        with patch.object(self.runner,
+        with patch.object(self.runner.kv_cache_manager,
                           '_update_mamba_page_size_padded') as mock_update:
             self.runner.get_kv_cache_spec()
             mock_update.assert_not_called()
 
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -2860,7 +2864,7 @@ class TestUpdateAttentionPageSizePadded:
         }
         stub = self._stub(stale_block_size=16)
 
-        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
+        KVCacheManager(stub)._update_attention_page_size_padded(layers, 256)
 
         expected = PallasAttentionBackend.get_kv_cache_page_size_bytes(
             256, 2, 512, torch.bfloat16)
@@ -2877,7 +2881,7 @@ class TestUpdateAttentionPageSizePadded:
         }
         stub = self._stub()
 
-        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
+        KVCacheManager(stub)._update_attention_page_size_padded(layers, 256)
 
         assert stub._hybrid_uniform_page_size_bytes is None
         assert stub.cache_config.mamba_page_size_padded == \

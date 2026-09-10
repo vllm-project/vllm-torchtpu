@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
-from vllm_torchtpu.runner.tpu_runner import _warn_if_kv_cache_is_padded
+from vllm_torchtpu.runner.kv_cache_manager import _warn_if_kv_cache_is_padded
 
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
