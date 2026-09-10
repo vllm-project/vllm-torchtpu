@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
-from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
 
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.runner.kv_connector_glue import _build_kv_connector_output
 from vllm_torchtpu.runner.speculative_decoding_manager import \
     SpecDecodeMetadata
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
+    AsyncTPUModelRunnerOutput)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -134,6 +139,440 @@ class SamplingMixin:
             recover_u=recover_u,
             do_sampling=True,
         )
+
+    def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        if self.execute_model_state is None:
+            # Nothing to do (PP non-final rank case), output isn't used.
+            return None  # type: ignore[return-value]
+
+        state = self.execute_model_state
+        scheduler_output = state.scheduler_output
+        self.execute_model_state = None
+
+        # Used to keep rand draws consistent across TP ranks.
+        sampling_generator = self._get_sampling_generator()
+
+        # Hand the per-chunk draft inputs to the drafter.
+        if self._is_async_drafter:
+            self.drafter.draft_chunks = state.draft_chunks
+
+        # Prepare inputs, the requests might be split into multiple
+        # executions, combine the result of each execution.
+
+        max_num_logprobs = self.input_batch.max_num_logprobs
+        if max_num_logprobs == -1:
+            raise NotImplementedError(
+                "TPU runner does not support full logprobs (`logprobs=-1`) "
+                "with the merged vLLM v1 sampler path yet.")
+        needs_logprobs = max_num_logprobs is not None
+
+        # Per-chunk bucketed (padded) tensors plus their real (unpadded)
+        # request counts; kept at bucketed shapes so the async D2H copy hits
+        # a precompiled program. Host-side trim happens in AsyncTPUCopyState.
+        combined_selected_tokens: list[torch.Tensor] = []
+        combined_selected_tokens_real_lens: list[int] = []
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
+        next_tokens_tpu_offset = 0
+        combined_logprobs: list[Any] = []
+
+        # True if the step has drafts to verify (a request carried drafts in
+        # from the previous step). Not the same as self.speculative_config, the
+        # static "spec configured" flag: on prefill/first-decode steps spec is
+        # configured but no drafts exist yet, so is_spec_step is False there.
+        is_spec_step = any(md is not None
+                           for md in state.spec_decode_metadata_list)
+        # Per-chunk mamba slot ids (hybrid + spec decode only; None entries
+        # otherwise) for the read-offset scatter after sampling.
+        mamba_idx_list = (state.mamba_state_indices_list
+                          or [None] * len(state.logits_list))
+        if self.is_pooling_model:
+            req_ids = cast(
+                list[str],
+                self.input_batch.req_ids[:self.input_batch.num_reqs])
+        elif is_spec_step:
+            if needs_logprobs:
+                raise NotImplementedError(
+                    "Logprobs are not supported with speculative decoding on "
+                    "TPU yet.")
+            # Per-chunk device rejection outputs, kept for the async-spec
+            # producer below.
+            next_tokens_per_chunk: list[torch.Tensor] = []
+            cur_start_idx = 0
+            all_greedy = self.input_batch.all_greedy
+            for logits, num_reqs, md, mamba_indices in zip(
+                    state.logits_list, state.num_reqs_list,
+                    state.spec_decode_metadata_list, mamba_idx_list):
+                cur_end_idx = cur_start_idx + num_reqs
+                if md is not None:
+                    next_tokens = self._sample_spec_verify_chunk(
+                        logits, md, grammar_output, scheduler_output,
+                        cur_start_idx, cur_end_idx, all_greedy,
+                        sampling_generator)
+                    combined_selected_tokens.append(next_tokens)
+                    combined_selected_tokens_real_lens.append(num_reqs)
+                    next_tokens_per_chunk.append(next_tokens)
+                    self._update_mamba_slot_read_offsets(
+                        mamba_indices, next_tokens, num_reqs)
+                else:
+                    if grammar_output is not None:
+                        _, logits = (
+                            self.structured_decoding_manager.mask_spec_logits(
+                                None, logits, grammar_output,
+                                scheduler_output.scheduled_spec_decode_tokens,
+                                None, cur_start_idx, cur_end_idx))
+                    if all_greedy:
+                        selected = self._greedy_sample(logits)
+                    else:
+                        temperatures_tpu, top_k_tpu, top_p_tpu = (
+                            self._build_padded_sampling_params(
+                                cur_start_idx, cur_end_idx, logits))
+                        u = torch.rand_like(logits,
+                                            generator=sampling_generator)
+                        selected = self.sample_from_logits_func(
+                            logits,
+                            temperatures_tpu,
+                            u,
+                            top_k_tpu,
+                            top_p_tpu,
+                            all_greedy=False)
+                    padded = torch.full(
+                        (selected.shape[0],
+                         self.speculative_config.num_speculative_tokens + 1),
+                        INVALID_TOKEN_ID,
+                        dtype=selected.dtype,
+                        device=selected.device)
+                    padded[:, 0] = selected.view(-1)
+                    combined_selected_tokens.append(padded)
+                    combined_selected_tokens_real_lens.append(num_reqs)
+                    next_tokens_per_chunk.append(padded)
+                    # Non-verify chunk in a spec step: reset the read offsets
+                    # (the latest state checkpoint is at the group base).
+                    self._update_mamba_slot_read_offsets(
+                        mamba_indices, None, num_reqs)
+                self._update_num_xla_graphs("spec_step")
+                cur_start_idx = cur_end_idx
+        else:
+            cur_start_idx = 0
+            req_ids = cast(
+                list[str],
+                self.input_batch.req_ids[:self.input_batch.num_reqs])
+            all_greedy = self.input_batch.all_greedy
+            for logits, num_reqs, mamba_indices in zip(state.logits_list,
+                                                       state.num_reqs_list,
+                                                       mamba_idx_list):
+                cur_end_idx = cur_start_idx + num_reqs
+                # Non-spec step (prefill / plain decode): reset the mamba
+                # read offsets so the next step resumes from the group base.
+                self._update_mamba_slot_read_offsets(mamba_indices, None,
+                                                     num_reqs)
+                if grammar_output is not None:
+                    logits = self.structured_decoding_manager.mask_logits(
+                        logits, grammar_output, cur_start_idx, cur_end_idx)
+                if all_greedy:
+                    selected_token_ids = self._greedy_sample(logits)
+                else:
+                    temperatures_tpu, top_k_tpu, top_p_tpu = (
+                        self._build_padded_sampling_params(
+                            cur_start_idx, cur_end_idx, logits))
+                    u = torch.rand_like(logits, generator=sampling_generator)
+                    selected_token_ids = self.sample_from_logits_func(
+                        logits,
+                        temperatures_tpu,
+                        u,
+                        top_k_tpu,
+                        top_p_tpu,
+                        all_greedy=all_greedy)
+                # NOTE (NickLucche) Use the original logits (before any penalties or
+                # temperature scaling) for the top-k logprobs. We can't enforce it
+                # due to recompilations outside torch.compiled code, so just make
+                # sure `sample_from_logits` does not modify the logits in-place.
+                logprobs = (self.gather_logprobs(logits, selected_token_ids)
+                            if needs_logprobs else None)
+
+                # Keep the bucketed (padded) tensor; trim happens on the host
+                # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
+                combined_selected_tokens.append(selected_token_ids)
+                combined_selected_tokens_real_lens.append(num_reqs)
+                if self.scheduler_config.async_scheduling:
+                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                    for req_idx in range(cur_start_idx, cur_end_idx):
+                        next_token_indices[req_idx] = (next_tokens_tpu_offset +
+                                                       req_idx - cur_start_idx)
+                    next_tokens_tpu_offset += selected_token_ids.shape[0]
+                if needs_logprobs:
+                    sliced_logprobs = LogprobsTensors(
+                        logprobs.logprob_token_ids[:num_reqs],
+                        logprobs.logprobs[:num_reqs],
+                        logprobs.selected_token_ranks[:num_reqs],
+                        logprobs.cu_num_generated_tokens)
+                    combined_logprobs.append(sliced_logprobs)
+
+                self._update_num_xla_graphs("decoding_step")
+                cur_start_idx = cur_end_idx
+
+        # NOTE: current kv load and save get h2d/d2h copies involved.
+        # Those copies are blocking. Once they become async., kv_save
+        # should be called right after each single forward pass,
+        # instead of the forwards of the entire input batch.
+        logprobs = []
+        if needs_logprobs and len(combined_logprobs):
+            # TODO: concatenate the LogprobsTensors (torch) first, then
+            # call .tolists() once to match the GPU path and avoid the
+            # per-chunk numpy round-trip.
+            combined_logprobs_lists = []
+            for i in range(len(combined_logprobs)):
+                logprobs = combined_logprobs[i].tolists()
+                combined_logprobs_lists.append(logprobs)
+
+            logprobs_lists = LogprobsLists(
+                logprob_token_ids=np.concatenate(
+                    [lp.logprob_token_ids for lp in combined_logprobs_lists]),
+                logprobs=np.concatenate(
+                    [lp.logprobs for lp in combined_logprobs_lists]),
+                sampled_token_ranks=np.concatenate([
+                    lp.sampled_token_ranks for lp in combined_logprobs_lists
+                ]),
+            )
+            logprobs = logprobs_lists
+
+        discard_sampled_tokens_req_indices = []
+        num_reqs = self.input_batch.num_reqs
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+        request_seq_lens = []
+        for i, req_id in enumerate(req_ids):
+            assert req_id is not None
+            req_state = self.requests[req_id]
+            seq_len = (req_state.num_computed_tokens +
+                       scheduler_output.num_scheduled_tokens[req_id])
+            # Ignore the sampled token from the partial request.
+            # Rewind the generator state as if the token was not sampled.
+            if seq_len < req_state.num_tokens:
+                generator = self.input_batch.generators.get(i)
+                if generator is not None:
+                    # This relies on cuda-specific torch-internal impl details
+                    generator.set_offset(generator.get_offset() - 4)
+                # Record the index of the request that should not be sampled,
+                # so that we could clear the sampled tokens before returning.
+                discard_sampled_tokens_req_indices.append(i)
+            else:
+                request_seq_lens.append((i, req_state, seq_len, req_id))
+
+        next_tokens_tpu = None
+        copy_state = None
+        if combined_selected_tokens:
+            copy_state = AsyncTPUCopyState.from_device_chunks(
+                combined_selected_tokens, combined_selected_tokens_real_lens)
+
+        if self.scheduler_config.async_scheduling:
+            self._modify_prev_results()
+
+        # Poll the KV connector only now: the wait above proves the previous
+        # forward finished, so a store deferred behind it can be handed to
+        # raiden in this step rather than the next.
+        self.maybe_wait_for_kv_save()
+        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
+
+        kv_connector_output = (None if (
+            finished_sending is None and finished_recving is None
+            and kv_worker_meta is None and not invalid_block_ids
+            and kv_connector_stats is None) else _build_kv_connector_output(
+                finished_sending=finished_sending,
+                finished_recving=finished_recving,
+                kv_connector_worker_meta=kv_worker_meta,
+                invalid_block_ids=invalid_block_ids,
+                invalid_block_group_index=invalid_block_group_index,
+                kv_connector_stats=kv_connector_stats,
+            ))
+
+        # Unified eagle3 draft propose -- ONE call serving both sync and async
+        # (mirrors the tpu-inference reference, where a single
+        # propose_draft_token_ids call runs every step and an async bool only
+        # picks the return form). Seeds on-device from this step's rejection
+        # output (spec step) or the just-sampled tokens (non-spec / prefill
+        # step), so neither mode waits on a host copy of the sampled tokens.
+        # Async gets the raw [num_reqs, K] device tensor back (consumed by the
+        # substitution assemblers below); sync caches the host list in the
+        # manager for take_draft_token_ids(). ngram has no device path and
+        # keeps proposing from the host-materialized output in the sync block
+        # below.
+        is_async = self.scheduler_config.async_scheduling
+        eagle3_drafts = None
+        if (self._is_async_drafter and combined_selected_tokens):
+            if is_spec_step:
+                eagle3_drafts = (
+                    self.spec_decode_manager.propose_draft_token_ids(
+                        sampled_token_ids=None,
+                        discard_sampled_tokens_req_indices=
+                        discard_sampled_tokens_req_indices,
+                        num_rejected_tokens_np=None,
+                        scheduler_output=scheduler_output,
+                        return_device=is_async,
+                        next_tokens_per_chunk=next_tokens_per_chunk))
+            else:
+                # Seed = the just-sampled tokens, kept on-device (no D2H):
+                # propose takes the sync seed path but reads the seed from
+                # `device_seed`.
+                device_seed = torch.cat([
+                    sel.view(-1)[:n]
+                    for sel, n in zip(combined_selected_tokens,
+                                      combined_selected_tokens_real_lens)
+                ])
+                eagle3_drafts = (
+                    self.spec_decode_manager.propose_draft_token_ids(
+                        sampled_token_ids=[],
+                        discard_sampled_tokens_req_indices=
+                        discard_sampled_tokens_req_indices,
+                        num_rejected_tokens_np=None,
+                        scheduler_output=scheduler_output,
+                        return_device=is_async,
+                        device_seed=device_seed))
+
+        if self.scheduler_config.async_scheduling:
+            # A replicated (draft_tp=1) drafter proposes independently per TP
+            # rank and the proposals are not bit-identical; async verifies
+            # each rank's OWN drafts (no driver round-trip like sync), so the
+            # ranks drift apart and the output corrupts. Pin every rank to
+            # rank 0's proposal; sharded drafters skip this.
+            eagle3_drafts = self._sync_replicated_drafts_across_tp(
+                eagle3_drafts)
+
+            if (eagle3_drafts is not None
+                    and scheduler_output.has_structured_output_requests):
+                # The deferred grammar-bitmask will fetch these drafts via
+                # take_draft_token_ids() to replace the async scheduler's -1
+                # splaceholders. Stage after the TP pin above so the host
+                # copy matches what gets substituted on device.
+                self.spec_decode_manager.stage_draft_token_ids_for_host(
+                    eagle3_drafts)
+
+            # Build the async substitution source from the drafts proposed
+            # above: the [bonus, draft_1..K] source + 1+K next_token_indices,
+            # and the per-request rejected count to park.
+            spec_num_rejected = None
+            num_draft_per_req = None
+            if is_spec_step:
+                (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                 num_draft_per_req) = (self._assemble_async_spec_substitution(
+                     eagle3_drafts, next_tokens_per_chunk, state))
+            elif (self._is_async_drafter and next_tokens_tpu_chunks):
+                # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
+                # branch parked a stride-1 source (sampled token only). Rebuild
+                # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
+                # prompt-context drafts so the NEXT step's verify gets real
+                # drafts instead of placeholders.
+                (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                 num_draft_per_req) = (self._assemble_async_prefill_bootstrap(
+                     eagle3_drafts, combined_selected_tokens,
+                     combined_selected_tokens_real_lens))
+            req_id_to_index_copy = {}
+            if not self.is_pooling_model:
+                req_id_to_index_copy = self._update_placeholder(
+                    discard_sampled_tokens_req_indices, request_seq_lens,
+                    next_token_indices, num_draft_per_req)
+            if next_tokens_tpu_chunks:
+                if len(next_tokens_tpu_chunks) == 1:
+                    next_tokens_tpu = next_tokens_tpu_chunks[0]
+                else:
+                    next_tokens_tpu = torch.cat(next_tokens_tpu_chunks, dim=0)
+                # Bound the async-spec source length so the torch.compiled
+                # _substitute_placeholder_token (next step) sees a fixed shape
+                # instead of recompiling per real num_reqs. Append-pad to the
+                # max stride-(1+K) span: the substitution only reads
+                # [position*stride .. +n_sched-1] for real reqs (positions <
+                # num_reqs), so the appended tail is never indexed -- real
+                # positions are unchanged. Spec only (stride 1+K); pure-non-spec
+                # async keeps its stride-1 source + existing precompile.
+                if spec_num_rejected is not None:
+                    bound = self.max_num_reqs * (
+                        1 + self.speculative_config.num_speculative_tokens)
+                    if next_tokens_tpu.shape[0] < bound:
+                        next_tokens_tpu = torch.nn.functional.pad(
+                            next_tokens_tpu,
+                            (0, bound - next_tokens_tpu.shape[0]))
+                self._pre_async_results = AsyncPreResults(
+                    req_ids=req_ids,
+                    next_tokens_tpu=next_tokens_tpu,
+                    request_seq_lens=request_seq_lens,
+                    discard_sampled_tokens_req_indices=
+                    discard_sampled_tokens_req_indices,
+                    req_id_to_index_copy=req_id_to_index_copy,
+                    copy_state=copy_state,
+                    spec_decode_num_rejected_tokens=spec_num_rejected,
+                    num_draft_per_req=num_draft_per_req,
+                )
+            else:
+                self._pre_async_results = None
+
+        pooler_output = []
+        if self.is_pooling_model:
+            for out in state.pooler_output_list:
+                # Move to CPU as expected by vLLM
+                if isinstance(out, torch.Tensor):
+                    pooler_output.extend(list(out.cpu().unbind(dim=0)))
+                else:
+                    pooler_output.extend(out)
+
+        model_runner_output = ModelRunnerOutput(
+            req_ids=req_ids,
+            # Snapshot of the req_id_to_index for the VLLM scheduler.
+            req_id_to_index=dict(self.input_batch.req_id_to_index),
+            sampled_token_ids=
+            [],  # Filled in AsyncTPUModelRunnerOutput get_output
+            logprobs=logprobs,
+            prompt_logprobs_dict={req_id: None
+                                  for req_id in req_ids},
+            pooler_output=pooler_output,
+            kv_connector_output=kv_connector_output,
+        )
+
+        async_output = AsyncTPUModelRunnerOutput(
+            model_runner_output=model_runner_output,
+            copy_state=copy_state,
+            discard_sampled_tokens_req_indices=
+            discard_sampled_tokens_req_indices)
+
+        if not self.scheduler_config.async_scheduling:
+            final_output = async_output.get_output()
+            if not self.is_pooling_model:
+                for i, req_state, seq_len, req_id in request_seq_lens:
+                    if i in discard_sampled_tokens_req_indices:
+                        continue
+                    valid_tokens = final_output.sampled_token_ids[i]
+                    if not valid_tokens:
+                        continue
+                    req_idx = self.input_batch.req_id_to_index[req_id]
+
+                    # Update the persistent batch.
+                    start_tok_idx = self.input_batch.num_tokens_no_spec[
+                        req_idx]
+                    end_tok_idx = start_tok_idx + len(valid_tokens)
+                    self.input_batch.token_ids_cpu[
+                        req_idx, start_tok_idx:end_tok_idx] = valid_tokens
+                    self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+
+                    req_state.output_token_ids.extend(valid_tokens)
+
+            if (self.speculative_config
+                    and self.speculative_config.method == "ngram"):
+                # ngram drafts on the host from the committed token ids, so it
+                # must run after materialization; eagle3/dflash were already proposed
+                # from device state by the unified call above.
+                self.spec_decode_manager.propose_draft_token_ids(
+                    sampled_token_ids=final_output.sampled_token_ids,
+                    discard_sampled_tokens_req_indices=
+                    discard_sampled_tokens_req_indices,
+                    num_rejected_tokens_np=None,
+                    scheduler_output=scheduler_output)
+
+            return final_output
+
+        return async_output
 
     def _build_padded_sampling_params(
         self,
