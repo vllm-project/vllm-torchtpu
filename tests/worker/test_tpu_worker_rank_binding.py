@@ -149,7 +149,6 @@ def test_dp_binding_applies_offset_without_remapping():
     assert b.native_local_rank == 6
 
 
-@pytest.mark.skip(reason="Pending #409 submission")
 def test_dense_dp_binding_keeps_native_local_rank_dp_aware_but_stays_local():
     # Dense (non-EP) DP replicas have no cross-rank collective, so each
     # bootstraps its own, replica-local torch_tpu slice: rank/world_size
