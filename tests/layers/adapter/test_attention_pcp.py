@@ -591,83 +591,82 @@ def test_adapter_make_streaming_kernel_rejects_unsupported_features(
         )
 
 
-def test_adapter_scoped_callable_uses_lowered_out_shardings(monkeypatch):
+def test_build_pcp_streaming_callable_returns_stock_jax_callable(monkeypatch):
+    """The callable must be stock, not a subclass that overrides __call__.
+
+    It used to be a local subclass so it could size shard_map outputs from
+    ``lowered._out_named_shardings``; stock derived them from
+    ``lowered.out_avals``, which jax.export records as replicated. Since
+    cl/975923205 stock takes ``output_partition_specs`` directly, so the
+    subclass is unnecessary -- and while it existed it silently dropped every
+    argument stock's __call__ gained, ``mesh_device_ids`` included. Asserting
+    the exact type is what keeps a subclass from creeping back in.
+    """
     captured = {}
-    original_call = pcp_adapter.pallas_impl.JaxCallable.__call__
 
-    class FakeOutTree:
-
-        def unflatten(self, values):
-            return tuple(values)
-
-    class FakeLowered:
-        out_avals = ("aval0", "aval1")
-        _out_named_shardings = ("sharding0", "sharding1")
-        out_tree = FakeOutTree()
-        mlir_module_serialized = b"mlir"
-
-        def mlir_module(self):
-            return "module {}"
-
-    class FakePcpCallable(pcp_adapter._PcpStreamingJaxCallable):
-
-        def __init__(self):
-            self.trace_key = "trace"
-            self.static_argnums = ()
-            self.output_shapes = {}
-            self.kernel_key_to_mlir_fingerprint = {}
-            self.mesh = "mesh"
-            self.input_partition_specs = ("input_spec", )
-            self.name = "op"
-            self.exported = lambda *args, **kwargs: FakeLowered()
-            self.donate_argnums = ()
-            self.input_output_aliases = {}
-
-        def _validate_args(self, *args):
-            captured["validated_args"] = args
-
-    class FakePallasRuntime:
-
-        def lookup_custom_kernel(self, name, key):
-            captured["lookup"] = (name, key)
-            return False
-
-        def register_custom_kernel(self, name, key, *, serialized_mlir_module):
-            captured["registered"] = (name, key, serialized_mlir_module)
-
-        def call_custom_kernel(self, name, key, *, inputs, output_shapes,
-                               donate_argnums):
-            captured["call"] = {
-                "name": name,
-                "key": key,
-                "inputs": inputs,
-                "output_shapes": output_shapes,
-                "donate_argnums": donate_argnums,
-            }
-            return ("result0", "result1")
-
-    monkeypatch.setattr(pcp_adapter.pallas_impl, "tpu_torch_pallas",
-                        FakePallasRuntime())
+    monkeypatch.setattr(pcp_adapter.pallas_impl, "_verify_signature",
+                        lambda _signature: None)
+    monkeypatch.setattr(pcp_adapter.pallas_impl, "_infer_static_argnums",
+                        lambda _signature: ())
     monkeypatch.setattr(pcp_adapter.pallas_impl, "_get_kernel_invocation_key",
-                        lambda *_args, **_kwargs: "kernel_key")
-    monkeypatch.setattr(pcp_adapter.pallas_impl, "jax_placeholders",
-                        lambda *_args, **_kwargs: ("jax_arg", ))
-    monkeypatch.setattr(
-        pcp_adapter, "_torch_placeholder_with_sharding",
-        lambda aval, sharding, mesh: f"{aval}:{sharding}:{mesh}")
+                        lambda *_args, **_kwargs: "trace_key")
 
-    result = FakePcpCallable()(torch.tensor(1.0))
+    # Record the kwargs but hand back a genuinely jitted function:
+    # JaxCallable.__init__ runs jax.export.export on it, which rejects
+    # anything that is not the result of jit.
+    real_jit = pcp_adapter.jax.jit
 
-    assert result == ("result0", "result1")
-    assert captured["call"]["output_shapes"] == [
-        "aval0:sharding0:mesh", "aval1:sharding1:mesh"
-    ]
-    assert pcp_adapter.pallas_impl.JaxCallable.__call__ is original_call
+    def recording_jit(fn, **kwargs):
+        captured["jit_kwargs"] = kwargs
+        return real_jit(fn, **kwargs)
+
+    monkeypatch.setattr(pcp_adapter.jax, "jit", recording_jit)
+
+    mesh = object()
+    callable_ = pcp_adapter.build_pcp_streaming_callable(
+        "pcp::op",
+        lambda tensor: tensor,
+        donate_argnums=(0, ),
+        mesh=mesh,
+        input_partition_specs=("input_spec", ),
+        output_partition_specs=("out_spec", ),
+    )
+
+    assert type(callable_) is pcp_adapter.pallas_impl.JaxCallable
+    assert callable_.name == "pcp::op"
+    assert callable_.mesh is mesh
+    assert callable_.input_partition_specs == ("input_spec", )
+    assert callable_.output_partition_specs == ("out_spec", )
+    assert callable_.donate_argnums == (0, )
+    # Stock does not constrain the jit's outputs, and neither should this: the
+    # shard_map body already declares out_specs, so pinning them again only
+    # adds an advisory result attribute to a module whose partitioner is a
+    # no-op. Matching stock is what makes the two paths interchangeable.
+    assert "out_shardings" not in captured["jit_kwargs"]
+
+
+def test_build_pcp_streaming_callable_defaults_output_specs(monkeypatch):
+    monkeypatch.setattr(pcp_adapter.pallas_impl, "_verify_signature",
+                        lambda _signature: None)
+    monkeypatch.setattr(pcp_adapter.pallas_impl, "_infer_static_argnums",
+                        lambda _signature: ())
+    monkeypatch.setattr(pcp_adapter.pallas_impl, "_get_kernel_invocation_key",
+                        lambda *_args, **_kwargs: "trace_key")
+
+    callable_ = pcp_adapter.build_pcp_streaming_callable(
+        "pcp::op",
+        lambda tensor: tensor,
+        donate_argnums=None,
+        mesh=object(),
+        input_partition_specs=("input_spec", ),
+    )
+
+    assert (callable_.output_partition_specs ==
+            pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)
 
 
 def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
     captured = {}
-    original_call = pcp_adapter.pallas_impl.JaxCallable.__call__
 
     class FakePcpCallable:
 
@@ -683,7 +682,7 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
         captured["custom_op"] = (name, wrapped_fn, mutates_args)
         return FakeCustomOp()
 
-    monkeypatch.setattr(pcp_adapter, "_PcpStreamingJaxCallable",
+    monkeypatch.setattr(pcp_adapter.pallas_impl, "JaxCallable",
                         FakePcpCallable)
     monkeypatch.setattr(pcp_adapter.pallas_impl, "_verify_signature",
                         lambda _signature: None)
@@ -691,8 +690,6 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
                         lambda _signature: ())
     monkeypatch.setattr(pcp_adapter.pallas_impl, "_get_kernel_invocation_key",
                         lambda *_args, **_kwargs: "trace_key")
-    monkeypatch.setattr(pcp_adapter, "_named_shardings",
-                        lambda *_args, **_kwargs: ("out0", "out1"))
     monkeypatch.setattr(pcp_adapter.jax, "jit", lambda fn, **kwargs:
                         ("jit_fn", fn, kwargs))
     monkeypatch.setattr(pcp_adapter.torch.library, "custom_op", fake_custom_op)
@@ -713,8 +710,9 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
     assert captured["callable_kwargs"]["name"] == "pcp::op"
     assert captured["callable_kwargs"]["jit_fn"][0] == "jit_fn"
     assert captured["callable_kwargs"]["donate_argnums"] == (0, )
+    assert (captured["callable_kwargs"]["output_partition_specs"] ==
+            pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)
     assert captured["custom_op"][2] == ()
-    assert pcp_adapter.pallas_impl.JaxCallable.__call__ is original_call
 
 
 def test_adapter_invoke_streaming_op_trims_generic_tensor_args():
