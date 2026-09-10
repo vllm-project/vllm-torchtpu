@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call
@@ -29,7 +43,16 @@ def executor(monkeypatch):
     instance.kv_output_aggregator = None
     instance.forward_dag = None
     instance.workers = []
-    monkeypatch.setattr(os, "environ", {})
+    for key in (
+            "TORCH_TPU_BASE_PORT",
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+            "TORCH_TPU_XPROF_SESSION_ID",
+            "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
+            "RAY_USAGE_STATS_ENABLED",
+    ):
+        # Track absent keys too, since the module writes os.environ directly.
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+        monkeypatch.delenv(key)
     yield instance
     instance.forward_dag = None
 
