@@ -6,6 +6,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
+from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.utils import synchronize_tensors
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -75,6 +77,83 @@ def _rollback_offsets_migrate(read_offsets: torch.Tensor, src_t: torch.Tensor,
 
 class MambaStateMixin:
     """Mamba/GDN recurrent state pool and seed copies."""
+
+    def _init_mamba_slot_pool(self, mamba_num_blocks: int) -> None:
+        """(Re)initialize the per-request mamba recurrent-slot allocator.
+
+        Slot 0 is the null/sentinel block (used for padded persistent-batch
+        positions and never handed to a request). Usable slots are
+        `[1, mamba_num_blocks)`, popped from the high end so the first request
+        gets slot 1 (stable pool ordering for easier debugging).
+        Called once after KV cache allocation, when the true mamba block count
+        is known. The mapping itself is keyed on req_id and rebuilt lazily in
+        `_build_mamba_state_indices`, so re-init only resets the free pool.
+
+        With speculative decoding each request owns a *group* of
+        `num_speculative_tokens + 1` consecutive slots; the tracked slot id is
+        the group's base. During a verify step the GDN kernel writes one state
+        checkpoint per window position into `base + t`, and the next step
+        reads its initial state from `base + (num_accepted - 1)`. Rejected
+        drafts are thus rolled back by *selection*, never by copying. Without
+        spec decode the stride is 1 (one slot per request), matching the
+        original layout.
+        """
+        stride = self._mamba_slot_stride
+        num_groups = (mamba_num_blocks - 1) // stride
+        self._mamba_slot_by_req_id = {}
+        self._free_mamba_slots = [
+            1 + g * stride for g in reversed(range(num_groups))
+        ]
+        self._has_mamba_state = True
+
+    def _build_mamba_state_indices(self, start_index: int, num_reqs: int,
+                                   target_num_reqs: int) -> torch.Tensor:
+        """Build the device `mamba_state_indices` for the current chunk.
+
+        Reconciles the req_id->slot map against the live persistent batch:
+          * frees slots whose req_id is no longer present (request finished),
+          * allocates a fresh unique slot for any new req_id.
+        Returns an int32 device tensor of length `target_num_reqs`: positions
+        `[0, num_reqs)` hold the slot for `req_ids[start_index + i]`; the
+        padded tail `[num_reqs, target_num_reqs)` holds slot 0 (null block) so
+        the GDN op (which scans the full length every step) cannot alias an
+        active slot — the null-tail invariant.
+
+        `num_reqs` may exceed the requests actually in the persistent batch:
+        an idle DP rank replaying a peer's collective trace passes the
+        coordinated shape (`num_reqs_max_model_len`) while its own batch is
+        empty or shorter. Those positions carry no request, so they keep the
+        null slot the tail already uses; only the live prefix is assigned.
+        Without this, `run_dp_dummy_draft` walks off the end of `req_ids`
+        with `IndexError` on the compact layout, killing the engine.
+
+        Slot assignment follows the request through upstream vLLM's
+        condense/swap reordering automatically because the map is keyed on the
+        stable req_id, not the moving persistent-batch position.
+        """
+        live_req_ids = set(self.input_batch.req_id_to_index.keys())
+        # Free slots for requests that left the batch.
+        for req_id in list(self._mamba_slot_by_req_id.keys()):
+            if req_id not in live_req_ids:
+                self._free_mamba_slots.append(
+                    self._mamba_slot_by_req_id.pop(req_id))
+
+        indices = self.mamba_state_indices_cpu[:target_num_reqs]
+        indices.fill_(0)
+        req_ids = self.input_batch.req_ids
+        num_live = max(0, min(num_reqs, len(req_ids) - start_index))
+        for i in range(num_live):
+            req_id = req_ids[start_index + i]
+            assert req_id is not None
+            slot = self._mamba_slot_by_req_id.get(req_id)
+            if slot is None:
+                # New request: take a fresh unique slot. The pool is sized to
+                # max_num_reqs + 1, so it can never be exhausted while the
+                # batch holds at most max_num_reqs requests.
+                slot = self._free_mamba_slots.pop()
+                self._mamba_slot_by_req_id[req_id] = slot
+            indices[i] = slot
+        return indices.to(self.device, non_blocking=True)
 
     def _build_mamba_copy_plan(
         self,
@@ -379,3 +458,204 @@ class MambaStateMixin:
         for raws, src_t, dst_t in self._pending_mamba_state_copies:
             copy_mamba_state_blocks(raws, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
+
+    @torch.no_grad()
+    def _update_mamba_slot_read_offsets(self,
+                                        indices_per_group: list[torch.Tensor]
+                                        | None,
+                                        next_tokens: torch.Tensor | None,
+                                        num_reqs: int) -> None:
+        """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
+
+        Each entry holds one mamba group's base slot per batch position for
+        the chunk (padded tail = slot 0, the null block, so its writes are
+        harmless); all groups get the same offsets, since the buffer is
+        indexed by slot/block id and groups allocate distinct ones. The
+        compact pool shares one slot tensor across groups and so passes a
+        single-element list.
+
+        The offset is `num_accepted - 1` derived from the rejection-sampler
+        output for verify chunks, and 0 for non-spec chunks (prefill / plain
+        decode) — which also resets a group's offset after prefill. The next
+        step's GDN kernel resumes each request from checkpoint `offset` of
+        its state block (the checkpoint of its last accepted token).
+        """
+        if self.mamba_slot_read_offsets is None or not indices_per_group:
+            return
+        offsets = torch.zeros(indices_per_group[0].shape[0],
+                              dtype=torch.int32,
+                              device=indices_per_group[0].device)
+        if next_tokens is not None:
+            # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
+            # last accepted token is at offset num_valid - 1.
+            num_valid = (next_tokens[:num_reqs]
+                         != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+            offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
+        if len(indices_per_group) == 1:
+            self.mamba_slot_read_offsets.index_put_(
+                (indices_per_group[0].long(), ), offsets)
+        else:
+            all_indices = torch.cat(indices_per_group, dim=0).long()
+            all_offsets = offsets.repeat(len(indices_per_group))
+            self.mamba_slot_read_offsets.index_put_((all_indices, ),
+                                                    all_offsets)
+
+    def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
+        """This chunk's mamba state slot/block ids, one tensor per group.
+
+        The compact pool shares one slot tensor across every mamba group, so
+        it yields a single-element list; the unified pool allocates a
+        distinct state block per group and the group builders collect them
+        during the metadata build.
+        """
+        ctx = self._attn_metadata_builder_ctx
+        if self.mamba_slot_read_offsets is None or ctx is None:
+            return None
+        if ctx.mamba_state_indices is not None:
+            return [ctx.mamba_state_indices]
+        return ctx.unified_mamba_state_indices
+
+    @torch.no_grad()
+    def _reset_read_offsets_for_new_requests(self, start_index: int,
+                                             num_reqs: int) -> None:
+        """Zero the read offset of every request entering the batch.
+
+        `mamba_slot_read_offsets` is indexed by slot/block id, but a slot
+        outlives the request that wrote it. A request that leaves the batch
+        mid-verify-window leaves `num_accepted - 1` behind, and both layouts
+        hand that storage straight to the next request:
+
+          * compact -- `_build_mamba_state_indices` returns the slot to
+            `_free_mamba_slots` and pops it for a new req_id;
+          * unified -- vLLM's block manager frees the state block and
+            reallocates it.
+
+        Nothing else clears the entry. `_update_mamba_slot_read_offsets`
+        only covers requests already in the batch and runs *after* the
+        forward, and the seed-copy migration is doubly gated (align mode
+        and the unified layout), so it never runs for a compact/`none`
+        deployment at all. The new owner's first forward would then resume
+        from a checkpoint belonging to the previous conversation — silent
+        GDN state corruption, not a crash.
+
+        The scatter is issued UNCONDITIONALLY, every step, whether or not
+        any request is new. Under EP-DP lockstep every rank must run the
+        same device program, and which requests are new is rank-local: an
+        early return on "nothing to reset" makes one rank skip device work
+        its peers perform, they fall out of step, and the next collective
+        deadlocks. The mask makes an all-old batch a no-op instead —
+        already-seen requests and padded positions are redirected to slot 0,
+        the null block, whose offset is 0 regardless.
+        """
+        if self.mamba_slot_read_offsets is None:
+            return
+        groups = self._mamba_state_index_groups()
+        if not groups:
+            return
+        req_ids = self.input_batch.req_ids
+        # Forget requests that have left, so a later req_id reusing the same
+        # string is still treated as new.
+        self._mamba_offset_seeded &= set(
+            self.input_batch.req_id_to_index.keys())
+
+        width = groups[0].shape[0]
+        keep, keep_dev, null = self._read_offset_reset_scratch(
+            width, groups[0].device)
+        keep.zero_()
+        for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
+            req_id = req_ids[start_index + i]
+            if req_id is None or i >= width:
+                continue
+            if req_id not in self._mamba_offset_seeded:
+                self._mamba_offset_seeded.add(req_id)
+                keep[i] = True
+        # No `if nothing_new: return` here — see the docstring. The device
+        # work below must be issued on every rank on every step.
+        keep_dev.copy_(keep, non_blocking=True)
+        # Stack groups and reset offsets across all groups in one compiled program.
+        stacked = torch.stack(groups) if len(
+            groups) > 1 else groups[0].unsqueeze(0)
+        _reset_read_offsets(self.mamba_slot_read_offsets, keep_dev, stacked,
+                            null)
+
+    def _read_offset_reset_scratch(
+        self, width: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reusable `(keep_cpu, keep_dev, null)` of length `width`.
+
+        `_reset_read_offsets_for_new_requests` runs on every step, so its
+        working set is allocated once per width rather than per step. Width
+        is the padded batch bucket, so this holds one entry per bucket —
+        a handful for the life of the process. `null` is a 0-d zero that
+        broadcasts in the `torch.where`, replacing a full-width
+        `zeros_like` per mamba group per step.
+        """
+        assert self.mamba_slot_read_offsets is not None
+        key = (width, str(device))
+        entry = self._read_offset_scratch.get(key)
+        if entry is None:
+            entry = (
+                torch.zeros(width, dtype=torch.bool),
+                torch.zeros(width, dtype=torch.bool, device=device),
+                torch.zeros((), dtype=torch.int32, device=device),
+            )
+            self._read_offset_scratch[key] = entry
+        return entry
+
+    def _precompile_mamba_state_seed_copies(self) -> None:
+        """Warm the seed-copy program for every raw-pool set at every bucket
+        length, so the first real block-boundary crossing does not compile
+        mid-serving. Runs right after the pool zero-fill sync: the pools must
+        be quiescent when their donation is first compiled (see the note in
+        initialize_kv_cache). All-zero indices copy the null block onto
+        itself; src and dst are distinct tensors (dynamo specializes on
+        src-is-dst otherwise).
+        """
+        if not self._mamba_copy_plan:
+            return
+        raw_sets: dict[tuple[int, ...], list[torch.Tensor]] = {}
+        for _, raws in self._mamba_copy_plan:
+            raw_sets.setdefault(tuple(id(r) for r in raws), raws)
+        # Serving calls the program under execute_model's no_grad, and dynamo
+        # guards on grad mode: compile it the same way.
+        with self._precompile_timed(
+                "mamba state seed copies"), torch.no_grad():
+            limit = self._bucket_len(
+                len(self._mamba_copy_plan) * self.max_num_reqs *
+                self._pool_block_split)
+            n = 8
+            while n <= limit:
+                src = torch.zeros(n, dtype=torch.int32).to(self.device)
+                dst = torch.zeros(n, dtype=torch.int32).to(self.device)
+                for raws in raw_sets.values():
+                    copy_mamba_state_blocks(raws, src, dst)
+                n *= 4
+            for raws in raw_sets.values():
+                synchronize_tensors(raws)
+
+    def _precompile_mamba_rollback_helpers(self) -> None:
+        """Warm the compiled rollback scatters at every bucket length.
+
+        Mamba block-boundary crossings do not occur during the synthetic
+        warmup request (unlike the reset scatter, which the real warmup
+        path exercises), so without this the first real crossing would
+        compile XLA mid-serving while lockstep peers wait at their next
+        collective. All-zero indices write the null slot, moving no state.
+        Crossings accumulate across every mamba group in a step, so the
+        ladder tops out at num_groups * max_num_reqs; src and dst must be
+        DISTINCT tensors or dynamo specializes the migrate graph on
+        src-is-dst and the real two-tensor call retraces mid-serving.
+        """
+        offsets = self.mamba_slot_read_offsets
+        if offsets is None:
+            return
+        with self._precompile_timed("mamba rollback helpers"):
+            num_groups = max(1, len(self._mamba_copy_plan))
+            limit = self._bucket_len(num_groups * self.max_num_reqs)
+            n = 8
+            while n <= limit:
+                src = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                dst = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                _rollback_offsets_seed_compiled(offsets, dst)
+                _rollback_offsets_migrate_compiled(offsets, src, dst)
+                n *= 4
