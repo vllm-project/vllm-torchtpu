@@ -48,6 +48,7 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import gc
 import os
 from collections.abc import Generator
 from typing import Optional
@@ -337,3 +338,88 @@ def patch_default_loader_ep_weight_filter() -> None:
     weight_utils._tpu_ep_filter_patch = True
     logger.info("Applied TPU patch: EP weight filter covers "
                 ".weight_packed/.weight_scale (DefaultModelLoader).")
+
+
+def _evict_checkpoint_page_cache(files: list[str]) -> None:
+    """Drop clean host page cache for weight files via posix_fadvise."""
+    evicted_count = 0
+    evicted_gb = 0.0
+    for fpath in files:
+        if os.path.isfile(fpath):
+            try:
+                file_size_gb = os.path.getsize(fpath) / (1024**3)
+                with open(fpath, "rb") as f:
+                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                evicted_gb += file_size_gb
+                evicted_count += 1
+                logger.info(
+                    "[tpu-model-loader] Evicted %s (%.2f GB) from host page cache.",
+                    fpath,
+                    file_size_gb,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[tpu-model-loader] Failed to evict page cache for %s: %s",
+                    fpath,
+                    e,
+                )
+    gc.collect()
+    logger.info(
+        "[tpu-model-loader] Evicted %d weight files (%.2f GB) from host page cache.",
+        evicted_count,
+        evicted_gb,
+    )
+
+
+def patch_default_model_loader_page_cache() -> None:
+    """Evict host page cache for weight files once loaded into TPU HBM.
+
+    Reading large models from local disk leaves significant clean page cache
+    in host memory. Evicting via posix_fadvise(DONTNEED) drops this
+    immediately after weights are loaded into TPU HBM, freeing host memory
+    for runtime allocations such as large KV cache offloading.
+    Guarded by TPU_EVICT_WEIGHTS_PAGE_CACHE (default: False).
+    """
+    from vllm_torchtpu import envs
+
+    if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
+        return
+
+    from vllm.config import ModelConfig
+    from vllm.model_executor.model_loader import default_loader as dl
+
+    if getattr(dl.DefaultModelLoader, "_tpu_cache_evict_patch", False):
+        return
+
+    original_prepare_weights = dl.DefaultModelLoader._prepare_weights
+    original_load_weights = dl.DefaultModelLoader.load_weights
+
+    def _prepare_weights(self, *args, **kwargs):
+        res = original_prepare_weights(self, *args, **kwargs)
+        if isinstance(res, tuple) and len(res) >= 2:
+            self._loaded_weight_files = res[1]
+        return res
+
+    def load_weights(self, model: torch.nn.Module,
+                     model_config: ModelConfig) -> None:
+        original_load_weights(self, model, model_config)
+
+        if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
+            return
+
+        # Host page cache is shared across ranks; only local rank 0 issues the eviction
+        local_rank = int(
+            os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        if local_rank == 0 and hasattr(self, "_loaded_weight_files"):
+            try:
+                _evict_checkpoint_page_cache(self._loaded_weight_files)
+            except Exception as e:
+                logger.warning(
+                    "[tpu-model-loader] Page cache eviction skipped: %s", e)
+
+    dl.DefaultModelLoader._prepare_weights = _prepare_weights
+    dl.DefaultModelLoader.load_weights = load_weights
+    dl.DefaultModelLoader._tpu_cache_evict_patch = True
+    logger.info(
+        "Applied TPU patch: DefaultModelLoader page cache eviction on load completion."
+    )

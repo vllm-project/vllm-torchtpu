@@ -109,8 +109,6 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/kernels",
     "vllm_torchtpu/layers/common",
     "vllm_torchtpu/layers/vllm/attention.py",
-    # DCP attention registers its own Pallas custom-op kernels (batched RPA
-    # over the decode-context-parallel group).
     "vllm_torchtpu/layers/vllm/cp_attention.py",
     "vllm_torchtpu/layers/vllm/custom_ops",
     "vllm_torchtpu/layers/vllm/fused_moe.py",

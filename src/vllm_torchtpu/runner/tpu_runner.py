@@ -6377,7 +6377,7 @@ class TPUModelRunner(GPUModelRunner):
                             ))
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = tuple(
-                            torch.zeros(spec.shape, dtype=spec.dtype).to(
+                            torch.zeros(spec.shape, dtype=spec.torch_dtype).to(
                                 self.device) for spec in specs)
                         continue
                     # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):

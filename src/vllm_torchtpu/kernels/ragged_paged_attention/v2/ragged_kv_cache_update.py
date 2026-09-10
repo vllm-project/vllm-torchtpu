@@ -10,6 +10,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.utils import TPU_HEAD_SIZE_ALIGNMENT, get_dtype_packing
 
 
@@ -33,46 +34,101 @@ def _kv_cache_update_kernel(
     scratch,  # [num_slices_per_block, page_size, num_combined_kv_heads,
     # head_dim]
     sem,
+    *,
+    pipelined_dma: bool = False,
 ):
-    async_copies = []
     block_idx = pl.program_id(0)
     num_slices_per_block = scratch.shape[0]
 
-    # Copy from new_kv_hbm_ref to scratch
-    for i in range(num_slices_per_block):
-        offset_i = i + block_idx * num_slices_per_block
-        new_kv_start = jax.lax.select(offset_i < num_slices_ref[0],
-                                      slices_ref[1, offset_i], 0)
-        length = jax.lax.select(offset_i < num_slices_ref[0],
-                                slices_ref[2, offset_i], 0)
-        async_copy = pltpu.make_async_copy(
-            new_kv_hbm_ref.at[pl.ds(new_kv_start, length), ...],
-            scratch.at[i, pl.ds(0, length), ...],
+    if not pipelined_dma:
+        async_copies = []
+        # Copy from new_kv_hbm_ref to scratch
+        for i in range(num_slices_per_block):
+            offset_i = i + block_idx * num_slices_per_block
+            new_kv_start = jax.lax.select(offset_i < num_slices_ref[0],
+                                          slices_ref[1, offset_i], 0)
+            length = jax.lax.select(offset_i < num_slices_ref[0],
+                                    slices_ref[2, offset_i], 0)
+            async_copy = pltpu.make_async_copy(
+                new_kv_hbm_ref.at[pl.ds(new_kv_start, length), ...],
+                scratch.at[i, pl.ds(0, length), ...],
+                sem,
+            )
+            async_copy.start()
+            async_copies.append(async_copy)
+
+        for async_copy in async_copies:
+            async_copy.wait()
+
+        # Copy from scratch to kv_cache_hbm_ref
+        async_copies.clear()
+        for i in range(num_slices_per_block):
+            offset_i = i + block_idx * num_slices_per_block
+            kv_cache_start = jax.lax.select(offset_i < num_slices_ref[0],
+                                            slices_ref[0, offset_i], 0)
+            length = jax.lax.select(offset_i < num_slices_ref[0],
+                                    slices_ref[2, offset_i], 0)
+            async_copy = pltpu.make_async_copy(
+                scratch.at[i, pl.ds(0, length), ...],
+                kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
+                sem,
+            )
+            async_copy.start()
+            async_copies.append(async_copy)
+        for async_copy in async_copies:
+            async_copy.wait()
+    else:
+        # Pipelined double-buffering: overlap reading slice i+1 with writing slice i to HBM
+        offset_0 = block_idx * num_slices_per_block
+        new_kv_start_0 = jax.lax.select(offset_0 < num_slices_ref[0],
+                                        slices_ref[1, offset_0], 0)
+        len_0 = jax.lax.select(offset_0 < num_slices_ref[0],
+                               slices_ref[2, offset_0], 0)
+        read_copy = pltpu.make_async_copy(
+            new_kv_hbm_ref.at[pl.ds(new_kv_start_0, len_0), ...],
+            scratch.at[0, pl.ds(0, len_0), ...],
             sem,
         )
-        async_copy.start()
-        async_copies.append(async_copy)
+        read_copy.start()
 
-    for async_copy in async_copies:
-        async_copy.wait()
+        write_copy = None
+        for i in range(num_slices_per_block):
+            read_copy.wait()
+            curr_buf_idx = i % 2
+            next_buf_idx = (i + 1) % 2
 
-    # Copy from scratch to kv_cache_hbm_ref
-    async_copies.clear()
-    for i in range(num_slices_per_block):
-        offset_i = i + block_idx * num_slices_per_block
-        kv_cache_start = jax.lax.select(offset_i < num_slices_ref[0],
-                                        slices_ref[0, offset_i], 0)
-        length = jax.lax.select(offset_i < num_slices_ref[0],
-                                slices_ref[2, offset_i], 0)
-        async_copy = pltpu.make_async_copy(
-            scratch.at[i, pl.ds(0, length), ...],
-            kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
-            sem,
-        )
-        async_copy.start()
-        async_copies.append(async_copy)
-    for async_copy in async_copies:
-        async_copy.wait()
+            if write_copy is not None:
+                write_copy.wait()
+
+            offset_i = i + block_idx * num_slices_per_block
+            kv_cache_start_i = jax.lax.select(offset_i < num_slices_ref[0],
+                                              slices_ref[0, offset_i], 0)
+            len_i = jax.lax.select(offset_i < num_slices_ref[0],
+                                   slices_ref[2, offset_i], 0)
+            write_copy = pltpu.make_async_copy(
+                scratch.at[curr_buf_idx, pl.ds(0, len_i), ...],
+                kv_cache_hbm_ref.at[pl.ds(kv_cache_start_i, len_i), ...],
+                sem,
+            )
+            write_copy.start()
+
+            if i + 1 < num_slices_per_block:
+                offset_next = (i + 1) + block_idx * num_slices_per_block
+                new_kv_start_next = jax.lax.select(
+                    offset_next < num_slices_ref[0],
+                    slices_ref[1, offset_next], 0)
+                len_next = jax.lax.select(offset_next < num_slices_ref[0],
+                                          slices_ref[2, offset_next], 0)
+                read_copy = pltpu.make_async_copy(
+                    new_kv_hbm_ref.at[pl.ds(new_kv_start_next, len_next), ...],
+                    scratch.at[next_buf_idx,
+                               pl.ds(0, len_next), ...],
+                    sem,
+                )
+                read_copy.start()
+
+        if write_copy is not None:
+            write_copy.wait()
 
 
 def _dynamic_validate_inputs(slices, new_token_num, kv_cache_token_num,
@@ -144,6 +200,7 @@ def _kv_cache_update(
     num_slices_per_block: int,
     dynamic_validate_inputs: bool,
     vmem_limit_bytes: int = 40 * 1024 * 1024,
+    pipelined_dma: bool = False,
 ):
     new_token_num, num_combined_kv_heads, head_dim = new_kv.shape
     assert kv_cache.shape[1] == num_combined_kv_heads
@@ -172,8 +229,11 @@ def _kv_cache_update(
         pltpu.SemaphoreType.DMA,
     ]
 
+    kernel_fn = (functools.partial(_kv_cache_update_kernel, pipelined_dma=True)
+                 if pipelined_dma else _kv_cache_update_kernel)
+
     kernel = pl.pallas_call(
-        _kv_cache_update_kernel,
+        kernel_fn,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_prefetches),
             in_specs=in_specs,
@@ -232,7 +292,8 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int,
 @functools.partial(
     jax.jit,
     static_argnames=[
-        "page_size", "num_slices_per_block", "mesh", "kv_cache_pspec"
+        "page_size", "num_slices_per_block", "mesh", "kv_cache_pspec",
+        "pipelined_dma"
     ],
     donate_argnames="kv_cache",
 )
@@ -251,7 +312,11 @@ def kv_cache_update(
     | None = None,  # Only sharding along head_dim is supported
     dynamic_validate_inputs: bool = False,
     vmem_limit_bytes: int = 40 * 1024 * 1024,
+    pipelined_dma: bool | None = None,
 ):
+    if pipelined_dma is None:
+        pipelined_dma = envs.USE_RPA_PIPELINED_DMA_STAGING
+
     if num_slices_per_block is None:
         _, num_combined_kv_heads, head_dim = new_kv.shape
         page_size_bytes = _get_page_size_bytes(page_size,
@@ -261,9 +326,17 @@ def kv_cache_update(
             page_size_bytes, vmem_limit_bytes)
 
     if mesh is None:
-        return _kv_cache_update(new_kv, slices, kv_cache, num_slices,
-                                page_size, num_slices_per_block,
-                                dynamic_validate_inputs)
+        return _kv_cache_update(
+            new_kv,
+            slices,
+            kv_cache,
+            num_slices,
+            page_size,
+            num_slices_per_block,
+            dynamic_validate_inputs,
+            vmem_limit_bytes=vmem_limit_bytes,
+            pipelined_dma=pipelined_dma,
+        )
 
     if kv_cache_pspec is None:
         raise ValueError(
@@ -278,6 +351,7 @@ def kv_cache_update(
             num_slices_per_block=num_slices_per_block,
             dynamic_validate_inputs=dynamic_validate_inputs,
             vmem_limit_bytes=vmem_limit_bytes,
+            pipelined_dma=pipelined_dma,
         ),
         mesh=mesh,
         in_specs=in_specs,
