@@ -40,9 +40,6 @@ from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
 )
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
-    pcp_streaming_jax_op,
-)
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -546,7 +543,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
                 PartitionSpec("pcp"),  # output
             )
-            gdn_jax_op = pcp_streaming_jax_op(
+            # Torchtpu native jax_op. The pcp_streaming wrapper adds only
+            # kernel_reload's dispatcher, which GDN does not use.
+            gdn_jax_op = pallas.jax_op(
                 op_name,
                 wrapped_fn,
                 donate_argnums=(3, 4),
@@ -829,7 +828,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             PartitionSpec("pcp"),  # output
             PartitionSpec("pcp"),  # z
         )
-        gdn_jax_op = pcp_streaming_jax_op(
+        # Torchtpu native jax_op. The pcp_streaming wrapper adds only
+        # kernel_reload's dispatcher, which GDN does not use.
+        gdn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             # Keep optional operands after the pool so filtering None at the

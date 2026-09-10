@@ -237,7 +237,7 @@ class TestVllmGatedDeltaNetAttention:
             ),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                "pcp_streaming_jax_op",
+                "pallas.jax_op",
                 return_value=fake_jax_op,
             ) as mock_pcp_jax_op,
             patch(
@@ -321,7 +321,7 @@ class TestVllmGatedDeltaNetAttention:
             set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=vllm_config),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                "pcp_streaming_jax_op",
+                "pallas.jax_op",
                 side_effect=fake_pcp_jax_op,
             ),
             patch(
@@ -629,7 +629,7 @@ class TestVllmGatedDeltaNetAttention:
             ),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                "pcp_streaming_jax_op",
+                "pallas.jax_op",
                 return_value=fake_jax_op,
             ) as mock_pcp_jax_op,
         ):
@@ -680,7 +680,7 @@ class TestVllmGatedDeltaNetAttention:
             ),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                "pcp_streaming_jax_op",
+                "pallas.jax_op",
                 return_value=fake_jax_op,
             ),
         ):
@@ -710,7 +710,7 @@ class TestVllmGatedDeltaNetAttention:
             ),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                "pcp_streaming_jax_op",
+                "pallas.jax_op",
                 return_value=fake_jax_op,
             ) as mock_pcp_jax_op,
         ):
