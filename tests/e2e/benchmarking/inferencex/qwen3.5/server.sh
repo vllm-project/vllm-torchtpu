@@ -67,7 +67,6 @@ export MOE_ROUTE_PADDING_TO_EXPERT0=1
 # Min decode bucket = 8: lowest swept concurrency is 4, but 4 is invalid -- the
 # gmm_v2 kernel asserts (num_tokens * topk) % 16 == 0 (4*10=40 isn't).
 export MIN_TOKEN_BUCKET=8
-export USE_MOE_EP_KERNEL=0
 export ATTN_BUCKETIZED_NUM_REQS=true
 export ATTN_CUSTOM_NUM_REQS_BUCKETS=4,8,16,32,64
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768

@@ -83,7 +83,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # Check if all parameters are provided
-if [ -z "$MODEL_NAME" ] || [ -z "$USE_MOE_EP_KERNEL" ] || [ -z "$TENSOR_PARALLEL_SIZE" ] || [ -z "$MAX_MODEL_LEN" ] || [ -z "$MAX_NUM_BATCHED_TOKENS" ] || [ -z "$MAX_GEN_TOKS" ] || [ -z "$ENABLE_EXPERT_PARALLEL" ] || [ -z "$FLEX_THRESHOLD" ] || [ -z "$STRICT_THRESHOLD" ]; then
+if [ -z "$MODEL_NAME" ] || [ -z "$TENSOR_PARALLEL_SIZE" ] || [ -z "$MAX_MODEL_LEN" ] || [ -z "$MAX_NUM_BATCHED_TOKENS" ] || [ -z "$MAX_GEN_TOKS" ] || [ -z "$ENABLE_EXPERT_PARALLEL" ] || [ -z "$FLEX_THRESHOLD" ] || [ -z "$STRICT_THRESHOLD" ]; then
     echo "Error: All parameters are required."
     usage
 fi
@@ -120,7 +120,7 @@ if [ -n "$LIMIT" ]; then
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-output=$(VLLM_XLA_CHECK_RECOMPILATION=0 USE_MOE_EP_KERNEL=${USE_MOE_EP_KERNEL} MODEL_IMPL_TYPE=vllm python "${script_dir}/../../scripts/vllm/integration/lm_eval_accuracy.py" "${lm_eval_args[@]}")
+output=$(VLLM_XLA_CHECK_RECOMPILATION=0 MODEL_IMPL_TYPE=vllm python "${script_dir}/../../scripts/vllm/integration/lm_eval_accuracy.py" "${lm_eval_args[@]}")
 
 echo "Evaluation output:"
 echo "$output"

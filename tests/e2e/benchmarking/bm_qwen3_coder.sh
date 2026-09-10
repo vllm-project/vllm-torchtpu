@@ -111,8 +111,8 @@ while true; do
       ;;
   esac
 done
-if [ -z "$model" ] || [ -z "$tp" ] || [ -z "$req_tput_limit" ] || [ -z "$output_token_tput_limit" ] || [ -z "$total_token_tput_limit" ] || [ -z "$input_len" ] || [ -z "$output_len" ] || [ -z "$use_moe_ep_kernel" ]; then
-  echo "Error: All parameters are required."
+if [ -z "$model" ] || [ -z "$tp" ] || [ -z "$req_tput_limit" ] || [ -z "$output_token_tput_limit" ] || [ -z "$total_token_tput_limit" ] || [ -z "$input_len" ] || [ -z "$output_len" ]; then
+  echo "Missing required arguments"
   echo "model=$model"
   echo "tp=$tp"
   echo "req_tput_limit=$req_tput_limit"
@@ -120,13 +120,19 @@ if [ -z "$model" ] || [ -z "$tp" ] || [ -z "$req_tput_limit" ] || [ -z "$output_
   echo "total_token_tput_limit=$total_token_tput_limit"
   echo "input_len=$input_len"
   echo "output_len=$output_len"
-  echo "use_moe_ep_kernel=$use_moe_ep_kernel"
-
   exit 1
 fi
 
-if [ ! -e ./bench_serving ]; then
-  echo "git clone bench_serving"
+if [ -z "$gpu_memory_utilization" ]; then
+  gpu_memory_utilization=0.9
+fi
+
+if [ -z "$timeout_mins" ]; then
+  timeout_mins=20
+fi
+
+if [ ! -d "bench_serving" ]; then
+  echo "bench_serving not found. Cloning repository..."
   git clone https://github.com/kimbochen/bench_serving.git
 else
   echo "bench_serving exists. Skip git cloning the repo."
@@ -137,8 +143,6 @@ DEFAULT_PORT=8000
 
 start_time=$(date +%s)
 
-# If needed, replace "--async-scheduling" with "--no-async-scheduling"
-export USE_MOE_EP_KERNEL=${use_moe_ep_kernel}
 export MODEL_IMPL_TYPE=vllm
 # TODO: Remove this once batched rpa is the default
 export USE_BATCHED_RPA_KERNEL=1
