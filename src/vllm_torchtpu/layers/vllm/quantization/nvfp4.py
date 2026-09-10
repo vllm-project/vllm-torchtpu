@@ -15,11 +15,11 @@
 
 Loads NVIDIA ModelOpt NVFP4 checkpoints (packed E2M1 weights + per-16-block
 E4M3 scales + per-tensor FP32 global scale) and runs them on the TPU GMM /
-quantized-matmul kernels in W4A16 mode by default (bf16 activations, fp4
-weights dequantized per block inside the kernel). Setting
-``MOE_REQUANTIZE_BLOCK_SIZE`` enables the fused-MoE W4A8 path: MoE weights are
-requantized to the requested MXU-sized block and both GMM inputs are dynamically
-quantized to FP8.
+quantized-matmul kernels in W4A16 mode (bf16 activations, fp4 weights).
+``MOE_REQUANTIZE_BLOCK_SIZE`` changes the MoE weight block size without
+changing the GMM activation precision. With ``USE_MOE_FUSED_EP_KERNEL=1``,
+EP layers default to the kernel's smallest supported weight block when no
+explicit block is configured. Admitted layers use fused EP MoE v2 in W4A8 mode.
 
 Design:
   - Reuse upstream `ModelOptNvFp4{LinearMethod,RoutedExperts}.create_weights` for
@@ -31,8 +31,8 @@ Design:
   - Unpack the packed uint8 weight to native fp4 (`torch.float4_e2m1fn_x2`) in
     the kernel's K-major layout once here at load (`load_kmajor_fp4`), so the
     forward hands native fp4 straight to the kernel with no per-forward unpack.
-    The default path keeps activations in bf16 (W4A16); the opt-in fused-MoE
-    W4A8 path dynamically quantizes activations to FP8 inside each GMM.
+    Ordinary and pipelined GMM keep activations in bf16 (W4A16), including
+    layers refused by fused EP. Only fused EP MoE v2 uses FP8 activations.
 
 Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 (google-pytorch/torch_tpu#1560).
@@ -94,7 +94,7 @@ def _requant_moe_w4a8(w13_u8: torch.Tensor, w13_scale_f: torch.Tensor,
                       w2_u8: torch.Tensor, w2_scale_f: torch.Tensor,
                       block: int):
     """Requantize NVFP4 MoE weights from native block-16 to block-`block` fp4
-    for W4A8 (block >= MXU -> native fp4xfp8 matmul, no in-kernel dequant).
+    for either W4A16 GMM or W4A8 fused EP execution.
 
     Dequantizes with the fused block-16 scale, pads the MoE intermediate up to a
     multiple of `block` (zero-pad: w13's two output halves and w2's contracting
@@ -107,7 +107,7 @@ def _requant_moe_w4a8(w13_u8: torch.Tensor, w13_scale_f: torch.Tensor,
     two_i = w13_u8.shape[1]
     inter = two_i // 2  # MoE intermediate (per expert)
     assert H % block == 0, (
-        f"W4A8 requant needs hidden ({H}) divisible by block ({block}).")
+        f"NVFP4 requant needs hidden ({H}) divisible by block ({block}).")
     inter_pad = align_to(inter, block) - inter
 
     # w13: dequant block-16 -> [E, 2I, H] fp32; pad each output half I -> I_pad.
@@ -170,13 +170,13 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
 
 
 class VllmNvfp4MoEMethod(FusedMoEMethodBase):
-    """NVFP4 MoE for TPU (W4A16).
+    """NVFP4 MoE for TPU: W4A16 GMM or opt-in W4A8 fused EP v2.
 
     Reuses upstream `ModelOptNvFp4FusedMoE.create_weights` for parameter
     registration. The E2M1 weights are unpacked to native fp4 in the kernel's
     K-major layout at load; the FP8 block scale and FP32 global scale are fused
-    into one FP32 block-16 scale and the matmul runs through `fused_moe_gmm` ->
-    `gmm_v2` with `maybe_quantize_lhs=False`.
+    into one FP32 scale, with optional weight-block requantization. GMM runs
+    with `maybe_quantize_lhs=False`; only admitted fused EP layers use W4A8.
     """
 
     def __init__(self, quant_config: 'VllmNvfp4Config', moe_config):
@@ -258,11 +258,30 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
-        # Requantization changes the checkpoint's block-16 weights and enables
-        # W4A8 in GMM. An admitted layer uses fused EP W4A8 instead.
-        # Unset retains the original block-16 W4A16 path.
+        # Requantization changes only the checkpoint's weight blocks. GMM
+        # always retains BF16 activations; admitted fused EP layers use W4A8.
+        # An explicit block wins; otherwise opt-in EP layers use the smallest
+        # block that fits the fused kernel's packed-weight row layout.
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
-        layer._tpu_quantize_fp4_lhs = bool(requant_block)
+        if (requant_block is None and envs.USE_MOE_FUSED_EP_KERNEL
+                and layer.moe_config.moe_parallel_config.use_ep):
+            from vllm_torchtpu.kernels.fused_moe.v2.host import (
+                PACK4, U32_SUBLANE_TILE)
+            min_block = U32_SUBLANE_TILE * PACK4
+            hidden = layer.w13_weight.data.shape[-1] * 2
+            # The existing requant path can pad the intermediate dimension,
+            # but the hidden dimension must already align. No larger legal
+            # block can divide it if the minimum packed-row tile does not.
+            if hidden % min_block == 0:
+                requant_block = min_block
+                logger.info_once(
+                    "NVFP4 fused EP automatically selects weight block-%d "
+                    "because MOE_REQUANTIZE_BLOCK_SIZE is unset.", min_block)
+            else:
+                logger.warning_once(
+                    "NVFP4 fused EP not engaged: hidden=%d is not divisible "
+                    "by the minimum weight block (%d); keeping GMM W4A16.",
+                    hidden, min_block)
         already_kmajor = False
         if requant_block:
             requant_block = int(requant_block)
@@ -278,14 +297,14 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 w2, w2_scale_4d = requant_load_kmajor_fp4(
                     _fresh(layer.w2_weight.data), w2_scale_f, requant_block)
                 already_kmajor = True
-                mode = f"W4A8 (jax requant block-{requant_block})"
+                mode = f"FP4 (jax requant block-{requant_block})"
             else:
                 # Contracting dim not divisible by the block (e.g. Qwen3-30B w2
                 # I=768): pad + requant in torch.
                 w13, w13_scale_4d, w2, w2_scale_4d = _requant_moe_w4a8(
                     layer.w13_weight.data, w13_scale_f, layer.w2_weight.data,
                     w2_scale_f, requant_block)
-                mode = f"W4A8 (torch requant block-{requant_block})"
+                mode = f"FP4 (torch requant block-{requant_block})"
         else:
             # Lay block-16 scales out for gmm_v2: [E, num_blocks_over_K, 1, N]
             # (already K-major-aligned). Weights are the checkpoint-layout packed
@@ -295,7 +314,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             w2_scale_4d = _to_kernel_scale(w2_scale_f)  # [E, I/group, 1, H]
             w13 = _fresh(layer.w13_weight.data)  # [E, 2I, H/2] uint8
             w2 = _fresh(layer.w2_weight.data)  # [E, H, I/2] uint8
-            mode = "W4A16"
+            mode = "FP4 (block-16)"
 
         for attr in ("w13_weight_scale_2", "w2_weight_scale_2",
                      "w13_input_scale", "w2_input_scale"):
@@ -303,8 +322,8 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 delattr(layer, attr)
 
         # Store the weights as native fp4 (torch.float4_e2m1fn_x2) in gmm_v2's
-        # K-major [E, K, N] layout. The W4A8 jax-requant path already returns
-        # native fp4 K-major; the W4A16 (and torch-requant) paths unpack +
+        # K-major [E, K, N] layout. The JAX requant path already returns
+        # native fp4 K-major; the block-16 and torch-requant paths unpack +
         # transpose the packed uint8 here, ONCE at load, so the forward hands
         # the weight straight to gmm_v2 with no per-forward unpack or transpose.
         if not already_kmajor:
@@ -341,13 +360,12 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            quantize_fp4_lhs=layer._tpu_quantize_fp4_lhs,
         )
 
         from vllm_torchtpu.layers.vllm.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
         op = None
-        # Keep the original block-16/default path when requantization is unset.
+        # Keep block-16 on GMM when no explicit or automatic requant is selected.
         # prebuild performs all per-layer routing/parallelism admission checks.
         if requant_block:
             op = prebuild_fused_moe_ep(layer,
@@ -370,6 +388,9 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 persistent=False)
             logger.info_once("NVFP4 fused EP W4A8 enabled: block-%d",
                              requant_block)
+        else:
+            logger.info_once("NVFP4 GMM W4A16 enabled: block-%d", requant_block
+                             or self.group_size)
 
     def apply_monolithic(
         self,
@@ -411,7 +432,6 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
-            "quantize_fp4_lhs": layer._tpu_quantize_fp4_lhs,
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

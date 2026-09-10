@@ -156,12 +156,10 @@ def gmm_wrapper(lhs,
                 zero_initialize=False,
                 fuse_act=None,
                 preferred_element_type=None,
-                rhs_quant_dtype=None,
-                quantize_fp4_lhs=False):
-    # FP4 weights keep BF16 activations by default. Callers may explicitly opt
-    # into W4A8 after requantizing the weight scales to an MXU-sized block. The
-    # gmm_v2 config still keeps block sizes smaller than the MXU on its W4A16
-    # dequant-before-matmul path.
+                rhs_quant_dtype=None):
+    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
+    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
+    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
     is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
                      and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
     return gmm_v2(
@@ -174,7 +172,7 @@ def gmm_wrapper(lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
-        maybe_quantize_lhs=not is_fp4_weight or quantize_fp4_lhs,
+        maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
     )
 
@@ -271,7 +269,6 @@ def moe_gmm(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
-    quantize_fp4_lhs: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -291,7 +288,6 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
-        quantize_fp4_lhs=quantize_fp4_lhs,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
@@ -307,8 +303,7 @@ def moe_gmm(
                            group_offset,
                            zero_initialize=False,
                            preferred_element_type=x.dtype,
-                           rhs_quant_dtype=rhs_quant_dtype,
-                           quantize_fp4_lhs=quantize_fp4_lhs)
+                           rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -379,7 +374,6 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
-        "quantize_fp4_lhs",
     ),
 )
 def fused_moe_func(
@@ -400,7 +394,6 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
-    quantize_fp4_lhs: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -485,6 +478,5 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
-        quantize_fp4_lhs=quantize_fp4_lhs,
     )
     return x[:num_tokens, :hidden_size]

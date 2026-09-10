@@ -121,7 +121,6 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
-    quantize_fp4_lhs: bool = False,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -153,8 +152,6 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
-        quantize_fp4_lhs: Whether to dynamically quantize activations for FP4
-            weights in both expert GMMs.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
@@ -196,7 +193,6 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
-            quantize_fp4_lhs=quantize_fp4_lhs,
         )
 
         if parallel_size > 1:
@@ -254,7 +250,6 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
-            quantize_fp4_lhs=quantize_fp4_lhs,
         )
 
         # Reduce-scatter partial output for current chunk

@@ -230,7 +230,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
-    # Specify requantization block size for MoE weights
+    # Specify requantization block size for MoE weights. When unset, NVFP4
+    # expert-parallel layers with USE_MOE_FUSED_EP_KERNEL use the kernel's
+    # smallest supported block; other MoE paths retain their default.
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
