@@ -23,13 +23,17 @@ export PRIORITY_DEFAULT=2
 export PRIORITY_NIGHTLY=1
 export PRIORITY_KERNEL_TUNING=-9
 
-# Implemented dynamic job prioritization by injecting integers during upload
+# Apply priority and default retries for jobs refused before execution.
 upload_with_priority() {
   local yaml_file=$1
   local JOB_PRIORITY=$2
   echo "--- :pipeline: Uploading $yaml_file with priority ${JOB_PRIORITY:-$PRIORITY_DEFAULT}"
-  {
-    echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
-    cat "$yaml_file";
-  } | buildkite-agent pipeline upload
+  JOB_PRIORITY="${JOB_PRIORITY:-$PRIORITY_DEFAULT}" yq '
+    explode(.) |
+    .priority = env(JOB_PRIORITY) |
+    (.. | select(tag == "!!map") | select(has("steps")) | .steps[] |
+      select(tag == "!!map") | select(has("command") or has("commands")) |
+      select(.retry.automatic == null) | .retry.automatic) =
+      [{"signal_reason": "agent_refused", "limit": 2}]
+  ' "$yaml_file" | buildkite-agent pipeline upload
 }
