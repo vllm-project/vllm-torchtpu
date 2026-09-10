@@ -50,21 +50,27 @@ EXEMPT_PATHS = {
     PACKAGE / "env_override.py",
 }
 
-# Process bootstrap, not user configuration: these are set per worker at
-# spawn time by torchrun / Ray / the TPU runtime, so a registry entry with a
-# default would be actively misleading.
+# Process bootstrap, not user configuration: set per worker at spawn time by
+# torchrun / Ray / the TPU runtime. These stay on raw os.environ because the
+# read sites need semantics no envs.py builder has -- every builder returns a
+# default when the variable is unset, and none of them raise:
+#
+#   __init__.py             os.environ["LOCAL_RANK"] must raise when unset;
+#                           a worker silently becoming rank 0 is worse.
+#   model_loader_patches.py chains LOCAL_RANK -> RANK -> "0".
+#   tpu_worker.py           falls back to pc.world_size, a runtime value.
+#   raiden_store.py         checks whether PYTHONHASHSEED is set, not its
+#                           value, and it is a CPython knob, not one of ours.
+#
+# Only names actually read in this package are listed. Adding a new bootstrap
+# read fails this hook with a message pointing here, which is the moment to
+# decide whether it belongs in envs.py instead.
 BOOTSTRAP_VARS = {
-    "RANK",
     "LOCAL_RANK",
-    "WORLD_SIZE",
     "LOCAL_WORLD_SIZE",
-    "GROUP_RANK",
-    "MASTER_ADDR",
-    "MASTER_PORT",
-    "TPU_WORKER_ID",
-    "TPU_WORKER_HOSTNAMES",
-    "CLOUD_TPU_TASK_ID",
     "PYTHONHASHSEED",
+    "RANK",
+    "WORLD_SIZE",
 }
 
 
