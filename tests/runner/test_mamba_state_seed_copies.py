@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 import torch
 
-import vllm_torchtpu.runner.tpu_runner as runner_mod
+import vllm_torchtpu.runner.mamba_state as runner_mod
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 BLOCK_SIZE = 256
