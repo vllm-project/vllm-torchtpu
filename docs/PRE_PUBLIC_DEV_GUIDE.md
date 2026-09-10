@@ -196,6 +196,13 @@ After the PR is merged into `main`:
 
 ## 4. CI Policy
 
+### Pure CPU unit tests
+
+Explicitly mark newly authored pure CPU unit tests with `pytestmark = pytest.mark.cpu_test`
+at module scope, or `@pytest.mark.cpu_test` on individual tests in mixed modules.
+CI uses this marker to run these tests on CPU queues and exclude them from TPU queues.
+Unmarked tests remain eligible for TPU queues.
+
 ### Presubmit Requires the `ready` Label
 
 - **Policy:** Presubmit pipelines only run on a PR that carries the `ready` label. Without it, the bootstrap job stops in about ten seconds and no test, build, or benchmark steps are uploaded.
