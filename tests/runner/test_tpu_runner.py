@@ -38,7 +38,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
                                                  PallasMLAttentionBackend)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner import kv_connector_glue, tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
@@ -71,7 +71,7 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
 
     with patch.object(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector):
         with pytest.raises(RuntimeError, match="synthetic warmup failed"):
-            with tpu_runner._suspend_kv_transfer_group():
+            with kv_connector_glue._suspend_kv_transfer_group():
                 assert kv_transfer_state._KV_CONNECTOR_AGENT is None
                 raise RuntimeError("synthetic warmup failed")
 
@@ -204,10 +204,11 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids():
     runner = SimpleNamespace()
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
-    with patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
-               return_value=True), patch(
-                   "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
-                   return_value=connector):
+    with patch(
+            "vllm_torchtpu.runner.kv_connector_glue.has_kv_transfer_group",
+            return_value=True), patch(
+                "vllm_torchtpu.runner.kv_connector_glue.get_kv_transfer_group",
+                return_value=connector):
         result = TPUModelRunner.get_finished_kv_transfers(
             runner, scheduler_output)
 
@@ -231,9 +232,9 @@ def test_no_forward_output_preserves_invalid_block_ids():
     vllm_config = SimpleNamespace()
 
     with patch(
-            "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+            "vllm_torchtpu.runner.kv_connector_glue.dist_utils.get_raiden_inline_load",
             return_value=False):
-        if not tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
+        if not kv_connector_glue._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
             with pytest.raises(RuntimeError,
                                match="cache-group-scoped KV load failure"):
                 TPUModelRunner.kv_connector_no_forward(runner,
@@ -250,11 +251,11 @@ def test_no_forward_output_preserves_invalid_block_ids():
 
 def test_build_kv_connector_output_supports_vllm_023():
     with patch.object(
-            tpu_runner,
+            kv_connector_glue,
             "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
             False,
-    ), patch.object(tpu_runner, "KVConnectorOutput") as output_cls:
-        tpu_runner._build_kv_connector_output(
+    ), patch.object(kv_connector_glue, "KVConnectorOutput") as output_cls:
+        kv_connector_glue._build_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
             kv_connector_worker_meta=None,
@@ -273,11 +274,11 @@ def test_build_kv_connector_output_supports_vllm_023():
 
 def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
     with patch.object(
-            tpu_runner,
+            kv_connector_glue,
             "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
             False,
     ), pytest.raises(RuntimeError, match="cache-group-scoped KV load failure"):
-        tpu_runner._build_kv_connector_output(
+        kv_connector_glue._build_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
             kv_connector_worker_meta=None,
@@ -728,9 +729,9 @@ class TestTPURunner:
         scheduler_output = MagicMock()
         meta = scheduler_output.kv_connector_metadata
 
-        with patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+        with patch('vllm_torchtpu.runner.kv_connector_glue.has_kv_transfer_group',
                    return_value=True), \
-                patch('vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group',
+                patch('vllm_torchtpu.runner.kv_connector_glue.get_kv_transfer_group',
                       return_value=connector):
             self.runner.maybe_setup_kv_connector(scheduler_output)
 

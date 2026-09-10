@@ -30,8 +30,7 @@ from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
-                                          has_kv_transfer_group,
-                                          kv_transfer_state)
+                                          has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import (Attention,
@@ -62,8 +61,8 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.kv_connector_model_runner_mixin import (
-    KVConnectorModelRunnerMixin, KVConnectorOutput)
+from vllm.v1.worker.kv_connector_model_runner_mixin import \
+    KVConnectorModelRunnerMixin
 from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
@@ -98,6 +97,10 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.dp_lockstep import DpLockstepMixin
+from vllm_torchtpu.runner.kv_connector_glue import (
+    _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP, KvConnectorMixin,
+    _build_kv_connector_output, _suspend_kv_transfer_group)
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
 from vllm_torchtpu.runner.padding import (
@@ -127,10 +130,11 @@ from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 __all__ = [
     'TPUModelRunner', 'ExecuteModelState', 'AsyncPreResults',
     'AsyncTPUModelRunnerOutput', 'MIN_NUM_SEQS',
-    '_get_num_slices_per_kv_cache_update_block',
+    '_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP',
+    '_build_kv_connector_output', '_get_num_slices_per_kv_cache_update_block',
     '_get_padded_num_kv_cache_update_slices',
     '_get_padded_num_reqs_with_upper_limit', '_get_padded_token_len',
-    '_get_req_paddings', '_prev_power_of_2'
+    '_get_req_paddings', '_prev_power_of_2', '_suspend_kv_transfer_group'
 ]
 
 if TYPE_CHECKING:
@@ -275,22 +279,6 @@ def _spec_warmup_all_token_ids(
     }
 
 
-@contextmanager
-def _suspend_kv_transfer_group() -> Iterator[None]:
-    """Hide the process-global connector during worker-local warmup."""
-    connector = kv_transfer_state._KV_CONNECTOR_AGENT
-    kv_transfer_state._KV_CONNECTOR_AGENT = None
-    try:
-        yield
-    finally:
-        kv_transfer_state._KV_CONNECTOR_AGENT = connector
-
-
-_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
-    "invalid_block_group_index" in getattr(KVConnectorOutput,
-                                           "__dataclass_fields__", {}))
-
-
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     """Whether this module owns one of DeepSeek-V4's custom KV caches.
 
@@ -300,40 +288,6 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     return isinstance(attn_module,
                       (DeepseekV4Attention, DeepseekV4SWACache,
                        DeepseekV4IndexerCache, CompressorStateCache))
-
-
-def _build_kv_connector_output(
-    *,
-    finished_sending: set[str] | None,
-    finished_recving: set[str] | None,
-    kv_connector_worker_meta: Any | None,
-    invalid_block_ids: set[int],
-    invalid_block_group_index: int | None,
-    kv_connector_stats: Any | None = None,
-) -> KVConnectorOutput:
-    """Build a connector output across the vLLM 0.23 API boundary.
-
-    vLLM 0.23 supports invalid block IDs only for a single KV cache group and
-    does not expose ``invalid_block_group_index``. Newer vLLM versions support
-    group-scoped recovery for hybrid caches. Do not pass the newer keyword to
-    0.23, but fail closed if a hybrid load actually fails: silently dropping
-    the group would make overlapping block IDs ambiguous to its scheduler.
-    """
-    kwargs: dict[str, Any] = {
-        "finished_sending": finished_sending,
-        "finished_recving": finished_recving,
-        "kv_connector_worker_meta": kv_connector_worker_meta,
-        "invalid_block_ids": invalid_block_ids,
-        "kv_connector_stats": kv_connector_stats,
-    }
-    if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
-        kwargs["invalid_block_group_index"] = invalid_block_group_index
-    elif invalid_block_group_index is not None:
-        raise RuntimeError(
-            "Installed vLLM does not support cache-group-scoped KV load "
-            "failure recovery; upgrade vLLM before recovering a failed "
-            f"hybrid KV load (group={invalid_block_group_index})")
-    return KVConnectorOutput(**kwargs)
 
 
 SAMPLING_EPS = 1e-5
@@ -439,7 +393,7 @@ def _warn_if_kv_cache_is_padded(
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(PhasedProfilingMixin, XlaGraphTrackerMixin,
-                     GPUModelRunner):
+                     KvConnectorMixin, DpLockstepMixin, GPUModelRunner):
 
     @property
     def _is_async_drafter(self) -> bool:
@@ -811,85 +765,6 @@ class TPUModelRunner(PhasedProfilingMixin, XlaGraphTrackerMixin,
 
     def _sync_device(self) -> None:
         synchronize_device()
-
-    def maybe_setup_kv_connector(self,
-                                 scheduler_output,
-                                 wait_for_completion: bool = False,
-                                 report_completion: bool = True) -> None:
-        if not has_kv_transfer_group():
-            return
-        kv_connector = get_kv_transfer_group()
-        assert scheduler_output.kv_connector_metadata is not None
-        # Upstream parity (gpu_model_runner calls this before every forward;
-        # base-class default is a no-op): lets connectors with async saves
-        # fence in-flight stores whose source blocks the scheduler is about
-        # to reuse (OffloadingConnector jobs_to_flush) before the forward
-        # overwrites them.
-        kv_connector.handle_preemptions(scheduler_output.kv_connector_metadata)
-        kv_connector.bind_connector_metadata(
-            scheduler_output.kv_connector_metadata)
-        # forward_context is unused by TPUConnector; pass None.
-        if wait_for_completion:
-            kv_connector.start_load_kv(None,
-                                       wait_for_completion=True,
-                                       report_completion=report_completion)
-        else:
-            kv_connector.start_load_kv(None)
-
-    def maybe_wait_for_kv_save(self) -> None:
-        if has_kv_transfer_group():
-            get_kv_transfer_group().wait_for_save()
-
-    def get_finished_kv_transfers(self, scheduler_output):
-        if not has_kv_transfer_group():
-            return None, None, None, set(), None, None
-        kv_connector = get_kv_transfer_group()
-        finished_sending, finished_recving = kv_connector.get_finished(
-            scheduler_output.finished_req_ids)
-        invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
-        invalid_block_group_index = (
-            kv_connector.get_block_ids_with_load_errors_group_index()
-            if invalid_block_ids else None)
-        # vLLM >=0.21 job model: store completions (and load completions) are
-        # reported to the scheduler via the worker meta's `completed_jobs`,
-        # NOT via finished_sending. Without plumbing this, the
-        # OffloadingConnector's complete_store is never called, host-pool
-        # blocks stay not-ready (ref_cnt=-1), and prefix-reuse lookups defer
-        # forever -> the engine busy-spins / hangs. Mirrors
-        # KVConnectorModelRunnerMixin._get_kv_connector_output.
-        worker_meta = kv_connector.build_connector_worker_meta()
-        kv_connector_stats = kv_connector.get_kv_connector_stats()
-        # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
-        # metadata is bound per-step and must be cleared after use.
-        kv_connector.clear_connector_metadata()
-        return (finished_sending, finished_recving, worker_meta,
-                invalid_block_ids, invalid_block_group_index,
-                kv_connector_stats)
-
-    def kv_connector_no_forward(self, scheduler_output,
-                                vllm_config) -> ModelRunnerOutput:
-        # Only Raiden inline mode blocks; otherwise the no-forward step returns
-        # immediately and the scheduler re-polls get_finished each step until
-        # the loads land.
-        self.maybe_setup_kv_connector(
-            scheduler_output,
-            wait_for_completion=dist_utils.get_raiden_inline_load())
-        (finished_sending, finished_recving, worker_meta, invalid_block_ids,
-         invalid_block_group_index,
-         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
-        kv_connector_output = _build_kv_connector_output(
-            finished_sending=finished_sending,
-            finished_recving=finished_recving,
-            kv_connector_worker_meta=worker_meta,
-            invalid_block_ids=invalid_block_ids,
-            invalid_block_group_index=invalid_block_group_index,
-            kv_connector_stats=kv_connector_stats,
-        )
-        if kv_connector_output.is_empty():
-            return EMPTY_MODEL_RUNNER_OUTPUT
-        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
-        output.kv_connector_output = kv_connector_output
-        return output
 
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
@@ -3169,115 +3044,6 @@ class TPUModelRunner(PhasedProfilingMixin, XlaGraphTrackerMixin,
             # multimodal models, it is not desirable for performance since
             # then the embedding layer is not included in the CUDA graph.
             return input_ids, None
-
-    def _dp_lockstep_enabled(self) -> bool:
-        # EP combine reduces partial expert outputs across DP engines; those
-        # ranks must enter the same collectives with matching token buckets.
-        # Non-EP DP engines remain independently schedulable.
-        return (utils.get_dp_size(self.parallel_config) > 1
-                and self.parallel_config.enable_expert_parallel)
-
-    def _count_input_chunks(
-            self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:
-        """Match _prepare_inputs chunking without staging any tensors.
-
-        Returns (num_chunks, max_chunk_reqs). The second value is the exact
-        maximum request count of any chunk — a most-model-len chunk holds up
-        to num_reqs_most_model_len requests, which can exceed
-        num_reqs_max_model_len, so no batch-level clamp is a safe substitute.
-        """
-        if scheduler_output.total_num_scheduled_tokens == 0:
-            return 0, 0
-
-        num_reqs = self.input_batch.num_reqs
-        start_index = 0
-        num_chunks = 0
-        max_chunk_reqs = 0
-        while start_index < num_reqs:
-            use_max_model_len = self.most_model_len is None
-            for i in range(start_index, num_reqs):
-                req_id = self.input_batch.req_ids[i]
-                assert req_id is not None
-                num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                if (not use_max_model_len and self.most_model_len is not None
-                        and num_tokens > self.most_model_len):
-                    use_max_model_len = True
-
-            if use_max_model_len:
-                chunk_reqs = self.num_reqs_max_model_len
-            else:
-                assert self.num_reqs_most_model_len is not None
-                chunk_reqs = self.num_reqs_most_model_len
-            this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
-            max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
-            start_index += this_chunk_reqs
-            num_chunks += 1
-        return num_chunks, max_chunk_reqs
-
-    def _dp_coordinated_step(
-            self,
-            local_num_tokens: int,
-            local_num_chunks: int,
-            local_num_reqs: int = 0) -> "tuple[int | None, int]":
-        """Return the DP-wide padded token bucket and forward chunk count."""
-        if not self._dp_lockstep_enabled():
-            return None, local_num_chunks
-        from vllm.distributed.parallel_state import get_dp_group
-
-        # Token/chunk metadata is synchronized on vLLM's CPU DP group. The
-        # model forward below receives this result explicitly as
-        # num_tokens_across_dp, so set_forward_context does not run a second
-        # DP synchronization.
-        t = torch.tensor([
-            int(local_num_tokens),
-            int(local_num_chunks),
-            int(local_num_reqs)
-        ],
-                         dtype=torch.int64,
-                         device="cpu")
-        torch.distributed.all_reduce(t,
-                                     op=torch.distributed.ReduceOp.MAX,
-                                     group=get_dp_group().cpu_group)
-        bucket = _get_padded_token_len(self.num_tokens_paddings,
-                                       int(t[0].item()))
-        # Spec-decode draft forwards size themselves off the step's DP-wide
-        # max per-chunk request count (see DFlashProposer), riding this same
-        # all-reduce instead of paying the theoretical max bucket or a
-        # second collective.
-        self._dp_step_max_reqs = int(t[2].item())
-        return bucket, int(t[1].item())
-
-    def _run_dp_dummy_chunk(self, bucket: int) -> None:
-        self._dummy_run(bucket,
-                        self.num_reqs_max_model_len,
-                        self.max_num_blocks_per_req,
-                        use_max_model_len=True,
-                        dp_lockstep=True)
-
-    def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
-        """Idle-rank EP-DP pairing: emit the same cross-DP collective stream a
-        busy rank does — ALL target dummy forwards, then ALL draft dummy
-        forwards.
-        """
-        # Set before any dummy fires: both _run_dp_dummy_chunk and the draft
-        # run_dp_dummy_draft read _dp_target_bucket for the coordinated, equal-token shape.
-        self._dp_target_bucket = bucket
-        # Phase 1: all TARGET dummy forwards.
-        for _ in range(num_chunks):
-            self._run_dp_dummy_chunk(bucket)
-        # Phase 2: all DRAFT dummy forwards (num_chunks * K).
-        # use_eagle() covers every hidden-state drafter, dflash included.
-        spec = self.speculative_config
-        if num_chunks > 0 and spec is not None and spec.use_eagle():
-            self.drafter.run_dp_dummy_draft(num_chunks)
-
-    def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
-        if not self._dp_lockstep_enabled():
-            return None
-        return torch.full((utils.get_dp_size(self.parallel_config), ),
-                          num_tokens,
-                          dtype=torch.int32,
-                          device="cpu")
 
     @torch.no_grad()
     def execute_model(
