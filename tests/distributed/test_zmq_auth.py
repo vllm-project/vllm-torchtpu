@@ -16,6 +16,8 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer import zmq_shm_base
 
+pytestmark = pytest.mark.cpu_test
+
 
 def test_secure_dumps_loads():
     payload = ("STAGE_NOTIFY", 12345, [0, 1, 2], {"key": "val"})

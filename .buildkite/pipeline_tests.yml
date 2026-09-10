@@ -16,6 +16,15 @@ x-unit-test-defaults: &unit_test_defaults
   commands:
     - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
 
+x-cpu-unit-test-defaults: &cpu_unit_test_defaults
+  depends_on: "build_docker"
+  commands:
+    - bash .buildkite/scripts/run_in_docker.sh bktec run
+  agents:
+    queue: "cpu_64_core"
+  env:
+    CPU_ONLY: "1"
+
 x-tests-plugin-defaults: &tests_plugin_defaults
   # Resolved relative to the Buildkite org running the build.
   suite-slug: tpu-ci
@@ -24,6 +33,28 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   oidc-lifetime: 7200
 
 steps:
+  - label: "Unit Tests - CPU (PR)"
+    key: "unit_tests_cpu_pr"
+    <<: *cpu_unit_test_defaults
+    if: 'build.env("NIGHTLY") != "1"'
+    plugins:
+      - tests#v1.0.0:
+          <<: *tests_plugin_defaults
+          test-file-pattern: "tests/**/{test_*,*_test}.py"
+          fail-on-no-tests: true
+          test-cmd: "pytest -sv --timeout=600 -m 'cpu_test and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
+
+  - label: "Unit Tests - CPU (Nightly)"
+    key: "unit_tests_cpu_nightly"
+    <<: *cpu_unit_test_defaults
+    if: 'build.env("NIGHTLY") == "1"'
+    plugins:
+      - tests#v1.0.0:
+          <<: *tests_plugin_defaults
+          test-file-pattern: "tests/**/{test_*,*_test}.py"
+          fail-on-no-tests: true
+          test-cmd: "pytest -sv --timeout=600 -m 'cpu_test' --junit-xml={{resultPath}} {{testExamples}}"
+
   - group: "Unit Tests on TPU"
     depends_on: "build_docker"
     steps:
@@ -42,7 +73,7 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (PR)"
         key: "unit_tests_multichip_pr"
@@ -54,7 +85,7 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Correctness only at PR time: the `*_performance*` tests are
       # nightly-marked (acceptance-rate floors are calibration sensitive on a
@@ -142,7 +173,7 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (Nightly)"
         key: "unit_tests_multichip_nightly"
@@ -154,4 +185,4 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and multichip' --junit-xml={{resultPath}} {{testExamples}}"

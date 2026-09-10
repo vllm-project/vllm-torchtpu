@@ -108,8 +108,13 @@ BQ_EVAL_VARS=(
   -e TPU_NAME="${TPU_NAME:-}"
 )
 
+DEVICE_ARGS=(--privileged --device /dev/fuse)
+if [[ "${CPU_ONLY:-0}" == "1" ]]; then
+  DEVICE_ARGS=(-e JAX_PLATFORMS=cpu)
+fi
+
 echo "--- Running command in Docker container"
-docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64g --device /dev/fuse \
+docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-size=64g \
   -w /root/torchtpu-vllm \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
