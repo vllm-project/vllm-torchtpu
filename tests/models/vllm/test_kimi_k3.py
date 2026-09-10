@@ -471,7 +471,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args) -> None:
+        def __init__(self, *args, gate_is_fused) -> None:
             super().__init__()
             self.mla_modules = args[8]
 
@@ -536,9 +536,10 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args) -> None:
+        def __init__(self, *args, gate_is_fused) -> None:
             super().__init__()
             self.mla_modules = args[8]
+            self.gate_is_fused = gate_is_fused
 
     monkeypatch.setattr(kimi_attention, "MultiHeadLatentAttentionWrapper",
                         FakeMLAWrapper)
@@ -572,7 +573,7 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
 
     assert layer.fused_qkv_a_proj.output_size == 8 + (8 + 2) + 4 * 4
     assert layer.g_proj is None
-    assert layer.mla_attn.mla_modules.gate_is_fused is True
+    assert layer.mla_attn.gate_is_fused is True
 
 
 @pytest.mark.parametrize("use_parameter_hook", [False, True],
@@ -954,3 +955,16 @@ def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
     assert unsupported_reason(shape_env, 1) is None
     assert unsupported_reason(shape_env, 2) is not None
     assert unsupported_reason(shape_env, 512) is not None
+
+
+@pytest.mark.parametrize("field", [
+    "mla_use_output_gate", "activation_situ_beta",
+    "activation_situ_linear_beta", "attn_res_block_size"
+])
+def test_kimi_model_requires_declared_optional_config_fields(field):
+    config = KimiLinearConfig()
+    delattr(config, field)
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(
+        hf_text_config=config))
+    with pytest.raises(AttributeError, match=field):
+        KimiModel(vllm_config=vllm_config)

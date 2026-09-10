@@ -362,18 +362,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     @staticmethod
     def _pcp_streaming_enabled() -> bool:
         vllm_context = get_vllm_model_wrapper_context()
-        parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
-                                  None)
-        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-        return isinstance(pcp_size, int) and pcp_size > 1
+        if vllm_context.vllm_config is None:
+            return False
+        parallel_config = vllm_context.vllm_config.parallel_config
+        return parallel_config.prefill_context_parallel_size > 1
 
     def _build_gdn_op(self, *, pcp_streaming: bool = False):
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.num_k_heads // self.tp_size
         has_conv_bias = self.conv1d.bias is not None
         vllm_context = get_vllm_model_wrapper_context()
-        parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
-                                  None)
         # The non-PCP op uses num_spec_tokens for verify/rollback. PCP is a
         # prefill-only path admitted at the platform boundary; its widened
         # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
@@ -389,8 +387,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                               device=mixed_qkv.device)
 
         if pcp_streaming:
-            interleave_size = getattr(parallel_config,
-                                      "cp_kv_cache_interleave_size", 0)
+            parallel_config = vllm_context.vllm_config.parallel_config
+            interleave_size = parallel_config.cp_kv_cache_interleave_size
             if not isinstance(interleave_size, int) or interleave_size <= 0:
                 raise ValueError("GDN PCP streaming requires "
                                  "cp_kv_cache_interleave_size > 0.")
@@ -617,10 +615,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.num_k_heads // self.tp_size
         has_conv_bias = self.conv1d.bias is not None
-        parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
-                                  None)
-        interleave_size = getattr(parallel_config,
-                                  "cp_kv_cache_interleave_size", 0)
+        parallel_config = vllm_context.vllm_config.parallel_config
+        interleave_size = parallel_config.cp_kv_cache_interleave_size
         if not isinstance(interleave_size, int) or interleave_size <= 0:
             raise ValueError("GDN pooled PCP prefill requires "
                              "cp_kv_cache_interleave_size > 0.")

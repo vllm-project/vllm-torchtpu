@@ -759,7 +759,7 @@ class TpuPlatform(Platform):
                              **kwargs) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        if getattr(attn_selector_config, "use_mla", False):
+        if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
         supported_backends = [

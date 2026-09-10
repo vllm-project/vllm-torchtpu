@@ -146,6 +146,10 @@ class FakeRoutedExperts(RoutedExperts):
         self.moe_config.moe_parallel_config.use_ep = False
         self.moe_config.activation = FakeActivation("silu")
         self.use_grouped_topk = False
+        self.custom_routing_function = None
+        self.scoring_func = "softmax"
+        self.e_score_correction_bias = None
+        self.routed_scaling_factor = 1.0
 
 
 class TestW4MoEWeightPreprocessing:

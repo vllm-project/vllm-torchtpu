@@ -374,19 +374,16 @@ class VllmTPUMLAAttention(MLAAttention):
         # duration of that call. `kv_b_proj`'s parameters are cleared a few
         # lines below once `W_UK_T`/`W_UV` are extracted, and it never runs a
         # forward pass, so this view is the only consumer either way.
-        kv_b_weight = getattr(self.kv_b_proj, "weight", None)
-        # The weight's own type says whether it was flipped, so no bookkeeping
-        # flag is needed. Upstream below wants the [n_out, n_in] view.
-        flipped = (kv_b_weight is not None
-                   and getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False))
+        flipped = getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False)
         if flipped:
+            kv_b_weight = self.kv_b_proj.weight
             self.kv_b_proj.weight = Parameter(kv_b_weight.transpose(
                 0, 1).contiguous(),
                                               requires_grad=False)
         try:
             super().process_weights_after_loading(act_dtype)
         finally:
-            if flipped and getattr(self.kv_b_proj, "weight", None) is not None:
+            if flipped:
                 self.kv_b_proj.weight = Parameter(kv_b_weight,
                                                   requires_grad=False)
 
@@ -428,7 +425,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 k_pe: torch.Tensor,
                 output: torch.Tensor | None = None,
                 **kwargs) -> torch.Tensor:
-        if getattr(self, "calculate_kv_scales", False):
+        if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe,
                                                 self.layer_name)
 
@@ -470,6 +467,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         skip_topk: bool = False,
         non_causal_multi_token_decode: bool = False,
         allow_short_prefill_indexer_scoring_skip: bool = False,
+        gate_is_fused: bool = False,
     ) -> None:
         torch.nn.Module.__init__(self)
 
@@ -490,8 +488,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.kv_b_proj = mla_modules.kv_b_proj
         self.rotary_emb = mla_modules.rotary_emb
         self.o_proj = mla_modules.o_proj
-        self.g_proj = getattr(mla_modules, "g_proj", None)
-        self.gate_is_fused = getattr(mla_modules, "gate_is_fused", False)
+        self.g_proj = mla_modules.g_proj
+        self.gate_is_fused = gate_is_fused
+        if self.gate_is_fused:
+            assert self.q_lora_rank is not None, (
+                "Fused MLA gating requires q_lora_rank")
+            assert self.fused_qkv_a_proj is not None, (
+                "Fused MLA gating requires fused_qkv_a_proj")
+            assert self.g_proj is None, (
+                "Fused MLA gating cannot also use g_proj")
         # `Indexer` has no `register_oot` hook and is fully built by
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
         # place. The mutation is visible through every reference to the object,

@@ -339,7 +339,7 @@ def prebuild_fused_moe_ep(layer,
     # holds the WHOLE expert set, and the kernel would read its shard as one
     # 1/ep block of a global set ep times too large -- a mis-addressed expert
     # lookup, or a late shape error, never a clear refusal.
-    if not getattr(layer.moe_config.moe_parallel_config, "use_ep", False):
+    if not layer.moe_config.moe_parallel_config.use_ep:
         logger.info_once(
             "Fused EP MoE not engaged: the experts are replicated rather than "
             "expert-parallel, so each shard would hold the whole expert set.")
@@ -554,21 +554,20 @@ def _unsupported_routing_reason(layer) -> str | None:
     """
     from vllm_torchtpu.layers.vllm import moe_routing
 
-    if getattr(layer, "custom_routing_function", None) is not None:
+    if layer.custom_routing_function is not None:
         return ("the layer supplies a custom_routing_function; the kernel "
                 "routes with its own softmax top-k")
-    scoring_fn = getattr(layer, "scoring_func", "softmax")
+    scoring_fn = layer.scoring_func
     if scoring_fn != "softmax":
         return f"scoring_func {scoring_fn!r}; the kernel scores with softmax"
-    if getattr(layer, "e_score_correction_bias", None) is not None:
+    if layer.e_score_correction_bias is not None:
         return "e_score_correction_bias is not applied inside the kernel"
-    if (getattr(layer, "use_grouped_topk", False)
-            and getattr(layer, "num_expert_group", 1) > 1
-            and getattr(layer, "topk_group", 1) < layer.num_expert_group):
+    if (layer.use_grouped_topk and layer.num_expert_group > 1
+            and layer.topk_group < layer.num_expert_group):
         return "grouped top-k routing is not implemented in the kernel"
     if getattr(layer, "hash_indices_table", None) is not None:
         return "hash routing is not implemented in the kernel"
-    scale = float(getattr(layer, "routed_scaling_factor", 1.0) or 1.0)
+    scale = float(layer.routed_scaling_factor)
     if scale != 1.0:
         return f"routed_scaling_factor {scale} is not applied by the kernel"
     # The routing simulator replaces the routing output wholesale, so a run
@@ -613,7 +612,7 @@ def _max_node_tokens(ep: int, pcp: int = 1) -> int:
         cfg = get_current_vllm_config()
     except Exception:  # noqa: BLE001 - no config outside a served model
         return 0
-    cap = getattr(cfg.scheduler_config, "max_num_batched_tokens", None)
+    cap = cfg.scheduler_config.max_num_batched_tokens
     if not isinstance(cap, int):
         return 0
     pcp = max(int(pcp), 1)
@@ -630,15 +629,5 @@ def _smem_capacity_bytes() -> int:
 
 
 def _pcp_size(layer) -> int:
-    """This layer's prefill-context-parallel width, or 1 if it cannot be read.
-
-    Read off the layer rather than the global config because that is where
-    `fp8.py` already reads `use_ep` from, and a layer built for a different
-    parallel shape should answer for itself.
-    """
-    cfg = getattr(getattr(layer, "moe_config", None), "moe_parallel_config",
-                  None)
-    try:
-        return int(getattr(cfg, "pcp_size", 1) or 1)
-    except (TypeError, ValueError):
-        return 1
+    """Returns the layer's configured prefill-context-parallel width."""
+    return int(layer.moe_config.moe_parallel_config.pcp_size)

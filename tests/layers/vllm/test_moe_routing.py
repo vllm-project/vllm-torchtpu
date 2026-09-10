@@ -94,6 +94,7 @@ def _routing_layer(topk=10, renormalize=True):
                            topk_group=None,
                            renormalize=renormalize,
                            scoring_func="softmax",
+                           custom_routing_function=None,
                            e_score_correction_bias=None,
                            routed_scaling_factor=1.0,
                            moe_config=SimpleNamespace(experts_per_token=topk))
@@ -181,3 +182,17 @@ def test_routing_path_compiles_fullgraph(monkeypatch, impl):
     got_w, got_i = compiled(hidden, logits)
     ref_w, ref_i = run(hidden, logits)
     assert torch.equal(got_w, ref_w) and torch.equal(got_i, ref_i)
+
+
+@pytest.mark.parametrize("field", [
+    "custom_routing_function", "scoring_func", "e_score_correction_bias",
+    "routed_scaling_factor"
+])
+def test_route_requires_declared_routing_fields(monkeypatch, field):
+    import torch
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    layer = _routing_layer(topk=1)
+    delattr(layer, field)
+    with pytest.raises(AttributeError, match=field):
+        moe_routing.route(layer, torch.ones(1, 2), torch.tensor([[1.0, 2.0]]))

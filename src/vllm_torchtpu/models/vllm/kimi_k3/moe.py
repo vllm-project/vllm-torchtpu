@@ -60,8 +60,7 @@ class KimiMoE(nn.Module):
         vllm_config = get_current_vllm_config_or_none()
         self.use_ep = (vllm_config is not None
                        and vllm_config.parallel_config.enable_expert_parallel)
-        routed_expert_hidden_size = getattr(config,
-                                            "routed_expert_hidden_size", None)
+        routed_expert_hidden_size = config.routed_expert_hidden_size
         expert_hidden_size = (routed_expert_hidden_size
                               if routed_expert_hidden_size is not None else
                               hidden_size)
@@ -86,10 +85,10 @@ class KimiMoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.routed_expert_down_proj",
         ) if routed_expert_hidden_size is not None else None)
-        self.routed_expert_norm = (
-            RMSNorm(expert_hidden_size, config.rms_norm_eps)
-            if self.routed_expert_down_proj is not None
-            and getattr(config, "latent_moe_use_norm", False) else None)
+        self.routed_expert_norm = (RMSNorm(expert_hidden_size,
+                                           config.rms_norm_eps)
+                                   if self.routed_expert_down_proj is not None
+                                   and config.latent_moe_use_norm else None)
         self.routed_expert_up_proj = (make_latent_projection(
             expert_hidden_size,
             hidden_size,
@@ -109,9 +108,8 @@ class KimiMoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.shared_experts",
             reduce_results=False,
-            situ_beta=getattr(config, "activation_situ_beta", None),
-            situ_linear_beta=getattr(config, "activation_situ_linear_beta",
-                                     None),
+            situ_beta=config.activation_situ_beta,
+            situ_linear_beta=config.activation_situ_linear_beta,
         ) if config.num_shared_experts > 0 else None)
 
         padded_intermediate_size = config.moe_intermediate_size
@@ -126,10 +124,9 @@ class KimiMoE(nn.Module):
                 < min_per_partition):
             padded_intermediate_size = min_per_partition * moe_tp_size
 
-        situ_beta = (getattr(config, "activation_situ_beta", None)
+        situ_beta = (config.activation_situ_beta
                      if config.hidden_act == "situ" else None)
-        situ_linear_beta = (getattr(config, "activation_situ_linear_beta",
-                                    None)
+        situ_linear_beta = (config.activation_situ_linear_beta
                             if config.hidden_act == "situ" else None)
         # Under TPU_MOE_HIERARCHICAL_EP this builds the routed experts
         # with expert parallelism between chips and tensor parallelism

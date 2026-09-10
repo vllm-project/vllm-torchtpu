@@ -50,6 +50,13 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
         w13_weight_scale_inv=torch.ones(experts, 1, 1, 2 * inter),
         w2_weight_scale_inv=torch.ones(experts, 1, 1, hidden),
         global_num_experts=experts * _STUB_EP,
+        custom_routing_function=None,
+        scoring_func="softmax",
+        e_score_correction_bias=None,
+        use_grouped_topk=False,
+        num_expert_group=None,
+        topk_group=None,
+        routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(
             experts_per_token=2,
             moe_parallel_config=SimpleNamespace(use_ep=True, pcp_size=1),
@@ -218,6 +225,7 @@ def test_refused_when_the_layer_carries_expert_biases():
     dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
     dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
     dict(routed_scaling_factor=2.5),
+    dict(routed_scaling_factor=0.0),
 ])
 def test_refused_on_routing_the_kernel_does_not_implement(routing):
     """The fused path never calls `moe_routing.route`: the kernel scores with
@@ -573,6 +581,14 @@ def _nvfp4_checkpoint_layer(hidden=512, inter=512, use_ep=True):
     layer.w2_weight_scale_2.data.fill_(4.)
     layer.activation = "silu"
     layer.renormalize = True
+    # RoutedExperts.__init__ always sets these, and the test stubs it out.
+    layer.custom_routing_function = None
+    layer.scoring_func = "softmax"
+    layer.e_score_correction_bias = None
+    layer.use_grouped_topk = False
+    layer.num_expert_group = None
+    layer.topk_group = None
+    layer.routed_scaling_factor = 1.0
     layer.global_num_experts = _STUB_EP
     layer.moe_config = SimpleNamespace(experts_per_token=2,
                                        moe_parallel_config=SimpleNamespace(
@@ -879,3 +895,14 @@ def test_nvfp4_admission_and_prepared_weight_validation(
                                    torch.full((1, 32, 1, 512), 3.))
         torch.testing.assert_close(layer.w2_weight_scale,
                                    torch.full((1, 32, 1, 512), 4.))
+
+
+@pytest.mark.parametrize("field", [
+    "custom_routing_function", "scoring_func", "e_score_correction_bias",
+    "use_grouped_topk", "routed_scaling_factor"
+])
+def test_missing_routing_field_cannot_arm_fused_ep(field):
+    layer = _layer()
+    delattr(layer, field)
+    with pytest.raises(AttributeError, match=field):
+        _prebuild(layer)

@@ -149,10 +149,7 @@ def route(
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated
-    # getattr with defaults, not direct attribute access: the compressed-tensors
-    # MoE methods are reached with layers that need not define either attribute,
-    # and previously guarded them exactly this way.
-    custom_routing_fn = getattr(layer, "custom_routing_function", None)
+    custom_routing_fn = layer.custom_routing_function
     if custom_routing_fn is not None:
         return custom_routing_fn(
             hidden_states=hidden_states,
@@ -165,7 +162,7 @@ def route(
         router_logits=router_logits,
         topk=topk,
         renormalize=layer.renormalize,
-        scoring_fn=getattr(layer, "scoring_func", "softmax"),
+        scoring_fn=layer.scoring_func,
         layer=layer,
         input_ids=input_ids,
     )
@@ -243,7 +240,7 @@ def select_experts(
                                  None) if layer is not None else None
     if hash_indices_table is not None and input_ids is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits.float())
-        routed_scaling_factor = getattr(layer, "routed_scaling_factor", 1.0)
+        routed_scaling_factor = layer.routed_scaling_factor
         topk_weights, topk_ids = _hash_moe_select(
             scores,
             hash_indices_table,
@@ -273,8 +270,8 @@ def select_experts(
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
     scores = _apply_scoring_fn(scoring_fn, router_logits.float())
-    e_score_correction_bias = getattr(layer, "e_score_correction_bias",
-                                      None) if layer is not None else None
+    e_score_correction_bias = (layer.e_score_correction_bias
+                               if layer is not None else None)
 
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
@@ -288,8 +285,8 @@ def select_experts(
     if renormalize:
         topk_weights = topk_weights / torch.clamp(
             topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
-    routed_scaling_factor = getattr(layer, "routed_scaling_factor",
-                                    1.0) if layer is not None else 1.0
+    routed_scaling_factor = (layer.routed_scaling_factor
+                             if layer is not None else 1.0)
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 

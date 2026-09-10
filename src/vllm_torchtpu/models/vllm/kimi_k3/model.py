@@ -45,6 +45,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
@@ -52,6 +53,8 @@ from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
+
+logger = init_logger(__name__)
 
 
 class KimiDecoderLayer(nn.Module):
@@ -94,15 +97,14 @@ class KimiDecoderLayer(nn.Module):
                 config.hidden_act,
                 quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.mlp",
-                situ_beta=getattr(config, "activation_situ_beta", None),
-                situ_linear_beta=getattr(config, "activation_situ_linear_beta",
-                                         None),
+                situ_beta=config.activation_situ_beta,
+                situ_linear_beta=config.activation_situ_linear_beta,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 config.rms_norm_eps)
 
-        self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
+        self.attn_res_block_size = config.attn_res_block_size
         if self.attn_res_block_size is not None:
             self.self_attention_res = AttentionResidual(
                 config.hidden_size,
@@ -166,7 +168,17 @@ class KimiModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: KimiLinearConfig = vllm_config.model_config.hf_text_config
-        self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
+        logger.info(
+            "Kimi optional features: mla_use_output_gate=%s, hidden_act=%s, "
+            "activation_situ_beta=%s, activation_situ_linear_beta=%s, "
+            "attn_res_block_size=%s",
+            config.mla_use_output_gate,
+            config.hidden_act,
+            config.activation_situ_beta,
+            config.activation_situ_linear_beta,
+            config.attn_res_block_size,
+        )
+        self.attn_res_block_size = config.attn_res_block_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
+from vllm.model_executor.layers.mla import MLAModules
 
 from vllm_torchtpu.layers.vllm.attention import (PallasMLAttentionBackend,
                                                  PallasMLAttentionBackendImpl)
 from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import (
     VllmMLAAttention, VllmMultiHeadLatentAttentionWrapper)
+from vllm_torchtpu.layers.vllm.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -376,3 +380,146 @@ def test_mla_forward_dense_dispatch_without_topk():
     expected_out = torch.bmm(op_out.transpose(0, 1),
                              layer.W_UV).transpose(0, 1).reshape(4, -1)
     torch.testing.assert_close(out, expected_out)
+
+
+class _ConstantProjection(torch.nn.Module):
+
+    def __init__(self, values):
+        super().__init__()
+        self.values = torch.tensor(values, dtype=torch.float32)
+
+    def forward(self, inputs):
+        return self.values.expand(inputs.shape[0], -1), None
+
+
+class _IdentityProjection(torch.nn.Module):
+
+    def forward(self, inputs):
+        return inputs, None
+
+
+def _gate_modules(gate_mode, q_lora_rank):
+    gate = [0.0, 2.0]
+    modules = MLAModules(
+        kv_a_layernorm=torch.nn.Identity(),
+        kv_b_proj=torch.nn.Identity(),
+        rotary_emb=None,
+        o_proj=_IdentityProjection(),
+        fused_qkv_a_proj=_ConstantProjection(
+            [1.0] * 5 + (gate if gate_mode == "fused" else [])),
+        kv_a_proj_with_mqa=_ConstantProjection([1.0] * 3),
+        q_a_layernorm=torch.nn.Identity(),
+        q_b_proj=_ConstantProjection([1.0] * 3),
+        q_proj=_ConstantProjection([1.0] * 3),
+        indexer=None,
+        is_sparse=False,
+        topk_indices_buffer=None,
+        g_proj=_ConstantProjection(gate) if gate_mode == "separate" else None,
+    )
+    if q_lora_rank is None:
+        modules.fused_qkv_a_proj = None
+    return modules
+
+
+def _gate_wrapper(modules, q_lora_rank, **kwargs):
+
+    class Attention(torch.nn.Module):
+
+        def forward(self, q, kv_c_normed, k_pe, **kwargs):
+            return torch.ones(kv_c_normed.shape[0], 2)
+
+    with patch(
+            "vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op.VllmTPUMLAAttention",
+            return_value=Attention()):
+        return VllmMultiHeadLatentAttentionWrapper(
+            hidden_size=4,
+            num_heads=1,
+            scale=1.0,
+            qk_nope_head_dim=2,
+            qk_rope_head_dim=1,
+            v_head_dim=2,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=2,
+            mla_modules=modules,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize("gate_mode,q_lora_rank", [("none", None), ("none", 2),
+                                                   ("separate", None),
+                                                   ("separate", 2),
+                                                   ("fused", 2)])
+def test_mla_output_gate_numerics(gate_mode, q_lora_rank):
+    wrapper = _gate_wrapper(_gate_modules(gate_mode, q_lora_rank),
+                            q_lora_rank,
+                            gate_is_fused=gate_mode == "fused")
+    result = wrapper(torch.arange(3), torch.ones(3, 4))
+    expected = (torch.ones(2)
+                if gate_mode == "none" else torch.tensor([0.0, 2.0]).sigmoid())
+    torch.testing.assert_close(result, expected.expand(3, -1))
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("fused_qkv_a_proj", None, "requires fused_qkv_a_proj"),
+    ("g_proj", torch.nn.Identity(), "cannot also use g_proj"),
+])
+def test_mla_rejects_invalid_fused_gate_modules(field, value, message):
+    modules = _gate_modules("fused", 2)
+    setattr(modules, field, value)
+    with pytest.raises(AssertionError, match=message):
+        _gate_wrapper(modules, 2, gate_is_fused=True)
+
+
+def test_mla_fused_gate_requires_q_lora_rank():
+    with pytest.raises(AssertionError, match="requires q_lora_rank"):
+        _gate_wrapper(_gate_modules("fused", 2), None, gate_is_fused=True)
+
+
+def test_mla_requires_declared_g_proj():
+    modules = SimpleNamespace(**vars(_gate_modules("none", 2)))
+    del modules.g_proj
+    with pytest.raises(AttributeError, match="g_proj"):
+        _gate_wrapper(modules, 2)
+
+
+def test_mla_requires_calculate_kv_scales():
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    with pytest.raises(AttributeError, match="calculate_kv_scales"):
+        attention(None, None, None)
+
+
+@pytest.mark.parametrize("layout", ["flipped", "unflipped", "packed"])
+def test_mla_weight_layout_is_restored_on_error(layout):
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.kv_b_proj = torch.nn.Module()
+    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    parameter_name = "weight_packed" if layout == "packed" else "weight"
+    attention.kv_b_proj.register_parameter(parameter_name,
+                                           torch.nn.Parameter(weight.clone()))
+    if layout == "flipped":
+        setattr(attention.kv_b_proj, WEIGHT_FLIPPED_ATTR, True)
+
+    def upstream_process(act_dtype):
+        observed = getattr(attention.kv_b_proj, parameter_name)
+        expected = weight.T if layout == "flipped" else weight
+        torch.testing.assert_close(observed, expected)
+        raise RuntimeError("upstream weight processing failed")
+
+    with patch(
+            "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
+            side_effect=upstream_process), pytest.raises(
+                RuntimeError, match="upstream weight processing failed"):
+        attention.process_weights_after_loading(torch.float32)
+    torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name),
+                               weight)
+
+
+def test_mla_flipped_projection_requires_weight():
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.kv_b_proj = torch.nn.Module()
+    setattr(attention.kv_b_proj, WEIGHT_FLIPPED_ATTR, True)
+    with pytest.raises(AttributeError, match="weight"):
+        attention.process_weights_after_loading(torch.float32)

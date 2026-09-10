@@ -19,6 +19,10 @@ class FakeRoutedExperts(RoutedExperts):
         self.moe_config.has_bias = False
         self.activation = "silu"
         self.use_grouped_topk = False
+        self.custom_routing_function = None
+        self.scoring_func = "softmax"
+        self.e_score_correction_bias = None
+        self.routed_scaling_factor = 1.0
         self.renormalize = True
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id):
