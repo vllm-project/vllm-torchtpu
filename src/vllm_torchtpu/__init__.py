@@ -525,19 +525,15 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
-    _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_vllm_mamba_split_scheduler_block_size()
-    _patch_vllm_offloading_config_build()
-    # Platform activation can happen from inside the first Scheduler.__init__.
-    # Install this constructor patch at the engine-core boundary instead, before
-    # the first scheduler is created.
-    _patch_vllm_hybrid_producer_prefix_hits()
-    _patch_vllm_merge_multimodal_embeddings()
+    from vllm_torchtpu.patch_registry import apply
+
+    apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import \
         patch_engine_core_for_pp_chunks
     from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
     patch_executor_for_pp_wave(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
+
 
     from vllm.v1.engine.core import EngineCoreProc
 

@@ -17,7 +17,7 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import \
@@ -179,7 +179,6 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
-_tpu_patches_applied = False
 _tpu_kv_connectors_registered = False
 
 
@@ -328,82 +327,6 @@ def _register_tpu_kv_connectors() -> None:
         KVConnectorFactory.register_connector(name, module_path, name)
 
 
-def apply_tpu_patches() -> None:
-    """Apply all module-level patches required for TorchTPU.
-
-    Must run in **every** process (including spawned workers) because
-    module-level state is re-initialized on import in spawned processes.
-    All patches are idempotent.
-    """
-    global _tpu_patches_applied
-    if _tpu_patches_applied:
-        return
-    _tpu_patches_applied = True
-
-    import vllm_torchtpu as tpu_plugin
-    from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
-                               _patch_disable_sequence_parallel_moe,
-                               _patch_moe_explicit_pcp_collectives,
-                               _patch_moe_runner_fused_output_is_reduced,
-                               _patch_vllm_compile_all_ranges,
-                               _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_hybrid_producer_prefix_hits)
-    from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
-
-    from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
-    from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size  # isort: skip
-    from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
-    from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
-    from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
-    _register_custom_ops()
-    tpu_plugin._patch_vllm_aot_compile_cache_key()
-    tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
-    _patch_default_moe_runner_select_forward()
-    _patch_moe_explicit_pcp_collectives()
-    _patch_moe_runner_fused_output_is_reduced()
-    _patch_vllm_disable_compile_ranges()
-    _patch_vllm_compile_all_ranges()
-    _patch_disable_sequence_parallel_moe()
-    _patch_expert_map_host_lookup()
-    _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_vllm_mamba_split_scheduler_block_size()
-    _patch_vllm_offloading_config_build()
-    _patch_vllm_kimi_kda_layer_counts()
-    _patch_vllm_hybrid_producer_prefix_hits()
-    tpu_plugin._patch_vllm_block_pool_lifo_free()
-    tpu_plugin._patch_vllm_vocab_parallel_embedding()
-    from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
-    from vllm_torchtpu import (  # isort: skip
-        _patch_dflash_bypass_v2_runner_check,
-        _patch_multiproc_worker_global_rank_env,
-        _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
-        _patch_vllm_force_v1_runner_tpu,
-        _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
-    _patch_multiproc_worker_global_rank_env()
-    _patch_vllm_reset_compile_wrapper()
-    _patch_vllm_piecewise_backend()
-    _patch_vllm_compile_prefix_isolation()
-    _patch_vllm_merge_multimodal_embeddings()
-    _patch_vllm_force_v1_runner_tpu()
-    _patch_dflash_bypass_v2_runner_check()
-    _patch_vllm_config_triton_tpu()
-    from vllm_torchtpu.model_loader_patches import (
-        patch_default_loader_ep_weight_filter,
-        patch_default_model_loader_page_cache, patch_moe_expert_write_staging,
-        patch_runai_sharded_expert_streaming)
-    patch_runai_sharded_expert_streaming()
-    patch_default_loader_ep_weight_filter()
-    patch_default_model_loader_page_cache()
-    patch_moe_expert_write_staging()
-    # Register the out-of-tree TPU vision-attention CustomOp by importing the
-    # module: its @CustomOp.register_oot makes vLLM instantiate our
-    # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
-    import vllm_torchtpu.layers.vllm.vision_attention  # noqa: F401
-    _configure_torchtpu_eager_mode()
-    _unwrap_dynamic_compile_fns()
-    _patch_api_server_kernel_reload_endpoint()
-
-
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
     if model_config is None:
         return False
@@ -423,9 +346,9 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
 
 
 def _apply_model_specific_patches(
-        model_config: Optional["ModelConfig"] = None) -> None:
+        model_config: Optional["ModelConfig"] = None) -> bool | None:
     if not _is_qwen3_vl_model(model_config):
-        return
+        return False
     """Apply model-specific and PyTorch XLA op-level patches for Qwen3-VL on TPU.
 
     This function applies the following patches:
@@ -856,8 +779,8 @@ class TpuPlatform(Platform):
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1.")
-        apply_tpu_patches()
-        _apply_model_specific_patches(vllm_config.model_config)
+        patch_registry.apply("platform_activation",
+                             model_config=vllm_config.model_config)
         _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:

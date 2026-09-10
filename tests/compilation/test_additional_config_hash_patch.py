@@ -43,7 +43,7 @@ def _upstream_compute_hash():
     """The genuine implementation, whether or not the patch already ran.
 
     Another test may have built a VllmConfig, which runs
-    ``TpuPlatform.check_and_update_config()`` -> ``apply_tpu_patches()``.
+    ``TpuPlatform.check_and_update_config()`` -> ``patch_registry.apply("platform_activation")``.
     """
     return getattr(VllmConfig, "_tpu_upstream_compute_hash",
                    None) or VllmConfig.__dict__["compute_hash"]
@@ -77,7 +77,7 @@ def apply_patch_over(monkeypatch):
 
     def _apply(trunk):
         monkeypatch.setattr(VllmConfig, "compute_hash", trunk)
-        # apply_tpu_patches() may already have run in this process; the patch
+        # Platform activation may already have run in this process; the patch
         # is idempotent by design, so clear its stamps to re-wrap the trunk.
         for stamp in _PATCH_STAMPS:
             monkeypatch.delattr(VllmConfig, stamp, raising=False)

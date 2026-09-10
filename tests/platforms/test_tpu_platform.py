@@ -16,7 +16,7 @@ import copy
 import math
 import os
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -24,8 +24,11 @@ from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine.core import EngineCoreProc
 
+import vllm_torchtpu as plugin
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
+from vllm_torchtpu import patch_registry
 from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_8I_MULTIHOST_TOPOLOGY_MAP,
@@ -179,7 +182,7 @@ class TestTpuPlatform:
         vllm_config.additional_config = {}
         return vllm_config
 
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -209,7 +212,7 @@ class TestTpuPlatform:
         mock_pallas.get_page_size.assert_not_called()
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -272,7 +275,7 @@ class TestTpuPlatform:
             ("align", None, True, None),
         ],
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -305,7 +308,7 @@ class TestTpuPlatform:
                 TpuPlatform.check_and_update_config(vllm_config)
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -323,7 +326,7 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -344,7 +347,7 @@ class TestTpuPlatform:
             "TPUMultiConnector"
         ],
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -368,7 +371,7 @@ class TestTpuPlatform:
             ([1, 16], DynamicShapesType.UNBACKED, DynamicShapesType.UNBACKED),
         ],
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -395,7 +398,7 @@ class TestTpuPlatform:
             (False, False, False),
         ],
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -427,7 +430,7 @@ class TestTpuPlatform:
             else:
                 TpuPlatform.check_and_update_config(vllm_config)
 
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -443,7 +446,7 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
@@ -625,7 +628,7 @@ def _device_left_unset():
                         return_value=True)
 
 
-@patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+@patch("vllm_torchtpu.patch_registry.apply")
 @patch(
     "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
 )
@@ -640,7 +643,7 @@ def test_check_and_update_config_accepts_a_config_without_a_model(
     assert vllm_config.compilation_config.splitting_ops == []
 
 
-@patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+@patch("vllm_torchtpu.patch_registry.apply")
 @patch(
     "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
 )
@@ -650,3 +653,111 @@ def test_check_and_update_config_rejects_pcp_moe_without_expert_parallel(
             NotImplementedError, match="requires --enable-expert-parallel"):
         VllmConfig(parallel_config=ParallelConfig(
             prefill_context_parallel_size=2, is_moe_model=True))
+
+
+@pytest.fixture
+def isolated_registry(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_applying", set())
+    monkeypatch.setattr(patch_registry, "_active_stages", set())
+    return patch_registry
+
+
+def test_qwen_wrappers_are_installed_once_across_model_loads(
+        isolated_registry, monkeypatch):
+    import transformers.models.qwen3_vl.modeling_qwen3_vl as modeling
+
+    reg = isolated_registry
+    monkeypatch.setattr(reg, "PATCHES",
+                        tuple(p for p in reg.PATCHES if p.model_config))
+    targets = [
+        (modeling.Qwen3VLModel, "get_rope_index"),
+        (modeling.Qwen3VLVisionAttention, "forward"),
+        (torch.Tensor, "masked_scatter_"),
+        (torch.Tensor, "masked_scatter"),
+        (torch, "masked_scatter"),
+        (torch, "repeat_interleave"),
+        (torch, "cumsum"),
+        (torch.Tensor, "cumsum"),
+    ]
+    originals = [getattr(target, name) for target, name in targets]
+    for (target, name), original in zip(targets, originals):
+        monkeypatch.setattr(target, name, original)
+    other_model = SimpleNamespace(hf_config=None, model="llama")
+    qwen_model = SimpleNamespace(hf_config=None, model="Qwen/Qwen3-VL-4B")
+    reg.apply("platform_activation", model_config=other_model)
+    assert [getattr(target, name) for target, name in targets] == originals
+    reg.apply("platform_activation", model_config=qwen_model)
+    wrappers = [getattr(target, name) for target, name in targets]
+    assert all(wrapper is not original
+               for wrapper, original in zip(wrappers, originals))
+    for _ in range(3):
+        reg.apply("model_load", model_config=qwen_model)
+        reg.apply("platform_activation", model_config=qwen_model)
+    assert [getattr(target, name) for target, name in targets] == wrappers
+    assert torch.cumsum(torch.tensor([1, 2, 3]), 0).tolist() == [1, 3, 6]
+    assert torch.repeat_interleave(torch.tensor([1, 2]),
+                                   2).tolist() == [1, 1, 2, 2]
+    assert torch.masked_scatter(torch.zeros(3),
+                                torch.tensor([True, False, True]),
+                                torch.tensor([4.,
+                                              5.])).tolist() == [4., 0., 5.]
+
+
+def test_engine_core_stage_precedes_original_entrypoint(monkeypatch):
+    events = []
+    monkeypatch.setattr(patch_registry, "apply",
+                        lambda stage: events.append(stage))
+    run = Mock(
+        side_effect=lambda *args, **kwargs: events.append((args, kwargs)))
+    monkeypatch.setattr(EngineCoreProc,
+                        "_tpu_original_run_engine_core",
+                        run,
+                        raising=False)
+    plugin._run_engine_core_with_tpu_patches("engine", rank=2)
+    assert events == ["engine_core", (("engine", ), {"rank": 2})]
+
+
+def test_multimodal_stage_refreshes_direct_imports(isolated_registry,
+                                                   monkeypatch):
+    import sys
+    from types import ModuleType
+
+    import vllm.model_executor.models.utils as utils
+
+    reg = isolated_registry
+    monkeypatch.setattr(
+        reg, "PATCHES",
+        tuple(p for p in reg.PATCHES if p.refresh ==
+              "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings"))
+    monkeypatch.setattr(utils, "_merge_multimodal_embeddings",
+                        utils._merge_multimodal_embeddings)
+    monkeypatch.setattr(utils,
+                        "_tpu_static_merge_mm_patch",
+                        False,
+                        raising=False)
+    reg.apply("platform_activation")
+    wrapper = utils._merge_multimodal_embeddings
+    late_model = ModuleType("vllm.model_executor.models.test_late_model")
+    late_model._merge_multimodal_embeddings = object()
+    monkeypatch.setitem(sys.modules, late_model.__name__, late_model)
+    reg.apply("engine_core")
+    assert late_model._merge_multimodal_embeddings is wrapper
+    assert utils._merge_multimodal_embeddings is wrapper
+
+
+def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+    original_cumsum = torch.cumsum
+
+    def unavailable(name, *args, **kwargs):
+        if name == "transformers.models.qwen3_vl.modeling_qwen3_vl":
+            raise ImportError("optional module unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", unavailable)
+    config = SimpleNamespace(hf_config=None, model="Qwen/Qwen3-VL-4B")
+    assert tpu_platform._apply_model_specific_patches(config) is None
+    assert torch.cumsum is original_cumsum
