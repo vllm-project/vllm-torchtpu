@@ -3,15 +3,25 @@ import dataclasses
 import math
 
 import torch
-from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.config import get_layers_from_vllm_config
+from vllm.model_executor.layers.attention import (Attention,
+                                                  ChunkedLocalAttention,
+                                                  MLAAttention)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheSpec,
+                                        MambaSpec, MLAAttentionSpec,
+                                        SlidingWindowSpec)
 
 from vllm_torchtpu import utils
+from vllm_torchtpu.kv_cache_spec_normalizer import \
+    normalize_kv_cache_specs_for_tpu
+from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.runner.ds_v4_kv_cache import is_cache_for_ds_v4
 
 logger = init_logger(__name__)
 
@@ -50,6 +60,309 @@ def _warn_if_kv_cache_is_padded(
 
 class KvCacheSpecMixin:
     """KV cache spec derivation and page-size padding."""
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """
+        Generates the KVCacheSpec by parsing the kv cache format from each
+        Attention module in the static forward context.
+        Returns:
+            KVCacheSpec: A dictionary mapping layer names to their KV cache
+            format. Layers that do not need KV cache are not included.
+        """
+        layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
+        )
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+        block_size = self.vllm_config.cache_config.block_size
+        cache_dtype_str = self.vllm_config.cache_config.cache_dtype
+
+        has_attention = any(
+            isinstance(m, (Attention, MLAAttention)) for m in layers.values())
+        has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
+        if has_attention and not self._unified_kv_layout:
+            self._update_attention_page_size_padded(layers, block_size)
+            if has_mamba:
+                self._update_mamba_page_size_padded(layers)
+
+        hma_enabled = (
+            not self.scheduler_config.disable_hybrid_kv_cache_manager)
+
+        kv_cache_spec: dict[str, KVCacheSpec] = {}
+        # DSv4 layers whose specs must reach vLLM verbatim; see
+        # `is_cache_for_ds_v4`.
+        ds_v4_layers: set[str] = set()
+        for layer_name, attn_module in layers.items():
+            # Linear Attention path
+            if isinstance(attn_module, MambaBase):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
+            # DSv4's attention, SWA, compressor and indexer caches all build
+            # their own specs, as the reference does.
+            elif is_cache_for_ds_v4(attn_module):
+                ds_v4_layers.add(layer_name)
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
+            # Classic Attention path
+            elif isinstance(attn_module, Attention):
+                if (kv_tgt_layer :=
+                        attn_module.kv_sharing_target_layer_name) is not None:
+                    if kv_tgt_layer not in layers:
+                        raise ValueError(
+                            f"Layer {layer_name} reuses KV cache from missing "
+                            f"target layer {kv_tgt_layer}.")
+                    target_module = layers[kv_tgt_layer]
+                    if not isinstance(target_module, Attention):
+                        raise ValueError(
+                            f"Layer {layer_name} reuses KV cache from "
+                            f"non-attention target layer {kv_tgt_layer}.")
+                    if target_module.kv_sharing_target_layer_name is not None:
+                        raise ValueError(
+                            f"Layer {layer_name} reuses KV cache from "
+                            f"{kv_tgt_layer}, which is itself a shared KV "
+                            "layer.")
+                    self._validate_shared_kv_cache_layout(
+                        layer_name, attn_module, kv_tgt_layer, target_module,
+                        hma_enabled)
+                    # The layer doesn't need its own KV cache and will use that of
+                    # the target layer. We skip creating a KVCacheSpec for it, so
+                    # that KV cache management logic will act as this layer does
+                    # not exist, and doesn't allocate KV cache for the layer. This
+                    # enables the memory saving of cross-layer kv sharing, allowing
+                    # a given amount of memory to accommodate longer context lengths
+                    # or enable more requests to be processed simultaneously.
+                    self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
+                    continue
+
+                if attn_module.attn_type == AttentionType.DECODER:
+                    if isinstance(attn_module, ChunkedLocalAttention):
+                        logger.warning_once(
+                            "Using irope in Pallas is not supported yet, it "
+                            "will fall back to global attention for long context."
+                        )
+                    # The layout can pad a page past what its shape and dtype
+                    # imply, with no other signal that it did. Take the backend
+                    # off this layer so it always matches the dimensions below.
+                    _warn_if_kv_cache_is_padded(
+                        backend_cls,
+                        block_size,
+                        attn_module.num_kv_heads,
+                        attn_module.head_size,
+                        self.kv_cache_dtype,
+                    )
+                    page_size_padded = (
+                        self._hybrid_uniform_page_size_bytes
+                        if self._hybrid_uniform_page_size_bytes is not None
+                        else backend_cls.get_kv_cache_page_size_bytes(
+                            block_size,
+                            attn_module.num_kv_heads,
+                            attn_module.head_size,
+                            self.kv_cache_dtype,
+                        ))
+                    if attn_module.sliding_window is not None:
+                        kv_cache_spec[layer_name] = SlidingWindowSpec(
+                            block_size=block_size,
+                            num_kv_heads=attn_module.num_kv_heads,
+                            head_size=attn_module.head_size,
+                            dtype=self.kv_cache_dtype,
+                            page_size_padded=page_size_padded,
+                            sliding_window=attn_module.sliding_window,
+                            indexes_kv_by_block_stride=True,
+                        )
+                    else:
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=attn_module.num_kv_heads,
+                            head_size=attn_module.head_size,
+                            dtype=self.kv_cache_dtype,
+                            page_size_padded=page_size_padded,
+                            indexes_kv_by_block_stride=True,
+                        )
+                elif attn_module.attn_type in (
+                        AttentionType.ENCODER,
+                        AttentionType.ENCODER_ONLY,
+                ):
+                    # encoder-only attention does not need KV cache.
+                    continue
+                elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
+                    raise NotImplementedError
+                else:
+                    raise ValueError(
+                        f"Unknown attention type: {attn_module.attn_type}")
+            # MLAAttention path
+            elif isinstance(attn_module, MLAAttention):
+                if layer_name in kv_cache_spec:
+                    continue
+                page_size_padded = (
+                    self._hybrid_uniform_page_size_bytes
+                    if self._hybrid_uniform_page_size_bytes is not None else
+                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                        block_size,
+                        1,
+                        attn_module.head_size,
+                        self.kv_cache_dtype,
+                    ))
+                kv_cache_spec[layer_name] = MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=attn_module.head_size,
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=cache_dtype_str,
+                    page_size_padded=page_size_padded,
+                    indexes_kv_by_block_stride=True,
+                )
+            elif isinstance(attn_module, DeepseekV32IndexerCache):
+                # DSA indexer K cache: the module declares its own uint8 spec
+                # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
+                kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
+                    self.vllm_config)
+            else:
+                continue
+
+        # Note: that each shared layer's target actually owns a KV cache (and
+        # that the shared layer was not itself allocated one) is enforced later
+        # against the concrete KVCacheConfig in
+        # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
+        return normalize_kv_cache_specs_for_tpu(
+            kv_cache_spec,
+            self.kv_cache_dtype,
+            enable_unified_kv_layout=self._unified_kv_layout,
+            exempt_layers=ds_v4_layers,
+            attention_backend=backend_cls,
+        )
+
+    @staticmethod
+    def _validate_shared_kv_cache_layout(
+        layer_name: str,
+        attn_module: Attention,
+        target_layer_name: str,
+        target_module: Attention,
+        hma_enabled: bool,
+    ) -> None:
+        # When the hybrid KV cache manager is disabled, all specs are unified to
+        # full attention: we store the full KV cache and apply each layer's own
+        # window mask on read, so sliding_window doesn't affect storage and need
+        # not match between the shared layer and its target. When the hybrid
+        # manager is enabled (e.g. a mamba + sliding window + full attn model),
+        # sliding-window layers get a smaller, window-sized cache, so a window
+        # mismatch would mean the layers genuinely disagree on storage and the
+        # share is unsafe -- enforce sliding_window in that case.
+        fields = ["attn_type", "num_kv_heads", "head_size"]
+        if hma_enabled:
+            fields.append("sliding_window")
+        mismatches = []
+        for field_name in fields:
+            if getattr(attn_module, field_name,
+                       None) != getattr(target_module, field_name, None):
+                mismatches.append(field_name)
+        if mismatches:
+            raise ValueError(f"Layer {layer_name} cannot reuse KV cache from "
+                             f"{target_layer_name}: incompatible "
+                             f"{', '.join(mismatches)}.")
+
+        # With fp8 KV cache the shared layer reads the target's cached K/V and
+        # dequantizes with its OWN scales, so mismatched scales/dtype would
+        # silently corrupt attention.
+        attn_quant = attn_module.impl.kv_cache_quantized_dtype
+        target_quant = target_module.impl.kv_cache_quantized_dtype
+        # Trigger the check if EITHER side is fp8: the asymmetric case (only one
+        # side quantized) is just as unsafe -- e.g. the shared layer reads the
+        # target's packed fp8 bytes as bf16 -- and must error rather than
+        # silently corrupt, so None != "fp8_e4m3" correctly fails below.
+        if attn_quant or target_quant:
+            attn_kv_layout = (
+                attn_module._k_scale_float,
+                attn_module._v_scale_float,
+                attn_quant,
+            )
+            target_kv_layout = (
+                target_module._k_scale_float,
+                target_module._v_scale_float,
+                target_quant,
+            )
+            if attn_kv_layout != target_kv_layout:
+                raise ValueError(
+                    f"Layer {layer_name} reuses the KV cache of "
+                    f"{target_layer_name} but their kv cache dtype or k/v "
+                    f"scales differ (shared={attn_kv_layout}, "
+                    f"target={target_kv_layout}); the shared layer would "
+                    "read/dequantize the target's cached K/V incorrectly. "
+                    "Cross-layer KV sharing requires a matching kv cache dtype "
+                    "and matching k/v scales.")
+
+    def _update_attention_page_size_padded(self,
+                                           layers: dict[str,
+                                                        AttentionLayerBase],
+                                           block_size: int) -> None:
+        """Pad attention page sizes so vLLM's num_blocks matches what
+        the TPU allocates per layer.
+
+        If every attention layer already has the same natural TPU page
+        size, there's nothing to compensate for: leave
+        `mamba_page_size_padded` as a no-op default.
+
+        If they differ, vLLM's own `unify_kv_cache_spec_page_size` will
+        rescale the smaller layer's `block_size` to match but leaves
+        its `page_size_padded` at the old, now-too-small
+        value, which trips `AttentionSpec.page_size_bytes`'s own
+        `page_size_padded >= real_page_size_bytes` assertion. Instead,
+        pin every layer's `page_size_padded` to the max natural size
+        up front (mirroring the Mamba-hybrid case below), so all
+        layers already report equal `page_size_bytes` and
+        `unify_kv_cache_spec_page_size` is a no-op.
+
+        NOTE: Cannot leave `page_size_padded=None` on every layer, because
+        vLLM core uses `page_size_padded` to size `num_blocks` against the HBM
+        budget. With `page_size_padded=None`, that sizing falls back to
+        generic page-size formula (https://github.com/vllm-project/vllm/blob/48aa8d8d7529d2314858d8487cc0a21789fc7ec1/vllm/v1/kv_cache_interface.py#L204-L218)
+        which has no notion of TPU's packing/alignment rules (e.g.
+        fp8 packs 4 elements per 32-bit lane, so `num_kv_heads * 2` gets
+        rounded up to a multiple of 4 in the actual TPU tensor -- see
+        `get_kv_cache_shape`). Where that rounding changes the byte count --
+        e.g. a GQA layer TP-sharded down to a single KV head -- the real TPU
+        allocation ends up larger than vLLM's generic formula accounted for,
+        so `num_blocks` is silently oversized and HBM usage silently exceeds
+        `gpu_memory_utilization`'s target, instead of failing loudly the way
+        this assertion does. `page_size_padded` has to stay pinned to the
+        true, packing-aware size on every layer; this function's job is only
+        to make sure every layer is pinned to the *same* one.
+        """
+        attn_page_sizes = set()
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+        for m in layers.values():
+            if isinstance(m, Attention):
+                attn_page_sizes.add(
+                    backend_cls.get_kv_cache_page_size_bytes(
+                        block_size,
+                        m.num_kv_heads,
+                        m.head_size,
+                        self.kv_cache_dtype,
+                    ))
+            elif isinstance(m, MLAAttention):
+                attn_page_sizes.add(
+                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                        block_size,
+                        1,
+                        m.head_size,
+                        self.kv_cache_dtype,
+                    ))
+
+        if not attn_page_sizes:
+            return
+        elif len(attn_page_sizes) > 1:
+            uniform_page_size_bytes = max(attn_page_sizes)
+            self._hybrid_uniform_page_size_bytes = uniform_page_size_bytes
+            self.cache_config.mamba_page_size_padded = uniform_page_size_bytes
+            logger.info(
+                "Pure-attention hybrid KV cache: padding every layer "
+                "spec to %d bytes (max of native sizes %s). Avoids "
+                "vLLM's unify_kv_cache_spec_page_size leaving a stale "
+                "page_size_padded behind when layer head_dims differ.",
+                uniform_page_size_bytes, sorted(attn_page_sizes))
+        else:
+            self.cache_config.mamba_page_size_padded = attn_page_sizes.pop()
 
     def _update_mamba_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:

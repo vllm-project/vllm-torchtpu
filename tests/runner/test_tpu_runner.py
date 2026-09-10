@@ -906,7 +906,7 @@ class TestTPURunner:
         self.runner._init_mamba_slot_pool.assert_called_once_with(
             mamba_num_blocks)
 
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_spec.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -953,7 +953,7 @@ class TestTPURunner:
     @patch.object(TpuPlatform,
                   '_find_non_ssm_backend',
                   return_value=PallasMLAttentionBackend)
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_spec.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.layers.vllm.attention.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=8192)
@@ -982,7 +982,7 @@ class TestTPURunner:
                     expected_padded_size)
         mock_get_page_size.assert_called()
 
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_spec.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -1003,7 +1003,7 @@ class TestTPURunner:
             self.runner.get_kv_cache_spec()
             mock_update.assert_not_called()
 
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.kv_cache_spec.get_layers_from_vllm_config')
     @patch(
         'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
