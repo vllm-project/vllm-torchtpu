@@ -239,15 +239,15 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
         return contextlib.nullcontext()
 
     monkeypatch.setattr(
-        "vllm_torchtpu.runner.tpu_runner.set_forward_context",
+        "vllm_torchtpu.runner.compile_warmup.set_forward_context",
         capture_forward_context,
     )
     monkeypatch.setattr(
-        "vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context",
+        "vllm_torchtpu.runner.compile_warmup.set_vllm_model_wrapper_context",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(
-        "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
+        "vllm_torchtpu.runner.compile_warmup.synchronize_tensors",
         lambda *_args, **_kwargs: None,
     )
 

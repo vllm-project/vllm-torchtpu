@@ -7,10 +7,8 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 import copy
 import dataclasses
 import math
-import os
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -19,8 +17,7 @@ import torch
 import torch_tpu  # noqa: F401
 import vllm.envs as vllm_envs
 # TODO: Remove this after jax dependency is removed
-from vllm.config import (CUDAGraphMode, VllmConfig,
-                         get_layers_from_vllm_config, set_current_vllm_config)
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -49,16 +46,14 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   prepare_kernel_block_sizes)
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
     materialize_kv_cache_tensors)
 from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
-from vllm_torchtpu.layers.common.attention_metadata import (
-    AttentionMetadata, AttentionMetadataBuilder,
-    AttentionMetadataBuilderContext)
+from vllm_torchtpu.layers.common.attention_metadata import \
+    AttentionMetadataBuilder
 from vllm_torchtpu.layers.common.sequence_layout import \
     create_sequence_layout_planner
 from vllm_torchtpu.layers.vllm import token_padding
@@ -90,8 +85,6 @@ from vllm_torchtpu.runner.mamba_state import (
     _rollback_offsets_migrate_compiled, _rollback_offsets_migrate_impl,
     _rollback_offsets_seed, _rollback_offsets_seed_compiled,
     _rollback_offsets_seed_impl, _tpu_compile)
-from vllm_torchtpu.runner.mm_encoder_manager import \
-    maybe_create_mm_encoder_manager
 from vllm_torchtpu.runner.model_loading import (ModelLoadingMixin,
                                                 _torch_tpu_wrapper,
                                                 _validate_libtpu_version)
@@ -1632,296 +1625,6 @@ class TPUModelRunner(PhasedProfilingMixin, XlaGraphTrackerMixin,
         if self.spec_decode_manager is None:
             return None
         return self.spec_decode_manager.take_draft_token_ids()
-
-    @torch.no_grad()
-    def _dummy_run(self,
-                   num_tokens: int,
-                   num_reqs: int,
-                   num_blocks: int,
-                   use_max_model_len: bool = True,
-                   dp_lockstep: bool = False) -> None:
-        kv_cache_initialized = self.kv_cache_config is not None
-
-        if self.supports_mm_inputs:
-            input_ids = None
-            inputs_embeds = torch.zeros(
-                (num_tokens, self.inputs_embeds_size),
-                dtype=self.dtype,
-                device=self.device,
-            )
-        else:
-            input_ids = torch.zeros((num_tokens),
-                                    dtype=torch.int32).to(self.device)
-            inputs_embeds = None
-        actual_num_reqs = min(num_tokens, num_reqs)
-        if self.uses_mrope:
-            position_ids = torch.zeros((3, num_tokens),
-                                       dtype=torch.int32).to(self.device)
-        else:
-            position_ids = torch.zeros(num_tokens,
-                                       dtype=torch.int32).to(self.device)
-        query_lens = ([1] * actual_num_reqs + [0] *
-                      (num_reqs - actual_num_reqs))
-        query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
-                                                    dtype=torch.int32),
-                                       dim=0,
-                                       dtype=torch.int32).to(self.device)
-        seq_lens = torch.ones((num_reqs, ), dtype=torch.int32).to(self.device)
-        # V3: request_distribution = [decode_end, prefill_end, mixed_end].
-        # Dummy runs use one scheduled token per active request, so model
-        # them as pure decode to match the real single-chip path.
-        request_distribution = torch.tensor(
-            [actual_num_reqs, actual_num_reqs, actual_num_reqs],
-            dtype=torch.int32).to(self.device)
-        dummy_layout_plan = _get_sequence_layout_planner_for_runner(
-            self).prepare_dummy(
-                num_tokens=num_tokens,
-                num_reqs=num_reqs,
-                kv_cache_initialized=kv_cache_initialized,
-            )
-
-        if self.kv_cache_config is not None:
-            # Dummy compact-mamba slot ids (all null slot 0): the dummy run
-            # only traces shapes/HBM, so the recurrent state read/written is
-            # never consumed. Shape must match the GDN op's max_reqs
-            # (= seq_lens length = num_reqs).
-            dummy_mamba_state_indices = (torch.zeros(
-                (num_reqs, ), dtype=torch.int32).to(self.device)
-                                         if self._has_mamba_state else None)
-            # Match _prepare_inputs: the spec-decode mamba fields are set iff
-            # the model has mamba layers and spec decoding is enabled, so the
-            # dummy runs compile the same GDN program signature — including
-            # the two distributions being views of one [6] base tensor (see
-            # _combined_request_distribution_cpu for why).
-            dummy_mamba_request_distribution = None
-            if self.mamba_slot_read_offsets is not None:
-                combined_device = torch.tensor([actual_num_reqs] * 6,
-                                               dtype=torch.int32).to(
-                                                   self.device)
-                request_distribution = combined_device[0:3]
-                dummy_mamba_request_distribution = combined_device[3:6]
-            self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
-                num_reqs=num_reqs,
-                start_index=0,
-                use_max_model_len=use_max_model_len,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                request_distribution=request_distribution,
-                position_ids_override=position_ids,
-                mamba_state_indices=dummy_mamba_state_indices,
-                mamba_slot_read_offsets=self.mamba_slot_read_offsets,
-                mamba_ckpt_window=self._mamba_ckpt_window,
-                mamba_request_distribution=dummy_mamba_request_distribution,
-                sequence_layout_descriptor=dummy_layout_plan.descriptor,
-            )
-            slot_mappings = self.empty_slot_mappings
-            per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
-                num_tokens=num_tokens,
-                num_reqs=num_reqs,
-                max_query_len=1,
-                num_tokens_padded=num_tokens,
-                num_reqs_padded=num_reqs,
-                slot_mappings=slot_mappings,
-            )
-        else:
-            # Pre-init path (called before initialize_kv_cache): use the
-            # caller-supplied num_blocks and a single shared metadata.
-            if self._attn_layer_names is None:
-                self._attn_layer_names = list(
-                    get_layers_from_vllm_config(
-                        self.vllm_config,
-                        (AttentionLayerBase, MambaBase)).keys())
-            block_tables = torch.zeros((num_reqs * num_blocks, ),
-                                       dtype=torch.int32).to(self.device)
-            attn_metadata = AttentionMetadata(
-                input_positions=position_ids,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                request_distribution=request_distribution,
-                sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
-                sequence_layout_protocol=(
-                    dummy_layout_plan.descriptor.protocol),
-                sequence_layout_version=(dummy_layout_plan.descriptor.version),
-            )
-
-            per_layer_attn_metadata = {
-                layer_name: attn_metadata
-                for layer_name in self._attn_layer_names
-            }
-
-        padding_state = getattr(self, "_token_padding_state", None)
-        if padding_state is not None:
-            # Every row of a dummy step is padding.
-            padding_state.update(0, num_tokens)
-        with (
-                self.maybe_select_dummy_loras(
-                    self.lora_config, np.array([num_tokens], dtype=np.int32)),
-                set_forward_context(
-                    per_layer_attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens if dp_lockstep else 0,
-                    num_tokens_across_dp=self._dp_num_tokens_across_dp(
-                        num_tokens) if dp_lockstep else None),
-                set_vllm_model_wrapper_context(
-                    mesh=self.mesh,
-                    vllm_config=self.vllm_config,
-                    kv_cache_bundle=self._kv_cache_bundle,
-                ),
-        ):
-            out, _ = self.forward_model(input_ids=input_ids,
-                                        positions=position_ids,
-                                        inputs_embeds=inputs_embeds)
-            if dp_lockstep:
-                # Idle DP engines must issue the same TP logits collective as
-                # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs,
-                                   dtype=torch.int32,
-                                   device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
-            if not dp_lockstep:
-                synchronize_tensors(out)
-        self._hidden_states_dtype = out.dtype
-
-    def capture_model(self) -> None:
-        """Precompile every torch.compile subgraph across all input buckets."""
-        if self.enforce_eager:
-            return
-        with self.maybe_setup_dummy_loras(self.lora_config):
-            with self._precompile_timed("model backbone"):
-                self._precompile_backbone()
-
-            self._precompile_sampling_subgraphs()
-            self._precompile_mamba_rollback_helpers()
-
-            # Precompile multimodal vision encoder graphs
-            self.encoder_cudagraph_manager = (maybe_create_mm_encoder_manager(
-                self.vllm_config, self.device, self.model))
-            if self.encoder_cudagraph_manager is not None:
-                with self._precompile_timed("multimodal vision encoder"):
-                    self.encoder_cudagraph_manager.precompile_vision_encoder()
-
-            # Warm the drafter's forward + sampling subgraphs at every
-            # bucket shape it may see at runtime.
-            if (self._is_async_drafter):
-                self.drafter.precompile()
-                if self._pcp_mtp_k1_enabled:
-                    logger.info(
-                        "Skipping rejection replay and decode/verify warmup "
-                        "for prefill-only PCP MTP K1")
-                    self._warmup_pcp_mtp_prefill()
-                else:
-                    self._precompile_rejection_sampler()
-                    # The isolated precompiles above emit standalone fused
-                    # programs; the real per-step propose+verify+sampling
-                    # dispatch fuses them differently, so the first real
-                    # request would otherwise compile new graphs. Warm those
-                    # through the real two-phase spec-decode path.
-                    self._warmup_spec_decode()
-
-    def _precompile_backbone(self) -> None:
-        """Compile the backbone for every token bucket.
-
-        One trace serves the whole ladder unless the model's structure depends
-        on the token count, in which case a bucket the current graph cannot
-        serve gets a trace of its own and hands its executable back, leaving
-        one executable per bucket either way (see
-        vllm_torchtpu.compilation.shape_variants).
-        """
-        with shape_variants.warmup() as buckets:
-            for num_tokens in self.num_tokens_paddings:
-                logger.info("  -- num_tokens: %d", num_tokens)
-                if buckets.needs_retrace(num_tokens):
-                    shape_variants.retrace(self.model, self.vllm_config)
-                self._dummy_run(num_tokens,
-                                self.num_reqs_max_model_len,
-                                self.max_num_blocks_per_req,
-                                use_max_model_len=True)
-                if self.most_model_len is not None:
-                    self._dummy_run(num_tokens,
-                                    self.num_reqs_most_model_len,
-                                    self.num_blocks_per_most_len_req,
-                                    use_max_model_len=False)
-            if buckets.refused:
-                # A refusal that no trace picked up leaves a raising closure in
-                # the live graph, which would surface as a failed request. Fail
-                # the start instead, where it can be read.
-                raise shape_variants.ShapeSpecializationError(
-                    "warmup left token buckets uncompiled: "
-                    f"{sorted(buckets.refused)}")
-
-    @contextmanager
-    def _profile_isolated_cache(self) -> Iterator[None]:
-        # Isolate the kv=0-specialized profile compile into a dedicated
-        # subdirectory ("profile_cache") so it can be cached across warm
-        # restarts without colliding with the real serving cache (kv > 0)
-        # or across different models / TP sizes / dtypes.
-        import hashlib
-
-        from vllm.compilation.caching import aot_compile_hash_factors
-
-        from vllm_torchtpu.compilation.tpu_compiler import \
-            compute_tpu_compilation_hash
-        cc = self.vllm_config.compilation_config
-        base_cache_dir = cc.cache_dir or vllm_envs.VLLM_CACHE_ROOT
-        factors = aot_compile_hash_factors(self.vllm_config)
-        factors.append(compute_tpu_compilation_hash(self.vllm_config))
-        hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
-        saved_cache_dir = cc.cache_dir
-        cc.cache_dir = os.path.join(base_cache_dir, "profile_cache", hash_key)
-        os.makedirs(cc.cache_dir, exist_ok=True)
-        try:
-            yield
-        finally:
-            cc.cache_dir = saved_cache_dir
-
-    def profile_run(
-        self,
-        num_tokens: int,
-    ) -> None:
-        from vllm.compilation.wrapper import reset_compile_wrapper
-
-        from vllm_torchtpu.layers.vllm.linear_common import (
-            _get_quantized_matmul_fp4_op, _get_quantized_matmul_op)
-
-        # set_current_vllm_config is required for the post-reset compile
-        # path: reset_compile_wrapper restores the wrapper's original
-        # forward code, so the next trace re-instantiates CustomOps that
-        # call get_current_vllm_config().
-        cc = self.vllm_config.compilation_config
-        saved_cache = (cc.cache_dir, cc.local_cache_dir)
-        saved_sizes = cc.compile_sizes
-        with set_current_vllm_config(self.vllm_config):
-            self._initialize_attention_kernels()
-            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
-            _get_quantized_matmul_op()
-            # Same for the NVFP4 W4A16 matmul op.
-            _get_quantized_matmul_fp4_op()
-
-            # Compile backbone here so XLA materializes the FP8 activation
-            # slab; vLLM's post-probe sees the real HBM. Cache writes are
-            # disabled so the kv=0-specialized graph never lands in the
-            # persistent serving cache. Compile only the max token bucket:
-            # every program loaded on the TPU holds a permanent bottom-of-HBM
-            # program-region reservation, and the kv=0-specialized graphs are
-            # dead after the dynamo reset below — one throwaway program keeps
-            # the region within budget for capture_model's full bucket ladder.
-            with self._profile_isolated_cache():
-                cc.compile_sizes = [num_tokens]
-                self._dummy_run(num_tokens, self.num_reqs_max_model_len,
-                                self.max_num_blocks_per_req)
-            reset_compile_wrapper(self.model)
-            # reset_compile_wrapper wipes cache_dir; restore so
-            # capture_model can read/write the persistent cache.
-            cc.cache_dir, cc.local_cache_dir = saved_cache
-            cc.compile_sizes = saved_sizes
-            torch._dynamo.reset()
-            synchronize_device()
-
-            # Sampling subgraphs (Phase A) — uses the restored cache_dir.
-            if not self.enforce_eager:
-                with self.maybe_setup_dummy_loras(self.lora_config):
-                    self._precompile_sampling_subgraphs()
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         if not has_kv_transfer_group():
