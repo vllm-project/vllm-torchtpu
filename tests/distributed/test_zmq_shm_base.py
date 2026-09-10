@@ -32,12 +32,18 @@ import torch
 import zmq
 
 from vllm_torchtpu.distributed.kv_transfer import zmq_shm_base as zsb
+from vllm_torchtpu.distributed.kv_transfer import \
+    zmq_shm_coordination as coordination
+from vllm_torchtpu.distributed.kv_transfer import \
+    zmq_shm_telemetry as telemetry
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta, SendMeta, TPUConnectorMetadata)
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
                                                                PoolSpec)
 
 _BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
+_COORDINATION = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_coordination"
+_TELEMETRY = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_telemetry"
 
 _NUM_LAYERS = 2
 _CACHE_BLOCKS = 16
@@ -291,7 +297,7 @@ class _FakeConnector(zsb.ZmqShmKvConnectorBase):
 class _ModuleStub:
     """Module wrapper that overrides specified attributes while delegating remaining lookups.
 
-    Patching `zsb.time` or `zsb.os` with this stub scopes overrides strictly to
+    Patching a module's `time` or `os` with this stub scopes overrides strictly to
     the module under test, preventing concurrent background threads from
     leaking scripted clocks or mocked filesystem state across tests.
     """
@@ -452,7 +458,7 @@ def _drain_ipc(conn) -> list[tuple]:
             ident, tag, payload = conn._coord_ipc_out.get_nowait()
         except queue.Empty:
             return out
-        out.append((ident, tag, zsb._secure_loads(payload)))
+        out.append((ident, tag, coordination._secure_loads(payload)))
 
 
 def _send_entry(conn, uuid=7, req_id="r0", slot_idx=0, num_blocks=2, ttl=60.0):
@@ -500,7 +506,7 @@ class TestIpcAuth:
 
     def test_env_key_wins(self, monkeypatch):
         monkeypatch.setenv("VLLM_TORCHTPU_IPC_KEY", "hunter2")
-        assert zsb._get_default_ipc_key() == b"hunter2"
+        assert coordination._get_default_ipc_key() == b"hunter2"
 
     def test_derived_key_reads_machine_id(self, monkeypatch, tmp_path):
         monkeypatch.delenv("VLLM_TORCHTPU_IPC_KEY", raising=False)
@@ -508,40 +514,41 @@ class TestIpcAuth:
         machine_id.write_text("abc123\n")
         fake_path = _ModuleStub(os.path,
                                 exists=lambda path: path == "/etc/machine-id")
-        with patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)), \
-             patch(f"{_BASE}.open", create=True,
+        with patch(f"{_COORDINATION}.os", new=_ModuleStub(os, path=fake_path)), \
+             patch(f"{_COORDINATION}.open", create=True,
                    return_value=open(machine_id, "r")):
-            key = zsb._get_default_ipc_key()
+            key = coordination._get_default_ipc_key()
         assert key == _derived_key("abc123")
 
     def test_derived_key_without_machine_id(self, monkeypatch):
         monkeypatch.delenv("VLLM_TORCHTPU_IPC_KEY", raising=False)
         fake_path = _ModuleStub(os.path, exists=lambda _path: False)
-        with patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)):
-            key = zsb._get_default_ipc_key()
+        with patch(f"{_COORDINATION}.os", new=_ModuleStub(os, path=fake_path)):
+            key = coordination._get_default_ipc_key()
         assert key == _derived_key("")
 
     def test_derived_key_survives_unreadable_machine_id(self, monkeypatch):
         monkeypatch.delenv("VLLM_TORCHTPU_IPC_KEY", raising=False)
         fake_path = _ModuleStub(os.path, exists=lambda _path: True)
-        with patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)), \
-             patch(f"{_BASE}.open", create=True, side_effect=OSError("nope")):
-            key = zsb._get_default_ipc_key()
+        with patch(f"{_COORDINATION}.os", new=_ModuleStub(os, path=fake_path)), \
+             patch(f"{_COORDINATION}.open", create=True, side_effect=OSError("nope")):
+            key = coordination._get_default_ipc_key()
         assert key == _derived_key("")
 
     def test_secure_roundtrip(self):
         payload = {"uuid": 5, "blocks": [1, 2, 3]}
-        assert zsb._secure_loads(zsb._secure_dumps(payload)) == payload
+        assert coordination._secure_loads(
+            coordination._secure_dumps(payload)) == payload
 
     def test_secure_loads_rejects_short_payload(self):
         with pytest.raises(ValueError, match="too short"):
-            zsb._secure_loads(b"\x00" * 8)
+            coordination._secure_loads(b"\x00" * 8)
 
     def test_secure_loads_rejects_tampered_payload(self):
-        blob = bytearray(zsb._secure_dumps({"a": 1}))
+        blob = bytearray(coordination._secure_dumps({"a": 1}))
         blob[-1] ^= 0xFF
         with pytest.raises(ValueError, match="HMAC authentication failed"):
-            zsb._secure_loads(bytes(blob))
+            coordination._secure_loads(bytes(blob))
 
 
 class TestRemoveIpcEndpoint:
@@ -549,23 +556,24 @@ class TestRemoveIpcEndpoint:
     def test_ignores_non_ipc_path(self, tmp_path):
         target = tmp_path / "keep.sock"
         target.write_text("")
-        zsb._try_remove_ipc_endpoint(f"tcp://127.0.0.1:{5555}")
+        coordination._try_remove_ipc_endpoint(f"tcp://127.0.0.1:{5555}")
         assert target.exists()
 
     def test_unlinks_stale_socket(self, tmp_path):
         target = tmp_path / "stale.sock"
         target.write_text("")
-        zsb._try_remove_ipc_endpoint(f"ipc://{target}")
+        coordination._try_remove_ipc_endpoint(f"ipc://{target}")
         assert not target.exists()
 
     def test_missing_socket_is_not_an_error(self, tmp_path):
-        zsb._try_remove_ipc_endpoint(f"ipc://{tmp_path / 'absent.sock'}")
+        coordination._try_remove_ipc_endpoint(
+            f"ipc://{tmp_path / 'absent.sock'}")
 
     def test_oserror_is_logged_not_raised(self, tmp_path):
         # Verify non-FileNotFoundError OS exceptions (e.g. EISDIR when unlinking
         # a directory) are handled gracefully with a warning rather than raised.
-        with patch(f"{_BASE}.logger") as log:
-            zsb._try_remove_ipc_endpoint(f"ipc://{tmp_path}")
+        with patch(f"{_COORDINATION}.logger") as log:
+            coordination._try_remove_ipc_endpoint(f"ipc://{tmp_path}")
         assert tmp_path.is_dir()
         assert log.warning.called
 
@@ -573,11 +581,11 @@ class TestRemoveIpcEndpoint:
 class TestLatencyTracker:
 
     def test_summary_reports_count_average_min_and_max_per_phase(self):
-        tracker = zsb._LatencyTracker("who", log_interval_s=0.01)
+        tracker = telemetry._LatencyTracker("who", log_interval_s=0.01)
         for value in (5.0, 1.0, 9.0):
             tracker.record("d2h", value)
         tracker._last_log = time.perf_counter() - 10.0
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_TELEMETRY}.logger") as log:
             tracker.record("wire", 4.0)
         fmt, who, summary = log.info.call_args.args
         assert "latency summary" in fmt and who == "who"
@@ -585,12 +593,12 @@ class TestLatencyTracker:
         assert "wire: n=1 avg=4.0ms min=4.0ms max=4.0ms" in summary
 
     def test_negative_interval_is_clamped_to_zero(self):
-        assert zsb._LatencyTracker("who", log_interval_s=-3.0)._log_interval_s \
+        assert telemetry._LatencyTracker("who", log_interval_s=-3.0)._log_interval_s \
             == 0.0
 
     def test_summary_is_suppressed_inside_the_interval(self):
-        tracker = zsb._LatencyTracker("who", log_interval_s=1000.0)
-        with patch(f"{_BASE}.logger") as log:
+        tracker = telemetry._LatencyTracker("who", log_interval_s=1000.0)
+        with patch(f"{_TELEMETRY}.logger") as log:
             tracker.record("wire", 4.0)
         assert not log.info.called
 
@@ -819,8 +827,8 @@ class TestCoordSetup:
                    return_value="ipc:///tmp/tpu-test.sock"), \
              patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
                    return_value=1), \
-             patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()), \
-             patch(f"{_BASE}._try_remove_ipc_endpoint"), \
+             patch(f"{_COORDINATION}.make_zmq_socket", return_value=_FakeSocket()), \
+             patch(f"{_COORDINATION}._try_remove_ipc_endpoint"), \
              patch.object(conn, "_pool_create",
                           side_effect=lambda spec, name: _make_pool()), \
              patch.object(conn, "_pool_attach",
@@ -855,7 +863,7 @@ class TestCoordSetup:
         self._setup(conn)
         assert conn._coord_ipc_sock.connected == "ipc:///tmp/tpu-test.sock"
         assert conn._coord_ipc_sock.opts[zmq.IDENTITY] == b"tpu_rank_1"
-        assert _drain_ipc(conn) == [(None, zsb._IPC_HELLO, (1, 1))]
+        assert _drain_ipc(conn) == [(None, coordination._IPC_HELLO, (1, 1))]
 
     def test_attach_retries_until_the_pool_appears(self):
         conn = _attach_runner(_make_conn(tp_rank=1, tp_size=2))
@@ -897,19 +905,22 @@ class TestIpcEnvelopes:
 
     def test_worker_send_enqueues_an_unaddressed_frame(self):
         conn = _make_conn(tp_rank=1, tp_size=2)
-        conn._coord_send_ipc(zsb._IPC_COPY_DONE, (9, 1))
-        assert _drain_ipc(conn) == [(None, zsb._IPC_COPY_DONE, (9, 1))]
+        conn._coord_send_ipc(coordination._IPC_COPY_DONE, (9, 1))
+        assert _drain_ipc(conn) == [(None, coordination._IPC_COPY_DONE, (9, 1))
+                                    ]
 
     def test_broadcast_addresses_every_known_rank(self):
         conn = _make_conn(tp_size=3)
         conn._coord_rank_to_identity = {1: b"r1", 2: b"r2"}
-        conn._coord_broadcast(zsb._IPC_DROP, (4, ))
-        assert sorted(_drain_ipc(conn)) == [(b"r1", zsb._IPC_DROP, (4, )),
-                                            (b"r2", zsb._IPC_DROP, (4, ))]
+        conn._coord_broadcast(coordination._IPC_DROP, (4, ))
+        assert sorted(_drain_ipc(conn)) == [
+            (b"r1", coordination._IPC_DROP, (4, )),
+            (b"r2", coordination._IPC_DROP, (4, ))
+        ]
 
     def test_broadcast_with_no_peers_sends_nothing(self):
         conn = _make_conn()
-        conn._coord_broadcast(zsb._IPC_DROP, (4, ))
+        conn._coord_broadcast(coordination._IPC_DROP, (4, ))
         assert _drain_ipc(conn) == []
 
     def test_drain_sends_dealer_and_router_shapes(self):
@@ -1121,7 +1132,7 @@ class TestHandleNewSend:
         assert (entry.req_id, entry.slot_idx, entry.num_blocks) == ("req-a", 0,
                                                                     3)
         assert len(entry.staged_events) == 2
-        assert _drain_ipc(conn) == [(b"r1", zsb._IPC_STAGE_NOTIFY,
+        assert _drain_ipc(conn) == [(b"r1", coordination._IPC_STAGE_NOTIFY,
                                      (42, 0, 3, [0, 1, 2]))]
         assert conn.stage_calls == [(0, 3, [0, 1, 2])]
 
@@ -1169,14 +1180,16 @@ class TestWorkerStageInline:
     def test_timeout_signals_a_failed_stage(self):
         conn = _attach_runner(_make_conn(tp_rank=1, tp_size=2))
         conn._coord_worker_stage_inline(5, "req-a", timeout=0.01)
-        assert _drain_ipc(conn) == [(None, zsb._IPC_STAGE_DONE, (5, 1, True))]
+        assert _drain_ipc(conn) == [(None, coordination._IPC_STAGE_DONE,
+                                     (5, 1, True))]
 
     def test_stage_exception_signals_a_failed_stage(self):
         conn = _attach_runner(_make_conn(tp_rank=1, tp_size=2))
         conn.stage_raises = RuntimeError("boom")
         conn._worker_pending_stage[5] = (0, 1, [0])
         conn._coord_worker_stage_inline(5, "req-a", timeout=1.0)
-        assert _drain_ipc(conn) == [(None, zsb._IPC_STAGE_DONE, (5, 1, True))]
+        assert _drain_ipc(conn) == [(None, coordination._IPC_STAGE_DONE,
+                                     (5, 1, True))]
 
     def test_a_late_stage_notify_still_wins(self):
         conn = _attach_runner(_make_conn(tp_rank=1, tp_size=2))
@@ -1213,7 +1226,7 @@ class TestStageShardAndWaiter:
         conn._coord_stage_wait_worker(conn._stage_pending_q.get_nowait())
         assert send.stage_complete.is_set()
         assert not send.stage_failed
-        assert conn._lat._stats[zsb._LAT_D2H][0] == 1.0
+        assert conn._lat._stats[telemetry._LAT_D2H][0] == 1.0
 
     def test_wait_worker_marks_a_raising_future_failed(self):
         conn = _attach_runner(_make_conn())
@@ -1336,7 +1349,8 @@ class TestSignalStageDone:
     def test_non_coordinator_sends_over_ipc(self):
         conn = _attach_runner(_make_conn(tp_rank=1, tp_size=2))
         conn._signal_stage_done(3, failed=True)
-        assert _drain_ipc(conn) == [(None, zsb._IPC_STAGE_DONE, (3, 1, True))]
+        assert _drain_ipc(conn) == [(None, coordination._IPC_STAGE_DONE,
+                                     (3, 1, True))]
 
 
 # ---------------------------------------------------------------------------
@@ -1375,7 +1389,8 @@ class TestHandleNewLoad:
         conn = _attach_runner(_make_conn(is_producer=False, tp_size=2))
         conn._coord_rank_to_identity = {1: b"r1"}
         conn._coord_rank0_handle_new_load("d1", _load_meta(remote_blocks=None))
-        assert _drain_ipc(conn) == [(b"r1", zsb._IPC_LOAD_SKIP, (11, ))]
+        assert _drain_ipc(conn) == [(b"r1", coordination._IPC_LOAD_SKIP,
+                                     (11, ))]
 
     def test_drain_tick_for_a_known_uuid_broadcasts_nothing(self):
         conn = _attach_runner(_make_conn(is_producer=False, tp_size=2))
@@ -1402,7 +1417,8 @@ class TestHandleNewLoad:
         conn._coord_rank0_handle_new_load("d1-again",
                                           _load_meta(local_blocks=(6, 7)))
         [(_ident, tag, notify)] = _drain_ipc(conn)
-        assert (tag, notify) == (zsb._IPC_LOAD_NOTIFY, (11, 0, 2, [6, 7]))
+        assert (tag, notify) == (coordination._IPC_LOAD_NOTIFY, (11, 0, 2,
+                                                                 [6, 7]))
 
     def test_pool_exhaustion_surfaces_done_recving(self):
         conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
@@ -1427,12 +1443,12 @@ def _pull_frames(*,
                  uuid_echo=b"11"):
     """Construct a producer PULL response frame sequence with patterned per-layer test data."""
     frames = [
-        _frame(zsb._MSG_OK),
+        _frame(coordination._MSG_OK),
         _frame(uuid_echo),
         _frame(str(len(ranks)).encode())
     ]
     if with_header:
-        frames.append(_frame(zsb._secure_dumps({"tp_size": 1})))
+        frames.append(_frame(coordination._secure_dumps({"tp_size": 1})))
     for rank in ranks:
         frames.append(_frame(str(rank).encode()))
         frames.extend(
@@ -1446,7 +1462,7 @@ class TestRank0Pull:
     def _prepare(self, conn, sockets):
         """Configure make_zmq_socket to return the provided _FakeSocket instances in sequence."""
         handed = iter(sockets)
-        return patch(f"{_BASE}.make_zmq_socket",
+        return patch(f"{_COORDINATION}.make_zmq_socket",
                      side_effect=lambda **kw: next(handed))
 
     def test_successful_pull_unpacks_and_broadcasts_load_notify(self):
@@ -1469,9 +1485,10 @@ class TestRank0Pull:
             _layer_payload(2, 0xA0 + layer) for layer in range(_NUM_LAYERS)
         ]
         assert sock.closed
-        assert sock.sent[0][0] == zsb._MSG_PULL
+        assert sock.sent[0][0] == coordination._MSG_PULL
         [(_ident, tag, notify)] = _drain_ipc(conn)
-        assert (tag, notify) == (zsb._IPC_LOAD_NOTIFY, (11, 0, 2, [0, 1]))
+        assert (tag, notify) == (coordination._IPC_LOAD_NOTIFY, (11, 0, 2,
+                                                                 [0, 1]))
 
     def test_multi_host_pull_uses_one_socket_per_host_and_channel(self):
         conn = _attach_runner(_make_conn(is_producer=False))
@@ -1518,8 +1535,8 @@ class TestRank0Pull:
         conn._coord_rank_to_identity = {1: b"r1"}
         entry = _recv_entry(conn, uuid=11, req_id="d1")
         socks = [
-            _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]]),
-            _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]]),
+            _FakeSocket(inbound=[[_frame(coordination._MSG_ERR)]]),
+            _FakeSocket(inbound=[[_frame(coordination._MSG_ERR)]]),
         ]
         with self._prepare(conn, socks), \
              patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
@@ -1529,7 +1546,7 @@ class TestRank0Pull:
         assert all(s.closed for s in socks)
         # Invariant: Channel errors are deduplicated so that exactly one IPC_DROP
         # is sent and the shm slot is released only once regardless of channel error count.
-        assert [m[1] for m in _drain_ipc(conn)] == [zsb._IPC_DROP]
+        assert [m[1] for m in _drain_ipc(conn)] == [coordination._IPC_DROP]
         assert conn._coord_pool.released == [0]
         assert 11 not in conn._coord_recv
         assert conn._coord_done_recving == {"d1"}
@@ -1563,7 +1580,9 @@ class TestRank0Pull:
         conn._coord_rank_to_identity = {1: b"r1"}
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
-        sock = _FakeSocket(inbound=[[_frame(zsb._MSG_ERR), _frame(b"11")]])
+        sock = _FakeSocket(
+            inbound=[[_frame(coordination._MSG_ERR),
+                      _frame(b"11")]])
         with self._prepare(conn, [sock]), \
              patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
                    return_value=1):
@@ -1573,7 +1592,7 @@ class TestRank0Pull:
         assert conn._coord_done_recving == {"d0"}
         assert conn._coord_pool.released == [0]
         [(_ident, tag, _obj)] = _drain_ipc(conn)
-        assert tag == zsb._IPC_DROP
+        assert tag == coordination._IPC_DROP
 
     def test_timeout_marks_the_pull_failed(self):
         conn = _attach_runner(_make_conn(is_producer=False))
@@ -1648,7 +1667,7 @@ class TestScatter:
         conn._coord_scatter_shard(0, 2, [4, 9])
         assert len(conn.sync_calls) == _NUM_LAYERS
         assert conn.fast_scatter_calls == []
-        assert conn._lat._stats[zsb._LAT_H2D][0] == 1.0
+        assert conn._lat._stats[telemetry._LAT_H2D][0] == 1.0
         # Verify each layer's shard is transferred strictly into target block
         # indices without modifying other cache blocks.
         for layer_idx, cache in enumerate(conn.runner.kv_caches):
@@ -1677,7 +1696,7 @@ class TestScatter:
             _make_conn(is_producer=False, tp_rank=1, tp_size=2))
         conn._coord_scatter_and_ack("d1", 11, 0, 2, [0, 1])
         [(_ident, tag, ack)] = _drain_ipc(conn)
-        assert (tag, ack) == (zsb._IPC_COPY_DONE, (11, 1))
+        assert (tag, ack) == (coordination._IPC_COPY_DONE, (11, 1))
 
     def test_scatter_failure_still_acks(self):
         conn = _attach_runner(_make_conn(is_producer=False))
@@ -1791,7 +1810,8 @@ class TestSendNotify:
     def test_creates_and_caches_one_socket_per_host(self):
         conn = self._consumer()
         sock = _FakeSocket()
-        with patch(f"{_BASE}.make_zmq_socket", return_value=sock) as factory:
+        with patch(f"{_COORDINATION}.make_zmq_socket",
+                   return_value=sock) as factory:
             conn._coord_rank0_send_notify(_load_meta(side_port=9700), 11)
             conn._coord_rank0_send_notify(_load_meta(side_port=9700), 12)
         assert factory.call_count == 1
@@ -1803,7 +1823,7 @@ class TestSendNotify:
         socks = [_FakeSocket(), _FakeSocket()]
         handed = iter(socks)
         meta = _load_meta(host=["h0", "h1"], port=[1, 2], side_port=9700)
-        with patch(f"{_BASE}.make_zmq_socket",
+        with patch(f"{_COORDINATION}.make_zmq_socket",
                    side_effect=lambda **kw: next(handed)):
             conn._coord_rank0_send_notify(meta, 11)
         assert sorted(
@@ -1811,7 +1831,7 @@ class TestSendNotify:
 
     def test_falls_back_to_the_local_side_channel_base(self):
         conn = self._consumer()
-        with patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()), \
+        with patch(f"{_COORDINATION}.make_zmq_socket", return_value=_FakeSocket()), \
              patch(f"{_BASE}.dist_utils.get_side_channel_port",
                    return_value="9600"):
             conn._coord_rank0_send_notify(_load_meta(), 11)
@@ -1824,11 +1844,11 @@ class TestSendNotify:
 
 
 def _router_frame(ident: bytes, tag: bytes, payload) -> list[bytes]:
-    return [ident, tag, zsb._secure_dumps(payload)]
+    return [ident, tag, coordination._secure_dumps(payload)]
 
 
 def _dealer_frame(tag: bytes, payload) -> list[bytes]:
-    return [tag, zsb._secure_dumps(payload)]
+    return [tag, coordination._secure_dumps(payload)]
 
 
 class TestRank0IpcLoop:
@@ -1841,14 +1861,16 @@ class TestRank0IpcLoop:
 
     def test_hello_registers_identities_and_unblocks_broadcasts(self):
         conn = _attach_runner(_make_conn(tp_size=2))
-        self._run(conn, [_router_frame(b"r1", zsb._IPC_HELLO, (1, 1))])
+        self._run(conn,
+                  [_router_frame(b"r1", coordination._IPC_HELLO, (1, 1))])
         assert conn._coord_rank_to_identity == {1: b"r1"}
         assert conn._coord_local_to_global_rank == {0: 0, 1: 1}
         assert conn._coord_workers_ready.is_set()
 
     def test_hello_from_only_some_ranks_keeps_broadcasts_gated(self):
         conn = _attach_runner(_make_conn(tp_size=3))
-        self._run(conn, [_router_frame(b"r1", zsb._IPC_HELLO, (1, 1))])
+        self._run(conn,
+                  [_router_frame(b"r1", coordination._IPC_HELLO, (1, 1))])
         assert conn._coord_rank_to_identity == {1: b"r1"}
         assert not conn._coord_workers_ready.is_set()
 
@@ -1856,23 +1878,26 @@ class TestRank0IpcLoop:
         conn = _attach_runner(_make_conn(tp_size=2))
         entry = _send_entry(conn, uuid=7)
         entry.staged.add(0)
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 1, False))])
+        self._run(conn, [
+            _router_frame(b"r1", coordination._IPC_STAGE_DONE, (7, 1, False))
+        ])
         assert entry.stage_complete.is_set()
         assert entry.staged_events[1].is_set()
 
     def test_stage_done_before_all_ranks_leaves_completion_clear(self):
         conn = _attach_runner(_make_conn(tp_size=4))
         entry = _send_entry(conn, uuid=7)
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 1, True))])
+        self._run(
+            conn,
+            [_router_frame(b"r1", coordination._IPC_STAGE_DONE, (7, 1, True))])
         assert entry.stage_failed
         assert not entry.stage_complete.is_set()
 
     def test_stage_done_for_an_unknown_uuid_is_dropped(self):
         conn = _attach_runner(_make_conn(tp_size=2))
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (99, 1, False))])
+        self._run(conn, [
+            _router_frame(b"r1", coordination._IPC_STAGE_DONE, (99, 1, False))
+        ])
 
     def test_stage_done_from_an_out_of_range_rank_is_counted(self):
         # TODO(#771): Rank identifiers in STAGE_DONE payloads are not validated
@@ -1881,8 +1906,9 @@ class TestRank0IpcLoop:
         # This test pins existing behavior until strict rank validation is added.
         conn = _attach_runner(_make_conn(tp_size=2))
         entry = _send_entry(conn, uuid=7)
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 9, False))])
+        self._run(conn, [
+            _router_frame(b"r1", coordination._IPC_STAGE_DONE, (7, 9, False))
+        ])
         assert entry.staged == {9}
         assert not entry.stage_complete.is_set()
         assert not any(ev.is_set() for ev in entry.staged_events)
@@ -1891,25 +1917,28 @@ class TestRank0IpcLoop:
         conn = _attach_runner(_make_conn(is_producer=False))
         _recv_entry(conn, uuid=11, slot_idx=1)
         with patch.object(conn, "_coord_rank0_send_notify") as notify:
-            self._run(conn,
-                      [_router_frame(b"r1", zsb._IPC_COPY_DONE, (11, 0))])
+            self._run(
+                conn,
+                [_router_frame(b"r1", coordination._IPC_COPY_DONE, (11, 0))])
         assert notify.called
         assert conn._coord_pool.released == [1]
 
     def test_copy_done_short_of_the_rank_count_holds_the_slot(self):
         conn = _attach_runner(_make_conn(is_producer=False, tp_size=2))
         entry = _recv_entry(conn, uuid=11)
-        self._run(conn, [_router_frame(b"r1", zsb._IPC_COPY_DONE, (11, 1))])
+        self._run(conn,
+                  [_router_frame(b"r1", coordination._IPC_COPY_DONE, (11, 1))])
         assert entry.copied == {1}
         assert conn._coord_pool.released == []
 
     def test_copy_done_for_an_unknown_uuid_is_dropped(self):
         conn = _attach_runner(_make_conn(is_producer=False))
-        self._run(conn, [_router_frame(b"r1", zsb._IPC_COPY_DONE, (99, 0))])
+        self._run(conn,
+                  [_router_frame(b"r1", coordination._IPC_COPY_DONE, (99, 0))])
 
     def test_unknown_tag_is_logged(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_COORDINATION}.logger") as log:
             self._run(conn, [_router_frame(b"r1", b"NOPE", (1, ))])
         assert log.warning.called
 
@@ -1919,12 +1948,12 @@ class TestRank0IpcLoop:
 
     def test_unauthenticated_payload_is_dropped(self):
         conn = _attach_runner(_make_conn())
-        self._run(conn, [[b"r1", zsb._IPC_HELLO, b"garbage"]])
+        self._run(conn, [[b"r1", coordination._IPC_HELLO, b"garbage"]])
         assert conn._coord_rank_to_identity == {}
 
     def test_zmq_error_is_logged_and_the_loop_continues(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_COORDINATION}.logger") as log:
             self._run(conn, [zmq.ZMQError("EAGAIN")])
         assert log.warning.called
 
@@ -1955,38 +1984,41 @@ class TestWorkerIpcLoop:
 
     def test_stage_notify_lands_in_pending_stage(self):
         conn = self._worker()
-        self._run(conn,
-                  [_dealer_frame(zsb._IPC_STAGE_NOTIFY, (5, 1, 3, [7, 8, 9]))])
+        self._run(conn, [
+            _dealer_frame(coordination._IPC_STAGE_NOTIFY, (5, 1, 3, [7, 8, 9]))
+        ])
         assert conn._worker_pending_stage[5] == (1, 3, [7, 8, 9])
 
     def test_load_notify_four_tuple(self):
         conn = self._worker()
-        self._run(conn,
-                  [_dealer_frame(zsb._IPC_LOAD_NOTIFY, (5, 1, 2, [0, 1]))])
+        self._run(
+            conn,
+            [_dealer_frame(coordination._IPC_LOAD_NOTIFY, (5, 1, 2, [0, 1]))])
         assert conn._worker_pending_load[5] == (1, 2, [0, 1])
 
     def test_load_notify_five_tuple_carries_a_req_id(self):
         conn = self._worker()
-        self._run(
-            conn,
-            [_dealer_frame(zsb._IPC_LOAD_NOTIFY, (5, "req", 1, 2, [0, 1]))])
+        self._run(conn, [
+            _dealer_frame(coordination._IPC_LOAD_NOTIFY,
+                          (5, "req", 1, 2, [0, 1]))
+        ])
         assert conn._worker_pending_load[5] == (1, 2, [0, 1])
 
     def test_load_skip_stores_the_none_sentinel(self):
         conn = self._worker()
-        self._run(conn, [_dealer_frame(zsb._IPC_LOAD_SKIP, (5, ))])
+        self._run(conn, [_dealer_frame(coordination._IPC_LOAD_SKIP, (5, ))])
         assert conn._worker_pending_load[5] is None
 
     def test_drop_clears_pending_stage_and_skips_the_load(self):
         conn = self._worker()
         conn._worker_pending_stage[5] = (0, 1, [0])
-        self._run(conn, [_dealer_frame(zsb._IPC_DROP, (5, ))])
+        self._run(conn, [_dealer_frame(coordination._IPC_DROP, (5, ))])
         assert conn._worker_pending_load[5] is None
         assert 5 not in conn._worker_pending_stage
 
     def test_unknown_tag_is_logged(self):
         conn = self._worker()
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_COORDINATION}.logger") as log:
             self._run(conn, [_dealer_frame(b"NOPE", (1, ))])
         assert log.warning.called
 
@@ -1996,12 +2028,12 @@ class TestWorkerIpcLoop:
 
     def test_unauthenticated_payload_is_dropped(self):
         conn = self._worker()
-        self._run(conn, [[zsb._IPC_LOAD_SKIP, b"garbage"]])
+        self._run(conn, [[coordination._IPC_LOAD_SKIP, b"garbage"]])
         assert conn._worker_pending_load == {}
 
     def test_zmq_error_is_logged_and_the_loop_continues(self):
         conn = self._worker()
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_COORDINATION}.logger") as log:
             self._run(conn, [zmq.ZMQError("EAGAIN")])
         assert log.warning.called
 
@@ -2030,7 +2062,7 @@ class TestExternalDataLoop:
                            on_exhausted=conn._stop_event.set,
                            send_error=send_error)
         conn._coord_channel_executor = _InlineExecutor()
-        ctx = patch(f"{_BASE}.make_zmq_socket", return_value=sock)
+        ctx = patch(f"{_COORDINATION}.make_zmq_socket", return_value=sock)
         timeout = patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
                         return_value=1)
         if response is None:
@@ -2044,48 +2076,52 @@ class TestExternalDataLoop:
 
     def test_serves_a_pull_with_the_prepared_frames(self):
         conn = _attach_runner(_make_conn())
-        frames = [zsb._MSG_OK, b"7", b"1"]
-        sock = self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"blocks"]],
-                         response={"return_value": frames})
+        frames = [coordination._MSG_OK, b"7", b"1"]
+        sock = self._run(
+            conn, [[b"client", coordination._MSG_PULL, b"7", b"blocks"]],
+            response={"return_value": frames})
         assert sock.sent == [[b"client", *frames]]
 
     def test_build_failure_answers_err(self):
         conn = _attach_runner(_make_conn())
-        sock = self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
+        sock = self._run(conn,
+                         [[b"client", coordination._MSG_PULL, b"7", b"b"]],
                          response={"side_effect": RuntimeError("no entry")})
-        assert sock.sent == [[b"client", zsb._MSG_ERR, b"7"]]
+        assert sock.sent == [[b"client", coordination._MSG_ERR, b"7"]]
 
     def test_none_response_answers_err(self):
         conn = _attach_runner(_make_conn())
-        sock = self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
+        sock = self._run(conn,
+                         [[b"client", coordination._MSG_PULL, b"7", b"b"]],
                          response={"return_value": None})
-        assert sock.sent == [[b"client", zsb._MSG_ERR, b"7"]]
+        assert sock.sent == [[b"client", coordination._MSG_ERR, b"7"]]
 
     def test_send_errors_are_logged_not_raised(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
-                      response={"return_value": [zsb._MSG_OK]},
+        with patch(f"{_COORDINATION}.logger") as log:
+            self._run(conn, [[b"client", coordination._MSG_PULL, b"7", b"b"]],
+                      response={"return_value": [coordination._MSG_OK]},
                       send_error=zmq.ZMQError("EHOSTUNREACH"))
         assert log.warning.called
 
     def test_err_send_errors_are_logged_not_raised(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
+        with patch(f"{_COORDINATION}.logger") as log:
+            self._run(conn, [[b"client", coordination._MSG_PULL, b"7", b"b"]],
                       response={"return_value": None},
                       send_error=zmq.ZMQError("EHOSTUNREACH"))
         assert log.warning.called
 
     def test_non_numeric_uuid_answers_bad_uuid(self):
         conn = _attach_runner(_make_conn())
-        sock = self._run(conn, [[b"client", zsb._MSG_PULL, b"not-a-number"]])
-        assert sock.sent == [[b"client", zsb._MSG_ERR, b"bad-uuid"]]
+        sock = self._run(
+            conn, [[b"client", coordination._MSG_PULL, b"not-a-number"]])
+        assert sock.sent == [[b"client", coordination._MSG_ERR, b"bad-uuid"]]
 
     def test_bad_uuid_send_error_is_logged(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [[b"client", zsb._MSG_PULL, b"nope"]],
+        with patch(f"{_COORDINATION}.logger") as log:
+            self._run(conn, [[b"client", coordination._MSG_PULL, b"nope"]],
                       send_error=zmq.ZMQError("EHOSTUNREACH"))
         assert log.warning.called
 
@@ -2096,7 +2132,7 @@ class TestExternalDataLoop:
 
     def test_zmq_error_is_logged_and_the_loop_continues(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_COORDINATION}.logger") as log:
             self._run(conn, [zmq.ZMQError("EAGAIN")])
         assert log.warning.called
 
@@ -2104,7 +2140,7 @@ class TestExternalDataLoop:
         conn = _attach_runner(_make_conn())
         sock = _FakeSocket(inbound=[zmq.ContextTerminated()])
         conn._coord_channel_executor = _InlineExecutor()
-        with patch(f"{_BASE}.make_zmq_socket", return_value=sock), \
+        with patch(f"{_COORDINATION}.make_zmq_socket", return_value=sock), \
              patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
                    return_value=1):
             conn._coord_rank0_external_data_loop(0)
@@ -2136,7 +2172,7 @@ class TestBuildPullResponse:
                 frames = conn._coord_rank0_build_pull_response(7, b"7", 0, [0])
         finally:
             thread.join()
-        assert frames[0] == zsb._MSG_OK
+        assert frames[0] == coordination._MSG_OK
 
     def test_channel_zero_prepends_the_header(self):
         conn = _attach_runner(_make_conn())
@@ -2145,10 +2181,11 @@ class TestBuildPullResponse:
         with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
                    return_value=1):
             frames = conn._coord_rank0_build_pull_response(7, b"7", 0, [0])
-        assert frames[0] == zsb._MSG_OK
+        assert frames[0] == coordination._MSG_OK
         assert frames[1] == b"7"
         assert frames[2] == b"1"
-        assert zsb._secure_loads(frames[3])["num_layers"] == _NUM_LAYERS
+        assert coordination._secure_loads(
+            frames[3])["num_layers"] == _NUM_LAYERS
         assert frames[4] == b"0"
         assert len(frames) == 5 + _NUM_LAYERS
 
@@ -2213,7 +2250,7 @@ class TestExternalNotifLoop:
 
     def _run(self, conn, inbound):
         sock = _FakeSocket(inbound=inbound, on_exhausted=conn._stop_event.set)
-        with patch(f"{_BASE}.make_zmq_socket", return_value=sock):
+        with patch(f"{_COORDINATION}.make_zmq_socket", return_value=sock):
             conn._coord_rank0_external_notif_loop()
         return sock
 
@@ -2225,7 +2262,7 @@ class TestExternalNotifLoop:
 
     def test_stray_ack_is_logged(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_COORDINATION}.logger") as log:
             self._run(conn, [[b"client", b"99"]])
         assert log.warning.called
 
@@ -2235,14 +2272,14 @@ class TestExternalNotifLoop:
 
     def test_zmq_error_is_logged_and_the_loop_continues(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.logger") as log:
+        with patch(f"{_COORDINATION}.logger") as log:
             self._run(conn, [zmq.ZMQError("EAGAIN")])
         assert log.warning.called
 
     def test_context_termination_returns(self):
         conn = _attach_runner(_make_conn())
         sock = _FakeSocket(inbound=[zmq.ContextTerminated()])
-        with patch(f"{_BASE}.make_zmq_socket", return_value=sock):
+        with patch(f"{_COORDINATION}.make_zmq_socket", return_value=sock):
             conn._coord_rank0_external_notif_loop()
         assert not conn._stop_event.is_set()
 
@@ -2366,7 +2403,7 @@ class TestCoordinatorWorkerHandoff:
 
         # Forward IPC_STAGE_NOTIFY to the worker, then trigger local staging.
         [(_ident, tag, notify)] = _drain_ipc(coord)
-        assert tag == zsb._IPC_STAGE_NOTIFY
+        assert tag == coordination._IPC_STAGE_NOTIFY
         uuid, slot_idx, num_blocks, block_ids = notify
         with worker._worker_pending_stage_cv:
             worker._worker_pending_stage[uuid] = (slot_idx, num_blocks,
@@ -2375,14 +2412,14 @@ class TestCoordinatorWorkerHandoff:
         worker._coord_stage_wait_worker(worker._stage_pending_q.get_nowait())
 
         [(_ident, tag, done)] = _drain_ipc(worker)
-        assert tag == zsb._IPC_STAGE_DONE
+        assert tag == coordination._IPC_STAGE_DONE
         done_uuid, rank, failed = done
         assert not failed
 
         # Complete rank 0 local D2H transfer and verify all ranks finish staging.
         coord._coord_stage_wait_worker(coord._stage_pending_q.get_nowait())
         sock = _FakeSocket(inbound=[
-            _router_frame(b"tpu_rank_1", zsb._IPC_STAGE_DONE,
+            _router_frame(b"tpu_rank_1", coordination._IPC_STAGE_DONE,
                           (done_uuid, rank, failed))
         ],
                            on_exhausted=coord._stop_event.set)
@@ -2417,12 +2454,13 @@ class TestCoordinatorWorkerHandoff:
 
         worker._coord_scatter_and_ack("d1", 11, 1, 2, [0, 1])
         [(_ident, tag, ack)] = _drain_ipc(worker)
-        assert tag == zsb._IPC_COPY_DONE
+        assert tag == coordination._IPC_COPY_DONE
 
         sock = _FakeSocket(inbound=[_router_frame(b"tpu_rank_1", tag, ack)],
                            on_exhausted=coord._stop_event.set)
         coord._coord_ipc_sock = sock
-        with patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()):
+        with patch(f"{_COORDINATION}.make_zmq_socket",
+                   return_value=_FakeSocket()):
             coord._coord_rank0_ipc_loop()
 
         assert 11 not in coord._coord_recv
