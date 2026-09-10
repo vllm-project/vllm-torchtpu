@@ -13,7 +13,8 @@
 # limitations under the License.
 """Insert-layout tests for the sparse-MLA KV cache writers.
 
-Pure jnp scatter, no Pallas: these run on CPU.
+Pure jnp scatter, no Pallas: these run on CPU. `test_mla_kv_cache_scatter.py`
+checks the SparseCore Pallas writer against the same layout contract.
 """
 
 import jax
@@ -22,8 +23,8 @@ import numpy as np
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-    KVCacheLayout, KVCacheType, SparseMLAKVCacheSpec,
-    update_sparse_mla_kv_cache)
+    SKIP_ROW, WORD_BYTES, KVCacheLayout, KVCacheType, SparseMLAKVCacheSpec,
+    as_token_bytes, get_dst_rows, pack_tokens, update_sparse_mla_kv_cache_jax)
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 
 LKV_DIM = 512
@@ -31,7 +32,6 @@ ROPE_DIM = 64
 PAGE_SIZE = 32
 PAGES_PER_SEQ = 4
 TOTAL_PAGES = 16
-WORD_BYTES = 4
 
 # Layouts pinned explicitly rather than read from the environment: these
 # tests check the exact geometry dsa_gather is written against.
@@ -48,24 +48,29 @@ def _empty(spec: SparseMLAKVCacheSpec) -> jax.Array:
     return jnp.zeros(spec.shape, spec.jax_dtype)
 
 
-def _token_bytes(cache: jax.Array, spec: SparseMLAKVCacheSpec) -> np.ndarray:
-    """Decode any layout to `[num_pages, page_size, head_dim]` uint8.
+def unpack4(words_u32: np.ndarray) -> np.ndarray:
+    """Unpack uint32 words `[..., n]` into four uint8 bands `[..., 4, n]`."""
+    w = np.asarray(words_u32).astype(np.uint32)
+    bands = [((w >> (8 * b)) & 0xFF).astype(np.uint8) for b in range(4)]
+    return np.stack(bands, axis=-2)
+
+
+def token_bytes(cache: jax.Array, spec: SparseMLAKVCacheSpec) -> np.ndarray:
+    """Decode any layout to `[num_pages, page_size, token_bytes]` uint8.
 
     Decoding is written from the layout contract, not from the writer: a
-    sparsecore word `w` holds byte `b` of feature band `b`, so recovering
-    token-major bytes needs the band axis transposed back in front of the
-    feature axis. A writer that packed in any other order fails the
+    sparsecore word `j` holds byte `b` of band `b`, so `unpack4`'s band axis
+    lands directly in front of the word axis and flattens back to token-major
+    with no transpose. A writer that packed in any other order fails the
     comparisons below.
     """
-    arr = np.asarray(cache)
-    rows = arr.reshape(spec.num_pages, spec.page_size, -1)
-    if spec.layout is KVCacheLayout.TENSORCORE:
-        # nope [P, S, 4, 128] and rope [P, S // 4, 4, 128] are both already
-        # byte images -- the flatten above is the whole decode.
-        return rows
-    bands = rows.view(np.uint8).reshape(*rows.shape, WORD_BYTES)
-    return bands.transpose(0, 1, 3, 2).reshape(spec.num_pages, spec.page_size,
-                                               spec.head_dim)
+    rows = np.asarray(cache).reshape(spec.num_pages, spec.page_size, -1)
+    if spec.layout is KVCacheLayout.SPARSECORE:
+        # nope [P, S, 128] u32 and rope [P, S // 4, 128] u32.
+        rows = unpack4(rows)
+    # TENSORCORE nope [P, S, 4, 128] and rope [P, S // 4, 4, 128] are already
+    # byte images -- the reshape above is the whole decode.
+    return rows.reshape(spec.num_pages, spec.page_size, spec.token_bytes)
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -109,7 +114,7 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         block_tables[0, :2] = [5, 2]
         block_tables[1, 0] = 9
 
-        nope_cache, rope_cache = update_sparse_mla_kv_cache(
+        nope_cache, rope_cache = update_sparse_mla_kv_cache_jax(
             _empty(nope_spec),
             _empty(rope_spec),
             kv_c,
@@ -121,8 +126,8 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
             rope_spec=rope_spec)
 
         # Every layout is token-major once decoded to [page, slot, bytes].
-        nope_rows = _token_bytes(nope_cache, nope_spec)
-        rope_rows = _token_bytes(rope_cache, rope_spec)
+        nope_rows = token_bytes(nope_cache, nope_spec)
+        rope_rows = token_bytes(rope_cache, rope_spec)
         exp_nope = np.asarray(jax.lax.bitcast_convert_type(kv_c, jnp.uint8))
         exp_rope = np.asarray(jax.lax.bitcast_convert_type(k_pe, jnp.uint8))
         # seq 0: positions 32..36 -> page 2 slots 0..4; seq 1: page 9 slots 0..2.
@@ -155,7 +160,7 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         block_tables[0, 0] = 1
         block_tables[1, 0] = 2
 
-        nope_cache, rope_cache = update_sparse_mla_kv_cache(
+        nope_cache, rope_cache = update_sparse_mla_kv_cache_jax(
             _empty(NOPE_SPEC),
             _empty(ROPE_SPEC),
             kv_c,
@@ -166,9 +171,9 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
             nope_spec=NOPE_SPEC,
             rope_spec=ROPE_SPEC)
 
-        nope_rows = _token_bytes(nope_cache, NOPE_SPEC).reshape(-1, LKV_DIM)
-        rope_rows = _token_bytes(rope_cache,
-                                 ROPE_SPEC).reshape(-1, ROPE_SPEC.head_dim)
+        nope_rows = token_bytes(nope_cache, NOPE_SPEC).reshape(-1, LKV_DIM)
+        rope_rows = token_bytes(rope_cache,
+                                ROPE_SPEC).reshape(-1, ROPE_SPEC.token_bytes)
         # Exactly the valid tokens landed, nothing else.
         self.assertEqual(int(nope_rows.any(axis=1).sum()), valid_tokens)
         self.assertEqual(int(rope_rows.any(axis=1).sum()), valid_tokens)
@@ -205,7 +210,7 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         for layout, spec in specs.items():
             nope_spec = spec if is_nope else NOPE_SPEC
             rope_spec = ROPE_SPEC if is_nope else spec
-            nope, rope = update_sparse_mla_kv_cache(
+            nope, rope = update_sparse_mla_kv_cache_jax(
                 _empty(nope_spec),
                 _empty(rope_spec),
                 kv_c,
@@ -222,7 +227,7 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         sc_words = np.asarray(caches[KVCacheLayout.SPARSECORE]).reshape(
             TOTAL_PAGES, PAGE_SIZE, -1)
         raw = np.asarray(jax.lax.bitcast_convert_type(values, jnp.uint8))
-        padded = np.zeros((num_tokens, sc_spec.head_dim), np.uint8)
+        padded = np.zeros((num_tokens, sc_spec.token_bytes), np.uint8)
         padded[:, :raw.shape[1]] = raw
         bands = padded.reshape(num_tokens, WORD_BYTES, -1).astype(np.uint32)
         expected = (bands[:, 0] | (bands[:, 1] << 8) | (bands[:, 2] << 16)
@@ -233,7 +238,71 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         # ...and the two layouts hold the same bytes, differing only in how
         # the 32-bit packing is expressed.
         np.testing.assert_array_equal(
-            _token_bytes(caches[KVCacheLayout.SPARSECORE],
-                         specs[KVCacheLayout.SPARSECORE]),
-            _token_bytes(caches[KVCacheLayout.TENSORCORE],
-                         specs[KVCacheLayout.TENSORCORE]))
+            token_bytes(caches[KVCacheLayout.SPARSECORE],
+                        specs[KVCacheLayout.SPARSECORE]),
+            token_bytes(caches[KVCacheLayout.TENSORCORE],
+                        specs[KVCacheLayout.TENSORCORE]))
+
+
+class PackingTest(parameterized.TestCase):
+    """The byte-packing helpers both writers share."""
+
+    def test_pack_tokens_round_trips_through_unpack4(self):
+        raw = jnp.arange(16, dtype=jnp.uint8).reshape(1, 16)
+        packed = pack_tokens(raw, token_bytes=16)
+        self.assertEqual(packed.shape, (1, 4))
+        # word j == bytes {j, 4 + j, 8 + j, 12 + j}, little-endian.
+        np.testing.assert_array_equal(
+            np.asarray(packed),
+            np.array([[0x0C080400, 0x0D090501, 0x0E0A0602, 0x0F0B0703]],
+                     np.uint32))
+        np.testing.assert_array_equal(
+            unpack4(np.asarray(packed)).reshape(1, 16), np.asarray(raw))
+
+    def test_as_token_bytes_zero_pads_the_tail(self):
+        raw = jnp.full((3, 64), 0xAB, jnp.uint8)
+        out = np.asarray(
+            as_token_bytes(jax.lax.bitcast_convert_type(
+                raw, jnp.float8_e4m3fn),
+                           token_bytes=128))
+        self.assertEqual(out.shape, (3, 128))
+        np.testing.assert_array_equal(out[:, :64], np.asarray(raw))
+        self.assertEqual(int(np.count_nonzero(out[:, 64:])), 0)
+
+    @parameterized.named_parameters(
+        dict(testcase_name="nope",
+             cache_type=KVCacheType.NOPE,
+             head_dim=LKV_DIM),
+        dict(testcase_name="rope",
+             cache_type=KVCacheType.ROPE,
+             head_dim=ROPE_DIM),
+    )
+    def test_spec_shape_is_a_retiling_of_token_bytes(self, cache_type,
+                                                     head_dim):
+        """Every layout reserves exactly `token_bytes` per token slot."""
+        for layout in KVCacheLayout:
+            spec = SparseMLAKVCacheSpec.create(cache_type, layout, TOTAL_PAGES,
+                                               PAGE_SIZE, head_dim, KV_PACKING)
+            cache = _empty(spec)
+            self.assertEqual(
+                cache.nbytes,
+                spec.num_pages * spec.page_size * spec.token_bytes,
+                msg=f"{cache_type} {layout} {spec.shape} {spec.jax_dtype}")
+
+    def test_get_dst_rows_flattens_page_and_slot(self):
+        """`dst_rows` is `page * page_size + slot`, and SKIP_ROW past the end."""
+        block_tables = np.full((2, PAGES_PER_SEQ), 7, np.int32)
+        block_tables[0, 1] = 5
+        block_tables[1, 0] = 9
+        # seq 0: len 37, 5 new tokens -> positions 32..36 on page 5 (idx 1).
+        # seq 1: len 3, 3 new tokens -> positions 0..2 on page 9.
+        dst_rows = np.asarray(
+            get_dst_rows(num_tokens=10,
+                         seq_lens=jnp.asarray([37, 3], jnp.int32),
+                         block_tables=jnp.asarray(block_tables.reshape(-1)),
+                         query_start_loc=jnp.asarray([0, 5, 8], jnp.int32),
+                         page_size=PAGE_SIZE))
+        expected = [5 * PAGE_SIZE + i for i in range(5)]
+        expected += [9 * PAGE_SIZE + i for i in range(3)]
+        expected += [SKIP_ROW, SKIP_ROW]  # tokens 8, 9 are batch padding
+        np.testing.assert_array_equal(dst_rows, np.array(expected, np.int32))

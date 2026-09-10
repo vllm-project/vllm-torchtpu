@@ -121,7 +121,7 @@ def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
        of different shapes.
     """
     return (vllm_config.model_config.architecture
-            in ("DeepseekV4ForCausalLM", ))
+            in ("DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"))
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):

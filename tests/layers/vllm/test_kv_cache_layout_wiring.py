@@ -242,27 +242,6 @@ def test_unified_pool_accepts_seq_along_lane(hnd):
                        "validate_kv_layout_supports_unified_pool")
 
 
-@pytest.mark.parametrize("seq_along_lane,reshapes", [(True, True),
-                                                     (False, False)])
-def test_pooled_gdn_state_view_follows_the_layout(seq_along_lane, reshapes):
-    """The pool reshape is keyed on the layout, so it fires for the mainline
-    kernel too -- and no-ops by default.
-
-    Takes the resolved flag rather than reading `get_kv_cache_layout()`: the
-    op body runs at forward time with no current vLLM config, so the layout is
-    resolved once in `_build_pooled_gdn_op` and closed over."""
-    import jax.numpy as jnp
-
-    from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
-        _pooled_gdn_state_view
-
-    # (num_blocks, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
-    state = jnp.zeros((1, 2, 64, 4, 128), dtype=jnp.float8_e4m3fn)
-    viewed = _pooled_gdn_state_view(state, seq_along_lane)
-    assert (viewed.shape != state.shape) is reshapes
-    assert viewed.size == state.size
-
-
 # Coexistence with the longctx fork
 
 
@@ -418,14 +397,11 @@ def test_no_layout_lookup_on_the_compiled_forward_path():
     import inspect
 
     from vllm_torchtpu.layers.vllm import attention as attn
-    from vllm_torchtpu.layers.vllm.custom_ops import gdn_attention_op as gdn
 
     on_forward_path = [
         attn.PallasAttentionBackendImpl.forward,
         attn.PallasAttentionBackendImpl._validate_pcp_streaming_support,
         attn._pallas_rpa_kernel_batched,
-        gdn._pooled_gdn_state_view,
-        gdn._pooled_gdn_block_tokens,
     ]
     offenders = [
         fn.__qualname__ for fn in on_forward_path

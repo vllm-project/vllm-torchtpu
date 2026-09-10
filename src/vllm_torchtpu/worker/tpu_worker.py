@@ -398,6 +398,8 @@ class TPUWorker(WorkerBase):
                 pipeline_model_parallel_size=self.parallel_config.
                 pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
+                decode_context_model_parallel_size=self.parallel_config.
+                decode_context_parallel_size,
             )
         # The patch above substitutes rank lists on the way in; this reads the
         # built groups back, so a patch that silently stopped applying fails

@@ -21,8 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-TILE_SUBROWS = 4
-TILE_LANE_BYTES = 128
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 
 
 def main_kernel(
@@ -49,7 +48,7 @@ def main_kernel(
     num_blocks = pl.cdiv(indices_hbm_ref.shape[0], block_size)
 
     # Inputs are 8-bit;
-    # nope output stays uint8 (4/int32), rope is unpacked to bf16 (2/int32).
+    # nope and rope output stays uint8 (4/int32).
     in_bits = jax.dtypes.itemsize_bits(nope_in_hbm_ref.dtype)
     in_packing = 32 // in_bits
     in_mask = (1 << in_bits) - 1  # 0xFF for 8-bit.
@@ -187,29 +186,31 @@ def dsa_gather(
     """Fused SparseCore gather of the nope and rope caches.
 
   Args:
-    nope_cache: (total_pages, page_size, TILE_SUBROWS, TILE_LANE_BYTES) uint8.
-      Each (TILE_SUBROWS, TILE_LANE_BYTES) uint8 is token's nope. It encodes 512
+    nope_cache: (total_pages, page_size, WORD_BYTES, TILE_LANE_BYTES) uint8.
+      Each (WORD_BYTES, TILE_LANE_BYTES) uint8 is token's nope. It encodes 512
       fp8 values (per-tensor k_scale applied by the attention kernel; no inline
       scales).
-    rope_cache: (total_pages, page_size // TILE_SUBROWS, TILE_SUBROWS,
+    rope_cache: (total_pages, page_size // WORD_BYTES, WORD_BYTES,
       TILE_LANE_BYTES) uint8. Each (1, TILE_LANE_BYTES) uint8 is token's rope.
-      It encodes 64 bf16.
+      It encodes 128 (rope_out_cols) fp8 values.
     indices: (N,) int32. Token indices into the caches.
 
   Returns:
-    nope_out: (N, TILE_SUBROWS, TILE_LANE_BYTES) uint8. Each token's nope tile
+    nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
       is copied out in the cache's raw layout.
-    rope_out: (N, 64) bf16.
-      Each (64) bf16 is token's rope.
+    rope_out: (N, 128) fp8.
+      (64) fp8 is token's rope, the rest 64 are padding.
   """
+    word_bytes = kv_cache_utils.WORD_BYTES
+    tile_lane_bytes = kv_cache_utils.TILE_LANE_BYTES
     assert indices.ndim == 1, "Indices must be 1D."
     assert nope_cache.dtype == rope_cache.dtype, "Caches must share a dtype."
     assert nope_cache.dtype == jnp.uint8, "Caches must be uint8."
-    assert nope_cache.shape[2:] == (TILE_SUBROWS, TILE_LANE_BYTES), (
-        f"nope_cache must be tiled (..., {TILE_SUBROWS}, {TILE_LANE_BYTES}), "
+    assert nope_cache.shape[2:] == (word_bytes, tile_lane_bytes), (
+        f"nope_cache must be tiled (..., {word_bytes}, {tile_lane_bytes}), "
         f"got {nope_cache.shape}")
-    assert rope_cache.shape[2:] == (TILE_SUBROWS, TILE_LANE_BYTES), (
-        f"rope_cache must be tiled (..., {TILE_SUBROWS}, {TILE_LANE_BYTES}), "
+    assert rope_cache.shape[2:] == (word_bytes, tile_lane_bytes), (
+        f"rope_cache must be tiled (..., {word_bytes}, {tile_lane_bytes}), "
         f"got {rope_cache.shape}")
     rope_out_cols = rope_cache.shape[3]
 
@@ -252,7 +253,7 @@ def dsa_gather(
         ),
         out_type=(
             jax.ShapeDtypeStruct(
-                ((out_size + out_pad_size) * TILE_SUBROWS, TILE_LANE_BYTES),
+                ((out_size + out_pad_size) * word_bytes, tile_lane_bytes),
                 jnp.uint8,
             ),
             jax.ShapeDtypeStruct((out_size + out_pad_size, rope_out_cols),
@@ -270,6 +271,6 @@ def dsa_gather(
         name="sc_dsa_gather",
     )(nope_cache, rope_cache, indices)
     return (
-        nope_out.reshape(-1, TILE_SUBROWS, TILE_LANE_BYTES)[:out_size],
+        nope_out.reshape(-1, word_bytes, tile_lane_bytes)[:out_size],
         rope_out[:out_size],
     )

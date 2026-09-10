@@ -128,6 +128,58 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: Nightly glm52-fp4-offload-correctness"
+        key: "integration_nightly_glm52_fp4_offload_correctness"
+        # Nightly only, like its DSv4 sibling above and for the same reason:
+        # the boot dominates. At ~465 GB the weight load is ~7 min of GCS
+        # streaming and the warmup precompile another ~22, so a PR pays close
+        # to half an hour before a smoke that itself runs in under a minute.
+        #
+        # The explicit timeout stays, and stays larger than that sibling's,
+        # because the Buildkite default does not cover that boot.
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 180
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "/perf_eval_results/glm52_fp4_offload_ci"
+          SERVED_MODEL_NAME: "nvidia/GLM-5.2-NVFP4"
+        commands:
+          # Deliberately NOT staged with stage_model_snapshot.sh, and going
+          # back to nightly does not change that: at ~433 GiB the checkpoint
+          # does not fit a tpu7x-8 agent's disk alongside what else lives
+          # there. The staging copy died at 123/174 files with ENOSPC, having
+          # written 304.5 GiB of 432.9 GiB, and the rig never started. A warm
+          # per-agent cache would only hide that on agents that already hold
+          # the snapshot, so the step streams from GCS and stages nothing.
+          #
+          # MODEL is not on run_in_docker.sh's forwarding list, and the rig
+          # defaults it to the HF id, which would download the checkpoint;
+          # hand it the bucket URI. A gs:// MODEL makes the rig serve with
+          # --load-format runai_streamer (runai-model-streamer[gcs] is a
+          # pyproject dependency). The prefix is a plain checkpoint directory
+          # with config.json at its root, not a models--<org>--<name> hub
+          # snapshot, so it needs no snapshots/ subdirectory resolution.
+          #
+          # It is a copy of gs://cloud-devkit/ckpt/hf/nvidia/GLM-5.2-NVFP4,
+          # and the copy is what makes streaming work at all. runai's GCS
+          # backend resolves a prefix through storage.Client.get_bucket()
+          # (runai_model_streamer_gcs/files/files.py), a bucket-metadata GET
+          # needing storage.buckets.get. The agent SA has only object-level
+          # access to cloud-devkit -- enough for the gcloud staging copy that
+          # ENOSPC'd above, not for get_bucket, which 403'd before a single
+          # weight moved. On tpu-commons-ci the same SA is covered by the
+          # bucket's projectEditor/projectViewer legacy bindings, so
+          # get_bucket resolves. Sibling of the GLM-5.2-FP8 prefix already
+          # there.
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            env MODEL=gs://tpu-commons-ci/glm/GLM-5.2-NVFP4
+            bash ./scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
         agents:

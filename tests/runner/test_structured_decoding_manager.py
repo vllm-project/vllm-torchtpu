@@ -136,6 +136,55 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[0].tolist() == [0, 0]
         assert bitmask[1].tolist() == [BLOCK_ALL, BLOCK_ALL]
 
+    def test_fast_path_no_structured_requests(self):
+        manager = make_manager(req_id_to_index={"req0": 0, "req1": 1})
+        grammar_output = make_grammar_output([], [])
+        logits = torch.zeros(2, VOCAB_SIZE)
+
+        require, bitmask, arange = manager.prepare_structured_decoding_input(
+            logits, grammar_output, 0, 2)
+
+        assert require.data_ptr() == manager.device_all_false_require.data_ptr(
+        )
+        assert require[:, 0].tolist() == [False, False]
+        assert bitmask.data_ptr() == manager.device_dummy_bitmask.data_ptr()
+        assert bitmask.shape == (2, 2)
+        assert arange.tolist() == list(range(32))
+
+    def test_fast_path_all_contiguous_structured(self):
+        manager = make_manager(req_id_to_index={"req0": 0, "req1": 1})
+        grammar_output = make_grammar_output(
+            ["req0", "req1"],
+            [[ALLOW_ALL, BLOCK_ALL], [BLOCK_ALL, ALLOW_ALL]],
+        )
+        logits = torch.zeros(2, VOCAB_SIZE)
+
+        require, bitmask, arange = manager.prepare_structured_decoding_input(
+            logits, grammar_output, 0, 2)
+
+        assert require.data_ptr() == manager.device_all_true_require.data_ptr()
+        assert require[:, 0].tolist() == [True, True]
+        assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
+        assert bitmask[1].tolist() == [BLOCK_ALL, ALLOW_ALL]
+        assert arange.tolist() == list(range(32))
+
+    def test_fast_path_all_contiguous_structured_with_padding(self):
+        # 1 real structured request, but padded bucket size is 2
+        manager = make_manager(req_id_to_index={"req0": 0})
+        grammar_output = make_grammar_output(
+            ["req0"],
+            [[ALLOW_ALL, BLOCK_ALL]],
+        )
+        logits = torch.zeros(2, VOCAB_SIZE)
+
+        require, bitmask, arange = manager.prepare_structured_decoding_input(
+            logits, grammar_output, 0, 1)
+
+        assert require[:, 0].tolist() == [True, False]
+        assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
+        assert bitmask[1].tolist() == [0, 0]
+        assert arange.tolist() == list(range(32))
+
 
 class TestStructuredDecode:
 

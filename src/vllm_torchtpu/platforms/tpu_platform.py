@@ -342,13 +342,10 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
-                               _patch_moe_no_ep_tp_scope,
                                _patch_moe_runner_fused_output_is_reduced,
-                               _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_hybrid_producer_prefix_hits,
-                               _patch_vllm_tpu_group_custom_ops)
+                               _patch_vllm_hybrid_producer_prefix_hits)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
@@ -357,18 +354,14 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
-    tpu_plugin._patch_vllm_pcp_v2_validation()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
-    _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
     _patch_moe_runner_fused_output_is_reduced()
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
-    _patch_moe_no_ep_tp_scope()
-    _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_mamba_split_scheduler_block_size()
@@ -379,12 +372,11 @@ def apply_tpu_patches() -> None:
     tpu_plugin._patch_vllm_vocab_parallel_embedding()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
     from vllm_torchtpu import (  # isort: skip
-        _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
+        _patch_dflash_bypass_v2_runner_check,
         _patch_multiproc_worker_global_rank_env,
         _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
         _patch_vllm_force_v1_runner_tpu,
         _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
-    _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_vllm_reset_compile_wrapper()
     _patch_vllm_piecewise_backend()
@@ -395,9 +387,11 @@ def apply_tpu_patches() -> None:
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import (
         patch_default_loader_ep_weight_filter,
+        patch_default_model_loader_page_cache,
         patch_runai_sharded_expert_streaming)
     patch_runai_sharded_expert_streaming()
     patch_default_loader_ep_weight_filter()
+    patch_default_model_loader_page_cache()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -854,6 +848,11 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
         _validate_phased_profiling_config(vllm_config)
+        if "USE_MOE_EP_KERNEL" in os.environ:
+            raise ValueError(
+                "USE_MOE_EP_KERNEL is no longer supported and enables "
+                "nothing. Unset it; the fused expert-parallel MoE kernel is "
+                "USE_MOE_FUSED_EP_KERNEL=1.")
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
         _register_tpu_kv_connectors()

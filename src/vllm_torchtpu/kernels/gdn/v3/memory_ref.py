@@ -433,7 +433,9 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
         base = state_idx * self.stride + self.region.kb0
-        if self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]:
+        if self.cfg.state_plan.whole_block_dma or (self.region.row0 == 0
+                                                   and self.region.nrows
+                                                   == src_ref.shape[1]):
             return src_ref.at[pl.ds(base, nblocks)]
         return src_ref.at[pl.ds(base, nblocks),
                           pl.ds(self.region.row0, self.region.nrows)]
@@ -681,12 +683,20 @@ def create_allocs(
         # the dense path, the tile holds one region per window position
         # (a single one without speculative decoding).
         plan = cfg.state_plan
-        payload = conv_state_ref.shape[2:]
-        conv_shape = (cfg.seq_tile_size, cfg.window_size, plan.conv.nblocks,
-                      plan.conv.nrows, *payload)
-        recurrent_shape = (cfg.seq_tile_size, cfg.window_size,
-                           plan.recurrent.nblocks, plan.recurrent.nrows,
-                           *payload)
+        if plan.whole_block_dma:
+            # Whole-block DMA transfers complete pages, retaining all inner dims.
+            conv_shape = (cfg.seq_tile_size, cfg.window_size,
+                          plan.conv.nblocks, *conv_state_ref.shape[1:])
+            recurrent_shape = (cfg.seq_tile_size, cfg.window_size,
+                               plan.recurrent.nblocks,
+                               *recurrent_state_ref.shape[1:])
+        else:
+            payload = conv_state_ref.shape[2:]
+            conv_shape = (cfg.seq_tile_size, cfg.window_size,
+                          plan.conv.nblocks, plan.conv.nrows, *payload)
+            recurrent_shape = (cfg.seq_tile_size, cfg.window_size,
+                               plan.recurrent.nblocks, plan.recurrent.nrows,
+                               *payload)
         state_buffered_partial = functools.partial(
             ExternalStateBufferedRef.input_output,
             buffer_count=pipeline_mode.buffer_count,

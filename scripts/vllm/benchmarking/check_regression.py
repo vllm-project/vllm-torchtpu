@@ -185,16 +185,21 @@ def calibrate_perf(
 
 
 def find_eval_results_jsons(results_dir: Path) -> list[Path]:
-    return sorted(results_dir.rglob("results_*.json"))
+    return list(results_dir.rglob("results_*.json"))
 
 
 def load_eval_results(results_dir: Path) -> dict[str, dict]:
     jsons = find_eval_results_jsons(results_dir)
     if not jsons:
         return {}
-    latest = max(jsons, key=lambda p: p.stat().st_mtime)
-    with latest.open() as fh:
-        data = json.load(fh)
+    # One results file per lm-eval task; oldest first so a re-run wins.
+    data: dict = {"results": {}}
+    for path in sorted(jsons, key=lambda p: p.stat().st_mtime):
+        try:
+            with path.open() as fh:
+                data["results"].update((json.load(fh).get("results") or {}))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Warning: failed to parse {path}: {e}", file=sys.stderr)
 
     out: dict[str, dict] = {}
     for task, metrics in (data.get("results") or {}).items():
