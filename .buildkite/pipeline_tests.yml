@@ -56,19 +56,9 @@ steps:
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      # Correctness only at PR time: the `*_performance*` tests are
-      # nightly-marked (acceptance-rate floors are calibration sensitive on a
-      # loaded agent), so `not nightly` deselects them here and the nightly
-      # steps below still run them.
-      #
-      # Every case here loads a model twice (a no-spec reference engine and a
-      # speculative one), so as a single job the suite ran ~3h and set the
-      # floor on PR turnaround. `parallelism` fans it out over 3 agents.
-      # `split-by-example` is what makes that fan-out do anything: bktec
-      # splits a suite by *file*, and this step targets one file, so without
-      # it one job would claim the whole file while the other two logged "No
-      # tests to run on this node" and exited 0 -- green, and exactly as slow
-      # as before.
+      # Representative correctness cases run on PRs; the full parameter
+      # matrix and acceptance-rate tests run nightly. Split by example because
+      # the suite is a single file. bktec balances using recorded test durations.
       - label: "Unit Tests - Speculative Decoding (PR)"
         key: "unit_tests_spec_decode_pr"
         <<: *unit_test_defaults
@@ -77,7 +67,7 @@ steps:
         env:
           # bktec enumerates the examples to split with a plain
           # `pytest --collect-only`, which does not see the `-m` filter in
-          # test-cmd. Without this the nightly-only perf cases would be handed
+          # test-cmd. Without this the nightly-only cases would be handed
           # to the splitter carrying their (long) nightly timings and then
           # deselected at run time, so a shard could be planned full and
           # actually run almost nothing. PYTEST_ADDOPTS applies to collection
@@ -109,11 +99,15 @@ steps:
         key: "unit_tests_spec_decode_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 3
+        env:
+          PYTEST_ADDOPTS: "-m 'not multichip'"
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
+              split-by-example: true
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
