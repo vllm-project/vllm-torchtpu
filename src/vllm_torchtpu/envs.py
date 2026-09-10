@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
 
@@ -456,6 +457,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Evict host page cache for checkpoint weight files via posix_fadvise
+    # after loading into TPU HBM.
+    "TPU_EVICT_WEIGHTS_PAGE_CACHE":
+    env_bool("TPU_EVICT_WEIGHTS_PAGE_CACHE", default=False),
 }
 
 
