@@ -38,7 +38,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
                                                  PallasMLAttentionBackend)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-from vllm_torchtpu.runner import kv_connector_glue, tpu_runner
+from vllm_torchtpu.runner import kv_connector_glue, spec_warmup
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
@@ -57,7 +57,7 @@ def _attention_layer_mock():
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
-    all_token_ids = tpu_runner._spec_warmup_all_token_ids(
+    all_token_ids = spec_warmup._spec_warmup_all_token_ids(
         ["request-0", "request-1"], [7, 12])
 
     assert all_token_ids == {
@@ -101,7 +101,7 @@ def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
     expectation = (pytest.raises(
         RuntimeError, match="PCP MTP prefill warmup failed after retry")
                    if raises_after_retry else contextlib.nullcontext())
-    with patch.object(tpu_runner,
+    with patch.object(spec_warmup,
                       "_suspend_kv_transfer_group",
                       return_value=contextlib.nullcontext()), expectation:
         TPUModelRunner._warmup_pcp_mtp_prefill(runner)
