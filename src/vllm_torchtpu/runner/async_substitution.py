@@ -4,6 +4,7 @@ import torch
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -314,3 +315,173 @@ class AsyncSubstitutionMixin:
             placeholder_req_id_to_index[req_state.req_id] = next_token_index
 
         return placeholder_req_id_to_index
+
+    def _sync_replicated_drafts_across_tp(
+            self, drafts: torch.Tensor | None) -> torch.Tensor | None:
+        """Pin a replicated drafter's device proposal to rank 0's on every rank.
+
+        Broadcast emulated as mask + all_reduce (tpu_dist has no broadcast);
+        tiny (num_reqs x K int32), fully on device. No-ops for a sharded
+        drafter, TP=1, the sync host-list form, and empty steps.
+        """
+        if drafts is None or not isinstance(drafts, torch.Tensor):
+            return drafts
+        if (self.speculative_config is None
+                or self.speculative_config.draft_tensor_parallel_size != 1):
+            return drafts
+        from vllm.distributed import (get_tensor_model_parallel_rank,
+                                      get_tensor_model_parallel_world_size)
+        if get_tensor_model_parallel_world_size() <= 1:
+            return drafts
+        if self._tp_rank0_mask is None:
+            self._tp_rank0_mask = torch.tensor(
+                1 if get_tensor_model_parallel_rank() == 0 else 0,
+                dtype=drafts.dtype,
+                device=drafts.device)
+        return self._tpu_pin_drafts_to_rank0(drafts, self._tp_rank0_mask)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _tpu_pin_drafts_to_rank0(self, drafts: torch.Tensor,
+                                 rank0_mask: torch.Tensor) -> torch.Tensor:
+        # Must be compiled (eager collectives wedge the TPU cores), and the
+        # rank must enter as runtime data (the 0/1 mask), not a trace-time
+        # constant: XLA pairs collectives by channel id, so every rank must
+        # compile the identical program.
+        from vllm.distributed import tensor_model_parallel_all_reduce
+        return tensor_model_parallel_all_reduce(drafts * rank0_mask)
+
+    def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk,
+                                          state):
+        """Async-spec substitution assembler.
+
+        From the already-proposed on-device ``drafts`` (the unified eagle3
+        propose call in ``sample_tokens``), builds the per-request
+        ``[bonus, draft_1..K]`` substitution source and the stride-``1+K``
+        ``next_token_indices``, and computes the per-request rejected count.
+        Returns ``(next_tokens_tpu_chunks, next_token_indices,
+        spec_decode_num_rejected_tokens, num_draft_per_req)``.
+        """
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            assemble_spec_next_tokens, compute_num_rejected)
+        assert drafts is not None, (
+            "async spec substitution requires the eagle3 drafts proposed "
+            "earlier in sample_tokens")
+        K = self.speculative_config.num_speculative_tokens
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
+        num_rejected_chunks: list[torch.Tensor] = []
+        num_draft_per_req: dict[int, int] = {}
+        req_offset = 0
+        # Uniform `1+K` source span per request: req position `p` maps to source
+        # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
+        # index builder multiplies by the stride). Mixed-batch non-spec chunks
+        # pad their single token to the same `1+K` width.
+        for nt_chunk, num_reqs, md in zip(next_tokens_per_chunk,
+                                          state.num_reqs_list,
+                                          state.spec_decode_metadata_list):
+            if md is not None:
+                drafts_chunk = drafts[req_offset:req_offset + num_reqs]
+                src = assemble_spec_next_tokens(nt_chunk, drafts_chunk,
+                                                num_reqs)  # [num_reqs*(1+K)]
+                num_rejected_chunks.append(
+                    compute_num_rejected(nt_chunk,
+                                         md.draft_lengths[:num_reqs]))
+                for r in range(num_reqs):
+                    num_draft_per_req[req_offset + r] = int(
+                        md.draft_lengths_cpu[r])
+            else:
+                # Mixed-batch non-spec chunk: pad the single sampled token to the
+                # uniform 1+K span (token at slot 0, rest INVALID).
+                token = nt_chunk[:num_reqs, 0]
+                src = torch.full((num_reqs, 1 + K),
+                                 INVALID_TOKEN_ID,
+                                 dtype=token.dtype,
+                                 device=token.device)
+                src[:, 0] = token
+                src = src.reshape(-1)  # [num_reqs*(1+K)]
+                num_rejected_chunks.append(
+                    torch.zeros(num_reqs,
+                                dtype=torch.int32,
+                                device=token.device))
+            next_tokens_tpu_chunks.append(src)
+            for r in range(num_reqs):
+                next_token_indices[req_offset + r] = req_offset + r
+            req_offset += num_reqs
+        spec_num_rejected = (torch.cat(num_rejected_chunks)
+                             if num_rejected_chunks else None)
+        return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                num_draft_per_req)
+
+    def _assemble_async_prefill_bootstrap(self, drafts,
+                                          combined_selected_tokens,
+                                          combined_real_lens):
+        """Async eagle3 bootstrap assembler for the prefill / pure-non-spec step.
+
+        From the already-proposed prompt-context ``drafts`` (the unified eagle3
+        propose call in ``sample_tokens``, device_seed path), parks a
+        stride-(1+K) `[bonus, draft_1..K]` source so the NEXT step substitutes
+        REAL prompt-context drafts. Returns ``(next_tokens_tpu_chunks,
+        next_token_indices, spec_num_rejected=zeros, num_draft_per_req)``.
+        """
+        assert drafts is not None, (
+            "async prefill bootstrap requires the eagle3 drafts proposed "
+            "earlier in sample_tokens")
+        K = self.speculative_config.num_speculative_tokens
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
+        num_rejected_chunks: list[torch.Tensor] = []
+        num_draft_per_req: dict[int, int] = {}
+        req_offset = 0
+        for sel, n in zip(combined_selected_tokens, combined_real_lens):
+            bonus = sel.view(-1)[:n].unsqueeze(1)  # [n, 1]
+            drafts_chunk = drafts[req_offset:req_offset + n]  # [n, K]
+            src = torch.cat([bonus.to(drafts_chunk.dtype), drafts_chunk],
+                            dim=1)  # [n, 1+K] = [bonus, draft_1..K]
+            next_tokens_tpu_chunks.append(src.reshape(-1))
+            num_rejected_chunks.append(
+                torch.zeros(n, dtype=torch.int32, device=src.device))
+            for r in range(n):
+                next_token_indices[req_offset + r] = req_offset + r
+                num_draft_per_req[req_offset + r] = K
+            req_offset += n
+        spec_num_rejected = (torch.cat(num_rejected_chunks)
+                             if num_rejected_chunks else None)
+        return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                num_draft_per_req)
+
+    def _precompile_substitute_placeholder_token(self) -> None:
+        if not self.scheduler_config.async_scheduling:
+            return
+        # next_tokens source lengths the runtime produces: stride-1 num_reqs
+        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
+        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
+        # substitute doesn't recompile per real num_reqs.
+        next_lens = list(self.num_reqs_paddings)
+        if (self._is_async_drafter):
+            next_lens.append(
+                self.max_num_reqs *
+                (1 + self.speculative_config.num_speculative_tokens))
+        with self._precompile_timed("substitute_placeholder_token"):
+            for num_tokens in self.num_tokens_paddings:
+                input_ids = torch.zeros(num_tokens,
+                                        dtype=torch.int32,
+                                        device=self.device)
+                cur_input_indices = torch.zeros(num_tokens,
+                                                dtype=torch.int32,
+                                                device=self.device)
+                # -1 sentinel marks every slot as padding so the precompiled
+                # program is byte-identical to the runtime JIT call.
+                pre_next_tokens_indices = torch.full((num_tokens, ),
+                                                     -1,
+                                                     dtype=torch.int32,
+                                                     device=self.device)
+                for nlen in next_lens:
+                    next_tokens = torch.zeros(nlen,
+                                              dtype=torch.int64,
+                                              device=self.device)
+                    out = _substitute_placeholder_token(
+                        input_ids, cur_input_indices, pre_next_tokens_indices,
+                        next_tokens)
+                    synchronize_tensors(out)
+                    logger.info("  -- num_tokens: %d, next_len: %d",
+                                num_tokens, nlen)
