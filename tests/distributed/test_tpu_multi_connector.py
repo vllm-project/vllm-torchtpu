@@ -36,6 +36,10 @@ class _FakeRaidenChild:
     def get_block_ids_with_load_errors_group_index(self):
         return 2
 
+    @classmethod
+    def reads_kv_page_layout(cls, vllm_config):
+        return True
+
 
 class _FakeOffloadChild:
     """Stands in for OffloadingConnector: no register_runner, like
@@ -45,6 +49,17 @@ class _FakeOffloadChild:
         self.vllm_config = vllm_config
         self.role = role
         self.kv_cache_config = kv_cache_config
+
+
+class _FakeOpaquePagesChild:
+    """Stands in for a connector that moves pages as opaque bytes."""
+
+    def __init__(self, vllm_config, role, kv_cache_config):
+        pass
+
+    @classmethod
+    def reads_kv_page_layout(cls, vllm_config):
+        return False
 
 
 def _make_vllm_config(kv_role="kv_consumer"):
@@ -143,3 +158,36 @@ def test_conflicting_group_indices_across_children_raise():
 
     with pytest.raises(RuntimeError, match="Conflicting"):
         connector.get_block_ids_with_load_errors_group_index()
+
+
+class TestTPUMultiConnectorPageLayout:
+
+    @staticmethod
+    def _config_with_children(*child_names):
+        return SimpleNamespace(kv_transfer_config=KVTransferConfig(
+            kv_connector="TPUMultiConnector",
+            kv_connector_module_path=(
+                "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"),
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "connectors": [{
+                    "kv_connector": name,
+                    "kv_connector_module_path": __name__,
+                    "kv_role": "kv_both",
+                } for name in child_names],
+            },
+        ))
+
+    def test_reads_the_page_layout_when_any_child_does(self):
+        config = self._config_with_children("_FakeOpaquePagesChild",
+                                            "_FakeRaidenChild")
+        assert TPUMultiConnector.reads_kv_page_layout(config) is True
+
+    def test_a_child_without_the_hook_counts_as_reading_it(self):
+        config = self._config_with_children("_FakeOpaquePagesChild",
+                                            "_FakeOffloadChild")
+        assert TPUMultiConnector.reads_kv_page_layout(config) is True
+
+    def test_pages_are_opaque_when_every_child_says_so(self):
+        config = self._config_with_children("_FakeOpaquePagesChild")
+        assert TPUMultiConnector.reads_kv_page_layout(config) is False

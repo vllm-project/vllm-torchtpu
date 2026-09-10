@@ -238,6 +238,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
+    @classmethod
+    def reads_kv_page_layout(cls, vllm_config: VllmConfig) -> bool:
+        """Pages are opaque byte rows to this connector.
+
+        A page leaves a pool for the host store and comes back to the same
+        pool, where the same kernel reads it; nothing in between looks inside
+        it, and the store keys its entries by the pool's physical block shape,
+        so pages of one encoding never reach a pool of another.
+        """
+        return False
+
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
                  kv_cache_config: KVCacheConfig):
         # Skip OffloadingConnector.__init__: default factory cannot carry

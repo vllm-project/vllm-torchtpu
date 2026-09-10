@@ -1,6 +1,13 @@
 """TPU Multi Connector wrapper for combining disagg and offloading."""
+from typing import TYPE_CHECKING
+
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import \
     MultiConnector
+
+from vllm_torchtpu.kv_page_layout import connector_reads_kv_page_layout
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 class TPUMultiConnector(MultiConnector):
@@ -14,6 +21,14 @@ class TPUMultiConnector(MultiConnector):
     the connector is instantiated, so children injected at init time would
     be invisible to them.
     """
+
+    @classmethod
+    def reads_kv_page_layout(cls, vllm_config: "VllmConfig") -> bool:
+        """True when any child depends on how a page encodes K and V."""
+        return any(
+            connector_reads_kv_page_layout(connector_cls, child_config)
+            for connector_cls, child_config in
+            cls._get_connector_classes_and_configs(vllm_config))
 
     def register_runner(self, runner) -> None:
         # torchtpu extension unknown to upstream MultiConnector: forward it to

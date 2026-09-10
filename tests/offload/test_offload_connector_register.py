@@ -69,3 +69,8 @@ def test_register_kv_caches_canonicalizes_unified_pool():
     for refs in canonical.group_data_refs:
         assert [(r.tensor_idx, r.page_size_bytes) for r in refs] == \
             [(0, 128), (1, 128)]
+
+
+def test_pages_are_opaque_bytes_to_the_offloading_connector():
+    assert TPURaidenOffloadingConnector.reads_kv_page_layout(
+        SimpleNamespace()) is False

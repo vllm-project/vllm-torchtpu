@@ -24,6 +24,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 from jax.experimental.pallas import tpu as pltpu
+from vllm.distributed.kv_transfer.kv_connector.factory import \
+    KVConnectorFactory
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
@@ -179,36 +181,74 @@ def fold_env(monkeypatch):
     monkeypatch.setenv("TPU_RPA_FOLD_KV_HEAD_DIM", "1")
 
 
+class _PageReadingConnector:
+
+    @classmethod
+    def reads_kv_page_layout(cls, vllm_config):
+        return True
+
+
+class _OpaquePageConnector:
+
+    @classmethod
+    def reads_kv_page_layout(cls, vllm_config):
+        return False
+
+
+class _ConnectorWithoutTheHook:
+    pass
+
+
+def _configured_connector(monkeypatch, connector_cls):
+    """Config naming `connector_cls`, with the factory resolving it."""
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class",
+        classmethod(lambda cls, kv_transfer_config: connector_cls))
+    return {
+        "kv_transfer_config":
+        SimpleNamespace(kv_connector=connector_cls.__name__)
+    }
+
+
 def test_fold_survives_a_supported_config(fold_env):
     _refuse_kv_head_dim_fold(_fake_config())
     assert os.environ["TPU_RPA_FOLD_KV_HEAD_DIM"] == "1"
 
 
+def test_fold_survives_a_connector_that_treats_pages_as_bytes(
+        fold_env, monkeypatch):
+    overrides = _configured_connector(monkeypatch, _OpaquePageConnector)
+    _refuse_kv_head_dim_fold(_fake_config(**overrides))
+    assert os.environ["TPU_RPA_FOLD_KV_HEAD_DIM"] == "1"
+
+
 @pytest.mark.parametrize(
-    "attr, overrides",
+    "attr, overrides, connector_cls",
     [
-        ("USE_BATCHED_RPA_LONGCTX", {}),
-        ("USE_BATCHED_RPA_SEQ_ON_LANE", {}),
+        ("USE_BATCHED_RPA_LONGCTX", {}, None),
+        ("USE_BATCHED_RPA_SEQ_ON_LANE", {}, None),
         (None, {
             "parallel_config": SimpleNamespace(prefill_context_parallel_size=8)
-        }),
+        }, None),
         (None, {
             "speculative_config": SimpleNamespace(num_speculative_tokens=2)
-        }),
-        (None, {
-            "kv_transfer_config": SimpleNamespace(kv_connector="x")
-        }),
+        }, None),
+        (None, {}, _PageReadingConnector),
+        (None, {}, _ConnectorWithoutTheHook),
     ],
     ids=[
-        "not-longctx", "seq-along-lane", "pcp", "spec-decode", "kv-connector"
+        "not-longctx", "seq-along-lane", "pcp", "spec-decode",
+        "kv-connector-reads-pages", "kv-connector-without-the-hook"
     ],
 )
 def test_fold_is_refused_where_the_page_is_read_unfolded(
-        fold_env, monkeypatch, attr, overrides):
+        fold_env, monkeypatch, attr, overrides, connector_cls):
     if attr == "USE_BATCHED_RPA_LONGCTX":
         monkeypatch.setattr(envs, attr, False)
     elif attr == "USE_BATCHED_RPA_SEQ_ON_LANE":
         monkeypatch.setattr(envs, attr, True)
+    if connector_cls is not None:
+        overrides = _configured_connector(monkeypatch, connector_cls)
     _refuse_kv_head_dim_fold(_fake_config(**overrides))
     assert os.environ["TPU_RPA_FOLD_KV_HEAD_DIM"] == "0"
 

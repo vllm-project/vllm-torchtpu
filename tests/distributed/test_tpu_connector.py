@@ -3435,3 +3435,7 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
     with pytest.raises(ValueError, match=message):
         worker._raiden_glm_admission_topology()
+
+
+def test_disagg_pages_are_read_by_the_peer_engine():
+    assert TPUConnector.reads_kv_page_layout(SimpleNamespace()) is True

@@ -265,6 +265,17 @@ def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
 class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     force_raiden_connector = False
 
+    @classmethod
+    def reads_kv_page_layout(cls, vllm_config: VllmConfig) -> bool:
+        """Pages cross to another engine, which must agree on their encoding.
+
+        The head_dim fold depends on the KV heads each rank holds, so a
+        prefill engine and a decode engine at different tensor-parallel sizes
+        would encode the same page differently, and the reshard path slices
+        pages by head.
+        """
+        return True
+
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
                  kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, role, kv_cache_config)
