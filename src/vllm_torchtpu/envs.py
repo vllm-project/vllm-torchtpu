@@ -68,6 +68,28 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_KV_TRANSFER_PORT: str = "9100"
+    TPU_SIDE_CHANNEL_PORT: str = "9600"
+    TPU_NODE_ID: int = 0
+    TPU_KV_TRANSFER_CHANNEL_NUMBER: int = 0
+    TPU_KV_COORD_EXECUTOR_MAX_WORKERS: int = 0
+    TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS: int = 0
+    TPU_KV_STAGE_WAITER_POOL_SIZE: int = 0
+    TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
+    TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
+    TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
+    TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
+    TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
+    TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
+    TPU_KV_SHM_POOL_GB: float = 128.0
+    TPU_KV_TRANSFER_NAMESPACE: str = ""
+    TPU_IPC_SOCKET_DIR: str = "/tmp"
+    TPU_KV_WARMUP_ENABLED: bool = True
+    TPU_KV_LATENCY_LOG_INTERVAL: float = 30.0
+    TPU_KV_PIN_SHM: bool = False
+    TPU_USE_RAIDEN_CONNECTOR: bool = False
+    TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
+    TPU_RAIDEN_INLINE_LOAD: bool = False
 
 
 def env_with_choices(
@@ -113,27 +135,90 @@ def env_with_choices(
     return _get_validated_env
 
 
+_TRUE_STRINGS = ("true", "1", "yes", "on")
+_FALSE_STRINGS = ("false", "0", "no", "off")
+
+
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
     """
-    Accepts both numeric strings ("0", "1") and boolean strings
-    ("true", "false", "True", "False").
+    Accepts numeric strings ("0", "1"), boolean strings ("true", "false"),
+    and the yes/no and on/off spellings, in any case. Anything else raises:
+    a misspelled flag is a launch-script bug, and silently falling back to
+    the default hides it until someone wonders why the knob did nothing.
     """
 
     def _get_bool_env() -> bool:
         value = os.getenv(env_name)
-        if value is None or value == "":
+        if value is None or value.strip() == "":
             return default
 
-        value_lower = value.lower()
-        if value_lower in ("true", "1"):
+        value_lower = value.strip().lower()
+        if value_lower in _TRUE_STRINGS:
             return True
-        if value_lower in ("false", "0"):
+        if value_lower in _FALSE_STRINGS:
             return False
-        raise ValueError(
-            f"Invalid boolean value '{value}' for {env_name}. "
-            f"Valid options: '0', '1', 'true', 'false', 'True', 'False'.")
+        raise ValueError(f"Invalid boolean value '{value}' for {env_name}. "
+                         f"Valid options: {_TRUE_STRINGS + _FALSE_STRINGS} "
+                         f"(any case).")
 
     return _get_bool_env
+
+
+def env_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob with a default. An unparseable value raises rather than
+    falling back, for the same reason as ``env_bool``."""
+
+    def _get_int_env() -> int:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return default
+        return int(value)
+
+    return _get_int_env
+
+
+def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob that must not be negative.
+
+    Pool sizes and slot counts use this. A negative value is rejected rather
+    than clamped: it reaches ``ThreadPoolExecutor(max_workers=...)`` and
+    similar, where silently substituting the default hides the typo and the
+    process runs with a pool size nobody asked for.
+    """
+    parse_int = env_int(env_name, default)
+
+    def _get_nonnegative_int_env() -> int:
+        value = parse_int()
+        if value < 0:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be >= 0.")
+        return value
+
+    return _get_nonnegative_int_env
+
+
+def env_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob with a default. An unparseable value raises."""
+
+    def _get_float_env() -> float:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return default
+        return float(value)
+
+    return _get_float_env
+
+
+def env_str(env_name: str, default: str) -> Callable[[], str]:
+    """String knob with a default, surrounding whitespace stripped."""
+
+    def _get_str_env() -> str:
+        value = os.getenv(env_name)
+        if value is None:
+            return default
+        return value.strip()
+
+    return _get_str_env
 
 
 def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
@@ -446,6 +531,76 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE":
     env_bool("TPU_EVICT_WEIGHTS_PAGE_CACHE", default=False),
+
+    # KV transfer / Raiden knobs. Each getter in distributed/utils.py
+    # documents what its knob does; this is the parsing and the default.
+
+    # TCP port the KV wire transfer listens on.
+    "TPU_KV_TRANSFER_PORT":
+    env_str("TPU_KV_TRANSFER_PORT", "9100"),
+    # TCP port for the out-of-band side channel.
+    "TPU_SIDE_CHANNEL_PORT":
+    env_str("TPU_SIDE_CHANNEL_PORT", "9600"),
+    # Host ordinal within a multi-host slice.
+    "TPU_NODE_ID":
+    env_int("TPU_NODE_ID", 0),
+    # 0 means auto; a non-zero override is clamped to tp_size downstream.
+    "TPU_KV_TRANSFER_CHANNEL_NUMBER":
+    env_int("TPU_KV_TRANSFER_CHANNEL_NUMBER", 0),
+    # Request-level pull executor size; 0 means auto.
+    "TPU_KV_COORD_EXECUTOR_MAX_WORKERS":
+    env_nonnegative_int("TPU_KV_COORD_EXECUTOR_MAX_WORKERS", 0),
+    # Channel-level pull executor size; 0 means auto.
+    "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS":
+    env_nonnegative_int("TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS", 0),
+    # Worker count for the stage waiter pool; 0 means auto (4).
+    "TPU_KV_STAGE_WAITER_POOL_SIZE":
+    env_nonnegative_int("TPU_KV_STAGE_WAITER_POOL_SIZE", 0),
+    # KV-cache transfer timeout, in seconds.
+    "TPU_P2P_WAIT_PULL_TIMEOUT":
+    env_int("TPU_P2P_WAIT_PULL_TIMEOUT", 120),
+    # Seconds; 0 disables the probe.
+    "TPU_RAIDEN_STAGE3_STATUS_PROBE_S":
+    env_float("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", 1.0),
+    # On by default; inline-load mode overrides it back to off.
+    "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT":
+    env_bool("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True),
+    # Seconds, bounded by TPU_P2P_WAIT_PULL_TIMEOUT downstream.
+    "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S":
+    env_float("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0),
+    # TEST-ONLY fault injection, in seconds; 0 disables it.
+    "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S":
+    env_float("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0),
+    # Seconds; non-positive falls back to 30 downstream.
+    "TPU_KV_STAGE_WAIT_TIMEOUT_SECS":
+    env_float("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
+    # Total GB budget for the per-host shared-memory KV staging pool.
+    "TPU_KV_SHM_POOL_GB":
+    env_float("TPU_KV_SHM_POOL_GB", 128.0),
+    # Optional engine namespace; sanitized at the call site.
+    "TPU_KV_TRANSFER_NAMESPACE":
+    env_str("TPU_KV_TRANSFER_NAMESPACE", ""),
+    # Directory holding the per-host intra-process IPC socket.
+    "TPU_IPC_SOCKET_DIR":
+    env_str("TPU_IPC_SOCKET_DIR", "/tmp"),
+    # Pre-compile KV gather/scatter executables at startup.
+    "TPU_KV_WARMUP_ENABLED":
+    env_bool("TPU_KV_WARMUP_ENABLED", default=True),
+    # Seconds; 0 disables the periodic summaries.
+    "TPU_KV_LATENCY_LOG_INTERVAL":
+    env_float("TPU_KV_LATENCY_LOG_INTERVAL", 30.0),
+    # mlock(2) the KV shm pool at startup.
+    "TPU_KV_PIN_SHM":
+    env_bool("TPU_KV_PIN_SHM", default=False),
+    # kv_connector_extra_config.use_raiden_connector takes precedence.
+    "TPU_USE_RAIDEN_CONNECTOR":
+    env_bool("TPU_USE_RAIDEN_CONNECTOR", default=False),
+    # 0 means auto-size from TPU_KV_SHM_POOL_GB, split across TP ranks.
+    "TPU_RAIDEN_TRANSFER_NUM_SLOTS":
+    env_nonnegative_int("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
+    # Load remote KV before the first forward, not in a no-forward step.
+    "TPU_RAIDEN_INLINE_LOAD":
+    env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
 }
 
 
