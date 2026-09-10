@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -8,7 +9,14 @@ from vllm_torchtpu.runner import mm_encoder_manager as mm
 
 
 @pytest.fixture
-def manager(monkeypatch):
+def compile_mock(monkeypatch):
+    result = Mock(return_value=Mock())
+    monkeypatch.setattr(mm.torch, "compile", result)
+    return result
+
+
+@pytest.fixture
+def manager(compile_mock):
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
         padding_logics={},
@@ -36,14 +44,15 @@ def manager(monkeypatch):
             encoder_cudagraph_token_budgets=[8, 4],
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=0))
-    compile_mock = Mock(return_value=Mock())
-    monkeypatch.setattr(mm.torch, "compile", compile_mock)
-    result = mm.MMEncoderManager(config, torch.device("cpu"), model)
-    compile_mock.assert_called_once_with(model.encoder_cudagraph_forward,
-                                         backend="tpu",
-                                         fullgraph=True,
-                                         dynamic=False)
-    return result
+    return mm.MMEncoderManager(config, torch.device("cpu"), model)
+
+
+def test_initialization_compiles_encoder_forward(manager, compile_mock):
+    compile_mock.assert_called_once_with(
+        manager.model.encoder_cudagraph_forward,
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False)
 
 
 def test_initialization_builds_positive_budgets_per_path(manager):

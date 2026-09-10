@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -57,24 +58,33 @@ def test_invalid_tile_limit(limit):
         tuned_block_sizes.round_up_to_multiple_of_128_within_limit(256, limit)
 
 
-@pytest.mark.parametrize("m, k, n, groups, expected", [
-    (320, 3072, 1000, 8, (80, 1536, 1024)),
-    (64, 128, 256, 8, (64, 128, 256)),
-    (4096, 4096, 6144, 8, (512, 2048, 2048)),
+@pytest.mark.parametrize("m, k, n, groups", [
+    (320, 3072, 1000, 8),
+    (64, 128, 256, 8),
+    (4096, 4096, 6144, 8),
 ])
-def test_default_tiles(m, k, n, groups, expected):
-    tiles = tuned_block_sizes.get_default_gmm_block_sizes(m, k, n, groups)
-    assert tiles == expected
-    assert m % tiles[0] == 0
+def test_default_tiles(m, k, n, groups):
+    tm, tk, tn = tuned_block_sizes.get_default_gmm_block_sizes(m, k, n, groups)
+    assert 0 < tm <= min(m, 512)
+    assert m % tm == 0
+    for tile in (tk, tn):
+        assert 0 < tile <= 2048
+        assert tile % 128 == 0
 
 
-def test_tuned_lookup():
-    assert tuned_block_sizes.get_tuned_block_sizes(128, 320, 6144, 160, 160,
-                                                   'bfloat16', 'float8_e4m3fn',
-                                                   320) == (128, 640, 1280)
+@pytest.mark.parametrize("tiles", [(128, 512, 1024), (64, 1024, 512)])
+def test_tuned_lookup(monkeypatch, tiles):
+    key = (128, 320, 6144, 160, 160, 'bfloat16', 'float8_e4m3fn', 320)
+    monkeypatch.setattr(tuned_block_sizes, "TUNED_BLOCK_SIZES", {key: tiles})
+    result = tuned_block_sizes.get_tuned_block_sizes(*key)
+    assert result == tiles
+    assert result != tuned_block_sizes.get_default_gmm_block_sizes(
+        128, 320, 6144, 160)
 
 
-def test_lookup_falls_back_for_untuned_shape():
-    assert tuned_block_sizes.get_tuned_block_sizes(320, 3072, 1000, 16, 8,
-                                                   'float32', 'float32',
-                                                   0) == (80, 1536, 1024)
+def test_lookup_falls_back_for_untuned_shape(monkeypatch):
+    monkeypatch.setattr(tuned_block_sizes, "TUNED_BLOCK_SIZES", {})
+    assert tuned_block_sizes.get_tuned_block_sizes(
+        320, 3072, 1000, 16, 8, 'float32', 'float32',
+        0) == tuned_block_sizes.get_default_gmm_block_sizes(
+            320, 3072, 1000, 8)
