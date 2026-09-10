@@ -1736,6 +1736,17 @@ class TestNamespace(unittest.TestCase):
         self.assertNotEqual(
             pcp_ns,
             derive_offload_namespace(cfg(), **kwargs, cp_geometry=(8, 1, 16)))
+        # DCP alone must also namespace apart: it changes which rank holds
+        # which token just as PCP does, so a DCP run reading back blocks a
+        # non-DCP run wrote would be reading someone else's placement.
+        dcp_ns = derive_offload_namespace(cfg(),
+                                          **kwargs,
+                                          cp_geometry=(1, 8, 1))
+        self.assertNotEqual(ns, dcp_ns)
+        self.assertNotEqual(pcp_ns, dcp_ns)
+        self.assertNotEqual(
+            dcp_ns,
+            derive_offload_namespace(cfg(), **kwargs, cp_geometry=(1, 8, 16)))
 
 
 class TestHybridGeometry(unittest.TestCase):

@@ -1443,9 +1443,17 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             "= one scheduler device block); got "
             f"{config.cache.blocks_per_chunk}")
         parallel = config.parallel
+        # Kept deliberately, and it is not stale. Under DCP a rank holds an
+        # interleaved 1/dcp_size of every block rather than whole blocks, so
+        # `tokens_per_block` below, the per-rank byte accounting, and the
+        # save/load fanout would all need reworking -- none of which has been
+        # exercised. The key namespace already distinguishes DCP runs (see
+        # `cp_geometry`), so lifting this is about the transfer path, not the
+        # cache keys.
         assert parallel.dcp_size == 1, (
-            "TPURaidenOffloadingConnector: does not support decode context parallelism"
-        )
+            "TPURaidenOffloadingConnector: does not support decode context "
+            "parallelism; a DCP rank holds an interleaved fraction of each "
+            "block, not whole blocks.")
         # Count all ranks in the distributed execution group (TP * PP * PCP)
         # for registration barriers, save fanout, and total host capacity sizing.
         self.world_size = parallel.world_size
@@ -1495,8 +1503,14 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Include context parallelism dimensions in key namespace only when CP
         # is active, preserving namespace compatibility for standard pcp=1 runs.
+        # The condition covers DCP as well as PCP: DCP alone (pcp=1, dcp>1)
+        # still changes which rank holds which token, so a namespace that
+        # omitted `dcp_size` would let a DCP run read back blocks a non-DCP run
+        # wrote under a different placement. That combination is refused
+        # outright above, but the key must be right before the refusal can be
+        # lifted, not after.
         cp_geometry: tuple[int, ...] = ()
-        if parallel.pcp_size > 1:
+        if parallel.pcp_size > 1 or parallel.dcp_size > 1:
             cp_geometry = (
                 parallel.pcp_size, parallel.dcp_size,
                 vllm_config.parallel_config.cp_kv_cache_interleave_size)
