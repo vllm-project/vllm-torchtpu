@@ -40,6 +40,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
+from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
@@ -752,7 +753,7 @@ class TestTPURunner:
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+    @patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_hybrid_duplication(self, mock_input_batch,
@@ -840,7 +841,7 @@ class TestTPURunner:
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+    @patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_compact_mamba(self, mock_input_batch,
@@ -958,7 +959,7 @@ class TestTPURunner:
                   return_value=PallasMLAttentionBackend)
     @patch('vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config')
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.runner.kv_cache_manager.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=8192)
     @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
@@ -1162,7 +1163,7 @@ class TestTPURunner:
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
     @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+    @patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_binds_shared_layer_to_target_cache(
@@ -1208,7 +1209,7 @@ class TestTPURunner:
         ]
         assert kv_cache_config.kv_cache_groups[0].layer_names == ["layer.0"]
 
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+    @patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_rejects_missing_shared_target(
@@ -1233,7 +1234,7 @@ class TestTPURunner:
         with pytest.raises(ValueError, match="target layer is missing"):
             self.runner.initialize_kv_cache(kv_cache_config)
 
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+    @patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_rejects_duplicate_shared_allocation(
@@ -1346,7 +1347,7 @@ class TestTPURunner:
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(num_blocks, ) + per_layer_shape), patch(
                     'vllm_torchtpu.utils.tpu_bind_kv_cache') as mock_bind, \
-             patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+             patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
                    return_value=False), \
              patch('vllm.v1.worker.kv_connector_model_runner_mixin.'
                    'has_kv_transfer_group', return_value=True), \
@@ -1436,7 +1437,7 @@ class TestTPURunner:
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
         ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache'), patch(
-                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
                 return_value=False), patch(
                     'vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV',
                     True), pytest.raises(NotImplementedError,
@@ -1489,7 +1490,7 @@ class TestTPURunner:
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
         ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache'), patch(
-                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
                 return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config)
 
@@ -1556,7 +1557,7 @@ class TestTPURunner:
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
         ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache') as mock_bind, patch(
-                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
                 return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config)
 
@@ -1599,11 +1600,11 @@ class TestTPURunner:
 
         with patch(
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(10, 16, 2, 1, 128)) as mock_get_shape, patch(
-                    'vllm_torchtpu.utils.tpu_bind_kv_cache'
-                ), patch(
-                    'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                    return_value=False):
+                return_value=(10, 16, 2, 1, 128)
+        ) as mock_get_shape, patch(
+                'vllm_torchtpu.utils.tpu_bind_kv_cache'
+        ), patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
+                 return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config_explicit)
             mock_get_shape.assert_called_once_with(10, attn_spec.block_size,
                                                    attn_spec.num_kv_heads,
@@ -2406,11 +2407,10 @@ def test_dsv4_layer_classification():
 
     runner = MagicMock()
     runner.shared_kv_cache_layers = {}
-    runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
-    runner._DS_V4_STATE_CACHE_SUFFIX = TPUModelRunner._DS_V4_STATE_CACHE_SUFFIX
 
-    mla_names, swa_groups, state_names = TPUModelRunner._classify_ds_v4_layers(
-        runner, SimpleNamespace(kv_cache_groups=groups), specs.__getitem__)
+    mla_names, swa_groups, state_names = DsV4KVCacheAllocator(
+        runner)._classify_ds_v4_layers(SimpleNamespace(kv_cache_groups=groups),
+                                       specs.__getitem__)
 
     assert mla_names == [
         "m.layers.0.attn", "m.layers.1.attn", "m.layers.0.attn.indexer.k_cache"
@@ -2423,8 +2423,8 @@ def test_dsv4_layer_classification():
 
     stray = SimpleNamespace(layer_names=["m.layers.0.mystery"])
     with pytest.raises(ValueError, match="no known role"):
-        TPUModelRunner._classify_ds_v4_layers(
-            runner, SimpleNamespace(kv_cache_groups=groups + [stray]), {
+        DsV4KVCacheAllocator(runner)._classify_ds_v4_layers(
+            SimpleNamespace(kv_cache_groups=groups + [stray]), {
                 **specs, "m.layers.0.mystery": swa()
             }.__getitem__)
 
@@ -2464,7 +2464,7 @@ def test_dsv4_swa_overlay_shares_hosts_across_groups():
         "m.layers.1.attn.swa_cache": csa_a,
         "m.layers.2.attn.swa_cache": csa_a,
     }
-    TPUModelRunner._validate_ds_v4_overlay(
+    DsV4KVCacheAllocator._validate_ds_v4_overlay(
         SimpleNamespace(kv_cache_groups=groups), kv_caches)
 
     # Two layers of ONE group on one array is the case that does corrupt:
@@ -2475,7 +2475,7 @@ def test_dsv4_swa_overlay_shares_hosts_across_groups():
         ])
     ]
     with pytest.raises(ValueError, match="same array"):
-        TPUModelRunner._validate_ds_v4_overlay(
+        DsV4KVCacheAllocator._validate_ds_v4_overlay(
             SimpleNamespace(kv_cache_groups=one_group), kv_caches)
 
 
@@ -2600,7 +2600,7 @@ def test_dsv4_is_cache_for_ds_v4_predicate():
     from vllm.models.deepseek_v4.compressor import CompressorStateCache
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-    from vllm_torchtpu.runner.tpu_runner import is_cache_for_ds_v4
+    from vllm_torchtpu.runner.kv_cache_manager import is_cache_for_ds_v4
 
     for cls in (DeepseekV4Attention, DeepseekV4SWACache,
                 DeepseekV4IndexerCache, CompressorStateCache):
@@ -2619,18 +2619,18 @@ def test_dsv4_compressor_state_cache_overlay_target():
     layer NAME before anything is allocated -- an overlaid cache that gets its
     own array still costs its HBM at peak, even if aliased away afterwards.
     """
-    assert TPUModelRunner._ds_v4_compressed_kv_layer_name(
+    assert DsV4KVCacheAllocator._ds_v4_compressed_kv_layer_name(
         "model.layers.0.self_attn.compressor.state_cache"
     ) == "model.layers.0.self_attn"
 
-    assert TPUModelRunner._ds_v4_compressed_kv_layer_name(
+    assert DsV4KVCacheAllocator._ds_v4_compressed_kv_layer_name(
         "model.layers.0.attn.indexer.compressor.state_cache"
     ) == "model.layers.0.attn.indexer.k_cache"
 
     # A renamed state cache would otherwise derive a host that does not exist
     # and overlay onto whatever happened to be there.
     with pytest.raises(ValueError, match="unexpected layer"):
-        TPUModelRunner._ds_v4_compressed_kv_layer_name(
+        DsV4KVCacheAllocator._ds_v4_compressed_kv_layer_name(
             "model.layers.0.self_attn.compressor.state")
 
 
@@ -2669,7 +2669,7 @@ def test_dsv4_state_cache_overlays_its_own_compressed_kv_array():
         SimpleNamespace(
             layer_names=["m.layers.1.attn.compressor.state_cache"]),
     ]
-    TPUModelRunner._validate_ds_v4_overlay(
+    DsV4KVCacheAllocator._validate_ds_v4_overlay(
         SimpleNamespace(kv_cache_groups=groups), kv_caches)
 
     # The CSA layer is matched on its NoPE array, not its RoPE companion, so a
@@ -2679,7 +2679,7 @@ def test_dsv4_state_cache_overlays_its_own_compressed_kv_array():
             layer_names=["m.layers.0.attn", "m.layers.0.attn.swa_cache"])
     ]
     with pytest.raises(ValueError, match="same array"):
-        TPUModelRunner._validate_ds_v4_overlay(
+        DsV4KVCacheAllocator._validate_ds_v4_overlay(
             SimpleNamespace(kv_cache_groups=clash), {
                 **kv_caches, "m.layers.0.attn.swa_cache": csa_nope
             })
