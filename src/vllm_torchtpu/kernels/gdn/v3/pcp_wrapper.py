@@ -39,6 +39,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import (config, memory_ref, pcp_metadata,
                                           wrapper)
+from vllm_torchtpu.kernels.gdn.v3.projection_scale import \
+    normalize_projection_scale
 
 
 @dataclasses.dataclass(frozen=True)
@@ -546,11 +548,14 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 sem=projection_weight_sem,
             ).start()
             if is_fp8_projection:
+                source = (pl.ds(source_row, width), )
+                target = (pl.ds(destination_row, width), )
+                if projection_weight_scale_ref.ndim == 2:
+                    source = (slice(None), ) + source
+                    target = (slice(None), ) + target
                 pltpu.make_async_copy(
-                    src_ref=projection_weight_scale_ref.at[pl.ds(
-                        source_row, width)],
-                    dst_ref=projection_weight_scale_vmem_ref.at[pl.ds(
-                        destination_row, width)],
+                    src_ref=projection_weight_scale_ref.at[source],
+                    dst_ref=projection_weight_scale_vmem_ref.at[target],
                     sem=projection_scale_sem,
                 ).start()
 
@@ -649,24 +654,45 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 dst_ref=weight_ref,
                 sem=projection_weight_sem,
             ).wait()
+            blocked = (is_fp8_projection
+                       and projection_weight_scale_vmem_ref.ndim == 2)
             if is_fp8_projection:
-                scale_ref = projection_weight_scale_vmem_ref.at[pl.ds(
-                    0, width)]
+                scale_slice = (pl.ds(0, width), )
+                if blocked:
+                    scale_slice = (slice(None), ) + scale_slice
+                scale_ref = projection_weight_scale_vmem_ref.at[scale_slice]
                 pltpu.make_async_copy(
                     src_ref=scale_ref,
                     dst_ref=scale_ref,
                     sem=projection_scale_sem,
                 ).wait()
-            acc = jax.lax.dot_general(
-                projection_x_prepared_ref[...],
-                projection_weight_vmem_ref[pl.ds(0, width), :],
-                dimension_numbers=(((1, ), (1, )), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            if is_fp8_projection:
+            if blocked:
+                num_blocks = projection_weight_scale_vmem_ref.shape[0]
+                block_k = projection_weight_vmem_ref.shape[1] // num_blocks
+                acc = jnp.zeros((projection_token_block_size, width),
+                                jnp.float32)
+                for block in range(num_blocks):
+                    k_slice = pl.ds(block * block_k, block_k)
+                    part = jax.lax.dot_general(
+                        projection_x_prepared_ref[:, k_slice],
+                        projection_weight_vmem_ref[pl.ds(0, width), k_slice],
+                        dimension_numbers=(((1, ), (1, )), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                    acc += part * projection_weight_scale_vmem_ref[
+                        pl.ds(block, 1), pl.ds(0, width)]
                 acc *= projection_x_scale_ref[...][:, None]
-                acc *= projection_weight_scale_vmem_ref[pl.ds(0,
-                                                              width)][None, :]
+            else:
+                acc = jax.lax.dot_general(
+                    projection_x_prepared_ref[...],
+                    projection_weight_vmem_ref[pl.ds(0, width), :],
+                    dimension_numbers=(((1, ), (1, )), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                if is_fp8_projection:
+                    acc *= projection_x_scale_ref[...][:, None]
+                    acc *= projection_weight_scale_vmem_ref[pl.ds(
+                        0, width)][None, :]
             return acc.astype(hidden_ref.dtype)
 
         @pl.when(is_qkv)
@@ -1341,11 +1367,10 @@ def fused_qkvz_projection_pcp_gdn(
                          f"{hidden_states.dtype}.")
     is_fp8_projection = qkvz_weight.dtype == jnp.float8_e4m3fn
     if is_fp8_projection:
-        if (qkvz_weight_scale is None or qkvz_weight_scale.ndim != 1
-                or qkvz_weight_scale.dtype != jnp.float32
-                or qkvz_weight_scale.shape[0] != expected_qkvz_dim):
-            raise ValueError("FP8 projection requires a per-channel rank-1 "
-                             "FP32 weight scale matching the QKVZ width.")
+        if qkvz_weight_scale is None or qkvz_weight_scale.dtype != jnp.float32:
+            raise ValueError("FP8 projection requires an FP32 weight scale.")
+        qkvz_weight_scale = normalize_projection_scale(qkvz_weight.shape,
+                                                       qkvz_weight_scale)
     elif qkvz_weight.dtype == jnp.bfloat16:
         if qkvz_weight_scale is not None:
             raise ValueError("BF16 projection weights must not have a scale.")
@@ -1551,7 +1576,9 @@ def fused_qkvz_projection_pcp_gdn(
             qkvz_weight.dtype,
         ),
         pltpu.VMEM(
-            (projection_cfg.out_block_size, ),
+            ((qkvz_weight_scale.shape[0], projection_cfg.out_block_size)
+             if qkvz_weight_scale.ndim == 2 else
+             (projection_cfg.out_block_size, )),
             qkvz_weight_scale.dtype,
         ) if is_fp8_projection else None,
         pltpu.VMEM(

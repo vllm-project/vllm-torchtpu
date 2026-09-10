@@ -755,7 +755,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def _require_pcp_projection_parameters(
             self) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Return native BF16 or per-channel FP8 QKVZ projection parameters."""
+        """Return BF16 or tensor/channel/block-scaled FP8 QKVZ parameters."""
         if (hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz")
                 or self.gqa_interleaved_layout):
             raise RuntimeError("GDN pooled PCP prefill requires the Qwen3.5 "
@@ -773,11 +773,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if weight_scale is not None:
                 raise RuntimeError("BF16 QKVZ weights must not have a scale.")
         elif weight.dtype == torch.float8_e4m3fn:
-            if (weight_scale is None or weight_scale.dtype != torch.float32
-                    or weight_scale.ndim != 1
-                    or weight_scale.shape[0] != weight.shape[0]):
-                raise RuntimeError("FP8 QKVZ weights require a per-channel "
-                                   "rank-1 FP32 scale.")
+            if weight_scale is None or weight_scale.dtype != torch.float32:
+                raise RuntimeError("FP8 QKVZ weights require an FP32 scale.")
+            from vllm_torchtpu.kernels.gdn.v3.projection_scale import \
+                projection_scale_layout
+            try:
+                projection_scale_layout(weight.shape, weight_scale.shape)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
         else:
             raise RuntimeError("GDN pooled PCP prefill requires BF16 or "
                                "float8_e4m3fn QKVZ weights.")

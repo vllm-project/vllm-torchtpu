@@ -274,7 +274,7 @@ class TestVllmGatedDeltaNetAttention:
              ):
             attn._build_pooled_pcp_gdn_op()
             args = [MagicMock()] * 14
-            args[5] = raw_pool
+            args[4] = raw_pool  # Pool is the donated argument; scale is last.
             new_pool, _, _ = captured["wrapped_fn"](*args)
 
         assert captured["pooled_state"].shape == raw_pool.shape
@@ -941,10 +941,23 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.equal(attn.norm.call_args[0][0], expected_local)
         assert torch.all(output == 5)
 
+    @pytest.mark.parametrize("shape", [(), (1, ), (192, ), (6, 2),
+                                       (1, 2, 1, 192)])
+    def test_pcp_projection_accepts_fp8_scale_layouts(self, shape):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.gqa_interleaved_layout = False
+        weight = torch.ones((192, 256), dtype=torch.float8_e4m3fn)
+        scale = torch.ones(shape, dtype=torch.float32)
+        attn.in_proj_qkvz = SimpleNamespace(weight=weight,
+                                            weight_scale=scale,
+                                            bias=None)
+        result = attn._require_pcp_projection_parameters()
+        assert result[0] is weight and result[1] is scale
+
     @pytest.mark.parametrize("dtype,scale_size,bias,error", [
         (torch.bfloat16, 192, False, "must not have a scale"),
-        (torch.float8_e4m3fn, None, False, "per-channel"),
-        (torch.float8_e4m3fn, 1, False, "per-channel"),
+        (torch.float8_e4m3fn, None, False, "FP32 scale"),
+        (torch.float8_e4m3fn, 3, False, "scale must"),
         (torch.float32, None, False, "BF16 or"),
         (torch.bfloat16, None, True, "bias-free"),
     ])

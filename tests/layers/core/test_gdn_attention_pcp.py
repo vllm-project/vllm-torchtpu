@@ -598,8 +598,13 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         assert np.any(np.array(pcp_pool).view(np.uint8))
 
 
-@pytest.mark.parametrize("projection_dtype", [jnp.bfloat16, jnp.float8_e4m3fn],
-                         ids=["bf16", "fp8"])
+@pytest.mark.parametrize("projection_dtype,weight_scheme", [
+    pytest.param(jnp.bfloat16, "none", id="bf16"),
+    pytest.param(jnp.float8_e4m3fn, "channel", id="fp8-channel"),
+    pytest.param(jnp.float8_e4m3fn, "tensor", id="fp8-tensor"),
+    pytest.param(jnp.float8_e4m3fn, "block_k", id="fp8-block-k128"),
+    pytest.param(jnp.float8_e4m3fn, "block_nk", id="fp8-block-n512-k128"),
+])
 @pytest.mark.parametrize(
     ("lengths", "token_owner_starts", "request_absolute_starts",
      "recurrent_state_dtype"),
@@ -607,7 +612,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
 )
 def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         lengths, token_owner_starts, request_absolute_starts,
-        recurrent_state_dtype, projection_dtype):
+        recurrent_state_dtype, projection_dtype, weight_scheme):
     """Cover PCP stage metadata, native BF16/FP8 projection, and pooled GDN."""
     pcp_size = 2
     lengths = np.asarray(lengths, dtype=np.int32)
@@ -658,12 +663,40 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
                                     qkvz_weight.T,
                                     preferred_element_type=jnp.float32).astype(
                                         jnp.bfloat16)
-    else:
+    elif weight_scheme == "channel":
         qkvz_weight, qkvz_weight_scale = quantized_matmul_util.quantize_tensor(
             weight_f32, projection_dtype)
         qkvz_weight_scale = qkvz_weight_scale[:, 0]
         projected_qkvz = quantized_matmul_util.xla_quantized_matmul(
             hidden, qkvz_weight.T, qkvz_weight_scale)
+    else:
+        if weight_scheme == "tensor":
+            qkvz_weight_scale = jnp.max(jnp.abs(weight_f32)) / 448.0
+            full_scale = jnp.broadcast_to(qkvz_weight_scale, weight_f32.shape)
+        else:
+            block_k = 128
+            block_n = 1 if weight_scheme == "block_k" else 512
+            # Strong variation across K blocks catches incorrect global scaling.
+            weight_f32 *= jnp.repeat(
+                jnp.geomspace(0.25, 4., hidden_size // block_k),
+                block_k)[None, :]
+            grid = weight_f32.reshape(qkvz_dim // block_n, block_n,
+                                      hidden_size // block_k, block_k)
+            scales = jnp.max(jnp.abs(grid), axis=(1, 3)) / 448.0
+            full_scale = jnp.repeat(jnp.repeat(scales, block_n, axis=0),
+                                    block_k,
+                                    axis=1)
+            qkvz_weight_scale = (scales.T[None, :, None, :]
+                                 if weight_scheme == "block_k" else scales)
+        qkvz_weight = jnp.clip(weight_f32 / full_scale, -448.,
+                               448.).astype(projection_dtype)
+        x_q, x_scale = quantized_matmul_util.quantize_tensor(
+            hidden, projection_dtype)
+        # Independent dense dequantized-weight reference, not the kernel's
+        # block accumulation loop or its scale-normalization helper.
+        projected_qkvz = ((x_q.astype(
+            jnp.float32) @ (qkvz_weight.astype(jnp.float32) * full_scale).T) *
+                          x_scale).astype(jnp.bfloat16)
     mixed_qkv = projected_qkvz[:, :qkv_dim]
     ref_z = projected_qkvz[:, qkv_dim:]
     b = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
