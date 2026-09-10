@@ -28,12 +28,14 @@ upload_with_priority() {
   local yaml_file=$1
   local JOB_PRIORITY=$2
   echo "--- :pipeline: Uploading $yaml_file with priority ${JOB_PRIORITY:-$PRIORITY_DEFAULT}"
-  JOB_PRIORITY="${JOB_PRIORITY:-$PRIORITY_DEFAULT}" yq '
-    explode(.) |
-    .priority = env(JOB_PRIORITY) |
-    (.. | select(tag == "!!map") | select(has("steps")) | .steps[] |
-      select(tag == "!!map") | select(has("command") or has("commands")) |
-      select(.retry.automatic == null) | .retry.automatic) =
-      [{"signal_reason": "agent_refused", "limit": 2}]
-  ' "$yaml_file" | buildkite-agent pipeline upload
+  {
+    echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
+    yq '
+      explode(.) |
+      (.. | select(tag == "!!map") | select(has("steps")) | .steps[] |
+        select(tag == "!!map") | select(has("command") or has("commands")) |
+        select(.retry.automatic == null) | .retry.automatic) =
+        [{"signal_reason": "agent_refused", "limit": 2}]
+    ' "$yaml_file";
+  } | buildkite-agent pipeline upload
 }
