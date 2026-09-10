@@ -100,8 +100,8 @@ def _build_fp8_linear_method(
 
 def _raise_not_implemented(scheme_class: str) -> None:
     raise NotImplementedError(
-        f"{scheme_class} is not implemented yet. "
-        "Port this from tpu_inference to support this layer.")
+        f"Compressed-tensors scheme '{scheme_class}' is not implemented yet in vllm-torchtpu."
+    )
 
 
 @register_quantization_config(get_tpu_quant_method(COMPRESSED_TENSORS))
@@ -199,7 +199,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                         self, layer, prefix)
 
                 # This is a bypass way of handling FP8 as a compressed tensors method for this is
-                # not implemented yet in vllm-torchtpu (unlike tpu_inference). Since this was an
+                # not implemented yet in vllm-torchtpu. Since this was an
                 # existing code, it has been moved here to ensure backward compatibility
                 if _is_weight_fp8(weight_quant):
                     return _build_fp8_linear_method(layer, weight_quant,

@@ -16,6 +16,8 @@ class PcpStaticConfig:
     num_speculative_tokens: int
     is_kv_producer: bool | None
     kv_role: str | None
+    is_moe: bool
+    expert_parallel: bool
 
     @property
     def enabled(self) -> bool:
@@ -44,6 +46,8 @@ class PcpStaticSupportValidator:
                 num_speculative_tokens=0,
                 is_kv_producer=None,
                 kv_role=None,
+                is_moe=False,
+                expert_parallel=False,
             )
 
         parallel_config = vllm_config.parallel_config
@@ -75,6 +79,8 @@ class PcpStaticSupportValidator:
             num_speculative_tokens=num_speculative_tokens,
             is_kv_producer=is_kv_producer,
             kv_role=kv_role,
+            is_moe=parallel_config.is_moe_model is True,
+            expert_parallel=bool(parallel_config.enable_expert_parallel),
         )
 
     @staticmethod
@@ -97,6 +103,13 @@ class PcpStaticSupportValidator:
         if config.pipeline_parallel_size != 1:
             raise NotImplementedError(
                 "PCP runner path does not support pipeline parallelism yet.")
+        if config.is_moe and not config.expert_parallel:
+            raise NotImplementedError(
+                "PCP on an MoE model requires --enable-expert-parallel: "
+                f"--prefill-context-parallel-size={config.pcp_size} without "
+                "it would shard MoE experts across the PCP ranks, which the "
+                "TPU MoE kernels do not implement. Add the flag, or drop "
+                "--prefill-context-parallel-size.")
         if config.speculative_enabled:
             if config.speculative_method != "mtp":
                 raise NotImplementedError(

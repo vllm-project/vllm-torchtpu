@@ -34,7 +34,6 @@ Run with: pytest tests/entrypoints/llm/test_structured_output.py -v
 """
 
 import json
-import os
 import re
 import weakref
 
@@ -103,26 +102,35 @@ def _assert_regex(text: str) -> None:
 
 @pytest.fixture(scope="module")
 def llm():
-    # The multi-chunk test sends a Python function to the TPU workers via
-    # collective_rpc, which needs pickle fallback in vLLM's IPC encoder;
-    # the engine (core process) must be spawned with it already set.
-    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-    # pytest caches the fixture so we use weakref.proxy to
-    # enable garbage collection
-    llm = LLM(
-        model=MODEL_NAME,
-        max_model_len=256,
-        max_num_seqs=4,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.6,
-        disable_log_stats=False,
-    )
+    # `pytest.MonkeyPatch.context()`, not the `monkeypatch` fixture: that
+    # fixture is function-scoped and requesting it here raises ScopeMismatch.
+    # Writing straight to os.environ instead would leave
+    # VLLM_ALLOW_INSECURE_SERIALIZATION set for every later test module in the
+    # session, masking any test that checks vLLM rejects insecure
+    # serialization.
+    with pytest.MonkeyPatch.context() as mp:
+        # The multi-chunk test sends a Python function to the TPU workers via
+        # collective_rpc, which needs pickle fallback in vLLM's IPC encoder;
+        # the engine (core process) must be spawned with it already set.
+        mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+        # pytest caches the fixture so we use weakref.proxy to
+        # enable garbage collection
+        llm = LLM(
+            model=MODEL_NAME,
+            max_model_len=256,
+            max_num_seqs=4,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.6,
+            disable_log_stats=False,
+        )
 
-    yield weakref.proxy(llm)
+        yield weakref.proxy(llm)
 
-    del llm
+        del llm
 
-    cleanup_dist_env_and_memory()
+        # Inside the context, so the engine is still torn down with the same
+        # environment it was spawned under.
+        cleanup_dist_env_and_memory()
 
 
 def test_choice_greedy(llm: LLM):

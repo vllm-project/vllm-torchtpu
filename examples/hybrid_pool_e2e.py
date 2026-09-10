@@ -10,8 +10,7 @@ GEN_OK with sane tokens.
 import os
 import sys
 
-# The default GDN impl (chunked_jax_pd) is where the int8-pool gather/scatter
-# is wired. No KV-cache env gates: the pool is the default now.
+# SparseCore MoE is on by default and is not what this smoke tests.
 os.environ.setdefault("USE_MOE_SPARSE_CORE", "0")
 
 

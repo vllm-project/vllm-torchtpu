@@ -14,8 +14,6 @@ if TYPE_CHECKING:
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
-    USE_MOE_EP_KERNEL: bool = False
-    NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
@@ -34,7 +32,6 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
     TPU_RAIDEN_RESHARD_IMPL: str = "controller"
-    TPU_RAIDEN_CLIENT_IMPL: str = "cpp"
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
     TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
@@ -48,7 +45,6 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
-    VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
@@ -66,7 +62,10 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
+    USE_RPA_PIPELINED_DMA_STAGING: bool = False
+    USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
 
@@ -215,12 +214,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL":
     lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),
-    # Use custom expert-parallel kernel for MoE (Mixture of Experts)
-    "USE_MOE_EP_KERNEL":
-    lambda: bool(int(os.getenv("USE_MOE_EP_KERNEL") or "0")),
-    # Number of TPU slices for multi-slice mesh
-    "NUM_SLICES":
-    lambda: int(os.getenv("NUM_SLICES") or "1"),
     # Enable/disable Ray usage statistics collection
     "RAY_USAGE_STATS_ENABLED":
     lambda: os.getenv("RAY_USAGE_STATS_ENABLED", "0"),
@@ -287,14 +280,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("TPU_RAIDEN_RESHARD_IMPL",
                      "controller", ["controller", "store"],
                      case_sensitive=False),
-    # Reshard client ownership: "cpp" backs the facade surface
-    # with the C++ ReshardClient (encodings, transport, and error text in
-    # C++, byte-compatible); "python" keeps the legacy Python facade as
-    # the one-release rollback.
-    "TPU_RAIDEN_CLIENT_IMPL":
-    env_with_choices("TPU_RAIDEN_CLIENT_IMPL",
-                     "cpp", ["cpp", "python"],
-                     case_sensitive=False),
     # Host advertised for in-process reshard/dispatch services (store mode).
     "TPU_RAIDEN_ADVERTISE_HOST":
     lambda: os.getenv("TPU_RAIDEN_ADVERTISE_HOST", "").strip(),
@@ -337,10 +322,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
                      "off", ["off", "on"],
                      case_sensitive=False),
-    # SparseCore MoE gather kernel version used by fused_moe_gmm.
-    # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
-    "RAGGED_GATHER_VERSION":
-    env_with_choices("RAGGED_GATHER_VERSION", "v2", ["v1", "v2"]),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -369,9 +350,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
-    # Bucket padding gap for TPU compile sizes
-    "VLLM_TPU_BUCKET_PADDING_GAP":
-    lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
     # Most model length cap for TPU compile bucketing
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
@@ -450,12 +428,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
+    # query DMA layout in RPA v3.
+    "USE_RPA_PIPELINED_DMA_STAGING":
+    lambda: env_bool("USE_RPA_PIPELINED_DMA_STAGING")
+    () or env_bool("USE_PIPELINED_DMA_STAGING")(),
+    "USE_PIPELINED_DMA_STAGING":
+    lambda: env_bool("USE_PIPELINED_DMA_STAGING")
+    () or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Evict host page cache for checkpoint weight files via posix_fadvise
+    # after loading into TPU HBM.
+    "TPU_EVICT_WEIGHTS_PAGE_CACHE":
+    env_bool("TPU_EVICT_WEIGHTS_PAGE_CACHE", default=False),
 }
 
 

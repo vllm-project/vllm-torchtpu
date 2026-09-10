@@ -48,6 +48,7 @@ def mock_model():
         "prepare_encoder_cudagraph_capture_inputs",
         "prepare_encoder_cudagraph_replay_buffers",
         "encoder_cudagraph_forward",
+        "encoder_eager_forward",
     ])
 
     encoder_config = EncoderCudaGraphConfig(
@@ -58,7 +59,12 @@ def mock_model():
     )
     model.get_encoder_cudagraph_config.return_value = encoder_config
 
-    def prepare_capture(budget, max_batch, max_frames, device, dtype):
+    def prepare_capture(budget,
+                        max_batch,
+                        max_frames,
+                        device,
+                        dtype,
+                        path="default"):
         return EncoderCudaGraphCaptureInputs(
             values={
                 "pixel_values":
@@ -66,11 +72,11 @@ def mock_model():
                 "image_grid_thw":
                 torch.zeros((max_batch, 3), dtype=torch.int32, device=device),
                 "scalar_meta":
-                42,
+                torch.tensor(42, device=device),
             })
 
     model.prepare_encoder_cudagraph_capture_inputs.side_effect = prepare_capture
-    model.encoder_cudagraph_forward.side_effect = lambda t: torch.ones(
+    model.encoder_cudagraph_forward.side_effect = lambda t, path="default": torch.ones(
         (256, 64), dtype=torch.bfloat16)
     return model
 
@@ -102,8 +108,8 @@ def test_maybe_create_mm_encoder_manager_success(mock_compile, mock_supports,
                                               torch.device("cpu"), mock_model)
     assert isinstance(manager, MMEncoderManager)
     assert manager.token_budgets == [256, 512]
-    assert 256 in manager.budget_templates
-    assert 512 in manager.budget_templates
+    assert 256 in manager.budget_templates["default"]
+    assert 512 in manager.budget_templates["default"]
 
 
 @patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
@@ -116,14 +122,14 @@ def test_pad_to_template_exact_shape(mock_compile, mock_vllm_config,
         "pixel_values": torch.ones((256, 64), dtype=torch.bfloat16),
         "image_grid_thw": torch.tensor([[1, 2, 3], [4, 5, 6]],
                                        dtype=torch.int32),
-        "scalar_meta": 42,
+        "scalar_meta": torch.tensor(42),
     }
 
     padded = manager._pad_to_template(replay_values, budget=256)
     assert torch.equal(padded["pixel_values"], replay_values["pixel_values"])
     assert torch.equal(padded["image_grid_thw"],
                        replay_values["image_grid_thw"])
-    assert padded["scalar_meta"] == 42
+    assert torch.equal(padded["scalar_meta"], replay_values["scalar_meta"])
 
 
 @patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
@@ -158,18 +164,18 @@ def test_pad_to_template_dynamic_padding(mock_compile, mock_vllm_config,
 
     # Missing key defaults to template
     assert "scalar_meta" in padded
-    assert padded["scalar_meta"] == 42
+    assert padded["scalar_meta"].item() == 42
 
 
 @patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-@patch("vllm_torchtpu.runner.mm_encoder_manager.sync.synchronize")
+@patch("vllm_torchtpu.runner.mm_encoder_manager.synchronize_tensors")
 def test_capture_budget_graph(mock_sync, mock_compile, mock_vllm_config,
                               mock_model):
     manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
                                mock_model)
 
     manager._capture_budget_graph(256)
-    assert 256 in manager.budget_graphs
+    assert 256 in manager.budget_graphs["default"]
     mock_sync.assert_called_once()
 
 
@@ -196,7 +202,10 @@ def test_run_budget_graph_hit(mock_compile, mock_vllm_config, mock_model):
     assert manager.graph_hits == 1
     assert manager.graph_misses == 0
     mock_model.prepare_encoder_cudagraph_replay_buffers.assert_called_once_with(
-        mm_kwargs, manager.max_batch_size, manager.max_frames_per_batch)
+        mm_kwargs,
+        manager.max_batch_size,
+        manager.max_frames_per_batch,
+        path="default")
 
 
 @patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
@@ -217,9 +226,7 @@ def test_run_budget_graph_miss(mock_compile, mock_vllm_config, mock_model):
 
 
 @patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-@patch("vllm_torchtpu.runner.mm_encoder_manager.sync.synchronize")
-def test_precompile_vision_encoder(mock_sync, mock_compile, mock_vllm_config,
-                                   mock_model):
+def test_precompile_vision_encoder(mock_compile, mock_vllm_config, mock_model):
     manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
                                mock_model)
 
@@ -229,4 +236,4 @@ def test_precompile_vision_encoder(mock_sync, mock_compile, mock_vllm_config,
     assert manager._capture_budget_graph.call_count == len(
         manager.token_budgets)
     for budget in manager.token_budgets:
-        manager._capture_budget_graph.assert_any_call(budget)
+        manager._capture_budget_graph.assert_any_call(budget, path="default")
