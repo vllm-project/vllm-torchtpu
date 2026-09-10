@@ -2031,9 +2031,17 @@ class TPURaidenConnectorWorker:
             return 0
         if _use_raiden_glm_admission():
             return int(self.tp_rank)
-        from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
+        # The chunk whose KV this worker holds is the one its kernels computed,
+        # so this is the kernels' partition index. That index is the position
+        # of this worker's device in the PCP mesh, and the mesh is built in
+        # rank order, so it is the PCP rank. #554 had to read it back off the
+        # device id instead, because Torchtpu built the kernel DeviceAssignment
+        # from device enumeration rather than from the mesh;
+        # google-pytorch/torch_tpu#3522 removed the hardcoded enumeration and
+        # enabled device assignment based on PCP rank.
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
-        return int(get_pcp_cache_rank())
+        return int(get_pcp_rank())
 
     def _raiden_engine_id(self) -> str:
         env_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
