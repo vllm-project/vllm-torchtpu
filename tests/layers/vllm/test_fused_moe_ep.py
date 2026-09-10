@@ -460,33 +460,44 @@ class TestFusedOutputIsReducedPatch:
         assert cls.__dict__["_fused_output_is_reduced"] is first
 
 
-def _fp4_layer():
-    layer = _layer(experts=1, hidden=512, inter=512)
-    layer.w13_weight = torch.empty((1, 512, 512), dtype=torch.float4_e2m1fn_x2)
-    layer.w2_weight = torch.empty((1, 512, 256), dtype=torch.float4_e2m1fn_x2)
-    layer.w13_weight_scale = torch.ones(1, 1, 1, 1024)
-    layer.w2_weight_scale = torch.ones(1, 1, 1, 512)
+def _fp4_layer(block=512, hidden=512, inter=512):
+    layer = _layer(experts=1, hidden=hidden, inter=inter)
+    layer.w13_weight = torch.empty((1, hidden, inter),
+                                   dtype=torch.float4_e2m1fn_x2)
+    layer.w2_weight = torch.empty((1, inter, hidden // 2),
+                                  dtype=torch.float4_e2m1fn_x2)
+    layer.w13_weight_scale = torch.ones(1, hidden // block, 1, 2 * inter)
+    layer.w2_weight_scale = torch.ones(1, inter // block, 1, hidden)
     del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     return layer
 
 
-def test_nvfp4_block512_arms_and_passes_format():
+@pytest.mark.parametrize("block", [64, 128, 256, 512, 1024])
+def test_nvfp4_aligned_block_arms_and_passes_format(block):
     seen = []
-    assert _prebuild(_fp4_layer(),
+    assert _prebuild(_fp4_layer(block, hidden=1024, inter=1024),
                      weight_format="fp4",
-                     rhs_qb=512,
+                     rhs_qb=block,
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen[0][-2:] == ("fp4", 512)
+    assert seen[0][-2:] == ("fp4", block)
 
 
-@pytest.mark.parametrize("block", [None, 16, 64, 256, 1024])
-def test_nvfp4_refuses_other_blocks(block):
+@pytest.mark.parametrize("block", [None, 0, -64, 16, 32, 96, 192, 1024])
+def test_nvfp4_refuses_invalid_blocks(block):
     assert _prebuild(_fp4_layer(), weight_format="fp4", rhs_qb=block) is None
 
 
+@pytest.mark.parametrize("hidden,inter", [(768, 1024), (1024, 768)])
+def test_nvfp4_block_must_divide_both_contractions(hidden, inter):
+    assert _prebuild(_fp4_layer(hidden=hidden, inter=inter),
+                     weight_format="fp4",
+                     rhs_qb=512) is None
+
+
+@pytest.mark.parametrize("block", [64, 256, 512])
 @pytest.mark.parametrize("fault", ["scale", "dtype", "routing", "bias"])
-def test_nvfp4_refuses_invalid_contract(fault):
-    layer = _fp4_layer()
+def test_nvfp4_refuses_invalid_contract(fault, block):
+    layer = _fp4_layer(block)
     if fault == "scale":
         layer.w2_weight_scale = torch.ones(1, 32, 1, 512)
     elif fault == "dtype":
@@ -495,7 +506,7 @@ def test_nvfp4_refuses_invalid_contract(fault):
         layer.scoring_func = "sigmoid"
     else:
         layer.w2_bias = torch.zeros(1, 512)
-    assert _prebuild(layer, weight_format="fp4", rhs_qb=512) is None
+    assert _prebuild(layer, weight_format="fp4", rhs_qb=block) is None
 
 
 def test_nvfp4_forward_preserves_single_block_scale_axis():
@@ -525,9 +536,10 @@ def test_nvfp4_communication_ownership(armed, pipelined):
         assert method.supports_internal_mk == (armed or pipelined)
 
 
+@pytest.mark.parametrize("block", [64, 128, 256, 512])
 @pytest.mark.parametrize("admitted", [True, False])
 def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
-        monkeypatch, admitted):
+        monkeypatch, admitted, block):
     from vllm_torchtpu.layers.vllm.quantization import nvfp4
     layer = torch.nn.Module()
     for name, shape, dtype in (
@@ -569,11 +581,16 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel", lambda **kw: None)
     monkeypatch.setattr(nvfp4.moe_routing, "register_experts_start_buffer",
                         lambda *a, **kw: None)
-    monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", lambda *a, **kw: op
-                        if admitted else None)
-    monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", 512)
+
+    def prebuild(*args, **kwargs):
+        assert kwargs["weight_format"] == "fp4"
+        assert kwargs["rhs_qb"] == block
+        return op if admitted else None
+
+    monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", prebuild)
+    monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", block)
     method.process_weights_after_loading(layer)
-    assert seen[0][1] == seen[1][1] == 512
+    assert seen[0][1] == seen[1][1] == block
     torch.testing.assert_close(seen[0][0][:, :512], torch.full((1, 512, 32),
                                                                2.))
     torch.testing.assert_close(seen[0][0][:, 512:], torch.full((1, 512, 32),
@@ -583,8 +600,8 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     if admitted:
         x = torch.ones(2, 512)
         assert method.apply_monolithic(layer, x, torch.ones(2, 2)) is x
-        assert seen[-1][3].shape == (1, 1, 1024)
-        assert seen[-1][4].shape == (1, 1, 512)
+        assert seen[-1][3].shape == (1, 512 // block, 1024)
+        assert seen[-1][4].shape == (1, 512 // block, 512)
     else:
         assert not hasattr(layer, "_tpu_fused_w13_scale")
         assert layer.w13_weight_scale.ndim == 4

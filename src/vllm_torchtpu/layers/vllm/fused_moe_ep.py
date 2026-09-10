@@ -53,7 +53,8 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
+from vllm_torchtpu.kernels.fused_moe.v2.host import (PACK4, U32_SUBLANE_TILE,
+                                                     token_gather_smem_bytes)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -505,12 +506,20 @@ def _unsupported_reason(layer,
     if weight_format == "fp4":
         if w1.dtype != torch.float4_e2m1fn_x2 or w2.dtype != w1.dtype:
             return "the FP4 form requires native float4_e2m1fn_x2 weights"
-        if rhs_qb != 512 or hidden % 512 or inter % 512:
-            return "NVFP4 fused EP requires block-512 dividing hidden and inter"
+        if not isinstance(rhs_qb, int) or rhs_qb <= 0:
+            return "NVFP4 fused EP requires a positive integer block size"
+        # Match the packed-row geometry used by the kernel's FP4 readers.
+        packed_row_tile = U32_SUBLANE_TILE * PACK4
+        if rhs_qb % packed_row_tile:
+            return (f"NVFP4 fused EP block-{rhs_qb} must be a multiple of "
+                    f"the packed-weight row tile ({packed_row_tile})")
+        if hidden % rhs_qb or inter % rhs_qb:
+            return (f"NVFP4 fused EP block-{rhs_qb} must divide both "
+                    f"hidden={hidden} and inter={inter}")
         for name, scale, k, n in (("w1_scale", w1_scale, hidden, 2 * inter),
                                   ("w2_scale", w2_scale, inter, hidden)):
-            if tuple(scale.shape) != (local_experts, k // 512, 1, n):
-                return f"{name} is not the block-512 K-major scale layout"
+            if tuple(scale.shape) != (local_experts, k // rhs_qb, 1, n):
+                return f"{name} is not the block-{rhs_qb} K-major scale layout"
     elif weight_format == "fp8":
         if w1.dtype != torch.float8_e4m3fn or w2.dtype != w1.dtype:
             return "the kernel's fp8 form takes float8_e4m3fn expert weights"

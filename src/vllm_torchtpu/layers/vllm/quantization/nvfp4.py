@@ -259,7 +259,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
         # Requantization changes the checkpoint's block-16 weights and enables
-        # W4A8 in GMM. An admitted block-512 layer uses fused EP W4A8 instead.
+        # W4A8 in GMM. An admitted layer uses fused EP W4A8 instead.
         # Unset retains the original block-16 W4A16 path.
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
         layer._tpu_quantize_fp4_lhs = bool(requant_block)
@@ -347,15 +347,15 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         from vllm_torchtpu.layers.vllm.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
         op = None
-        # Keep the existing block-16/default and other requant block paths.
+        # Keep the original block-16/default path when requantization is unset.
         # prebuild performs all per-layer routing/parallelism admission checks.
-        if requant_block == 512:
+        if requant_block:
             op = prebuild_fused_moe_ep(layer,
                                        topk=layer.moe_config.experts_per_token,
                                        renormalize=layer.renormalize,
                                        activation=activation_str,
                                        weight_format="fp4",
-                                       rhs_qb=512)
+                                       rhs_qb=requant_block)
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
             # Do the layout conversion once, outside compiled forward. Keep
@@ -368,7 +368,8 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 "_tpu_fused_w2_scale",
                 layer.w2_weight_scale.squeeze(2).contiguous(),
                 persistent=False)
-            logger.info_once("NVFP4 fused EP W4A8 enabled: block-512")
+            logger.info_once("NVFP4 fused EP W4A8 enabled: block-%d",
+                             requant_block)
 
     def apply_monolithic(
         self,
