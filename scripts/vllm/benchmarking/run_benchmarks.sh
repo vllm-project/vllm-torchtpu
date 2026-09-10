@@ -507,6 +507,9 @@ else
     model_uri_json=null
 fi
 
+# Eval generation arguments can contain nested JSON.
+lm_eval_gen_kwargs_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$LM_EVAL_GEN_KWARGS")
+
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
 {
@@ -535,7 +538,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
     "lm_eval_tasks": "$LM_EVAL_TASKS",
     "extra_lm_eval_model_args": "$EXTRA_LM_EVAL_MODEL_ARGS",
-    "lm_eval_gen_kwargs": "$LM_EVAL_GEN_KWARGS",
+    "lm_eval_gen_kwargs": $lm_eval_gen_kwargs_json,
     "perf_tolerance": $PERF_TOLERANCE,
     "eval_tolerance": $EVAL_TOLERANCE
 }
