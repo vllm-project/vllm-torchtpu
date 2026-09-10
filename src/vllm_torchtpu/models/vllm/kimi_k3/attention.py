@@ -470,9 +470,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
         )
         self.kv_cache = None
-        # The dispatched op owns the short convolution as well: the fused decode
-        # kernel it routes decode rows to does the convolution itself, so it
-        # cannot be fed by a separate convolution op.
+        # The dispatched op owns the short convolution as well: the fused
+        # kernel does the convolution itself, so it cannot be fed by a separate
+        # convolution op.
         self.dispatched_kda_op = build_kimi_dispatched_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,

@@ -2,17 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness tests for the KDA path of the fused conv1d + GDN v3 kernel.
 
-The KDA math itself is shared with `kernels/kimi_k3/chunk_kda.py` and is
-already covered by `test_kimi_chunk_kda.py`. What is new here, and what
-these tests exist for, is the wiring: the per-channel gate is `kq_head_dim`
+What these tests exist for is the wiring: the per-channel gate is `kq_head_dim`
 times wider than GDN's per-head scalar, so it travels through a different
 BlockSpec and a different VMEM load on its way into the kernel.
 
-The oracle is the same float64 token-at-a-time recurrence
-`test_kimi_chunk_kda.py` uses, preceded by the conv1d and silu that the
-fused kernel folds in. Comparing against a recurrence rather than against
-another Pallas kernel keeps this independent of the implementation it is
-meant to check.
+The oracle is a float64 token-at-a-time recurrence, preceded by the conv1d
+and silu that the fused kernel folds in. Comparing against a recurrence rather
+than against another Pallas kernel keeps this independent of the implementation
+it is meant to check.
 
 Both gate forms are covered. `gate_lower_bound=None` gives
 `-exp(A_log) * softplus(g + dt_bias)`, which Kimi-Linear-48B uses; a float
@@ -50,8 +47,7 @@ def _recurrence(
 ) -> tuple[np.ndarray, np.ndarray]:
     """One token at a time, in float64.
 
-    The same recurrence `test_kimi_chunk_kda._recurrence` uses, transposed
-    to this kernel's token-major activation layout.
+    Transposed to this kernel's token-major activation layout.
     """
     running = state.astype(np.float64).copy()
     output = np.zeros((q.shape[0], q.shape[1], v.shape[-1]), np.float64)

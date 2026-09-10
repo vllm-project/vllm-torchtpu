@@ -21,8 +21,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.kimi_k3.chunk_kda import align_up
-
 _RCP_LN2 = 1.0 / math.log(2)
 
 CHUNK_KIND_ALL_PAD = 0
@@ -30,6 +28,10 @@ CHUNK_KIND_FULL_IN_SEGMENT = 1
 CHUNK_KIND_BOUNDARY = 2
 CHUNK_KIND_PARTIAL_PAD = 3
 CHUNK_FLAG_LAST_REAL = 4
+
+
+def align_up(x, align: int):
+    return (x + align - 1) // align * align
 
 
 def _build_chunk_metadata(segment_ids, chunk_size):
