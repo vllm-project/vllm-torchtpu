@@ -368,7 +368,7 @@ class TestStartStopPhasedProfiling:
         """Phased mode is on, but there is nowhere to write traces."""
         runner = _init_phased_runner(monkeypatch, torch_profiler_dir="")
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+                "vllm_torchtpu.runner.phased_profiling.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -386,7 +386,7 @@ class TestStartStopPhasedProfiling:
             delay_iterations=3,
         )
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+                "vllm_torchtpu.runner.phased_profiling.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -416,7 +416,7 @@ class TestStartStopPhasedProfiling:
         it names the run, and the phase subdirectories sit beneath it."""
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+                "vllm_torchtpu.runner.phased_profiling.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner, "decode")
 
@@ -427,7 +427,7 @@ class TestStartStopPhasedProfiling:
         lose the phases it has already marked as seen."""
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+                "vllm_torchtpu.runner.phased_profiling.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
             first_profiler = runner.phase_based_profiler
@@ -444,7 +444,7 @@ class TestStartStopPhasedProfiling:
                                      profiler_rank=9,
                                      profiler_world_size=16)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+                "vllm_torchtpu.runner.phased_profiling.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -457,7 +457,7 @@ class TestStartStopPhasedProfiling:
                                      max_iterations=0,
                                      delay_iterations=0)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+                "vllm_torchtpu.runner.phased_profiling.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -471,7 +471,7 @@ class TestStartStopPhasedProfiling:
     def test_stop_finishes_and_clears_the_profiler(self, monkeypatch):
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+                "vllm_torchtpu.runner.phased_profiling.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
             armed_profiler = mock_profiler_cls.return_value
@@ -621,7 +621,7 @@ class TestTPURunner:
         self._find_non_ssm_backend_patcher.stop()
 
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
@@ -660,7 +660,7 @@ class TestTPURunner:
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
 
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(3 * 1024 * 1024, 3 * 1024 * 1024))
@@ -682,7 +682,7 @@ class TestTPURunner:
             self.runner._update_mamba_page_size_padded(layers)
 
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
@@ -742,10 +742,10 @@ class TestTPURunner:
             'bind_connector_metadata') < names.index('start_load_kv')
 
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
     @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
@@ -830,10 +830,10 @@ class TestTPURunner:
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
 
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
     @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
@@ -907,7 +907,7 @@ class TestTPURunner:
 
     @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
@@ -954,7 +954,7 @@ class TestTPURunner:
                   return_value=PallasMLAttentionBackend)
     @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=8192)
     @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
@@ -983,7 +983,7 @@ class TestTPURunner:
 
     @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     def test_get_kv_cache_spec_pure_attention_no_cache_config_updates(
             self, mock_get_page_size, mock_get_layers):
@@ -1004,7 +1004,7 @@ class TestTPURunner:
 
     @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     def test_get_kv_cache_spec_records_shared_layers(self, mock_get_page_size,
                                                      mock_get_layers):
@@ -1155,7 +1155,7 @@ class TestTPURunner:
                                                             hma_enabled=False)
 
     @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+        'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
     @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
     @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
@@ -1339,7 +1339,7 @@ class TestTPURunner:
         cross_layer_connector = MagicMock()
         cross_layer_connector.prefer_cross_layer_blocks = True
         with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(num_blocks, ) + per_layer_shape), patch(
                     'vllm_torchtpu.utils.tpu_bind_kv_cache') as mock_bind, \
              patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
@@ -1429,7 +1429,7 @@ class TestTPURunner:
         self.runner._mamba_num_blocks = None
 
         with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
         ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache'), patch(
                 'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
@@ -1482,7 +1482,7 @@ class TestTPURunner:
         self.runner.input_batch = mock_input_batch
 
         with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
         ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache'), patch(
                 'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
@@ -1549,7 +1549,7 @@ class TestTPURunner:
         self.runner.input_batch = mock_input_batch
 
         with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
         ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache') as mock_bind, patch(
                 'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
@@ -1594,7 +1594,7 @@ class TestTPURunner:
         self.runner.input_batch = mock_input_batch
 
         with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                'vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(10, 16, 2, 1, 128)) as mock_get_shape, patch(
                     'vllm_torchtpu.utils.tpu_bind_kv_cache'
                 ), patch(

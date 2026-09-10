@@ -4,7 +4,6 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
-import bisect
 import contextlib
 import copy
 import dataclasses
@@ -101,6 +100,12 @@ from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
+from vllm_torchtpu.runner.padding import (
+    MIN_NUM_SEQS, _get_num_slices_per_kv_cache_update_block,
+    _get_padded_num_kv_cache_update_slices,
+    _get_padded_num_reqs_with_upper_limit, _get_padded_token_len,
+    _get_req_paddings, _prev_power_of_2)
+from vllm_torchtpu.runner.phased_profiling import PhasedProfilingMixin
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.structured_decoding_manager import \
@@ -108,16 +113,25 @@ from vllm_torchtpu.runner.structured_decoding_manager import \
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
+from vllm_torchtpu.runner.xla_graph_tracker import XlaGraphTrackerMixin
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              normalize_draft_config)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
-from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
                                          extract_request_ids_for_tracing)
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+
+__all__ = [
+    'TPUModelRunner', 'ExecuteModelState', 'AsyncPreResults',
+    'AsyncTPUModelRunnerOutput', 'MIN_NUM_SEQS',
+    '_get_num_slices_per_kv_cache_update_block',
+    '_get_padded_num_kv_cache_update_slices',
+    '_get_padded_num_reqs_with_upper_limit', '_get_padded_token_len',
+    '_get_req_paddings', '_prev_power_of_2'
+]
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -322,8 +336,6 @@ def _build_kv_connector_output(
     return KVConnectorOutput(**kwargs)
 
 
-# Smallest output size
-MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
@@ -426,7 +438,8 @@ def _warn_if_kv_cache_is_padded(
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
-class TPUModelRunner(GPUModelRunner):
+class TPUModelRunner(PhasedProfilingMixin, XlaGraphTrackerMixin,
+                     GPUModelRunner):
 
     @property
     def _is_async_drafter(self) -> bool:
@@ -788,75 +801,6 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
 
-    def _init_phased_profiling(self) -> None:
-        """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
-
-        The trace directory comes from `profiler_config`, the same field the
-        standard torch profiler uses; the env var only selects which profiler
-        consumes it. The profiler itself is armed later by
-        `start_phased_profiling`/`stop_phased_profiling`, called from
-        TPUWorker.profile() so both profilers share one trigger.
-        """
-        profiler_config = self.vllm_config.profiler_config
-        self.phased_profiling_dir = (profiler_config.torch_profiler_dir
-                                     if envs.USE_PHASED_PROFILER else "")
-        self.phase_based_profiler = None
-
-    def start_phased_profiling(self,
-                               profile_prefix: str | None = None) -> None:
-        """Arms the phase-based profiler. Called from TPUWorker.profile()."""
-        if not self.phased_profiling_dir:
-            logger.warning(
-                "Phased profiling directory is not set. Skipping profiling.")
-            return
-        if self.phase_based_profiler is not None:
-            logger.warning(
-                "Phased profiler is already running. Ignoring start request.")
-            return
-        profiler_config = self.vllm_config.profiler_config
-        additional_config = self.vllm_config.additional_config
-        decode_kv_len_threshold = additional_config.get(
-            runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
-            runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
-        prefill_kv_len_threshold = additional_config.get(
-            runner_utils.PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
-            runner_utils.PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD)
-        # Same scoping as the standard profiler: the prefix names the run, and
-        # the per-phase subdirectories sit beneath it.
-
-        profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
-            self.phased_profiling_dir, profile_prefix)
-
-        # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
-        # so every DP replica would call itself rank 0 and their traces would
-        # overwrite each other on merge. The worker resolves the slice-global
-        # rank from the TPU rank binding and passes it in.
-        self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
-            profile_dir,
-            worker_rank=self._profiler_rank,
-            world_size=self._profiler_world_size,
-            # max_iterations defaults to 0 ("no limit") for standard torch
-            # profiling; that's meaningless for the phased profiler, so fall
-            # back to its own default when unset.
-            num_steps_to_profile_for=(
-                profiler_config.max_iterations
-                or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
-            num_decode_steps_to_skip=profiler_config.delay_iterations,
-            decode_kv_len_threshold=decode_kv_len_threshold,
-            prefill_kv_len_threshold=prefill_kv_len_threshold,
-            standard_opts=standard_opts,
-            advanced_opts=advanced_opts,
-        )
-
-    def stop_phased_profiling(self) -> None:
-        """Disarms the phase-based profiler. Called from TPUWorker.profile()."""
-        if self.phase_based_profiler is None:
-            logger.warning(
-                "Phased profiler is not running. Ignoring stop request.")
-            return
-        self.phase_based_profiler.finish()
-        self.phase_based_profiler = None
-
     # ----- Backend hooks overridden from GPUModelRunner -----
 
     def _init_device_properties(self) -> None:
@@ -1033,123 +977,6 @@ class TPUModelRunner(GPUModelRunner):
             [getattr(d, "id", None) for d in jax.devices()],
         )
         return mesh
-
-    # Entries described per report before the rest are summarized. A boot
-    # compiles hundreds, and the interesting case -- a handful appearing once
-    # traffic is running -- is well under this.
-    _MAX_DESCRIBED_GRAPHS = 20
-
-    # Newest entry seen by the previous report, which is what makes an entry
-    # "first read since then". A class attribute rather than an __init__ one
-    # because the first report runs from inside __init__, so an instance
-    # attribute has to be assigned above that call to exist in time.
-    _xla_graphs_checked_at = None
-
-    @staticmethod
-    def _describe_xla_graph(entry) -> str:
-        """One line describing a cache entry, from whatever fields it carries.
-
-        ``per_entry_stats`` holds an opaque pybind type whose fields differ
-        between torch_tpu versions, so read them reflectively rather than
-        pinning names that will silently vanish on an upgrade.
-        """
-        fields = []
-        for name in sorted(dir(entry)):
-            if name.startswith("_"):
-                continue
-            try:
-                value = getattr(entry, name)
-            except Exception:  # a property that needs live device state
-                continue
-            if callable(value):
-                continue
-            text = str(value).replace("\n", " ")
-            if len(text) > 120:
-                text = text[:117] + "..."
-            fields.append(f"{name}={text}")
-        return " ".join(fields) if fields else repr(entry)[:200]
-
-    @staticmethod
-    def _xla_graph_compile_secs(entry) -> float:
-        duration = getattr(entry, "compilation_duration", None)
-        total_seconds = getattr(duration, "total_seconds", None)
-        return total_seconds() if total_seconds is not None else 0.0
-
-    def _fresh_xla_graphs(self, entries) -> list:
-        """The entries this process compiled since the previous report.
-
-        There is no identifier on an entry to diff against, and the list is not
-        append-only -- its tail routinely holds boot-time programs with
-        ``read_count`` in the dozens -- so slicing off ``num_xla_graphs`` names
-        the wrong graphs. What each entry does carry is when it was last read
-        and how often, so an entry first read after the previous report is one
-        this report is responsible for.
-        """
-        fresh, newest = [], self._xla_graphs_checked_at
-        for entry in entries:
-            last_read = getattr(entry, "last_read", None)
-            if last_read is None:
-                continue
-            if newest is None or last_read > newest:
-                newest = last_read
-            if getattr(entry, "read_count", 0) != 1:
-                continue  # read before, so it predates this report
-            if (self._xla_graphs_checked_at is not None
-                    and last_read <= self._xla_graphs_checked_at):
-                continue
-            fresh.append(entry)
-        self._xla_graphs_checked_at = newest
-        fresh.sort(key=self._xla_graph_compile_secs, reverse=True)
-        return fresh
-
-    def _update_num_xla_graphs(self, case_str):
-        check_comp = self.check_recompilation and not self.enforce_eager
-        if not check_comp:
-            return
-
-        stats = torch.tpu._get_cache_stats()
-        entries = stats.per_entry_stats
-        total_graphs = len(entries)
-        if total_graphs < self.num_xla_graphs:
-            # Entries were evicted, so the delta below would understate what
-            # was compiled. Resynchronize rather than report a negative count.
-            logger.info(
-                "XLA cache shrank from %d to %d entries (case: %s); "
-                "resynchronizing the recompilation counter",
-                self.num_xla_graphs, total_graphs, case_str)
-            self.num_xla_graphs = total_graphs
-            return
-
-        fresh = self._fresh_xla_graphs(entries)
-        new_compiled_graphs = total_graphs - self.num_xla_graphs
-        if new_compiled_graphs == 0 and not fresh:
-            logger.info(f"No new compiled graphs for case: {case_str}")
-            return
-
-        logger.info(f"Total Requests: {stats.num_cache_reqs}")
-        logger.info(f"Total Hits: {stats.num_cache_hits}")
-        logger.info(
-            f"Total number of cached graphs: {total_graphs}, new: {new_compiled_graphs}, case: {case_str}"
-        )
-
-        # A count says four graphs appeared; it does not say which op keeps
-        # producing fresh shapes, which is the only thing that makes a runtime
-        # recompilation actionable. Note the compile seconds: an entry with a
-        # zero duration was served from a cache rather than compiled here, so
-        # it costs nothing even though it counts.
-        if fresh:
-            secs = sum(map(self._xla_graph_compile_secs, fresh))
-            logger.info(
-                "  %d first read since the last check, %.3fs compiling",
-                len(fresh), secs)
-            for i, entry in enumerate(fresh[:self._MAX_DESCRIBED_GRAPHS], 1):
-                logger.info("  graph %d/%d: %s", i, len(fresh),
-                            self._describe_xla_graph(entry))
-            if len(fresh) > self._MAX_DESCRIBED_GRAPHS:
-                logger.info("  ... %d more not shown",
-                            len(fresh) - self._MAX_DESCRIBED_GRAPHS)
-
-        self.num_xla_graphs += new_compiled_graphs
 
     def _reorder_batch_for_rpa(
             self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:
@@ -6687,71 +6514,3 @@ class TPUModelRunner(GPUModelRunner):
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
         )
-
-
-def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
-    logger.info("Preparing request paddings:")
-    # assert min_req_size is power of 2
-    assert (min_req_size & (min_req_size - 1) == 0) and min_req_size > 0
-    paddings: list = []
-    num = max(MIN_NUM_SEQS, min_req_size)
-    while num <= max_req_size and (len(paddings) == 0 or paddings[-1] != num):
-        paddings.append(num)
-        logger.info("    %d", num)
-        num = _get_padded_num_reqs_with_upper_limit(num + 1, max_req_size)
-    return paddings
-
-
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
-    res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
-    return min(res, upper_limit)
-
-
-def _get_padded_token_len(paddings: list[int], x: int) -> int:
-    """Return the first element in paddings list greater or equal to x."""
-    index = bisect.bisect_left(paddings, x)
-    assert index < len(paddings)
-    return paddings[index]
-
-
-def _get_padded_num_kv_cache_update_slices(num_tokens: int, max_num_reqs: int,
-                                           page_size: int) -> int:
-    """Calculates the padded number of KV cache update slices to avoid
-    recompilation."""
-    # NOTE(chengjiyao): let's say R_i is the token num for i-th request,
-    # so it occupies most 2 + R_i // page_size pages. The total maximum
-    # possible number of pages needed is sum(2 + R_i // page_size), which
-    # is <= 2 * max_num_reqs + sum(R_i) // page_size
-    # = 2 * max_num_reqs + num_tokens // page_size
-    padded_num_slices = 2 * max_num_reqs + num_tokens // page_size
-    padded_num_slices = min(padded_num_slices, num_tokens)
-    return padded_num_slices
-
-
-def _prev_power_of_2(n: int) -> int:
-    """The previous power of 2 (inclusive)"""
-    if n <= 0:
-        return 0
-    return 1 << (n.bit_length() - 1)
-
-
-def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
-    """Find the optimum number of slices to copy per Pallas program instance.
-
-    Increasing the number of slices copied in one instance of the kernel program
-    will increase HBM bandwidth utilization via more in-flight DMAs.
-
-    However, it will also use more VMEM, and experimentally, we observed
-    performance regression at 128 slices on v6e, likely due to running
-    out of scalar registers. Thus this function will limit the number of
-    slices to 64.
-    """
-    # The default vmem_limit_bytes of a pallas kernel is 32MB. Here we
-    # calculate num_slices_per_block based on 16MB in case any register spills.
-    vmem_limit = 16 * 1024 * 1024
-    num_slices_per_block = vmem_limit // page_size_bytes
-    assert num_slices_per_block > 0, "Number of slices should be positive"
-    num_slices_per_block = _prev_power_of_2(num_slices_per_block)
-    if num_slices_per_block > 64:
-        num_slices_per_block = 64
-    return num_slices_per_block
