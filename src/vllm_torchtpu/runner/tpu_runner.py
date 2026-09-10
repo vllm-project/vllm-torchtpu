@@ -33,7 +33,6 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group,
                                           kv_transfer_state)
 from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (MRotaryEmbedding,
@@ -1262,59 +1261,10 @@ class TPUModelRunner(GPUModelRunner):
                 metadata[name] = built
         return metadata
 
-    # KV-cache spec derivation and page/block sizing live on
+    # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.kv_cache_manager.get_kv_cache_spec()
-
-    @staticmethod
-    def _validate_shared_kv_cache_layout(
-        layer_name: str,
-        attn_module: Attention,
-        target_layer_name: str,
-        target_module: Attention,
-        hma_enabled: bool,
-    ) -> None:
-        KVCacheManager._validate_shared_kv_cache_layout(
-            layer_name, attn_module, target_layer_name, target_module,
-            hma_enabled)
-
-    def _maybe_add_kv_sharing_layers_to_kv_cache_groups(
-            self, kv_cache_config: KVCacheConfig) -> None:
-        self.kv_cache_manager._maybe_add_kv_sharing_layers_to_kv_cache_groups(
-            kv_cache_config)
-
-    def _add_shared_kv_cache_aliases(
-            self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self.kv_cache_manager._add_shared_kv_cache_aliases(kv_caches)
-
-    def _update_attention_page_size_padded(self,
-                                           layers: dict[str,
-                                                        AttentionLayerBase],
-                                           block_size: int) -> None:
-        self.kv_cache_manager._update_attention_page_size_padded(
-            layers, block_size)
-
-    def _update_mamba_page_size_padded(
-            self, layers: dict[str, AttentionLayerBase]) -> None:
-        self.kv_cache_manager._update_mamba_page_size_padded(layers)
-
-    def _available_kv_cache_hbm(self) -> int:
-        return self.kv_cache_manager._available_kv_cache_hbm()
-
-    def _maybe_set_compact_mamba_num_blocks_override(
-            self, attn_page_size_bytes: int,
-            unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
-            num_mamba_groups: int, group_size: int) -> None:
-        self.kv_cache_manager._maybe_set_compact_mamba_num_blocks_override(
-            attn_page_size_bytes, unpadded_mamba_page_size_bytes,
-            num_attn_groups, num_mamba_groups, group_size)
-
-    def _maybe_set_num_blocks_override(self, attn_page_size_bytes: int,
-                                       uniform_page_size_bytes: int,
-                                       group_size: int) -> None:
-        self.kv_cache_manager._maybe_set_num_blocks_override(
-            attn_page_size_bytes, uniform_page_size_bytes, group_size)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
