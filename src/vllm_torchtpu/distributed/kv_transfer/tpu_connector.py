@@ -3182,10 +3182,18 @@ class TPURaidenConnectorWorker:
         if _use_raiden_dsv4_admission():
             # DP attention: one transfer rank per engine.
             return 0
-        from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank, get_pcp_rank
+        # The chunk whose KV this worker holds is the one its kernels computed,
+        # so this is the kernels' partition index. That index is the position
+        # of this worker's device in the PCP mesh, and the mesh is built in
+        # rank order, so it is the PCP rank. #554 had to read it back off the
+        # device id instead, because Torchtpu built the kernel DeviceAssignment
+        # from device enumeration rather than from the mesh;
+        # google-pytorch/torch_tpu#3522 removed the hardcoded enumeration and
+        # enabled device assignment based on PCP rank.
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
         if self.tp_size == 1:
-            return int(get_pcp_cache_rank())
+            return int(get_pcp_rank())
         # A work-unit identity enumerates workers, not GDN head shards. FA
         # lowering consumes PCP and TP coordinates separately; GDN uses the
         # transposed (TP, PCP) head order. Include both axes here so TP peers
