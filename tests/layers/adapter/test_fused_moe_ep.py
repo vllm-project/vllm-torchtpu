@@ -70,7 +70,6 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
 def _prebuild(layer,
               *,
               has_mesh=True,
-              tp=1,
               node_tokens=4096,
               smem_bytes=1024 * 1024,
               ep_order=None,
@@ -92,7 +91,6 @@ def _prebuild(layer,
             patch.object(bridge, "_max_node_tokens", return_value=node_tokens), \
             patch.object(bridge, "_smem_capacity_bytes",
                          return_value=smem_bytes), \
-            patch.object(bridge, "_tensor_parallel_size", return_value=tp), \
             patch.object(bridge, "_build_op", side_effect=build_op):
         defaults = dict(topk=2, renormalize=True, activation="silu")
         defaults.update(kwargs)
@@ -159,10 +157,6 @@ def test_pcp_threshold_counts_one_logical_scheduler_batch():
     with patch("vllm.config.get_current_vllm_config", return_value=cfg):
         assert bridge._max_node_tokens(ep=8, pcp=8) == 4096
         assert bridge._max_node_tokens(ep=8, pcp=1) == 32768
-
-
-def test_refused_under_tensor_parallelism():
-    assert _prebuild(_layer(), tp=8) is None
 
 
 def test_refused_without_an_ep_group():
@@ -785,8 +779,8 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
 
 @pytest.mark.parametrize("configured_block", [None, 128])
 @pytest.mark.parametrize("refusal", [
-    "tp", "mesh", "tokens", "smem", "routing", "experts", "activation",
-    "simulation", "prepared_scales"
+    "mesh", "tokens", "smem", "routing", "experts", "activation", "simulation",
+    "prepared_scales"
 ])
 def test_nvfp4_admission_and_prepared_weight_validation(
         monkeypatch, refusal, configured_block):
@@ -799,9 +793,7 @@ def test_nvfp4_admission_and_prepared_weight_validation(
     method.moe = SimpleNamespace(has_bias=False, is_act_and_mul=True)
     method.group_size = 16
     admission = {}
-    if refusal == "tp":
-        admission["tp"] = 8
-    elif refusal == "mesh":
+    if refusal == "mesh":
         admission["has_mesh"] = False
     elif refusal == "tokens":
         admission["node_tokens"] = 1

@@ -345,43 +345,15 @@ def prebuild_fused_moe_ep(layer,
             "expert-parallel, so each shard would hold the whole expert set.")
         return None
 
-    # The former full token-gather scalar-prefetch table made this path look
-    # token-count limited under TP and at a 4K/rank DP8 bucket. The table now
-    # remains in HBM and is streamed through two fixed SMEM windows, so that
-    # compile-time limit is gone. Tensor parallelism is still refused for an
-    # independent reason: the kernel deadlocks during warmup, and a replicated
-    # batch would also make every rank repeat the full expert work.
-    #
-    # That hang is NOT specific to this kernel: the fused reduce-scatter MoE
-    # kernel, written independently, fails at the same phase with the same
-    # signature under TP8, while both work under DP8. Ruled out for it, and
-    # so presumably for this one: receive-count mismatch, a ragged last tile,
-    # a missing drain, barrier re-entry across layers, tiny buckets, routing
-    # skew, collective-id collision, and a Pallas barrier interleaved with
-    # XLA all-reduces. The untested candidate is GDN's `ragged_all_to_all`, a
-    # data-dependent collective in 45 of this model's 60 layers.
-    #
-    # There is another thing worth knowing before anyone lifts it: under
-    # replicated TP each rank hands the op a full copy of the batch as its
-    # shard, so the kernel does ep_size times the expert work for one batch
-    # of output. Lifting the refusal usefully needs the bridge to hand each
-    # rank a distinct 1/ep slice, which also removes the SMEM inflation.
-    # PCP is not replicated TP: every PCP rank already presents a distinct
-    # token shard, exactly like DP does for this kernel.  The TPU MoERunner
+    # The token-gather table remains in HBM and is streamed through two fixed
+    # SMEM windows, so TP and a 4K bucket do not exceed the compile-time SMEM
+    # limit. TP ranks present replicated token rows, which the fused EP program
+    # consumes directly on the flattened EP mesh. The TPU MoERunner
     # patch suppresses its explicit PCP all-gather/reduce-scatter only for a
     # layer this function actually arms; refused layers keep the old fallback.
     # Consequently the kernel is the sole dispatch/combine owner under PCP,
     # independent of whether the separate GMM chunk pipeline is enabled.
     pcp = _pcp_size(layer)
-    tp = _tensor_parallel_size()
-    if tp > 1:
-        logger.warning_once(
-            "Fused EP MoE not engaged: under tensor parallelism (tp_size=%d) "
-            "it arms and compiles but then deadlocks during warmup, and with "
-            "the batch replicated it would do %dx the expert work per batch "
-            "anyway. The grouped-matmul path serves every step.", tp, tp)
-        return None
-
     mesh = build_ep_mesh()
     if mesh is None:
         logger.info_once("Fused EP MoE requested but there is no EP group; "
@@ -580,31 +552,14 @@ def _unsupported_routing_reason(layer) -> str | None:
     return None
 
 
-def _tensor_parallel_size() -> int:
-    """This deployment's tensor-parallel width, or 1 if it cannot be read.
-
-    Read off the config, not off `get_tp_group()`. The group coordinator is a
-    mutable singleton and `spec_decode.utils._force_draft_tp1` rewrites its
-    `world_size` to 1 for the duration of the draft model's weight load --
-    which is exactly where this runs. On a TP>1 target with an MTP draft, the
-    target's layers would refuse and the draft's would arm on a spoofed 1.
-    """
-    try:
-        from vllm.config import get_current_vllm_config
-        return int(
-            get_current_vllm_config().parallel_config.tensor_parallel_size)
-    except Exception:  # noqa: BLE001 - no config outside a served model
-        return 1
-
-
 def _max_node_tokens(ep: int, pcp: int = 1) -> int:
     """The largest node-wide token count a step can carry, or 0 if unknown.
 
     A DP scheduler cap is per independent batch, so every DP rank contributes
     another cap's worth of tokens.  PCP ranks partition one scheduler batch;
     multiplying by the full flattened EP width would count the same logical
-    tokens once per PCP shard.  TP is refused before this helper is called, so
-    ``ep // pcp`` is the number of independent DP batches represented here.
+    tokens once per PCP shard. ``ep // pcp`` is the number of independent DP
+    batches represented here.
     """
     from vllm.config import get_current_vllm_config
 
