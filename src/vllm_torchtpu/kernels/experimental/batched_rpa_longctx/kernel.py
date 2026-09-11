@@ -93,7 +93,7 @@ def calculate_and_store_out(
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
         out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
         pad_width = [[0, 0] for _ in range(out.ndim)]
-        pad_width[-1][-1] = cfgs.aligned_q_head_dim - cfgs.aligned_kv_head_dim
+        pad_width[-1][-1] = cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim
         out = jnp.pad(out, pad_width, constant_values=0)
         out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
         utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
@@ -125,6 +125,70 @@ def calculate_and_store_out(
             l_val = l_list[b]
             jax.lax.cond(is_last_k, _stage_lse, lambda *_: None, b, m_val,
                          l_val)
+
+
+def get_scale_factors(
+    k: jax.Array,
+    v: jax.Array,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    if not cfgs.serve.per_token_scale:
+        return k, v, cfgs.serve.scale_k, cfgs.serve.scale_v
+
+    b = k.shape[0]
+    num_heads = k.shape[1]
+    # Number of scale channels in VMEM is determined by the scale factor bitwidth
+    # and the VMEM kv bitwidth (k.dtype). However, we cannot use the
+    # scale_channels configs.py member variable because of the case of unpacking
+    # uint8_t to fp4_e2m1fn.
+    if cfgs.serve.per_token_scale_dtype is None:
+        scale_channels = 0
+    else:
+        scale_bits = jax.dtypes.itemsize_bits(cfgs.serve.per_token_scale_dtype)
+        kv_bits = jax.dtypes.itemsize_bits(k.dtype)
+        scale_channels = max(1, scale_bits // kv_bits)
+
+    # Extract multi-channel scale factor slices from the trailing sublanes
+    k_scale_slice = k[:, :, cfgs.model.head_dim:cfgs.model.head_dim +
+                      scale_channels, :]
+    v_scale_slice = v[:, :, cfgs.model.head_dim:cfgs.model.head_dim +
+                      scale_channels, :]
+
+    # If there are multiple scale channels, pltpu.bitcast operates on the
+    # second to last dimension, which is the head dimension, which is the same
+    # as the scale_channels dimension, so this works out of the box.
+    if scale_channels > 1:
+        k_scale = pltpu.bitcast(k_scale_slice,
+                                cfgs.serve.per_token_scale_dtype)
+        v_scale = pltpu.bitcast(v_scale_slice,
+                                cfgs.serve.per_token_scale_dtype)
+
+    # If there is only one scale channel, just change dtype to the scale dtype.
+    else:
+        k_scale = k_scale_slice.astype(cfgs.serve.per_token_scale_dtype)
+        v_scale = v_scale_slice.astype(cfgs.serve.per_token_scale_dtype)
+
+    # In QK multiplication, we always scale after the qk matmul, so we can
+    # unify per-token and per-tensor scaling by broadcasting the scale factor
+    # to the head dimension outside of the flash attention kernel.
+    k_scale = k_scale.reshape(b, num_heads, cfgs.bkv_sz)
+    # To match the accumulation dtype of qk.
+    k_scale = k_scale.astype(jnp.float32)
+    # Add a new dimension for the head dimension.
+    k_scale = k_scale[:, :, jnp.newaxis, :]
+
+    # In PV multiplication, we scale the p rather than the pv for per-token
+    # scaling (as it is mathematically necessary to scale before the matmul for
+    # per-token scaling) so we can NOT unify per-token and per-tensor scaling,
+    # so we broadcast the scale factor along the head dimension inside the
+    # flash attention kernel itself and do not do so here.
+    v_scale = v_scale.reshape(b, num_heads, cfgs.bkv_sz)
+
+    k = k[:, :, :cfgs.compute_kv_head_dim, :]
+    v = v[:, :, :cfgs.compute_kv_head_dim, :]
+
+    return k, v, k_scale, v_scale
 
 
 @jax.tree_util.register_dataclass
@@ -281,8 +345,7 @@ def rpa_body(
         cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
         cfgs.aligned_q_head_dim,
     )
-    if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
-        q = q[..., :cfgs.aligned_kv_head_dim]
+    q = q[..., :cfgs.compute_kv_head_dim]
 
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing
@@ -321,24 +384,27 @@ def rpa_body(
                 v_head_ref = v_slice.reshape(target_shape)
                 pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
 
-                k_head_loaded = utils.strided_load(k_head_ref,
-                                                   0,
-                                                   pack_dim,
-                                                   1,
-                                                   dtype=cfgs.serve.dtype_kv)
-                v_head_loaded = utils.strided_load(v_head_ref,
-                                                   0,
-                                                   pack_dim,
-                                                   1,
-                                                   dtype=cfgs.serve.dtype_kv)
+                # Load as uint32 to avoid dtype conversion during strided load
+                k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
+                v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
 
-                k_head = k_head_loaded[:, :cfgs.bkv_sz]
-                v_head = v_head_loaded[:, :cfgs.bkv_sz]
-
-                ks.append(k_head.reshape(cfgs.aligned_kv_head_dim,
-                                         cfgs.bkv_sz))
-                vs.append(v_head.reshape(cfgs.aligned_kv_head_dim,
-                                         cfgs.bkv_sz))
+                if cfgs.serve.dtype_kv == jnp.uint8:
+                    fp4 = jnp.float4_e2m1fn
+                    k_head = pltpu.bitcast(k_head_u32, fp4)[:, :cfgs.bkv_sz]
+                    v_head = pltpu.bitcast(v_head_u32, fp4)[:, :cfgs.bkv_sz]
+                    ks.append(k_head)
+                    vs.append(v_head)
+                else:
+                    k_head_loaded = pltpu.bitcast(k_head_u32,
+                                                  cfgs.serve.dtype_kv)
+                    v_head_loaded = pltpu.bitcast(v_head_u32,
+                                                  cfgs.serve.dtype_kv)
+                    k_head = k_head_loaded[:, :cfgs.bkv_sz]
+                    v_head = v_head_loaded[:, :cfgs.bkv_sz]
+                    ks.append(
+                        k_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+                    vs.append(
+                        v_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
             k_b.append(jnp.stack(ks, axis=0))
             v_b.append(jnp.stack(vs, axis=0))
     else:
@@ -367,6 +433,8 @@ def rpa_body(
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
     k = jnp.stack(k_b, axis=0)
     v = jnp.stack(v_b, axis=0)
+
+    k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
 
     # Step 3: Perform compute.
     m_val = m_scratch_ref[...]
@@ -403,6 +471,8 @@ def rpa_body(
             schedule_ref.is_last_k,
             custom_mask=custom_mask,
             cfgs=cfgs,
+            bq_start=bq_start,
+            k_scale=k_scale,
         )
         m_scratch_ref[:, q_slice] = m_carry
         l_scratch_ref[:, q_slice] = l_next[-1]
@@ -417,6 +487,7 @@ def rpa_body(
                 prev_alpha_list,
                 acc_val[:, prev_q_slice],
                 cfgs=cfgs,
+                v_scale=v_scale,
             )
             acc_scratch_ref[:, prev_q_slice] = o_next[-1]
             acc_new_list.append(o_next)
@@ -432,6 +503,7 @@ def rpa_body(
         prev_alpha_list,
         acc_val[:, prev_q_slice],
         cfgs=cfgs,
+        v_scale=v_scale,
     )
     acc_scratch_ref[:, prev_q_slice] = o_next[-1]
     acc_new_list.append(o_next)

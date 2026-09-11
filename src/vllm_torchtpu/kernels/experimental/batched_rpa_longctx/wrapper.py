@@ -45,12 +45,14 @@ def prepare_inputs(
     v: jax.Array,
     q_dtype: jnp.dtype,
     kv_dtype: jnp.dtype,
+    k_scale: jax.Array | None = None,
+    v_scale: jax.Array | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
 
-    total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
-    _, actual_num_kv_heads, _ = k.shape
+    total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
+    _, actual_num_kv_heads, actual_kv_head_dim = k.shape
     num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
     q_packing = utils.get_dtype_packing(q_dtype)
@@ -60,25 +62,36 @@ def prepare_inputs(
                                                      q_packing)
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
-    aligned_q_head_dim = utils.align_to(actual_head_dim, num_lanes)
+    aligned_q_head_dim = utils.align_to(actual_q_head_dim, num_lanes)
+
+    # Compute aligned kv head dimension, accounting for per-token scale if
+    # present.
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        aligned_kv_head_dim = utils.align_to(actual_head_dim,
-                                             num_sublanes * kv_packing)
+        if k_scale is not None and v_scale is not None:
+            scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
+            kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
+            num_scale_channels = max(1, scale_bits // kv_bits)
+            aligned_kv_head_dim = utils.align_to(
+                actual_kv_head_dim + num_scale_channels,
+                num_sublanes * kv_packing)
+        else:
+            aligned_kv_head_dim = utils.align_to(actual_kv_head_dim,
+                                                 num_sublanes * kv_packing)
     else:
-        aligned_kv_head_dim = utils.align_to(actual_head_dim, num_lanes)
+        aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
     # queries: (T, H, D) -> (T, H_kv, G, D)
     o_hbm_alias_q_hbm = (jnp.pad(
         q.reshape(
             total_q_tokens,
             actual_num_kv_heads,
             num_q_heads_per_kv_head,
-            actual_head_dim,
+            actual_q_head_dim,
         ),
         (
             (0, 0),
             (0, 0),
             (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-            (0, aligned_q_head_dim - actual_head_dim),
+            (0, aligned_q_head_dim - actual_q_head_dim),
         ),
         constant_values=0,
     ).reshape(
@@ -94,6 +107,27 @@ def prepare_inputs(
     num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2,
                                              kv_packing)
 
+    if k_scale is not None and v_scale is not None:
+        k_scale = k_scale.reshape(total_q_tokens, actual_num_kv_heads)
+        v_scale = v_scale.reshape(total_q_tokens, actual_num_kv_heads)
+
+        scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
+        kv_bits = jax.dtypes.itemsize_bits(k.dtype)
+        num_scale_channels = max(1, scale_bits // kv_bits)
+
+        # Bitcast the scale factors to the kv dtype and reshape scale factors to
+        # (T, H_kv, num_scale_channels).
+        k_scale_split = jax.lax.bitcast_convert_type(k_scale, k.dtype).reshape(
+            total_q_tokens, actual_num_kv_heads, num_scale_channels)
+        v_scale_split = jax.lax.bitcast_convert_type(v_scale, v.dtype).reshape(
+            total_q_tokens, actual_num_kv_heads, num_scale_channels)
+
+        # k/v have shape (T, H_kv, D) -> (T, H_kv, D + num_scale_channels)
+        k = jnp.concatenate([k, k_scale_split], axis=-1)
+        v = jnp.concatenate([v, v_scale_split], axis=-1)
+
+        actual_kv_head_dim += num_scale_channels
+
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_lanes = pltpu.get_tpu_info().num_lanes
         align_tokens = max(num_lanes, page_size)
@@ -101,11 +135,11 @@ def prepare_inputs(
         new_kv_hbm = (jnp.pad(
             jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
                                                      actual_num_kv_heads_x2,
-                                                     actual_head_dim),
+                                                     actual_kv_head_dim),
             (
                 (0, padded_total_tokens - total_q_tokens),
                 (0, 0),
-                (0, aligned_kv_head_dim - actual_head_dim),
+                (0, aligned_kv_head_dim - actual_kv_head_dim),
             ),
             constant_values=0,
         ).reshape(
@@ -118,11 +152,11 @@ def prepare_inputs(
         new_kv_hbm = jnp.pad(
             jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
                                                      actual_num_kv_heads_x2,
-                                                     actual_head_dim),
+                                                     actual_kv_head_dim),
             (
                 (0, 0),
                 (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
-                (0, aligned_kv_head_dim - actual_head_dim),
+                (0, aligned_kv_head_dim - actual_kv_head_dim),
             ),
             constant_values=0,
         ).reshape(
@@ -147,16 +181,23 @@ def get_kv_cache_shape(
     kv_dtype,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     chip_version: pltpu.ChipVersion = pltpu.ChipVersion.TPU_7X,
+    use_per_token_scale: bool = False,
+    scale_dtype: jnp.dtype | None = None,
 ):
     chip_info = pltpu.get_tpu_info_for_chip(chip_version, 1)
     num_lanes, num_sublanes = chip_info.num_lanes, chip_info.num_sublanes
     kv_packing = utils.get_dtype_packing(kv_dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        num_scale_channels = 0
+        if use_per_token_scale:
+            kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
+            scale_bits = jax.dtypes.itemsize_bits(scale_dtype)
+            num_scale_channels = max(1, scale_bits // kv_bits)
+        base_dim = actual_head_dim + num_scale_channels
         return (
             total_num_pages,
             actual_num_kv_heads * 2,
-            utils.align_to(actual_head_dim, num_sublanes * kv_packing) //
-            kv_packing,
+            utils.align_to(base_dim, num_sublanes * kv_packing) // kv_packing,
             kv_packing,
             page_size,
         )
@@ -183,6 +224,8 @@ def calculate_block_sizes(
 
     # Calculate aligned model dimensions.
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
+    num_sublanes = tpu_info.num_sublanes
+
     aligned_num_q_heads_per_kv_head = utils.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q)
     aligned_num_q_heads = (aligned_num_q_heads_per_kv_head *
@@ -197,9 +240,26 @@ def calculate_block_sizes(
             bkv_stride += 1
         aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
 
-    q_bytes = jnp.dtype(serve_cfgs.dtype_q).itemsize
-    kv_bytes = jnp.dtype(serve_cfgs.dtype_kv).itemsize
-    out_bytes = jnp.dtype(serve_cfgs.dtype_out).itemsize
+    q_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_q) / 8
+    kv_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_kv) / 8
+    out_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_out) / 8
+
+    is_packed_fp4 = serve_cfgs.dtype_kv == jnp.uint8
+    physical_kv_head_dim = model_cfgs.head_dim
+    if is_packed_fp4:
+        physical_kv_head_dim = physical_kv_head_dim // 2
+
+    num_sublanes = tpu_info.num_sublanes
+    packing_kv = serve_cfgs.packing_kv
+
+    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        num_scale_channels = serve_cfgs.scale_channels
+        base_dim = physical_kv_head_dim + num_scale_channels
+        aligned_kv_head_dim_val = utils.align_to(base_dim,
+                                                 num_sublanes * packing_kv)
+    else:
+        aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim,
+                                                 num_lanes)
 
     def calculate_vmem_usage(batch_size: int, n_buffer: int, bq_sz: int,
                              bkv_sz: int) -> int:
@@ -211,9 +271,10 @@ def calculate_block_sizes(
         bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
         if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             bkv_array_size = ((bkv_sz + 2 * serve_cfgs.page_size) *
-                              aligned_num_kv_heads_x2 * aligned_head_dim)
+                              aligned_num_kv_heads_x2 *
+                              aligned_kv_head_dim_val)
         else:
-            bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
+            bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_kv_head_dim_val
 
         # Get output buffer size as well - which has same size as query size.
         bo_array_size = bq_array_size
@@ -228,7 +289,7 @@ def calculate_block_sizes(
         bkv_bytes *= n_buffer
         bo_bytes *= 2
 
-        # Sum up all buffer memory usage.
+        # Sum up all buffer memory usage (scales are co-located inside bkv_bytes).
         buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
 
         # Step 2: Calculate worst case memory usage during computation.
@@ -242,11 +303,26 @@ def calculate_block_sizes(
 
         # Convert to bytes.
         loaded_bq_bytes = loaded_bq_size * q_bytes
-        loaded_bkv_bytes = loaded_bkv_size * kv_bytes
+        compute_kv_bytes = kv_bytes
+        loaded_bkv_bytes = loaded_bkv_size * compute_kv_bytes
         qk_bytes = qk_size * out_bytes
 
+        # Calculate VMEM contribution of active unpacked scale arrays during
+        # compute. Note: since flash_attention consumes quantized k/v directly
+        # along with our active k_scale and v_scale tensors (no upfront dequantized
+        # intermediate copy), we only need to account for unpacked k_scale + v_scale
+        # during compute.
+        loaded_scale_bytes = 0
+        if serve_cfgs.per_token_scale:
+            scale_bits = jax.dtypes.itemsize_bits(
+                serve_cfgs.per_token_scale_dtype)
+            scale_bytes = scale_bits // 8
+            # Active k_scale and v_scale each have shape (num_kv_heads, bkv_sz)
+            loaded_scale_bytes = 2 * bkv_sz * model_cfgs.num_kv_heads * scale_bytes
+
         # Sum up all compute memory usage.
-        compute_bytes = loaded_bq_bytes + loaded_bkv_bytes + qk_bytes
+        compute_bytes = (loaded_bq_bytes + loaded_bkv_bytes + qk_bytes +
+                         loaded_scale_bytes)
 
         # Step 3: Sum up all memory usage.
         total_bytes = buffer_bytes + compute_bytes
@@ -308,11 +384,12 @@ def calculate_block_sizes(
             raise ValueError(
                 "Cannot find batch size that fits within VMEM limit.")
 
+        max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
-        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-               < capped_vmem_limit_bytes and bkv_sz <= max_seq_len
-               # and bkv_sz <= 8192
+        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz,
+                                    bkv_sz) < capped_vmem_limit_bytes
+               and bkv_sz <= max_seq_len and bkv_sz <= 4096  # TEMP PATCH
                ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
             # size. When using causal masking, if bq size is larger than bkv size,
@@ -323,8 +400,10 @@ def calculate_block_sizes(
             bq_sz += bq_stride
 
         # Rollback one step since the last attempted value triggered OOM.
-        bkv_sz -= bkv_stride
-        bq_sz -= bq_stride
+        if bkv_sz > bkv_stride:
+            bkv_sz -= bkv_stride
+            if fixed_bq_sz is None:
+                bq_sz -= bq_stride
 
         # Indicates OOM was triggered from the starting bkv size.
         if bkv_sz == 0:
@@ -386,6 +465,8 @@ def calculate_block_sizes(
         "sliding_window",
         "soft_cap",
         "mask_value",
+        "use_per_token_scale",
+        "per_token_scale_dtype",
         "q_scale",
         "k_scale",
         "v_scale",
@@ -422,9 +503,13 @@ def ragged_paged_attention(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = None,
+    use_per_token_scale: bool = False,
+    per_token_scale_dtype: jnp.dtype | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    dynamic_k_scale: jax.Array | None = None,
+    dynamic_v_scale: jax.Array | None = None,
     chunk_prefill_size: int | None = None,
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
@@ -463,11 +548,13 @@ def ragged_paged_attention(
         soft_cap: Cap values of softmax inputs.
         mask_value: Value to use for causal masking. Defaults to smallest
             representable value of the activation dtype.
+        use_per_token_scale: Whether to use per-token quantization.
+        per_token_scale_dtype: Dtype of per-token scale. Defaults to None.
         q_scale: Quantization scale value of queries.
-        k_scale: Quantization scale value of keys.
-        v_scale: Quantization scale value of values.
-        decode_query_size: Number of query tokens in decode (1 by default, can be
-            higher in case of speculative decoding).
+        k_scale: Per-tensor quantization scale value of keys.
+        v_scale: Per-tensor quantization scale value of values.
+        dynamic_k_scale: Per-token quantization scale value of keys.
+        dynamic_v_scale: Per-token quantization scale value of values.
         chunk_prefill_size: Not used.
         decode_block_sizes: Kernel block size to use during decode.
         prefill_block_sizes: Kernel block size to use during prefill.
@@ -476,6 +563,8 @@ def ragged_paged_attention(
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
+        decode_query_size: Number of query tokens in decode (1 by default, can be
+            higher in case of speculative decoding).
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
@@ -524,6 +613,21 @@ def ragged_paged_attention(
         soft_cap=soft_cap,
         mask_value=mask_value,
     )
+
+    if k_scale is not None and dynamic_k_scale is not None:
+        raise ValueError(
+            "Only one of k_scale or dynamic_k_scale can be set. Got"
+            f" {k_scale=} and {dynamic_k_scale=}")
+    if v_scale is not None and dynamic_v_scale is not None:
+        raise ValueError(
+            "Only one of v_scale or dynamic_v_scale can be set. Got"
+            f" {v_scale=} and {dynamic_v_scale=}")
+
+    k_scale_config = k_scale
+    v_scale_config = v_scale
+    k_scale_tensor = dynamic_k_scale
+    v_scale_tensor = dynamic_v_scale
+
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
@@ -532,9 +636,11 @@ def ragged_paged_attention(
         dtype_kv=kv_cache.dtype,
         dtype_out=out_dtype,
         page_size=page_size,
+        per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
         scale_q=q_scale,
-        scale_k=k_scale,
-        scale_v=v_scale,
+        scale_k=k_scale_config,
+        scale_v=v_scale_config,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
         cp_group_size=cp_group_size,
@@ -547,6 +653,8 @@ def ragged_paged_attention(
         values,
         queries.dtype,
         kv_cache.dtype,
+        k_scale_tensor,
+        v_scale_tensor,
         kv_layout=kv_layout,
         page_size=page_size,
     )
@@ -674,8 +782,8 @@ def ragged_paged_attention(
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
     if not return_lse:
         return o_hbm, kv_cache
-    # Reshape LSE from [num_kv_heads, max_tokens * aligned_num_q_heads_per_kv_head, num_lanes] to
-    # [max_tokens, num_q_heads].
+    # Reshape LSE from [num_kv_heads, max_tokens *
+    # aligned_num_q_heads_per_kv_head, num_lanes] to [max_tokens, num_q_heads].
     max_tokens = queries.shape[0]
     # Extract first lane (scalar LSE value per token-head pair).
     lse = lse_hbm.reshape(num_kv_heads, max_tokens,

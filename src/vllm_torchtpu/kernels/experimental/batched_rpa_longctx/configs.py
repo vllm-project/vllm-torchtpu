@@ -92,6 +92,8 @@ class ServingConfigs:
     dtype_q: jnp.dtype
     dtype_kv: jnp.dtype
     dtype_out: jnp.dtype
+    per_token_scale: bool | None = None
+    per_token_scale_dtype: jnp.dtype | None = None
     scale_q: int | None = None
     scale_k: int | None = None
     scale_v: int | None = None
@@ -126,6 +128,15 @@ class ServingConfigs:
     @property
     def packing_kv(self) -> int:
         return utils.get_dtype_packing(self.dtype_kv)
+
+    @property
+    def scale_channels(self) -> int:
+        if self.per_token_scale:
+            assert self.per_token_scale_dtype is not None
+            scale_bits = jax.dtypes.itemsize_bits(self.per_token_scale_dtype)
+            kv_bits = jax.dtypes.itemsize_bits(self.dtype_kv)
+            return max(1, scale_bits // kv_bits)
+        return 0
 
 
 class RpaCase(enum.StrEnum):
@@ -224,9 +235,9 @@ class RpaConfigs:
         bytes_per_step = (28 + 12 * self.bkv_p_cache +
                           4 * self.dma_kv_new_size * self.bkv_p_new)
         bytes_per_step *= self.block.batch_size
-        # Add 16 bytes for the 4 total_wait fields (total_wait_kv_in, total_wait_kv_out,
-        # total_wait_q_in, total_wait_o_out) which are 1D arrays (not multiplied by batch_size).
-        bytes_per_step += 16
+        # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in, total_wait_kv_out,
+        # total_wait_q_in, total_wait_o_out, total_wait_lse_out) which are 1D arrays (not multiplied by batch_size).
+        bytes_per_step += 20
 
         max_steps_ub = available_bytes // bytes_per_step
 
@@ -266,14 +277,36 @@ class RpaConfigs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         return utils.align_to(self.model.head_dim, num_lanes)
 
+    # Actual head dimension used for compute, does not include scale factors.
     @property
-    def aligned_kv_head_dim(self) -> int:
+    def compute_kv_head_dim(self) -> int:
         num_lanes = pltpu.get_tpu_info().num_lanes
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return utils.align_to(self.model.head_dim,
                                   num_sublanes * kv_packing)
+        return utils.align_to(self.model.head_dim, num_lanes)
+
+    # Head dimension used for storing kv in VMEM, includes scale factors if
+    # per_token_scale is enabled.
+    @property
+    def aligned_kv_head_dim(self) -> int:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
+
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            total_head_dim = self.model.head_dim
+            if self.serve.dtype_kv == jnp.uint8:
+                total_head_dim = total_head_dim // 2
+            # If per-token scale is enabled, we need to add num_scale_channels to the
+            # head dimension to account for the scale factor. Note that if per-token
+            # scale is not enabled, self.serve.scale_channels is 0.
+            total_head_dim += self.serve.scale_channels
+
+            return utils.align_to(total_head_dim, num_sublanes * kv_packing)
+
         return utils.align_to(self.model.head_dim, num_lanes)
 
     @property
@@ -313,16 +346,16 @@ class RpaConfigs:
     @property
     def q_bytes_per_token(self) -> int:
         q_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_q)
-        return int(self.model.num_kv_heads *
-                self.aligned_num_q_heads_per_kv_head *
-                self.aligned_q_head_dim * q_dtype_bytes) >> 3
+        return int(
+            self.model.num_kv_heads * self.aligned_num_q_heads_per_kv_head *
+            self.aligned_q_head_dim * q_dtype_bytes) >> 3
 
     @property
     def o_bytes_per_token(self) -> int:
         out_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_out)
-        return int(self.model.num_kv_heads *
-                self.aligned_num_q_heads_per_kv_head *
-                self.aligned_q_head_dim * out_dtype_bytes) >> 3
+        return int(
+            self.model.num_kv_heads * self.aligned_num_q_heads_per_kv_head *
+            self.aligned_q_head_dim * out_dtype_bytes) >> 3
 
     @property
     def q_vmem_shape(self):
@@ -388,7 +421,7 @@ class RpaConfigs:
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
-            self.aligned_kv_head_dim,
+            self.compute_kv_head_dim,
         )
 
     @property
@@ -418,10 +451,16 @@ class RpaConfigs:
             raise ValueError(
                 "Expected number of sequences in Q, K, and V to be the same, but got"
                 f" {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}")
-        if not (q.shape[2] == k.shape[2] == v.shape[2]):
+        expected_kv_head_dim = q.shape[2]
+        if self.serve.dtype_kv == jnp.uint8:
+            expected_kv_head_dim = q.shape[2] // 2
+
+        if not (k.shape[2] == v.shape[2] == expected_kv_head_dim):
             raise ValueError(
-                "Expected number of head dimensions in Q, K, and V to be the same,"
-                f" but got {q.shape[2]=}, {k.shape[2]=}, and {v.shape[2]=}")
+                "Expected number of head dimensions in K and V to be"
+                f" {expected_kv_head_dim} (matching Q shape {q.shape[2]} with"
+                f" packing for {self.serve.dtype_kv}), but got {k.shape[2]=} and"
+                f" {v.shape[2]=}")
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             if self.serve.page_size % 128 != 0:
@@ -448,14 +487,17 @@ class RpaConfigs:
             raise ValueError(f"Expected {kv_cache.shape=} to be equal to"
                              f" {expected_kv_cache_shape=}")
 
-        # Integer kv quantization is currently not supported.
-        if not jnp.issubdtype(kv_cache.dtype, jnp.floating):
-            raise ValueError(
-                f"Expected {kv_cache.dtype=} to be a floating point.")
-        if not (kv_cache.dtype == k.dtype == v.dtype):
-            raise ValueError(
-                "Expected KV cache dtype and K/V dtype to be the same, but got"
-                f" {kv_cache.dtype=}, {k.dtype=}, and {v.dtype=}")
+        # If we are using per-token quantization, we expect the kv-cache scale to be
+        # in VMEM, and so it will not be in the configs.
+        if self.serve.per_token_scale:
+            if self.serve.kv_layout != KVLayout.SEQ_ALONG_LANE:
+                raise ValueError(
+                    "Expected kv_layout=KVLayout.SEQ_ALONG_LANE when per_token_scale is"
+                    f" True, but got {self.serve.kv_layout=}.")
+            if self.serve.scale_k is not None or self.serve.scale_v is not None:
+                raise ValueError(
+                    "Expected scale_k and scale_v to be None when per_token_scale is"
+                    " True.")
 
         if not (jnp.int32 == kv_lens.dtype == page_indices.dtype ==
                 cu_q_lens.dtype == distribution.dtype):
