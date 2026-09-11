@@ -23,14 +23,14 @@ from vllm_torchtpu.layers.vllm import cp_mla_attention as cp_mla
 
 
 class _FakeGroup:
-    """Serves `all_gather`/`all_reduce` from a full stack of rank partials.
+    """Serves `all_gather`/`reduce_scatter` from a full stack of rank partials.
 
-    `all_reduce` is where the fake has to be careful: the real collective sums
-    contributions from every rank, but only one rank's tensor is passed in. So
-    the summands come from the stack, and the argument is ignored beyond its
-    shape -- which means `all_reduce` here is only faithful when every rank
-    would have called it with its own weighted output, exactly as
-    `merge_lse_partials` does.
+    `reduce_scatter` is where the fake has to be careful: the real collective
+    sums a contribution from every rank, but only one rank's tensor is passed
+    in. The other summands are produced by running the module's own
+    `_weight_by_lse` as each peer -- rather than by reimplementing the
+    weighting here, which would quietly replace the code under test with a
+    second copy of itself and leave the real one unexercised.
     """
 
     def __init__(self, outputs, lses, rank):
@@ -43,29 +43,54 @@ class _FakeGroup:
         assert dim == 0 and tensor.shape[0] == 1
         return self._lses.clone()
 
-    def all_reduce(self, tensor):
-        shift = torch.where(torch.isfinite(self._lses), self._lses,
-                            torch.full_like(self._lses,
-                                            float("-inf"))).amax(dim=0)
-        empty = ~torch.isfinite(shift)
-        shift = torch.where(empty, torch.zeros_like(shift), shift)
-        w = torch.where(torch.isfinite(self._lses),
-                        torch.exp(self._lses - shift.unsqueeze(0)),
-                        torch.zeros_like(self._lses))
-        denom = w.sum(0)
-        w = w / torch.where(denom > 0, denom, torch.ones_like(denom))
-        return (self._outputs * w.unsqueeze(-1)).sum(0).to(tensor.dtype)
+    def _reduced(self, dtype):
+        """What the real all-reduce inside the reduce-scatter would sum."""
+        total = None
+        for rank in range(self.world_size):
+            peer = _FakeGroup(self._outputs, self._lses, rank)
+            term = cp_mla._weight_by_lse(self._outputs[rank], self._lses[rank],
+                                         peer)
+            total = term if total is None else total + term
+        return total.to(dtype)
 
     def reduce_scatter(self, tensor, dim=-1):
-        total = self.all_reduce(tensor)
+        total = self._reduced(tensor.dtype)
         width = total.shape[dim] // self.world_size
         return total.narrow(dim, self.rank_in_group * width, width)
 
 
 def _merge_as_rank(outputs, lses, rank, monkeypatch):
+    """The merge as rank `r` sees it: its own head block of the whole answer."""
     group = _FakeGroup(outputs, lses, rank)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
-    return cp_mla.merge_lse_partials(outputs[rank], lses[rank])
+    return cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
+
+
+def _merge_whole(outputs, lses, monkeypatch):
+    """The full merged tensor, reassembled from every rank's scatter block.
+
+    The scatter deliberately leaves each rank only `num_heads // dcp_size`
+    heads, so the whole-context tensor the arithmetic tests below want is the
+    concatenation of what all `dcp_size` ranks got back.
+    """
+    return torch.cat([
+        _merge_as_rank(outputs, lses, rank, monkeypatch)
+        for rank in range(outputs.shape[0])
+    ],
+                     dim=1)
+
+
+def _reference_merge(outputs, lses):
+    """`o = sum_r softmax_r(lse) * o_r` in f64 numpy, owing nothing to the
+    module -- an oracle rather than a second opinion."""
+    out = outputs.numpy().astype(np.float64)
+    lse = lses.numpy().astype(np.float64)
+    shift = np.where(np.isfinite(lse), lse, -np.inf).max(axis=0)
+    shift = np.where(np.isfinite(shift), shift, 0.0)
+    weights = np.where(np.isfinite(lse), np.exp(lse - shift[None]), 0.0)
+    denom = weights.sum(axis=0)
+    weights = weights / np.where(denom > 0.0, denom, 1.0)
+    return (out * weights[..., None]).sum(axis=0)
 
 
 def _jax_merge_worker(payload, queue):
@@ -119,7 +144,14 @@ def _jax_merge(outputs, lses):
     return payload
 
 
-def _partials(rng, dcp_size, tokens=8, heads=4, vdim=16, empty=()):
+def _partials(rng, dcp_size, tokens=8, local_heads=2, vdim=16, empty=()):
+    """Per-rank partials, sized the way the kernel really produces them.
+
+    `local_heads` is what a rank keeps *after* the scatter, so the merged head
+    axis is `dcp_size * local_heads` -- which is also the divisibility the
+    reduce-scatter requires.
+    """
+    heads = dcp_size * local_heads
     outputs = torch.from_numpy(
         rng.standard_normal(
             (dcp_size, tokens, heads, vdim)).astype(np.float32))
@@ -133,7 +165,7 @@ def _partials(rng, dcp_size, tokens=8, heads=4, vdim=16, empty=()):
 @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
 def test_torch_merge_matches_the_jax_merge(dcp_size, monkeypatch):
     outputs, lses = _partials(np.random.default_rng(20260907), dcp_size)
-    got = _merge_as_rank(outputs, lses, 0, monkeypatch).numpy()
+    got = _merge_whole(outputs, lses, monkeypatch).numpy()
     np.testing.assert_allclose(got,
                                _jax_merge(outputs, lses),
                                rtol=1e-5,
@@ -141,20 +173,27 @@ def test_torch_merge_matches_the_jax_merge(dcp_size, monkeypatch):
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
-def test_every_rank_computes_the_same_answer(rank, monkeypatch):
-    """All-reduce means the result is replicated; the rank index must only
-    select which weight this rank contributes, never change the total."""
-    outputs, lses = _partials(np.random.default_rng(11), 4)
+def test_each_rank_gets_its_own_block_of_one_answer(rank, monkeypatch):
+    """The rank index must only select which head block comes back -- never
+    change the arithmetic that produced it."""
+    local_heads = 3
+    outputs, lses = _partials(np.random.default_rng(11),
+                              4,
+                              local_heads=local_heads)
     got = _merge_as_rank(outputs, lses, rank, monkeypatch).numpy()
-    ref = _merge_as_rank(outputs, lses, 0, monkeypatch).numpy()
-    np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
+    reference = _reference_merge(outputs, lses)
+    np.testing.assert_allclose(got,
+                               reference[:, rank * local_heads:(rank + 1) *
+                                         local_heads],
+                               rtol=1e-5,
+                               atol=1e-5)
 
 
 def test_ranks_owning_nothing_are_excluded(monkeypatch):
     """A `-inf` rank must contribute nothing -- not a small weight."""
     rng = np.random.default_rng(5)
     outputs, lses = _partials(rng, 4, empty=[(1, 3), (2, 3), (3, 3)])
-    got = _merge_as_rank(outputs, lses, 0, monkeypatch).numpy()
+    got = _merge_whole(outputs, lses, monkeypatch).numpy()
     # Token 3 is owned by rank 0 alone, so the merge must return rank 0's
     # output there verbatim.
     np.testing.assert_allclose(got[3],
@@ -167,16 +206,9 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
     """Padding rows are `-inf` everywhere; `inf - inf` must not leak out."""
     rng = np.random.default_rng(6)
     outputs, lses = _partials(rng, 4, empty=[(r, 7) for r in range(4)])
-    got = _merge_as_rank(outputs, lses, 0, monkeypatch).numpy()
+    got = _merge_whole(outputs, lses, monkeypatch).numpy()
     assert np.isfinite(got).all()
     np.testing.assert_array_equal(got[7], np.zeros_like(got[7]))
-
-
-def test_merge_is_a_noop_without_a_group(monkeypatch):
-    """Single-rank and pre-init paths must not pay for, or require, DCP."""
-    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
-    out = torch.ones(2, 3, 4)
-    assert cp_mla.merge_lse_partials(out, torch.zeros(2, 3)) is out
 
 
 class _HeadGatherGroup:
@@ -219,33 +251,8 @@ def test_head_gather_is_a_noop_without_a_group(monkeypatch):
     assert cp_mla.all_gather_heads(q) is q
 
 
-@pytest.mark.parametrize("rank", [0, 1, 2, 3])
-def test_scatter_merge_is_the_all_reduce_merge_narrowed(rank, monkeypatch):
-    """The two merges must agree; only the head axis they leave behind differs.
-
-    Every rank attended with all `dcp_size * heads` heads, so the whole-context
-    answer is the same tensor either way -- the scatter just drops the
-    `dcp_size - 1` head blocks whose `W_UV` lives on another rank.
-    """
-    dcp_size, local_heads = 4, 3
-    outputs, lses = _partials(np.random.default_rng(77),
-                              dcp_size,
-                              heads=dcp_size * local_heads)
-    group = _FakeGroup(outputs, lses, rank)
-    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
-
-    whole = cp_mla.merge_lse_partials(outputs[rank], lses[rank])
-    mine = cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
-
-    assert mine.shape == (outputs.shape[1], local_heads, outputs.shape[3])
-    np.testing.assert_allclose(mine.numpy(),
-                               whole[:, rank * local_heads:(rank + 1) *
-                                     local_heads].numpy(),
-                               rtol=1e-6,
-                               atol=1e-6)
-
-
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):
+    """Single-rank and pre-init paths must not pay for, or require, DCP."""
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     out = torch.ones(2, 3, 4)
     assert cp_mla.merge_lse_partials_scatter_heads(out, torch.zeros(2,
@@ -259,7 +266,8 @@ def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
     the result must equal the softmax over all the keys at once.
     """
     rng = np.random.default_rng(99)
-    dcp_size, tokens, heads, vdim, keys = 4, 6, 3, 8, 40
+    dcp_size, tokens, local_heads, vdim, keys = 4, 6, 3, 8, 40
+    heads = dcp_size * local_heads
     q = rng.standard_normal((tokens, heads, vdim))
     k = rng.standard_normal((keys, vdim))
     v = rng.standard_normal((keys, vdim))
@@ -279,7 +287,7 @@ def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
         outs[r] = np.einsum("tnk,kd->tnd", e / e.sum(-1, keepdims=True),
                             v[r::dcp_size])
 
-    got = _merge_as_rank(
+    got = _merge_whole(
         torch.from_numpy(outs).float(),
-        torch.from_numpy(lses).float(), 0, monkeypatch).numpy()
+        torch.from_numpy(lses).float(), monkeypatch).numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
