@@ -1493,8 +1493,9 @@ class TPURaidenConnectorWorker:
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.dp_rank: int = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
-        self.host_ip = dist_utils.get_host_ip()
+        self.dp_rank: int = (vllm_config.parallel_config.data_parallel_rank
+                             if vllm_config.parallel_config else 0)
+        self.host_ip = dist_utils.get_kv_transfer_ip()
         self.kv_transfer_port = int(dist_utils.get_kv_transfer_port()) + (
             2 * self.dp_rank * self.tp_size)
         self._raiden_transfer_engine: Optional["KVCacheManager"] = None
@@ -2134,6 +2135,14 @@ class TPURaidenConnectorWorker:
         if not listener_address:
             raise RuntimeError(
                 "Stage-3 Raiden manager did not advertise a listener endpoint")
+
+        if self.host_ip and self.host_ip not in ("0.0.0.0", "::"):
+            if ":" in data_address:
+                data_port = data_address.rsplit(":", 1)[-1]
+                data_address = f"{self.host_ip}:{data_port}"
+            if ":" in listener_address:
+                listener_port = listener_address.rsplit(":", 1)[-1]
+                listener_address = f"{self.host_ip}:{listener_port}"
 
         fingerprint, fingerprint_payload, page_tokens = (
             self._measure_stage3_layout(manifest))

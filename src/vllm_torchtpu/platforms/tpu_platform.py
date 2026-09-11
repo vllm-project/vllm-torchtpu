@@ -4,6 +4,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import glob
 import os
 import time
 from typing import TYPE_CHECKING, Optional, Tuple, Union
@@ -699,6 +700,43 @@ class TpuPlatform(Platform):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return hardware.get_tpu_device_name()
+
+    @classmethod
+    def get_device_numa_node(cls, device_id: int = 0) -> int | None:
+        """Returns the hardware NUMA node of a TPU device.
+
+        Scans sysfs (/sys/bus/pci/devices) to discover TPU PCI devices and
+        their NUMA affinity. Maps logical device_id to physical endpoint.
+        Returns None if sysfs is unavailable or cannot be resolved.
+        """
+        if (not isinstance(device_id, int) or isinstance(device_id, bool)
+                or device_id < 0):
+            return None
+
+        endpoints: list[int] = []
+        try:
+            for p in sorted(glob.glob("/sys/bus/pci/devices/*")):
+                try:
+                    with open(f"{p}/vendor", "r", encoding="utf-8") as f:
+                        v = f.read().strip().lower()
+                    with open(f"{p}/device", "r", encoding="utf-8") as f:
+                        d = f.read().strip().lower()
+                    if (v == hardware._GOOGLE_PCI_VENDOR_ID.lower()
+                            and d in hardware._PCI_DEVICE_ID_TO_NAME):
+                        with open(f"{p}/numa_node", "r",
+                                  encoding="utf-8") as f:
+                            val = int(f.read().strip())
+                            if val >= 0:
+                                endpoints.append(val)
+                except (OSError, ValueError):
+                    pass
+        except OSError:
+            return None
+
+        if not endpoints:
+            return None
+
+        return endpoints[device_id % len(endpoints)]
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:

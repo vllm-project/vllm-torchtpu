@@ -1,3 +1,8 @@
+import json
+import os
+import subprocess
+from collections import defaultdict
+
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
@@ -33,6 +38,121 @@ def get_kv_ports() -> str:
 def get_host_ip() -> str:
     """Use `VLLM_HOST_IP` if set, otherwise use default network interface IP."""
     return get_ip()
+
+
+def get_kv_transfer_ips(
+    configured_ips: str | list[str] | None = None, ) -> list[str]:
+    """Returns list of IPs configured for KV transfer, or falls back to
+    [get_host_ip()].
+
+    Precedence:
+    1. Explicit multi-NIC environment variable: TPU_KV_TRANSFER_IPS
+    2. Configured transfer host IPs from kv_transfer_config (configured_ips)
+    3. Fallback to [get_host_ip()]
+    """
+    raw = envs.TPU_KV_TRANSFER_IPS
+    if raw.strip():
+        ips = [ip.strip() for ip in raw.split(",") if ip.strip()]
+        if ips:
+            return ips
+
+    if isinstance(configured_ips, str):
+        configured_ips = [
+            ip.strip() for ip in configured_ips.split(",") if ip.strip()
+        ]
+    if configured_ips:
+        return list(configured_ips)
+
+    return [get_host_ip()]
+
+
+def _read_interface_numa_node(ifname: str) -> int:
+    """Reads the hardware NUMA node index for a given network interface name."""
+    numa_path = f"/sys/class/net/{ifname}/device/numa_node"
+    if os.path.exists(numa_path):
+        try:
+            with open(numa_path, "r", encoding="utf-8") as f:
+                val = int(f.read().strip())
+                return max(val, 0)
+        except (OSError, ValueError):
+            pass
+    return 0
+
+
+def _get_local_ip_to_numa_map() -> dict[str, int]:
+    """Inspects local network interfaces and maps their IPv4 addresses to
+    NUMA nodes."""
+    ip_to_numa: dict[str, int] = {}
+    try:
+        out = subprocess.check_output(["ip", "-j", "-4", "addr", "show"],
+                                      text=True,
+                                      stderr=subprocess.DEVNULL)
+        data = json.loads(out)
+        for entry in data:
+            ifname = entry.get("ifname", "")
+            if not ifname or ifname == "lo":
+                continue
+            numa_node = _read_interface_numa_node(ifname)
+            for addr_info in entry.get("addr_info", []):
+                ip = addr_info.get("local")
+                if ip:
+                    ip_to_numa[ip] = numa_node
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
+        logger.debug("Failed to discover IP-to-NUMA mapping: %s", exc)
+
+    return ip_to_numa
+
+
+def get_kv_transfer_ip() -> str:
+    """Resolves the NUMA-appropriate KV transfer IP for the local TPU worker."""
+    ips = get_kv_transfer_ips()
+    if not ips:
+        return get_host_ip()
+    if len(ips) <= 1:
+        return ips[0]
+
+    raw_rank = os.environ.get("LOCAL_RANK", "0")
+    try:
+        device_id = int(raw_rank)
+        if device_id < 0:
+            device_id = 0
+    except (ValueError, TypeError):
+        device_id = 0
+
+    ip_to_numa = _get_local_ip_to_numa_map()
+    numa_to_ips: dict[int, list[str]] = defaultdict(list)
+    for ip in ips:
+        if ip in ip_to_numa:
+            numa_to_ips[ip_to_numa[ip]].append(ip)
+
+    dev_numa = None
+    try:
+        from vllm.platforms import current_platform
+        get_numa_fn = getattr(current_platform, "get_device_numa_node", None)
+        if callable(get_numa_fn):
+            dev_numa = get_numa_fn(device_id)
+    except Exception as exc:
+        logger.debug("Failed to query device NUMA node: %s", exc)
+
+    unique_numas = sorted(numa_to_ips.keys())
+    if len(unique_numas) >= 2 and dev_numa is not None:
+        if dev_numa in numa_to_ips:
+            target_ips = numa_to_ips[dev_numa]
+            if len(target_ips) == 1:
+                return target_ips[0]
+            return target_ips[device_id % len(target_ips)]
+
+    fallback_ip = ips[device_id % len(ips)]
+    logger.warning(
+        "Unable to resolve NUMA-aware KV transfer IP for device_id=%s "
+        "(device NUMA=%s, detected local IP-to-NUMA map=%s). Falling back to "
+        "round-robin assignment: %s",
+        device_id,
+        dev_numa,
+        ip_to_numa,
+        fallback_ip,
+    )
+    return fallback_ip
 
 
 def get_kv_transfer_port() -> str:

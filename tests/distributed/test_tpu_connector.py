@@ -217,6 +217,9 @@ def _make_raiden_worker(*,
                             pcp_size=pcp_size,
                             interleave_size=interleave_size,
                             pp_size=pp_size)
+    extra = cfg.kv_transfer_config.kv_connector_extra_config
+    if kv_ips != "127.0.0.1" and "kv_transfer_ips" not in extra:
+        extra["kv_transfer_ips"] = kv_ips
     with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank), \
          patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size), \
          patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
@@ -1959,6 +1962,7 @@ class TestTPURaidenConnectorWorker:
                 dp_size=1 if is_producer else 8,
                 pcp_size=8 if is_producer else 1,
                 interleave_size=4,
+                kv_ips=host,
             )
             named, groups = _synthetic_qwen35_materialization(
                 tp_size=1, pcp_size=8 if is_producer else 1)
@@ -2051,6 +2055,104 @@ class TestTPURaidenConnectorWorker:
                                                          if is_producer else 8)
             assert worker._raiden_controller_facade is facade
             assert worker._raiden_work_unit is unit
+
+    def test_configured_transfer_host_ip_takes_precedence(self, monkeypatch):
+        # 1. TPU_KV_TRANSFER_IPS environment variable takes precedence
+        monkeypatch.setenv("TPU_KV_TRANSFER_IPS", "10.50.0.1")
+        cfg = _make_vllm_config(is_producer=True)
+        with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=0), \
+             patch(f"{_MOD}.get_tensor_model_parallel_world_size",
+                   return_value=1), \
+             patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
+             patch(f"{_MOD}.dist_utils.get_host_ip",
+                   return_value="127.0.0.1"), \
+             patch(f"{_MOD}.dist_utils.get_kv_transfer_port",
+                   return_value=9100):
+            worker = TPURaidenConnectorWorker(cfg)
+            assert worker.host_ip == "10.50.0.1"
+
+        # 2. Defaults to get_host_ip() when TPU_KV_TRANSFER_IPS is unset
+        monkeypatch.delenv("TPU_KV_TRANSFER_IPS", raising=False)
+        cfg2 = _make_vllm_config(is_producer=True)
+        with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=0), \
+             patch(f"{_MOD}.get_tensor_model_parallel_world_size",
+                   return_value=1), \
+             patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
+             patch(f"{_MOD}.dist_utils.get_host_ip",
+                   return_value="127.0.0.1"), \
+             patch(f"{_MOD}.dist_utils.get_kv_transfer_port",
+                   return_value=9100):
+            worker2 = TPURaidenConnectorWorker(cfg2)
+            assert worker2.host_ip == "127.0.0.1"
+
+    def test_tpu_connector_resolves_kv_transfer_ip(self, monkeypatch):
+        # Verify that TPURaidenConnectorWorker calls
+        # dist_utils.get_kv_transfer_ip for both producer and consumer.
+        captured_calls = []
+
+        def mock_get_ip(*args, **kwargs):
+            captured_calls.append({"args": args, "kwargs": kwargs})
+            return "10.0.0.6"
+
+        # 1. Producer
+        cfg_prod = _make_vllm_config(is_producer=True)
+        with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=0), \
+             patch(f"{_MOD}.get_tensor_model_parallel_world_size",
+                   return_value=1), \
+             patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
+             patch(f"{_MOD}.dist_utils.get_kv_transfer_ip",
+                   side_effect=mock_get_ip), \
+             patch(f"{_MOD}.dist_utils.get_kv_transfer_port",
+                   return_value=9100):
+            worker_prod = TPURaidenConnectorWorker(cfg_prod)
+            assert worker_prod.host_ip == "10.0.0.6"
+            assert len(captured_calls) == 1
+            assert captured_calls[-1] == {"args": (), "kwargs": {}}
+
+        # 2. Consumer (Decode)
+        cfg_cons = _make_vllm_config(is_producer=False)
+        cfg_cons.parallel_config.data_parallel_rank = 4
+        cfg_cons.parallel_config.data_parallel_size = 8
+        with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=0), \
+             patch(f"{_MOD}.get_tensor_model_parallel_world_size",
+                   return_value=1), \
+             patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
+             patch(f"{_MOD}.dist_utils.get_kv_transfer_ip",
+                   side_effect=mock_get_ip), \
+             patch(f"{_MOD}.dist_utils.get_kv_transfer_port",
+                   return_value=9100):
+            worker_cons = TPURaidenConnectorWorker(cfg_cons)
+            assert worker_cons.host_ip == "10.0.0.6"
+            assert len(captured_calls) == 2
+            assert captured_calls[-1] == {"args": (), "kwargs": {}}
+
+    def test_tpu_connector_numa_ip_mapping(self, monkeypatch):
+        # Verify that TPURaidenConnectorWorker maps devices 0..3 to NUMA 0 IP
+        # and devices 4..7 to NUMA 1 IP when dual IPs are configured.
+        ip_to_numa = {"10.10.0.3": 0, "10.190.0.3": 1}
+        monkeypatch.setattr(
+            "vllm_torchtpu.distributed.utils._get_local_ip_to_numa_map",
+            lambda: ip_to_numa,
+        )
+        monkeypatch.setattr(
+            "vllm.platforms.current_platform.get_device_numa_node",
+            lambda dev_id: 0 if dev_id < 4 else 1,
+        )
+        monkeypatch.setenv("TPU_KV_TRANSFER_IPS", "10.10.0.3,10.190.0.3")
+        for dev_id in range(8):
+            cfg = _make_vllm_config(is_producer=False)
+            cfg.parallel_config.data_parallel_rank = dev_id
+            monkeypatch.setenv("LOCAL_RANK", str(dev_id))
+            with patch(f"{_MOD}.get_tensor_model_parallel_rank",
+                       return_value=0), \
+                 patch(f"{_MOD}.get_tensor_model_parallel_world_size",
+                       return_value=1), \
+                 patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
+                 patch(f"{_MOD}.dist_utils.get_kv_transfer_port",
+                       return_value=9100):
+                worker = TPURaidenConnectorWorker(cfg)
+                expected_ip = "10.10.0.3" if dev_id < 4 else "10.190.0.3"
+                assert worker.host_ip == expected_ip
 
     def test_stage3_producer_unit_ids_are_unique_and_enumerable(self):
         fields = [

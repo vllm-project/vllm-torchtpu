@@ -761,3 +761,155 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
     config = SimpleNamespace(hf_config=None, model="Qwen/Qwen3-VL-4B")
     assert tpu_platform._apply_model_specific_patches(config) is None
     assert torch.cumsum is original_cumsum
+
+
+def test_get_device_numa_node_invalid_args():
+    assert TpuPlatform.get_device_numa_node(None) is None
+    assert TpuPlatform.get_device_numa_node(-1) is None
+    assert TpuPlatform.get_device_numa_node(-5) is None
+    assert TpuPlatform.get_device_numa_node("0") is None
+    assert TpuPlatform.get_device_numa_node(1.5) is None
+    assert TpuPlatform.get_device_numa_node(True) is None
+    assert TpuPlatform.get_device_numa_node(False) is None
+
+
+def test_get_device_numa_node_no_devices(monkeypatch):
+    monkeypatch.setattr("glob.glob", lambda pat: [])
+    assert TpuPlatform.get_device_numa_node(0) is None
+
+
+def test_get_device_numa_node_filters_non_tpu_pci_devices(monkeypatch):
+    import builtins
+    from io import StringIO
+
+    fake_pci_devs = [f"/sys/bus/pci/devices/0000:00:0{i}.0" for i in range(2)]
+    monkeypatch.setattr("glob.glob", lambda pat: fake_pci_devs)
+
+    orig_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        filepath = str(file)
+        if "vendor" in filepath:
+            return StringIO("0x10de\n")  # NVIDIA vendor ID
+        if "device" in filepath:
+            return StringIO("0x2330\n")
+        if "numa_node" in filepath:
+            return StringIO("0\n")
+        return orig_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert TpuPlatform.get_device_numa_node(0) is None
+
+
+def test_get_device_numa_node_unassigned_numa_node(monkeypatch):
+    import builtins
+    from io import StringIO
+
+    fake_pci_devs = [f"/sys/bus/pci/devices/0000:00:0{i}.0" for i in range(4)]
+    monkeypatch.setattr("glob.glob", lambda pat: fake_pci_devs)
+
+    orig_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        filepath = str(file)
+        if "vendor" in filepath:
+            return StringIO("0x1ae0\n")
+        if "device" in filepath:
+            return StringIO("0x0076\n")
+        if "numa_node" in filepath:
+            return StringIO("-1\n")
+        return orig_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert TpuPlatform.get_device_numa_node(0) is None
+
+
+def test_get_device_numa_node_v7x_physical_8_endpoints(monkeypatch):
+    import builtins
+    from io import StringIO
+
+    # 8 PCI endpoints in sysfs (4 physical chips * 2 functions) as on
+    # physical v7x
+    fake_pci_devs = [
+        "0000:00:03.0",
+        "0000:00:03.1",
+        "0000:00:04.0",
+        "0000:00:04.1",
+        "0000:c0:00.0",
+        "0000:c0:00.1",
+        "0000:c0:02.0",
+        "0000:c0:02.1",
+    ]
+    pci_paths = [f"/sys/bus/pci/devices/{bdf}" for bdf in fake_pci_devs]
+    monkeypatch.setattr("glob.glob", lambda pat: pci_paths)
+
+    orig_open = builtins.open
+    chip_numa_map = {
+        "0000:00:03.0": 0,
+        "0000:00:03.1": 0,
+        "0000:00:04.0": 0,
+        "0000:00:04.1": 0,
+        "0000:c0:00.0": 1,
+        "0000:c0:00.1": 1,
+        "0000:c0:02.0": 1,
+        "0000:c0:02.1": 1,
+    }
+
+    def fake_open(file, *args, **kwargs):
+        filepath = str(file)
+        for bdf, path in zip(fake_pci_devs, pci_paths):
+            if filepath == f"{path}/vendor":
+                return StringIO("0x1ae0\n")
+            if filepath == f"{path}/device":
+                return StringIO("0x0076\n")
+            if filepath == f"{path}/numa_node":
+                return StringIO(f"{chip_numa_map[bdf]}\n")
+        return orig_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    for dev_id in range(4):
+        assert TpuPlatform.get_device_numa_node(dev_id) == 0
+    for dev_id in range(4, 8):
+        assert TpuPlatform.get_device_numa_node(dev_id) == 1
+
+
+def test_get_device_numa_node_v6e_single_device_per_chip(monkeypatch):
+    import builtins
+    from io import StringIO
+
+    # 4 physical chips of TPU v6e (0x006f)
+    fake_pci_devs = [f"/sys/bus/pci/devices/0000:00:0{i}.0" for i in range(4)]
+    monkeypatch.setattr("glob.glob", lambda pat: fake_pci_devs)
+
+    orig_open = builtins.open
+    chip_numa_map = {0: 0, 1: 0, 2: 1, 3: 1}
+
+    def fake_open(file, *args, **kwargs):
+        filepath = str(file)
+        for idx, p in enumerate(fake_pci_devs):
+            if filepath == f"{p}/vendor":
+                return StringIO("0x1ae0\n")
+            if filepath == f"{p}/device":
+                return StringIO("0x006f\n")
+            if filepath == f"{p}/numa_node":
+                return StringIO(f"{chip_numa_map[idx]}\n")
+        return orig_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    assert TpuPlatform.get_device_numa_node(0) == 0
+    assert TpuPlatform.get_device_numa_node(1) == 0
+    assert TpuPlatform.get_device_numa_node(2) == 1
+    assert TpuPlatform.get_device_numa_node(3) == 1
+
+
+def test_get_device_numa_node_io_errors(monkeypatch):
+    fake_pci_devs = [f"/sys/bus/pci/devices/0000:00:0{i}.0" for i in range(2)]
+    monkeypatch.setattr("glob.glob", lambda pat: fake_pci_devs)
+
+    def fake_open(file, *args, **kwargs):
+        raise OSError("Permission denied")
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert TpuPlatform.get_device_numa_node(0) is None

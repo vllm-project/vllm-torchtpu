@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_KV_TRANSFER_IPS: str = ""
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -581,6 +582,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # KV transfer / Raiden knobs. Each getter in distributed/utils.py
     # documents what its knob does; this is the parsing and the default.
 
+    # Comma-separated list of IP addresses configured for multi-NIC KV transfer.
+    "TPU_KV_TRANSFER_IPS":
+    env_str("TPU_KV_TRANSFER_IPS", ""),
     # TCP port the KV wire transfer listens on.
     "TPU_KV_TRANSFER_PORT":
     env_str("TPU_KV_TRANSFER_PORT", "9100"),
