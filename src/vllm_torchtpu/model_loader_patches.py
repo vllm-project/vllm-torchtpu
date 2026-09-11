@@ -56,6 +56,7 @@ from typing import Optional
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -233,7 +234,7 @@ def _sharded_runai_weights_iterator(
         # streaming). This iterator runs on the same thread that consumes
         # the tensors, so a periodic device sync here releases the queued
         # copies' host sources and bounds resident memory to a window.
-        sync_every = int(os.getenv("TPU_SHARDED_LOAD_SYNC_EVERY", "512"))
+        sync_every = envs.TPU_SHARDED_LOAD_SYNC_EVERY
 
         def _device_sync() -> None:
             try:
@@ -381,8 +382,6 @@ def patch_default_model_loader_page_cache() -> None:
     for runtime allocations such as large KV cache offloading.
     Guarded by TPU_EVICT_WEIGHTS_PAGE_CACHE (default: False).
     """
-    from vllm_torchtpu import envs
-
     if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
         return
 

@@ -61,7 +61,7 @@ logger = init_logger(__name__)
 
 
 def _get_default_ipc_key() -> bytes:
-    key_str = os.environ.get("VLLM_TORCHTPU_IPC_KEY", "")
+    key_str = envs.VLLM_TORCHTPU_IPC_KEY
     if key_str:
         return key_str.encode("utf-8")
     machine_id = ""

@@ -37,6 +37,7 @@ from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
 from vllm.v1.executor.ray_utils import _wait_until_pg_ready
 from vllm.v1.outputs import ModelRunnerOutput
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
@@ -109,8 +110,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         placement_group = self.parallel_config.placement_group
 
         # Disable Ray usage stats collection.
-        ray_usage = os.environ.get("RAY_USAGE_STATS_ENABLED", "0")
-        if ray_usage != "1":
+        if tpu_envs.RAY_USAGE_STATS_ENABLED != "1":
             os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
         # Create the parallel GPU workers.
@@ -381,7 +381,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             host_workers[each.ip].append(each)
 
         sb_addresses = []
-        base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
+        base_port = tpu_envs.TORCH_TPU_BASE_PORT
         for ip in sorted(host_workers.keys()):
             for i in range(len(host_workers[ip])):
                 sb_addresses.append(f"{ip}:{base_port + i}")

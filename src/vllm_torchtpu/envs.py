@@ -107,6 +107,18 @@ if TYPE_CHECKING:
     KDA_PACK_HEAD_INV: bool = True
     KDA_PACKED_METADATA: bool = True
     KDA_FWD_MB: int | None = None
+    SPEC_WARMUP: bool = True
+    RAIDEN_DISABLE_SINGLETON_WORKER: bool | None = None
+    RAIDEN_SHM_KEY: str = ""
+    VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
+    VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TORCHTPU_IPC_KEY: str = ""
+    TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
+    VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
+    TPU_LOCAL_RANK_OFFSET: int = 0
+    DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
+    TORCH_TPU_BASE_PORT: int = 8070
+    TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
 
 
 def env_with_choices(
@@ -189,7 +201,12 @@ def env_int(env_name: str, default: int) -> Callable[[], int]:
         value = os.getenv(env_name)
         if value is None or value.strip() == "":
             return default
-        return int(value)
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be an integer."
+            ) from exc
 
     return _get_int_env
 
@@ -221,7 +238,12 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
         value = os.getenv(env_name)
         if value is None or value.strip() == "":
             return default
-        return float(value)
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be a number."
+            ) from exc
 
     return _get_float_env
 
@@ -684,6 +706,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("KDA_PACKED_METADATA", default=True),
     "KDA_FWD_MB":
     env_optional_int("KDA_FWD_MB"),
+
+    # Startup and host-side knobs that used to be read inline (issue #773).
+    # None of them change what gets compiled; each is also listed in
+    # _TPU_COMPILE_ENV_IGNORED so it stays out of the compile-cache key.
+
+    # Run the real spec-decode dispatch once at startup so the first request
+    # does not pay for those compiles. Off skips that warmup.
+    "SPEC_WARMUP":
+    env_bool("SPEC_WARMUP", default=True),
+    # Raiden library switch. The TPU offloading connector cannot run next to
+    # the raiden singleton worker, so it refuses an explicit false value
+    # here and otherwise sets the variable to "1" itself.
+    "RAIDEN_DISABLE_SINGLETON_WORKER":
+    env_optional_bool("RAIDEN_DISABLE_SINGLETON_WORKER"),
+    # Raiden library key for shm-backed host pools, which the TPU offloading
+    # connector does not support: a non-empty value makes it refuse to start.
+    "RAIDEN_SHM_KEY":
+    env_str("RAIDEN_SHM_KEY", ""),
+    # Seconds; upper bound on a scheduler-side drain of in-flight offload
+    # jobs whose blocks are about to be reused.
+    "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S":
+    env_float("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
+    # How many times an offload save whose transfer failed is retried.
+    "VLLM_TPU_OFFLOAD_SAVE_RETRIES":
+    env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # Secret for the KV-transfer IPC socket; "" derives one from the host.
+    # Read raw, not through env_str: a secret's bytes must not be trimmed.
+    "VLLM_TORCHTPU_IPC_KEY":
+    lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
+    # Sync the device every N tensors during sharded EP weight loading so
+    # queued host copies are released; 0 disables the periodic sync.
+    "TPU_SHARDED_LOAD_SYNC_EVERY":
+    env_int("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
+    # Log the PCP sequence layout window on every step.
+    "VLLM_TPU_DEBUG_PCP_LAYOUT":
+    env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
+    # Added to every worker's local rank when it binds to a physical chip.
+    # worker/tpu_rank_binding.py reads it from the env mapping it is given.
+    "TPU_LOCAL_RANK_OFFSET":
+    env_int("TPU_LOCAL_RANK_OFFSET", 0),
+    # Same offset for the legacy worker init path; debug only.
+    "DEBUG_TPU_LOCAL_RANK_OFFSET":
+    env_int("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
+    # First slicebuilder port; each chip on a host takes base + local rank.
+    "TORCH_TPU_BASE_PORT":
+    env_int("TORCH_TPU_BASE_PORT", 8070),
+    # TCPStore port for the mp multihost rendezvous; unset means the vLLM
+    # coordination port plus one.
+    "TORCH_TPU_MP_RENDEZVOUS_PORT":
+    env_optional_int("TORCH_TPU_MP_RENDEZVOUS_PORT"),
 }
 
 

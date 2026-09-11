@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -10,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import \
     all_gather_equal_tokens as _pcp_all_gather_equal_tokens
 from vllm_torchtpu.distributed.pcp import all_reduce_sum as _pcp_all_reduce_sum
@@ -702,7 +702,7 @@ def prepare_pcp_sequence_layout(
                                         device="cpu")
     logits_owner_mask_cpu[:num_reqs] = torch.from_numpy(logits_owner_mask_np)
 
-    if os.environ.get("VLLM_TPU_DEBUG_PCP_LAYOUT") == "1":
+    if envs.VLLM_TPU_DEBUG_PCP_LAYOUT:
         layout_debug = _debug_pcp_layout_window(
             runner,
             pcp_rank=pcp_rank,

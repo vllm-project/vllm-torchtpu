@@ -33,8 +33,6 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform, _validate_phased_profiling_config, get_tpu_multihost_topology)
-from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
-                                             _debug_tpu_local_rank_offset)
 
 
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
@@ -92,15 +90,20 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
 
 
 def test_debug_tpu_local_rank_offset_env(monkeypatch):
-    monkeypatch.delenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, raising=False)
-    assert _debug_tpu_local_rank_offset() == 0
+    """The worker reads this through the registry now; the contract the old
+    inline helper had (0 when unset, int otherwise, an error that names the
+    variable) must survive the move."""
+    from vllm_torchtpu import envs
 
-    monkeypatch.setenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "4")
-    assert _debug_tpu_local_rank_offset() == 4
+    monkeypatch.delenv("DEBUG_TPU_LOCAL_RANK_OFFSET", raising=False)
+    assert envs.DEBUG_TPU_LOCAL_RANK_OFFSET == 0
 
-    monkeypatch.setenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "not-an-int")
-    with pytest.raises(ValueError, match=DEBUG_TPU_LOCAL_RANK_OFFSET_ENV):
-        _debug_tpu_local_rank_offset()
+    monkeypatch.setenv("DEBUG_TPU_LOCAL_RANK_OFFSET", "4")
+    assert envs.DEBUG_TPU_LOCAL_RANK_OFFSET == 4
+
+    monkeypatch.setenv("DEBUG_TPU_LOCAL_RANK_OFFSET", "not-an-int")
+    with pytest.raises(ValueError, match="DEBUG_TPU_LOCAL_RANK_OFFSET"):
+        _ = envs.DEBUG_TPU_LOCAL_RANK_OFFSET
 
 
 def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(

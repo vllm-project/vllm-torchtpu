@@ -56,6 +56,7 @@ from datetime import timedelta
 import torch.distributed as dist
 from vllm.utils.network_utils import get_ip
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -75,9 +76,9 @@ _keepalive_stores: list = []
 def _rendezvous_port(base_port: int) -> int:
     # A dedicated port next to the caller's own coordination port so this
     # doesn't collide with vLLM's own rendezvous on the same address.
-    override = os.environ.get("TORCH_TPU_MP_RENDEZVOUS_PORT")
-    if override:
-        return int(override)
+    override = envs.TORCH_TPU_MP_RENDEZVOUS_PORT
+    if override is not None:
+        return override
     return int(base_port) + 1
 
 
@@ -146,7 +147,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     # Same construction as ray_distributed_executor.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
-    base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
+    base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
         f"{ip}:{base_port + local_rank}" for ip in host_ips
         for local_rank in range(local_world_size)
@@ -238,7 +239,7 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # increases in host-major order under --data-parallel-start-rank.
     world_size = parallel_config.world_size
     local_chip_count = world_size * dp_size_local
-    base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
+    base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
         f"{ip}:{base_port + local_slot}" for ip in host_ips
         for local_slot in range(local_chip_count)

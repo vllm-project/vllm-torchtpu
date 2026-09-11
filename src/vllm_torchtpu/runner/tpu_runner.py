@@ -4580,7 +4580,7 @@ class TPUModelRunner(GPUModelRunner):
         This lifecycle is intentionally separate from ``_warmup_spec_decode``:
         a prefill-only producer must never synthesize decode/verify work.
         """
-        if os.environ.get("SPEC_WARMUP", "1") == "0":
+        if not envs.SPEC_WARMUP:
             return
         if self.enforce_eager or not self._is_async_drafter:
             return
@@ -4773,7 +4773,7 @@ class TPUModelRunner(GPUModelRunner):
         request just pays the bounded recompiles, as before) rather than breaking
         serving.
         """
-        if os.environ.get("SPEC_WARMUP", "1") == "0":
+        if not envs.SPEC_WARMUP:
             return  # escape hatch / A-B toggle
         if self.enforce_eager:
             return
