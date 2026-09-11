@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_JOINT_ROUTING_128: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
@@ -475,6 +476,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
+    # Opt in to the fixed 128-route stable order/inverse Pallas kernels.
+    # Applies only to eligible int32, non-EP routing; other inputs keep argsort.
+    # Set before server startup/JIT compilation. Off preserves both original sorts.
+    "TPU_MOE_JOINT_ROUTING_128":
+    env_bool("TPU_MOE_JOINT_ROUTING_128"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

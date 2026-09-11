@@ -19,6 +19,7 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.inverse_permutation import inverse_permutation_128
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
@@ -29,6 +30,8 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
     ragged_gather_reduce as ragged_gather_reduce_v3
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.stable_order_and_inverse import \
+    stable_order_and_inverse_128
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -212,8 +215,27 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
+    use_routing_128 = envs.TPU_MOE_JOINT_ROUTING_128
+    # For 128 routes, JAX argsort uses int64 indices iff x64 is enabled.
+    # Eligibility is entirely static; signed int32 key values are unrestricted.
+    if (use_routing_128 and not use_ep and topk_indices_flat.dtype == jnp.int32
+            and topk_indices_flat.shape == (128, )
+            and sort_keys.dtype == jnp.int32 and sort_keys.shape == (128, )
+            and not jax.config.x64_enabled):
+        sorted_indices, argsort_revert_indices = stable_order_and_inverse_128(
+            sort_keys)
+    else:
+        sorted_indices = jnp.argsort(sort_keys)
+        # The inverse helper needs an int32 permutation, even if the sort keys
+        # have another dtype. The flag also gates this fallback, so disabling
+        # it restores the original two-sort implementation.
+        if (use_routing_128 and not use_ep
+                and topk_indices_flat.dtype == jnp.int32
+                and sorted_indices.shape == (128, )
+                and sorted_indices.dtype == jnp.int32):
+            argsort_revert_indices = inverse_permutation_128(sorted_indices)
+        else:
+            argsort_revert_indices = jnp.argsort(sorted_indices)
 
     token_indices_sorted = token_indices_flat[sorted_indices]
     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
