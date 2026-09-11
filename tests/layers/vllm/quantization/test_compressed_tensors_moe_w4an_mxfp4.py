@@ -138,8 +138,8 @@ def test_mxfp4_apply_masks_padded_token_routes():
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    method._tpu_activation_str = "silu"
     layer = FakeRoutedExperts(experts_per_token=2)
-    layer._tpu_activation_str = "silu"
     layer.w13_weight = torch.empty(0)
     layer.w2_weight = torch.empty(0)
     layer.w13_weight_scale = torch.empty(0)

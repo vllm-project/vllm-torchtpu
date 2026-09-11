@@ -78,6 +78,17 @@ repos:
     language: system
     verbose: true
     stages: [commit-msg]
+  - id: check-env-reads
+    name: Env vars must be declared in envs.py
+    # Ratchet against tools/env_reads_baseline.txt: existing direct reads
+    # stay until migrated, a newly added one fails. See issue #773.
+    # `script`, not `system`: the file carries its own shebang and is
+    # executable, so the hook does not depend on a bare `python` being on
+    # PATH in whatever environment pre-commit runs in.
+    entry: tools/check_env_reads.py
+    language: script
+    always_run: true
+    pass_filenames: false
   - id: check-filenames
     name: Check for spaces in all filenames
     entry: bash

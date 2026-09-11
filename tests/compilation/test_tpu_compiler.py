@@ -166,6 +166,58 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/kernels/pool_adapters.py",
         } <= hashed
 
+    def test_serving_only_kv_knobs_stay_out_of_the_compile_cache_key(self):
+        """Serving-time knobs must stay out of the compile-cache key.
+
+        Every `envs.py` entry not in `_TPU_COMPILE_ENV_IGNORED` is hashed, so
+        a knob added there recompiles the world once on upgrade and again
+        every time an operator retunes it.
+        """
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _TPU_COMPILE_ENV_IGNORED, _tpu_compile_env_factors)
+
+        serving_only = {
+            "TPU_IPC_SOCKET_DIR",
+            "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
+            "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
+            "TPU_KV_LATENCY_LOG_INTERVAL",
+            "TPU_KV_PIN_SHM",
+            "TPU_KV_SHM_POOL_GB",
+            "TPU_KV_STAGE_WAITER_POOL_SIZE",
+            "TPU_KV_STAGE_WAIT_TIMEOUT_SECS",
+            "TPU_KV_TRANSFER_CHANNEL_NUMBER",
+            "TPU_KV_TRANSFER_NAMESPACE",
+            "TPU_KV_TRANSFER_PORT",
+            "TPU_KV_WARMUP_ENABLED",
+            "TPU_NODE_ID",
+            "TPU_P2P_WAIT_PULL_TIMEOUT",
+            "TPU_RAIDEN_INLINE_LOAD",
+            "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
+            "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
+            "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
+            "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
+            "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+            "TPU_SIDE_CHANNEL_PORT",
+            "TPU_USE_RAIDEN_CONNECTOR",
+        }
+
+        assert serving_only <= _TPU_COMPILE_ENV_IGNORED
+        assert not serving_only & set(_tpu_compile_env_factors())
+
+    def test_every_registry_entry_is_hashed_or_deliberately_ignored(self):
+        """The two sets must partition the registry, so a new entry forces a
+        deliberate hash-or-ignore choice, and a stale exemption cannot sit
+        waiting for a later knob to reuse its name."""
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _TPU_COMPILE_ENV_IGNORED, _tpu_compile_env_factors)
+
+        registry = set(envs.environment_variables)
+        stale = _TPU_COMPILE_ENV_IGNORED - registry
+        assert not stale, f"ignored but no longer in envs.py: {sorted(stale)}"
+        assert set(_tpu_compile_env_factors()) | _TPU_COMPILE_ENV_IGNORED \
+            == registry
+
     def test_aot_hash_includes_tpu_compiler_hash(self):
         from vllm.compilation import caching
 

@@ -7,6 +7,8 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size
 
+pytestmark = pytest.mark.cpu_test
+
 
 @pytest.fixture(autouse=True)
 def _restore_scheduler_split_method():

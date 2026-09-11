@@ -45,12 +45,16 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    TPU_MLA_MASKED_DENSE_ENABLED: bool = False
+    TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
+    TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -68,6 +72,28 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_KV_TRANSFER_PORT: str = "9100"
+    TPU_SIDE_CHANNEL_PORT: str = "9600"
+    TPU_NODE_ID: int = 0
+    TPU_KV_TRANSFER_CHANNEL_NUMBER: int = 0
+    TPU_KV_COORD_EXECUTOR_MAX_WORKERS: int = 0
+    TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS: int = 0
+    TPU_KV_STAGE_WAITER_POOL_SIZE: int = 0
+    TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
+    TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
+    TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
+    TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
+    TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
+    TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
+    TPU_KV_SHM_POOL_GB: float = 128.0
+    TPU_KV_TRANSFER_NAMESPACE: str = ""
+    TPU_IPC_SOCKET_DIR: str = "/tmp"
+    TPU_KV_WARMUP_ENABLED: bool = True
+    TPU_KV_LATENCY_LOG_INTERVAL: float = 30.0
+    TPU_KV_PIN_SHM: bool = False
+    TPU_USE_RAIDEN_CONNECTOR: bool = False
+    TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
+    TPU_RAIDEN_INLINE_LOAD: bool = False
 
 
 def env_with_choices(
@@ -113,27 +139,90 @@ def env_with_choices(
     return _get_validated_env
 
 
+_TRUE_STRINGS = ("true", "1", "yes", "on")
+_FALSE_STRINGS = ("false", "0", "no", "off")
+
+
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
     """
-    Accepts both numeric strings ("0", "1") and boolean strings
-    ("true", "false", "True", "False").
+    Accepts numeric strings ("0", "1"), boolean strings ("true", "false"),
+    and the yes/no and on/off spellings, in any case. Anything else raises:
+    a misspelled flag is a launch-script bug, and silently falling back to
+    the default hides it until someone wonders why the knob did nothing.
     """
 
     def _get_bool_env() -> bool:
         value = os.getenv(env_name)
-        if value is None or value == "":
+        if value is None or value.strip() == "":
             return default
 
-        value_lower = value.lower()
-        if value_lower in ("true", "1"):
+        value_lower = value.strip().lower()
+        if value_lower in _TRUE_STRINGS:
             return True
-        if value_lower in ("false", "0"):
+        if value_lower in _FALSE_STRINGS:
             return False
-        raise ValueError(
-            f"Invalid boolean value '{value}' for {env_name}. "
-            f"Valid options: '0', '1', 'true', 'false', 'True', 'False'.")
+        raise ValueError(f"Invalid boolean value '{value}' for {env_name}. "
+                         f"Valid options: {_TRUE_STRINGS + _FALSE_STRINGS} "
+                         f"(any case).")
 
     return _get_bool_env
+
+
+def env_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob with a default. An unparseable value raises rather than
+    falling back, for the same reason as ``env_bool``."""
+
+    def _get_int_env() -> int:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return default
+        return int(value)
+
+    return _get_int_env
+
+
+def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob that must not be negative.
+
+    Pool sizes and slot counts use this. A negative value is rejected rather
+    than clamped: it reaches ``ThreadPoolExecutor(max_workers=...)`` and
+    similar, where silently substituting the default hides the typo and the
+    process runs with a pool size nobody asked for.
+    """
+    parse_int = env_int(env_name, default)
+
+    def _get_nonnegative_int_env() -> int:
+        value = parse_int()
+        if value < 0:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be >= 0.")
+        return value
+
+    return _get_nonnegative_int_env
+
+
+def env_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob with a default. An unparseable value raises."""
+
+    def _get_float_env() -> float:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return default
+        return float(value)
+
+    return _get_float_env
+
+
+def env_str(env_name: str, default: str) -> Callable[[], str]:
+    """String knob with a default, surrounding whitespace stripped."""
+
+    def _get_str_env() -> str:
+        value = os.getenv(env_name)
+        if value is None:
+            return default
+        return value.strip()
+
+    return _get_str_env
 
 
 def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
@@ -233,7 +322,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
-    # Specify requantization block size for MoE weights
+    # Specify requantization block size for MoE weights. When unset, NVFP4
+    # expert-parallel layers admitted with USE_MOE_FUSED_EP_KERNEL and
+    # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
+    # Other MoE paths retain their default, including explicit requantization.
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
@@ -350,6 +442,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
+    # Off by default until the model and hardware scope of the cost model is
+    # broadened or selected automatically from an explicit model profile.
+    "TPU_MLA_MASKED_DENSE_ENABLED":
+    env_bool("TPU_MLA_MASKED_DENSE_ENABLED", default=False),
+    # Longest per-sequence KV length for which an enabled sparse-MLA step runs
+    # the masked-dense kernel instead of the gather kernel. ANALYTIC is the
+    # cheaper masked-dense tier, which computes the causal mask in registers
+    # and needs its limit at or under the indexer's topk; the other is the
+    # tier that materializes the CSA bitmap on SparseCore. Unset uses the
+    # measured default; 0 disables that tier; any other value must be a
+    # multiple of the streamed KV block size. These controls take effect only
+    # when TPU_MLA_MASKED_DENSE_ENABLED=1 and only for eligible prefill; a
+    # batch containing any decode always uses sparse gather attention.
+    "TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN":
+    env_optional_int("TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN"),
+    "TPU_MLA_MASKED_DENSE_MAX_KV_LEN":
+    env_optional_int("TPU_MLA_MASKED_DENSE_MAX_KV_LEN"),
     # Most model length cap for TPU compile bucketing
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
@@ -376,6 +486,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL":
     env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
+    # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
+    "MOE_FUSED_EP_ENABLE_W4A8":
+    env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
     # Largest node-wide token count, out of the scheduler's cap, at or above
     # which the fused kernel is armed for the whole deployment. Decided once at
     # weight load, not per step: a per-step choice would need the token count
@@ -446,6 +560,76 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE":
     env_bool("TPU_EVICT_WEIGHTS_PAGE_CACHE", default=False),
+
+    # KV transfer / Raiden knobs. Each getter in distributed/utils.py
+    # documents what its knob does; this is the parsing and the default.
+
+    # TCP port the KV wire transfer listens on.
+    "TPU_KV_TRANSFER_PORT":
+    env_str("TPU_KV_TRANSFER_PORT", "9100"),
+    # TCP port for the out-of-band side channel.
+    "TPU_SIDE_CHANNEL_PORT":
+    env_str("TPU_SIDE_CHANNEL_PORT", "9600"),
+    # Host ordinal within a multi-host slice.
+    "TPU_NODE_ID":
+    env_int("TPU_NODE_ID", 0),
+    # 0 means auto; a non-zero override is clamped to tp_size downstream.
+    "TPU_KV_TRANSFER_CHANNEL_NUMBER":
+    env_int("TPU_KV_TRANSFER_CHANNEL_NUMBER", 0),
+    # Request-level pull executor size; 0 means auto.
+    "TPU_KV_COORD_EXECUTOR_MAX_WORKERS":
+    env_nonnegative_int("TPU_KV_COORD_EXECUTOR_MAX_WORKERS", 0),
+    # Channel-level pull executor size; 0 means auto.
+    "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS":
+    env_nonnegative_int("TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS", 0),
+    # Worker count for the stage waiter pool; 0 means auto (4).
+    "TPU_KV_STAGE_WAITER_POOL_SIZE":
+    env_nonnegative_int("TPU_KV_STAGE_WAITER_POOL_SIZE", 0),
+    # KV-cache transfer timeout, in seconds.
+    "TPU_P2P_WAIT_PULL_TIMEOUT":
+    env_int("TPU_P2P_WAIT_PULL_TIMEOUT", 120),
+    # Seconds; 0 disables the probe.
+    "TPU_RAIDEN_STAGE3_STATUS_PROBE_S":
+    env_float("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", 1.0),
+    # On by default; inline-load mode overrides it back to off.
+    "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT":
+    env_bool("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True),
+    # Seconds, bounded by TPU_P2P_WAIT_PULL_TIMEOUT downstream.
+    "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S":
+    env_float("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0),
+    # TEST-ONLY fault injection, in seconds; 0 disables it.
+    "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S":
+    env_float("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0),
+    # Seconds; non-positive falls back to 30 downstream.
+    "TPU_KV_STAGE_WAIT_TIMEOUT_SECS":
+    env_float("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
+    # Total GB budget for the per-host shared-memory KV staging pool.
+    "TPU_KV_SHM_POOL_GB":
+    env_float("TPU_KV_SHM_POOL_GB", 128.0),
+    # Optional engine namespace; sanitized at the call site.
+    "TPU_KV_TRANSFER_NAMESPACE":
+    env_str("TPU_KV_TRANSFER_NAMESPACE", ""),
+    # Directory holding the per-host intra-process IPC socket.
+    "TPU_IPC_SOCKET_DIR":
+    env_str("TPU_IPC_SOCKET_DIR", "/tmp"),
+    # Pre-compile KV gather/scatter executables at startup.
+    "TPU_KV_WARMUP_ENABLED":
+    env_bool("TPU_KV_WARMUP_ENABLED", default=True),
+    # Seconds; 0 disables the periodic summaries.
+    "TPU_KV_LATENCY_LOG_INTERVAL":
+    env_float("TPU_KV_LATENCY_LOG_INTERVAL", 30.0),
+    # mlock(2) the KV shm pool at startup.
+    "TPU_KV_PIN_SHM":
+    env_bool("TPU_KV_PIN_SHM", default=False),
+    # kv_connector_extra_config.use_raiden_connector takes precedence.
+    "TPU_USE_RAIDEN_CONNECTOR":
+    env_bool("TPU_USE_RAIDEN_CONNECTOR", default=False),
+    # 0 means auto-size from TPU_KV_SHM_POOL_GB, split across TP ranks.
+    "TPU_RAIDEN_TRANSFER_NUM_SLOTS":
+    env_nonnegative_int("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
+    # Load remote KV before the first forward, not in a no-forward step.
+    "TPU_RAIDEN_INLINE_LOAD":
+    env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
 }
 
 

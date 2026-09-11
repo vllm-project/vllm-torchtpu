@@ -50,13 +50,18 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh"
 echo "~~~ Pulling Docker Image: ${IMAGE_TAG}"
 docker pull -q "${IMAGE_TAG}"
 
-# Ensure cache directory exists on the host
-mkdir -p /mnt/disks/persist/models
+HOST_CACHE_ROOT="/mnt/disks/persist"
+if [[ "${CPU_ONLY:-0}" == "1" ]]; then
+  # CPU agents have no persistent disk mounted under /mnt/disks.
+  HOST_CACHE_ROOT="${HOME}/.cache/vllm-torchtpu-ci"
+fi
 
-# Ensure results directory exists on the persistent disk (always mountable).
-# The container below runs as root, so never assume the agent can rm the
-# leftovers of whatever ran last -- see reset_results_dir.sh.
-bash "${SCRIPT_DIR}/reset_results_dir.sh" /mnt/disks/persist/perf_eval_results "${IMAGE_TAG}"
+# Ensure cache directory exists on the host
+mkdir -p "${HOST_CACHE_ROOT}/models"
+
+# The container runs as root, so reset_results_dir.sh handles results the
+# agent cannot remove.
+bash "${SCRIPT_DIR}/reset_results_dir.sh" "${HOST_CACHE_ROOT}/perf_eval_results" "${IMAGE_TAG}"
 
 # Ensure a clean results directory exists in the workspace
 rm -rf perf_eval_results
@@ -108,11 +113,16 @@ BQ_EVAL_VARS=(
   -e TPU_NAME="${TPU_NAME:-}"
 )
 
+DEVICE_ARGS=(--privileged --device /dev/fuse)
+if [[ "${CPU_ONLY:-0}" == "1" ]]; then
+  DEVICE_ARGS=(-e JAX_PLATFORMS=cpu)
+fi
+
 echo "--- Running command in Docker container"
-docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64g --device /dev/fuse \
+docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-size=64g \
   -w /root/torchtpu-vllm \
-  -v /mnt/disks/persist/models:/local_hf_cache \
-  -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
+  -v "${HOST_CACHE_ROOT}/models:/local_hf_cache" \
+  -v "${HOST_CACHE_ROOT}/perf_eval_results:/perf_eval_results" \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
   -e FORCE_COLOR="1" \
   -e HF_HOME=/local_hf_cache \
@@ -143,7 +153,7 @@ DOCKER_EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
 echo "~~~ Copying test results back to workspace for artifact upload"
-cp -r /mnt/disks/persist/perf_eval_results/* perf_eval_results/ 2>/dev/null || true
+cp -r "${HOST_CACHE_ROOT}/perf_eval_results/"* perf_eval_results/ 2>/dev/null || true
 # Clean up any broken symlinks on the host to prevent buildkite-agent upload failures
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 

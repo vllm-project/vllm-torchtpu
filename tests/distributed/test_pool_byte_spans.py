@@ -9,10 +9,14 @@ for the legacy segment-major vocabulary. For GLM-5.2 the granule is the
 packed row (4 tokens: 2560 B of latent, 1024 B of indexer).
 """
 
+import pytest
+
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan, lower_gdn_state_shard_spans, lower_glm_row_spans)
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
     RegionSpec
+
+pytestmark = pytest.mark.cpu_test
 
 # Qwen3.5-35B TP8 shard, QK pair-blocked: one 1024-byte QK token plus one
 # 1024-byte V token per tap.

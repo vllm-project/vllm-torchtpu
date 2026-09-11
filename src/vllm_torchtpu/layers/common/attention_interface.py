@@ -21,6 +21,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
@@ -844,11 +845,12 @@ def sparse_mla_attention(
             rope_spec=rope_spec)
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        output = sparse_mla_ragged_paged_attention(
+        output = mla_dispatch.ragged_paged_attention(
             q,
             kv_cache_nope,
             kv_cache_rope,
             topk_idx,
+            seq_lens_,
             block_tables_,
             query_start_loc_,
             request_distribution_,

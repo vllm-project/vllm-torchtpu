@@ -194,6 +194,34 @@ def pack_tokens(values: jax.Array, token_bytes: int) -> jax.Array:
             | (bands[:, 3] << 24))
 
 
+def _row_positions(
+    num_tokens: int,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Per-row `(token, sequence, global KV position, valid)`.
+
+    `pos` counts back from `seq_lens`, which already includes this step's
+    tokens, so a chunked-prefill continuation resumes at the right offset
+    rather than at zero.
+
+    Padded tokens index past the last sequence; `seq_id` is clamped so the
+    gathers stay in bounds and `valid` is returned alongside so every caller
+    masks them out the same way. Shared by the sharded and unsharded writers so
+    they cannot drift into two different notions of where a row belongs.
+    """
+    num_seqs = seq_lens.shape[0]
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_id = jnp.searchsorted(query_start_loc[1:], tok,
+                              side="right").astype(jnp.int32)
+    valid = tok < query_start_loc[-1]
+
+    seq_id = jnp.minimum(seq_id, num_seqs - 1)
+    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
+    pos = seq_lens[seq_id] - q_len + (tok - query_start_loc[seq_id])
+    return tok, seq_id, pos, valid
+
+
 def get_page_and_slot(
     num_tokens: int,
     seq_lens: jax.Array,
@@ -202,22 +230,13 @@ def get_page_and_slot(
     page_size: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Computes target (page, slot) in the paged KV cache for each token."""
-    num_seqs = seq_lens.shape[0]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(query_start_loc[1:], tok,
-                              side="right").astype(jnp.int32)
-    valid = tok < query_start_loc[-1]
+    _, seq_id, pos, valid = _row_positions(num_tokens, seq_lens,
+                                           query_start_loc)
 
-    # Padded tokens index past the end; clamp so the gathers stay in bounds.
-    safe_seq_id = jnp.minimum(seq_id, num_seqs - 1)
-    q_len = query_start_loc[safe_seq_id + 1] - query_start_loc[safe_seq_id]
-    local = tok - query_start_loc[safe_seq_id]
-    pos = seq_lens[safe_seq_id] - q_len + local
-
-    block_tables_2d = block_tables.reshape(num_seqs, -1)
+    block_tables_2d = block_tables.reshape(seq_lens.shape[0], -1)
     max_pages_per_seq = block_tables_2d.shape[1]
     safe_page_idx = jnp.clip(pos // page_size, 0, max_pages_per_seq - 1)
-    page = jnp.where(valid, block_tables_2d[safe_seq_id, safe_page_idx],
+    page = jnp.where(valid, block_tables_2d[seq_id, safe_page_idx],
                      jnp.int32(OOB_PAGE))
     slot = jnp.where(valid, pos % page_size, 0)
     return page, slot
@@ -353,5 +372,97 @@ def update_sparse_mla_kv_cache_jax(
     page, slot = get_page_and_slot(kv_c_normed.shape[0], seq_lens,
                                    block_tables, query_start_loc,
                                    nope_spec.page_size)
+    return (_scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
+            _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot))
+
+
+def update_sparse_mla_kv_cache_dcp(
+        kv_cache_nope: jax.Array, kv_cache_rope: jax.Array,
+        kv_c_normed: jax.Array, k_pe: jax.Array, seq_lens: jax.Array,
+        block_tables: jax.Array, query_start_loc: jax.Array,
+        dcp_rank: jax.Array, *, nope_spec: SparseMLAKVCacheSpec,
+        rope_spec: SparseMLAKVCacheSpec, dcp_size: int,
+        interleave_size: int) -> tuple[jax.Array, jax.Array]:
+    """Scatter this step's MLA latents into a DCP position-sharded cache.
+
+    The DCP twin of `update_sparse_mla_kv_cache`, and the reason DCP is cheap:
+    under PCP the cache is replicated, so every rank must be handed *every*
+    rank's new rows and the caller pays an all-gather to do it. Under DCP the
+    queries are replicated, so `kv_c_normed`/`k_pe` are computed from a
+    residual stream every rank already holds -- the rows are local to begin
+    with and each rank simply masks its write down to the positions it owns.
+    The all-gather disappears entirely rather than moving.
+
+    Ownership is chunk-interleaved: a *virtual* page spans
+    `page_size * dcp_size` positions, and rank `r` holds the
+    `interleave_size`-sized chunk at offset `r * interleave_size` within each
+    `dcp_size * interleave_size` cycle. `block_tables` therefore holds virtual
+    page ordinals, resolved against this rank's own shard by
+    `virtual % num_pages` -- the same resolution the readers do, which is what
+    keeps the indexer cache, the latent cache and the top-k coordinates in one
+    coordinate space and lets a global top-k index be handed to a rank as a
+    plain local cache index.
+
+    Rows owned by another rank are dropped by aiming them at an out-of-bounds
+    page -- the same trick the unsharded scatter uses for padding, and it is
+    why this needs no collective and no branch.
+
+    Must be called from inside a `shard_map`; `dcp_rank` is this shard's index
+    along the DCP axis as traced data, so one compiled program serves every
+    rank.
+
+    Args:
+      kv_cache_nope, kv_cache_rope: this rank's shards, shaped by the specs.
+      kv_c_normed, k_pe: this step's rows, in request-major order. Identical on
+        every rank; the mask, not the data, is what differs.
+      seq_lens, block_tables, query_start_loc: global sequence coordinates,
+        replicated. `block_tables` holds *virtual* page ordinals.
+      dcp_rank: i32 scalar, this shard's DCP index.
+      nope_spec, rope_spec: layout descriptors the shards were allocated from.
+      dcp_size, interleave_size: the shard layout.
+
+    Returns:
+      The updated (nope, rope) shards, same shapes/dtypes as the inputs.
+    """
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec,
+                  rope_spec)
+    # Asserted equal to the rope page size just above, so one (page, slot)
+    # addresses both caches.
+    page_size = nope_spec.page_size
+    if interleave_size % WORD_BYTES:
+        raise ValueError(
+            f"interleave_size={interleave_size} must be a multiple of "
+            f"WORD_BYTES={WORD_BYTES}, or a rope tile -- which packs that many "
+            "consecutive tokens into one word -- would straddle two ranks.")
+    if page_size % interleave_size:
+        raise ValueError(
+            f"interleave_size={interleave_size} must divide "
+            f"page_size={page_size}. Otherwise an interleave chunk straddles "
+            "a page boundary and the local index a reader derives from the "
+            "global position stops agreeing with the (page, slot) written "
+            "here.")
+
+    _, seq_id, pos, in_batch = _row_positions(kv_c_normed.shape[0], seq_lens,
+                                              query_start_loc)
+
+    virtual_page_size = jnp.int32(page_size * dcp_size)
+    cycle = jnp.int32(dcp_size * interleave_size)
+    interleave = jnp.int32(interleave_size)
+    offset = pos % virtual_page_size
+    owner = (offset % cycle) // interleave
+    slot = (offset // cycle) * interleave + (offset % interleave)
+
+    # Virtual ordinal -> physical block in this rank's own shard, exactly as
+    # the DCP readers resolve it.
+    local_block_tables = jnp.mod(block_tables,
+                                 jnp.int32(nope_spec.num_pages)).reshape(
+                                     seq_lens.shape[0], -1)
+    max_pages_per_seq = local_block_tables.shape[1]
+    virtual_page = jnp.clip(pos // virtual_page_size, 0, max_pages_per_seq - 1)
+
+    valid = jnp.logical_and(in_batch, owner == dcp_rank)
+    page = jnp.where(valid, local_block_tables[seq_id, virtual_page],
+                     jnp.int32(OOB_PAGE))
+
     return (_scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
             _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot))
