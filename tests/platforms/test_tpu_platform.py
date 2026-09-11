@@ -90,9 +90,8 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
 
 
 def test_debug_tpu_local_rank_offset_env(monkeypatch):
-    """The worker reads this through the registry now; the contract the old
-    inline helper had (0 when unset, int otherwise, an error that names the
-    variable) must survive the move."""
+    """0 when unset, an int otherwise, and an error that names the variable
+    when the value does not parse."""
     from vllm_torchtpu import envs
 
     monkeypatch.delenv("DEBUG_TPU_LOCAL_RANK_OFFSET", raising=False)

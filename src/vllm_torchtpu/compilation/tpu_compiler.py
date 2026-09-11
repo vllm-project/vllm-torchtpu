@@ -128,11 +128,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
-    # Startup and host-side knobs migrated from inline reads (issue #773):
-    # ports, an IPC secret, two raiden startup checks, offload retry and
-    # drain limits, a weight-load sync cadence, a debug log switch, and the
-    # local-rank offsets, which move a worker to a different chip without
-    # changing the executable it runs.
+    # Startup and host-side knobs: ports, an IPC secret, two raiden startup
+    # checks, offload retry and drain limits, a weight-load sync cadence, a
+    # debug log switch, and the local-rank offsets, which move a worker to a
+    # different chip without changing the executable it runs.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
     "RAIDEN_SHM_KEY",

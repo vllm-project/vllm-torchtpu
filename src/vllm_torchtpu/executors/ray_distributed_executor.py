@@ -109,7 +109,9 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         self._initialize_ray_cluster()
         placement_group = self.parallel_config.placement_group
 
-        # Disable Ray usage stats collection.
+        # Disable Ray usage stats collection. Ray accepts exactly "0" or "1"
+        # here and raises on anything else (ray/_common/usage/usage_lib.py),
+        # so pass an explicit "1" through and force every other value to "0".
         if tpu_envs.RAY_USAGE_STATS_ENABLED != "1":
             os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 

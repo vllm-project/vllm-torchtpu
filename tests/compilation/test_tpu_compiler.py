@@ -200,7 +200,6 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
-            # Second batch, same rule: startup and host-side only.
             "DEBUG_TPU_LOCAL_RANK_OFFSET",
             "RAIDEN_DISABLE_SINGLETON_WORKER",
             "RAIDEN_SHM_KEY",

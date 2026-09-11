@@ -198,7 +198,7 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
     ("KDA_PACKED_METADATA", True),
     ("KDA_FWD_MB", None),
     ("SPEC_WARMUP", True),
-    ("RAIDEN_DISABLE_SINGLETON_WORKER", None),
+    ("RAIDEN_DISABLE_SINGLETON_WORKER", True),
     ("RAIDEN_SHM_KEY", ""),
     ("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
     ("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
@@ -218,9 +218,8 @@ def test_migrated_knob_defaults(monkeypatch, name, expected):
 
 
 def test_spec_warmup_off_spellings(monkeypatch):
-    """The inline read only honored SPEC_WARMUP=0. The registry entry keeps
-    that spelling and adds the usual false spellings; anything else raises
-    instead of silently leaving warmup on."""
+    """SPEC_WARMUP accepts the usual on/off spellings; anything else raises
+    rather than silently leaving warmup on."""
     from vllm_torchtpu import envs
 
     for value in ("0", "false", "off"):

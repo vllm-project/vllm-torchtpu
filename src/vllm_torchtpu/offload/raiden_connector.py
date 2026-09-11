@@ -303,13 +303,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # The raiden singleton worker cannot coexist with this connector: the
         # disagg stack runs its own control plane in the same process and the
         # two collide on ports.
-        if tpu_envs.RAIDEN_DISABLE_SINGLETON_WORKER is False:
+        if not tpu_envs.RAIDEN_DISABLE_SINGLETON_WORKER:
             raise ValueError(
                 "TPURaidenOffloadingConnector requires the raiden singleton "
                 "worker to be disabled (it collides with the in-process "
                 "control plane's ports), but RAIDEN_DISABLE_SINGLETON_WORKER "
-                "was explicitly set to a false value. Unset it or set it "
-                "to '1'.")
+                "was explicitly set to off. Unset it or set it to '1'.")
         os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
 
         # Call through module to preserve PCP-aware patch on build_offloading_config.

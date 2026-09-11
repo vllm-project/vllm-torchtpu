@@ -108,7 +108,7 @@ if TYPE_CHECKING:
     KDA_PACKED_METADATA: bool = True
     KDA_FWD_MB: int | None = None
     SPEC_WARMUP: bool = True
-    RAIDEN_DISABLE_SINGLETON_WORKER: bool | None = None
+    RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
@@ -707,21 +707,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "KDA_FWD_MB":
     env_optional_int("KDA_FWD_MB"),
 
-    # Startup and host-side knobs that used to be read inline (issue #773).
-    # None of them change what gets compiled; each is also listed in
-    # _TPU_COMPILE_ENV_IGNORED so it stays out of the compile-cache key.
+    # Startup and host-side knobs. None of them change what gets compiled;
+    # each is also listed in _TPU_COMPILE_ENV_IGNORED so it stays out of the
+    # compile-cache key.
 
     # Run the real spec-decode dispatch once at startup so the first request
     # does not pay for those compiles. Off skips that warmup.
     "SPEC_WARMUP":
     env_bool("SPEC_WARMUP", default=True),
-    # Raiden library switch. The TPU offloading connector cannot run next to
-    # the raiden singleton worker, so it refuses an explicit false value
-    # here and otherwise sets the variable to "1" itself.
+    # Raiden library switch, on by default. The TPU offloading connector
+    # cannot run next to the raiden singleton worker, so it rejects an
+    # explicit off and exports the variable as on for the raiden library.
     "RAIDEN_DISABLE_SINGLETON_WORKER":
-    env_optional_bool("RAIDEN_DISABLE_SINGLETON_WORKER"),
-    # Raiden library key for shm-backed host pools, which the TPU offloading
-    # connector does not support: a non-empty value makes it refuse to start.
+    env_bool("RAIDEN_DISABLE_SINGLETON_WORKER", default=True),
+    # The raiden library's shared-memory key, a string naming the segment
+    # behind its shm-backed host pools. The TPU offloading connector cannot
+    # serve those pools, so it refuses to start when the key is set at all.
     "RAIDEN_SHM_KEY":
     env_str("RAIDEN_SHM_KEY", ""),
     # Seconds; upper bound on a scheduler-side drain of in-flight offload
