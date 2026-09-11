@@ -612,10 +612,11 @@ class TestNvfp4MoEMethod:
         ):
             method.process_weights_after_loading(layer)
             mock_ep.assert_called_once_with(layer)
+            assert method._tpu_activation_str == "silu"
+            assert not hasattr(layer, "_tpu_activation_str")
 
     def test_apply_monolithic_standard(self):
         layer = FakeRoutedExperts()
-        layer._tpu_activation_str = "silu"
         layer._experts_start = torch.zeros(4)
         layer.w13_weight = torch.empty(0)
         layer.w2_weight = torch.empty(0)
@@ -629,6 +630,7 @@ class TestNvfp4MoEMethod:
                                 dtype=torch.int32)
 
         method = VllmNvfp4MoEMethod(MagicMock(group_size=16), layer.moe_config)
+        method._tpu_activation_str = "silu"
 
         with patch(
                 "vllm_torchtpu.layers.vllm.quantization.nvfp4.moe_routing.route",
@@ -648,7 +650,6 @@ class TestNvfp4MoEMethod:
 
     def test_apply_monolithic_pipelined(self):
         layer = FakeRoutedExperts()
-        layer._tpu_activation_str = "silu"
         layer._experts_start = torch.zeros(4)
         layer.w13_weight = torch.empty(0)
         layer.w2_weight = torch.empty(0)
@@ -659,6 +660,7 @@ class TestNvfp4MoEMethod:
         router_logits = torch.randn(4, 4)
 
         method = VllmNvfp4MoEMethod(MagicMock(group_size=16), layer.moe_config)
+        method._tpu_activation_str = "silu"
 
         with patch(
                 "vllm_torchtpu.layers.vllm.quantization.nvfp4.moe_routing.route",
