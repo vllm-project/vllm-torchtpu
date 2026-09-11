@@ -2983,6 +2983,9 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_source_req_ids == {}
         assert worker._stage3_destination_req_ids == {}
+        assert worker._stage3_submitted_loads == {}
+        assert worker._stage3_submitted_load_tokens == {}
+        assert worker._stage3_load_start_times == {}
 
         assert len(facade.start_transfer_calls) == 1
         call = facade.start_transfer_calls[0]
@@ -3201,6 +3204,7 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_transfer_engine = engine
         worker._stage3_submitted_loads["aborted-load-decode"] = 911
         worker._stage3_submitted_load_tokens["aborted-load-decode"] = 1536
+        worker._stage3_load_start_times["aborted-load-decode"] = 100.0
         worker._bind_stage3_request_ids("aborted-load-decode",
                                         "aborted-load-prefill")
         worker._stage3_controller_accepted.add("aborted-load-decode")
@@ -3217,6 +3221,9 @@ class TestTPURaidenConnectorWorker:
                                                                     set())
             assert worker._stage3_submitted_loads == {
                 "aborted-load-decode": 911
+            }
+            assert worker._stage3_load_start_times == {
+                "aborted-load-decode": 100.0
             }
             assert worker._stage3_controller_accepted == {
                 "aborted-load-decode"
@@ -3240,6 +3247,7 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_submitted_loads == {}
         assert worker._stage3_submitted_load_tokens == {}
+        assert worker._stage3_load_start_times == {}
         assert worker._stage3_controller_accepted == set()
         assert worker._load_block_ids == {}
         assert worker._stage3_finished_loads_pending_cleanup == set()

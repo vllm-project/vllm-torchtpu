@@ -3562,6 +3562,7 @@ class TPURaidenConnectorWorker:
             self._load_block_ids.pop(req_id, None)
             self._stage3_submitted_loads.pop(req_id, None)
             self._stage3_submitted_load_tokens.pop(req_id, None)
+            self._stage3_load_start_times.pop(req_id, None)
             self._stage3_controller_accepted.discard(req_id)
             self._stage3_pending_controller_failures.pop(req_id, None)
             self._stage3_pending_submits.pop(req_id, None)
