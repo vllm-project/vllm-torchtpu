@@ -306,19 +306,23 @@ class RpaConfigs:
             num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
         else:
             num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
-        return num_elements * self.serve.dtype_kv.itemsize
+        # Calculate byte size using bits to account for subbyte dtypes like fp4.
+        kv_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_kv)
+        return int(num_elements * kv_dtype_bytes) >> 3  # 8 bits per byte
 
     @property
     def q_bytes_per_token(self) -> int:
-        return (self.model.num_kv_heads *
+        q_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_q)
+        return int(self.model.num_kv_heads *
                 self.aligned_num_q_heads_per_kv_head *
-                self.aligned_q_head_dim * self.serve.dtype_q.itemsize)
+                self.aligned_q_head_dim * q_dtype_bytes) >> 3
 
     @property
     def o_bytes_per_token(self) -> int:
-        return (self.model.num_kv_heads *
+        out_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_out)
+        return int(self.model.num_kv_heads *
                 self.aligned_num_q_heads_per_kv_head *
-                self.aligned_q_head_dim * self.serve.dtype_out.itemsize)
+                self.aligned_q_head_dim * out_dtype_bytes) >> 3
 
     @property
     def q_vmem_shape(self):
