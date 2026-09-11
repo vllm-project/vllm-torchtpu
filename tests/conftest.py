@@ -67,12 +67,7 @@ def _clear_kv_cache_layout_cache():
     Memoized process-wide, so the first caller would pin the answer and a
     later `monkeypatch.setenv` would be silently ignored.
     """
-    try:
-        from vllm.v1.attention.backends.utils import set_kv_cache_layout
-    except ImportError:
-        yield
-        return
-
+    from vllm.v1.attention.backends.utils import set_kv_cache_layout
     set_kv_cache_layout(None)
     yield
     set_kv_cache_layout(None)

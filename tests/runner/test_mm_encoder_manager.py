@@ -1,239 +1,244 @@
-# Copyright 2025 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from unittest.mock import MagicMock, patch
+# SPDX-License-Identifier: Apache-2.0
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 import torch
-from vllm.v1.worker.encoder_cudagraph_defs import (
-    EncoderCudaGraphCaptureInputs, EncoderCudaGraphConfig,
-    EncoderCudaGraphPathConfig, EncoderCudaGraphReplayBuffers)
 
-from vllm_torchtpu.runner.mm_encoder_manager import (
-    MMEncoderManager, maybe_create_mm_encoder_manager)
+from vllm_torchtpu.runner import mm_encoder_manager as mm
 
 
 @pytest.fixture
-def mock_vllm_config():
-    config = MagicMock()
-    config.compilation_config.cudagraph_mm_encoder = True
-    config.compilation_config.encoder_cudagraph_token_budgets = [256, 512]
-    config.compilation_config.encoder_cudagraph_max_vision_items_per_batch = 2
-    config.compilation_config.encoder_cudagraph_max_frames_per_batch = 16
-    config.model_config.dtype = torch.bfloat16
-
-    mm_config = MagicMock()
-    mm_config.get_limit_per_prompt.return_value = 0
-    mm_config.mm_encoder_tp_mode = None
-    config.model_config.multimodal_config = mm_config
-    config.parallel_config.tensor_parallel_size = 1
-    return config
+def compile_mock(monkeypatch):
+    result = Mock(return_value=Mock())
+    monkeypatch.setattr(mm.torch, "compile", result)
+    return result
 
 
 @pytest.fixture
-def mock_model():
-    model = MagicMock(spec=[
-        "get_encoder_cudagraph_config",
-        "prepare_encoder_cudagraph_capture_inputs",
-        "prepare_encoder_cudagraph_replay_buffers",
-        "encoder_cudagraph_forward",
-        "encoder_eager_forward",
-    ])
-
-    encoder_config = EncoderCudaGraphConfig(
-        modalities=["image"],
-        buffer_keys=["pixel_values", "image_grid_thw"],
-        out_hidden_size=64,
-        paths={"default": EncoderCudaGraphPathConfig()},
-    )
-    model.get_encoder_cudagraph_config.return_value = encoder_config
-
-    def prepare_capture(budget,
-                        max_batch,
-                        max_frames,
-                        device,
-                        dtype,
-                        path="default"):
-        return EncoderCudaGraphCaptureInputs(
+def manager(compile_mock):
+    model = Mock()
+    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        padding_logics={},
+        paths={
+            "global":
+            SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
+            "local":
+            SimpleNamespace(min_token_budget=8, allow_zero_tokens=True),
+        })
+    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
+        lambda budget, *args, path: SimpleNamespace(
             values={
-                "pixel_values":
-                torch.zeros((budget, 64), dtype=dtype, device=device),
-                "image_grid_thw":
-                torch.zeros((max_batch, 3), dtype=torch.int32, device=device),
-                "scalar_meta":
-                torch.tensor(42, device=device),
-            })
-
-    model.prepare_encoder_cudagraph_capture_inputs.side_effect = prepare_capture
-    model.encoder_cudagraph_forward.side_effect = lambda t, path="default": torch.ones(
-        (256, 64), dtype=torch.bfloat16)
-    return model
-
-
-def test_maybe_create_mm_encoder_manager_disabled(mock_vllm_config,
-                                                  mock_model):
-    mock_vllm_config.compilation_config.cudagraph_mm_encoder = False
-    manager = maybe_create_mm_encoder_manager(mock_vllm_config,
-                                              torch.device("cpu"), mock_model)
-    assert manager is None
-
-
-@patch("vllm_torchtpu.runner.mm_encoder_manager.supports_encoder_cudagraph",
-       return_value=False)
-def test_maybe_create_mm_encoder_manager_unsupported(mock_supports,
-                                                     mock_vllm_config,
-                                                     mock_model):
-    manager = maybe_create_mm_encoder_manager(mock_vllm_config,
-                                              torch.device("cpu"), mock_model)
-    assert manager is None
-
-
-@patch("vllm_torchtpu.runner.mm_encoder_manager.supports_encoder_cudagraph",
-       return_value=True)
-@patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-def test_maybe_create_mm_encoder_manager_success(mock_compile, mock_supports,
-                                                 mock_vllm_config, mock_model):
-    manager = maybe_create_mm_encoder_manager(mock_vllm_config,
-                                              torch.device("cpu"), mock_model)
-    assert isinstance(manager, MMEncoderManager)
-    assert manager.token_budgets == [256, 512]
-    assert 256 in manager.budget_templates["default"]
-    assert 512 in manager.budget_templates["default"]
-
-
-@patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-def test_pad_to_template_exact_shape(mock_compile, mock_vllm_config,
-                                     mock_model):
-    manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
-                               mock_model)
-
-    replay_values = {
-        "pixel_values": torch.ones((256, 64), dtype=torch.bfloat16),
-        "image_grid_thw": torch.tensor([[1, 2, 3], [4, 5, 6]],
-                                       dtype=torch.int32),
-        "scalar_meta": torch.tensor(42),
-    }
-
-    padded = manager._pad_to_template(replay_values, budget=256)
-    assert torch.equal(padded["pixel_values"], replay_values["pixel_values"])
-    assert torch.equal(padded["image_grid_thw"],
-                       replay_values["image_grid_thw"])
-    assert torch.equal(padded["scalar_meta"], replay_values["scalar_meta"])
-
-
-@patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-def test_pad_to_template_dynamic_padding(mock_compile, mock_vllm_config,
-                                         mock_model):
-    manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
-                               mock_model)
-
-    # Dynamic input has fewer tokens (100) than the budget (256)
-    dynamic_pixel_values = torch.ones((100, 64), dtype=torch.bfloat16)
-    replay_values = {
-        "pixel_values": dynamic_pixel_values,
-        "image_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.int32),
-    }
-
-    padded = manager._pad_to_template(replay_values, budget=256)
-
-    # Output should be padded to budget template shape (256, 64)
-    assert padded["pixel_values"].shape == (256, 64)
-    # The first 100 rows should contain the dynamic input
-    assert torch.equal(padded["pixel_values"][:100], dynamic_pixel_values)
-    # The remaining rows should be zero-padded
-    assert torch.equal(padded["pixel_values"][100:],
-                       torch.zeros((156, 64), dtype=torch.bfloat16))
-
-    # Grid THW should match template shape (2, 3) with first row filled
-    assert padded["image_grid_thw"].shape == (2, 3)
-    assert torch.equal(padded["image_grid_thw"][:1],
-                       replay_values["image_grid_thw"])
-    assert torch.equal(padded["image_grid_thw"][1:],
-                       torch.zeros((1, 3), dtype=torch.int32))
-
-    # Missing key defaults to template
-    assert "scalar_meta" in padded
-    assert padded["scalar_meta"].item() == 42
-
-
-@patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-@patch("vllm_torchtpu.runner.mm_encoder_manager.synchronize_tensors")
-def test_capture_budget_graph(mock_sync, mock_compile, mock_vllm_config,
-                              mock_model):
-    manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
-                               mock_model)
-
-    manager._capture_budget_graph(256)
-    assert 256 in manager.budget_graphs["default"]
-    mock_sync.assert_called_once()
-
-
-@patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-def test_run_budget_graph_hit(mock_compile, mock_vllm_config, mock_model):
-    manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
-                               mock_model)
-
-    mock_model.prepare_encoder_cudagraph_replay_buffers.return_value = (
-        EncoderCudaGraphReplayBuffers(
-            values={
-                "pixel_values": torch.ones((100, 64), dtype=torch.bfloat16),
-                "image_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.int32),
+                "pixels": torch.zeros(budget, 2),
+                "scalar": torch.tensor(0),
+                "positions": torch.arange(budget),
             }))
-
-    # Mock item specs (e.g. 1 vision item)
-    item_spec = MagicMock()
-    manager._get_item_specs = MagicMock(return_value=[item_spec])
-
-    mm_kwargs = {"image": torch.zeros(1)}
-    output = manager._run_budget_graph(mm_kwargs, token_budget=256)
-
-    assert output is not None
-    assert manager.graph_hits == 1
-    assert manager.graph_misses == 0
-    mock_model.prepare_encoder_cudagraph_replay_buffers.assert_called_once_with(
-        mm_kwargs,
-        manager.max_batch_size,
-        manager.max_frames_per_batch,
-        path="default")
+    model.get_encoder_cudagraph_item_specs.return_value = [Mock(), Mock()]
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.float32,
+                                     multimodal_config=SimpleNamespace(
+                                         get_limit_per_prompt=lambda _: 0,
+                                         mm_encoder_tp_mode="weights")),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[8, 4],
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0))
+    return mm.MMEncoderManager(config, torch.device("cpu"), model)
 
 
-@patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-def test_run_budget_graph_miss(mock_compile, mock_vllm_config, mock_model):
-    manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
-                               mock_model)
-
-    item_spec = MagicMock()
-    manager._get_item_specs = MagicMock(return_value=[item_spec])
-
-    mm_kwargs = {"image": torch.zeros(1)}
-    # Unbudgeted token count
-    output = manager._run_budget_graph(mm_kwargs, token_budget=9999)
-
-    assert output is None
-    assert manager.graph_hits == 0
-    assert manager.graph_misses == 1
+def test_initialization_compiles_encoder_forward(manager, compile_mock):
+    compile_mock.assert_called_once_with(
+        manager.model.encoder_cudagraph_forward,
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False)
 
 
-@patch("torch.compile", side_effect=lambda fn, **kwargs: fn)
-def test_precompile_vision_encoder(mock_compile, mock_vllm_config, mock_model):
-    manager = MMEncoderManager(mock_vllm_config, torch.device("cpu"),
-                               mock_model)
+def test_initialization_builds_positive_budgets_per_path(manager):
+    assert {
+        path: list(templates)
+        for path, templates in manager.budget_templates.items()
+    } == {
+        "global": [4, 8],
+        "local": [8]
+    }
+    assert manager.graph_hits == manager.graph_misses == 0
+    assert manager.model.prepare_encoder_cudagraph_capture_inputs.call_args_list == [
+        call(4, 2, 0, torch.device("cpu"), torch.float32, path="global"),
+        call(8, 2, 0, torch.device("cpu"), torch.float32, path="global"),
+        call(8, 2, 0, torch.device("cpu"), torch.float32, path="local"),
+    ]
+    assert manager.budget_templates["global"][8]["pixels"] is not (
+        manager.budget_templates["local"][8]["pixels"])
 
-    manager._capture_budget_graph = MagicMock()
+
+def test_padding_clears_previous_request_and_preserves_defaults(manager):
+    template = manager.budget_templates["global"][4]
+    template["pixels"].fill_(99)
+    source = torch.tensor([[1., 2.], [3., 4.]])
+    result = manager._pad_to_template(
+        {
+            "pixels": source,
+            "scalar": torch.tensor(7)
+        }, 4, "global")
+    torch.testing.assert_close(
+        result["pixels"], torch.tensor([[1., 2.], [3., 4.], [0., 0.], [0.,
+                                                                       0.]]))
+    assert result["scalar"].item() == 7
+    assert result["positions"] is template["positions"]
+    assert result["pixels"] is template["pixels"]
+    torch.testing.assert_close(source, torch.tensor([[1., 2.], [3., 4.]]))
+    result = manager._pad_to_template({"pixels": torch.ones(1, 2)}, 4,
+                                      "global")
+    torch.testing.assert_close(result["pixels"][1:], torch.zeros(3, 2))
+
+
+def test_exact_shape_uses_input_without_overwriting_template(manager):
+    source = torch.ones(4, 2)
+    result = manager._pad_to_template({"pixels": source}, 4, "global")
+    assert result["pixels"] is source
+    torch.testing.assert_close(manager.budget_templates["global"][4]["pixels"],
+                               torch.zeros(4, 2))
+
+
+def test_custom_padding_is_selected_per_key_and_path(manager):
+
+    def pad(dst, src):
+        dst.fill_(-1)
+        dst[-src.shape[0]:].copy_(src)
+
+    manager.config.padding_logics["pixels"] = pad
+    result = manager._pad_to_template({"pixels": torch.ones(1, 2)}, 8, "local")
+    torch.testing.assert_close(result["pixels"][:-1], -torch.ones(7, 2))
+    torch.testing.assert_close(result["pixels"][-1:], torch.ones(1, 2))
+    torch.testing.assert_close(manager.budget_templates["global"][8]["pixels"],
+                               torch.zeros(8, 2))
+
+
+def test_capture_preserves_template_mapping_and_registers_after_sync(
+        manager, monkeypatch):
+    template = manager.budget_templates["global"][4]
+    output = torch.ones(4, 2)
+
+    def forward(values, *, path):
+        assert not torch.is_grad_enabled()
+        assert values is not template
+        assert path == "global"
+        values.pop("pixels")
+        return output
+
+    def synchronize(values, *, wait):
+        assert values is output
+        assert wait
+        assert 4 not in manager._get_graph_set("global")
+
+    manager._compiled_budget_forward.side_effect = forward
+    monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
+    manager._capture_budget_graph(4, "global")
+    assert manager._get_graph_set("global")[4] is template
+    assert "pixels" in template
+
+
+@pytest.mark.parametrize("failure", ["forward", "synchronize"])
+def test_capture_failure_leaves_budget_unregistered(manager, monkeypatch,
+                                                    failure):
+    synchronize = Mock()
+    target = manager._compiled_budget_forward if failure == "forward" else synchronize
+    target.side_effect = RuntimeError("capture failed")
+    monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
+    manager._capture_budget_graph(4, "global")
+    assert 4 not in manager._get_graph_set("global")
+    assert manager.graph_hits == manager.graph_misses == 0
+
+
+def test_precompile_continues_after_one_budget_fails(manager, monkeypatch):
+    manager._compiled_budget_forward.side_effect = [
+        RuntimeError("compile"),
+        torch.ones(8, 2),
+        torch.ones(8, 2)
+    ]
+    synchronize = Mock()
+    monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
     manager.precompile_vision_encoder()
+    assert manager._compiled_budget_forward.call_count == 3
+    assert synchronize.call_count == 2
+    assert set(manager._get_graph_set("global")) == {8}
+    assert set(manager._get_graph_set("local")) == {8}
 
-    assert manager._capture_budget_graph.call_count == len(
-        manager.token_budgets)
-    for budget in manager.token_budgets:
-        manager._capture_budget_graph.assert_any_call(budget, path="default")
+
+@pytest.mark.parametrize("path, budget", [("missing", 4), ("global", 16),
+                                          ("local", 0)])
+def test_missing_template_counts_items_without_replay(manager, path, budget):
+    assert manager._run_budget_graph({}, budget, path) is None
+    assert manager.graph_hits == 0
+    assert manager.graph_misses == 2
+    manager.model.prepare_encoder_cudagraph_replay_buffers.assert_not_called()
+    manager._compiled_budget_forward.assert_not_called()
+
+
+def test_replay_counts_items_and_passes_padded_values(manager):
+    mm_kwargs = {"images": object()}
+    manager.model.prepare_encoder_cudagraph_replay_buffers.return_value = (
+        SimpleNamespace(values={"pixels": torch.ones(2, 2)}))
+    output = torch.ones(4, 3)
+
+    def forward(values, *, path):
+        assert not torch.is_grad_enabled()
+        assert path == "global"
+        pixels = values.pop("pixels")
+        torch.testing.assert_close(pixels[:2], torch.ones(2, 2))
+        torch.testing.assert_close(pixels[2:], torch.zeros(2, 2))
+        return output
+
+    manager._compiled_budget_forward.side_effect = forward
+    for _ in range(2):
+        assert manager._run_budget_graph(mm_kwargs, 4, "global") is output
+    assert manager.graph_hits == 4
+    assert manager.graph_misses == 0
+    assert "pixels" in manager.budget_templates["global"][4]
+    manager.model.prepare_encoder_cudagraph_replay_buffers.assert_called_with(
+        mm_kwargs, 2, 0, path="global")
+    manager.model.encoder_eager_forward.assert_not_called()
+
+
+def test_replay_failure_uses_original_inputs_for_eager_fallback(manager):
+    mm_kwargs = {"images": object()}
+    manager.model.prepare_encoder_cudagraph_replay_buffers.return_value = (
+        SimpleNamespace(values={"pixels": torch.ones(2, 2)}))
+    manager._compiled_budget_forward.side_effect = RuntimeError("execute")
+    output = torch.ones(2, 3)
+
+    def eager(values, *, path):
+        assert values is mm_kwargs
+        assert path == "local"
+        assert torch.is_inference_mode_enabled()
+        return output
+
+    manager.model.encoder_eager_forward.side_effect = eager
+    assert manager._run_budget_graph(mm_kwargs, 8, "local") is output
+    assert manager.graph_hits == 0
+    assert manager.graph_misses == 2
+
+
+@pytest.mark.parametrize("enabled, supported", [(False, True), (True, False),
+                                                (True, True)])
+def test_factory_requires_enabled_and_supported(monkeypatch, enabled,
+                                                supported):
+    config = SimpleNamespace(compilation_config=SimpleNamespace(
+        cudagraph_mm_encoder=enabled))
+    model = Mock()
+    device = torch.device("cpu")
+    supports = Mock(return_value=supported)
+    constructor = Mock()
+    monkeypatch.setattr(mm, "supports_encoder_cudagraph", supports)
+    monkeypatch.setattr(mm, "MMEncoderManager", constructor)
+    result = mm.maybe_create_mm_encoder_manager(config, device, model)
+    if enabled and supported:
+        assert result is constructor.return_value
+        constructor.assert_called_once_with(config, device, model)
+    else:
+        assert result is None
+        constructor.assert_not_called()
+    if not enabled:
+        supports.assert_not_called()
