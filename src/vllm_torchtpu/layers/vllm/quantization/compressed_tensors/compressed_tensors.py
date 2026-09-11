@@ -146,10 +146,10 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 targets=self.target_scheme_map.keys(),
                 fused_mapping=self.packed_modules_mapping,
             )
-
-            scheme_dict = self.target_scheme_map[matched_target]
-            weight_quant = scheme_dict.get("weights")
-            input_quant = scheme_dict.get("input_activations")
+            if matched_target is not None:
+                scheme_dict = self.target_scheme_map[matched_target]
+                weight_quant = scheme_dict.get("weights")
+                input_quant = scheme_dict.get("input_activations")
 
         if weight_quant is None:
             logger.warning_once("Acceleration for non-quantized schemes is "
@@ -169,7 +169,8 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         if self._is_fp8_w8a8(weight_quant, input_quant):
             _raise_not_implemented("VllmCompressedTensorsW8A8Fp8")
 
-        if self._is_dynamic_token_w8a8(weight_quant, input_quant):
+        if input_quant is not None and self._is_dynamic_token_w8a8(
+                weight_quant, input_quant):
             _raise_not_implemented("VllmCompressedTensorsW8A8Int8")
 
         raise NotImplementedError(
