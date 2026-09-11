@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -233,8 +234,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
     # Specify requantization block size for MoE weights. When unset, NVFP4
-    # expert-parallel layers with USE_MOE_FUSED_EP_KERNEL use the kernel's
-    # smallest supported block; other MoE paths retain their default.
+    # expert-parallel layers admitted with USE_MOE_FUSED_EP_KERNEL and
+    # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
+    # Other MoE paths retain their default, including explicit requantization.
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
@@ -377,6 +379,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL":
     env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
+    # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
+    "MOE_FUSED_EP_ENABLE_W4A8":
+    env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
     # Largest node-wide token count, out of the scheduler's cap, at or above
     # which the fused kernel is armed for the whole deployment. Decided once at
     # weight load, not per step: a per-step choice would need the token count

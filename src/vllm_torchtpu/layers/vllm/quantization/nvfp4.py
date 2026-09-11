@@ -17,9 +17,10 @@ Loads NVIDIA ModelOpt NVFP4 checkpoints (packed E2M1 weights + per-16-block
 E4M3 scales + per-tensor FP32 global scale) and runs them on the TPU GMM /
 quantized-matmul kernels in W4A16 mode (bf16 activations, fp4 weights).
 ``MOE_REQUANTIZE_BLOCK_SIZE`` changes the MoE weight block size without
-changing the GMM activation precision. With ``USE_MOE_FUSED_EP_KERNEL=1``,
+changing the GMM activation precision. W4A8 requires both
+``USE_MOE_FUSED_EP_KERNEL=1`` and ``MOE_FUSED_EP_ENABLE_W4A8=1``. Only admitted
 EP layers default to the kernel's smallest supported weight block when no
-explicit block is configured. Admitted layers use fused EP MoE v2 in W4A8 mode.
+explicit block is configured. Refused layers retain their GMM weight recipe.
 
 Design:
   - Reuse upstream `ModelOptNvFp4{LinearMethod,RoutedExperts}.create_weights` for
@@ -134,6 +135,76 @@ def _requant_moe_w4a8(w13_u8: torch.Tensor, w13_scale_f: torch.Tensor,
 
     return (_fresh(w13_out), _fresh(w13_scale_4d), _fresh(w2_out),
             _fresh(w2_scale_4d))
+
+
+def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
+    """Prepare a candidate weight set without replacing checkpoint tensors."""
+    w13, w2 = layer.w13_weight.data, layer.w2_weight.data
+    if requant_block:
+        requant_block = int(requant_block)
+        hidden, inter = w13.shape[-1] * 2, w2.shape[-1] * 2
+        if hidden % requant_block == 0 and inter % requant_block == 0:
+            w13, s13 = requant_load_kmajor_fp4(_fresh(w13), w13_scale_f,
+                                               requant_block)
+            w2, s2 = requant_load_kmajor_fp4(_fresh(w2), w2_scale_f,
+                                             requant_block)
+            return (w13, w2, s13,
+                    s2), f"FP4 (jax requant block-{requant_block})"
+        # Pad each gate/up half and w2's contracting dimension together.
+        w13, s13, w2, s2 = _requant_moe_w4a8(w13, w13_scale_f, w2, w2_scale_f,
+                                             requant_block)
+        mode = f"FP4 (torch requant block-{requant_block})"
+    else:
+        w13, w2 = _fresh(w13), _fresh(w2)
+        s13, s2 = _to_kernel_scale(w13_scale_f), _to_kernel_scale(w2_scale_f)
+        mode = "FP4 (block-16)"
+    return (load_kmajor_fp4(w13), load_kmajor_fp4(w2), s13, s2), mode
+
+
+def _prebuild_w4a8(layer, activation, configured_block):
+    """Admit the proposed runtime layout while checkpoint weights are intact."""
+    from vllm_torchtpu.layers.vllm.fused_moe_ep import prebuild_fused_moe_ep
+
+    if not (envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
+            and layer.moe_config.moe_parallel_config.use_ep):
+        return None, configured_block
+    from vllm_torchtpu.kernels.fused_moe.v2.host import PACK4, U32_SUBLANE_TILE
+
+    block = (U32_SUBLANE_TILE *
+             PACK4 if configured_block is None else configured_block)
+    hidden = layer.w13_weight.shape[-1] * 2
+    inter = layer.w2_weight.shape[-1] * 2
+    if block <= 0 or hidden % block:
+        logger.info_once(
+            "NVFP4 fused EP not engaged: weight block-%d cannot "
+            "serve hidden=%d; retaining the GMM weight recipe.", block, hidden)
+        return None, configured_block
+    inter = align_to(inter, block)
+    experts = layer.w13_weight.shape[0]
+    # Admission reads only shapes/dtypes. Meta tensors allocate no weight
+    # storage and describe Torch's packed, K-major FP4 representation.
+    weights = (
+        torch.empty((experts, hidden, inter),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="meta"),
+        torch.empty((experts, inter, hidden // 2),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="meta"),
+        torch.empty((experts, hidden // block, 1, 2 * inter),
+                    dtype=torch.float32,
+                    device="meta"),
+        torch.empty((experts, inter // block, 1, hidden),
+                    dtype=torch.float32,
+                    device="meta"),
+    )
+    op = prebuild_fused_moe_ep(layer,
+                               topk=layer.moe_config.experts_per_token,
+                               renormalize=layer.renormalize,
+                               activation=activation,
+                               weight_format="fp4",
+                               rhs_qb=block,
+                               weights=weights)
+    return op, block if op is not None else configured_block
 
 
 @register_quantization_config(get_tpu_quant_method(NVFP4))
@@ -258,78 +329,41 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
-        # Requantization changes only the checkpoint's weight blocks. GMM
-        # always retains BF16 activations; admitted fused EP layers use W4A8.
-        # An explicit block wins; otherwise opt-in EP layers use the smallest
-        # block that fits the fused kernel's packed-weight row layout.
-        requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
-        if (requant_block is None and envs.USE_MOE_FUSED_EP_KERNEL
-                and layer.moe_config.moe_parallel_config.use_ep):
-            from vllm_torchtpu.kernels.fused_moe.v2.host import (
-                PACK4, U32_SUBLANE_TILE)
-            min_block = U32_SUBLANE_TILE * PACK4
-            hidden = layer.w13_weight.data.shape[-1] * 2
-            # The existing requant path can pad the intermediate dimension,
-            # but the hidden dimension must already align. No larger legal
-            # block can divide it if the minimum packed-row tile does not.
-            if hidden % min_block == 0:
-                requant_block = min_block
-                logger.info_once(
-                    "NVFP4 fused EP automatically selects weight block-%d "
-                    "because MOE_REQUANTIZE_BLOCK_SIZE is unset.", min_block)
-            else:
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason)
+
+        # Preserve main's explicit requantization recipe for the GMM path.
+        # Automatic requantization is committed only for an admitted W4A8 op.
+        configured_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
+        op, requant_block = _prebuild_w4a8(layer, activation_str,
+                                           configured_block)
+        weights, mode = _prepare_moe_weights(layer, w13_scale_f, w2_scale_f,
+                                             requant_block)
+        if op is not None:
+            reason = fused_moe_ep_unsupported_reason(layer,
+                                                     weights,
+                                                     activation_str,
+                                                     weight_format="fp4",
+                                                     rhs_qb=requant_block)
+            if reason is not None:
                 logger.warning_once(
-                    "NVFP4 fused EP not engaged: hidden=%d is not divisible "
-                    "by the minimum weight block (%d); keeping GMM W4A16.",
-                    hidden, min_block)
-        already_kmajor = False
-        if requant_block:
-            requant_block = int(requant_block)
-            hidden = layer.w13_weight.data.shape[-1] * 2  # w13 contracting (H)
-            inter = layer.w2_weight.data.shape[-1] * 2  # w2 contracting (I)
-            if hidden % requant_block == 0 and inter % requant_block == 0:
-                # Dequant block-16 -> requant block-`requant_block` -> K-major
-                # native fp4, all in JAX (matches tpu-inference's
-                # process_quantized_moe_weights). Returns native fp4 + kernel
-                # scale directly, so no separate load_kmajor_fp4 below.
-                w13, w13_scale_4d = requant_load_kmajor_fp4(
-                    _fresh(layer.w13_weight.data), w13_scale_f, requant_block)
-                w2, w2_scale_4d = requant_load_kmajor_fp4(
-                    _fresh(layer.w2_weight.data), w2_scale_f, requant_block)
-                already_kmajor = True
-                mode = f"FP4 (jax requant block-{requant_block})"
-            else:
-                # Contracting dim not divisible by the block (e.g. Qwen3-30B w2
-                # I=768): pad + requant in torch.
-                w13, w13_scale_4d, w2, w2_scale_4d = _requant_moe_w4a8(
-                    layer.w13_weight.data, w13_scale_f, layer.w2_weight.data,
-                    w2_scale_f, requant_block)
-                mode = f"FP4 (torch requant block-{requant_block})"
-        else:
-            # Lay block-16 scales out for gmm_v2: [E, num_blocks_over_K, 1, N]
-            # (already K-major-aligned). Weights are the checkpoint-layout packed
-            # uint8 [E, N, K/2]; they are unpacked + transposed to K-major native
-            # fp4 below (load_kmajor_fp4).
-            w13_scale_4d = _to_kernel_scale(w13_scale_f)  # [E, H/group, 1, 2I]
-            w2_scale_4d = _to_kernel_scale(w2_scale_f)  # [E, I/group, 1, H]
-            w13 = _fresh(layer.w13_weight.data)  # [E, 2I, H/2] uint8
-            w2 = _fresh(layer.w2_weight.data)  # [E, H, I/2] uint8
-            mode = "FP4 (block-16)"
+                    "NVFP4 fused EP not engaged after weight preparation: %s; "
+                    "restoring the GMM weight recipe.", reason)
+                op = None
+                requant_block = configured_block
+                # The checkpoint tensors still belong to the layer. Discard
+                # the candidate and rebuild the fallback from those originals.
+                del weights
+                weights, mode = _prepare_moe_weights(layer, w13_scale_f,
+                                                     w2_scale_f, requant_block)
+        w13, w2, w13_scale_4d, w2_scale_4d = weights
 
         for attr in ("w13_weight_scale_2", "w2_weight_scale_2",
                      "w13_input_scale", "w2_input_scale"):
             if hasattr(layer, attr):
                 delattr(layer, attr)
 
-        # Store the weights as native fp4 (torch.float4_e2m1fn_x2) in gmm_v2's
-        # K-major [E, K, N] layout. The JAX requant path already returns
-        # native fp4 K-major; the block-16 and torch-requant paths unpack +
-        # transpose the packed uint8 here, ONCE at load, so the forward hands
-        # the weight straight to gmm_v2 with no per-forward unpack or transpose.
-        if not already_kmajor:
-            w13 = load_kmajor_fp4(w13)  # [E, N, K/2] uint8 -> fp4 [E, K, N]
-            w2 = load_kmajor_fp4(w2)
-
+        # Install only the admitted W4A8 candidate or the original GMM recipe.
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale = torch.nn.Parameter(w13_scale_4d,
@@ -362,22 +396,9 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
 
-        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
-        op = None
-        # Keep block-16 on GMM when no explicit or automatic requant is selected.
-        # prebuild performs all per-layer routing/parallelism admission checks.
-        if requant_block:
-            op = prebuild_fused_moe_ep(layer,
-                                       topk=layer.moe_config.experts_per_token,
-                                       renormalize=layer.renormalize,
-                                       activation=activation_str,
-                                       weight_format="fp4",
-                                       rhs_qb=requant_block)
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
-            # Do the layout conversion once, outside compiled forward. Keep
-            # the original GMM scales for the fallback and its load contract.
+            # Do the scale layout conversion once, outside compiled forward.
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
                 layer.w13_weight_scale.squeeze(2).contiguous(),

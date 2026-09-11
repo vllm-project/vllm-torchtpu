@@ -96,6 +96,7 @@ def _prebuild(layer,
 def _armed():
     """Every test here runs as if the operator asked for the kernel."""
     with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True), \
+            patch.object(envs, "MOE_FUSED_EP_ENABLE_W4A8", True), \
             patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1024), \
             patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", False):
         yield
@@ -472,6 +473,23 @@ def _fp4_layer(block=512, hidden=512, inter=512):
     return layer
 
 
+@pytest.mark.parametrize("setting,enabled", [(None, False), ("0", False),
+                                             ("1", True)])
+def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
+    name = "MOE_FUSED_EP_ENABLE_W4A8"
+    if setting is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, setting)
+    value = envs.environment_variables[name]()
+    assert value is enabled
+    monkeypatch.setattr(envs, name, value)
+    assert _prebuild(_fp4_layer(), weight_format="fp4",
+                     rhs_qb=512) == ("op" if enabled else None)
+    # The new opt-in applies only to FP4; FP8 fused EP retains its behavior.
+    assert _prebuild(_layer()) == "op"
+
+
 @pytest.mark.parametrize("block", [64, 128, 256, 512, 1024])
 def test_nvfp4_aligned_block_arms_and_passes_format(block):
     seen = []
@@ -589,6 +607,10 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
 
     monkeypatch.setattr(nvfp4, "RoutedExperts", torch.nn.Module)
     monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)
+    monkeypatch.setattr(
+        nvfp4, "load_kmajor_fp4", lambda w: torch.empty(
+            (w.shape[0], w.shape[2] * 2, w.shape[1] // 2),
+            dtype=torch.float4_e2m1fn_x2))
     monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel",
                         lambda **kw: gmm_options.append(kw))
     monkeypatch.setattr(nvfp4.moe_routing, "register_experts_start_buffer",
@@ -596,7 +618,10 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     monkeypatch.setattr(nvfp4.moe_routing, "validate_linear_ep_placement",
                         lambda *a: None)
 
-    def prebuild(*args, **kwargs):
+    def prebuild(candidate, **kwargs):
+        assert candidate.w13_weight.dtype == torch.uint8
+        assert seen == []  # Admission must precede requantization.
+        assert all(w.device.type == "meta" for w in kwargs["weights"])
         assert kwargs["weight_format"] == "fp4"
         assert kwargs["rhs_qb"] == effective_block
         return op if admitted else None
@@ -608,12 +633,17 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     # even when the layer is also admitted to fused EP.
     assert len(gmm_options) == 1
     assert not gmm_options[0].get("quantize_fp4_lhs", False)
-    assert seen[0][1] == seen[1][1] == effective_block
-    torch.testing.assert_close(seen[0][0][:, :512], torch.full((1, 512, 32),
-                                                               2.))
-    torch.testing.assert_close(seen[0][0][:, 512:], torch.full((1, 512, 32),
-                                                               3.))
-    torch.testing.assert_close(seen[1][0], torch.full((1, 512, 32), 4.))
+    if admitted or block is not None:
+        assert seen[0][1] == seen[1][1] == effective_block
+        torch.testing.assert_close(seen[0][0][:, :512],
+                                   torch.full((1, 512, 32), 2.))
+        torch.testing.assert_close(seen[0][0][:, 512:],
+                                   torch.full((1, 512, 32), 3.))
+        torch.testing.assert_close(seen[1][0], torch.full((1, 512, 32), 4.))
+    else:
+        assert seen == []
+        assert layer.w13_weight_scale.shape == (1, 32, 1, 1024)
+        assert layer.w2_weight_scale.shape == (1, 32, 1, 512)
     assert bridge.fused_moe_ep_supported(method) == admitted
     if admitted:
         x = torch.ones(2, 512)
@@ -651,6 +681,7 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
         assert not kwargs.get("quantize_fp4_lhs", False)
 
 
+@pytest.mark.parametrize("w4a8_enabled", [False, True])
 @pytest.mark.parametrize(
     "fused_enabled,use_ep,configured_block,hidden,inter,expected_block,armed",
     [
@@ -667,8 +698,12 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
 def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
                                                    use_ep, configured_block,
                                                    hidden, inter,
-                                                   expected_block, armed):
+                                                   expected_block, armed,
+                                                   w4a8_enabled):
     from vllm_torchtpu.layers.vllm.quantization import nvfp4
+    if not w4a8_enabled:
+        expected_block = configured_block or 16
+        armed = False
     layer = _nvfp4_checkpoint_layer(hidden, inter, use_ep)
     method = object.__new__(nvfp4.VllmNvfp4MoEMethod)
     method.moe = SimpleNamespace(has_bias=False, is_act_and_mul=True)
@@ -690,11 +725,14 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
     original_prebuild = bridge.prebuild_fused_moe_ep
 
     def prebuild(layer, **kwargs):
+        assert layer.w13_weight.dtype == torch.uint8
+        assert requant_blocks == []
         prebuild_calls.append(kwargs["rhs_qb"])
         with patch.object(bridge, "prebuild_fused_moe_ep", original_prebuild):
             return _prebuild(layer, **kwargs)
 
     monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", fused_enabled)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_ENABLE_W4A8", w4a8_enabled)
     monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", configured_block)
     monkeypatch.setattr(nvfp4, "RoutedExperts", torch.nn.Module)
     monkeypatch.setattr(nvfp4, "load_kmajor_fp4", load)
@@ -714,10 +752,118 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
     assert layer.w2_weight_scale.shape == (1, padded_inter // expected_block,
                                            1, hidden)
     assert bridge.fused_moe_ep_supported(method) == armed
-    if expected_block != 16 or configured_block:
-        assert prebuild_calls == [expected_block]
+    if (w4a8_enabled and fused_enabled and use_ep
+            and (configured_block is None or configured_block > 0)
+            and hidden % (configured_block or 64) == 0):
+        assert prebuild_calls == [configured_block or 64]
+    else:
+        assert prebuild_calls == []
+    if configured_block or armed:
         if inter % expected_block == 0:
             assert requant_blocks == [expected_block, expected_block]
     else:
-        assert prebuild_calls == []
         assert requant_blocks == []
+
+
+@pytest.mark.parametrize("configured_block", [None, 128])
+@pytest.mark.parametrize("refusal", [
+    "tp", "mesh", "tokens", "smem", "routing", "experts", "activation",
+    "simulation", "prepared_scales"
+])
+def test_nvfp4_refusal_preserves_the_gmm_weight_recipe(monkeypatch, refusal,
+                                                       configured_block):
+    from vllm_torchtpu.layers.vllm.quantization import nvfp4
+
+    layer = _nvfp4_checkpoint_layer()
+    originals = (layer.w13_weight, layer.w2_weight)
+    original_values = tuple(w.clone() for w in originals)
+    method = object.__new__(nvfp4.VllmNvfp4MoEMethod)
+    method.moe = SimpleNamespace(has_bias=False, is_act_and_mul=True)
+    method.group_size = 16
+    admission = {}
+    if refusal == "tp":
+        admission["tp"] = 8
+    elif refusal == "mesh":
+        admission["has_mesh"] = False
+    elif refusal == "tokens":
+        admission["node_tokens"] = 1
+    elif refusal == "smem":
+        admission["smem_bytes"] = 1
+    elif refusal == "routing":
+        layer.scoring_func = "sigmoid"
+    elif refusal == "experts":
+        layer.global_num_experts = 3
+    elif refusal == "activation":
+        layer.activation = "gelu"
+    elif refusal == "simulation":
+        monkeypatch.setattr(nvfp4.moe_routing, "_SIMULATION_STRATEGY",
+                            object())
+
+    loads = []
+    requants = []
+    events = []
+
+    def load(w):
+        loads.append(w.clone())
+        e, n, half_k = w.shape
+        return torch.empty((e, 2 * half_k, n // 2),
+                           dtype=torch.float4_e2m1fn_x2)
+
+    def requant(w, scales, block):
+        events.append("requant")
+        requants.append(block)
+        # No candidate may replace the checkpoint tensors before validation.
+        assert layer.w13_weight is originals[0]
+        assert layer.w2_weight is originals[1]
+        e, n, half_k = w.shape
+        weight = torch.empty((e, 2 * half_k, n // 2),
+                             dtype=torch.float4_e2m1fn_x2)
+        scale = torch.ones(e, 2 * half_k // block, 1, n)
+        if refusal == "prepared_scales" and len(requants) <= 2:
+            scale = scale[..., :-1]  # Force final validation to refuse.
+        return weight, scale
+
+    original_prebuild = bridge.prebuild_fused_moe_ep
+
+    def prebuild(candidate, **kwargs):
+        events.append("admission")
+        assert requants == [] and loads == []
+        assert candidate.w13_weight is originals[0]
+        assert candidate.w2_weight is originals[1]
+        with patch.object(bridge, "prebuild_fused_moe_ep", original_prebuild):
+            return _prebuild(candidate, **admission, **kwargs)
+
+    monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", configured_block)
+    monkeypatch.setattr(nvfp4, "RoutedExperts", torch.nn.Module)
+    monkeypatch.setattr(nvfp4, "load_kmajor_fp4", load)
+    monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)
+    monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel", lambda **kw: None)
+    monkeypatch.setattr(nvfp4.moe_routing, "register_experts_start_buffer",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(nvfp4.moe_routing, "validate_linear_ep_placement",
+                        lambda *a: None)
+    monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", prebuild)
+    method.process_weights_after_loading(layer)
+
+    assert events[0] == "admission"
+    assert not bridge.fused_moe_ep_supported(method)
+    assert not hasattr(layer, "_tpu_fused_w13_scale")
+    expected_block = configured_block or 16
+    assert layer.w13_weight_scale.shape == (1, 512 // expected_block, 1, 1024)
+    assert layer.w2_weight_scale.shape == (1, 512 // expected_block, 1, 512)
+    expected_requants = [configured_block] * 2 if configured_block else []
+    if refusal == "prepared_scales":
+        expected_requants = [configured_block or 64] * 2 + expected_requants
+    assert requants == expected_requants
+    for original, value in zip(originals, original_values):
+        torch.testing.assert_close(original, value)
+    if configured_block is None:
+        assert len(loads) == 2
+        for loaded, original in zip(loads, original_values):
+            torch.testing.assert_close(loaded, original)
+        torch.testing.assert_close(layer.w13_weight_scale[..., :512],
+                                   torch.full((1, 32, 1, 512), 2.))
+        torch.testing.assert_close(layer.w13_weight_scale[..., 512:],
+                                   torch.full((1, 32, 1, 512), 3.))
+        torch.testing.assert_close(layer.w2_weight_scale,
+                                   torch.full((1, 32, 1, 512), 4.))

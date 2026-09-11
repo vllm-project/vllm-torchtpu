@@ -89,7 +89,7 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # per MoE layer -- 60 times on Qwen3.5-397B.
 #
 # WHICH layers are armed is a separate question, and not one this key can
-# answer: two of prebuild's refusals -- the SMEM bound and `_unsupported_reason`
+# answer: two of prebuild's refusals -- the SMEM bound and the weight contract
 # -- read things that are not in it. So prebuild hands the op back to the caller
 # and the caller records it on the layer's own quant method; see
 # `fused_moe_ep_supported`.
@@ -309,7 +309,8 @@ def prebuild_fused_moe_ep(layer,
                           activation: str,
                           *,
                           weight_format="fp8",
-                          rhs_qb=None) -> Any | None:
+                          rhs_qb=None,
+                          weights=None) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
     Called once per layer from `process_weights_after_loading`. Everything here
@@ -319,8 +320,16 @@ def prebuild_fused_moe_ep(layer,
     Returns the op to serve this layer with, or None on any refusal. The caller
     records it, which is what makes arming per layer rather than per process --
     several of the refusals below read things that vary by layer.
+
+    `weights` optionally supplies (w1, w2, w1_scale, w2_scale) before they are
+    installed on the layer. NVFP4 uses meta tensors describing the proposed
+    requantized layout so admission precedes any lossy weight conversion.
+    The caller must validate the actual prepared tensors before installing
+    them; the built op closes over configuration, never these tensors.
     """
     if not envs.USE_MOE_FUSED_EP_KERNEL:
+        return None
+    if weight_format == "fp4" and not envs.MOE_FUSED_EP_ENABLE_W4A8:
         return None
 
     # The experts have to actually be expert-parallel. vLLM builds an EP group
@@ -399,13 +408,14 @@ def prebuild_fused_moe_ep(layer,
                                 device=layer.w13_weight.device)
     mesh_expert_order = _mesh_expert_order(ep)
 
-    w1, w2 = layer.w13_weight, layer.w2_weight
-    if weight_format == "fp4":
-        w1_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
-    else:
-        w1_scale = layer.w13_weight_scale_inv
-        w2_scale = layer.w2_weight_scale_inv
+    if weights is None:
+        if weight_format == "fp4":
+            weights = (layer.w13_weight, layer.w2_weight,
+                       layer.w13_weight_scale, layer.w2_weight_scale)
+        else:
+            weights = (layer.w13_weight, layer.w2_weight,
+                       layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+    w1, w2, w1_scale, w2_scale = weights
     local_experts, hidden = w1.shape[0], w1.shape[1]
     # Torch stores two FP4 output elements per byte; JAX sees the logical
     # width after the bridge converts the native FP4 tensor.
@@ -441,17 +451,11 @@ def prebuild_fused_moe_ep(layer,
             local_experts)
         return None
 
-    reason = _unsupported_reason(layer,
-                                 w1,
-                                 w2,
-                                 w1_scale,
-                                 w2_scale,
-                                 local_experts,
-                                 hidden,
-                                 inter,
-                                 activation,
-                                 weight_format=weight_format,
-                                 rhs_qb=rhs_qb)
+    reason = fused_moe_ep_unsupported_reason(layer,
+                                             weights,
+                                             activation,
+                                             weight_format=weight_format,
+                                             rhs_qb=rhs_qb)
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
@@ -483,21 +487,18 @@ def prebuild_fused_moe_ep(layer,
     return op
 
 
-def _unsupported_reason(layer,
-                        w1,
-                        w2,
-                        w1_scale,
-                        w2_scale,
-                        local_experts,
-                        hidden,
-                        inter,
-                        activation,
-                        *,
-                        weight_format="fp8",
-                        rhs_qb=None) -> str | None:
-    """Why this layer cannot use the fused kernel, or None if it can."""
-    if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != local_experts:
+def fused_moe_ep_unsupported_reason(layer,
+                                    weights,
+                                    activation,
+                                    *,
+                                    weight_format="fp8",
+                                    rhs_qb=None) -> str | None:
+    """Validate prepared (or meta) weights and routing before installation."""
+    w1, w2, w1_scale, w2_scale = weights
+    if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != w1.shape[0]:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
+    local_experts, hidden = w1.shape[:2]
+    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
     packing = 2 if weight_format == "fp4" else 1
     if w2.shape[1] != inter or w2.shape[2] * packing != hidden:
         return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
