@@ -770,8 +770,8 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
     "tp", "mesh", "tokens", "smem", "routing", "experts", "activation",
     "simulation", "prepared_scales"
 ])
-def test_nvfp4_refusal_preserves_the_gmm_weight_recipe(monkeypatch, refusal,
-                                                       configured_block):
+def test_nvfp4_admission_and_prepared_weight_validation(
+        monkeypatch, refusal, configured_block):
     from vllm_torchtpu.layers.vllm.quantization import nvfp4
 
     layer = _nvfp4_checkpoint_layer()
@@ -819,7 +819,7 @@ def test_nvfp4_refusal_preserves_the_gmm_weight_recipe(monkeypatch, refusal,
         weight = torch.empty((e, 2 * half_k, n // 2),
                              dtype=torch.float4_e2m1fn_x2)
         scale = torch.ones(e, 2 * half_k // block, 1, n)
-        if refusal == "prepared_scales" and len(requants) <= 2:
+        if refusal == "prepared_scales":
             scale = scale[..., :-1]  # Force final validation to refuse.
         return weight, scale
 
@@ -843,6 +843,20 @@ def test_nvfp4_refusal_preserves_the_gmm_weight_recipe(monkeypatch, refusal,
     monkeypatch.setattr(nvfp4.moe_routing, "validate_linear_ep_placement",
                         lambda *a: None)
     monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", prebuild)
+    if refusal == "prepared_scales":
+        with pytest.raises(AssertionError,
+                           match="prepared weights violate the admitted "
+                           "layout: w1_scale"):
+            method.process_weights_after_loading(layer)
+        assert events == ["admission", "requant", "requant"]
+        assert requants == [configured_block or 64] * 2
+        assert loads == []  # No second preparation or GMM fallback.
+        assert layer.w13_weight is originals[0]
+        assert layer.w2_weight is originals[1]
+        for original, value in zip(originals, original_values):
+            torch.testing.assert_close(original, value)
+        assert not bridge.fused_moe_ep_supported(method)
+        return
     method.process_weights_after_loading(layer)
 
     assert events[0] == "admission"
@@ -852,8 +866,6 @@ def test_nvfp4_refusal_preserves_the_gmm_weight_recipe(monkeypatch, refusal,
     assert layer.w13_weight_scale.shape == (1, 512 // expected_block, 1, 1024)
     assert layer.w2_weight_scale.shape == (1, 512 // expected_block, 1, 512)
     expected_requants = [configured_block] * 2 if configured_block else []
-    if refusal == "prepared_scales":
-        expected_requants = [configured_block or 64] * 2 + expected_requants
     assert requants == expected_requants
     for original, value in zip(originals, original_values):
         torch.testing.assert_close(original, value)

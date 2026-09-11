@@ -345,17 +345,11 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                                                      activation_str,
                                                      weight_format="fp4",
                                                      rhs_qb=requant_block)
-            if reason is not None:
-                logger.warning_once(
-                    "NVFP4 fused EP not engaged after weight preparation: %s; "
-                    "restoring the GMM weight recipe.", reason)
-                op = None
-                requant_block = configured_block
-                # The checkpoint tensors still belong to the layer. Discard
-                # the candidate and rebuild the fallback from those originals.
-                del weights
-                weights, mode = _prepare_moe_weights(layer, w13_scale_f,
-                                                     w2_scale_f, requant_block)
+            # Admission already accepted the proposed layout. A mismatch in
+            # the actual tensors is a preparation bug, not a fallback case.
+            assert reason is None, (
+                "NVFP4 fused EP prepared weights violate the admitted layout: "
+                f"{reason}")
         w13, w2, w13_scale_4d, w2_scale_4d = weights
 
         for attr in ("w13_weight_scale_2", "w2_weight_scale_2",
