@@ -190,7 +190,7 @@ class TestCompressedTensorsHelpers:
         with pytest.raises(
                 NotImplementedError,
                 match=
-                "SampleScheme is not implemented yet. Port this from tpu_inference to support this layer."
+                "Compressed-tensors scheme 'SampleScheme' is not implemented yet in vllm-torchtpu."
         ):
             _raise_not_implemented("SampleScheme")
 
@@ -258,7 +258,9 @@ class TestCompressedTensorsConfig:
                                           quant_format="dense")
         with pytest.raises(
                 NotImplementedError,
-                match="VllmCompressedTensorsW4A8Fp8 is not implemented yet"):
+                match=
+                "Compressed-tensors scheme 'VllmCompressedTensorsW4A8Fp8' is not implemented yet"
+        ):
             cfg.get_scheme(linear_layer, "proj")
 
     def test_get_scheme_unsupported_nvfp4_raises(self, linear_layer):
@@ -276,7 +278,9 @@ class TestCompressedTensorsConfig:
             quant_format="dense")
         with pytest.raises(
                 NotImplementedError,
-                match="VllmCompressedTensorsW4A4Fp4 is not implemented yet"):
+                match=
+                "Compressed-tensors scheme 'VllmCompressedTensorsW4A4Fp4' is not implemented yet"
+        ):
             cfg.get_scheme(linear_layer, "proj")
 
     def test_get_scheme_unsupported_w8a8_fp8_raises(self, linear_layer):
@@ -300,7 +304,9 @@ class TestCompressedTensorsConfig:
                                           quant_format="dense")
         with pytest.raises(
                 NotImplementedError,
-                match="VllmCompressedTensorsW8A8Fp8 is not implemented yet"):
+                match=
+                "Compressed-tensors scheme 'VllmCompressedTensorsW8A8Fp8' is not implemented yet"
+        ):
             cfg.get_scheme(linear_layer, "proj")
 
     def test_get_scheme_unsupported_dynamic_token_w8a8_int8_raises(
@@ -325,7 +331,9 @@ class TestCompressedTensorsConfig:
                                           quant_format="dense")
         with pytest.raises(
                 NotImplementedError,
-                match="VllmCompressedTensorsW8A8Int8 is not implemented yet"):
+                match=
+                "Compressed-tensors scheme 'VllmCompressedTensorsW8A8Int8' is not implemented yet"
+        ):
             cfg.get_scheme(linear_layer, "proj")
 
     def test_get_scheme_unrecognized_scheme_raises(self, linear_layer):
