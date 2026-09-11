@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Validation and selection tests for the optional Kimi K3 mega KDA path."""
+"""Validation tests for the Kimi K3 mega KDA kernel."""
 
 from __future__ import annotations
 
@@ -9,26 +9,6 @@ import pytest
 
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import (_layout_supported,
                                                     kda_forward_inference)
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
-    _get_kda_prefill_kernel
-
-
-def test_kda_prefill_kernel_defaults_to_chunked(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", raising=False)
-    assert _get_kda_prefill_kernel() == "chunked"
-
-
-@pytest.mark.parametrize("value", ["chunked", " CHUNKED ", "mega", " MEGA "])
-def test_kda_prefill_kernel_accepts_supported_values(monkeypatch,
-                                                     value: str) -> None:
-    monkeypatch.setenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", value)
-    assert _get_kda_prefill_kernel() == value.strip().lower()
-
-
-def test_kda_prefill_kernel_rejects_unknown_value(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "automatic")
-    with pytest.raises(ValueError, match="must be 'chunked' or 'mega'"):
-        _get_kda_prefill_kernel()
 
 
 @pytest.mark.parametrize(

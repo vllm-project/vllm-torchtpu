@@ -387,9 +387,11 @@ def apply_tpu_patches() -> None:
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import (
         patch_default_loader_ep_weight_filter,
+        patch_default_model_loader_page_cache,
         patch_runai_sharded_expert_streaming)
     patch_runai_sharded_expert_streaming()
     patch_default_loader_ep_weight_filter()
+    patch_default_model_loader_page_cache()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).

@@ -52,8 +52,8 @@ from vllm.model_executor.utils import replace_parameter
 from vllm_torchtpu.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.vllm import moe_routing
-from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
-                                                 get_fused_moe_activation,
+from vllm_torchtpu.layers.vllm.fused_moe import (TpuMoEActivationMixin,
+                                                 fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
                                                      WEIGHT_FLIPPED_ATTR)
@@ -184,7 +184,8 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return None
 
 
-class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
+                                    UnquantizedFusedMoEMethod):
     """
     TPU-native implementation of unquantized RoutedExperts.
 
@@ -217,10 +218,8 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         # Pre-compute activation string: layer.activation is a MoEActivation
         # enum in v0.17.1 but the Pallas kernel expects a plain string.
-        # Resolve here (outside torch.compile) and stash on the layer.
-        activation_str = get_fused_moe_activation(layer.activation,
-                                                  layer.moe_config)
-        layer._tpu_activation_str = activation_str
+        # Resolve here, outside torch.compile.
+        activation_str = self._set_tpu_activation(layer)
 
         w13_weight = layer.w13_weight.data
         w2_weight = layer.w2_weight.data
@@ -304,7 +303,9 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer")
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

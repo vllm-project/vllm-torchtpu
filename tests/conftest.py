@@ -73,6 +73,21 @@ def _clear_kv_cache_layout_cache():
     set_kv_cache_layout(None)
 
 
+@pytest.fixture(autouse=True)
+def _reset_warning_once():
+    """`warning_once` dedups by message for the life of the process, so without
+    this a test passes or fails depending on what ran before it."""
+    try:
+        import vllm.logger
+    except ImportError:
+        yield
+        return
+
+    vllm.logger._print_warning_once.cache_clear()
+    yield
+    vllm.logger._print_warning_once.cache_clear()
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run a test body inside an active vLLM config.

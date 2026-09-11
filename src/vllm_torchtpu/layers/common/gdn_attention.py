@@ -798,13 +798,9 @@ def run_jax_gdn_attention_pooled_local(
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
     in ``recurrent_state_dtype`` at token offset 0 and the fixed-BF16 Conv
-    region in the following tokens. All pool knowledge lives here: for the
-    chunked impls, conv state is gathered/scattered through `pool_adapters`
-    around the stock conv kernel, and the SSM region is threaded into the
-    stock delta-rule via
-    pluggable `StateOps`; the fused V3 kernel instead streams both regions
-    in place through a `v3_state_source` copy-plan — the model kernels'
-    math is unmodified either way.
+    region in the following tokens. All pool knowledge lives here: this
+    function builds the copy-plan that maps those two regions onto the V3
+    kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
     conv_dim = conv_weight.shape[0]

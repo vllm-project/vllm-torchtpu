@@ -62,8 +62,8 @@ from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor_to_fp4,
                                                       unpack_uint8_to_fp4)
 from vllm_torchtpu.layers.vllm import moe_routing
-from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
-                                                 get_fused_moe_activation,
+from vllm_torchtpu.layers.vllm.fused_moe import (TpuMoEActivationMixin,
+                                                 fused_moe_gmm,
                                                  load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel,
                                                  requant_load_kmajor_fp4)
@@ -240,7 +240,7 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
         return None
 
 
-class VllmNvfp4MoEMethod(FusedMoEMethodBase):
+class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
     """NVFP4 MoE for TPU: W4A16 GMM or opt-in W4A8 fused EP v2.
 
     Reuses upstream `ModelOptNvFp4FusedMoE.create_weights` for parameter
@@ -299,19 +299,21 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 getattr(layer, name),
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value})
 
+    def _resolve_tpu_activation(self, layer) -> str:
+        activation_str = super()._resolve_tpu_activation(layer)
+        if activation_str == "swigluoai":
+            raise NotImplementedError(
+                "NVFP4 MoE on TPU supports act_and_mul (silu/gelu) layouts; "
+                "swigluoai (interleaved) is not implemented.")
+        return activation_str
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU NVFP4 MoE does not support bias."
         assert self.moe.is_act_and_mul, (
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
             "[gate; up] w13 layout and a per-w1/w3 global scale [E, 2].")
-        activation_str = get_fused_moe_activation(layer.activation,
-                                                  layer.moe_config)
-        if activation_str == "swigluoai":
-            raise NotImplementedError(
-                "NVFP4 MoE on TPU supports act_and_mul (silu/gelu) layouts; "
-                "swigluoai (interleaved) is not implemented.")
-        layer._tpu_activation_str = activation_str
+        activation_str = self._set_tpu_activation(layer)
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
@@ -414,7 +416,9 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer")
         from vllm_torchtpu.layers.vllm.fused_moe_ep import (
             fused_moe_ep, fused_moe_ep_supported)
         if fused_moe_ep_supported(self):

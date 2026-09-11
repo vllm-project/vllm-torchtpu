@@ -308,7 +308,7 @@ def test_mla_forward_sparse_dispatch_and_quantization():
     topk_indices = torch.zeros((4, 8), dtype=torch.int32)
     # Sparse layers hold a native (nope, rope) split cache.
     inputs["kv_cache"] = tuple(
-        torch.zeros(spec.shape, dtype=spec.dtype)
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
         for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
             2, 8, 576, torch.float8_e4m3fn))
 

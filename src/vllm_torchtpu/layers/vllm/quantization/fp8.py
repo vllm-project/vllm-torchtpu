@@ -63,8 +63,8 @@ from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
 from vllm_torchtpu.layers.vllm import moe_routing, token_padding
-from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
-                                                 get_fused_moe_activation,
+from vllm_torchtpu.layers.vllm.fused_moe import (TpuMoEActivationMixin,
+                                                 fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
                                                      WEIGHT_FLIPPED_ATTR,
@@ -618,7 +618,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         return None
 
 
-class VllmFp8MoEMethodTPU(Fp8MoEMethod):
+class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     """
     TPU-native FP8 MoE method.
 
@@ -772,9 +772,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
-        activation_str = get_fused_moe_activation(layer.activation,
-                                                  layer.moe_config)
-        layer._tpu_activation_str = activation_str
+        activation_str = self._set_tpu_activation(layer)
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
         if is_fp8_serialized:
@@ -859,7 +857,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer")
         # The fused EP kernel takes this rank's own tokens and returns this
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,

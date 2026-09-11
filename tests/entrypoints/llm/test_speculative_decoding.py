@@ -40,11 +40,11 @@ from vllm_torchtpu import tpu_info
 # Spec-decode e2e integration suite, split across the PR and nightly steps in
 # `.buildkite/pipeline_tests.yml`:
 #
-#   correctness tests  -- unmarked, so they run at PR time AND nightly. A
-#       spec-decode correctness regression is expensive to find after the
-#       fact, and these paths (rejection sampling, chunked verify, draft
-#       proposal, the DP lockstep) have no cheaper coverage. Anything added
-#       here lands on the critical path of every PR; weigh its runtime.
+#   correctness tests  -- representative cases run at PR time AND nightly.
+#       Basic model-based tests use bs1 + async and batched + sync on PRs,
+#       covering both scheduling modes and batch sizes for each method. The
+#       remaining combinations run nightly. Multi-chunk, structured-output,
+#       multi-step MTP, sharded-draft, and DP coverage also runs on PRs.
 #
 #   `*_performance*`   -- `@pytest.mark.nightly`, so the PR steps
 #       (`-m "not nightly"`) deselect them and only the nightly steps run
@@ -448,13 +448,12 @@ def test_ngram_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
-@pytest.mark.parametrize(
-    "max_num_seqs", [pytest.param(1, id="bs1"),
-                     pytest.param(10, id="bs10")])
+@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
+    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+    pytest.param(1, True, id="bs1-async"),
+    pytest.param(10, False, id="bs10-sync"),
+    pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
+])
 def test_eagle3_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -479,13 +478,12 @@ def test_eagle3_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
-@pytest.mark.parametrize(
-    "max_num_seqs", [pytest.param(1, id="bs1"),
-                     pytest.param(10, id="bs10")])
+@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
+    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+    pytest.param(1, True, id="bs1-async"),
+    pytest.param(10, False, id="bs10-sync"),
+    pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
+])
 def test_dflash_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -512,13 +510,12 @@ def test_dflash_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
-@pytest.mark.parametrize(
-    "max_num_seqs", [pytest.param(1, id="bs1"),
-                     pytest.param(10, id="bs10")])
+@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
+    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+    pytest.param(1, True, id="bs1-async"),
+    pytest.param(10, False, id="bs10-sync"),
+    pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
+])
 def test_dspark_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -552,13 +549,12 @@ def test_dspark_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
-@pytest.mark.parametrize(
-    "max_num_seqs", [pytest.param(1, id="bs1"),
-                     pytest.param(4, id="bs4")])
+@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
+    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+    pytest.param(1, True, id="bs1-async"),
+    pytest.param(4, False, id="bs4-sync"),
+    pytest.param(4, True, id="bs4-async", marks=pytest.mark.nightly),
+])
 def test_qwen35_mtp_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,

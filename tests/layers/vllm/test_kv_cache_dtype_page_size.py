@@ -100,17 +100,6 @@ def test_fp8_should_halve_the_page(num_kv_heads, head_size):
                       BF16) == 2 * page_bytes(num_kv_heads, head_size, FP8)
 
 
-@pytest.fixture(autouse=True)
-def _reset_warning_once():
-    """`warning_once` dedups by message for the life of the process, so without
-    this a test passes or fails depending on what ran before it."""
-    import vllm.logger
-
-    vllm.logger._print_warning_once.cache_clear()
-    yield
-    vllm.logger._print_warning_once.cache_clear()
-
-
 @contextlib.contextmanager
 def captured_warnings(logger_name: str = "vllm"):
     """Collect warnings emitted under `logger_name`.

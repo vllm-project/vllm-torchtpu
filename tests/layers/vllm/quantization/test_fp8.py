@@ -534,7 +534,6 @@ class TestOnlineFp8Quantization:
 
         # Create mock layer with custom routing
         layer = MagicMock()
-        layer._tpu_activation_str = "silu"
         layer.moe_config.experts_per_token = 2
         layer.moe_config.moe_parallel_config.use_ep = False
         layer.renormalize = True
@@ -545,6 +544,7 @@ class TestOnlineFp8Quantization:
         layer.custom_routing_function = mock_routing
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
+        method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
 
