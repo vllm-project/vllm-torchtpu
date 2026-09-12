@@ -24,7 +24,7 @@
 # you specify the --dataset-name, --dataset-path, and --root-dir flags
 
 # Example default usage: bash tests/e2e/benchmarking/mlperf.sh -r /local/root_dir
-# Example local docker + JAX TPU usage: BUILDKITE_COMMIT=0f199f1 .buildkite/scripts/run_in_docker.sh bash /workspace/tpu_inference/tests/e2e/benchmarking/mlperf.sh
+# Example local docker usage: BUILDKITE_COMMIT=0f199f1 .buildkite/scripts/run_in_docker.sh bash tests/e2e/benchmarking/mlperf.sh
 
 # Logs the vLLM server output to a file
 LOG_FILE="server.log"
@@ -65,7 +65,7 @@ helpFunction()
 {
    echo ""
    echo "Usage: $0 [-r full_path_to_root_dir -m model_id]"
-   echo -e "\t-r The path your root directory containing both 'vllm' and 'tpu_inference' (default: /workspace/, which is used in the Dockerfile)"
+   echo -e "\t-r The path your root directory containing 'vllm' and 'vllm-torchtpu' (default: /workspace/, which is used in the Dockerfile)"
    echo -e "\t-d The dataset name (default: mlperf, which will download the dataset)"
    echo -e "\t-p The path to the processed MLPerf dataset (default: None, which will download the dataset)"
    echo -e "\t-m A space-separated list of HuggingFace model ids to use (default: Qwen/Qwen2.5-1.5B-Instruct, Qwen/Qwen2.5-0.5B-Instruct, meta-llama/Llama-3.1-8B-Instruct and meta-llama/Llama-4-Scout-17B-16E-Instruct)"
@@ -212,9 +212,12 @@ cd "$root_dir"/vllm || exit
 echo "Current working directory: $(pwd)"
 echo "Using vLLM hash: $(git rev-parse HEAD)"
 
-# Overwrite a few of the vLLM benchmarking scripts with the TPU Inference ones
-cp -r "$root_dir"/tpu_inference/scripts/vllm/benchmarking/*.py "$root_dir"/vllm/benchmarks/
-echo "Using TPU Inference hash: $(git -C "$root_dir"/tpu_inference rev-parse HEAD)"
+# Overwrite a few of the vLLM benchmarking scripts with the vLLM TorchTPU ones
+TORCHTPU_DIR="${TORCHTPU_DIR:-$root_dir/vllm-torchtpu}"
+if [ -d "$TORCHTPU_DIR/scripts/vllm/benchmarking" ]; then
+    cp -r "$TORCHTPU_DIR"/scripts/vllm/benchmarking/*.py "$root_dir"/vllm/benchmarks/
+    echo "Using vLLM TorchTPU hash: $(git -C "$TORCHTPU_DIR" rev-parse HEAD 2>/dev/null || echo "N/A")"
+fi
 
 checkThroughputAndRouge() {
     # This function checks whether the ROUGE1 score and total token throughput

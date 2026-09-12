@@ -52,7 +52,7 @@ if [ -z "${BUILDKITE_COMMIT:-}" ]; then
 fi
 
 if [ ! -f verified_commit_hashes.csv ]; then
-    echo "timestamp,vllm_commit_hash,tpu_inference_commit_hash" > verified_commit_hashes.csv
+    echo "timestamp,vllm_commit_hash,vllm_torchtpu_commit_hash" > verified_commit_hashes.csv
 fi
 echo "$(date '+%Y-%m-%d %H:%M:%S'),${VLLM_COMMIT_HASH},${BUILDKITE_COMMIT}" >> verified_commit_hashes.csv
 

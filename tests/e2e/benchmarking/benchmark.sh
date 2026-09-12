@@ -139,9 +139,12 @@ cd "$root_dir"/vllm || exit
 echo "Current working directory: $(pwd)"
 echo "Using vLLM hash: $(git rev-parse HEAD)"
 
-# Overwrite a few of the vLLM benchmarking scripts with the TPU Commons ones
-cp -r "$root_dir"/tpu_inference/scripts/vllm/benchmarking/*.py "$root_dir"/vllm/benchmarks/
-echo "Using TPU Inference hash: $(git -C "$root_dir"/tpu_inference rev-parse HEAD)"
+# Overwrite a few of the vLLM benchmarking scripts with the vLLM TorchTPU ones
+TORCHTPU_DIR="${TORCHTPU_DIR:-$root_dir/vllm-torchtpu}"
+if [ -d "$TORCHTPU_DIR/scripts/vllm/benchmarking" ]; then
+    cp -r "$TORCHTPU_DIR"/scripts/vllm/benchmarking/*.py "$root_dir"/vllm/benchmarks/
+    echo "Using vLLM TorchTPU hash: $(git -C "$TORCHTPU_DIR" rev-parse HEAD 2>/dev/null || echo "N/A")"
+fi
 
 checkThroughput() {
     # This function checks whether the Request throughput from a benchmark
