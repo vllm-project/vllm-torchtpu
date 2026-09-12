@@ -102,6 +102,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     sliding_window: int,
     logical_page_size: int,
     unnormalized_output: bool,
+    non_causal_block: bool,
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
@@ -201,6 +202,14 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             # So we only need to check the upper bound.
             keep = (q_span - k_span).astype(
                 jnp.uint32) < jnp.uint32(sliding_window)
+            if non_causal_block:
+                # DSpark draft block mode: the last q_len positions
+                # of the sequence are one parallel-drafting block attending
+                # bidirectionally within itself. The upper bound is NOT free
+                # here: the causal uint32 trick excluded the final page's
+                # tail garbage (k_span >= kv_len), so the block clause must
+                # re-impose it.
+                keep = keep | ((k_span >= kv_len - q_len) & (k_span < kv_len))
 
             s = jnp.einsum("nd,md->nm",
                            qc,
@@ -1367,6 +1376,7 @@ def run_mla_batched_decode_kernel(
         "vmem_limit_bytes",
         "logical_page_size",
         "unnormalized_output",
+        "non_causal_block",
         "q_compute_block_size",
     ),
     donate_argnames=("cache_kv", ),
@@ -1394,6 +1404,10 @@ def mla_sliding_window_ragged_paged_attention(
     q_compute_block_size: int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     unnormalized_output: bool = False,
+    # Draft (DSpark/DFlash) block mode: the last q_len positions of each
+    # sequence attend bidirectionally within themselves (window still
+    # bounds context keys). Requires q_len <= sliding_window.
+    non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
 ) -> tuple[
         jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
@@ -1588,7 +1602,8 @@ def mla_sliding_window_ragged_paged_attention(
             jnp.full((6, ), -1, jnp.int32),
         )
 
-        scope_name = f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
+        scope_name = (f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
+                      f"{'-ncb' if non_causal_block else ''}")
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -1600,6 +1615,7 @@ def mla_sliding_window_ragged_paged_attention(
                     bkv_p=bkv_p,
                     logical_page_size=logical_page_size,
                     unnormalized_output=unnormalized_output,
+                    non_causal_block=non_causal_block,
                     q_compute_block_size=q_compute_block_size,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
