@@ -305,6 +305,65 @@ def outer_kernel(
     _run()
 
 
+def compute_decode_tile_size(
+    *,
+    batch_size: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    dim: int,
+    aligned_num_v_heads: int,
+    kernel_size: int,
+    num_spec_tokens: int = 0,
+    requested_tile_size: int = 4,
+    vmem_capacity_bytes: int | None = None,
+) -> int:
+    """Derives a decode batch tile size clamped against VMEM capacity limits.
+
+    Under double buffering (num_buffers=2), sequence states (recurrent SSM matrix,
+    conv state, and activations) must fit within the scoped VMEM budget.
+    For speculative verify windows (num_spec_tokens > 0), footprint multiplies
+    by the window size. For non-speculative decode (num_spec_tokens == 0),
+    the window is 1; this unconditional clamping prevents low-TP configurations
+    (TP <= 2, where local n_v is large) from overflowing physical VMEM (64 MiB
+    on TPU v7x) and spilling to HBM.
+
+    Args:
+        batch_size: Active decode batch size.
+        n_v: Number of value heads (rank-local).
+        d_k: Key head dimension.
+        d_v: Value head dimension.
+        dim: Feature dimension of the convolved QKV tensor.
+        aligned_num_v_heads: Number of value heads aligned to TPU vector lanes.
+        kernel_size: 1D convolution filter width.
+        num_spec_tokens: Number of speculative draft tokens (0 for standard decode).
+        requested_tile_size: Desired initial tile size (defaults to 4).
+        vmem_capacity_bytes: Optional override for VMEM capacity in bytes (queries
+            pltpu.get_tpu_info() if None).
+
+    Returns:
+        Clamped decode tile size guaranteed to fit within VMEM capacity limits.
+    """
+    if vmem_capacity_bytes is None:
+        vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+
+    initial_tile_size = min(requested_tile_size, batch_size)
+    window = num_spec_tokens + 1
+    num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
+    bytes_per_seq = window * (
+        # Recurrent checkpoints (fp32) — the dominant term.
+        n_v * d_k * d_v * 4
+        # Conv checkpoints (fp32).
+        + (kernel_size - 1) * dim * 4
+        # qkv (fp32), b/a (fp32), out (act_out).
+        + dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+    vmem_fraction = (config.GDNConfig.WINDOWED_VMEM_FRACTION if num_spec_tokens
+                     > 0 else config.GDNConfig.DEFAULT_VMEM_FRACTION)
+    vmem_budget = int(vmem_fraction * vmem_capacity_bytes)
+    decode_budget = (vmem_budget // 2) // num_buffers
+    return max(1, min(initial_tile_size, decode_budget // bytes_per_seq))
+
+
 @jax.jit(
     donate_argnames=("conv_state", "recurrent_state", "state_source"),
     static_argnames=(
@@ -352,7 +411,7 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO(kyuyeunk): Calculate tile size based on input dimensions.
+    # Default tile size along sequence dimension (clamped to VMEM bounds below).
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array,
@@ -503,31 +562,20 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
-    decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
-    if num_spec_tokens > 0:
-        # A verify window holds one state checkpoint per window position per
-        # sequence in VMEM, which multiplies the per-sequence footprint by
-        # the window size. Shrink the tile so the double-buffered windows
-        # fit in roughly half the scoped-VMEM budget (the rest goes to
-        # weights, activations scratch and compiler temporaries).
-        window = num_spec_tokens + 1
-        num_buffers = config.GDNConfig.__dataclass_fields__[
-            "num_buffers"].default
-        bytes_per_seq = window * (
-            # Recurrent checkpoints (fp32) — the dominant term.
-            n_v * d_k * d_v * 4
-            # Conv checkpoints (fp32).
-            + (kernel_size - 1) * dim * 4
-            # qkv (fp32), b/a (fp32), out (act_out).
-            + dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
-        vmem_budget = int(config.GDNConfig.WINDOWED_VMEM_FRACTION *
-                          pltpu.get_tpu_info().vmem_capacity_bytes)
-        spec_tile_budget = (vmem_budget // 2) // num_buffers
-        decode_tile_size = max(
-            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq))
+    decode_tile_size = compute_decode_tile_size(
+        batch_size=batch_size,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        dim=dim,
+        aligned_num_v_heads=aligned_num_v_heads,
+        kernel_size=kernel_size,
+        num_spec_tokens=num_spec_tokens,
+        requested_tile_size=decode_tile_size,
+    )
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
