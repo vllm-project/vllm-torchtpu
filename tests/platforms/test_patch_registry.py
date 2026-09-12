@@ -205,6 +205,7 @@ def test_manifest_preserves_lifecycle_dependencies():
     ]
     assert stages["platform_activation"][:-1] == stages["worker_init"]
     assert stages["model_load"] == ["_apply_model_specific_patches"]
+    assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu")
