@@ -33,7 +33,15 @@ class Patch:
     refresh: str | None = None
 
 
+# Processes can enter through different lifecycle boundaries. _ACTIVE covers
+# platform activation and worker initialization, since spawned workers do not
+# inherit the parent's patches.
 _ACTIVE: tuple[Stage, ...] = ("platform_activation", "worker_init")
+
+# _ENGINE includes both stages in _ACTIVE and adds engine-core startup.
+# These patches must also be installed in the engine-core process before
+# scheduler and KV connector construction, because patches installed in workers
+# do not affect that process.
 _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 
 # Tuple order is application order, including when several stages share a patch.

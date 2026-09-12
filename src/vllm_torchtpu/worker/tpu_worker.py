@@ -78,13 +78,12 @@ class TPUWorker(WorkerBase):
         devices=None,
         ip: str = "localhost",
     ):
-        from vllm_torchtpu.patch_registry import apply
+        from vllm_torchtpu import patch_registry
 
-        apply("worker_init")
+        patch_registry.apply("worker_init")
         # This process creates the worker's reply ring to the engine.
         from vllm_torchtpu.distributed.pp_push import widen_message_rings
         widen_message_rings(vllm_config)
-
 
         super().__init__(vllm_config=vllm_config,
                          local_rank=local_rank,
@@ -619,9 +618,9 @@ class TPUWorker(WorkerBase):
         return key
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        from vllm_torchtpu.patch_registry import apply
+        from vllm_torchtpu import patch_registry
 
-        apply("model_load", model_config=self.model_config)
+        patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:

@@ -255,6 +255,6 @@ def _patch_jax_pallas_fori_lowering() -> None:
     _lowering._torchtpu_fori_patch_applied = True
 
 
-from vllm_torchtpu.patch_registry import apply  # noqa: E402
+from vllm_torchtpu import patch_registry  # noqa: E402
 
-apply("import")
+patch_registry.apply("import")
