@@ -16,7 +16,7 @@
 set -e
 
 # --- Configuration ---
-REPO_URL="https://github.com/vllm-project/tpu-inference.git"
+REPO_URL="${REPO_URL:-https://github.com/vllm-project/vllm-torchtpu.git}"
 TARGET_BRANCH="${BUILDKITE_BRANCH:-main}"
 
 # Conditional Configuration for Release vs. Nightly

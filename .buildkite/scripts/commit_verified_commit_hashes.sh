@@ -16,7 +16,7 @@
 set -e
 
 # --- Configuration ---
-REPO_URL="https://github.com/vllm-project/tpu-inference.git"
+REPO_URL="${REPO_URL:-https://github.com/vllm-project/vllm-torchtpu.git}"
 TARGET_BRANCH="main"
 
 COMMIT_MESSAGE="Update verified commit hashes"
