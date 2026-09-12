@@ -240,8 +240,14 @@ def test_layout_missing_rank_is_not_cached(monkeypatch):
 def test_mesh_preserves_group_order_and_caches_by_axis_and_devices(
         monkeypatch):
     layout = pcp.PcpGroupLayout((2, 6), (30, 10), 0, 2)
-    monkeypatch.setattr(mesh_utils, "get_cp_group_layout",
-                        lambda group: layout)
+    group = object()
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
+
+    def get_layout(actual_group):
+        assert actual_group is group
+        return layout
+
+    monkeypatch.setattr(mesh_utils, "get_cp_group_layout", get_layout)
     monkeypatch.setattr(jax, "devices",
                         lambda: [SimpleNamespace(id=i) for i in [10, 20, 30]])
     mesh = Mock(side_effect=lambda *args, **kwargs: object())
