@@ -32,9 +32,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
-from vllm_torchtpu.gdn_pool_layout import (
-    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
-    unified_kv_layout_enabled_for_architecture)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.layers.common.gdn_attention import (
@@ -44,8 +41,11 @@ from vllm_torchtpu.layers.common.gdn_attention import (
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.layers.vllm.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
+
+logger = init_logger(__name__)
 
 
 def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
@@ -316,26 +316,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        if unified_kv_layout_enabled_for_architecture(
-                self.model_config.architecture):
-            # Declare exactly what the pool physically stores. vLLM sizes the
-            # mamba page from the dtype declared HERE and asserts the padded
-            # page covers it, while the block-slot derivation budgets the page
-            # from DEFAULT_POOLED_GDN_CONV_STATE_DTYPE. Declaring anything
-            # wider is not conservative, it is a contradiction: the two
-            # disagreed once and every hybrid GDN engine failed to start on
-            # that assert.
-            conv_state_dtype = getattr(
-                torch,
-                DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1])
-        else:
-            # TODO: Support bf16 conv state.
-            # Per-layer cache: unlike the pool, the declared dtype IS the
-            # storage dtype (vLLM strides the raw tensor with it), and this
-            # kernel path still reads fp32 conv state. Nothing pads this
-            # layout, so the wider declaration costs only its own bytes.
-            conv_state_dtype = torch.float32
+        # TODO: Support bf16 conv state.
+        if conv_state_dtype != torch.float32:
+            logger.info("Overwriting Mamba conv state dtype to float32 due to "
+                        "performance implications.")
+        conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        conv_state_shape, temporal_state_shape = super().get_state_shape()
+        # NOTE: Leverage compact layout with fp32.
+        conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
+        return conv_state_shape, temporal_state_shape
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Back the conv weight with a buffer of its own 3-D shape.
@@ -353,11 +345,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.conv1d.weight.data = torch.empty(w.shape,
                                               dtype=w.dtype,
                                               device=w.device).copy_(w)
-
-    def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        conv_state_shape, temporal_state_shape = super().get_state_shape()
-        conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
-        return conv_state_shape, temporal_state_shape
 
     @staticmethod
     def _pcp_streaming_enabled() -> bool:

@@ -8,8 +8,7 @@ import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
     PooledGDNStateLayout, derive_pooled_gdn_state_layout,
-    pooled_gdn_state_dtypes, pooled_gdn_state_itemsize,
-    unified_kv_layout_enabled_for_architecture)
+    pooled_gdn_state_itemsize, unified_kv_layout_enabled_for_architecture)
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -139,12 +138,6 @@ def _hybrid_mamba_state_layout(
             "TPU unified hybrid KV pool requires two GDN state regions "
             f"(conv, SSM), got shapes={shapes}")
 
-    # Byte widths come from the pool's own layout helper. Conv remains fixed
-    # BF16, while SSM follows the model class's configured dtype. Every other
-    # reader of pool bytes (the kernel state plan and the Raiden manifest) is
-    # sourced from the same helper, so slot sizing cannot use a different
-    # dtype source without contradicting the physical layout.
-    #
     # Shapes still come from the model class, which is a different kind of
     # fact: kernel taps and head counts are architecture, not layout. They do
     # carry the spec-decode conv widening, so under spec decode this is wider
@@ -153,12 +146,8 @@ def _hybrid_mamba_state_layout(
     # `VllmGatedDeltaNetAttention.get_state_shape()` still declares the widened
     # conv to vLLM, and the padded page has to cover what vLLM accounts for.
     # Narrowing here means narrowing there in the same change.
-    dtypes = tuple(model_cls.get_mamba_state_dtype_from_config(vllm_config))
-    if len(dtypes) != 2:
-        raise ValueError(
-            "TPU unified hybrid KV pool requires two GDN state dtypes "
-            f"(conv, SSM), got dtypes={dtypes}")
-    conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    conv_dtype, ssm_dtype = model_cls.get_mamba_state_dtype_from_config(
+        vllm_config)
     conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
     ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
     conv_bytes = math.prod(shapes[0]) * conv_itemsize
