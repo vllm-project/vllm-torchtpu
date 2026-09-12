@@ -196,3 +196,36 @@ def test_route_requires_declared_routing_fields(monkeypatch, field):
     delattr(layer, field)
     with pytest.raises(AttributeError, match=field):
         moe_routing.route(layer, torch.ones(1, 2), torch.tensor([[1.0, 2.0]]))
+
+
+def test_route_scales_topk_weights_by_the_layer_factor(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    hidden = torch.ones(2, 4)
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
+    unit = _routing_layer(topk=2)
+    scaled = _routing_layer(topk=2)
+    scaled.routed_scaling_factor = 2.5
+    unit_weights, unit_ids = moe_routing.route(unit, hidden, logits)
+    scaled_weights, scaled_ids = moe_routing.route(scaled, hidden, logits)
+    assert torch.equal(unit_ids, scaled_ids)
+    torch.testing.assert_close(scaled_weights, unit_weights * 2.5)
+
+
+def test_route_hash_table_scales_by_the_layer_factor():
+    import torch
+
+    layer = _routing_layer(topk=2, renormalize=False)
+    layer.hash_indices_table = torch.tensor([[0, 1], [2, 3]])
+    layer.routed_scaling_factor = 2.0
+    hidden = torch.ones(2, 4)
+    # Uniform logits score every expert 0.25, so the factor is the only
+    # thing shaping the weights.
+    logits = torch.zeros(2, 4)
+    weights, ids = moe_routing.route(layer,
+                                     hidden,
+                                     logits,
+                                     input_ids=torch.tensor([1, 0]))
+    assert ids.tolist() == [[2, 3], [0, 1]]
+    torch.testing.assert_close(weights, torch.full((2, 2), 0.5))

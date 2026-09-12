@@ -13,7 +13,7 @@ import torch.fx.experimental._config as fx_config
 from torch import nn
 from torch._dynamo import mark_dynamic
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.models.interfaces import supports_pp
@@ -24,6 +24,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
+import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
 from vllm_torchtpu.compilation.shape_variants import (trace_shape_env,
                                                       unsupported_reason)
@@ -968,3 +969,91 @@ def test_kimi_model_requires_declared_optional_config_fields(field):
         hf_text_config=config))
     with pytest.raises(AttributeError, match=field):
         KimiModel(vllm_config=vllm_config)
+
+
+@pytest.mark.parametrize("use_norm", [False, True])
+def test_latent_moe_norm_follows_the_config_flag(
+        monkeypatch: pytest.MonkeyPatch, use_norm: bool) -> None:
+
+    class Fake(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    monkeypatch.setattr(kimi_moe, "GateLinear", Fake)
+    monkeypatch.setattr(kimi_moe, "KimiMLP", Fake)
+    monkeypatch.setattr(kimi_moe, "make_latent_projection", Fake)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", lambda **kwargs: Fake())
+    norm_args: list[tuple] = []
+
+    class FakeNorm(nn.Module):
+
+        def __init__(self, *args) -> None:
+            super().__init__()
+            norm_args.append(args)
+
+    monkeypatch.setattr(kimi_moe, "RMSNorm", FakeNorm)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        num_experts=4,
+        num_experts_per_token=2,
+        moe_intermediate_size=32,
+        routed_expert_hidden_size=8,
+        latent_moe_use_norm=use_norm,
+    )
+    layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+
+    assert isinstance(layer.routed_expert_down_proj, Fake)
+    assert isinstance(layer.routed_expert_up_proj, Fake)
+    if use_norm:
+        assert isinstance(layer.routed_expert_norm, FakeNorm)
+        assert norm_args == [(8, config.rms_norm_eps)]
+    else:
+        assert layer.routed_expert_norm is None
+        assert norm_args == []
+
+
+@pytest.mark.parametrize("attn_res_block_size", [None, 4])
+def test_kimi_model_wires_declared_optional_features(
+        monkeypatch: pytest.MonkeyPatch,
+        attn_res_block_size: int | None) -> None:
+
+    class Recorder(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            self.args = args
+            self.kwargs = kwargs
+
+    for name in ("MultiHeadLatentAttention", "KimiDeltaAttention", "KimiMoE",
+                 "KimiMLP", "RMSNorm", "AttentionResidual",
+                 "VocabParallelEmbedding"):
+        monkeypatch.setattr(kimi_model, name, Recorder)
+    config = KimiLinearConfig(
+        num_hidden_layers=2,
+        hidden_act="situ",
+        activation_situ_beta=1.5,
+        activation_situ_linear_beta=0.5,
+        attn_res_block_size=attn_res_block_size,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=config),
+        quant_config=None,
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+    )
+
+    model = kimi_model.KimiModel(vllm_config=vllm_config)
+
+    uses_residual_blocks = attn_res_block_size is not None
+    assert model.attn_res_block_size == attn_res_block_size
+    assert hasattr(model, "output_attn_res") is uses_residual_blocks
+    assert len(model.layers) == 2
+    for layer in model.layers:
+        assert isinstance(layer.self_attn, Recorder)
+        assert layer.attn_res_block_size == attn_res_block_size
+        assert hasattr(layer, "self_attention_res") is uses_residual_blocks
+        assert hasattr(layer, "mlp_res") is uses_residual_blocks
+        assert layer.mlp.kwargs["situ_beta"] == 1.5
+        assert layer.mlp.kwargs["situ_linear_beta"] == 0.5

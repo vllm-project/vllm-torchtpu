@@ -1183,3 +1183,15 @@ class TestConvWeightReHome:
         assert w.dtype == torch.float32
         assert w.data_ptr() != aliased_ptr
         assert torch.equal(w.data.squeeze(1), base)
+
+
+@pytest.mark.parametrize("pcp_size,expected", [(1, False), (8, True)])
+def test_pcp_streaming_follows_the_declared_pcp_width(pcp_size, expected):
+    with set_vllm_model_wrapper_context(
+            mesh=_mesh(), vllm_config=_vllm_config(pcp_size=pcp_size)):
+        assert VllmGatedDeltaNetAttention._pcp_streaming_enabled() is expected
+
+
+def test_pcp_streaming_is_off_without_a_vllm_config():
+    with set_vllm_model_wrapper_context(mesh=_mesh()):
+        assert VllmGatedDeltaNetAttention._pcp_streaming_enabled() is False

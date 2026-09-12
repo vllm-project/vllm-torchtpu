@@ -906,3 +906,10 @@ def test_missing_routing_field_cannot_arm_fused_ep(field):
     delattr(layer, field)
     with pytest.raises(AttributeError, match=field):
         _prebuild(layer)
+
+
+def test_pcp_size_reads_the_layer_parallel_config():
+    layer = _layer()
+    assert bridge._pcp_size(layer) == 1
+    layer.moe_config.moe_parallel_config.pcp_size = 4
+    assert bridge._pcp_size(layer) == 4

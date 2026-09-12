@@ -523,3 +523,43 @@ def test_mla_flipped_projection_requires_weight():
     setattr(attention.kv_b_proj, WEIGHT_FLIPPED_ATTR, True)
     with pytest.raises(AttributeError, match="weight"):
         attention.process_weights_after_loading(torch.float32)
+
+
+@pytest.mark.parametrize("selected,expected", [("FLASH_ATTN", "FLASH_ATTN"),
+                                               ("FLASHINFER", "FLASH_ATTN")])
+def test_tpu_platform_keeps_the_selected_backend_without_mla(
+        selected, expected):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    TpuPlatform.pre_register_and_update()
+    attn_selector_config = MagicMock()
+    attn_selector_config.use_mla = False
+    cls_name = TpuPlatform.get_attn_backend_cls(
+        selected_backend=AttentionBackendEnum[selected],
+        attn_selector_config=attn_selector_config)
+    assert cls_name == AttentionBackendEnum[expected].get_path()
+    assert cls_name != AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
+
+
+@pytest.mark.parametrize("calculate_kv_scales", [False, True])
+def test_mla_forward_calculates_kv_scales_only_when_declared(
+        calculate_kv_scales):
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.calculate_kv_scales = calculate_kv_scales
+    attention.layer_name = "model.layers.0.attn"
+    attention.impl = MagicMock()
+    attention.impl.forward.return_value = "out"
+    q, kv_c_normed, k_pe = torch.zeros(1), torch.zeros(2), torch.zeros(3)
+    with patch.object(torch.ops.vllm, "maybe_calc_kv_scales",
+                      create=True) as calc_scales, patch(
+                          "vllm_torchtpu.layers.vllm.custom_ops."
+                          "mla_attention_op.get_attention_context",
+                          return_value=("meta", None, "cache", None)):
+        assert attention(q, kv_c_normed, k_pe) == "out"
+    assert calc_scales.call_count == int(calculate_kv_scales)
+    if calculate_kv_scales:
+        calc_scales.assert_called_once_with(q, kv_c_normed, k_pe,
+                                            "model.layers.0.attn")
+    attention.impl.forward.assert_called_once()
+    assert attention.impl.forward.call_args.kwargs["attn_metadata"] == "meta"
+    assert attention.impl.forward.call_args.kwargs["kv_cache"] == "cache"
