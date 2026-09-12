@@ -15,6 +15,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
 from .raiden_test_utils import FakeTensor, glm_named_kv_caches
 
+pytestmark = pytest.mark.cpu_test
+
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
     return types.SimpleNamespace(

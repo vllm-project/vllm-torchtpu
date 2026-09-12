@@ -20,6 +20,8 @@ import pytest
 
 from vllm_torchtpu.distributed import pcp_rank_order as order_mod
 
+pytestmark = pytest.mark.cpu_test
+
 
 def _config(**kwargs):
     parallel = SimpleNamespace(
@@ -66,7 +68,10 @@ def test_propagates_the_error_when_the_mesh_call_fails(monkeypatch):
     def _boom(_shape):
         raise RuntimeError("topology_aware_mesh exploded")
 
-    monkeypatch.setattr(torch.tpu, "topology_aware_mesh", _boom, raising=False)
+    monkeypatch.setattr(torch,
+                        "tpu",
+                        SimpleNamespace(topology_aware_mesh=_boom),
+                        raising=False)
     with pytest.raises(RuntimeError, match="exploded"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -76,10 +81,11 @@ def test_raises_when_the_mesh_is_not_a_permutation(monkeypatch):
     import torch
 
     mesh = numpy.array([0, 1, 2, 3, 4, 5, 6, 6]).reshape(1, 8, 1)
-    monkeypatch.setattr(torch.tpu,
-                        "topology_aware_mesh",
-                        lambda _shape: mesh,
-                        raising=False)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False)
     with pytest.raises(RuntimeError, match="not a permutation"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -91,10 +97,11 @@ def test_returns_both_axes_from_one_mesh(monkeypatch):
     import torch
 
     mesh = numpy.array([[[0, 1], [6, 7], [4, 5], [2, 3]]])
-    monkeypatch.setattr(torch.tpu,
-                        "topology_aware_mesh",
-                        lambda _shape: mesh,
-                        raising=False)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False)
     got = order_mod.resolve_pcp_topology_order(_config(pcp=4, tp=2))
 
     assert got == {
@@ -117,10 +124,11 @@ def test_matches_the_order_measured_on_hardware(monkeypatch):
     import torch
 
     mesh = numpy.array([0, 1, 6, 7, 4, 5, 2, 3]).reshape(1, 8, 1)
-    monkeypatch.setattr(torch.tpu,
-                        "topology_aware_mesh",
-                        lambda _shape: mesh,
-                        raising=False)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False)
     got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
 
     assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]

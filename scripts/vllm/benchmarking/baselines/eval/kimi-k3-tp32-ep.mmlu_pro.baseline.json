@@ -1,0 +1,9 @@
+{
+  "_source": {
+    "url": "https://buildkite.com/vllm/vllm-torchtpu-dev/builds/33",
+    "description": "Reported TPU calibration: MMLU-Pro, 100 questions per subject, thinking disabled, client concurrency 16."
+  },
+  "mmlu_pro": {
+    "exact_match,custom-extract": 0.8342857142857143
+  }
+}

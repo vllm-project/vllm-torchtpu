@@ -38,6 +38,16 @@ class StructuredDecodingManager:
                                                      32,
                                                      dtype=torch.int32,
                                                      device=self.device)
+        self.device_all_true_require = torch.ones((runner.max_num_reqs, 1),
+                                                  dtype=torch.bool,
+                                                  device=self.device)
+        self.device_all_false_require = torch.zeros((runner.max_num_reqs, 1),
+                                                    dtype=torch.bool,
+                                                    device=self.device)
+        self.device_dummy_bitmask = torch.zeros(
+            (runner.max_num_reqs, num_words),
+            dtype=torch.int32,
+            device=self.device)
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -83,23 +93,67 @@ class StructuredDecodingManager:
         padded_num_reqs = logits.shape[0]
         req_id_to_index = self.runner.input_batch.req_id_to_index
 
-        # Reset only the rows this chunk will read.
-        self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
-        self.require_structured_out_cpu[:padded_num_reqs].zero_()
-
         bitmask = grammar_output.grammar_bitmask
+        local_indices = []
+        mask_rows = []
         for mask_row, req_id in enumerate(
                 grammar_output.structured_output_request_ids):
             batch_index = req_id_to_index.get(req_id)
-            if (batch_index is None
-                    or not cur_start_idx <= batch_index < cur_end_idx):
-                continue
-            local_index = batch_index - cur_start_idx
-            self.grammar_bitmask_cpu[local_index] = torch.from_numpy(
-                bitmask[mask_row])
-            # Not all requests in the batch require structured output, so
-            # mark the rows that need masking.
-            self.require_structured_out_cpu[local_index] = True
+            if (batch_index is not None
+                    and cur_start_idx <= batch_index < cur_end_idx):
+                local_indices.append(batch_index - cur_start_idx)
+                mask_rows.append(mask_row)
+
+        num_reqs = cur_end_idx - cur_start_idx
+
+        # Fast path 1: No structured requests in this chunk.
+        # Bypass both requirement and bitmask host transfers completely by
+        # returning pre-allocated device-resident zero tensors.
+        if not local_indices:
+            return (
+                self.device_all_false_require[:padded_num_reqs],
+                self.device_dummy_bitmask[:padded_num_reqs],
+                self.structured_decode_arange,
+            )
+
+        num_local = len(local_indices)
+
+        # Fast path 2: All real requests in this chunk are contiguous structured requests (0..num_reqs-1).
+        # Direct contiguous slice copy to pinned host buffer ensures fast block memory transfer.
+        if (num_local == num_reqs and local_indices[0] == 0
+                and local_indices[-1] == num_reqs - 1
+                and mask_rows[-1] - mask_rows[0] == num_reqs - 1):
+            mask_start = mask_rows[0]
+            self.grammar_bitmask_cpu[:num_reqs].copy_(
+                torch.from_numpy(bitmask[mask_start:mask_start + num_reqs]))
+            if num_reqs < padded_num_reqs:
+                self.grammar_bitmask_cpu[num_reqs:padded_num_reqs].zero_()
+                self.require_structured_out_cpu[:padded_num_reqs].zero_()
+                self.require_structured_out_cpu[:num_reqs] = True
+                require_tensor = self.require_structured_out_cpu[:
+                                                                 padded_num_reqs].to(
+                                                                     logits.
+                                                                     device)
+            else:
+                require_tensor = self.device_all_true_require[:padded_num_reqs]
+
+            return (
+                require_tensor,
+                self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
+                self.structured_decode_arange,
+            )
+
+        # Standard path: Mixed batch (some structured, some non-structured).
+        self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
+        self.require_structured_out_cpu[:padded_num_reqs].zero_()
+
+        if num_local == 1:
+            self.grammar_bitmask_cpu[local_indices[0]].copy_(
+                torch.from_numpy(bitmask[mask_rows[0]]))
+        else:
+            self.grammar_bitmask_cpu[local_indices] = torch.from_numpy(
+                bitmask[mask_rows])
+        self.require_structured_out_cpu[local_indices] = True
 
         return (
             self.require_structured_out_cpu[:padded_num_reqs].to(

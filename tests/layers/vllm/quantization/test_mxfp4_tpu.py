@@ -173,6 +173,11 @@ class TestMxfp4MoETPU:
         layer, method = _build_layer_and_method(device)
         method.process_weights_after_loading(layer)
 
+        # Pins VllmDeepseekV4Mxfp4MoEMethod._resolve_tpu_activation, which
+        # documents why this is stored rather than recomputed at apply time.
+        assert method._tpu_activation_str == "silu_and_mul_with_clamp"
+        assert not hasattr(layer, "_tpu_activation_str")
+
         assert layer.w13_weight.dtype == torch.uint8
         assert layer.w2_weight.dtype == torch.uint8
         assert layer.w13_weight_scale.dtype in (torch.float32, torch.bfloat16)

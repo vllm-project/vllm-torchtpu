@@ -119,8 +119,7 @@ def _call(inputs, *, lower_bound=None, **kwargs):
         inputs["conv_weight"],
         inputs["pool"],
         inputs["a_log"],
-        # The decode kernel wants dt_bias per head and channel; chunk_kda takes
-        # the same numbers flat.
+        # The decode kernel wants dt_bias per head and channel.
         inputs["dt_bias"].reshape(HEADS, HEAD_DIM),
         inputs["state_indices"],
         has_initial_state,
@@ -573,8 +572,8 @@ def test_decode_kda_rejects_a_conv_state_with_the_wrong_tail() -> None:
         _call(inputs, conv_state_dim_first=True)
 
 
-def test_decode_kda_rejects_a_dt_bias_in_the_chunk_kernels_layout() -> None:
-    """``chunk_kda`` takes dt_bias flat; this kernel wants it per head.
+def test_decode_kda_rejects_a_dt_bias_in_the_flat_layout() -> None:
+    """The decode kernel wants dt_bias per head, not flat.
 
     Passing the flat form would otherwise be a silent broadcast.
     """

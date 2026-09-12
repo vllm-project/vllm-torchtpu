@@ -22,6 +22,8 @@ from .raiden_test_utils import kimi_pool_manifest
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
 from .test_raiden_pool_liveness_tpu import _extent_bytes, _live_extents
 
+pytestmark = pytest.mark.cpu_test
+
 # Qwen3.5-35B TP8 shard, QK pair-blocked: one 1024-byte QK token plus one
 # 1024-byte V token per tap.
 _CONV_REGIONS_PAIR_TP8 = (

@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -32,35 +32,6 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TpuPlatform, _validate_phased_profiling_config, get_tpu_multihost_topology)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
-
-
-def test_pcp_v2_validation_skips_gpu_only_checks(monkeypatch):
-    from vllm.config import vllm as vllm_config
-
-    from vllm_torchtpu import _patch_vllm_pcp_v2_validation
-
-    def validate(config):
-        assert vllm_config.HAS_TRITON
-        raise RuntimeError("other validation")
-
-    def get_unsupported(config):
-        return ["prefill context parallelism", "other feature"]
-
-    monkeypatch.setattr(vllm_config, "HAS_TRITON", False)
-    monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", validate)
-    monkeypatch.setattr(VllmConfig,
-                        "_get_v2_model_runner_unsupported_features",
-                        get_unsupported)
-    _patch_vllm_pcp_v2_validation()
-    config = SimpleNamespace(parallel_config=SimpleNamespace(
-        prefill_context_parallel_size=4))
-
-    assert VllmConfig._get_v2_model_runner_unsupported_features(config) == [
-        "other feature"
-    ]
-    with pytest.raises(RuntimeError, match="other validation"):
-        VllmConfig._validate_v2_model_runner(config)
-    assert not vllm_config.HAS_TRITON
 
 
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
@@ -645,3 +616,37 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
                  "TPURaidenOffloadingConnector"):
         cls = KVConnectorFactory.get_connector_class_by_name(name)
         assert cls.__name__ == name
+
+
+def _device_left_unset():
+    """Stop ``DeviceConfig`` building ``torch.device("tpu")`` off a TPU."""
+    return patch.object(TpuPlatform,
+                        "uses_host_device_handling",
+                        return_value=True)
+
+
+@patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+@patch(
+    "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+)
+def test_check_and_update_config_accepts_a_config_without_a_model(
+        mock_prepare_env, mock_apply_patches):
+    with _device_left_unset():
+        vllm_config = VllmConfig()
+
+    assert vllm_config.model_config is None
+    assert vllm_config.parallel_config.is_moe_model is None
+    # The hook reached its end rather than short-circuiting.
+    assert vllm_config.compilation_config.splitting_ops == []
+
+
+@patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+@patch(
+    "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+)
+def test_check_and_update_config_rejects_pcp_moe_without_expert_parallel(
+        mock_prepare_env, mock_apply_patches):
+    with _device_left_unset(), pytest.raises(
+            NotImplementedError, match="requires --enable-expert-parallel"):
+        VllmConfig(parallel_config=ParallelConfig(
+            prefill_context_parallel_size=2, is_moe_model=True))

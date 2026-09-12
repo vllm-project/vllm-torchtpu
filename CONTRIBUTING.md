@@ -23,13 +23,10 @@ If you encounter a bug or have a feature request, please search [existing issues
 ## Directory Structure
 We choose to follow a similar directory structure as vLLM:
 * `src/vllm_torchtpu/layers/`:
-  * `common` contains layers that are common to both vLLM and JAX
-  * `jax` contains layers that are only used by JAX models
-  * `vllm` contains layers that are only used by vLLM models
-* `src/vllm_torchtpu/models/`
-  * `common` contains model implementations/functionalities that are used by both vLLM and JAX
-  * `jax` contains model implementations/functionalities that are only used by JAX models
-  * `vllm` contains model implementations/functionalities that are only used by vLLM models
+  * `common` contains shared layers and building blocks used across implementations
+  * `vllm` contains custom layer adaptations and wrappers for vLLM models
+* `src/vllm_torchtpu/models/`:
+  * `vllm` contains model implementations and architectures supported on TPU
 
 ## Finding Reviewers
 Not sure who to ask for a review? `scripts/find_owners.py` matches your changed files against [.github/CODEOWNERS](.github/CODEOWNERS) and prints the owners of each area you touched, plus the smallest set of reviewers that covers all of them.

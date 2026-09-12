@@ -1,7 +1,11 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from vllm_torchtpu.tracing.annotation import (TraceAnnotation,
                                               is_trace_annotation_enabled)
+
+pytestmark = pytest.mark.cpu_test
 
 
 @patch("torch.autograd._profiler_enabled", return_value=False)

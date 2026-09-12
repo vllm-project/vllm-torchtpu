@@ -100,8 +100,8 @@ def _build_fp8_linear_method(
 
 def _raise_not_implemented(scheme_class: str) -> None:
     raise NotImplementedError(
-        f"{scheme_class} is not implemented yet. "
-        "Port this from tpu_inference to support this layer.")
+        f"Compressed-tensors scheme '{scheme_class}' is not implemented yet in vllm-torchtpu."
+    )
 
 
 @register_quantization_config(get_tpu_quant_method(COMPRESSED_TENSORS))
@@ -146,10 +146,10 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 targets=self.target_scheme_map.keys(),
                 fused_mapping=self.packed_modules_mapping,
             )
-
-            scheme_dict = self.target_scheme_map[matched_target]
-            weight_quant = scheme_dict.get("weights")
-            input_quant = scheme_dict.get("input_activations")
+            if matched_target is not None:
+                scheme_dict = self.target_scheme_map[matched_target]
+                weight_quant = scheme_dict.get("weights")
+                input_quant = scheme_dict.get("input_activations")
 
         if weight_quant is None:
             logger.warning_once("Acceleration for non-quantized schemes is "
@@ -169,7 +169,8 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         if self._is_fp8_w8a8(weight_quant, input_quant):
             _raise_not_implemented("VllmCompressedTensorsW8A8Fp8")
 
-        if self._is_dynamic_token_w8a8(weight_quant, input_quant):
+        if input_quant is not None and self._is_dynamic_token_w8a8(
+                weight_quant, input_quant):
             _raise_not_implemented("VllmCompressedTensorsW8A8Int8")
 
         raise NotImplementedError(
@@ -199,7 +200,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                         self, layer, prefix)
 
                 # This is a bypass way of handling FP8 as a compressed tensors method for this is
-                # not implemented yet in vllm-torchtpu (unlike tpu_inference). Since this was an
+                # not implemented yet in vllm-torchtpu. Since this was an
                 # existing code, it has been moved here to ensure backward compatibility
                 if _is_weight_fp8(weight_quant):
                     return _build_fp8_linear_method(layer, weight_quant,

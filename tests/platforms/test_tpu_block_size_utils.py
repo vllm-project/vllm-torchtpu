@@ -9,6 +9,8 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     update_tpu_block_size_and_slot_config
 
+pytestmark = pytest.mark.cpu_test
+
 
 class FakeBatchedRPAAttentionBackend:
 

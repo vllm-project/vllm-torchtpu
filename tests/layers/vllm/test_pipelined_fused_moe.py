@@ -302,7 +302,6 @@ class TestMoEForwardPrecisionBranches:
             self, pipelined):
         """Verify FP8 apply_monolithic passes identical valid kwargs to both branches."""
         layer = MagicMock()
-        layer._tpu_activation_str = "silu"
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16).to(
             torch.float8_e4m3fn)
@@ -324,6 +323,7 @@ class TestMoEForwardPrecisionBranches:
         layer.moe_config.moe_parallel_config.use_ep = False
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
+        method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
@@ -362,7 +362,6 @@ class TestMoEForwardPrecisionBranches:
             self, pipelined):
         """Verify unquantized apply_monolithic passes identical valid kwargs to both branches."""
         layer = MagicMock()
-        layer._tpu_activation_str = "silu"
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
         layer.w2_weight = torch.randn(4, 128, 64, dtype=torch.bfloat16)
@@ -371,6 +370,7 @@ class TestMoEForwardPrecisionBranches:
         layer.moe_config.experts_per_token = 2
 
         method = MagicMock()
+        method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
@@ -409,7 +409,6 @@ class TestMoEForwardPrecisionBranches:
             self, pipelined):
         """Verify MXFP4 forward monolithic passes identical valid kwargs to both branches."""
         layer = MagicMock()
-        layer._tpu_activation_str = "silu"
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
         layer.w2_weight = torch.randn(4, 128, 64, dtype=torch.bfloat16)
@@ -420,6 +419,7 @@ class TestMoEForwardPrecisionBranches:
         layer.moe_config.experts_per_token = 2
 
         method = MagicMock()
+        method._tpu_activation_str = "silu"
         method.rhs_quant_dtype = None
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
@@ -459,7 +459,6 @@ class TestMoEForwardPrecisionBranches:
             self, pipelined):
         """Verify NVFP4 apply_monolithic passes identical valid kwargs to both branches."""
         layer = MagicMock()
-        layer._tpu_activation_str = "silu"
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
         layer.w2_weight = torch.randn(4, 128, 64, dtype=torch.bfloat16)
@@ -468,6 +467,7 @@ class TestMoEForwardPrecisionBranches:
         layer.moe_config.experts_per_token = 2
 
         method = MagicMock(spec=VllmNvfp4MoEMethod)
+        method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
@@ -553,7 +553,6 @@ class TestMoEForwardPrecisionBranches:
             self, pipelined):
         """Verify compressed tensors W4AN_MXFP4 apply_monolithic passes identical valid kwargs to both branches."""
         layer = MagicMock()
-        layer._tpu_activation_str = "silu"
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
         layer.w2_weight = torch.randn(4, 128, 64, dtype=torch.bfloat16)
@@ -562,6 +561,7 @@ class TestMoEForwardPrecisionBranches:
         layer.moe_config.experts_per_token = 2
 
         method = MagicMock(spec=VllmCompressedTensorsW4ANMxfp4MoEMethod)
+        method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5

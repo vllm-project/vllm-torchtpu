@@ -66,6 +66,23 @@ if [ -z "$CONFIG_NAME" ]; then
     exit 1
 fi
 
+# An eval regression warns instead of failing the step. Perf regressions still
+# fail either way. For a config whose eval baseline is new and whose
+# run-to-run spread is not yet known -- it keeps the perf gate hard while the
+# accuracy number earns confidence, instead of soft_fail'ing the whole step.
+EVAL_SOFT_FAIL="${EVAL_SOFT_FAIL:-0}"
+
+# Called when check_regression.py --mode eval exits non-zero.
+eval_regression_failed() {
+    local task="$1"
+    if [ "$EVAL_SOFT_FAIL" = "1" ]; then
+        echo "::warning::Eval regression for $task (EVAL_SOFT_FAIL=1, not failing the step). See logs above."
+    else
+        echo "::error::Eval regression check failed for $task! See logs above for details."
+        fail=1
+    fi
+}
+
 # If running in Buildkite CI, only upload to Spanner/BigQuery if on main branch and not a PR.
 if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
     echo "Running on PR or non-main branch in Buildkite. Skipping database upload."
@@ -155,7 +172,7 @@ run_lm_eval() {
           --mode eval \
           --tolerance "$EVAL_TOLERANCE" \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
         echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
     fi
@@ -212,7 +229,7 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
           --mode eval \
           --tolerance "$EVAL_TOLERANCE" \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
         echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
     fi

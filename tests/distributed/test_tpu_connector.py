@@ -1478,8 +1478,10 @@ class _FakeAdmissionRaidenEngine:
         self.transfer_address = transfer_address
         self.listener_address = listener_address
 
-    def register_pools(self, pools):
+    def register_pools(self, pools, **kwargs):
         self.registered_pools = list(pools)
+        # Bounded host staging kwargs (RESHARD_BOUNDED_STAGING_DESIGN.md).
+        self.register_pools_kwargs = dict(kwargs)
         storage_indices = {
             pool["storage_index"]
             for pool in self.registered_pools
@@ -1488,6 +1490,10 @@ class _FakeAdmissionRaidenEngine:
             "admitted": True,
             "pools": len(self.registered_pools),
             "storages": len(storage_indices),
+            "host_staging": {
+                "mode": "bounded" if kwargs.get("staging_leases") else "full",
+                "leases": kwargs.get("staging_leases", 0),
+            },
         }
 
 
@@ -1741,6 +1747,21 @@ class TestTPURaidenConnectorWorker:
             construct_call = worker._construct_raiden_transfer_engine.call_args
             wrapped_storages = construct_call.args[0]
             assert construct_call.kwargs == {"num_slots": 1}
+            # Bounded host staging: the connector passes the lease count and
+            # one hint per pool: the distinct blocks one transfer touches on
+            # the pool's storage. Every typed cache is its own storage here,
+            # so FA pools report pages per max-length request and GDN state
+            # pools report their single block.
+            staging_kwargs = engine.register_pools_kwargs
+            assert staging_kwargs["staging_leases"] == 8
+            hints = staging_kwargs["staging_blocks_per_pool"]
+            assert len(hints) == len(engine.registered_pools)
+            for pool_dict, hint in zip(engine.registered_pools, hints):
+                tag = str(pool_dict["tag"])
+                if tag.startswith("fa"):
+                    assert hint == worker._max_request_blocks()
+                else:
+                    assert hint == 1, (tag, hint)
             typed_storages = set()
             for cache in named.values():
                 tensors = cache if isinstance(cache, tuple) else (cache, )
@@ -1818,6 +1839,15 @@ class TestTPURaidenConnectorWorker:
         assert len(engine.registered_pools) == 105
         assert len({pool["storage_index"]
                     for pool in engine.registered_pools}) == 15
+        # Every raw storage hosts one FA layer plus one layer of each of the
+        # three GDN groups (conv + ssm). Raiden sizes a storage's staging
+        # arena from max(hint) over its pools, so each pool reports the
+        # storage-wide union: FA pages plus one block per GDN group.
+        staging_kwargs = engine.register_pools_kwargs
+        assert staging_kwargs["staging_leases"] == 8
+        hints = staging_kwargs["staging_blocks_per_pool"]
+        assert len(hints) == 105
+        assert set(hints) == {worker._max_request_blocks() + 3}
         summary = worker.raiden_admission_summary()
         assert summary["binding"] == "aliased_raw"
         assert summary["pools"] == 105
@@ -2072,6 +2102,43 @@ class TestTPURaidenConnectorWorker:
             assert worker._failed_block_ids == set()
         assert set(worker._stage3_pending_controller_failures) == (
             {"decode-request"} if status == "uncertain" else set())
+
+    def test_raiden_staging_hints_cover_every_block_table_on_a_storage(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+        fa_pages = worker._max_request_blocks()
+        groups = (
+            SimpleNamespace(layer_names=("fa.0", "fa.1")),
+            SimpleNamespace(layer_names=("gdn.0", )),
+            SimpleNamespace(layer_names=("gdn.1", )),
+            SimpleNamespace(layer_names=("gdn.2", )),
+        )
+
+        def pool(tag, layer_name, storage_index):
+            return SimpleNamespace(tag=tag,
+                                   layer_name=layer_name,
+                                   storage_index=storage_index)
+
+        manifest = SimpleNamespace(pools=[
+            # Storage 0: FA pages plus one block per GDN group; a group's
+            # conv and ssm pools share that block.
+            pool("fa", "fa.0", 0),
+            pool("gdn.conv.g0", "gdn.0", 0),
+            pool("gdn.ssm.g0", "gdn.0", 0),
+            pool("gdn.conv.g1", "gdn.1", 0),
+            pool("gdn.ssm.g1", "gdn.1", 0),
+            pool("gdn.conv.g2", "gdn.2", 0),
+            pool("gdn.ssm.g2", "gdn.2", 0),
+            # Storage 1: only full attention.
+            pool("fa", "fa.1", 1),
+            # Storage 2: an unknown pool kind keeps the whole storage on the
+            # full host mirror.
+            pool("fa", "fa.1", 2),
+            pool("opaque", "fa.1", 2),
+        ])
+
+        hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+
+        assert hints == [fa_pages + 3] * 7 + [fa_pages] + [0, 0]
 
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
@@ -3226,6 +3293,9 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_source_req_ids == {}
         assert worker._stage3_destination_req_ids == {}
+        assert worker._stage3_submitted_loads == {}
+        assert worker._stage3_submitted_load_tokens == {}
+        assert worker._stage3_load_start_times == {}
 
         assert len(facade.start_transfer_calls) == 1
         call = facade.start_transfer_calls[0]
@@ -3444,6 +3514,7 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_transfer_engine = engine
         worker._stage3_submitted_loads["aborted-load-decode"] = 911
         worker._stage3_submitted_load_tokens["aborted-load-decode"] = 1536
+        worker._stage3_load_start_times["aborted-load-decode"] = 100.0
         worker._bind_stage3_request_ids("aborted-load-decode",
                                         "aborted-load-prefill")
         worker._stage3_controller_accepted.add("aborted-load-decode")
@@ -3460,6 +3531,9 @@ class TestTPURaidenConnectorWorker:
                                                                     set())
             assert worker._stage3_submitted_loads == {
                 "aborted-load-decode": 911
+            }
+            assert worker._stage3_load_start_times == {
+                "aborted-load-decode": 100.0
             }
             assert worker._stage3_controller_accepted == {
                 "aborted-load-decode"
@@ -3483,6 +3557,7 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_submitted_loads == {}
         assert worker._stage3_submitted_load_tokens == {}
+        assert worker._stage3_load_start_times == {}
         assert worker._stage3_controller_accepted == set()
         assert worker._load_block_ids == {}
         assert worker._stage3_finished_loads_pending_cleanup == set()

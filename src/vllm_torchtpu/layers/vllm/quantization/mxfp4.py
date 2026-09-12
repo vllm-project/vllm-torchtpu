@@ -71,7 +71,8 @@ from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
 from vllm_torchtpu.layers.vllm import moe_routing
-from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+from vllm_torchtpu.layers.vllm.fused_moe import (TpuMoEActivationMixin,
+                                                 fused_moe_gmm,
                                                  prebuild_fused_moe_kernel,
                                                  quantize_native_fp4_kmajor)
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
@@ -154,7 +155,7 @@ def _get_activation_str(activation) -> str:
                                        'value') else str(activation)
 
 
-class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
+class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     """
     TPU-specific implementation of MXFP4 MoE quantization.
 
@@ -165,6 +166,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     Inherits from Mxfp4MoEMethod to reuse its create_weights() method,
     but bypasses its __init__ to avoid the GPU backend assertion.
     """
+
     # Upstream Mxfp4MoEMethod.__init__ defines is_k3_situ_aiter for GPU AITER kernels.
     # Since __init__ is bypassed on TPU, explicitly define it here as False.
     is_k3_situ_aiter: bool = False
@@ -188,12 +190,16 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     def _select_monolithic(self):
         return self._forward_monolithic_tpu
 
+    def _resolve_tpu_activation(self, layer) -> str:
+        # Deliberately not get_fused_moe_activation: that also encodes the
+        # situ beta parameters, which this kernel path does not take.
+        return _get_activation_str(layer.activation)
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
-        activation_str = _get_activation_str(layer.activation)
-        layer._tpu_activation_str = activation_str
+        activation_str = self._set_tpu_activation(layer)
 
         w13_weight = dequantize_mxfp4_packed(
             layer.w13_weight.data.to("cpu"),
@@ -282,7 +288,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer")
 
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
@@ -325,6 +333,15 @@ REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
     rhs_quant_dtype = jnp.float4_e2m1fn
+
+    def _resolve_tpu_activation(self, layer) -> str:
+        # This variant runs the clamped kernel, so the string is not
+        # recoverable from layer.activation alone -- resolving it at apply
+        # time instead of storing it here would silently drop the clamp.
+        activation_str = super()._resolve_tpu_activation(layer)
+        if activation_str.lower() in ("silu", "silu_and_mul", "swiglu"):
+            return "silu_and_mul_with_clamp"
+        return activation_str
 
     def create_weights(
         self,
@@ -453,10 +470,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         assert isinstance(layer, RoutedExperts)
         device = layer.w13_weight.device
 
-        activation_str = _get_activation_str(layer.activation)
-        if activation_str.lower() in ("silu", "silu_and_mul", "swiglu"):
-            activation_str = "silu_and_mul_with_clamp"
-        layer._tpu_activation_str = activation_str
+        activation_str = self._set_tpu_activation(layer)
 
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)

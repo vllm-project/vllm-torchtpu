@@ -90,9 +90,7 @@ def chunked_kda_per_seq(
     # transition blocks (L) against every column block, then immediately use
     # L[r_b, :r_b] to forward-substitute that row strip of T_inv.
     #
-    # Diagonal and off-diagonal blocks take different paths. The split, and
-    # the reasoning below, come from `kernels/kimi_k3/chunk_kda.py`, which
-    # has the longer write-up and the measurements.
+    # Diagonal and off-diagonal blocks take different paths.
     #
     # The quantity wanted is, for every causal pair (r, t),
     #   Aqk[h, r, t] = sum_k q[h, r, k] * k[h, t, k]
