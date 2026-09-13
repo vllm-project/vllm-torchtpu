@@ -362,6 +362,35 @@ def test_rejection_sampler_synthetic_rejects_placeholder_draft(device):
     assert torch.equal(output, expected)
 
 
+@pytest.mark.parametrize("padding_token_id", [-1, 0])
+def test_rejection_sampler_greedy_ignores_padded_draft_slots(
+        device, padding_token_id):
+    """Ignore static-shape padding beyond the declared draft length."""
+    sampler = RejectionSampler()
+    draft_token_ids = torch.tensor([1, 2, padding_token_id, padding_token_id],
+                                   dtype=torch.int32,
+                                   device=device)
+    num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    # Mismatched padding must not replace the real bonus token.
+    target_logits = _target_logits_from_tokens([1, 2, 4, 5], device)
+    bonus_token_ids = torch.tensor([3], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 0, 0], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 2, 3],
+                                 dtype=torch.int64,
+                                 device=device)
+
+    output = sampler(draft_token_ids=draft_token_ids,
+                     num_draft_tokens=num_draft_tokens,
+                     target_logits=target_logits,
+                     bonus_token_ids=bonus_token_ids,
+                     segment_ids=segment_ids,
+                     group_indices=group_indices,
+                     max_draft_tokens=3)
+
+    expected = torch.tensor([[1, 2, 3, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
 def test_apply_top_k_top_p_top_k(device):
     logits = torch.tensor([[1.0, 3.0, 2.0, 0.0]], device=device)
     top_k = torch.tensor([[2]], dtype=torch.int32, device=device)
@@ -444,6 +473,43 @@ def test_rejection_sampler_random_all_accepted_uses_bonus(device):
                      do_sampling=True)
 
     expected = torch.tensor([[1, 2, 4]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("padding_token_id", [-1, 0])
+def test_rejection_sampler_random_ignores_padded_draft_slots(
+        device, padding_token_id):
+    """Ignore static-shape padding beyond the declared draft length."""
+    sampler = RejectionSampler()
+    draft_token_ids = torch.tensor([1, 2, padding_token_id, padding_token_id],
+                                   dtype=torch.int32,
+                                   device=device)
+    num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    target_logits = _target_logits_from_tokens([1, 2, 4, 5], device)
+    bonus_token_ids = torch.tensor([3], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 0, 0], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 2, 3],
+                                 dtype=torch.int64,
+                                 device=device)
+    temperatures = torch.ones((4, 1), dtype=torch.float32, device=device)
+    top_k = torch.zeros((4, 1), dtype=torch.int32, device=device)
+    top_p = torch.ones((4, 1), dtype=torch.float32, device=device)
+
+    output = sampler(draft_token_ids=draft_token_ids,
+                     num_draft_tokens=num_draft_tokens,
+                     target_logits=target_logits,
+                     bonus_token_ids=bonus_token_ids,
+                     segment_ids=segment_ids,
+                     group_indices=group_indices,
+                     max_draft_tokens=3,
+                     temperatures=temperatures,
+                     top_k=top_k,
+                     top_p=top_p,
+                     accept_u=torch.full((4, ), 0.01, device=device),
+                     recover_u=torch.full_like(target_logits, 0.5),
+                     do_sampling=True)
+
+    expected = torch.tensor([[1, 2, 3, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
 
 
@@ -700,7 +766,8 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([1, 0], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([1, 0], dtype=torch.int32, device=device)
-    target_logits = _target_logits_from_tokens([1, 0], device)
+    # The mismatched out-of-range padding segment must be ignored.
+    target_logits = _target_logits_from_tokens([1, 7], device)
     bonus_token_ids = torch.tensor([9, 8], dtype=torch.int32, device=device)
     segment_ids = torch.tensor([0, 2], dtype=torch.int64, device=device)
     group_indices = torch.tensor([0, 0], dtype=torch.int64, device=device)

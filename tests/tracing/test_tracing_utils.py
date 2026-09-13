@@ -1,8 +1,12 @@
 from unittest.mock import patch
 
+import pytest
+
 from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
                                          extract_request_ids_for_tracing,
                                          trim_request_id_suffix)
+
+pytestmark = pytest.mark.cpu_test
 
 
 def test_trim_request_id_suffix():

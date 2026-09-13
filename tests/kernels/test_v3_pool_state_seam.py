@@ -66,6 +66,7 @@ class TestV3StateSourcePlan:
         assert c.lane_split == 1
         assert c.rows_used == CONV_ROWS
         assert plan.stride == SPLIT
+        assert plan.whole_block_dma is False
 
     def test_plan_is_static_hashable_and_stable(self):
         assert _plan() == _plan()
@@ -677,3 +678,101 @@ class TestPooledCallerV3:
                                    atol=1e-5)
         assert jnp.array_equal(new_pool.view(jnp.int16),
                                pool_rt.view(jnp.int16))
+
+    @pytest.mark.parametrize("page_size", [128, 256])
+    def test_caller_matches_dense_with_native_seq_along_lane_pool(
+            self, monkeypatch, page_size):
+        monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        gdn_attention = pytest.importorskip(
+            "vllm_torchtpu.layers.common.gdn_attention")
+        n = 4
+        pool_idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        dense_idx = jnp.arange(n, dtype=jnp.int32)
+
+        # split must provide at least 1056 tokens per manager block (SSM=1024 + Conv=32)
+        split = 1536 // page_size
+        num_kv_heads_x2, packed_d, pack = 2, 64, 4  # head_dim = 64 * 4 = 256
+        pool = jnp.zeros(
+            (NUM_MGR * split, num_kv_heads_x2, packed_d, pack, page_size),
+            dtype=jnp.float8_e4m3fn)
+        conv = jnp.zeros((n, KERNEL_SIZE - 1, DIM), dtype=jnp.float32)
+        recurrent_f32 = jnp.zeros((n, N_V, D_K, D_V), dtype=jnp.float32)
+
+        kwargs = _rand_inputs(17, n) | dict(
+            query_start_loc=jnp.arange(n + 1),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
+        )
+        (dense_conv, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
+            conv_state=conv,
+            recurrent_state=recurrent_f32,
+            state_indices=dense_idx,
+            **kwargs)
+
+        new_pool, pooled_out = gdn_attention.run_jax_gdn_attention_pooled_local(
+            mixed_qkv=kwargs["qkv"],
+            b=kwargs["b"],
+            a=kwargs["a"],
+            recurrent_state=pool,
+            conv_weight=kwargs["conv_weight"],
+            conv_bias=kwargs["conv_bias"],
+            A_log=kwargs["a_log"],
+            dt_bias=kwargs["dt_bias"],
+            query_start_loc=kwargs["query_start_loc"],
+            state_indices=pool_idx,
+            distribution=kwargs["distribution"],
+            seq_lens=kwargs["seq_lens"],
+            n_kq=N_KQ,
+            n_v=N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+            pool_block_tokens=split * page_size,
+            recurrent_state_dtype=jnp.float32,
+        )
+        assert new_pool.shape == pool.shape
+        np.testing.assert_allclose(np.asarray(pooled_out),
+                                   np.asarray(dense_out),
+                                   rtol=1e-5,
+                                   atol=1e-5)
+
+        # state update by feeding next token into both dense
+        kwargs2 = kwargs | dict(
+            qkv=jax.random.normal(jax.random.key(18), (n, DIM)),
+            b=jax.random.normal(jax.random.key(19), (n, N_V)),
+            a=jax.random.normal(jax.random.key(20), (n, N_V)),
+            seq_lens=jnp.full((n, ), 10, dtype=jnp.int32),
+        )
+        (_,
+         _), dense_out2 = wrapper.fused_conv1d_gdn(conv_state=dense_conv,
+                                                   recurrent_state=dense_ssm,
+                                                   state_indices=dense_idx,
+                                                   **kwargs2)
+
+        new_pool2, pooled_out2 = gdn_attention.run_jax_gdn_attention_pooled_local(
+            mixed_qkv=kwargs2["qkv"],
+            b=kwargs2["b"],
+            a=kwargs2["a"],
+            recurrent_state=new_pool,
+            conv_weight=kwargs2["conv_weight"],
+            conv_bias=kwargs2["conv_bias"],
+            A_log=kwargs2["a_log"],
+            dt_bias=kwargs2["dt_bias"],
+            query_start_loc=kwargs2["query_start_loc"],
+            state_indices=pool_idx,
+            distribution=kwargs2["distribution"],
+            seq_lens=kwargs2["seq_lens"],
+            n_kq=N_KQ,
+            n_v=N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+            pool_block_tokens=split * page_size,
+            recurrent_state_dtype=jnp.float32,
+        )
+        assert new_pool2.shape == pool.shape
+        np.testing.assert_allclose(np.asarray(pooled_out2),
+                                   np.asarray(dense_out2),
+                                   rtol=1e-3,
+                                   atol=1e-3)

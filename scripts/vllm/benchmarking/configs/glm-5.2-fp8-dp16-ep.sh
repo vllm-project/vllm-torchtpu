@@ -78,3 +78,7 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filt
 # Greedy decoding for bench requests.
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
+LM_EVAL_TASKS="mmlu_pro"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=32,timeout=7200"
+LM_EVAL_GEN_KWARGS="until=['<|im_end|>']"

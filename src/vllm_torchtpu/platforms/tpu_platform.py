@@ -17,9 +17,11 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.platforms.pp_validation import \
+    validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
 
@@ -177,7 +179,6 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
-_tpu_patches_applied = False
 _tpu_kv_connectors_registered = False
 
 
@@ -326,85 +327,6 @@ def _register_tpu_kv_connectors() -> None:
         KVConnectorFactory.register_connector(name, module_path, name)
 
 
-def apply_tpu_patches() -> None:
-    """Apply all module-level patches required for TorchTPU.
-
-    Must run in **every** process (including spawned workers) because
-    module-level state is re-initialized on import in spawned processes.
-    All patches are idempotent.
-    """
-    global _tpu_patches_applied
-    if _tpu_patches_applied:
-        return
-    _tpu_patches_applied = True
-
-    import vllm_torchtpu as tpu_plugin
-    from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
-                               _patch_disable_sequence_parallel_moe,
-                               _patch_moe_explicit_pcp_collectives,
-                               _patch_moe_no_ep_tp_scope,
-                               _patch_moe_runner_fused_output_is_reduced,
-                               _patch_rowparallel_defer_bias,
-                               _patch_vllm_compile_all_ranges,
-                               _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_hybrid_producer_prefix_hits,
-                               _patch_vllm_tpu_group_custom_ops)
-    from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
-
-    from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
-    from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size  # isort: skip
-    from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
-    from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
-    from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
-    _register_custom_ops()
-    tpu_plugin._patch_vllm_pcp_v2_validation()
-    tpu_plugin._patch_vllm_aot_compile_cache_key()
-    tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
-    _patch_vllm_tpu_group_custom_ops()
-    _patch_default_moe_runner_select_forward()
-    _patch_moe_explicit_pcp_collectives()
-    _patch_moe_runner_fused_output_is_reduced()
-    _patch_vllm_disable_compile_ranges()
-    _patch_vllm_compile_all_ranges()
-    _patch_disable_sequence_parallel_moe()
-    _patch_moe_no_ep_tp_scope()
-    _patch_rowparallel_defer_bias()
-    _patch_expert_map_host_lookup()
-    _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_vllm_mamba_split_scheduler_block_size()
-    _patch_vllm_offloading_config_build()
-    _patch_vllm_kimi_kda_layer_counts()
-    _patch_vllm_hybrid_producer_prefix_hits()
-    tpu_plugin._patch_vllm_block_pool_lifo_free()
-    tpu_plugin._patch_vllm_vocab_parallel_embedding()
-    from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
-    from vllm_torchtpu import (  # isort: skip
-        _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
-        _patch_multiproc_worker_global_rank_env,
-        _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
-        _patch_vllm_force_v1_runner_tpu,
-        _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
-    _patch_disable_dp_ubatch()
-    _patch_multiproc_worker_global_rank_env()
-    _patch_vllm_reset_compile_wrapper()
-    _patch_vllm_piecewise_backend()
-    _patch_vllm_compile_prefix_isolation()
-    _patch_vllm_merge_multimodal_embeddings()
-    _patch_vllm_force_v1_runner_tpu()
-    _patch_dflash_bypass_v2_runner_check()
-    _patch_vllm_config_triton_tpu()
-    from vllm_torchtpu.model_loader_patches import \
-        patch_runai_sharded_expert_streaming
-    patch_runai_sharded_expert_streaming()
-    # Register the out-of-tree TPU vision-attention CustomOp by importing the
-    # module: its @CustomOp.register_oot makes vLLM instantiate our
-    # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
-    import vllm_torchtpu.layers.vllm.vision_attention  # noqa: F401
-    _configure_torchtpu_eager_mode()
-    _unwrap_dynamic_compile_fns()
-    _patch_api_server_kernel_reload_endpoint()
-
-
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
     if model_config is None:
         return False
@@ -424,9 +346,9 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
 
 
 def _apply_model_specific_patches(
-        model_config: Optional["ModelConfig"] = None) -> None:
+        model_config: Optional["ModelConfig"] = None) -> bool | None:
     if not _is_qwen3_vl_model(model_config):
-        return
+        return False
     """Apply model-specific and PyTorch XLA op-level patches for Qwen3-VL on TPU.
 
     This function applies the following patches:
@@ -650,7 +572,7 @@ class TpuPlatform(Platform):
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
         "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK",
-        "MOE_FUSED_EP_V2_SHARDED_PLAN"
+        "MOE_FUSED_EP_V2_SHARDED_PLAN", "MOE_FUSED_EP_ENABLE_W4A8"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -852,8 +774,13 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
         _validate_phased_profiling_config(vllm_config)
-        apply_tpu_patches()
-        _apply_model_specific_patches(vllm_config.model_config)
+        if "USE_MOE_EP_KERNEL" in os.environ:
+            raise ValueError(
+                "USE_MOE_EP_KERNEL is no longer supported and enables "
+                "nothing. Unset it; the fused expert-parallel MoE kernel is "
+                "USE_MOE_FUSED_EP_KERNEL=1.")
+        patch_registry.apply("platform_activation",
+                             model_config=vllm_config.model_config)
         _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
@@ -870,6 +797,15 @@ class TpuPlatform(Platform):
         if pcp_config.enabled:
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
+        validate_pipeline_parallel_config(vllm_config)
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
+            # get the hand-off push here; engine-core processes install it
+            # again on their side.
+            from vllm_torchtpu.distributed.pp_push import \
+                patch_executor_for_pp_wave
+            patch_executor_for_pp_wave(vllm_config)
+            _configure_pipeline_chunks(vllm_config)
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
@@ -1142,38 +1078,45 @@ class TpuPlatform(Platform):
         if backend_cls is None:
             return
 
-        architectures = getattr(
-            getattr(vllm_config.model_config, "hf_config", None),
-            "architectures", None) or []
-        is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+        # `get_supported_kernel_block_sizes` and
+        # `get_kv_cache_shape` resolve the KV layout, which falls through
+        # to the KV connector and so needs a current config. Upstream's
+        # `update_block_size_for_backend` wraps the same calls.
+        from vllm.config.vllm import set_current_vllm_config
+        with set_current_vllm_config(vllm_config):
+            architectures = getattr(
+                getattr(vllm_config.model_config, "hf_config", None),
+                "architectures", None) or []
+            is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
 
-        if is_ds_v4 and not cache_config.user_specified_block_size:
-            # DSv4 pages hold compressed rows. Its backend's
-            # get_preferred_block_size is a hardcoded 256, which does not fit
-            # the packed latent record, so take the MLA page size directly.
-            from vllm_torchtpu.layers.vllm.attention import \
-                PallasMLAttentionBackend
-            cache_config.block_size = (  # type: ignore[assignment]
-                PallasMLAttentionBackend.get_page_size(vllm_config))
-        else:
-            is_hybrid = vllm_config.model_config.is_hybrid
-            if not is_hybrid and not cache_config.user_specified_block_size:
-                default = backend_cls.get_page_size(vllm_config)
+            if is_ds_v4 and not cache_config.user_specified_block_size:
+                # DSv4 pages hold compressed rows. Its backend's
+                # get_preferred_block_size is a hardcoded 256, which does not fit
+                # the packed latent record, so take the MLA page size directly.
+                from vllm_torchtpu.layers.vllm.attention import \
+                    PallasMLAttentionBackend
                 cache_config.block_size = (  # type: ignore[assignment]
-                    backend_cls.get_preferred_block_size(default))
-        if unified_kv_layout_enabled(vllm_config):
-            update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
+                    PallasMLAttentionBackend.get_page_size(vllm_config))
+            else:
+                is_hybrid = vllm_config.model_config.is_hybrid
+                if not is_hybrid and not cache_config.user_specified_block_size:
+                    default = backend_cls.get_page_size(vllm_config)
+                    cache_config.block_size = (  # type: ignore[assignment]
+                        backend_cls.get_preferred_block_size(default))
+            if unified_kv_layout_enabled(vllm_config):
+                update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
-        min_page_size = backend_cls.get_min_page_size(vllm_config)
-        if min_page_size > cache_config.block_size:
-            logger.warning(
-                "Increase the page size from %s to %s to make sure there's"
-                "no SMEM OOM",
-                cache_config.block_size,
-                min_page_size,
-            )
-            cache_config.block_size = min_page_size  # type: ignore[assignment]
-        logger.info("Using KV cache block size: %s", cache_config.block_size)
+            min_page_size = backend_cls.get_min_page_size(vllm_config)
+            if min_page_size > cache_config.block_size:
+                logger.warning(
+                    "Increase the page size from %s to %s to make sure there's"
+                    "no SMEM OOM",
+                    cache_config.block_size,
+                    min_page_size,
+                )
+                cache_config.block_size = min_page_size  # type: ignore[assignment]
+            logger.info("Using KV cache block size: %s",
+                        cache_config.block_size)
 
     @classmethod
     def is_pin_memory_available(cls):
@@ -1251,6 +1194,37 @@ def _get_exponential_token_paddings(min_token_size: int,
         num *= 2
     paddings.append(max_token_size)
     return paddings
+
+
+def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
+    """Install the time-budget scheduler for a pipeline and the engine-core
+    hook that times the stages. Off when the env disables it, when the DP
+    scheduler or another scheduler is configured, or when chunked prefill is
+    disabled."""
+    from vllm_torchtpu.core.pp_chunk_scheduler import (
+        SCHEDULER_CLS, patch_engine_core_for_pp_chunks)
+    scheduler_config = vllm_config.scheduler_config
+    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+        return
+    if (envs.DP_SCHED_ENABLED
+            and vllm_config.parallel_config.data_parallel_size > 1):
+        logger.warning(
+            "Pipeline chunk sizing is off: the DP scheduler is enabled.")
+        return
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+        logger.warning(
+            "Pipeline chunk sizing is off: scheduler %s is configured.",
+            scheduler_config.scheduler_cls)
+        return
+    if not scheduler_config.enable_chunked_prefill:
+        logger.warning(
+            "Pipeline chunk sizing is off: chunked prefill is disabled.")
+        return
+    if envs.TPU_PP_CHUNK_SLACK < 0:
+        raise ValueError("TPU_PP_CHUNK_SLACK must not be negative: "
+                         f"{envs.TPU_PP_CHUNK_SLACK}")
+    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    patch_engine_core_for_pp_chunks(vllm_config)
 
 
 def _get_token_paddings(

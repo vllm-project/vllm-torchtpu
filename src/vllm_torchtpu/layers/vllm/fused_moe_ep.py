@@ -53,7 +53,8 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
+from vllm_torchtpu.kernels.fused_moe.v2.host import (PACK4, U32_SUBLANE_TILE,
+                                                     token_gather_smem_bytes)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -88,11 +89,11 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # per MoE layer -- 60 times on Qwen3.5-397B.
 #
 # WHICH layers are armed is a separate question, and not one this key can
-# answer: two of prebuild's refusals -- the SMEM bound and `_unsupported_reason`
+# answer: two of prebuild's refusals -- the SMEM bound and the weight contract
 # -- read things that are not in it. So prebuild hands the op back to the caller
 # and the caller records it on the layer's own quant method; see
 # `fused_moe_ep_supported`.
-_OPS: dict[tuple[int, bool, str, tuple[int, ...] | None, bool], Any] = {}
+_OPS: dict[tuple, Any] = {}
 # This is a fact about the mesh, not about a layer, so one copy for the process
 # is what it is: every layer in a deployment sees the same EP group.
 # This rank's mesh index, as a device tensor. The kernel needs it as data;
@@ -151,13 +152,20 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
-def _build_op(mesh, topk: int, renormalize: bool, activation: str,
-              mesh_expert_order: tuple[int, ...] | None, sharded_plan: bool):
+def _build_op(mesh,
+              topk: int,
+              renormalize: bool,
+              activation: str,
+              mesh_expert_order: tuple[int, ...] | None,
+              sharded_plan: bool,
+              weight_format="fp8",
+              rhs_qb=None):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
-    key = (topk, renormalize, activation, mesh_expert_order, sharded_plan)
+    key = (topk, renormalize, activation, mesh_expert_order, sharded_plan,
+           weight_format, rhs_qb)
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -194,7 +202,8 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
                                capacity=_TILE_M,
                                block=None,
                                ragged_stride=None,
-                               weight_format=WeightFormat.FP8,
+                               weight_format=WeightFormat(weight_format),
+                               rhs_qb=rhs_qb,
                                act_fn=activation,
                                mesh_ep_ranks=mesh_expert_order,
                                sharded_plan=sharded_plan)
@@ -244,6 +253,11 @@ def fused_moe_ep(
     only call this when that said yes.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    if w1.dtype == torch.float4_e2m1fn_x2:
+        # FP4 scales are already [E, K/block, N]. Even a single block must
+        # retain its axis; the per-channel helper would incorrectly drop it.
+        return op(hidden_states, w1, w2, w1_scale, w2_scale, router_logits,
+                  _RANK_BUFFER)
     return op(hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
               _squeeze_channel_scale_checked(w2_scale), router_logits,
               _RANK_BUFFER)
@@ -289,8 +303,14 @@ def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:
     return s
 
 
-def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
-                          activation: str) -> Any | None:
+def prebuild_fused_moe_ep(layer,
+                          topk: int,
+                          renormalize: bool,
+                          activation: str,
+                          *,
+                          weight_format="fp8",
+                          rhs_qb=None,
+                          weights=None) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
     Called once per layer from `process_weights_after_loading`. Everything here
@@ -300,8 +320,16 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     Returns the op to serve this layer with, or None on any refusal. The caller
     records it, which is what makes arming per layer rather than per process --
     several of the refusals below read things that vary by layer.
+
+    `weights` optionally supplies (w1, w2, w1_scale, w2_scale) before they are
+    installed on the layer. NVFP4 uses meta tensors describing the proposed
+    requantized layout so admission precedes any lossy weight conversion.
+    The caller must validate the actual prepared tensors before installing
+    them; the built op closes over configuration, never these tensors.
     """
     if not envs.USE_MOE_FUSED_EP_KERNEL:
+        return None
+    if weight_format == "fp4" and not envs.MOE_FUSED_EP_ENABLE_W4A8:
         return None
 
     # The experts have to actually be expert-parallel. vLLM builds an EP group
@@ -380,11 +408,18 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                                 device=layer.w13_weight.device)
     mesh_expert_order = _mesh_expert_order(ep)
 
-    w1, w2 = layer.w13_weight, layer.w2_weight
-    w1_scale = layer.w13_weight_scale_inv
-    w2_scale = layer.w2_weight_scale_inv
+    if weights is None:
+        if weight_format == "fp4":
+            weights = (layer.w13_weight, layer.w2_weight,
+                       layer.w13_weight_scale, layer.w2_weight_scale)
+        else:
+            weights = (layer.w13_weight, layer.w2_weight,
+                       layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+    w1, w2, w1_scale, w2_scale = weights
     local_experts, hidden = w1.shape[0], w1.shape[1]
-    inter = w1.shape[2] // 2
+    # Torch stores two FP4 output elements per byte; JAX sees the logical
+    # width after the bridge converts the native FP4 tensor.
+    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
 
     # The threshold is applied here rather than per step: the op is shape
     # agnostic, so the only place a token count is known outside the traced
@@ -416,19 +451,27 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
             local_experts)
         return None
 
-    reason = _unsupported_reason(layer, w1, w2, w1_scale, w2_scale,
-                                 local_experts, hidden, inter, activation)
+    reason = fused_moe_ep_unsupported_reason(layer,
+                                             weights,
+                                             activation,
+                                             weight_format=weight_format,
+                                             rhs_qb=rhs_qb)
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
-    op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
-                   sharded_plan)
+    if weight_format == "fp8":
+        op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
+                       sharded_plan)
+    else:
+        op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
+                       sharded_plan, weight_format, rhs_qb)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "pcp=%d topk=%d capacity=%d sharded_plan=%s", hidden, inter,
-        local_experts, ep, pcp, topk, _TILE_M, sharded_plan)
+        "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s",
+        hidden, inter, local_experts, ep, pcp, topk, _TILE_M, sharded_plan,
+        weight_format, rhs_qb)
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either
     # the padding mask or the chunked path. Padding costs expert work and
@@ -444,24 +487,49 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     return op
 
 
-def _unsupported_reason(layer, w1, w2, w1_scale, w2_scale, local_experts,
-                        hidden, inter, activation) -> str | None:
-    """Why this layer cannot use the fused kernel, or None if it can."""
-    if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != local_experts:
+def fused_moe_ep_unsupported_reason(layer,
+                                    weights,
+                                    activation,
+                                    *,
+                                    weight_format="fp8",
+                                    rhs_qb=None) -> str | None:
+    """Validate prepared (or meta) weights and routing before installation."""
+    w1, w2, w1_scale, w2_scale = weights
+    if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != w1.shape[0]:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
-    if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
-        return (f"the kernel's fp8 form takes float8_e4m3fn expert weights, "
-                f"got {w1.dtype} / {w2.dtype}")
-    if w2.shape[1] != inter or w2.shape[2] != hidden:
+    local_experts, hidden = w1.shape[:2]
+    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
+    packing = 2 if weight_format == "fp4" else 1
+    if w2.shape[1] != inter or w2.shape[2] * packing != hidden:
         return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
     if activation != "silu":
         return f"activation {activation!r} is not wired to the kernel's ACT_FNS"
-    if _squeeze_channel_scale(w1_scale, local_experts, 2 * inter) is None:
-        return (
-            "w1_scale is not the per-output-channel form the kernel takes; "
-            "a block-scaled weight is a different kernel format")
-    if _squeeze_channel_scale(w2_scale, local_experts, hidden) is None:
-        return "w2_scale is not the per-output-channel form the kernel takes"
+    if weight_format == "fp4":
+        if w1.dtype != torch.float4_e2m1fn_x2 or w2.dtype != w1.dtype:
+            return "the FP4 form requires native float4_e2m1fn_x2 weights"
+        if not isinstance(rhs_qb, int) or rhs_qb <= 0:
+            return "NVFP4 fused EP requires a positive integer block size"
+        # Match the packed-row geometry used by the kernel's FP4 readers.
+        packed_row_tile = U32_SUBLANE_TILE * PACK4
+        if rhs_qb % packed_row_tile:
+            return (f"NVFP4 fused EP block-{rhs_qb} must be a multiple of "
+                    f"the packed-weight row tile ({packed_row_tile})")
+        if hidden % rhs_qb or inter % rhs_qb:
+            return (f"NVFP4 fused EP block-{rhs_qb} must divide both "
+                    f"hidden={hidden} and inter={inter}")
+        for name, scale, k, n in (("w1_scale", w1_scale, hidden, 2 * inter),
+                                  ("w2_scale", w2_scale, inter, hidden)):
+            if tuple(scale.shape) != (local_experts, k // rhs_qb, 1, n):
+                return f"{name} is not the block-{rhs_qb} K-major scale layout"
+    elif weight_format == "fp8":
+        if w1.dtype != torch.float8_e4m3fn or w2.dtype != w1.dtype:
+            return "the kernel's fp8 form takes float8_e4m3fn expert weights"
+        if _squeeze_channel_scale(w1_scale, local_experts, 2 * inter) is None:
+            return "w1_scale is not the per-output-channel form the kernel takes"
+        if _squeeze_channel_scale(w2_scale, local_experts, hidden) is None:
+            return "w2_scale is not the per-output-channel form the kernel takes"
+    else:
+        return f"unsupported fused EP weight format {weight_format!r}"
     # The kernel takes expert biases (`has_w1_bias`/`has_w2_bias`) but this
     # bridge does not pass them, and dropping a bias is silent: the output is
     # simply wrong by the bias term on every routed token. Refuse until they

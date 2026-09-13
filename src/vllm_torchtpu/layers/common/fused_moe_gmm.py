@@ -177,6 +177,61 @@ def gmm_wrapper(lhs,
     )
 
 
+# Rows per block of the rank contraction: the triangular matmul is B x B, so this
+# trades that against the number of blocks.
+_COUNTING_SORT_BLOCK = 512
+
+
+def _counting_sort_positions(
+        sort_keys: jax.Array,
+        num_buckets: int) -> tuple[jax.Array | None, jax.Array | None]:
+    """Stable counting sort: row -> its position in the sorted order.
+
+    `jnp.argsort(jnp.argsort(keys))` spends a second comparison sort over M
+    distinct values on what is really the inverse of the first permutation.
+    The keys take only `num_buckets` values, so the rank within a bucket comes
+    from a triangular matmul on the one-hot block -- MXU work proportional to
+    M*block*num_buckets instead of a length-M sort -- and the bucket totals
+    fall out of the same histogram, which is exactly `group_sizes`.
+    """
+    m = sort_keys.shape[0]
+    block = min(_COUNTING_SORT_BLOCK, m)
+    if num_buckets > block:
+        # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
+        # 0.0.44.1: under jit the positions come back not a permutation. Only
+        # num_buckets > block is affected, so that is the excluded region.
+        return None, None
+    pad = -m % block
+    if pad:
+        # The sentinel bucket sorts after every real one, so padding into it
+        # leaves the real bucket bases untouched; the caller slices the
+        # sentinel off `counts` anyway.
+        sort_keys = jnp.pad(sort_keys, (0, pad),
+                            constant_values=num_buckets - 1)
+    onehot = jax.nn.one_hot(sort_keys.reshape(-1, block),
+                            num_buckets,
+                            dtype=jnp.bfloat16)
+    # The histogram rides along as one more row of the contraction the rank
+    # matmul already performs. Exact: 0/1 summands, at most `block` of them.
+    lower = jnp.concatenate(
+        [
+            jnp.ones((1, block), jnp.bfloat16),
+            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
+        ],
+        axis=0,
+    )
+    both = jnp.einsum("ij,bje->bie",
+                      lower,
+                      onehot,
+                      preferred_element_type=jnp.float32)
+    hist = both[:, 0, :]
+    rank = both[:, 1:, :]
+    counts = hist.sum(axis=0)
+    base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
+    pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -212,15 +267,39 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
+    # The keys take only `local_num_experts + 1` values, so a counting sort
+    # gives the positions and `group_sizes` without a second comparison sort.
+    # Ragged permute only: under the one-hot permute these positions break MTP.
+    ragged_permute = (use_ep and use_sparse_core
+                      and token_indices_flat.shape[0]
+                      > onehot_moe_permute_threshold)
+    argsort_revert_indices, bucket_counts = (_counting_sort_positions(
+        sort_keys, local_num_experts + 1) if ragged_permute else (None, None))
+    token_bits = max(1, (num_tokens_local - 1).bit_length())
+    packable = ((local_num_experts + 1).bit_length() + token_bits < 31)
+    sorted_indices = (jnp.argsort(sort_keys) if argsort_revert_indices is None
+                      or not packable else None)
 
-    token_indices_sorted = token_indices_flat[sorted_indices]
-    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (jax.nn.one_hot(
-        topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                         valid_mask[:, None].astype(jnp.int32))
-    group_sizes_local = group_sizes_local.sum(axis=0)
+    if argsort_revert_indices is not None:
+        group_sizes_local = bucket_counts[:local_num_experts]
+    else:
+        argsort_revert_indices = jnp.argsort(sorted_indices)
+        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+        group_sizes_local = (jax.nn.one_hot(
+            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                             valid_mask[:, None].astype(jnp.int32))
+        group_sizes_local = group_sizes_local.sum(axis=0)
+
+    if packable:
+        # Packing (key, token) into one int32 keeps the payload out of the sort
+        # and drops the follow-up gather. Equal packed values carry the same
+        # token id, so their order cannot matter.
+        packed = jax.lax.sort(jnp.left_shift(sort_keys, token_bits)
+                              | token_indices_flat,
+                              is_stable=False)
+        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
+    else:
+        token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
@@ -244,7 +323,7 @@ def prepare_routed_gmm_inputs(
     else:
         x = hidden_states_local[token_indices_sorted]
     return (x, group_sizes_local, argsort_revert_indices, topk_weights_flat,
-            valid_mask, sorted_indices)
+            valid_mask, token_indices_sorted)
 
 
 def moe_gmm(
@@ -259,7 +338,7 @@ def moe_gmm(
     argsort_revert_indices: jax.Array,
     topk_weights_flat: jax.Array,
     valid_mask_flat: jax.Array,
-    sorted_indices: jax.Array,
+    token_indices_sorted: jax.Array,
     *,
     activation: str,
     num_tokens: int,
@@ -308,10 +387,10 @@ def moe_gmm(
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
-            # The flattened route index identifies its source token because
-            # each token contributes exactly `topk` consecutive routes.
-            token_indices_sorted = sorted_indices // topk
-            topk_weights_sorted = topk_weights_flat[sorted_indices]
+            # `argsort_revert_indices` is the inverse of the sort, so scattering
+            # through it is the gather by the (unmaterialised) forward one.
+            topk_weights_sorted = jnp.zeros_like(topk_weights_flat).at[
+                argsort_revert_indices].set(topk_weights_flat)
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
             if (envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on" and
                     can_use_blockwise_onehot_unpermute(gmm2_res,
@@ -445,7 +524,7 @@ def fused_moe_func(
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
-     sorted_indices) = prepare_routed_gmm_inputs(
+     token_indices_sorted) = prepare_routed_gmm_inputs(
          hidden_states,
          topk_ids,
          topk_weights,
@@ -469,7 +548,7 @@ def fused_moe_func(
         argsort_revert_indices,
         topk_weights_flat,
         valid_mask,
-        sorted_indices,
+        token_indices_sorted,
         activation=activation,
         num_tokens=num_tokens,
         topk=topk,

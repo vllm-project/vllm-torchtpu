@@ -275,6 +275,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
+    @classmethod
+    def get_required_kvcache_layout(cls,
+                                    vllm_config: VllmConfig) -> str | None:
+        """No layout preference, unlike the `OffloadingConnector` this extends.
+
+        Upstream hardcodes "HND" for NIXL on CUDA. On TPU "HND" names
+        SEQ_ALONG_LANE, so inheriting it would select a layout nobody asked
+        for; these pages are opaque bytes to this connector.
+        """
+        return None
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         # Opt in to uniform cross-layer KV cache allocation when block-major layout is enabled.

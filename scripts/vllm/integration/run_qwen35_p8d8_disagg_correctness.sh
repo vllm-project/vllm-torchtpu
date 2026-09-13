@@ -51,6 +51,7 @@ PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-4096}"
 DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-256,4096}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-128}"
 RUN_PREFIX_CACHE_E2E_DIVERGENCE="${RUN_PREFIX_CACHE_E2E_DIVERGENCE:-1}"
+MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.65}"
 TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP}}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
 
@@ -264,12 +265,54 @@ case "${ROLE}" in
       echo "RUN_PREFIX_CACHE_E2E_DIVERGENCE=${RUN_PREFIX_CACHE_E2E_DIVERGENCE}; skipping prefix-cache E2E divergence smoke"
       DIVERGENCE_EXIT_CODE=0
     fi
+
+    # --- MTP (speculative decoding) health --------------------------------
+    MTP_EXIT_CODE=0
+    if [[ -n "${DECODE_SPECULATIVE_CONFIG+x}" && -z "${DECODE_SPECULATIVE_CONFIG}" ]]; then
+      echo "DECODE_SPECULATIVE_CONFIG is explicitly empty; skipping MTP acceptance assertions"
+    else
+      echo "--- Checking MTP acceptance on decode (${target_decode_host}:${DECODE_PORT})"
+      read_spec_counter() {
+        # $1 = host, $2 = port, $3 = counter name without the _total suffix.
+        # An unreachable server or a missing counter reads as 0, which the
+        # draft-token check below rejects.
+        curl -fsS "http://$1:$2/metrics" 2>/dev/null |
+          awk -v want="^$3_total" '$0 ~ want { sum += $2 } END { printf "%.0f", sum + 0 }'
+      }
+
+      decode_draft_tokens="$(read_spec_counter "${target_decode_host}" "${DECODE_PORT}" vllm:spec_decode_num_draft_tokens)"
+      decode_accepted_tokens="$(read_spec_counter "${target_decode_host}" "${DECODE_PORT}" vllm:spec_decode_num_accepted_tokens)"
+      echo "MTP_DECODE_DRAFT_TOKENS ${decode_draft_tokens}"
+      echo "MTP_DECODE_ACCEPTED_TOKENS ${decode_accepted_tokens}"
+
+      # Observability only: prefill drafts to warm its own draft-layer KV but
+      # never verifies, so this is expected to stay at 0. Printed, not asserted.
+      echo "MTP_PREFILL_DRAFT_TOKENS $(read_spec_counter "${target_prefill_host}" "${PREFILL_PORT}" vllm:spec_decode_num_draft_tokens)"
+
+      if [[ "${decode_draft_tokens}" -le 0 ]]; then
+        echo "ERROR: Decode engine proposed no draft tokens; MTP never ran" >&2
+        MTP_EXIT_CODE=1
+      else
+        decode_acceptance_rate="$(awk -v a="${decode_accepted_tokens}" \
+          -v d="${decode_draft_tokens}" 'BEGIN { printf "%.4f", a / d }')"
+        echo "MTP_DECODE_ACCEPTANCE_RATE ${decode_acceptance_rate}"
+        if awk -v r="${decode_acceptance_rate}" -v m="${MIN_MTP_ACCEPTANCE_RATE}" \
+            'BEGIN { exit !(r < m) }'; then
+          echo "ERROR: Expected MTP acceptance rate >= ${MIN_MTP_ACCEPTANCE_RATE} on the" \
+            "decode engine, got ${decode_acceptance_rate}" >&2
+          MTP_EXIT_CODE=1
+        else
+          echo "MTP_ACCEPTANCE_OK 1"
+        fi
+      fi
+    fi
     set -e
 
     chmod -R 777 /perf_eval_results 2>/dev/null || true
 
-    if [[ "${CORRECTNESS_EXIT_CODE}" -ne 0 || "${DIVERGENCE_EXIT_CODE}" -ne 0 ]]; then
-      echo "ERROR: Disaggregation smoke tests failed (correctness=${CORRECTNESS_EXIT_CODE}, divergence=${DIVERGENCE_EXIT_CODE})" >&2
+    if [[ "${CORRECTNESS_EXIT_CODE}" -ne 0 || "${DIVERGENCE_EXIT_CODE}" -ne 0 \
+        || "${MTP_EXIT_CODE}" -ne 0 ]]; then
+      echo "ERROR: Disaggregation smoke tests failed (correctness=${CORRECTNESS_EXIT_CODE}, divergence=${DIVERGENCE_EXIT_CODE}, mtp=${MTP_EXIT_CODE})" >&2
       exit 1
     fi
 

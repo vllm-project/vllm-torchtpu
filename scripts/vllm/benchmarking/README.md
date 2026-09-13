@@ -37,7 +37,7 @@ All configs target TPU v7x-8 (TP=8). KV cache is forced to fp8 in `run_benchmark
 
 Configs are shell files in `configs/`. Add your own by copying an existing one.
 
-CI (`.github/workflows/perf.yml`) runs `check_regression.py` three times against
+CI (`.buildkite/pipeline_perf.yml`) runs `check_regression.py` three times against
 the same live server:
 
 - `--mode perf` compares benchmark JSON to `baselines/perf/<config>.baseline.json`
@@ -49,13 +49,34 @@ the same live server:
   calibrated with `--gate-ttft-max-concurrency 0` to omit it.
 - `--mode eval` compares `lm_eval` accuracy to
   `baselines/eval/<config>.<task>.baseline.json` (1.5pp tolerance). Only keys
-  present in the baseline are gated. MMLU tasks (`mmlu_llama`, `mmlu_pro`) run
-  against the chat-completions endpoint; code-generation tasks
+  present in the baseline are gated. `--run-lm-eval` walks `LM_EVAL_TASKS`
+  (default `mmlu_llama mmlu_pro`; configs may narrow it). MMLU tasks
+  (`mmlu_llama`, `mmlu_pro`) run against the chat-completions endpoint;
+  code-generation tasks
   (`humaneval_plus_tpu`, `mbpp_plus_tpu` — the full EvalPlus datasets,
   nightly only via `--run-code-eval`) also run against the chat-completions
   endpoint with evalplus-style instruct prompting + code-block extraction
   (see `lm_eval_tasks/`) and gate pass@1. Each task gates only when its
   baseline file exists.
+
+Two config vars tune the `lm_eval` invocation, for matching an external
+reference run: `EXTRA_LM_EVAL_MODEL_ARGS` (`key=value` pairs merged into
+`--model_args`, last-wins per key) and `LM_EVAL_GEN_KWARGS` (*replaces* the
+per-task `--gen_kwargs`, which is a merging action in lm-eval). A generation
+cap goes in the latter as `max_gen_toks`: the `--model_args` value is only a
+fallback for tasks whose yaml omits the key, and `mmlu_pro` sets 2048 itself.
+
+`LM_EVAL_GEN_KWARGS` takes either form lm-eval accepts, but not a mix: a value
+containing `{` must be valid JSON with double quotes (`{"chat_template_kwargs":
+{"thinking": false}}`), since lm-eval raises rather than falling back to its
+`key=value` parser once it sees a brace. Otherwise use `key=value`
+(`until=['<|im_end|>']`).
+
+Suppressing reasoning is per-template, not universal. The harness default sends
+`chat_template_kwargs: {"enable_thinking": false}`; a template keyed on a
+different flag ignores it silently and the model reasons anyway — Kimi-K2.6
+wants `thinking`. Check the checkpoint's `chat_template.jinja` before assuming
+the default lands.
 
 ## What It Does
 
@@ -101,4 +122,5 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 |----------|---------|-------------|
 | `PORT` | `8000` | Server port |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
+| `EVAL_SOFT_FAIL` | `0` | `1` downgrades an eval regression to a `::warning` instead of failing the step. Perf regressions still fail. For a config whose eval baseline is new and whose run-to-run spread is not yet known — prefer it to `soft_fail` on the Buildkite step, which would mask the perf gate too. Forwarded into the container by `run_in_docker.sh` |
 | `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |

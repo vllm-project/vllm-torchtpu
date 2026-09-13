@@ -88,6 +88,7 @@ class StateSourcePlan:
     stride: int
     conv: StateRegion
     recurrent: StateRegion
+    whole_block_dma: bool = False
 
 
 @jax.tree_util.register_dataclass

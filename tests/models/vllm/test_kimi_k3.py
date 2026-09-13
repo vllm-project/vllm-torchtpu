@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.fx.experimental._config as fx_config
 from torch import nn
+from torch._dynamo import mark_dynamic
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
@@ -23,6 +25,8 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from vllm_torchtpu.compilation.shape_variants import (trace_shape_env,
+                                                      unsupported_reason)
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.vllm.custom_ops import \
     kda_attention_op as kimi_custom_ops
@@ -690,6 +694,70 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     )
 
 
+def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache() -> None:
+    """A one-tensor kv_cache means the unified pool: the layer must take the
+    pooled op and never the dense dispatched op."""
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.fused_fa_ga_proj = _Projection(4)
+    layer.f_a_proj = None
+    layer.g_proj = None
+    layer.local_projection_size = 4
+    layer.f_b_proj = _Projection(4)
+    layer.g_b_proj = _Projection(4)
+    layer.o_proj = _IdentityProjection()
+    layer.q_conv1d = _ConvWeight()
+    layer.k_conv1d = _ConvWeight()
+    layer.v_conv1d = _ConvWeight()
+    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
+    layer.o_norm = SimpleNamespace(weight=torch.ones(2))
+    layer.A_log = nn.Parameter(torch.zeros(2))
+    layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
+
+    pool = torch.zeros(2, 4, 2, 8)
+    layer.kv_cache = [pool]
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_slot_read_offsets=None,
+    )
+    layer._metadata = lambda: metadata
+
+    calls: list[str] = []
+
+    def pooled_kda_op(mixed_qkv, *args):
+        calls.append("pooled")
+        assert args[3] is pool
+        return mixed_qkv[:, :4].view(-1, 2, 2)
+
+    def unexpected(name):
+
+        def op(*args, **kwargs):
+            raise AssertionError(f"{name} must not run for the pooled cache")
+
+        return op
+
+    layer.pooled_kda_op = pooled_kda_op
+    layer.dispatched_kda_op = unexpected("dispatched_kda_op")
+    layer.sconv_op = unexpected("sconv_op")
+    layer.chunk_kda_op = unexpected("chunk_kda_op")
+    layer.kda_op = unexpected("kda_op")
+
+    output = layer(torch.arange(2), torch.ones(2, 4))
+    assert calls == ["pooled"]
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
+    )
+
+
 def test_kda_custom_ops_compile_as_one_full_graph(
     monkeypatch: pytest.MonkeyPatch, ) -> None:
 
@@ -824,3 +892,65 @@ def test_attention_residual_matches_reference(num_blocks: int) -> None:
     assert actual.shape == (num_tokens, hidden)
     assert actual.dtype == prefix_sum.dtype
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
+    # Same stubbing as test_attention_residual_matches_reference: the fold
+    # only reads the two weights.
+    module = AttentionResidual.__new__(AttentionResidual)
+    nn.Module.__init__(module)
+    module.eps = eps
+    module.norm = SimpleNamespace(weight=nn.Parameter(
+        torch.randn(hidden, dtype=torch.bfloat16) * 0.5 + 1))
+    module.proj = SimpleNamespace(weight=nn.Parameter(
+        torch.randn(1, hidden, dtype=torch.bfloat16) * 0.1))
+    module.process_weights_after_loading()
+    return module
+
+
+def test_attention_residual_single_token_matches_batched_rows() -> None:
+    """One token mixes the same way whether it is alone or in a batch."""
+    torch.manual_seed(0)
+    module = _attention_residual_stub(hidden=64, eps=1e-5)
+    prefix_sum = torch.randn(5, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(5, 8, 64, dtype=torch.bfloat16)
+
+    batched = module(prefix_sum, block_residuals)
+    for row in range(5):
+        alone = module(prefix_sum[row:row + 1], block_residuals[row:row + 1])
+        torch.testing.assert_close(alone, batched[row:row + 1])
+
+
+def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
+    """The one-token structure must not leak into other token buckets.
+
+    The layer decides its formulation from the token count, so the trace made
+    for one token has to carry a guard that refuses every other compile size;
+    shape_variants then gives those buckets their own trace.
+    """
+    torch.manual_seed(0)
+    module = _attention_residual_stub(hidden=64, eps=1e-5)
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    prefix_sum = torch.randn(1, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(1, 8, 64, dtype=torch.bfloat16)
+    mark_dynamic(prefix_sum, 0)
+    mark_dynamic(block_residuals, 0)
+    torch._dynamo.reset()
+    # The TPU platform switches to size-oblivious shapes when compile_sizes
+    # has 1; that is the mode the bucket-1 trace runs under.
+    with fx_config.patch(backed_size_oblivious=True):
+        compiled = torch.compile(module,
+                                 backend=capture,
+                                 fullgraph=True,
+                                 dynamic=False)
+        compiled(prefix_sum, block_residuals)
+
+    shape_env = trace_shape_env(graphs[0])
+    assert unsupported_reason(shape_env, 1) is None
+    assert unsupported_reason(shape_env, 2) is not None
+    assert unsupported_reason(shape_env, 512) is not None

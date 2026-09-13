@@ -25,14 +25,14 @@
 # HOW TO TRIGGER
 # ──────────────
 # Option A — Buildkite UI:
-#   https://buildkite.com/tpu-commons/vllm-torchtpu-dev → "New Build",
+#   https://buildkite.com/vllm/vllm-torchtpu-dev → "New Build",
 #   set branch to your branch, "Create Build".
 #
 # Option B — Buildkite API (needs BUILDKITE_API_TOKEN in your env):
 #   curl -s -X POST \
 #     -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
 #     -H "Content-Type: application/json" \
-#     "https://api.buildkite.com/v2/organizations/tpu-commons/pipelines/vllm-torchtpu-dev/builds" \
+#     "https://api.buildkite.com/v2/organizations/vllm/pipelines/vllm-torchtpu-dev/builds" \
 #     -d "{\"commit\": \"$(git rev-parse HEAD)\", \"branch\": \"$(git rev-parse --abbrev-ref HEAD)\", \"message\": \"my test\"}"
 #
 # HOW TO CUSTOMIZE

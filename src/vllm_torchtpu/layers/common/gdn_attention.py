@@ -728,13 +728,16 @@ def _build_v3_pool_state_plan(
     recurrent_state_dtype: jnp.dtype = jnp.float32,
 ):
     """Describe this rank's GDN state regions in the unified pool."""
-    if pool_block_tokens % pool.shape[1] != 0:
+    block_size, payload, lanes = pool_adapters._pool_geometry(pool)
+    if pool_block_tokens % block_size != 0:
         raise ValueError("Manager block size must be divisible by the unified "
                          f"pool kernel block size: {pool_block_tokens} and "
-                         f"{pool.shape[1]}.")
-    split = pool_block_tokens // pool.shape[1]
-    per_tok_elems = math.prod(pool.shape[2:])
-    tok_bytes = per_tok_elems * jnp.dtype(pool.dtype).itemsize
+                         f"{block_size}.")
+    split = pool_block_tokens // block_size
+    if pool_adapters.is_seq_along_lane_pool():
+        tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
+    else:
+        tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
     state_layout = derive_pooled_gdn_state_layout(
         ssm_bytes=pooled_gdn_ssm_state_bytes(
             num_v_heads=n_v,
@@ -795,13 +798,9 @@ def run_jax_gdn_attention_pooled_local(
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
     in ``recurrent_state_dtype`` at token offset 0 and the fixed-BF16 Conv
-    region in the following tokens. All pool knowledge lives here: for the
-    chunked impls, conv state is gathered/scattered through `pool_adapters`
-    around the stock conv kernel, and the SSM region is threaded into the
-    stock delta-rule via
-    pluggable `StateOps`; the fused V3 kernel instead streams both regions
-    in place through a `v3_state_source` copy-plan — the model kernels'
-    math is unmodified either way.
+    region in the following tokens. All pool knowledge lives here: this
+    function builds the copy-plan that maps those two regions onto the V3
+    kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
     conv_dim = conv_weight.shape[0]
@@ -913,7 +912,7 @@ def run_jax_gdn_attention_pooled(
         - The updated pool (the in-place written state regions).
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
-    pool_spec = P(None, None, None, None)  # attention-shaped pool
+    pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
         P(None, "model"),  # j_mixed_qkv
         P(None, "model"),  # j_b

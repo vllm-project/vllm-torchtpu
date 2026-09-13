@@ -107,7 +107,8 @@ def _capture_kernel(monkeypatch):
     return captured
 
 
-def test_forward_routes_partial_layout_to_streaming_kernel(monkeypatch):
+def test_forward_routes_partial_layout_to_streaming_kernel(
+        monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -126,7 +127,8 @@ def test_forward_routes_partial_layout_to_streaming_kernel(monkeypatch):
     assert torch.all(outputs == 7)
 
 
-def test_forward_routes_fp8_partial_layout_with_kv_scales(monkeypatch):
+def test_forward_routes_fp8_partial_layout_with_kv_scales(
+        monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -147,7 +149,8 @@ def test_forward_routes_fp8_partial_layout_with_kv_scales(monkeypatch):
     assert torch.all(outputs == 7)
 
 
-def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(monkeypatch):
+def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(
+        monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -179,7 +182,7 @@ def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(monkeypatch):
     ],
 )
 def test_forward_rejects_unsupported_pcp_streaming_features(
-        impl_kwargs, expected_message):
+        impl_kwargs, expected_message, vllm_config_context):
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
 
@@ -190,14 +193,16 @@ def test_forward_rejects_unsupported_pcp_streaming_features(
                                          metadata)
 
 
-def test_initialize_kernel_rejects_unsupported_pcp_streaming_features():
+def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
+        vllm_config_context):
     with set_vllm_model_wrapper_context(mesh=_mesh(),
                                         vllm_config=_vllm_config()):
         with pytest.raises(NotImplementedError, match="logits soft cap"):
             _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
 
 
-def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch):
+def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch,
+                                                      vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
     metadata = _metadata()
@@ -211,7 +216,7 @@ def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch):
 
 
 def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
-        monkeypatch):
+        monkeypatch, vllm_config_context):
     calls = []
 
     def fake_build(self,
@@ -235,7 +240,7 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
 
 
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
-        monkeypatch):
+        monkeypatch, vllm_config_context):
     impl = _impl()
     fake_mesh = object()
 
@@ -288,7 +293,8 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     assert cached is prebuilt
 
 
-def test_build_streaming_kernel_registers_eight_tensor_custom_op(monkeypatch):
+def test_build_streaming_kernel_registers_eight_tensor_custom_op(
+        monkeypatch, vllm_config_context):
     impl = _impl()
     fake_mesh = object()
     captured = {}
@@ -594,3 +600,66 @@ def test_adapter_invoke_streaming_op_rejects_kwargs_and_wrong_arg_count():
     with pytest.raises(ValueError, match="expects 8 tensor args"):
         pcp_adapter.invoke_pcp_streaming_op(lambda *_args: None, object(), (),
                                             {})
+
+
+@pytest.mark.parametrize(
+    "rebind_local, expects_kv_layout",
+    [(False, True), (True, False)],
+    ids=["batched entry", "tp=1 draft rebound to local entry"],
+)
+def test_kv_layout_kwarg_follows_the_bound_kernel_entry(
+        monkeypatch, vllm_config_context, rebind_local, expects_kv_layout):
+    """`tpu_runner._initialize_attention_kernels` rebinds `_kernel_entry` on the
+    instance for a tp=1 draft, so the kwarg must be decided per instance.
+
+    Binding `kv_layout` into `_pallas_rpa_kernel_local`, which has no such
+    parameter, took down both disagg spec-decode suites with
+    `TypeError: got an unexpected keyword argument 'kv_layout'`.
+    """
+    from vllm_torchtpu.layers.vllm.attention import (
+        PallasBatchedRPAAttentionBackendImpl, _pallas_rpa_kernel_local)
+
+    impl = PallasBatchedRPAAttentionBackendImpl(
+        num_heads=2,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="bfloat16",
+    )
+    if rebind_local:
+        impl._kernel_entry = _pallas_rpa_kernel_local
+        impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl, "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (object(), object(), None)))
+
+    captured = {}
+
+    class FakeOp:
+
+        def register_fake(self, _fake_impl):
+            pass
+
+        def __call__(self, kv_cache, query, *_args, **_kwargs):
+            return kv_cache, query
+
+    def fake_jax_op(_name, wrapped_fn, **_kwargs):
+        captured["fn"] = wrapped_fn
+        return FakeOp()
+
+    monkeypatch.setattr("vllm_torchtpu.layers.vllm.attention.pallas.jax_op",
+                        fake_jax_op)
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        impl._build_rpa_kernel(None, None, None)
+
+    bound = captured["fn"]
+    assert bound.func is impl._kernel_entry
+    assert ("kv_layout" in bound.keywords) is expects_kv_layout
+    # The partial must be callable with what it was bound to.
+    inspect.signature(bound.func).bind_partial(**bound.keywords)

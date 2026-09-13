@@ -2,10 +2,10 @@ import math
 from dataclasses import replace
 
 import torch
-from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec)
 
+from vllm_torchtpu.gdn_pool_layout import pooled_gdn_state_dtypes
 from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
                                                  PallasMLAttentionBackend)
 
@@ -16,9 +16,13 @@ def normalize_kv_cache_specs_for_tpu(
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
-    attention_backend: type[AttentionBackend] | None = None,
+    attention_backend: type[PallasAttentionBackend],
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
+
+    `attention_backend` must be the backend that will actually allocate: page
+    geometry varies by layout, so a fixed base class would floor the spec at a
+    page size nobody allocates.
 
     `exempt_layers` pass through untouched: their packed, compressed layout is
     not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
@@ -40,6 +44,19 @@ def normalize_kv_cache_specs_for_tpu(
             for k, v in normalized.items() if k not in exempt
         }
         if _has_hybrid_attention_and_mamba(non_exempt_specs):
+            # The pool stores the mamba state regions in its fixed physical
+            # dtypes (bf16 conv -- see gdn_pool_layout), not the layer's
+            # declared dense-cache dtypes. A layer that declares an fp32 conv
+            # state (KDA does, for the fused kernel's sake) would otherwise
+            # size its page past the attention-shaped page the pool is born
+            # with; worse, a padded page below the declared-dtype page trips
+            # MambaSpec.page_size_bytes' own invariant. Retype the spec to
+            # the physical layout before any page math.
+            non_exempt_specs = {
+                name: _pooled_physical_mamba_spec(spec)
+                for name, spec in non_exempt_specs.items()
+            }
+            normalized.update(non_exempt_specs)
             page_size = max(
                 _required_page_size_bytes(spec)
                 for spec in non_exempt_specs.values())
@@ -51,11 +68,31 @@ def normalize_kv_cache_specs_for_tpu(
     return normalized
 
 
+def _as_torch_dtype(dtype: object) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    return getattr(torch, str(dtype).removeprefix("torch."))
+
+
+def _pooled_physical_mamba_spec(spec: KVCacheSpec) -> KVCacheSpec:
+    """Retype a two-state (conv, ssm) mamba spec to the dtypes the unified
+    pool physically stores; anything else passes through."""
+    if not isinstance(spec, MambaSpec):
+        return spec
+    if len(spec.shapes) != 2 or len(spec.dtypes) != 2:
+        return spec
+    conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(spec.dtypes)
+    dtypes = (_as_torch_dtype(conv_dtype), _as_torch_dtype(ssm_dtype))
+    if tuple(spec.dtypes) == dtypes:
+        return spec
+    return replace(spec, dtypes=dtypes)
+
+
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: str | torch.dtype,
     *,
-    attention_backend: type[AttentionBackend] | None = None,
+    attention_backend: type[PallasAttentionBackend],
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
@@ -77,8 +114,7 @@ def _normalize_one_spec(
             kv_cache_dtype,
         )
     else:
-        backend = attention_backend or PallasAttentionBackend
-        page_size = backend.get_kv_cache_page_size_bytes(
+        page_size = attention_backend.get_kv_cache_page_size_bytes(
             spec.block_size,
             spec.num_kv_heads,
             spec.head_size,

@@ -138,6 +138,13 @@ EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 # so a config can tell "unset" from "forced by the operator".
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
+LM_EVAL_TASKS="mmlu_llama mmlu_pro"
+# key=value pairs merged into lm_eval's --model_args. Last-wins per key, so
+# num_concurrent=32 here overrides the harness default of 128.
+EXTRA_LM_EVAL_MODEL_ARGS="${EXTRA_LM_EVAL_MODEL_ARGS:-}"
+# Replaces the per-task --gen_kwargs: that flag is a merging action in
+# lm-eval, so a second one would union with the default, not override it.
+LM_EVAL_GEN_KWARGS="${LM_EVAL_GEN_KWARGS:-}"
 EVAL_TOLERANCE=""
 # Ratio tolerance for the perf regression gate (per-metric floors in
 # check_regression.py still apply). Raise per config for noisier layouts.
@@ -499,6 +506,13 @@ if [ -n "$MODEL_URI" ]; then
 else
     model_uri_json=null
 fi
+# lm-eval only reaches its key=value parser for a --gen_kwargs string with no
+# "{" in it; anything brace-shaped must be real JSON with double quotes. Those
+# quotes would close the string literal below, so encode rather than interpolate.
+lm_eval_gen_kwargs_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$LM_EVAL_GEN_KWARGS")
+
+# Eval generation arguments can contain nested JSON.
+lm_eval_gen_kwargs_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$LM_EVAL_GEN_KWARGS")
 
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
@@ -526,6 +540,9 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "profile_gcs_dir": $profile_gcs_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "lm_eval_tasks": "$LM_EVAL_TASKS",
+    "extra_lm_eval_model_args": "$EXTRA_LM_EVAL_MODEL_ARGS",
+    "lm_eval_gen_kwargs": $lm_eval_gen_kwargs_json,
     "perf_tolerance": $PERF_TOLERANCE,
     "eval_tolerance": $EVAL_TOLERANCE
 }

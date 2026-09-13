@@ -66,6 +66,23 @@ if [ -z "$CONFIG_NAME" ]; then
     exit 1
 fi
 
+# An eval regression warns instead of failing the step. Perf regressions still
+# fail either way. For a config whose eval baseline is new and whose
+# run-to-run spread is not yet known -- it keeps the perf gate hard while the
+# accuracy number earns confidence, instead of soft_fail'ing the whole step.
+EVAL_SOFT_FAIL="${EVAL_SOFT_FAIL:-0}"
+
+# Called when check_regression.py --mode eval exits non-zero.
+eval_regression_failed() {
+    local task="$1"
+    if [ "$EVAL_SOFT_FAIL" = "1" ]; then
+        echo "::warning::Eval regression for $task (EVAL_SOFT_FAIL=1, not failing the step). See logs above."
+    else
+        echo "::error::Eval regression check failed for $task! See logs above for details."
+        fail=1
+    fi
+}
+
 # If running in Buildkite CI, only upload to Spanner/BigQuery if on main branch and not a PR.
 if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
     echo "Running on PR or non-main branch in Buildkite. Skipping database upload."
@@ -93,6 +110,13 @@ run_lm_eval() {
     local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
 
+    # --model_args is one comma-separated string, not a repeatable flag, so
+    # config extras merge in here. Last-wins per key: an extra can override.
+    local model_args="model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+    if [ -n "$EXTRA_LM_EVAL_MODEL_ARGS" ]; then
+        model_args="$model_args,$EXTRA_LM_EVAL_MODEL_ARGS"
+    fi
+
     local lm_eval_args=(
         --tasks "$task"
         --seed "0,1234,None,1234"
@@ -109,7 +133,7 @@ run_lm_eval() {
             lm_eval_args+=(
                 --include_path "$SCRIPT_DIR/lm_eval_tasks"
                 --model local-chat-completions
-                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --model_args "$model_args"
                 --apply_chat_template
                 --gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}'
                 --confirm_run_unsafe_code
@@ -119,15 +143,22 @@ run_lm_eval() {
             lm_eval_args+=(
                 --limit 100
                 --model local-chat-completions
-                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --model_args "$model_args"
                 --apply_chat_template
             )
+            local gen_kwargs
             if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
-                lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
+                gen_kwargs='{"chat_template_kwargs": {"enable_thinking": false}}'
             else
                 lm_eval_args+=(--fewshot_as_multiturn true)
-                lm_eval_args+=(--gen_kwargs '{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}')
+                gen_kwargs='{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}'
             fi
+            # Replaced, not extended: --gen_kwargs is a merging argparse
+            # action, so a second flag would union with the default.
+            if [ -n "$LM_EVAL_GEN_KWARGS" ]; then
+                gen_kwargs="$LM_EVAL_GEN_KWARGS"
+            fi
+            lm_eval_args+=(--gen_kwargs "$gen_kwargs")
             ;;
     esac
 
@@ -141,7 +172,7 @@ run_lm_eval() {
           --mode eval \
           --tolerance "$EVAL_TOLERANCE" \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
         echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
     fi
@@ -198,7 +229,7 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
           --mode eval \
           --tolerance "$EVAL_TOLERANCE" \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
         echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
     fi
@@ -232,6 +263,9 @@ BENCH_ARGS+=(--port "$PORT")
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
+LM_EVAL_TASKS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("lm_eval_tasks") or "mmlu_llama mmlu_pro")' "$RESULTS_DIR/config.json")
+EXTRA_LM_EVAL_MODEL_ARGS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("extra_lm_eval_model_args", ""))' "$RESULTS_DIR/config.json")
+LM_EVAL_GEN_KWARGS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("lm_eval_gen_kwargs", ""))' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
 PERF_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("perf_tolerance", 0.05))' "$RESULTS_DIR/config.json")
 
@@ -253,8 +287,10 @@ fi
 # 4. Run lm_eval
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ]; then
-    run_lm_eval "mmlu_llama"
-    run_lm_eval "mmlu_pro"
+    # shellcheck disable=SC2086  # space-separated task list, split on purpose
+    for task in $LM_EVAL_TASKS; do
+        run_lm_eval "$task"
+    done
 fi
 
 # ========================================================

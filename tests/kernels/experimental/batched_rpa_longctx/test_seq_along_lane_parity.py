@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Numeric parity for the `USE_BATCHED_RPA_SEQ_ON_LANE` KV-cache layout."""
+"""Numeric parity for the SEQ_ALONG_LANE KV-cache layout.
+
+Selected with `VLLM_KV_CACHE_LAYOUT=HND`, which drives both this fork and the
+mainline batched-RPA kernel.
+"""
 
 import jax.numpy as jnp
 import numpy as np

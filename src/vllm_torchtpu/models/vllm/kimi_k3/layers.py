@@ -114,9 +114,20 @@ class AttentionResidual(nn.Module):
         prefix_sum: torch.Tensor,
         block_residuals: torch.Tensor,
     ) -> torch.Tensor:
+        w = self.folded_weight
+        if prefix_sum.shape[0] == 1:
+            # With one token the per-slot statistics below are scalars that
+            # XLA leaves unfused; reducing over the concatenated slots keeps
+            # them one vector. A shape branch, so bucket 1 gets its own trace
+            # (see compilation.shape_variants).
+            values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)),
+                               dim=-2).float()  # [1, K, hidden]
+            inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
+            probabilities = ((values * w).sum(-1) * inv).softmax(dim=-1)
+            out = (probabilities.unsqueeze(-1) * values).sum(dim=-2)
+            return out.to(block_residuals.dtype)
         v_blocks = block_residuals.float()
         v_prefix = prefix_sum.float()
-        w = self.folded_weight
         inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
         inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
         scores = torch.cat(

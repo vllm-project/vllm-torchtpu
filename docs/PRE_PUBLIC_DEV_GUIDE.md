@@ -106,10 +106,28 @@ All contributions during this pre-public phase must strictly follow this 4-step 
   ```
 
 - **UI Override (Temporary Pre-Public Option):** During this pre-public stage, repository collaborators can also manually click the DCO check details in the GitHub PR UI and click "Set DCO to PASS" to manually override and pass the check when necessary.
+1. **Find Your Reviewers:** GitHub does not auto-request CODEOWNERS on this private repo, so pick reviewers yourself. `scripts/find_owners.py` maps your changed files onto [.github/CODEOWNERS](https://github.com/vllm-project/vllm-torchtpu/blob/main/.github/CODEOWNERS) and prints the smallest set of owners covering every area you touched:
+
+   ```bash
+   scripts/find_owners.py             # owners of the current branch's changes
+   scripts/find_owners.py --pr 123    # owners of an existing PR
+   scripts/find_owners.py --handles   # just a comma-separated handle list
+   ```
+
+   Once the PR exists, `--request` requests review from those owners for you instead of you retyping the handles. It uses the current branch's PR unless you name one with `--pr`:
+
+   ```bash
+   scripts/find_owners.py --request
+   scripts/find_owners.py --pr 123 --request
+   ```
+
 1. **Push & Open PR with Assignees & Reviewers:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`, or add multiple reviewers using comma-separated handles:
 
    ```bash
    git push origin HEAD
+   gh pr create --fill --assignee "$(scripts/find_owners.py --handles)"
+
+   # Or name them yourself
    gh pr create --fill --assignee reviewer1,reviewer2
    gh pr edit --add-reviewer reviewer3,reviewer4
    ```
@@ -132,6 +150,7 @@ During this pre-public phase, GitHub does not automatically block merges or show
   You can also check the Buildkite dashboard from the UI: [Buildkite TPU Commons](https://screenshot.googleplex.com/36Qsd6vKhWSjEmb)
 - **Verify Reviewer Approval:** Ensure at least one reviewer has explicitly approved the PR before merging.
   (Refer to [Section 5: Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet-gh-commands-links) for approval verification command)
+  The **CODEOWNERS Approval** check reports whether every area you touched has an owner's approval — see [Approval Gate (Advisory)](#approval-gate-advisory) below.
 - **Check Unresolved Discussion Comments:** Verify that all review comment threads have been addressed and marked as resolved.
   (Refer to [Section 5: Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet-gh-commands-links) for GraphQL thread query)
 - **Update Outdated PR (Missing Web UI Button):** Because the "Update branch" web button is disabled/missing on outdated PRs in this repository setup, update your branch directly via GitHub CLI if main has moved ahead.
@@ -156,7 +175,7 @@ After the PR is merged into `main`:
 1. **Inspect Nightly & Scheduled Build Results (Buildkite):**
    To verify that your change runs successfully in scheduled nightly TPU benchmarks:
    🔗 **Buildkite Dashboard URL:**
-   [Buildkite Scheduled Builds](https://buildkite.com/tpu-commons/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build)
+   [Buildkite Scheduled Builds](https://buildkite.com/vllm/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build)
 2. **Verify Main Branch CI Runs (GitHub CLI):** Confirm that recent workflow runs on `main` remain green and stable:
 
    ```bash
@@ -177,6 +196,13 @@ After the PR is merged into `main`:
 
 ## 4. CI Policy
 
+### Pure CPU unit tests
+
+Explicitly mark newly authored pure CPU unit tests with `pytestmark = pytest.mark.cpu_test`
+at module scope, or `@pytest.mark.cpu_test` on individual tests in mixed modules.
+CI uses this marker to run these tests on CPU queues and exclude them from TPU queues.
+Unmarked tests remain eligible for TPU queues.
+
 ### Presubmit Requires the `ready` Label
 
 - **Policy:** Presubmit pipelines only run on a PR that carries the `ready` label. Without it, the bootstrap job stops in about ten seconds and no test, build, or benchmark steps are uploaded.
@@ -190,6 +216,18 @@ After the PR is merged into `main`:
 
 > [!NOTE] The Label Does Not Gate Merging
 > Because this repository has no branch rulesets (see Section 1), the `ready` label controls only whether CI **runs**. It does not block the merge button. The Pre-Merge Verification Checklist is still what protects `main`.
+
+### Approval Gate (Advisory)
+
+- **Policy:** The `CODEOWNERS Approval` check reports whether every area a PR touches has at least one approval from an owner of that area in [.github/CODEOWNERS](../.github/CODEOWNERS). It resolves ownership with the same matcher as `scripts/find_owners.py`, so its verdict always agrees with what that command tells you to do. (The `Run Approval Gate` check next to it is the job that produces the verdict; it is green whenever the gate managed to run.)
+- **Rationale:** GitHub applies CODEOWNERS automatically only on plans this repository is not on (see Section 1), so an approval from someone who happens to be available today does not mean the people who own the code have seen it. The gate makes that gap visible instead of leaving it to the reviewer's memory.
+- **It is advisory, not enforcing.** An unmet gate is reported **grey, not red**, so it stays out of the "some checks were not successful" banner and is never confused with a real test failure. Every PR is unmet for the whole window between opening it and being reviewed, and a red X across that window would just train everyone to ignore the check. Treat it as a line item on the Pre-Merge Verification Checklist. Making it block, once branch rulesets become available, takes two changes: set `MISSING_APPROVAL_CONCLUSION: failure` in the workflow, and mark the check required.
+- **Reading the result:** The check's details have a table of one row per owned area, who approved it, and who could. An unmet gate names the specific areas that are missing an approval and the handles that would satisfy each one — `scripts/find_owners.py --request` asks exactly those people. The check re-runs on every push and on every review, so approving a PR turns it green without anyone re-triggering CI.
+- **What counts:**
+  - Ownership is read from the **base branch's** CODEOWNERS, matching how GitHub evaluates it: a PR does not get to grant itself ownership of a directory until it merges. The resolver itself runs from the PR, so a change to `scripts/find_owners.py` is exercised by the gate before it lands.
+  - Self-approvals are ignored. If you are an area's **only** owner, any other reviewer's approval clears it, so the PR does not deadlock.
+  - A stale approval — one submitted against an older head commit — still counts, and is reported as a warning. This is deliberate: the DCO fix in Phase 1 (`git commit --amend --signoff` plus a force push) rewrites the head SHA, and dismissing approvals on that would be noise. Flip `STRICT_STALE_APPROVALS` in the workflow to change this.
+- **Override:** Add the `approval-gate-override` label to bypass the gate in an emergency (for example, reverting a broken `main` when the owner is unreachable). Every use is logged as a warning on the run; explain it in the PR.
 
 ### Addressing Existing Regression in main
 
@@ -232,7 +270,9 @@ In urgent situations where you must unblock yourself immediately:
 
 | Objective | Command / Direct Link |
 | :--- | :--- |
-| **Phase 1: Create PR & Assign** | `gh pr create --fill --assignee reviewer1,reviewer2` |
+| **Phase 1: Find Reviewers (CODEOWNERS)** | `scripts/find_owners.py` (or `--pr <PR_NUMBER>`) |
+| **Phase 1: Request Those Reviewers** | `scripts/find_owners.py --request` (or `--pr <PR_NUMBER> --request`) |
+| **Phase 1: Create PR & Assign** | `gh pr create --fill --assignee "$(scripts/find_owners.py --handles)"` |
 | **Phase 1: Add Multiple Reviewers** | `gh pr edit <PR_NUMBER> --add-reviewer reviewer3,reviewer4` |
 | **Phase 1: Start CI (`ready` label)** | `gh pr edit <PR_NUMBER> --add-label ready` |
 | **Phase 2: Check PR Approval** | `gh pr view <PR_NUMBER> --json latestReviews --jq 'if ([.latestReviews[] \| select(.state == "APPROVED")] \| length > 0) then "APPROVED ✅" else "NOT APPROVED ❌" end'` |
@@ -241,7 +281,7 @@ In urgent situations where you must unblock yourself immediately:
 | **Phase 2: Update Outdated Branch** | `gh pr update-branch <PR_NUMBER>` |
 | **Phase 3: Guarded Merge (Approved + Green)** | `[ "$(gh pr view <PR_NUMBER> --json latestReviews \| jq '[.latestReviews[] \| select(.state == "APPROVED")] \| length')" -gt 0 ] && gh pr checks <PR_NUMBER> && gh pr merge <PR_NUMBER> --squash --delete-branch` |
 | **Phase 4: Main Branch CI Check (CLI)** | `gh run list --branch main --limit 5` |
-| **Phase 4: Buildkite Nightly URL** | [Buildkite Scheduled Builds](https://buildkite.com/tpu-commons/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build) |
+| **Phase 4: Buildkite Nightly URL** | [Buildkite Scheduled Builds](https://buildkite.com/vllm/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build) |
 | **Fix Missing DCO (CLI)** | `git commit --amend --signoff --no-edit && git push origin HEAD --force-with-lease` |
 | **Fix Missing DCO (UI Override)** | Click DCO check details in GitHub PR UI -> Click "Set DCO to PASS" |
 

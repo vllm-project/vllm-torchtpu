@@ -2514,6 +2514,7 @@ def test_dsv4_specs_are_exempt_from_tpu_normalization():
     out = normalize_kv_cache_specs_for_tpu(
         specs,
         torch.float8_e4m3fn,
+        attention_backend=PallasAttentionBackend,
         exempt_layers=set(specs),
     )
 
@@ -2524,7 +2525,8 @@ def test_dsv4_specs_are_exempt_from_tpu_normalization():
 
     # Without the exemption the same specs are rewritten -- guards against the
     # exemption silently becoming a no-op.
-    unexempt = normalize_kv_cache_specs_for_tpu(specs, torch.float8_e4m3fn)
+    unexempt = normalize_kv_cache_specs_for_tpu(
+        specs, torch.float8_e4m3fn, attention_backend=PallasAttentionBackend)
     assert unexempt["model.layers.0.attn"] is not ds_v4_spec
     assert unexempt["model.layers.0.attn"].page_size_padded is not None
     # A page sized from the logical block, not from the compressed rows: this
@@ -2712,7 +2714,44 @@ def _block_size_for(architecture, backend_page_size=256, preferred=None):
     return vllm_config.cache_config.block_size
 
 
-def test_tpu_platform_block_size_override_is_dsv4_only():
+def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
+    """`update_block_size_for_backend` runs before vLLM makes the config
+    current, so anything it reaches that resolves the KV layout has to
+    establish the context itself.
+
+    Deliberately takes no `vllm_config_context` and uses the real backend
+    rather than a MagicMock: with either of those in place the call resolves
+    the layout against an ambient config and the gap stays hidden. Missing it
+    both ways is what let this reach CI as an `AssertionError: Current vLLM
+    config is not set` at server startup."""
+    from vllm_torchtpu.layers.vllm.attention import \
+        PallasBatchedRPAAttentionBackend
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            user_specified_block_size=False,
+            block_size_unaligned=16,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=False,
+            is_hybrid=False,
+            max_model_len=1024,
+            architecture="Qwen3ForCausalLM",
+            get_head_size=lambda: 128,
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        kv_transfer_config=None,
+    )
+    with patch.object(TpuPlatform,
+                      "_find_non_ssm_backend",
+                      return_value=PallasBatchedRPAAttentionBackend):
+        TpuPlatform.update_block_size_for_backend(vllm_config)
+    assert vllm_config.cache_config.block_size in (128, 256)
+
+
+def test_tpu_platform_block_size_override_is_dsv4_only(vllm_config_context):
     """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
 
     DSv4's own backend does not define get_page_size, so its size comes from
@@ -2908,3 +2947,49 @@ class TestBuildAttentionMetadataForLayers:
 
         assert out == {}
         group.metadata_builders[0].build.assert_not_called()
+
+
+class _FakeTpuEvent:
+    instances: list["_FakeTpuEvent"] = []
+
+    def __init__(self):
+        self.recorded = False
+        self.synchronized = 0
+        _FakeTpuEvent.instances.append(self)
+
+    def record(self):
+        self.recorded = True
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+class TestInputStagingFence:
+    """A chunk records a fence after uploading from the reusable host staging
+    tensors; the next chunk synchronizes on it before rewriting them, once."""
+
+    def test_record_then_wait_synchronizes_once(self, monkeypatch):
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(torch,
+                            "tpu",
+                            SimpleNamespace(Event=_FakeTpuEvent),
+                            raising=False)
+        runner = SimpleNamespace(_input_staging_fence=None)
+        TPUModelRunner._record_input_staging_fence(runner)
+        fence = runner._input_staging_fence
+        assert fence is _FakeTpuEvent.instances[-1]
+        assert fence.recorded
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+        assert runner._input_staging_fence is None
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+
+    def test_wait_without_fence_is_noop(self, monkeypatch):
+        monkeypatch.setattr(torch,
+                            "tpu",
+                            SimpleNamespace(Event=_FakeTpuEvent),
+                            raising=False)
+        runner = SimpleNamespace(_input_staging_fence=None)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._input_staging_fence is None

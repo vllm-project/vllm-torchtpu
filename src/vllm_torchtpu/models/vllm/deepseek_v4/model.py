@@ -312,6 +312,10 @@ class DeepseekV4Model(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+        # Layer tags for eagle-family draft conditioning. Set via
+        # ``DeepseekV4ForCausalLM.set_aux_hidden_state_layers`` before warmup.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
     @property
     def mhc_post_op(self):
         """The op that settles the post the last decoder layer deferred.
@@ -382,7 +386,11 @@ class DeepseekV4Model(nn.Module):
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        final_aux_recon: torch.Tensor | None = None
+        for idx, layer in enumerate(islice(self.layers, self.start_layer,
+                                           self.end_layer),
+                                    start=self.start_layer):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -391,11 +399,23 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            if idx + 1 in self.aux_hidden_state_layers:
+                # Reconstruct the full hc-stream state and collapse it the
+                # way the drafts were trained on: settle the deferred post,
+                # then mean over the hc streams (upstream numerics).
+                aux_recon = self.mhc_post_op(hidden_states, residual, post_mix,
+                                             res_mix)
+                aux_hidden_states.append(aux_recon.mean(dim=1))
+                final_aux_recon = aux_recon
 
         if post_mix is not None:
-            # Fused path: settle the post the last layer deferred.
-            hidden_states = self.mhc_post_op(hidden_states, residual, post_mix,
-                                             res_mix)
+            if (final_aux_recon is not None
+                    and self.end_layer in self.aux_hidden_state_layers):
+                hidden_states = final_aux_recon
+            else:
+                # Fused path: settle the post the last layer deferred.
+                hidden_states = self.mhc_post_op(hidden_states, residual,
+                                                 post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -408,7 +428,10 @@ class DeepseekV4Model(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -617,6 +640,16 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Tag layers whose post-layer state feeds an eagle-family draft.
+        Must run before warmup so the captured forward is the one that compiles.
+        """
+        invalid = [i for i in layers if i < 1 or i > len(self.model.layers)]
+        if invalid:
+            raise ValueError(
+                f"Invalid DeepseekV4 aux hidden-state layers: {invalid}")
+        self.model.aux_hidden_state_layers = tuple(layers)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:

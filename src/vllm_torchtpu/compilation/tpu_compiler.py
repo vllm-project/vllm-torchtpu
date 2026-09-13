@@ -94,6 +94,40 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
+    # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
+    # timeouts. Same reasoning as the Raiden group above. Every registry
+    # entry not named here joins the cache key, so omitting these would
+    # recompile the world whenever an operator retuned a port.
+    "TPU_IPC_SOCKET_DIR",
+    "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
+    "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
+    "TPU_KV_LATENCY_LOG_INTERVAL",
+    "TPU_KV_PIN_SHM",
+    "TPU_KV_SHM_POOL_GB",
+    "TPU_KV_STAGE_WAITER_POOL_SIZE",
+    "TPU_KV_STAGE_WAIT_TIMEOUT_SECS",
+    "TPU_KV_TRANSFER_CHANNEL_NUMBER",
+    "TPU_KV_TRANSFER_NAMESPACE",
+    "TPU_KV_TRANSFER_PORT",
+    # Compiles the same artifacts, just eagerly at startup.
+    "TPU_KV_WARMUP_ENABLED",
+    "TPU_NODE_ID",
+    "TPU_P2P_WAIT_PULL_TIMEOUT",
+    "TPU_RAIDEN_INLINE_LOAD",
+    "TPU_RAIDEN_POOL_STAGING_LEASES",
+    "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
+    "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
+    "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
+    "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
+    "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+    "TPU_SIDE_CHANNEL_PORT",
+    # The HBM reserve that feeds block-count sizing comes from
+    # kv_transfer_config, not from this variable.
+    "TPU_USE_RAIDEN_CONNECTOR",
+    # Pipeline chunk sizing: scheduling and the extra token buckets, which
+    # are keyed by shape inside the same cache.
+    "TPU_PP_DYNAMIC_CHUNKS",
+    "TPU_PP_CHUNK_SLACK",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -109,6 +143,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/kernels",
     "vllm_torchtpu/layers/common",
     "vllm_torchtpu/layers/vllm/attention.py",
+    "vllm_torchtpu/layers/vllm/cp_attention.py",
     "vllm_torchtpu/layers/vllm/custom_ops",
     "vllm_torchtpu/layers/vllm/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a

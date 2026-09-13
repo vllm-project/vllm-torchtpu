@@ -105,7 +105,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
         argsort_revert_indices=jnp.array([0, 1], dtype=jnp.int32),
         topk_weights_flat=jnp.array([0.25, 0.75], dtype=jnp.float32),
         valid_mask_flat=jnp.array([True, True]),
-        sorted_indices=jnp.array([0, 1], dtype=jnp.int32),
+        token_indices_sorted=jnp.array([0, 0], dtype=jnp.int32),
         activation="silu",
         num_tokens=1,
         topk=2,
@@ -174,7 +174,7 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
                                          kind="stable")
 
     (_, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
-     sorted_indices) = prepare_routed_gmm_inputs(
+     token_indices_sorted) = prepare_routed_gmm_inputs(
          hidden_states,
          topk_indices,
          topk_weights,
@@ -192,7 +192,8 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     np.testing.assert_array_equal(topk_weights_flat,
                                   np.asarray(topk_weights).reshape(-1))
     np.testing.assert_array_equal(valid_mask, valid)
-    np.testing.assert_array_equal(sorted_indices, sorted_indices_expected)
+    np.testing.assert_array_equal(token_indices_sorted,
+                                  sorted_indices_expected // 2)
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
 
 
@@ -207,6 +208,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     topk_weights_flat = jnp.array([0.1, 0.2, 0.3, 0.4], dtype=jnp.bfloat16)
     valid_mask = jnp.ones((4, ), dtype=jnp.bool_)
     sorted_indices = jnp.array([1, 2, 0, 3], dtype=jnp.int32)
+    token_indices_sorted = sorted_indices // 2
     gmm1_res = jnp.zeros((4, 2), dtype=jnp.bfloat16)
     gmm2_res = jnp.zeros((4, 2), dtype=jnp.bfloat16)
     expected = jnp.ones((2, 2), dtype=jnp.bfloat16)
@@ -240,7 +242,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
             argsort_revert_indices,
             topk_weights_flat,
             valid_mask,
-            sorted_indices,
+            token_indices_sorted,
             activation="silu",
             num_tokens=2,
             topk=2,
@@ -738,8 +740,8 @@ def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
             group_sizes=jnp.array([rows], dtype=jnp.int32),
             argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
                                              dtype=jnp.int32),
-            sorted_indices=jnp.array([4, 2, 6, 0, 7, 5, 1, 3],
-                                     dtype=jnp.int32),
+            token_indices_sorted=jnp.array([4, 2, 6, 0, 7, 5, 1, 3],
+                                           dtype=jnp.int32) // topk,
             topk_weights_flat=jnp.linspace(0.1, 0.8, rows, dtype=jnp.float32),
             valid_mask_flat=jnp.array(
                 [True, True, False, True, True, False, True, True]),
@@ -781,7 +783,8 @@ def _small_moe_gmm_kwargs(num_tokens=4, topk=2, hidden=8):
         group_sizes=jnp.array([rows], dtype=jnp.int32),
         argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
                                          dtype=jnp.int32),
-        sorted_indices=jnp.array([4, 2, 6, 0, 7, 5, 1, 3], dtype=jnp.int32),
+        token_indices_sorted=jnp.array([4, 2, 6, 0, 7, 5, 1, 3],
+                                       dtype=jnp.int32) // topk,
         topk_weights_flat=jnp.full((rows, ), 0.5, dtype=jnp.bfloat16),
         valid_mask_flat=jnp.ones((rows, ), dtype=bool),
         activation="silu",

@@ -2,9 +2,28 @@
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly perf benchmark for Kimi-K3 on the multihost TPU v7x-32 pod
 # (4 hosts x 8 chips): TP=32 with EP. Single-request latency probe at
-# 8k in / 1k out. Baseline calibrated on the pod from two dev-pipeline
-# runs with run-to-run spread <= 0.3% on every gated metric — the
+# 8k in / 1k out. Baseline calibrated on the pod from three repeats in one
+# server lifetime, run-to-run spread <= 0.3% on every gated metric — the
 # default 5% perf tolerance applies.
+# Serve flags select the tuned MLA path for this model on this topology. The v2
+# MLA tuning table carries an entry for K3 at TP32 keyed on (max_num_tokens,
+# q_heads, kv_dtype, page_size_per_kv_packing, max_num_seqs, pages_per_seq), and
+# the settings below are what set those fields:
+#
+#   max_num_tokens           <- MAX_NUM_BATCHED_TOKENS 8192 + compile size 8192
+#   actual_num_q_heads       <- 96 / TP32 = 3
+#   kv_dtype                 <- KV_CACHE_DTYPE fp8
+#   page_size_per_kv_packing <- block size 256 / kv_packing 4 = 64
+#   max_num_seqs             <- MAX_NUM_SEQS 8
+#   pages_per_seq            <- ceil(MAX_MODEL_LEN 10240 / block size 256) = 40
+#
+# Changing max-model-len, block-size, kv-cache-dtype or max-num-seqs drops the
+# lookup to the untuned fallback with no warning, so treat those four as one
+# setting rather than four. The table has no K3 TP32 entry above max_num_seqs 8,
+# which is why this config stays a single-request latency probe.
+#
+# compile_sizes[0] = 1: a decode step is padded up to the next compiled size, so
+# without a 1 in the list a single-sequence step runs a 16-token shape.
 MODEL="moonshotai/Kimi-K3"
 # v7x-32 hosts have no data disk that fits the 1561 GB checkpoint, so
 # weights stream directly from GCS via --load-format runai_streamer.
@@ -33,21 +52,21 @@ NUM_PROMPTS=64
 # 8192:1024 lengths, so TTFT/TPOT medians are comparable run to run.
 RANDOM_RANGE_RATIO="0.0"
 
-# Server configuration (mirrors the proven multihost bring-up recipe):
-# - max-model-len=9216: exact nominal length for 8192 in + 1024 out.
-# - max-num-batched-tokens=512 / max-num-seqs=1: bs=1 latency regime.
-MAX_MODEL_LEN=9216
-MAX_NUM_BATCHED_TOKENS=512
-MAX_NUM_SEQS=1
+# Server configuration:
+# 10240 gives pages_per_seq 40 at block size 256, the value the tuned MLA entry
+# is keyed on. Still the exact nominal length for 8192 in + 1024 out.
+MAX_MODEL_LEN=10240
+MAX_NUM_BATCHED_TOKENS=8192
+MAX_NUM_SEQS=8
 
 # Startup budget covers the GCS stream plus a cold XLA compile
 # (VLLM_DISABLE_COMPILE_CACHE=1 in the multihost containers).
 SERVER_READY_WAIT_MIN=240
-GPU_MEMORY_UTILIZATION=0.7
+GPU_MEMORY_UTILIZATION=0.82
 # The proven recipe serves with vllm's default KV cache dtype and
 # synchronous scheduling; both are recorded in the run's config.json.
-KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
-ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-false}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 
 # Kimi-K3 is an MLA model; ATTENTION_BACKEND default CUSTOM applies.
 
@@ -62,7 +81,7 @@ ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-false}"
 #   a multiple of max-num-batched-tokens, no remainder) and bs=1 decode
 #   pads to 16. 64/256 were compiled cold every run (~5.6 min on the pod)
 #   and never executed.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --compilation-config {\"compile_sizes\":[16,512]}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 --compilation-config {\"compile_sizes\":[1,8,8192]}"
 
 # The bench client tokenizes from the dir the server pulled from GCS
 # (run_benchmarks.sh derives --tokenizer from MODEL_URI); the harness
@@ -72,3 +91,10 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --e
 # Greedy decoding for bench requests.
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
+# MMLU-Pro extracts an answer letter from a complete chat response. K3's
+# template closes assistant messages, so continuation-based tasks do not fit.
+LM_EVAL_TASKS="mmlu_pro"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=16"
+# K3's tokenizer uses `thinking`; its default enables reasoning.
+LM_EVAL_GEN_KWARGS='{"chat_template_kwargs":{"thinking":false}}'
