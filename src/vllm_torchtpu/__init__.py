@@ -1427,6 +1427,12 @@ def _patch_vllm_structured_jump_decoding() -> None:
                 if self.structured_output_manager.should_advance(request):
                     metadata = request.structured_output_request
                     grammar = getattr(metadata, "grammar", None)
+                    # Keep whatever the proposer guessed that the grammar
+                    # accepts, then fill only the slots it left empty. Replacing
+                    # the draft outright would discard valid n-gram hits that
+                    # the target model would have accepted anyway.
+                    spec_token_ids = metadata.grammar.validate_tokens(
+                        spec_token_ids)
                     if grammar is not None and hasattr(
                             grammar, "peek_jump_forward_tokens"):
                         max_k = getattr(self, "num_spec_tokens",
@@ -1435,16 +1441,13 @@ def _patch_vllm_structured_jump_decoding() -> None:
                             0, request.max_tokens -
                             len(request.output_token_ids) - 1)
                         max_k = min(max_k, remaining)
-                        jump_tokens = (grammar.peek_jump_forward_tokens(
-                            max_tokens=max_k) if max_k > 0 else [])
-                        if jump_tokens:
-                            spec_token_ids = jump_tokens
-                        else:
-                            spec_token_ids = metadata.grammar.validate_tokens(
-                                spec_token_ids)
-                    else:
-                        spec_token_ids = metadata.grammar.validate_tokens(
-                            spec_token_ids)
+                        needed = max_k - len(spec_token_ids)
+                        if needed > 0:
+                            jump_tokens = grammar.peek_jump_forward_tokens(
+                                max_tokens=needed)
+                            if jump_tokens:
+                                spec_token_ids = (spec_token_ids +
+                                                  jump_tokens[:needed])
                 request.spec_token_ids = spec_token_ids
 
             processed_req_ids = set(draft_token_ids.req_ids)
