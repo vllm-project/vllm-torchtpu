@@ -180,6 +180,77 @@ def test_pcp8_manifest_matches_live_geometry():
                                                              64)
 
 
+def test_per_layer_tags_name_each_layer_and_fold_into_class_geometry():
+    # A pipeline stage materializes only its own layers (here 0..4, one FA
+    # layer at 3); under per-layer tags every pool names its layer and the
+    # class geometry view still sees one FA and one GDN geometry.
+    named_all = _qwen35_materialization(
+        fa_shape=(256, 256, 1, 4, 256),
+        fa_esz=1,
+        fa_dtype="torch.float8_e4m3fn",
+        conv_shape=(16, 3, 1, 12288),
+        conv_esz=2,
+        ssm_shape=(16, 64, 128, 128),
+        ssm_esz=4,
+    )
+    stage_layers = {f"model.layers.{i}." for i in range(5)}
+    named = {
+        name: tensor
+        for name, tensor in named_all.items() if any(
+            name.startswith(prefix) for prefix in stage_layers)
+    }
+    groups = _qwen35_groups(named,
+                            block_size=4096,
+                            num_kv_heads=2,
+                            head_size=256)
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        mamba_group_ordinal_by_layer={
+            name: 0
+            for name in named if "linear_attn" in name
+        },
+        per_layer_tags=True,
+    )
+
+    assert [pool.tag for pool in manifest.pools] == [
+        "gdn.conv.g0.l0", "gdn.ssm.g0.l0", "gdn.conv.g0.l1", "gdn.ssm.g0.l1",
+        "gdn.conv.g0.l2", "gdn.ssm.g0.l2", "fa.l3", "gdn.conv.g0.l4",
+        "gdn.ssm.g0.l4"
+    ]
+    assert set(
+        manifest.geometry_by_tag()) == {"fa", "gdn.conv.g0", "gdn.ssm.g0"}
+    assert [pool.tag for pool in manifest.pools_of_class("fa")] == ["fa.l3"]
+    # The class view is what the default tagging produces for the same
+    # layers.
+    plain = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        mamba_group_ordinal_by_layer={
+            name: 0
+            for name in named if "linear_attn" in name
+        },
+    )
+    assert manifest.geometry_by_tag() == plain.geometry_by_tag()
+
+
+def test_layer_tag_helpers_round_trip():
+    from vllm_torchtpu.distributed.kv_transfer.raiden import tags
+
+    assert tags.layer_tag("fa", 3) == "fa.l3"
+    assert tags.split_layer_tag("fa.l3") == ("fa", 3)
+    assert tags.split_layer_tag("gdn.conv.g0.l12") == ("gdn.conv.g0", 12)
+    assert tags.split_layer_tag("gdn.conv.g0") == ("gdn.conv.g0", None)
+    assert tags.class_tag("fa.l3") == "fa"
+    assert tags.class_tag("fa") == "fa"
+    with pytest.raises(ValueError):
+        tags.layer_tag("fa", -1)
+
+
 def test_canonical_pool_order_is_layer_major_conv_before_ssm():
     _, manifest = _build_pcp8()
     # Layer 0..2 are GDN (conv, ssm), layer 3 is FA.

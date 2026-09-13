@@ -48,6 +48,7 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import functools
 import gc
 import os
 from collections.abc import Generator
@@ -423,3 +424,219 @@ def patch_default_model_loader_page_cache() -> None:
     logger.info(
         "Applied TPU patch: DefaultModelLoader page cache eviction on load completion."
     )
+
+
+# Shards every expert of a parameter receives, keyed by the shard written.
+_SHARDS_PER_EXPERT = {"w1": 2, "w3": 2, "w2": 1}
+
+
+class ExpertWriteTracker:
+    """Tells when every expert of a parameter has been written.
+
+    A w13 parameter receives a ``w1`` and a ``w3`` shard per expert, a w2
+    parameter one ``w2`` shard. The shard being written says which kind the
+    parameter is, so the count of writes that completes it is known from
+    the first one, whatever order the shards arrive in. Writes with any
+    other shard id (a loader that copies all experts at once passes None)
+    and experts the loader never writes leave the parameter incomplete.
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[int, set[tuple[int, str]]] = {}
+
+    def record(self, param: torch.Tensor, expert_id: int,
+               shard_id: str) -> bool:
+        shards = _SHARDS_PER_EXPERT.get(shard_id)
+        if shards is None:
+            return False
+        seen = self._seen.setdefault(id(param), set())
+        seen.add((expert_id, shard_id))
+        complete = len(seen) == param.shape[0] * shards
+        if complete:
+            del self._seen[id(param)]
+        return complete
+
+
+# Host bytes per device upload of a staged parameter.
+_UPLOAD_CHUNK_BYTES = 256 << 20
+# Parameters staged at once before the oldest is written early.
+_MAX_STAGED = 32
+
+
+def _rss_gib() -> float:
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**30
+
+
+class ExpertParamStager:
+    """Host stand-ins for expert parameters while their experts stream in.
+
+    Loaders write each expert into the stand-in; the device parameter gets
+    one upload when its last expert lands, or at the end of loading for
+    parameters the loader never completes. Stand-in buffers are reused
+    across parameters of the same shape, so host memory stays at a few
+    parameters' worth however the runtime tracks upload sources.
+    """
+
+    def __init__(self) -> None:
+        self._staged: dict[int, tuple[torch.nn.Parameter, torch.Tensor]] = {}
+        self._pool: dict[tuple, list[torch.Tensor]] = {}
+        self._tracker = ExpertWriteTracker()
+        self.written_early: set[int] = set()
+        self.flushed = 0
+
+    def staging(self, param: torch.nn.Parameter) -> bool:
+        """Whether writes to ``param`` still go through a stand-in.
+
+        A parameter written early keeps its later experts on the direct
+        device path, so the early write is never overwritten.
+        """
+        return id(param) not in self.written_early
+
+    def host_param(self, param: torch.nn.Parameter) -> torch.Tensor:
+        entry = self._staged.get(id(param))
+        if entry is None:
+            if len(self._staged) >= _MAX_STAGED:
+                oldest = next(iter(self._staged.values()))[0]
+                self.written_early.add(id(oldest))
+                self.flush(oldest)
+            key = (tuple(param.shape), param.dtype)
+            free = self._pool.get(key)
+            buffer = free.pop() if free else torch.empty(
+                param.shape, dtype=param.dtype, device="cpu")
+            # The stand-in keeps the parameter's class and attributes so the
+            # loader's dispatch on them (is_transposed, quant flags) holds.
+            host = torch.Tensor._make_subclass(type(param), buffer, False)
+            host.__dict__.update(param.__dict__)
+            entry = (param, host)
+            self._staged[id(param)] = entry
+        return entry[1]
+
+    def written(self, param: torch.nn.Parameter, expert_id: int,
+                shard_id: str) -> bool:
+        """Note one expert write; flush the parameter if it is complete."""
+        if not self._tracker.record(param, expert_id, shard_id):
+            return False
+        self.flush(param)
+        return True
+
+    def flush(self, param: torch.nn.Parameter) -> None:
+        """Upload ``param``'s stand-in to the device in slices and join them.
+
+        The slices bound the source copies the runtime keeps per upload. One
+        concatenation joins them rather than slice writes into a
+        preallocated parameter: on TPU an in-place slice write is a program
+        that rewrites the whole parameter, once per slice.
+        """
+        entry = self._staged.pop(id(param), None)
+        if entry is None:
+            return
+        param, host = entry
+        device = param.data.device
+        per_row = max(1, host[0].numel() * host.element_size())
+        step = max(1, _UPLOAD_CHUNK_BYTES // per_row)
+        chunks = [
+            host[start:start + step].to(device)
+            for start in range(0, host.shape[0], step)
+        ]
+        param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+        del chunks
+        if device.type == "tpu":
+            from vllm_torchtpu.utils import synchronize_tensors
+            synchronize_tensors([param.data], wait=True)
+        self.flushed += 1
+        buffer = torch.Tensor._make_subclass(torch.Tensor, host.data, False)
+        self._pool.setdefault((tuple(host.shape), host.dtype),
+                              []).append(buffer)
+        logger.debug(
+            "Staged expert parameter %d written: shape=%s staged=%d "
+            "pooled=%d rss=%.1f GiB", self.flushed, tuple(param.shape),
+            len(self._staged), sum(len(v) for v in self._pool.values()),
+            _rss_gib())
+
+    def flush_all(self) -> None:
+        for param, _ in list(self._staged.values()):
+            self.flush(param)
+
+    def __len__(self) -> int:
+        return len(self._staged)
+
+
+def patch_moe_expert_write_staging() -> None:
+    """Load expert parameters through host stand-ins written to the device
+    once each.
+
+    Every per-expert copy into a device parameter uploads its source and runs
+    as its own program that rewrites the whole parameter; a stage holding
+    whole experts (no expert parallelism) spends tens of minutes on those
+    programs and holds its expert weights twice by the end of loading.
+    A stand-in is written when its last expert lands, or at the end of
+    loading if the loader never completes it, in slices of
+    ``_UPLOAD_CHUNK_BYTES`` joined on the device. Only a parameter written
+    early, to keep at most ``_MAX_STAGED`` stand-ins alive, gets further
+    writes: its remaining experts go through the direct path. Experts the
+    loader never writes (padding experts) stay uninitialized, as they would
+    on the device.
+    """
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.model_loader import base_loader
+
+    if getattr(RoutedExperts, "_tpu_expert_staging_patch", False):
+        return
+    stager = ExpertParamStager()
+    orig_weight_loader = RoutedExperts.weight_loader
+    orig_process = base_loader.process_weights_after_loading
+    calls = [0]
+
+    # wraps keeps the attributes model loaders read off the upstream
+    # loader, such as ``supports_moe_loading``.
+    @functools.wraps(orig_weight_loader)
+    def weight_loader(self,
+                      param,
+                      loaded_weight,
+                      weight_name,
+                      shard_id,
+                      expert_id,
+                      return_success=False):
+        # Experts of other ranks and parameters already written early take
+        # the direct path, which skips or writes them as before.
+        if (param.data.device.type != "tpu" or not stager.staging(param)
+                or self._map_global_expert_id_to_local_expert_id(expert_id)
+                == -1):
+            return orig_weight_loader(self,
+                                      param,
+                                      loaded_weight,
+                                      weight_name,
+                                      shard_id,
+                                      expert_id,
+                                      return_success=return_success)
+        result = orig_weight_loader(self,
+                                    stager.host_param(param),
+                                    loaded_weight,
+                                    weight_name,
+                                    shard_id,
+                                    expert_id,
+                                    return_success=return_success)
+        if result is not False:
+            stager.written(param, expert_id, shard_id)
+        calls[0] += 1
+        if calls[0] % 1000 == 0:
+            logger.debug(
+                "Expert writes: %d, parameters staged: %d, rss=%.1f "
+                "GiB", calls[0], len(stager), _rss_gib())
+        return result
+
+    def process_weights_after_loading(model, model_config, target_device):
+        during_load = stager.flushed
+        stager.flush_all()
+        logger.info(
+            "Expert parameters written to the device: %d as their last "
+            "expert landed, %d at the end of loading.", during_load,
+            stager.flushed - during_load)
+        return orig_process(model, model_config, target_device)
+
+    RoutedExperts.weight_loader = weight_loader
+    RoutedExperts._tpu_expert_staging_patch = True
+    base_loader.process_weights_after_loading = process_weights_after_loading
+    logger.info("Applied TPU patch: expert parameters are staged on the host "
+                "and written to the device once each.")

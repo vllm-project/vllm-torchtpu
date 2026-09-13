@@ -132,6 +132,7 @@ docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e UV_NO_CACHE="1" \
+  ${EVAL_SOFT_FAIL:+-e EVAL_SOFT_FAIL="${EVAL_SOFT_FAIL}"} \
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"} \
   ${P4D2_BIND_HOST:+-e P4D2_BIND_HOST="${P4D2_BIND_HOST}"} \
   ${PROXY_PORT:+-e PROXY_PORT="${PROXY_PORT}"} \

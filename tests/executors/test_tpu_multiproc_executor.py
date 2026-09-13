@@ -25,13 +25,18 @@ from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
 _SPECS = [{"layer": MagicMock()}]
 
 
-def _make_executor(engine_override, worker_overrides):
+def _make_executor(engine_override,
+                   worker_overrides,
+                   pipeline_parallel_size=1):
     """Build an executor without running __init__, with a mocked engine
     cache_config and a collective_rpc that returns the per-worker overrides."""
     executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
     executor.vllm_config = MagicMock()
     executor.vllm_config.cache_config = MagicMock(spec=CacheConfig)
     executor.vllm_config.cache_config.num_gpu_blocks_override = engine_override
+    executor.vllm_config.parallel_config.world_size = len(worker_overrides)
+    executor.vllm_config.parallel_config.pipeline_parallel_size = (
+        pipeline_parallel_size)
     executor.collective_rpc = MagicMock(return_value=worker_overrides)
     return executor
 
@@ -123,6 +128,56 @@ def test_no_override_when_workers_return_none(mock_super):
     assert executor.vllm_config.cache_config.num_gpu_blocks_override is None
 
 
+@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_pipeline_stages_may_disagree_and_the_smallest_stage_wins(mock_super):
+    """Each pipeline stage holds different layers, so its workers measure a
+    different count; vLLM sizes every stage's pool to the minimum."""
+    executor = _make_executor(engine_override=None,
+                              worker_overrides=[100, 100, 100, 100] +
+                              [80, 80, 80, 80],
+                              pipeline_parallel_size=2)
+
+    specs = executor.get_kv_cache_specs()
+
+    assert specs is _SPECS
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 80
+
+
+@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_workers_within_a_pipeline_stage_must_still_agree(mock_super):
+    executor = _make_executor(engine_override=None,
+                              worker_overrides=[100, 100, 100, 150] +
+                              [80, 80, 80, 80],
+                              pipeline_parallel_size=2)
+
+    with pytest.raises(ValueError, match="workers disagree"):
+        executor.get_kv_cache_specs()
+
+
+@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_pipeline_stage_without_an_override_is_rejected(mock_super):
+    """vLLM applies the override to every stage, so a stage that set none
+    (no attention or no mamba layers in it) has no measured capacity for
+    the value the others computed."""
+    executor = _make_executor(engine_override=None,
+                              worker_overrides=[None, None] + [80, 81],
+                              pipeline_parallel_size=2)
+
+    with pytest.raises(ValueError, match=r"stage\(s\) \[0\] set no"):
+        executor.get_kv_cache_specs()
+
+
+@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_pipeline_stages_without_any_override_leave_it_unset(mock_super):
+    executor = _make_executor(engine_override=None,
+                              worker_overrides=[None, None, None, None],
+                              pipeline_parallel_size=2)
+
+    executor.get_kv_cache_specs()
+
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override is None
+
+
 def _make_ray_executor(engine_override, worker_overrides):
     """Same shape as _make_executor but for the Ray multi-host executor."""
     from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
@@ -131,6 +186,8 @@ def _make_ray_executor(engine_override, worker_overrides):
     executor.vllm_config = MagicMock()
     executor.vllm_config.cache_config = MagicMock(spec=CacheConfig)
     executor.vllm_config.cache_config.num_gpu_blocks_override = engine_override
+    executor.vllm_config.parallel_config.world_size = len(worker_overrides)
+    executor.vllm_config.parallel_config.pipeline_parallel_size = 1
     executor.collective_rpc = MagicMock(return_value=worker_overrides)
     return executor
 

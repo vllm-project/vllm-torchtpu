@@ -18,6 +18,7 @@ from typing import Any
 from vllm_torchtpu import envs as tpu_envs
 
 from .pool_manifest import TAG_FA, TAG_MLA_NOPE, PoolManifest
+from .tags import class_tag
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
@@ -48,7 +49,7 @@ def fa_page_tokens(manifest: PoolManifest) -> int:
         raise TypeError("manifest must be a PoolManifest")
     page_tokens: set[int] = set()
     for pool in manifest.pools:
-        if pool.tag != TAG_FA:
+        if class_tag(pool.tag) != TAG_FA:
             continue
         if len(pool.regions) != 1:
             raise ValueError(
@@ -85,7 +86,9 @@ def measured_fa_layout_fingerprint(
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
-    fa_pools = [pool for pool in manifest.pools if pool.tag == TAG_FA]
+    fa_pools = [
+        pool for pool in manifest.pools if class_tag(pool.tag) == TAG_FA
+    ]
     if not fa_pools:
         raise ValueError("layout fingerprint requires an admitted FA pool")
     fa_pool = fa_pools[0]
@@ -177,15 +180,19 @@ def measured_glm_layout_fingerprint(
     getter = layout_getter or _default_layout_getter
     version = package_version or importlib.metadata.version
 
+    # Keyed by class tag: per-layer tags describe the same physical layout
+    # per class, and a producer holding a layer subset must fingerprint
+    # identically to the destination holding every layer.
     per_tag: dict[str, Any] = {}
     shape_by_tag: dict[str, tuple[int, ...]] = {}
     for pool in manifest.pools:
+        tag = class_tag(pool.tag)
         tensor = manifest.storages[pool.storage_index]
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
         if len(shape) != 4:
             raise RuntimeError(
                 f"admitted {pool.tag} storage must be rank-4: shape={shape}")
-        known = shape_by_tag.setdefault(pool.tag, shape)
+        known = shape_by_tag.setdefault(tag, shape)
         if known != shape:
             raise RuntimeError(
                 f"admitted {pool.tag} storages disagree on shape: "
@@ -201,7 +208,7 @@ def measured_glm_layout_fingerprint(
         # the dtype is authoritative.
         element_bits = 8 * int(tensor.element_size())
         _, rows, packing, width = shape
-        page_rows_tokens = rows if pool.tag == TAG_MLA_NOPE else rows * packing
+        page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
         if page_rows_tokens != page_tokens:
             raise RuntimeError(
                 f"{pool.tag} page geometry {rows}x{packing} does not match "
@@ -217,7 +224,7 @@ def measured_glm_layout_fingerprint(
                 f"(({packing},128),({packing},1)): tag={pool.tag}, "
                 f"layer={pool.layer_name}, tiles={tiles}")
         per_tag.setdefault(
-            pool.tag, {
+            tag, {
                 "page_shape": [rows, packing, width],
                 "row_bytes": packing * width * element_bits // 8,
                 "minor_to_major": list(minor_to_major),

@@ -66,6 +66,18 @@ per-task `--gen_kwargs`, which is a merging action in lm-eval). A generation
 cap goes in the latter as `max_gen_toks`: the `--model_args` value is only a
 fallback for tasks whose yaml omits the key, and `mmlu_pro` sets 2048 itself.
 
+`LM_EVAL_GEN_KWARGS` takes either form lm-eval accepts, but not a mix: a value
+containing `{` must be valid JSON with double quotes (`{"chat_template_kwargs":
+{"thinking": false}}`), since lm-eval raises rather than falling back to its
+`key=value` parser once it sees a brace. Otherwise use `key=value`
+(`until=['<|im_end|>']`).
+
+Suppressing reasoning is per-template, not universal. The harness default sends
+`chat_template_kwargs: {"enable_thinking": false}`; a template keyed on a
+different flag ignores it silently and the model reasons anyway — Kimi-K2.6
+wants `thinking`. Check the checkpoint's `chat_template.jinja` before assuming
+the default lands.
+
 ## What It Does
 
 1. Loads a config (model, TP, ISL/OSL sweep, concurrency levels)
@@ -110,4 +122,5 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 |----------|---------|-------------|
 | `PORT` | `8000` | Server port |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
+| `EVAL_SOFT_FAIL` | `0` | `1` downgrades an eval regression to a `::warning` instead of failing the step. Perf regressions still fail. For a config whose eval baseline is new and whose run-to-run spread is not yet known — prefer it to `soft_fail` on the Buildkite step, which would mask the perf gate too. Forwarded into the container by `run_in_docker.sh` |
 | `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |

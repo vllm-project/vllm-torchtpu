@@ -91,3 +91,10 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --e
 # Greedy decoding for bench requests.
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
+# MMLU-Pro extracts an answer letter from a complete chat response. K3's
+# template closes assistant messages, so continuation-based tasks do not fit.
+LM_EVAL_TASKS="mmlu_pro"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=16"
+# K3's tokenizer uses `thinking`; its default enables reasoning.
+LM_EVAL_GEN_KWARGS='{"chat_template_kwargs":{"thinking":false}}'

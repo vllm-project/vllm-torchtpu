@@ -114,6 +114,11 @@ def _make_runner(*,
     runner._cached_request_distribution = None
     runner._dp_target_bucket = None
     runner._has_mamba_state = False
+    # One pipeline stage: the runner embeds its own inputs.
+    runner._pp_is_first = True
+    runner._pp_is_last = True
+    # The stub runs no attention kernel: nothing to bound.
+    runner._check_attention_schedule = lambda *args: None
     # Spec-decode mamba rollback is inactive in these PCP layout tests; the
     # runner leaves the read-offset buffer unset (None) unless speculative
     # decoding is enabled, so _prepare_inputs / dummy_run skip the windowed
@@ -254,7 +259,8 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
     runner.maybe_select_dummy_loras = (
         lambda *_args, **_kwargs: contextlib.nullcontext())
     runner.forward_model = MagicMock(
-        side_effect=lambda input_ids, positions, inputs_embeds: (torch.zeros(
+        side_effect=lambda input_ids, positions, inputs_embeds,
+        intermediate_tensors=None: (torch.zeros(
             (positions.shape[-1], 4), dtype=torch.float32), None))
 
     TPUModelRunner._dummy_run(

@@ -236,7 +236,7 @@ class TestTpuPlatform:
             unified_kv_layout_enabled
         monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
         pooled_arch = "Qwen3_5ForConditionalGeneration"
-        unpooled_arch = "KimiLinearForCausalLM"
+        unpooled_arch = "BambaForCausalLM"
         vllm_config.model_config.is_hybrid = True
         vllm_config.kv_transfer_config = None
 

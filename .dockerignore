@@ -31,4 +31,20 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+# Git repository
 .git
+
+# Test caches & coverage
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Non-runtime files excluded from container images (Fixes #820)
+docs/
+.buildkite/
+.github/
+mkdocs.yml
+.readthedocs.yaml
+.pre-commit-config.yaml
+.coveragerc

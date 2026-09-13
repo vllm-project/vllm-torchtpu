@@ -485,3 +485,71 @@ def test_non_spec_crossing_keeps_the_state_block_source():
     _collect(fake, _sched({"a": 1}))
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(7, 8)]
     assert int(fake.mamba_slot_read_offsets[8]) == 3
+
+
+# --- copy-plan pool split derivation -----------------------------------------
+
+
+def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes):
+    """Run `_build_mamba_copy_plan` on a minimal config; return the split."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    spec = MambaSpec(
+        shapes=((3, 4), (2, 2)),
+        dtypes=(torch.bfloat16, torch.float32),
+        block_size=manager_tokens,
+        page_size_padded=page_bytes,
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_tensors=[SimpleNamespace(shared_by=["model.layers.0.lin"])],
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=spec,
+                            layer_names=["model.layers.0.lin"])
+        ],
+    )
+    raw = torch.zeros(raw_shape, dtype=raw_dtype)
+    fake = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        _mamba_copy_plan=None,
+        _mamba_state_block_size=None,
+        _pool_block_split=1,
+    )
+    TPUModelRunner._build_mamba_copy_plan(fake, kv_cache_config, [raw])
+    return fake._pool_block_split
+
+
+def test_copy_plan_split_is_one_for_token_packed_mla_pool():
+    # MLA pool: a 214-token manager block is one pool block of 107 packed
+    # rows (2 tokens each) x 2560 B; a row count of 107 must not read as a
+    # 214 // 107 = 2 split.
+    split = _copy_plan_split((8, 107, 2, 640),
+                             torch.bfloat16,
+                             manager_tokens=214,
+                             page_bytes=107 * 2 * 640 * 2)
+    assert split == 1
+
+
+def test_copy_plan_split_from_kernel_granular_rpa_pool():
+    # RPA pool born at kernel granularity: a 256-token manager block spans
+    # four 64-token kernel blocks.
+    manager_page = 256 * 1024
+    kernel_page = 64 * 1024
+    raw_numel_per_block = kernel_page // 2  # bf16
+    split = _copy_plan_split((16, 64, raw_numel_per_block // 64),
+                             torch.bfloat16,
+                             manager_tokens=256,
+                             page_bytes=manager_page)
+    assert split == 4
+
+
+def test_copy_plan_split_for_seq_on_lane_pool():
+    # SEQ_ALONG_LANE / HND pool: the token axis is LAST — (blocks, kv_heads*2,
+    # head_dim/packing, packing, tokens). The bytes-based split does not care
+    # which axis holds tokens: a 256-token manager block spans two 128-token
+    # kernel blocks either way.
+    kernel_block_bytes = 2 * 64 * 2 * 128 * 2  # (kv2, hd/2, packing, 128 tok)
+    split = _copy_plan_split((16, 2, 64, 2, 128),
+                             torch.bfloat16,
+                             manager_tokens=256,
+                             page_bytes=2 * kernel_block_bytes)
+    assert split == 2

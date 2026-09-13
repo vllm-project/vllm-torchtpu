@@ -51,6 +51,32 @@ def get_fused_moe_activation(activation, moe_config) -> str:
     return f"situ:{beta}:{'none' if linear_beta is None else linear_beta}"
 
 
+class TpuMoEActivationMixin:
+    """Holds the Pallas GMM kernel's activation string for one MoE layer.
+
+    Written by process_weights_after_loading, read by apply_monolithic.
+    vLLM builds one quant method per MoE layer, so the method is the right
+    owner. Defines no __init__, so it does not disturb the upstream
+    __init__s these methods deliberately bypass; mix it in ahead of the
+    upstream class.
+    """
+
+    _tpu_activation_str: str | None = None
+
+    def _resolve_tpu_activation(self, layer) -> str:
+        """Encode this layer's activation for the kernel.
+
+        Overridden where a method needs a different encoding -- the string
+        is not uniformly recomputable from layer.activation.
+        """
+        return get_fused_moe_activation(layer.activation, layer.moe_config)
+
+    def _set_tpu_activation(self, layer) -> str:
+        """Resolve and store; returns it, since callers also use it locally."""
+        self._tpu_activation_str = self._resolve_tpu_activation(layer)
+        return self._tpu_activation_str
+
+
 def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     """One-time load transform: packed uint8 ``[..., N, K//2]`` -> native
     fp4 ``torch.float4_e2m1fn_x2`` ``[..., K, N]`` (K-major).

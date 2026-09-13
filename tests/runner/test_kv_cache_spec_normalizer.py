@@ -285,6 +285,48 @@ def test_hybrid_specs_pad_attention_when_mamba_is_larger() -> None:
     assert normalized["mamba"].page_size_padded == 1000000
 
 
+def test_hybrid_specs_mamba_page_uses_pooled_physical_dtypes() -> None:
+    # K3 TP32 regression: the KDA layer declares its conv state fp32 (the
+    # fused kernel wants fp32 dense caches), but the unified pool stores the
+    # conv region in bf16. Sizing the mamba page from the declared dtypes
+    # (196608 + 13824 = 210432 B) outgrows the pool's attention-shaped page
+    # (207360 B) and fails the materializer's page invariant; the pool
+    # physical dtypes keep it at 203520 B so the platform-padded 207360 B
+    # holds.
+    attention_spec = MLAAttentionSpec(
+        block_size=162,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        page_size_padded=PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            162, 1, 576, torch.bfloat16),
+    )
+    assert attention_spec.page_size_bytes == 207360
+    mamba_spec = MambaSpec(
+        block_size=32768,
+        shapes=[(3, 3, 3, 128), (3, 128, 128)],
+        dtypes=[torch.float32, torch.float32],
+        page_size_padded=207360,
+    )
+
+    normalized = normalize_kv_cache_specs_for_tpu(
+        {
+            "attn": attention_spec,
+            "mamba": mamba_spec,
+        },
+        torch.bfloat16,
+        enable_unified_kv_layout=True,
+        attention_backend=PallasAttentionBackend,
+    )
+
+    assert normalized["mamba"].page_size_bytes == 207360
+    assert normalized["mamba"].page_size_bytes == normalized[
+        "attn"].page_size_bytes
+    # The retyped spec describes the pool's physical layout: bf16 conv, fp32
+    # ssm.
+    assert tuple(normalized["mamba"].dtypes) == (torch.bfloat16, torch.float32)
+
+
 def test_exempt_layers_pass_through_untouched_under_unified_layout() -> None:
     # DeepSeek-V4 custom packed specs where page_size_padded < real_page_size_bytes.
     # If spec.page_size_bytes is called on such an AttentionSpec, it asserts:

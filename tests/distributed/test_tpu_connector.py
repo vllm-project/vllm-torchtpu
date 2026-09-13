@@ -109,7 +109,8 @@ def _make_vllm_config(*,
                       dp_size: int = 1,
                       tp_size: int = 1,
                       pcp_size: int = 1,
-                      interleave_size: int = 1):
+                      interleave_size: int = 1,
+                      pp_size: int = 1):
     cfg = MagicMock()
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.kv_transfer_config.kv_connector_extra_config = {}
@@ -128,6 +129,7 @@ def _make_vllm_config(*,
     cfg.parallel_config.tensor_parallel_size = tp_size
     cfg.parallel_config.prefill_context_parallel_size = pcp_size
     cfg.parallel_config.cp_kv_cache_interleave_size = interleave_size
+    cfg.parallel_config.pipeline_parallel_size = pp_size
     return cfg
 
 
@@ -204,6 +206,7 @@ def _make_raiden_worker(*,
                         pcp_size: int = 1,
                         interleave_size: int = 1,
                         block_size: int = 16,
+                        pp_size: int = 1,
                         kv_ips: Any = "127.0.0.1",
                         kv_ports: Any = 9100) -> TPURaidenConnectorWorker:
     cfg = _make_vllm_config(is_producer=is_producer,
@@ -212,7 +215,8 @@ def _make_raiden_worker(*,
                             dp_size=dp_size,
                             tp_size=tp_size,
                             pcp_size=pcp_size,
-                            interleave_size=interleave_size)
+                            interleave_size=interleave_size,
+                            pp_size=pp_size)
     with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank), \
          patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size), \
          patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
@@ -1471,8 +1475,10 @@ class _FakeAdmissionRaidenEngine:
         self.transfer_address = transfer_address
         self.listener_address = listener_address
 
-    def register_pools(self, pools):
+    def register_pools(self, pools, **kwargs):
         self.registered_pools = list(pools)
+        # Bounded host staging kwargs (RESHARD_BOUNDED_STAGING_DESIGN.md).
+        self.register_pools_kwargs = dict(kwargs)
         storage_indices = {
             pool["storage_index"]
             for pool in self.registered_pools
@@ -1481,6 +1487,10 @@ class _FakeAdmissionRaidenEngine:
             "admitted": True,
             "pools": len(self.registered_pools),
             "storages": len(storage_indices),
+            "host_staging": {
+                "mode": "bounded" if kwargs.get("staging_leases") else "full",
+                "leases": kwargs.get("staging_leases", 0),
+            },
         }
 
 
@@ -1734,6 +1744,21 @@ class TestTPURaidenConnectorWorker:
             construct_call = worker._construct_raiden_transfer_engine.call_args
             wrapped_storages = construct_call.args[0]
             assert construct_call.kwargs == {"num_slots": 1}
+            # Bounded host staging: the connector passes the lease count and
+            # one hint per pool: the distinct blocks one transfer touches on
+            # the pool's storage. Every typed cache is its own storage here,
+            # so FA pools report pages per max-length request and GDN state
+            # pools report their single block.
+            staging_kwargs = engine.register_pools_kwargs
+            assert staging_kwargs["staging_leases"] == 8
+            hints = staging_kwargs["staging_blocks_per_pool"]
+            assert len(hints) == len(engine.registered_pools)
+            for pool_dict, hint in zip(engine.registered_pools, hints):
+                tag = str(pool_dict["tag"])
+                if tag.startswith("fa"):
+                    assert hint == worker._max_request_blocks()
+                else:
+                    assert hint == 1, (tag, hint)
             typed_storages = set()
             for cache in named.values():
                 tensors = cache if isinstance(cache, tuple) else (cache, )
@@ -1811,6 +1836,15 @@ class TestTPURaidenConnectorWorker:
         assert len(engine.registered_pools) == 105
         assert len({pool["storage_index"]
                     for pool in engine.registered_pools}) == 15
+        # Every raw storage hosts one FA layer plus one layer of each of the
+        # three GDN groups (conv + ssm). Raiden sizes a storage's staging
+        # arena from max(hint) over its pools, so each pool reports the
+        # storage-wide union: FA pages plus one block per GDN group.
+        staging_kwargs = engine.register_pools_kwargs
+        assert staging_kwargs["staging_leases"] == 8
+        hints = staging_kwargs["staging_blocks_per_pool"]
+        assert len(hints) == 105
+        assert set(hints) == {worker._max_request_blocks() + 3}
         summary = worker.raiden_admission_summary()
         assert summary["binding"] == "aliased_raw"
         assert summary["pools"] == 105
@@ -1829,6 +1863,43 @@ class TestTPURaidenConnectorWorker:
                          if pool["tag"] == "gdn.conv")
         assert [region["units_per_stride"]
                 for region in conv_pool["regions"]] == [2, 2, 4]
+
+    def test_raiden_staging_hints_cover_every_block_table_on_a_storage(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+        fa_pages = worker._max_request_blocks()
+        groups = (
+            SimpleNamespace(layer_names=("fa.0", "fa.1")),
+            SimpleNamespace(layer_names=("gdn.0", )),
+            SimpleNamespace(layer_names=("gdn.1", )),
+            SimpleNamespace(layer_names=("gdn.2", )),
+        )
+
+        def pool(tag, layer_name, storage_index):
+            return SimpleNamespace(tag=tag,
+                                   layer_name=layer_name,
+                                   storage_index=storage_index)
+
+        manifest = SimpleNamespace(pools=[
+            # Storage 0: FA pages plus one block per GDN group; a group's
+            # conv and ssm pools share that block.
+            pool("fa", "fa.0", 0),
+            pool("gdn.conv.g0", "gdn.0", 0),
+            pool("gdn.ssm.g0", "gdn.0", 0),
+            pool("gdn.conv.g1", "gdn.1", 0),
+            pool("gdn.ssm.g1", "gdn.1", 0),
+            pool("gdn.conv.g2", "gdn.2", 0),
+            pool("gdn.ssm.g2", "gdn.2", 0),
+            # Storage 1: only full attention.
+            pool("fa", "fa.1", 1),
+            # Storage 2: an unknown pool kind keeps the whole storage on the
+            # full host mirror.
+            pool("fa", "fa.1", 2),
+            pool("opaque", "fa.1", 2),
+        ])
+
+        hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+
+        assert hints == [fa_pages + 3] * 7 + [fa_pages] + [0, 0]
 
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
@@ -1951,6 +2022,13 @@ class TestTPURaidenConnectorWorker:
         assert [field["job_replica_id"] for field in fields
                 ] == [f"engine0-rank{rank}" for rank in range(8)]
         assert len({tuple(field.items()) for field in fields}) == 8
+        stage = stage3_fa_raiden_id_fields(job_name="decode",
+                                           engine_id="engine1",
+                                           dp_rank=0,
+                                           transfer_rank=3,
+                                           is_producer=False,
+                                           per_rank_unit=True)
+        assert stage["job_replica_id"] == "engine1-rank3"
 
     def test_stage3_registration_requires_explicit_controller_address(self):
         worker = _make_raiden_worker(tp_rank=0,
@@ -2983,6 +3061,9 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_source_req_ids == {}
         assert worker._stage3_destination_req_ids == {}
+        assert worker._stage3_submitted_loads == {}
+        assert worker._stage3_submitted_load_tokens == {}
+        assert worker._stage3_load_start_times == {}
 
         assert len(facade.start_transfer_calls) == 1
         call = facade.start_transfer_calls[0]
@@ -3201,6 +3282,7 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_transfer_engine = engine
         worker._stage3_submitted_loads["aborted-load-decode"] = 911
         worker._stage3_submitted_load_tokens["aborted-load-decode"] = 1536
+        worker._stage3_load_start_times["aborted-load-decode"] = 100.0
         worker._bind_stage3_request_ids("aborted-load-decode",
                                         "aborted-load-prefill")
         worker._stage3_controller_accepted.add("aborted-load-decode")
@@ -3217,6 +3299,9 @@ class TestTPURaidenConnectorWorker:
                                                                     set())
             assert worker._stage3_submitted_loads == {
                 "aborted-load-decode": 911
+            }
+            assert worker._stage3_load_start_times == {
+                "aborted-load-decode": 100.0
             }
             assert worker._stage3_controller_accepted == {
                 "aborted-load-decode"
@@ -3240,6 +3325,7 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_submitted_loads == {}
         assert worker._stage3_submitted_load_tokens == {}
+        assert worker._stage3_load_start_times == {}
         assert worker._stage3_controller_accepted == set()
         assert worker._load_block_ids == {}
         assert worker._stage3_finished_loads_pending_cleanup == set()
@@ -4148,3 +4234,183 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
     with pytest.raises(ValueError, match=message):
         worker._raiden_glm_admission_topology()
+
+
+class TestPipelineParallelProducer:
+    """Pipeline-parallel prefill (PP x TP1) as a Stage-3 source: each stage
+    transfers every token of its own layers and pools pair up by layer."""
+
+    @staticmethod
+    def _stage_manifest():
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
+            PoolEntry, PoolManifest, RegionSpec)
+
+        def pool(tag, layer):
+            return PoolEntry(tag=tag,
+                             layer_name=f"model.layers.{layer}.x",
+                             storage_index=0,
+                             base_offset_bytes=0,
+                             block_stride_bytes=1024,
+                             num_blocks=4,
+                             regions=(RegionSpec("live", 0, 1024, 1024, 1), ),
+                             dtype_tag="uint8")
+
+        # Stage holding layers 0..4: one FA layer (3), four GDN layers.
+        return PoolManifest(binding="private_typed",
+                            storages=[object()],
+                            pools=[
+                                pool("gdn.conv.g0.l0", 0),
+                                pool("gdn.ssm.g0.l0", 0),
+                                pool("gdn.conv.g0.l1", 1),
+                                pool("gdn.ssm.g0.l1", 1),
+                                pool("fa.l3", 3),
+                                pool("gdn.conv.g0.l4", 4),
+                                pool("gdn.ssm.g0.l4", 4),
+                            ])
+
+    def test_topology_names_the_stage_count(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+        assert worker._raiden_qwen35_admission_topology() == "pp8_prefill"
+        consumer = _make_raiden_worker(tp_rank=0,
+                                       tp_size=1,
+                                       is_producer=False,
+                                       dp_size=8)
+        assert consumer._raiden_qwen35_admission_topology() == "dp8_decode"
+
+    def test_transfer_rank_is_the_stage_and_spans_are_contiguous(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=4)
+        group = SimpleNamespace(rank_in_group=2)
+        with patch("vllm.distributed.parallel_state.get_pp_group",
+                   return_value=group):
+            assert worker._local_raiden_transfer_rank() == 2
+        # A stage owns every token: no PCP interleave applies.
+        assert worker._raiden_interleave_tokens(4096, 4) == 4096
+
+    def test_parallelism_must_be_the_stage_count_with_per_layer_tags(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=4)
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER",
+                   True,
+                   create=True):
+            worker._validate_stage3_transfer_parallelism(4)
+            with pytest.raises(ValueError, match="PP stage count"):
+                worker._validate_stage3_transfer_parallelism(8)
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER",
+                   False,
+                   create=True), pytest.raises(
+                       ValueError, match="TPU_RAIDEN_POOL_TAGS_PER_LAYER"):
+            worker._validate_stage3_transfer_parallelism(4)
+
+    def test_registration_tags_follow_the_stage_manifest(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+        worker._raiden_manifest = self._stage_manifest()
+        worker._stage3_state_group_count = 1
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER",
+                   True,
+                   create=True):
+            assert worker._stage3_fa_registration_tags() == ["fa.l3"]
+            assert worker._stage3_state_registration_tags() == [
+                ("gdn.conv.g0.l0", 0),
+                ("gdn.conv.g0.l1", 0),
+                ("gdn.conv.g0.l4", 0),
+                ("gdn.ssm.g0.l0", 0),
+                ("gdn.ssm.g0.l1", 0),
+                ("gdn.ssm.g0.l4", 0),
+            ]
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER",
+                   False,
+                   create=True):
+            assert worker._stage3_fa_registration_tags() == ["fa"]
+            assert worker._stage3_state_registration_tags() == [
+                ("gdn.conv.g0", 0),
+                ("gdn.ssm.g0", 0),
+            ]
+
+    def test_scheduler_expects_one_report_per_stage(self):
+        cfg = _make_vllm_config(is_producer=True, pp_size=8)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            scheduler = TPURaidenConnectorScheduler(cfg)
+            assert scheduler.get_finished_count() == 8
+
+
+class TestPipelineParallelConsumer:
+    """Pipeline-parallel decode (PP x TP1) as a Stage-3 destination."""
+
+    def test_topology_and_transfer_rank(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=False,
+                                     pp_size=8)
+        assert worker._raiden_qwen35_admission_topology() == "pp8_decode"
+        group = SimpleNamespace(rank_in_group=5)
+        with patch("vllm.distributed.parallel_state.get_pp_group",
+                   return_value=group):
+            assert worker._local_raiden_transfer_rank() == 5
+
+    def test_stage_names_every_prefill_stage_as_source(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=False,
+                                     pp_size=8)
+        meta = SimpleNamespace(src_parallelism=8,
+                               src_job_name="prefill",
+                               src_engine_id="p",
+                               src_data_replica_idx=0)
+        group = SimpleNamespace(rank_in_group=3)
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   8,
+                   create=True), patch(
+                       "vllm.distributed.parallel_state.get_pp_group",
+                       return_value=group):
+            units = worker._stage3_source_work_units(meta)
+        assert [unit.job_replica_id
+                for unit in units] == [f"p-rank{rank}" for rank in range(8)]
+
+    def test_each_stage_is_its_own_endpoint_and_unit(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=False,
+                                     pp_size=8)
+        group = SimpleNamespace(rank_in_group=5)
+        with patch.object(worker, "_raiden_stage3_enabled",
+                          return_value=True), patch(
+                              "vllm.distributed.parallel_state.get_pp_group",
+                              return_value=group):
+            assert worker._raiden_endpoint_identity() == (5, 5)
+            fields = worker._raiden_work_unit_fields(5)
+        assert fields["job_replica_id"].endswith("-rank5")
+        assert fields["data_replica_idx"] == worker.dp_rank
+
+    def test_non_pipelined_consumer_is_one_endpoint_per_engine(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=False,
+                                     pp_size=1)
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            assert worker._raiden_endpoint_identity() == (0, worker.dp_rank)
+            fields = worker._raiden_work_unit_fields(0)
+        assert "-rank" not in fields["job_replica_id"]
+
+    def test_stage_count_mismatch_is_rejected(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=False,
+                                     pp_size=4)
+        meta = SimpleNamespace(src_parallelism=8,
+                               src_job_name="prefill",
+                               src_engine_id="p",
+                               src_data_replica_idx=0)
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   8,
+                   create=True), pytest.raises(ValueError,
+                                               match="same stage count"):
+            worker._stage3_source_work_units(meta)
+
+    def test_scheduler_expects_one_report_per_decode_stage(self):
+        cfg = _make_vllm_config(is_producer=False, pp_size=8)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            scheduler = TPURaidenConnectorScheduler(cfg)
+            assert scheduler.get_finished_count() == 8

@@ -102,6 +102,26 @@ def _tpu_attention_page_size_bytes(vllm_config: VllmConfig,
     return _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
 
 
+def _pool_row_tokens(vllm_config: VllmConfig, backend_cls) -> int:
+    """Tokens per physical pool row (the pool's `shape[1]` unit).
+
+    GQA/RPA pools keep tokens on their own axis, so a row is one token. The
+    MLA v2 cache packs the token axis by the KV dtype packing (bf16: 2,
+    fp8: 4), so a pool row holds that many tokens and a 1-token page already
+    occupies a whole row. Detected by probing page linearity: with packing p
+    the page stays flat until p tokens and doubles by 2p.
+    """
+    p = 1
+    while (_tpu_attention_slot_size_bytes(vllm_config, backend_cls, 2 * p)
+           != 2 * _tpu_attention_slot_size_bytes(vllm_config, backend_cls, p)):
+        p *= 2
+        if p > 128:
+            raise ValueError(
+                "TPU FA page is not token-linear: page size does not settle "
+                "into a linear regime within 256 tokens")
+    return p
+
+
 def _hybrid_mamba_state_layout(
     vllm_config: VllmConfig,
     fa_physical_bytes_per_token: int,
@@ -201,15 +221,22 @@ def _derive_tpu_block_slot_config(
     input_block_size: int,
 ) -> dict[str, int | str | Sequence[object] | None]:
     supported = backend_cls.get_supported_kernel_block_sizes()
-    fa_physical_bytes_per_token = _tpu_attention_page_size_bytes(
+    # The pool row (the pool tensor's shape[1] unit) is the quantum the GDN
+    # state regions are measured in. GQA/RPA pools hold one token per row;
+    # the MLA pool packs the token axis, holding `fa_pool_row_tokens` tokens
+    # per row, so the manager block must cover the state regions times that
+    # packing — and stay a multiple of it.
+    fa_pool_row_tokens = _pool_row_tokens(vllm_config, backend_cls)
+    fa_physical_bytes_per_pool_row = _tpu_attention_page_size_bytes(
         vllm_config, backend_cls)
     fa_raw_payload_bytes_per_token = (
         _tpu_attention_raw_payload_bytes_per_token(vllm_config))
-    fa_layout_padding_bytes_per_token = (fa_physical_bytes_per_token -
-                                         fa_raw_payload_bytes_per_token)
+    fa_layout_padding_bytes_per_pool_row = (
+        fa_physical_bytes_per_pool_row -
+        fa_pool_row_tokens * fa_raw_payload_bytes_per_token)
 
     mamba_layout = _hybrid_mamba_state_layout(vllm_config,
-                                              fa_physical_bytes_per_token)
+                                              fa_physical_bytes_per_pool_row)
     mamba_raw_state_bytes = (None if mamba_layout is None else
                              mamba_layout.conv_bytes + mamba_layout.ssm_bytes)
     mamba_required_state_bytes = (None if mamba_layout is None else
@@ -220,7 +247,8 @@ def _derive_tpu_block_slot_config(
     final_block_size = input_block_size
     block_size_source = "input_block_size"
     if mamba_layout is not None:
-        mamba_fit_block_size = mamba_layout.required_tokens
+        mamba_fit_block_size = (mamba_layout.required_tokens *
+                                fa_pool_row_tokens)
         if vllm_config.cache_config.user_specified_block_size:
             user_block_size_floor = input_block_size
         block_size_floor = max(
@@ -229,6 +257,8 @@ def _derive_tpu_block_slot_config(
             backend_min_page_size,
         )
         final_block_size = _align_block_to_backend(block_size_floor, supported)
+        final_block_size = _round_up_to_multiple(final_block_size,
+                                                 fa_pool_row_tokens)
         if (user_block_size_floor is not None
                 and block_size_floor == user_block_size_floor):
             block_size_source = "user_block_size_floor"
@@ -246,13 +276,14 @@ def _derive_tpu_block_slot_config(
         _SLOT_ALIGNMENT_BYTES,
     )
     if mamba_layout is not None:
-        expected_fa_slot_bytes = (final_block_size *
-                                  fa_physical_bytes_per_token)
+        expected_fa_slot_bytes = ((final_block_size // fa_pool_row_tokens) *
+                                  fa_physical_bytes_per_pool_row)
         if fa_physical_slot_bytes != expected_fa_slot_bytes:
             raise ValueError("TPU unified hybrid FA page is not token-linear: "
                              f"block_size={final_block_size}, "
-                             f"fa_physical_bytes_per_token="
-                             f"{fa_physical_bytes_per_token}, "
+                             f"pool_row_tokens={fa_pool_row_tokens}, "
+                             f"fa_physical_bytes_per_pool_row="
+                             f"{fa_physical_bytes_per_pool_row}, "
                              f"expected_page_bytes={expected_fa_slot_bytes}, "
                              f"actual_page_bytes={fa_physical_slot_bytes}")
         if fa_physical_slot_bytes < mamba_layout.required_bytes:
@@ -264,8 +295,8 @@ def _derive_tpu_block_slot_config(
 
     fa_raw_payload_slot_bytes = (final_block_size *
                                  fa_raw_payload_bytes_per_token)
-    fa_layout_padding_slot_bytes = (final_block_size *
-                                    fa_layout_padding_bytes_per_token)
+    fa_layout_padding_slot_bytes = (final_block_slot_bytes -
+                                    fa_raw_payload_slot_bytes)
     mamba_slot_padding_bytes: int | None = None
     mamba_layout_padding_bytes: int | None = None
     mamba_slot_tail_padding_bytes: int | None = None
@@ -287,8 +318,10 @@ def _derive_tpu_block_slot_config(
         "mamba_raw_state_bytes": mamba_raw_state_bytes,
         "mamba_required_state_bytes": mamba_required_state_bytes,
         "fa_raw_payload_bytes_per_token": fa_raw_payload_bytes_per_token,
-        "fa_physical_bytes_per_token": fa_physical_bytes_per_token,
-        "fa_layout_padding_bytes_per_token": fa_layout_padding_bytes_per_token,
+        "fa_pool_row_tokens": fa_pool_row_tokens,
+        "fa_physical_bytes_per_pool_row": fa_physical_bytes_per_pool_row,
+        "fa_layout_padding_bytes_per_pool_row":
+        fa_layout_padding_bytes_per_pool_row,
         "mamba_fit_block_size": mamba_fit_block_size,
         "final_block_size": final_block_size,
         "fa_raw_payload_slot_bytes": fa_raw_payload_slot_bytes,
@@ -311,8 +344,8 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
         "TPU block_size derivation path: backend=%s -> "
         "backend_supported_kernel_block_sizes=%s -> input_block_size=%s -> "
         "mamba_raw_state_bytes=%s -> mamba_required_state_bytes=%s -> "
-        "fa_bytes_per_token(raw_payload=%s + layout_padding=%s -> "
-        "physical=%s) -> mamba_fit_block_size=%s -> "
+        "fa_pool_row(tokens=%s, raw_payload_per_token=%s + "
+        "layout_padding=%s -> physical_bytes=%s) -> mamba_fit_block_size=%s -> "
         "user_block_size_floor=%s -> backend_min_page_size=%s -> "
         "final_block_size=%s (source=%s).",
         derivation["backend"],
@@ -320,9 +353,10 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
         derivation["input_block_size"],
         _optional_log_value(derivation["mamba_raw_state_bytes"]),
         _optional_log_value(derivation["mamba_required_state_bytes"]),
+        derivation["fa_pool_row_tokens"],
         derivation["fa_raw_payload_bytes_per_token"],
-        derivation["fa_layout_padding_bytes_per_token"],
-        derivation["fa_physical_bytes_per_token"],
+        derivation["fa_layout_padding_bytes_per_pool_row"],
+        derivation["fa_physical_bytes_per_pool_row"],
         _optional_log_value(derivation["mamba_fit_block_size"]),
         _optional_log_value(derivation["user_block_size_floor"]),
         derivation["backend_min_page_size"],

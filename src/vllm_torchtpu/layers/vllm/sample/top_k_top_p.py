@@ -14,7 +14,7 @@
 """Binary search over float32 bits.
 
 Includes fast algorithms for top-k masking and top-p masking on probability
-distributions. Torch port of tpu-inference's `layers/common/binary_search.py`.
+distributions.
 """
 
 from typing import Callable, Sequence
