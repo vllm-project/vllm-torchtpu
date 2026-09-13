@@ -55,3 +55,6 @@ class LoadMeta:
 class TPUConnectorMetadata(KVConnectorMetadata):
     reqs_to_send: dict[ReqId, SendMeta] = field(default_factory=dict)
     reqs_to_load: dict[ReqId, LoadMeta] = field(default_factory=dict)
+    # Producer request id -> transfer uuid whose ahead-of-finish request-block
+    # registration every pipeline stage retires.
+    reqs_to_release: dict[ReqId, int] = field(default_factory=dict)

@@ -409,9 +409,10 @@ class _Stage3PendingSubmit:
     """One consumer load parked because the producer's request-block
     registrations were not yet visible at the source controller.
 
-    The registration travels out-of-band and structurally lags the producer's
-    finish response by at least one producer scheduler step, so a consumer
-    query can legitimately arrive first. Instead of spinning the worker step
+    The registration travels out-of-band and reaches the producer workers
+    no later than the scheduler step after the finish response (a pipeline
+    producer registers in the prompt-completing step), so a consumer query
+    can legitimately arrive first. Instead of spinning the worker step
     in an inline poll, the request is re-attempted once per scheduler step
     from get_finished() until defer_deadline.
     """
@@ -474,6 +475,10 @@ class _Stage3RegisteredSend:
     local_block_ids: tuple[int, ...]
     num_tokens: int
     expiration_time: float
+    # Registered ahead of the scheduler's finish: expiration_time is
+    # infinite and the status probe skips the request until
+    # finished_req_ids names it.
+    finish_pending: bool = False
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
@@ -843,7 +848,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
     ) -> TPUConnectorMetadata:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.build_connector_meta()
+        return self.connector_scheduler.build_connector_meta(scheduler_output)
 
     def request_finished(
         self,
@@ -1256,7 +1261,11 @@ class TPUConnectorScheduler:
             self.reqs_to_load,
         )
 
-    def build_connector_meta(self) -> TPUConnectorMetadata:
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> TPUConnectorMetadata:
+        # scheduler_output is read only by the pipeline producer override.
         meta = TPUConnectorMetadata()
         if self.is_producer:
             meta.reqs_to_send = self.reqs_to_send
@@ -1475,6 +1484,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # Decoder: prefill (source) req_id -> the admitted destination
         # req_id.
         self._stage3_active_source_req_ids: dict[str, str] = {}
+        # Pipeline producer register-ahead state: the scheduled requests and
+        # their per-group block tables as accumulated from scheduler output,
+        # the uuids published ahead of the finish and not yet adopted by
+        # one, and the uuids every stage must release.
+        self._stage3_early_requests: dict[str, Request] = {}
+        self._stage3_block_tables: dict[str, list[list[int]]] = {}
+        self._stage3_early_sends: dict[str, int] = {}
+        self.reqs_to_release: dict[ReqId, int] = {}
         # Get DP rank and TP size from config and stagger kv_port and side_channel_port
         dp_rank = (
             vllm_config.parallel_config.data_parallel_rank
@@ -1506,6 +1523,18 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         """
         return bool(self._stage3_mamba_group_indices) or any(
             group.window_tokens for group in self._stage3_transfer_groups
+        )
+
+    def _stage3_register_ahead_enabled(self) -> bool:
+        """Whether this producer publishes a request's Stage-3 send in the
+        step that completes its prompt (pipeline producers only)."""
+        return (
+            self.is_producer
+            and _use_raiden_stage3_transport()
+            and not _use_raiden_glm_admission()
+            and not _use_raiden_dsv4_admission()
+            and not _uses_tp_stage3_source(self.vllm_config)
+            and _engine_is_pipeline(self.vllm_config)
         )
 
     def on_new_request(self, request: "Request") -> None:
@@ -1672,6 +1701,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        if self._stage3_register_ahead_enabled():
+            self._stage3_early_requests[request.request_id] = request
         if not self._admit_kv_transfer_params(request):
             return
 
@@ -2037,6 +2068,86 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             uuid,
         )
 
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> TPUConnectorMetadata:
+        if scheduler_output is not None and self._stage3_register_ahead_enabled():
+            self._stage3_register_ahead(scheduler_output)
+        meta = super().build_connector_meta(scheduler_output)
+        if self.reqs_to_release:
+            meta.reqs_to_release, self.reqs_to_release = self.reqs_to_release, {}
+        return meta
+
+    def _stage3_register_ahead(self, scheduler_output: SchedulerOutput) -> None:
+        """Publishes a pipeline producer's Stage-3 send in the step whose
+        chunk completes the prompt, so every stage registers its blocks
+        while executing that step.
+
+        Only requests that finish right after their prompt (max_tokens == 1,
+        not resumable) are published here; the finish adopts the uuid through
+        the dedup record or, when it does not match, releases it.
+
+        Block tables are accumulated from the scheduler output the way the
+        workers accumulate theirs: a new request's table is taken whole, a
+        cached request appends its new blocks per group, and a resumed
+        request replaces its table.
+        """
+        for req_id in scheduler_output.preempted_req_ids or ():
+            self._stage3_block_tables.pop(req_id, None)
+            uuid = self._stage3_early_sends.pop(req_id, None)
+            if uuid is not None:
+                self._stage3_finished_sends.pop(req_id, None)
+                self.reqs_to_release[req_id] = uuid
+        computed_before: dict[str, int] = {}
+        tables = self._stage3_block_tables
+        for new_req in scheduler_output.scheduled_new_reqs:
+            tables[new_req.req_id] = [
+                list(group_ids) for group_ids in new_req.block_ids
+            ]
+            computed_before[new_req.req_id] = int(new_req.num_computed_tokens)
+        cached = scheduler_output.scheduled_cached_reqs
+        for index, req_id in enumerate(cached.req_ids):
+            new_block_ids = cached.new_block_ids[index]
+            if req_id in cached.resumed_req_ids:
+                tables[req_id] = [
+                    list(group_ids) for group_ids in (new_block_ids or ())
+                ]
+            elif new_block_ids is not None and req_id in tables:
+                for group, group_ids in zip(tables[req_id], new_block_ids):
+                    group.extend(group_ids)
+            computed_before[req_id] = int(cached.num_computed_tokens[index])
+        for req_id, num_new_tokens in scheduler_output.num_scheduled_tokens.items():
+            request = self._stage3_early_requests.get(req_id)
+            if request is None or req_id in self._stage3_finished_sends:
+                continue
+            if int(request.max_tokens) != 1 or request.resumable:
+                continue
+            computed_tokens = computed_before.get(req_id, 0) + int(num_new_tokens)
+            if computed_tokens < int(request.num_prompt_tokens):
+                continue
+            if len(self._stage3_finished_sends) >= _STAGE3_FINISH_DEDUP_LIMIT:
+                continue
+            num_tokens = self._stage3_transfer_tokens(request, computed_tokens)
+            if num_tokens <= 0:
+                continue
+            table = tables.get(req_id)
+            if not table:
+                continue
+            fa_block_ids = table[self._stage3_fa_group_index]
+            mamba_block_ids = [
+                table[group_index] for group_index in self._stage3_mamba_group_indices
+            ] or None
+            delay_free_blocks, params = self._stage3_publish_send(
+                request,
+                fa_block_ids,
+                mamba_block_ids,
+                num_tokens,
+                computed_tokens=computed_tokens,
+            )
+            if delay_free_blocks:
+                self._stage3_early_sends[req_id] = int(params["uuid"])
+
     def request_finished(
         self,
         request: "Request",
@@ -2046,6 +2157,30 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     ) -> tuple[bool, dict[str, Any] | None]:
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
+        req_id = request.request_id
+        early_uuid = self._stage3_early_sends.get(req_id)
+        self._stage3_early_requests.pop(req_id, None)
+        self._stage3_block_tables.pop(req_id, None)
+        delay_free_blocks, params = self._request_finished_stage3(
+            request, block_ids, mamba_block_ids, group_block_ids
+        )
+        self._stage3_early_sends.pop(req_id, None)
+        if early_uuid is not None and (params or {}).get("uuid") != early_uuid:
+            # The finish did not adopt the send published ahead of it: drop
+            # that dedup record and have every stage release the uuid.
+            record = self._stage3_finished_sends.get(req_id)
+            if record is not None and record[0] == early_uuid:
+                del self._stage3_finished_sends[req_id]
+            self.reqs_to_release[req_id] = early_uuid
+        return delay_free_blocks, params
+
+    def _request_finished_stage3(
+        self,
+        request: "Request",
+        block_ids: list[int],
+        mamba_block_ids: list[list[int]] | None,
+        group_block_ids: list[list[int]] | None,
+    ) -> tuple[bool, dict[str, Any] | None]:
         if not self.is_producer:
             params = request.kv_transfer_params
             if isinstance(params, dict) and params.get(_KV_PARAMS_ADMITTED):
@@ -2079,6 +2214,22 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # The controller emits a short final chunk, so retain that partial
         # source page instead of inheriting the legacy full-block-only trim.
         computed_tokens = int(request.num_computed_tokens)
+        num_tokens = self._stage3_transfer_tokens(request, computed_tokens)
+        if num_tokens <= 0 or not block_ids:
+            return False, {}
+        return self._stage3_publish_send(
+            request,
+            block_ids,
+            mamba_block_ids,
+            num_tokens,
+            computed_tokens=computed_tokens,
+            group_block_ids=group_block_ids,
+        )
+
+    @staticmethod
+    def _stage3_transfer_tokens(request: "Request", computed_tokens: int) -> int:
+        """Transfer extent of a producer request whose first
+        computed_tokens prompt tokens are computed."""
         prompt_tokens = int(request.num_prompt_tokens)
         finish_params = request.kv_transfer_params
         if isinstance(finish_params, dict) and bool(
@@ -2089,11 +2240,21 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # sliding-window skip needs: the allocator freed against
             # computed_tokens, and any other value picks a different page
             # boundary and lists a page that is back in the pool.
-            num_tokens = min(computed_tokens, prompt_tokens)
-        else:
-            num_tokens = min(computed_tokens, prompt_tokens - 1)
-        if num_tokens <= 0 or not block_ids:
-            return False, {}
+            return min(computed_tokens, prompt_tokens)
+        return min(computed_tokens, prompt_tokens - 1)
+
+    def _stage3_publish_send(
+        self,
+        request: "Request",
+        block_ids: list[int],
+        mamba_block_ids: list[list[int]] | None,
+        num_tokens: int,
+        *,
+        computed_tokens: int,
+        group_block_ids: list[list[int]] | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Enqueues the request's Stage-3 SendMeta for the workers and
+        returns the consumer-facing transfer parameters."""
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         if (
@@ -2255,6 +2416,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if src_data_replica_idx < 0:
             raise ValueError("Producer data-parallel rank must be non-negative")
         existing = self._stage3_finished_sends.get(request.request_id)
+        if (
+            existing is not None
+            and existing[0] == self._stage3_early_sends.get(request.request_id)
+            and (existing[1] != normalized_ids or existing[2] != num_tokens)
+        ):
+            # The finish covers less than the send published ahead of it:
+            # mint a fresh transfer below; request_finished releases the
+            # published uuid.
+            del self._stage3_finished_sends[request.request_id]
+            existing = None
         if existing is not None:
             uuid, old_ids, old_num_tokens, params = existing
             if old_ids != normalized_ids or old_num_tokens != num_tokens:
@@ -3840,7 +4011,10 @@ class TPURaidenConnectorWorker:
         """TEST-ONLY fault injection (TPU_RAIDEN_TEST_REGISTRATION_DELAY_S):
         widen the out-of-band registration race by delaying the producer's
         registration step, reproducing a saturated producer whose
-        registration-carrying step runs long after the finish response."""
+        registration-carrying step runs long after the finish response.
+        On a pipeline producer the sleep runs before the prompt-completing
+        forward and delays the finish response by the same amount, so it
+        widens the race only for PCP and DP producers."""
         delay_s = dist_utils.get_stage3_test_registration_delay_s()
         if delay_s > 0 and metadata.reqs_to_send:
             logger.warning(
@@ -3881,6 +4055,29 @@ class TPURaidenConnectorWorker:
             self._stage3_terminal_sends.pop(req_id, None)
             self._stage3_reported_sends.discard(req_id)
             self._stage3_prune_state_send_tracking(req_id)
+
+        # Retires this stage's registration of a uuid the scheduler published
+        # ahead of the finish and did not hand to a consumer; no
+        # finished_sending is reported for it.
+        for req_id, uuid in metadata.reqs_to_release.items():
+            registration = self._stage3_registered_sends.get(req_id)
+            if registration is None or registration.uuid != int(uuid):
+                continue
+            del self._stage3_registered_sends[req_id]
+            self._stage3_status_probe_next.pop(req_id, None)
+            facade.release_request_blocks(req_id=req_id, uuid=int(uuid))
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage3_registration_released",
+                        "req_id": req_id,
+                        "uuid": int(uuid),
+                        "transfer_rank": transfer_rank,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
@@ -4063,7 +4260,8 @@ class TPURaidenConnectorWorker:
                 uuid=uuid,
                 local_block_ids=local_ids,
                 num_tokens=num_tokens,
-                expiration_time=expiration_time,
+                expiration_time=float("inf") if pipeline else expiration_time,
+                finish_pending=pipeline,
             )
             if not any(reg.spans for reg in pool_spans):
                 # This PCP rank owns no physical page for the request. It has
@@ -4860,6 +5058,7 @@ class TPURaidenConnectorWorker:
             if (
                 req_id in self._stage3_terminal_cleanup
                 or req_id in self._stage3_send_outcomes
+                or self._stage3_registered_sends[req_id].finish_pending
             ):
                 continue
             next_probe = self._stage3_status_probe_next.get(req_id)
@@ -4917,10 +5116,11 @@ class TPURaidenConnectorWorker:
         """Bridges the one-step P scheduler-to-worker registration window.
 
         vLLM returns producer transfer parameters from update_from_output(),
-        while the D5 block registrations reach producer workers in the next
-        scheduler step. The source controller fails before receiver arming
-        when those registrations are incomplete, so retry only that precise,
-        side-effect-free error for a short bounded interval.
+        while the D5 block registrations reach producer workers no later than
+        the next scheduler step (a pipeline producer registers in the
+        prompt-completing step). The source controller fails before receiver
+        arming when those registrations are incomplete, so retry only that
+        precise, side-effect-free error for a short bounded interval.
         """
         configured_timeout = float(dist_utils.get_p2p_wait_pull_timeout())
         deadline = time.perf_counter() + min(
@@ -6005,6 +6205,20 @@ class TPURaidenConnectorWorker:
             # loop in _wait_for_recving can run different counts on each rank
             # and must never contain a collective.
             self._drain_stage3_submit_outcomes()
+        if self.is_producer and self._raiden_stage3_enabled():
+            # The scheduler finished these requests: their registrations
+            # made ahead of the finish start the TTL clock and the status
+            # probe.
+            now = time.perf_counter()
+            for req_id in finished_req_ids or ():
+                registration = self._stage3_registered_sends.get(req_id)
+                if registration is not None and registration.finish_pending:
+                    self._stage3_registered_sends[req_id] = dataclasses.replace(
+                        registration,
+                        finish_pending=False,
+                        expiration_time=now
+                        + float(dist_utils.get_p2p_wait_pull_timeout()),
+                    )
         self._poll_finished(engine)
         done_sending = self._done_sending
         if self.is_producer and self._raiden_stage3_enabled():
