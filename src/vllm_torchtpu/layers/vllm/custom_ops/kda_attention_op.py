@@ -7,11 +7,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
+from vllm.config import VllmConfig
 
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
 from vllm_torchtpu.logger import init_logger
@@ -419,3 +424,254 @@ def build_kimi_dispatched_kda_op(
         return output
 
     return dispatched_impl
+
+
+def _pooled_kda_core(
+    mixed_qkv: jax.Array,
+    raw_gate: jax.Array,
+    beta: jax.Array,
+    output_gate: jax.Array,
+    pool: jax.Array,  # (num_blocks, block_size, *payload, lanes)
+    conv_weight: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    norm_weight: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    seq_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    pool_block_tokens: int,
+) -> tuple[jax.Array, jax.Array]:
+    num_reqs = state_indices.shape[0]
+    num_heads = a_log.shape[0]
+    head_dim = norm_weight.shape[0]
+    kernel_size = conv_weight.shape[0]
+    elem_bytes = jnp.dtype(pool.dtype).itemsize
+    tok_bytes = math.prod(pool.shape[2:]) * elem_bytes
+    layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=num_heads * head_dim * head_dim * 4,
+        conv_bytes=(kernel_size - 1) * 3 * num_heads * head_dim * elem_bytes,
+        token_bytes=tok_bytes,
+    )
+    # state_indices are MANAGER block ids, and the region offsets are
+    # manager-block-relative. The pool's shape[1] unit is a packed token
+    # row (an MLA pool packs `pool.shape[2]` tokens per row), and a backend
+    # with a fixed kernel block size splits each manager block into `split`
+    # consecutive pool blocks — so measure the regions against the manager
+    # block and let gather_region/scatter_region remap the ids
+    # (`state_indices * split + kb`) through their split branch.
+    tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    if pool_block_tokens % tokens_per_row != 0:
+        raise ValueError("Manager block size is not a whole number of pool "
+                         f"rows: {pool_block_tokens} tokens at "
+                         f"{tokens_per_row} tokens/row")
+    manager_rows = pool_block_tokens // tokens_per_row
+    if manager_rows % pool.shape[1] != 0:
+        raise ValueError("Manager block does not split into whole pool "
+                         f"blocks: {manager_rows} rows vs pool block of "
+                         f"{pool.shape[1]}")
+    split = manager_rows // pool.shape[1]
+    if layout.required_tokens > manager_rows:
+        raise ValueError("KDA state regions exceed the pool block: "
+                         f"{layout.required_tokens} > {manager_rows}")
+
+    # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
+    # per typed row, so the leading H * D rows are exactly the state.
+    ssm_gathered = pool_adapters.gather_region(pool,
+                                               state_indices,
+                                               tok0=0,
+                                               ntok=layout.ssm_tokens,
+                                               out_dtype=jnp.float32,
+                                               out_lanes=head_dim,
+                                               split=split)
+    ssm_rows = num_heads * head_dim
+    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(num_reqs, num_heads,
+                                                      head_dim, head_dim)
+
+    # Conv region [ssm_tokens, ssm_tokens + conv_tokens): the layer's
+    # (taps, qkv, heads, head_dim) slot order, stored in the pool dtype.
+    conv_gathered = pool_adapters.gather_region(pool,
+                                                state_indices,
+                                                tok0=layout.ssm_tokens,
+                                                ntok=layout.conv_tokens,
+                                                out_dtype=pool.dtype,
+                                                split=split)
+    conv_elems = (kernel_size - 1) * 3 * num_heads * head_dim
+    conv_local = conv_gathered.reshape(num_reqs, -1)[:, :conv_elems].reshape(
+        num_reqs, kernel_size - 1, 3, num_heads, head_dim)
+
+    # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
+    conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local],
+                               axis=0)
+    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local],
+                              axis=0)
+    identity = jnp.arange(1, num_reqs + 1, dtype=jnp.int32)
+
+    # The fused conv1d + GDN v3 kernel takes the conv state flat
+    # [slots, K - 1, 3*H*D]; the buffers here lay their channels out as
+    # (K - 1, 3, H, D) in row-major order, so both reshapes are free. Padded
+    # and zero-length sequences are safe under identity indices because the
+    # kernel gates their state DMAs to zero size rather than redirecting them
+    # to the null slot.
+    fused_core = _build_fused_core(lower_bound, eps)
+    output, new_conv_buf, new_ssm_buf = fused_core(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        conv_buf.reshape(num_reqs + 1, kernel_size - 1, -1),
+        ssm_buf,
+        conv_weight,
+        a_log,
+        dt_bias,
+        norm_weight,
+        query_start_loc,
+        identity,
+        seq_lens,
+        distribution,
+    )
+    new_conv_buf = new_conv_buf.reshape(num_reqs + 1, kernel_size - 1, 3,
+                                        num_heads, head_dim)
+
+    # Scatter the real slots back; the padding rows/elems of each region are
+    # zero-filled so the pool bytes stay deterministic.
+    ssm_region_rows = layout.ssm_tokens * tok_bytes // (4 * head_dim)
+    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
+    new_ssm = jnp.pad(new_ssm,
+                      ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
+    pool = pool_adapters.scatter_region(pool,
+                                        new_ssm,
+                                        state_indices,
+                                        tok0=0,
+                                        ntok=layout.ssm_tokens,
+                                        split=split)
+
+    conv_region_elems = layout.conv_tokens * tok_bytes // elem_bytes
+    new_conv = new_conv_buf[1:].reshape(num_reqs, conv_elems)
+    new_conv = jnp.pad(new_conv, ((0, 0), (0, conv_region_elems - conv_elems)))
+    new_conv = new_conv.reshape(num_reqs, -1, pool.shape[-1])
+    pool = pool_adapters.scatter_region(pool,
+                                        new_conv,
+                                        state_indices,
+                                        tok0=layout.ssm_tokens,
+                                        ntok=layout.conv_tokens,
+                                        split=split)
+
+    return output, pool
+
+
+def build_kimi_pooled_kda_op(
+    prefix: str,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    vllm_config: VllmConfig,
+):
+    """Build the KDA op that reads and writes its state through the pool.
+
+    Same torch-level contract as the dense dispatched op, except the two
+    state caches are replaced by the single attention-shaped pool buffer.
+    The state regions are gathered out of the pool, run through the fused
+    conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
+    unfused core is not available here), and scattered back.
+
+    The manager block size (``cache_config.block_size``) lets the op size
+    the state regions against the manager block and derive the
+    manager->pool-block split for the state-index remap. It is read PER
+    CALL, not at build time: the platform's block-size derivation for the
+    pool runs after model construction (hybrid layers are built before the
+    adjusted value exists), so a value captured at build time is the
+    pre-adjustment one (16) and the op would size its regions against the
+    wrong manager block.
+    """
+
+    def pooled_core(
+        mixed_qkv: jax.Array,
+        raw_gate: jax.Array,
+        beta: jax.Array,
+        output_gate: jax.Array,
+        pool: jax.Array,
+        conv_weight: jax.Array,
+        a_log: jax.Array,
+        dt_bias: jax.Array,
+        norm_weight: jax.Array,
+        query_start_loc: jax.Array,
+        state_indices: jax.Array,
+        seq_lens: jax.Array,
+        distribution: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        # Explicit annotated signature: pallas.jax_op's _verify_signature
+        # rejects unannotated *args.
+        return _pooled_kda_core(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            distribution,
+            lower_bound=lower_bound,
+            eps=eps,
+            pool_block_tokens=vllm_config.cache_config.block_size)
+
+    # vLLM's compile cache is keyed on the model config and not on the op
+    # body, so the kernel variant goes in the op name (see
+    # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
+    # era would otherwise be served stale.
+    op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
+    pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4, ))
+
+    def _fake_pooled(mixed_qkv, _raw_gate, _beta, _output_gate, pool,
+                     _conv_weight, a_log, _dt_bias, norm_weight, *args,
+                     **kwargs):
+        output = torch.empty(
+            (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0]),
+            dtype=mixed_qkv.dtype,
+            device=mixed_qkv.device)
+        return output, torch.empty_like(pool)
+
+    pooled_op.register_fake(_fake_pooled)
+
+    def pooled_impl(
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        pool: torch.Tensor,
+        conv_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        distribution: torch.Tensor,
+    ) -> torch.Tensor:
+        output, new_pool = pooled_op(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            distribution,
+        )
+        pool.copy_(new_pool)
+        return output
+
+    return pooled_impl

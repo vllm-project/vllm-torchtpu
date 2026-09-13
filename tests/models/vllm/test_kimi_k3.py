@@ -694,6 +694,70 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     )
 
 
+def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache() -> None:
+    """A one-tensor kv_cache means the unified pool: the layer must take the
+    pooled op and never the dense dispatched op."""
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.fused_fa_ga_proj = _Projection(4)
+    layer.f_a_proj = None
+    layer.g_proj = None
+    layer.local_projection_size = 4
+    layer.f_b_proj = _Projection(4)
+    layer.g_b_proj = _Projection(4)
+    layer.o_proj = _IdentityProjection()
+    layer.q_conv1d = _ConvWeight()
+    layer.k_conv1d = _ConvWeight()
+    layer.v_conv1d = _ConvWeight()
+    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
+    layer.o_norm = SimpleNamespace(weight=torch.ones(2))
+    layer.A_log = nn.Parameter(torch.zeros(2))
+    layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
+
+    pool = torch.zeros(2, 4, 2, 8)
+    layer.kv_cache = [pool]
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_slot_read_offsets=None,
+    )
+    layer._metadata = lambda: metadata
+
+    calls: list[str] = []
+
+    def pooled_kda_op(mixed_qkv, *args):
+        calls.append("pooled")
+        assert args[3] is pool
+        return mixed_qkv[:, :4].view(-1, 2, 2)
+
+    def unexpected(name):
+
+        def op(*args, **kwargs):
+            raise AssertionError(f"{name} must not run for the pooled cache")
+
+        return op
+
+    layer.pooled_kda_op = pooled_kda_op
+    layer.dispatched_kda_op = unexpected("dispatched_kda_op")
+    layer.sconv_op = unexpected("sconv_op")
+    layer.chunk_kda_op = unexpected("chunk_kda_op")
+    layer.kda_op = unexpected("kda_op")
+
+    output = layer(torch.arange(2), torch.ones(2, 4))
+    assert calls == ["pooled"]
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
+    )
+
+
 def test_kda_custom_ops_compile_as_one_full_graph(
     monkeypatch: pytest.MonkeyPatch, ) -> None:
 

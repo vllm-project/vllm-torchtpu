@@ -117,10 +117,10 @@ class FakeKimiLinearModel:
 
 
 class FakeKimiMLABackend(FakePlainAttentionBackend):
-    """MLA page geometry: packing=2 x 640 padded bf16 lanes = 2560 B/token.
-
-    The real PallasMLAttentionBackend inherits MultipleOf(1) kernel block
-    sizes, so the derivation's alignment step is a no-op ([] matches)."""
+    """MLA page geometry: the pool packs the token axis (bf16 packing 2), so
+    a pool row is a 2560 B packed pair; a 1-token page already takes a whole
+    row. The real PallasMLAttentionBackend inherits MultipleOf(1) kernel
+    block sizes, so the derivation's alignment step is a no-op ([] matches)."""
 
     @staticmethod
     def get_name():
@@ -133,7 +133,7 @@ class FakeKimiMLABackend(FakePlainAttentionBackend):
 
     @staticmethod
     def get_kv_cache_page_size_bytes(block_size, *_args, **_kwargs):
-        return block_size * 2560
+        return ((block_size + 1) // 2) * 2560
 
 
 @pytest.fixture
@@ -225,8 +225,9 @@ def test_hybrid_fit_uses_configured_bf16_ssm_dtype(vllm_config):
 
 def test_kimi_linear_padded_ssm_fit(vllm_config):
     """Kimi-Linear TP8: the f32 KDA state (2^18 B) does not divide the MLA
-    token row (2^9 * 5 B), so the derivation pads the SSM region up to whole
-    token rows instead of rejecting the geometry."""
+    pool row (2^9 * 5 B), so the derivation pads the SSM region up to whole
+    rows; the pool's token-axis packing (2 tokens/row) then doubles the
+    manager block the fit floor implies."""
     vllm_config.model_config.is_hybrid = True
     vllm_config.model_config.architecture = "KimiLinearForCausalLM"
     vllm_config.model_config.get_head_size.return_value = 576
@@ -239,11 +240,11 @@ def test_kimi_linear_padded_ssm_fit(vllm_config):
             backend_cls=FakeKimiMLABackend,
             model_cls=FakeKimiLinearModel)
 
-    # SSM: ceil(262144 / 2560) = 103 rows (1536 B of padding in the last
-    # row); conv: pow2(ceil(9216 / 2560)) = 4 rows; the fit floor 107 beats
-    # the backend minimum of 64 and the input block size of 16.
-    assert vllm_config.cache_config.block_size == 107
-    assert vllm_config.cache_config.mamba_block_size == 107
+    # State regions: ceil(262144 / 2560) = 103 pool rows + pow2(ceil(9216 /
+    # 2560)) = 4 -> 107 packed rows = 214 tokens at packing 2. The fit floor
+    # 214 beats the backend minimum of 64 and the input block size of 16.
+    assert vllm_config.cache_config.block_size == 214
+    assert vllm_config.cache_config.mamba_block_size == 214
     assert vllm_config.cache_config.mamba_page_size_padded == 107 * 2560
 
 

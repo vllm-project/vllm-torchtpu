@@ -533,6 +533,11 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     # the first scheduler is created.
     _patch_vllm_hybrid_producer_prefix_hits()
     _patch_vllm_merge_multimodal_embeddings()
+    from vllm_torchtpu.core.pp_chunk_scheduler import \
+        patch_engine_core_for_pp_chunks
+    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+    patch_executor_for_pp_wave(kwargs.get("vllm_config"))
+    patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 

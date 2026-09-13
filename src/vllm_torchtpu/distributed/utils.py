@@ -232,6 +232,22 @@ def get_raiden_transfer_num_slots() -> int:
     return envs.TPU_RAIDEN_TRANSFER_NUM_SLOTS
 
 
+def get_raiden_pool_staging_leases() -> int:
+    """Concurrent pool-reshard transfers to provision bounded host staging for.
+
+    The Raiden pool-reshard path used to shadow each rank's whole device KV
+    pool in host memory; with an auto-sized pool that shadow (~25-30 GB/rank)
+    overflows libtpu's 16 GiB premapped pool and D2H/H2D silently fall back to
+    the staged-copy slow path (2-4x slower transfers, see
+    RESHARD_BOUNDED_STAGING_DESIGN.md). With N > 0 the connector asks tpu-sync
+    for a bounded staging arena per KV storage of N x the distinct blocks one
+    transfer touches on that storage (pages per max-length request plus one
+    state block per GDN group sharing it), leased per transfer. 0 keeps the
+    full host mirror.
+    """
+    return envs.TPU_RAIDEN_POOL_STAGING_LEASES
+
+
 def get_raiden_inline_load() -> bool:
     """Load remote KV before the first forward instead of a no-forward step."""
     return envs.TPU_RAIDEN_INLINE_LOAD

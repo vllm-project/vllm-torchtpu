@@ -26,6 +26,7 @@ def vllm_config():
     config.parallel_config.nnodes = 1
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.pipeline_parallel_size = 1
     config.kv_transfer_config = None
     return config
 

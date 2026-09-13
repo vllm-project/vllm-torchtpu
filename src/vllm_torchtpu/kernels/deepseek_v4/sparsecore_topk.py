@@ -47,9 +47,8 @@ MAX_SLICE_WORDS = 64 * 1024
 L0_SHIFT = 24
 REFINEMENT_LEVELS = ((16, 0xFF), (8, 0xFF), (0, 0xFF))
 MONO_MASK = 0x7FFFFFFF
-KEY_NEG_INF = int(
-    np.int32(np.array(-np.inf, np.float32).view(np.int32))
-    ^ np.int32(0x7FFFFFFF))
+BITS_NEG_INF = int(np.array(-np.inf, np.float32).view(np.int32))
+KEY_NEG_INF = int(np.int32(BITS_NEG_INF) ^ np.int32(0x7FFFFFFF))
 
 
 def _cdiv(a, b):
@@ -64,14 +63,16 @@ def _cdiv_dyn(x):
     return jnp.right_shift(x + (LANES - 1), 4)
 
 
-def _topk_kernel(
+def _topk_body(
     scores_hbm,  # i32[b * n]                (fp32 score bits)
     lengths_hbm,  # i32[b_pad]
     out_hbm,  # i32[b * k]
+    keys_hbm,  # i32[b * k], or None
     resident_vmem,  # i32[slice_len]
     priv_vmem,  # i32[16 * NUM_BUCKETS + LANES]  (lane-private histograms)
-    glob_vmem,  # i32[NUM_BUCKETS + LANES]  (folded hist, then its prefix sum)
-    rowbuf_vmem,  # i32[k + LANES]          (winner indices for one row)
+    glob_vmem,  # i32[NUM_BUCKETS + LANES]  (folded hist, then prefix sum)
+    rowbuf_vmem,  # i32[k + LANES]           (winner indices for one row)
+    keybuf_vmem,  # i32[k + LANES], or None
     len_vmem,  # i32[b_pad]
     sems,  # DMA[4]
     *,
@@ -82,6 +83,14 @@ def _topk_kernel(
     num_waves: int,
     write_empty: bool,
 ):
+    # Shared body of the two kernel entry points below. `keys_hbm` is
+    # i32[b * k]: the fp32 score bits of each winner, paired slot for slot with
+    # out_hbm, so the caller need not gather the scores back. It and its VMEM
+    # staging buffer are None on the indices-only variant, which then traces
+    # exactly as it did before the option existed.
+    emit_keys = keys_hbm is not None
+    assert (keybuf_vmem is not None) == emit_keys
+
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
@@ -262,6 +271,11 @@ def _topk_kernel(
         def fill_body(i):
             rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES, ), -1,
                                                             jnp.int32)
+            if emit_keys:
+                # Padding slots must read back as -inf, the same value the
+                # caller used to substitute for a -1 index.
+                keybuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full(
+                    (LANES, ), BITS_NEG_INF, jnp.int32)
 
         fill_bound = jnp.where(out_gate & (total < k), k // LANES, 0)
         plsc.parallel_loop(0, fill_bound, unroll=4)(fill_body)
@@ -275,10 +289,16 @@ def _topk_kernel(
             tie_rank = plsc.cumsum(tie.astype(jnp.int32)) + rank
             take = tie & (tie_rank <= my_take)
             sel = jnp.where(keep_all, valid, strict | take)
-            pos = j
             plsc.store_compressed(rowbuf_vmem.at[pl.ds(woff, LANES)],
-                                  pos,
+                                  j,
                                   mask=sel)
+            if emit_keys:
+                # monotone_key is an involution, so this recovers the original
+                # fp32 bits. Same woff and same mask, so the two compactions
+                # stay aligned slot for slot.
+                plsc.store_compressed(keybuf_vmem.at[pl.ds(woff, LANES)],
+                                      monotone_key(key),
+                                      mask=sel)
             woff = woff + plsc.all_reduce_population_count(sel)[0]
             rank = tie_rank[LANES - 1]
             return woff, rank
@@ -297,10 +317,103 @@ def _topk_kernel(
                 out_hbm.at[pl.ds(row_c * k, k)],
                 2,
             )
+            if emit_keys:
+                dma(
+                    keybuf_vmem.at[pl.ds(0, k)],
+                    keys_hbm.at[pl.ds(row_c * k, k)],
+                    3,
+                )
 
         return 0
 
     lax.fori_loop(0, num_waves, wave_body, 0)
+
+
+# Pallas passes inputs, then outputs, then scratch, all positionally, so the
+# extra key output and its staging buffer land part-way through that sequence
+# rather than at the end. That is one arity per variant, hence one entry point
+# per variant: each spells out the refs it is handed, and both delegate to
+# `_topk_body`.
+def _topk_kernel(
+    scores_hbm,
+    lengths_hbm,
+    out_hbm,
+    resident_vmem,
+    priv_vmem,
+    glob_vmem,
+    rowbuf_vmem,
+    len_vmem,
+    sems,
+    *,
+    b: int,
+    n: int,
+    k: int,
+    slice_len: int,
+    num_waves: int,
+    write_empty: bool,
+):
+    """Indices only."""
+    _topk_body(
+        scores_hbm,
+        lengths_hbm,
+        out_hbm,
+        None,
+        resident_vmem,
+        priv_vmem,
+        glob_vmem,
+        rowbuf_vmem,
+        None,
+        len_vmem,
+        sems,
+        b=b,
+        n=n,
+        k=k,
+        slice_len=slice_len,
+        num_waves=num_waves,
+        write_empty=write_empty,
+    )
+
+
+def _topk_kernel_keys(
+    scores_hbm,
+    lengths_hbm,
+    out_hbm,
+    keys_hbm,
+    resident_vmem,
+    priv_vmem,
+    glob_vmem,
+    rowbuf_vmem,
+    keybuf_vmem,
+    len_vmem,
+    sems,
+    *,
+    b: int,
+    n: int,
+    k: int,
+    slice_len: int,
+    num_waves: int,
+    write_empty: bool,
+):
+    """Indices plus each winner's score."""
+    _topk_body(
+        scores_hbm,
+        lengths_hbm,
+        out_hbm,
+        keys_hbm,
+        resident_vmem,
+        priv_vmem,
+        glob_vmem,
+        rowbuf_vmem,
+        keybuf_vmem,
+        len_vmem,
+        sems,
+        b=b,
+        n=n,
+        k=k,
+        slice_len=slice_len,
+        num_waves=num_waves,
+        write_empty=write_empty,
+    )
 
 
 def _sc_topk_direct(
@@ -309,8 +422,13 @@ def _sc_topk_direct(
     row_lengths: jax.Array,  # i32[b]
     *,
     write_empty: bool = True,
-) -> jax.Array:
-    """Single-stage lock-free SparseCore top-k on 32 subcores."""
+    emit_keys: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Single-stage lock-free SparseCore top-k on 32 subcores.
+
+    With ``emit_keys``, also returns the f32 score of each winner, paired
+    slot-for-slot with the returned indices and ``-inf`` in the pad slots.
+    """
     b, n = scores.shape
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
@@ -330,9 +448,28 @@ def _sc_topk_direct(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
+    slot_type = jax.ShapeDtypeStruct((b * k, ), jnp.int32)
+    out_type = (slot_type, slot_type) if emit_keys else slot_type
+
+    scratch_types = (
+        pltpu.VMEM((slice_len, ), jnp.int32),
+        pltpu.VMEM((LANES * NUM_BUCKETS + LANES, ), jnp.int32),
+        pltpu.VMEM((NUM_BUCKETS + LANES, ), jnp.int32),
+        pltpu.VMEM((k + LANES, ), jnp.int32),
+    )
+    if emit_keys:
+        scratch_types += (pltpu.VMEM((k + LANES, ), jnp.int32), )
+    scratch_types += (
+        pltpu.VMEM((b_pad, ), jnp.int32),
+        pltpu.SemaphoreType.DMA((4, )),
+    )
+
+    # The kernel names itself after the variant that was built, so a profile
+    # scope name is enough to tell which path actually ran.
+    suffix = "_keys" if emit_keys else ""
     out = pl.kernel(
         functools.partial(
-            _topk_kernel,
+            _topk_kernel_keys if emit_keys else _topk_kernel,
             b=b,
             n=n,
             k=k,
@@ -340,20 +477,17 @@ def _sc_topk_direct(
             num_waves=num_waves,
             write_empty=write_empty,
         ),
-        out_type=jax.ShapeDtypeStruct((b * k, ), jnp.int32),
+        out_type=out_type,
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True,
                                              needs_layout_passes=False),
-        scratch_types=(
-            pltpu.VMEM((slice_len, ), jnp.int32),
-            pltpu.VMEM((LANES * NUM_BUCKETS + LANES, ), jnp.int32),
-            pltpu.VMEM((NUM_BUCKETS + LANES, ), jnp.int32),
-            pltpu.VMEM((k + LANES, ), jnp.int32),
-            pltpu.VMEM((b_pad, ), jnp.int32),
-            pltpu.SemaphoreType.DMA((4, )),
-        ),
+        scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}",
+        name=f"sc_topk_direct_b{b}_n{n}_k{k}{suffix}",
     )(words.reshape(-1), lengths)
+    if emit_keys:
+        slots, keys = out
+        return slots.reshape(b, k), jax.lax.bitcast_convert_type(
+            keys.reshape(b, k), jnp.float32)
     return out.reshape(b, k)
 
 
@@ -377,18 +511,32 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     return p
 
 
-@functools.partial(jax.jit, static_argnames=("k", "write_empty_rows"))
+@functools.partial(jax.jit,
+                   static_argnames=("k", "write_empty_rows",
+                                    "_reference_stage2_gather"))
 def sparsecore_topk(
     scores: jax.Array,  # f32[b, n]
     k: int,
     row_lengths: jax.Array | None = None,  # i32[b], defaults to n
     *,
     write_empty_rows: bool = True,
+    _reference_stage2_gather: bool = False,
 ) -> jax.Array:  # i32[b, k]
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
   Uses 2-stage hierarchical subcore selection when b < 32 or n > 64K to utilize
   all 32 subcores in parallel without inter-core barrier overhead.
+
+  On the two-stage path stage 1 emits each winner's score alongside its index,
+  so stage 2 does not gather those scores back out of `scores`. Stage 1 has
+  already read every one of them.
+
+  `_reference_stage2_gather` is a test seam, not a tuning knob. It selects the
+  earlier formulation, which performs that gather. The two return the same
+  indices bit for bit; the differential test in
+  `tests/kernels/test_dsv4_sparsecore_topk.py` is what establishes that, and it
+  is the reason this branch is still here. No production caller sets it --
+  `streamindex_topk` does not expose it.
   """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -424,8 +572,23 @@ def sparsecore_topk(
     lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0,
                          n_p).reshape(b * p)
 
-    local_indices = _sc_topk_direct(scores_p, k_p, lengths_p,
-                                    write_empty=True).reshape(b, p, k_p)
+    if _reference_stage2_gather:
+        # Test-seam formulation: stage 1 returns indices only, and stage 2's
+        # scores are gathered back below. `cand_scores = None` is what couples
+        # the two halves, so neither can be changed without the other.
+        cand_scores = None
+        local_indices = _sc_topk_direct(scores_p,
+                                        k_p,
+                                        lengths_p,
+                                        write_empty=True).reshape(b, p, k_p)
+    else:
+        local_slots, cand_scores = _sc_topk_direct(scores_p,
+                                                   k_p,
+                                                   lengths_p,
+                                                   write_empty=True,
+                                                   emit_keys=True)
+        local_indices = local_slots.reshape(b, p, k_p)
+        cand_scores = cand_scores.reshape(b, p * k_p)
 
     # Map local indices to global column indices
     global_cand_indices = jnp.where(
@@ -434,10 +597,12 @@ def sparsecore_topk(
         offsets[None, :, None] + local_indices,
     ).reshape(b, p * k_p)
 
-    # Gather candidate scores for Stage 2
-    safe_cand_indices = jnp.maximum(global_cand_indices, 0)
-    cand_scores = jnp.take_along_axis(scores, safe_cand_indices, axis=1)
-    cand_scores = jnp.where(global_cand_indices >= 0, cand_scores, -jnp.inf)
+    if cand_scores is None:
+        # The gather the shipped path deletes. Reached only from the test seam.
+        safe_cand_indices = jnp.maximum(global_cand_indices, 0)
+        cand_scores = jnp.take_along_axis(scores, safe_cand_indices, axis=1)
+        cand_scores = jnp.where(global_cand_indices >= 0, cand_scores,
+                                -jnp.inf)
 
     # Stage 2: Merge the P * k_p candidates to select the final top-k
     cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))

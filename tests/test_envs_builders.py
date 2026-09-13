@@ -187,6 +187,7 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
     ("TPU_KV_PIN_SHM", False),
     ("TPU_USE_RAIDEN_CONNECTOR", False),
     ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
+    ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
     ("TPU_RAIDEN_INLINE_LOAD", False),
 ])
 def test_migrated_knob_defaults(monkeypatch, name, expected):

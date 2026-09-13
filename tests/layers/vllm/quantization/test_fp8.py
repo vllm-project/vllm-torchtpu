@@ -630,3 +630,72 @@ class TestInt8MoERequantization:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestMoERequantizationChunks:
+    """Requantizing a few experts at a time must give the whole-tensor
+    result."""
+
+    @staticmethod
+    def _layer(device, dtype, num_experts=6, inter=256, hidden=512, block=128):
+        from types import SimpleNamespace
+
+        def param(t):
+            return torch.nn.Parameter(t, requires_grad=False)
+
+        w13 = torch.randn(num_experts,
+                          2 * inter,
+                          hidden,
+                          device=device,
+                          dtype=torch.bfloat16).to(dtype)
+        w2 = torch.randn(num_experts,
+                         hidden,
+                         inter,
+                         device=device,
+                         dtype=torch.bfloat16).to(dtype)
+        layer = SimpleNamespace(
+            w13_weight=param(w13),
+            w2_weight=param(w2),
+            w13_weight_scale_inv=param(
+                torch.rand(num_experts,
+                           2 * inter // block,
+                           hidden // block,
+                           device=device) + 0.5),
+            w2_weight_scale_inv=param(
+                torch.rand(num_experts,
+                           hidden // block,
+                           inter // block,
+                           device=device) + 0.5),
+            moe_config=SimpleNamespace(
+                intermediate_size_per_partition=inter,
+                intermediate_size_per_partition_unpadded=inter,
+                tp_size=1,
+                tp_rank=0),
+        )
+        # w13 chunks of two experts: 2 * (2*inter*hidden) float32 bytes
+        return layer, 2 * 2 * inter * hidden * 4
+
+    @staticmethod
+    def _same(whole, chunked):
+        for a, b in zip(whole[:4], chunked[:4]):
+            assert a.shape == b.shape
+            assert torch.equal(a.float(), b.float())
+
+    def test_fp8_checkpoint(self, device, monkeypatch):
+        from vllm_torchtpu.layers.vllm.quantization import fp8 as fp8_mod
+        torch.manual_seed(0)
+        layer, chunk_bytes = self._layer(device, torch.float8_e4m3fn)
+        kwargs = dict(weight_block_size=(128, 128), activation="silu")
+        whole = fp8_mod._process_fp8_moe_weights(layer, **kwargs)
+        monkeypatch.setattr(fp8_mod, "_REQUANT_CHUNK_BYTES", chunk_bytes)
+        chunked = fp8_mod._process_fp8_moe_weights(layer, **kwargs)
+        self._same(whole, chunked)
+
+    def test_bf16_checkpoint(self, device, monkeypatch):
+        from vllm_torchtpu.layers.vllm.quantization import fp8 as fp8_mod
+        torch.manual_seed(0)
+        layer, chunk_bytes = self._layer(device, torch.bfloat16)
+        whole = fp8_mod._quantize_bf16_moe_weights(layer, activation="silu")
+        monkeypatch.setattr(fp8_mod, "_REQUANT_CHUNK_BYTES", chunk_bytes)
+        chunked = fp8_mod._quantize_bf16_moe_weights(layer, activation="silu")
+        self._same(whole, chunked)

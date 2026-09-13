@@ -23,66 +23,123 @@ import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
-    HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat,
-    act_scale_slab_rows, align_up, build_routing_tables,
+    HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, GatheredPairs,
+    WeightFormat, act_scale_slab_rows, align_up, build_routing_tables,
     build_routing_tables_sharded, expert_visit_list, local_slab_rows,
-    ragged_stride_bound, routing_block, shard_count_vector, shard_expert_slabs,
-    shard_push_tables_in_rows, shard_token_gather,
-    shard_transport_tables_in_blocks, token_gather_window_rows, weight_form,
-    weight_format_of_dtype)
+    pair_block_hist, pow2_shift, ragged_stride_bound, routing_block,
+    shard_count_vector, shard_expert_slabs, shard_push_tables_in_rows,
+    shard_token_gather, shard_transport_tables_in_blocks,
+    token_gather_window_rows, weight_form, weight_format_of_dtype)
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
-    build_fused_ep_moe_kernel, rowquant_fp8)
+    build_combine_kernel, build_fused_ep_moe_kernel, combine_step_tokens,
+    rowquant_fp8)
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 
 
-def _combine_arrivals(arrivals, arrival_scales, pos, topk_weights, out_dtype):
-    """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden]."""
+def _combine_arrivals(arrivals, arrival_scales, pos, mirror_pos, topk_weights,
+                      out_dtype):
+    """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
+
+    Two tables index two different objects, so each owns its own clamp.
+    `pos` is the arrival ROW: a row of `arrivals`, and on the kernel path
+    below it is a DMA address. `mirror_pos` is a position in the wire's scale
+    mirror, which is [sublanes, tile_m] because a transport can only address
+    the mirror a sublane at a time and a sublane holds tile_m f32 whatever is
+    written in it -- so a whole source TILE's scales are one sublane and the
+    mirror position is NOT the arrival row.
+
+    Where the kernel path applies (kernel.combine_step_tokens) the row gather
+    and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
+    with a SparseCore gather whose output is in HBM at any size, so the rows
+    are written out and read straight back before the sum sees them.
+    Everywhere else the gather is not offloaded and there is no round trip to
+    remove, so the fused XLA epilogue below stays.
+
+    Both paths fold the arrival row's scale and the router weight into one
+    coefficient over K * t_local values, so each of the K * t_local * hidden
+    elements is multiplied once rather than twice.
+    """
     t_local, topk = pos.shape
-    _, lane_blocks, lanes = arrivals.shape
+    recv_rows, lane_blocks, lanes = arrivals.shape
+    mirror_sublanes, tile_m = arrival_scales.shape
     hidden = lane_blocks * lanes
-    arrival_rows = pos.T.reshape(-1)  # k-major [K*t_local]
-    rows_fp8 = arrivals[arrival_rows]  # f8 [K*t, lane blocks, 128]
-    row_scales = arrival_scales[arrival_rows][:, :1]  # f32 row scales
-    weights_f32 = topk_weights.astype(jnp.float32)
+    # A gather clamps an out-of-range index to the last one; a DMA does not,
+    # and a sublane index clamped on its own would pair the last sublane with
+    # the wrong lane. Neither position is ever negative.
+    rows = jnp.minimum(pos, recv_rows - 1)
+    shift = pow2_shift(tile_m, "the mirror's lane count")
+    scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+    row_scales = arrival_scales[jnp.right_shift(scl, shift),
+                                scl & (tile_m - 1)]
+    coef = row_scales * topk_weights.astype(jnp.float32)
+    if combine_step_tokens(t_local):
+        combine = build_combine_kernel(t_local=t_local,
+                                       topk=topk,
+                                       hidden=hidden,
+                                       lane_blocks=lane_blocks,
+                                       wire_dtype=arrivals.dtype,
+                                       out_dtype=out_dtype)
+        return combine(arrivals, coef, rows)
+    rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
+    coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
     for k in range(topk):
         slot_rows = lax.slice(rows_fp8, (k * t_local, 0, 0),
                               ((k + 1) * t_local, lane_blocks, lanes))
-        slot_scales = lax.slice(row_scales, (k * t_local, 0),
-                                ((k + 1) * t_local, 1))
-        terms.append(
-            slot_rows.astype(jnp.float32) * slot_scales[:, :, None] *
-            weights_f32[:, k:k + 1, None])
+        slot_coef = lax.slice(coef_k, (k * t_local, ), ((k + 1) * t_local, ))
+        terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
     return sum(terms).astype(out_dtype).reshape(t_local, hidden)
 
 
-def _pack_routing_blob(topk_idx, row_scale):
-    """Fold idx [t, K] and row scales [t, 1] into one [t, K+1] i32 blob.
+def _exchange_layout(t_local, topk, e_total, quantized):
+    """(scale offset, count offset, width) of the flat routing payload.
 
-    row_scale is None where the rows were never quantized and so carry no
-    scale; the blob is then the indices alone, [t, K].
+    ONE all-gather carries everything the other shards need to know about
+    this shard's tokens: the selections, the row scales the wire quantized
+    them by, and the per-expert pair counts the routing plan exchanges. The
+    plan's own count collective disappears into this one, and the selections
+    arrive already flat -- the pair grid the plan reads is a reshape of the
+    gathered payload rather than a [T, topk] array whose 10 live lanes sit in
+    a 128-lane tile.
+
+    Section starts are lane-block aligned so every unpack slice is a view.
     """
-    # The router weight stays local: the destination combine applies it in
-    # f32 from its own copy, so the wire never carries it.
-    if row_scale is None:
-        return topk_idx.astype(jnp.int32)
-    return jnp.concatenate([
-        topk_idx.astype(jnp.int32),
-        lax.bitcast_convert_type(row_scale.astype(jnp.float32), jnp.int32)
-    ],
-                           axis=1)
+    idx = align_up(t_local * topk, HIDDEN_LANE_BLOCK)
+    scale = align_up(t_local, HIDDEN_LANE_BLOCK) if quantized else 0
+    return idx, idx + scale, idx + scale + e_total
 
 
-def _unpack_routing_blob(blob_g, topk):
-    """Inverse of _pack_routing_blob (bit-exact round trip).
+def _pack_routing_exchange(pairs, scale_bits, counts, layout):
+    """The flat i32 payload: pairs [t*K], row-scale bits [t], counts [E].
 
-    Returns a row scale of None for the blob that carries none.
+    The router weight stays local: the destination combine applies it in f32
+    from its own copy, so the wire never carries it.
     """
-    topk_idx_g = blob_g[:, :topk]
-    if blob_g.shape[1] == topk:
-        return topk_idx_g, None
-    row_scale_g = lax.bitcast_convert_type(blob_g[:, topk:], jnp.float32)
-    return topk_idx_g, row_scale_g
+    scale_at, count_at, _ = layout
+    parts = [pairs, jnp.zeros((scale_at - pairs.size, ), jnp.int32)]
+    if scale_bits is not None:
+        parts += [
+            scale_bits,
+            jnp.zeros((count_at - scale_at - scale_bits.size, ), jnp.int32)
+        ]
+    parts.append(counts)
+    return jnp.concatenate([p for p in parts if p.size])
+
+
+def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
+    """Inverse of _pack_routing_exchange over the gathered [ep, width] rows.
+
+    Returns the gathered pairs [ep, t*K], the row-scale BIT PATTERNS [T] (the
+    scale slab wants them as int32, so nothing is bitcast back) and the
+    [ep, e_total] count table. The bits are None where the payload has none.
+    """
+    scale_at, count_at, _ = layout
+    ep = exchange.shape[0]
+    pairs = lax.slice(exchange, (0, 0), (ep, t_local * topk))
+    scale_bits = None if scale_at == count_at else lax.slice(
+        exchange, (0, scale_at), (ep, scale_at + t_local)).reshape(-1)
+    counts = lax.slice(exchange, (0, count_at), (ep, count_at + e_total))
+    return pairs, scale_bits, counts
 
 
 def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
@@ -111,6 +168,13 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
                                mesh_block)
     return mesh_block * g_local + topk_idx % g_local
 
+
+# Local tokens at or above which the activation all-gather is enqueued ahead
+# of the slab scatters. Measured, not chosen: +2.80% at t_local 2048 and
+# -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the scatters
+# lose ~90 us of cover to buy a ~129 us hoist and only the largest shape's
+# plan is long enough to pay for it.
+AGQ_MIN_LOCAL_TOKENS = 1024
 
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
@@ -321,13 +385,32 @@ def fused_ep_moe_v2(x,
         # host, which is how this repository verifies that a change served
         # the same program. A counter belongs in a metrics channel outside
         # the trace.
-        # One all-gather carries the indices and, where the rows were
-        # quantized, their row scales, packed into one integer blob.
-        blob_g = lax.all_gather(_pack_routing_blob(topk_idx, row_scale_l),
-                                ax,
-                                axis=0,
-                                tiled=True)
-        topk_idx_g, row_scale_g = _unpack_routing_blob(blob_g, topk)
+        # One all-gather carries the indices, the row scales where the rows
+        # were quantized, and the per-expert pair counts the routing plan
+        # would otherwise exchange in a collective of its own.
+        local_blocks = topk_idx.astype(jnp.int32).reshape(
+            t_local * topk // block, block)
+        block_hist = pair_block_hist(local_blocks, e_total)
+        scale_bits_l = None if row_scale_l is None else (
+            lax.bitcast_convert_type(row_scale_l[:, 0].astype(jnp.float32),
+                                     jnp.int32))
+        layout = _exchange_layout(t_local, topk, e_total,
+                                  form.quantized_activations)
+        exchange = lax.all_gather(_pack_routing_exchange(
+            local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0),
+            layout),
+                                  ax,
+                                  axis=0,
+                                  tiled=True).reshape(ep, layout[-1])
+        pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
+            exchange, layout, t_local, topk, e_total)
+        gathered = GatheredPairs(expert_blocks=pairs_g.reshape(
+            T * topk // block, block),
+                                 local_blocks=local_blocks,
+                                 block_hist=block_hist,
+                                 rows_by_dest=rows_by_dest,
+                                 n_tokens=T,
+                                 topk=topk)
 
         plan_kw = dict(e_total=e_total,
                        ep=ep,
@@ -336,14 +419,12 @@ def fused_ep_moe_v2(x,
                        tile_m=capacity,
                        shard_stride=ragged_stride)
         if sharded_plan:
-            routing = build_routing_tables_sharded(
-                topk_idx_g,
-                me,
-                all_gather_rows=lambda row: lax.all_gather(
-                    row, ax, axis=0, tiled=True),
-                **plan_kw)
+            routing = build_routing_tables_sharded(None,
+                                                   me,
+                                                   gathered=gathered,
+                                                   **plan_kw)
         else:
-            routing = build_routing_tables(topk_idx_g, **plan_kw)
+            routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
         block_tables = shard_transport_tables_in_blocks(routing,
                                                         me,
                                                         e_total=e_total,
@@ -356,9 +437,19 @@ def fused_ep_moe_v2(x,
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+        # The two slab scatters and the activation all-gather are offloaded to
+        # the SAME SparseCore. Ordering the scatters behind the collective
+        # enqueues it 129 us earlier and costs them the cover they had; that
+        # trade measures +2.80% at 2048 local tokens and negative at every
+        # smaller shape, so it is taken only where the routing plan in front
+        # of the collective is longer than the scatters behind it. Same bits
+        # either way; only the queue moves.
+        if t_local >= AGQ_MIN_LOCAL_TOKENS:
+            slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         token_gather = shard_token_gather(routing,
                                           me,
-                                          shard_stride=ragged_stride)
+                                          shard_stride=ragged_stride,
+                                          rows=slab_row)
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard
@@ -381,8 +472,7 @@ def fused_ep_moe_v2(x,
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
         if form.quantized_activations:
-            scale_bits = lax.bitcast_convert_type(
-                jnp.repeat(row_scale_g[:, 0], topk), jnp.int32)
+            scale_bits = jnp.repeat(scale_bits_g, topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK, ),
@@ -444,8 +534,11 @@ def fused_ep_moe_v2(x,
         # The destination's own table: one arrival row per selection slot.
         pos = routing.pos if sharded_plan else lax.dynamic_slice(
             routing.arrival_row, (me * t_local, 0), (t_local, topk))
-        return _combine_arrivals(arrivals, arrival_scales, pos, topk_weights,
-                                 x_l.dtype)
+        mirror_pos = routing.mirror_pos if sharded_plan else \
+            lax.dynamic_slice(routing.mirror_row, (me * t_local, 0),
+                              (t_local, topk))
+        return _combine_arrivals(arrivals, arrival_scales, pos, mirror_pos,
+                                 topk_weights, x_l.dtype)
 
     # The biases ride the same expert-axis sharding as the weights they
     # belong to, so no shard ever holds a bias for an expert it does not own.

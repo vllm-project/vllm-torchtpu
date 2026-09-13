@@ -37,6 +37,7 @@ ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
 the blockwise Pallas kernel path instead.
 """
 
+from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -333,6 +334,53 @@ def _quantize_and_format_single_moe_weight(
     return w, w_scale
 
 
+# Bytes of the float32 copy one requantization chunk dequantizes at a time.
+# The quantized chunk, its scales and the formatting temporaries come on top.
+_REQUANT_CHUNK_BYTES = 1 << 30
+
+
+def _requantize_expert_chunks(
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    dequantize: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
+    zero_padding: Callable[[torch.Tensor], None] | None,
+    **format_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Dequantize, requantize and format ``weight`` a few experts at a time.
+
+    The float32 copy of a whole expert tensor can be several times the
+    device memory left after loading (one layer of a 160-expert model with
+    no expert parallelism is 4.7 GB in FP8), so every chunk is materialized
+    before the next one starts and only the quantized results are
+    concatenated.
+    One concatenation joins the chunks rather than slice writes into a
+    preallocated tensor: on TPU an in-place slice write is a program that
+    rewrites the whole tensor, once per chunk.
+    """
+    num_experts = weight.shape[0]
+    per_expert = weight[0].numel() * 4
+    per_chunk = max(1, _REQUANT_CHUNK_BYTES // per_expert)
+    weights, scales = [], []
+    for start in range(0, num_experts, per_chunk):
+        end = min(start + per_chunk, num_experts)
+        fp32 = dequantize(weight[start:end],
+                          None if scale is None else scale[start:end])
+        if zero_padding is not None:
+            zero_padding(fp32)
+        w, w_scale = _quantize_and_format_single_moe_weight(
+            fp32, **format_kwargs)
+        del fp32
+        if per_chunk < num_experts and w.device.type == "tpu":
+            synchronize_tensors([w] if w_scale is None else [w, w_scale])
+        weights.append(w)
+        scales.append(w_scale)
+    if len(weights) == 1:
+        return weights[0], scales[0]
+    w = torch.cat(weights, dim=0)
+    w_scale = None if scales[0] is None else torch.cat(scales, dim=0)
+    return w, w_scale
+
+
 def _quantize_and_format_moe_weights(
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -410,86 +458,73 @@ def _process_fp8_moe_weights(
                     "FP8 block quantized MoE weights must be divisible by the checkpoint "
                     f"block size, got {name}.shape={tuple(weight.shape)} and "
                     f"block_size={weight_block_size}.")
-        w13_fp32 = dequantize_tensor(
-            layer.w13_weight.data,
-            w13_scale_param.data,
-            axis=(1, 2),
-            out_dtype=torch.float32,
-        )
-        if needs_padding and local_real < padded_intermediate:
+
+    zero_w13 = zero_w2 = None
+    if needs_padding and local_real < padded_intermediate:
+
+        def zero_w13(w13_fp32: torch.Tensor) -> None:
             w13_fp32[:, local_real:padded_intermediate, :] = 0
             w13_fp32[:, padded_intermediate + local_real:2 *
                      padded_intermediate, :] = 0
 
-        w13, w13_scale = _quantize_and_format_single_moe_weight(
-            w13_fp32,
-            name="w13",
-            quant_dtype=requant_dtype,
-            block_size=requant_block_size,
-            activation=activation,
-        )
-        del w13_fp32
-
-        w2_fp32 = dequantize_tensor(
-            layer.w2_weight.data,
-            w2_scale_param.data,
-            axis=(1, 2),
-            out_dtype=torch.float32,
-        )
-        if needs_padding and local_real < padded_intermediate:
+        def zero_w2(w2_fp32: torch.Tensor) -> None:
             w2_fp32[:, :, local_real:padded_intermediate] = 0
 
-        w2, w2_scale = _quantize_and_format_single_moe_weight(
-            w2_fp32,
-            name="w2",
-            quant_dtype=requant_dtype,
-            block_size=requant_block_size,
-            activation=activation,
-        )
-        del w2_fp32
+    if weight_block_size is not None:
+
+        def dequantize_w13(w_q: torch.Tensor,
+                           scale: torch.Tensor) -> torch.Tensor:
+            return dequantize_tensor(w_q,
+                                     scale,
+                                     axis=(1, 2),
+                                     out_dtype=torch.float32)
+
+        dequantize_w2 = dequantize_w13
     else:
-        w13_q = layer.w13_weight.data.to(torch.float32)
-        s13 = w13_scale_param.data.to(torch.float32)
-        if s13.ndim == 2 and s13.shape[1] == 2:
-            half = w13_q.shape[1] // 2
-            s13 = s13.repeat_interleave(half, dim=1).unsqueeze(-1)
-        elif s13.ndim == 2 and s13.shape[1] == w13_q.shape[1]:
-            s13 = s13.unsqueeze(-1)
-        elif s13.ndim == 1:
-            s13 = s13.view(-1, 1, 1)
-        w13_fp32 = w13_q * s13
-        if needs_padding and local_real < padded_intermediate:
-            w13_fp32[:, local_real:padded_intermediate, :] = 0
-            w13_fp32[:, padded_intermediate + local_real:2 *
-                     padded_intermediate, :] = 0
 
-        w13, w13_scale = _quantize_and_format_single_moe_weight(
-            w13_fp32,
-            name="w13",
-            quant_dtype=requant_dtype,
-            block_size=requant_block_size,
-            activation=activation,
-        )
-        del w13_fp32
+        def dequantize_w13(w_q: torch.Tensor,
+                           scale: torch.Tensor) -> torch.Tensor:
+            w_q = w_q.to(torch.float32)
+            s13 = scale.to(torch.float32)
+            if s13.ndim == 2 and s13.shape[1] == 2:
+                half = w_q.shape[1] // 2
+                s13 = s13.repeat_interleave(half, dim=1).unsqueeze(-1)
+            elif s13.ndim == 2 and s13.shape[1] == w_q.shape[1]:
+                s13 = s13.unsqueeze(-1)
+            elif s13.ndim == 1:
+                s13 = s13.view(-1, 1, 1)
+            return w_q * s13
 
-        w2_q = layer.w2_weight.data.to(torch.float32)
-        s2 = w2_scale_param.data.to(torch.float32)
-        if s2.ndim == 2 and s2.shape[1] == w2_q.shape[1]:
-            s2 = s2.unsqueeze(-1)
-        elif s2.ndim == 1:
-            s2 = s2.view(-1, 1, 1)
-        w2_fp32 = w2_q * s2
-        if needs_padding and local_real < padded_intermediate:
-            w2_fp32[:, :, local_real:padded_intermediate] = 0
+        def dequantize_w2(w_q: torch.Tensor,
+                          scale: torch.Tensor) -> torch.Tensor:
+            w_q = w_q.to(torch.float32)
+            s2 = scale.to(torch.float32)
+            if s2.ndim == 2 and s2.shape[1] == w_q.shape[1]:
+                s2 = s2.unsqueeze(-1)
+            elif s2.ndim == 1:
+                s2 = s2.view(-1, 1, 1)
+            return w_q * s2
 
-        w2, w2_scale = _quantize_and_format_single_moe_weight(
-            w2_fp32,
-            name="w2",
-            quant_dtype=requant_dtype,
-            block_size=requant_block_size,
-            activation=activation,
-        )
-        del w2_fp32
+    w13, w13_scale = _requantize_expert_chunks(
+        layer.w13_weight.data,
+        w13_scale_param.data,
+        dequantize_w13,
+        zero_w13,
+        name="w13",
+        quant_dtype=requant_dtype,
+        block_size=requant_block_size,
+        activation=activation,
+    )
+    w2, w2_scale = _requantize_expert_chunks(
+        layer.w2_weight.data,
+        w2_scale_param.data,
+        dequantize_w2,
+        zero_w2,
+        name="w2",
+        quant_dtype=requant_dtype,
+        block_size=requant_block_size,
+        activation=activation,
+    )
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
@@ -508,25 +543,29 @@ def _quantize_bf16_moe_weights(
     desired_quant_dtype, requant_dtype, requant_block_size = (
         _get_moe_quant_config("[MoE online FP8]: quantizing BF16 MoE weights"))
 
-    w13_fp32 = layer.w13_weight.data.to(torch.float32)
-    w13, w13_scale = _quantize_and_format_single_moe_weight(
-        w13_fp32,
+    def to_fp32(w: torch.Tensor, _scale: torch.Tensor | None) -> torch.Tensor:
+        return w.to(torch.float32)
+
+    w13, w13_scale = _requantize_expert_chunks(
+        layer.w13_weight.data,
+        None,
+        to_fp32,
+        None,
         name="w13",
         quant_dtype=requant_dtype,
         block_size=requant_block_size,
         activation=activation,
     )
-    del w13_fp32
-
-    w2_fp32 = layer.w2_weight.data.to(torch.float32)
-    w2, w2_scale = _quantize_and_format_single_moe_weight(
-        w2_fp32,
+    w2, w2_scale = _requantize_expert_chunks(
+        layer.w2_weight.data,
+        None,
+        to_fp32,
+        None,
         name="w2",
         quant_dtype=requant_dtype,
         block_size=requant_block_size,
         activation=activation,
     )
-    del w2_fp32
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 

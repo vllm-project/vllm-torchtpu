@@ -20,6 +20,8 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.platforms.pp_validation import \
+    validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
 
@@ -387,11 +389,12 @@ def apply_tpu_patches() -> None:
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import (
         patch_default_loader_ep_weight_filter,
-        patch_default_model_loader_page_cache,
+        patch_default_model_loader_page_cache, patch_moe_expert_write_staging,
         patch_runai_sharded_expert_streaming)
     patch_runai_sharded_expert_streaming()
     patch_default_loader_ep_weight_filter()
     patch_default_model_loader_page_cache()
+    patch_moe_expert_write_staging()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -871,6 +874,15 @@ class TpuPlatform(Platform):
         if pcp_config.enabled:
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
+        validate_pipeline_parallel_config(vllm_config)
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
+            # get the hand-off push here; engine-core processes install it
+            # again on their side.
+            from vllm_torchtpu.distributed.pp_push import \
+                patch_executor_for_pp_wave
+            patch_executor_for_pp_wave(vllm_config)
+            _configure_pipeline_chunks(vllm_config)
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
@@ -1259,6 +1271,37 @@ def _get_exponential_token_paddings(min_token_size: int,
         num *= 2
     paddings.append(max_token_size)
     return paddings
+
+
+def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
+    """Install the time-budget scheduler for a pipeline and the engine-core
+    hook that times the stages. Off when the env disables it, when the DP
+    scheduler or another scheduler is configured, or when chunked prefill is
+    disabled."""
+    from vllm_torchtpu.core.pp_chunk_scheduler import (
+        SCHEDULER_CLS, patch_engine_core_for_pp_chunks)
+    scheduler_config = vllm_config.scheduler_config
+    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+        return
+    if (envs.DP_SCHED_ENABLED
+            and vllm_config.parallel_config.data_parallel_size > 1):
+        logger.warning(
+            "Pipeline chunk sizing is off: the DP scheduler is enabled.")
+        return
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+        logger.warning(
+            "Pipeline chunk sizing is off: scheduler %s is configured.",
+            scheduler_config.scheduler_cls)
+        return
+    if not scheduler_config.enable_chunked_prefill:
+        logger.warning(
+            "Pipeline chunk sizing is off: chunked prefill is disabled.")
+        return
+    if envs.TPU_PP_CHUNK_SLACK < 0:
+        raise ValueError("TPU_PP_CHUNK_SLACK must not be negative: "
+                         f"{envs.TPU_PP_CHUNK_SLACK}")
+    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    patch_engine_core_for_pp_chunks(vllm_config)
 
 
 def _get_token_paddings(

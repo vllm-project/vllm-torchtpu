@@ -192,6 +192,7 @@ class TestTpuCompilerCache:
             "TPU_NODE_ID",
             "TPU_P2P_WAIT_PULL_TIMEOUT",
             "TPU_RAIDEN_INLINE_LOAD",
+            "TPU_RAIDEN_POOL_STAGING_LEASES",
             "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
             "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
             "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
