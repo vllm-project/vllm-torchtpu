@@ -615,6 +615,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model",
                         default=os.environ.get("SERVED_MODEL_NAME",
                                                "Qwen3.5-35B-A3B-FP8"))
+    parser.add_argument(
+        "--namespace",
+        help="Stable prompt namespace for priming and measured invocations.",
+    )
     parser.add_argument("--timeout",
                         type=int,
                         default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600))
@@ -662,7 +666,7 @@ def main() -> int:
     if args.quick_probe_only:
         return run_quick_probe(url, args.model, args.timeout)
 
-    namespace = f"pc-correctness-{time.time_ns()}"
+    namespace = args.namespace or f"pc-correctness-{time.time_ns()}"
     if args.prefix_hit_probe_only:
         requests, failures = run_repeat_consistency(
             url,

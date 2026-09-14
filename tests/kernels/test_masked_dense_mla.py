@@ -16,7 +16,7 @@
 The kernel streams the paged KV cache and masks the scores with the indexer's
 `topk_indices`, so the reference is a plain float32 numpy attention over
 exactly the KV rows each token selected -- the same reference shape
-`tests/layers/common/test_sparse_mla_attention.py` uses for the gather kernel.
+`tests/layers/core/test_sparse_mla_attention.py` uses for the gather kernel.
 
 The caches are built through `update_sparse_mla_kv_cache`, i.e. the same insert
 path the model runs, so a layout mistake in either the insert or the kernel's

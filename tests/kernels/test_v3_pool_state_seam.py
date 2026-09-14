@@ -565,7 +565,7 @@ class TestPooledCallerV3:
 
     def test_bf16_ssm_round_trips_through_fp8_pool(self):
         gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
+            "vllm_torchtpu.layers.core.gdn_attention")
         n = 4
         pool_idx = jnp.arange(1, n + 1, dtype=jnp.int32)
         dense_idx = jnp.arange(n, dtype=jnp.int32)
@@ -634,7 +634,7 @@ class TestPooledCallerV3:
 
     def test_caller_matches_roundtrip(self):
         gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
+            "vllm_torchtpu.layers.core.gdn_attention")
         n = 4
         idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         keys = iter(jax.random.split(jax.random.key(14), 2))
@@ -685,7 +685,7 @@ class TestPooledCallerV3:
         monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
+            "vllm_torchtpu.layers.core.gdn_attention")
         n = 4
         pool_idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         dense_idx = jnp.arange(n, dtype=jnp.int32)

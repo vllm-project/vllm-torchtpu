@@ -17,7 +17,7 @@ def test_submodule_imports_before_vllm_initialization_completes():
         [
             sys.executable,
             "-c",
-            "import vllm_torchtpu.layers.vllm.quantization.fp8; import vllm",
+            "import vllm_torchtpu.layers.adapter.quantization.fp8; import vllm",
         ],
         capture_output=True,
         text=True,

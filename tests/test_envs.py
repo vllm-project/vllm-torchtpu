@@ -26,6 +26,7 @@ def vllm_config():
     config.parallel_config.nnodes = 1
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.pipeline_parallel_size = 1
     config.kv_transfer_config = None
     return config
 
@@ -39,7 +40,7 @@ def test_startup_rejects_the_removed_knob(monkeypatch, vllm_config, value):
         TpuPlatform.check_and_update_config(vllm_config)
 
 
-@patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+@patch("vllm_torchtpu.patch_registry.apply")
 @patch("vllm_torchtpu.platforms.tpu_platform."
        "TpuPlatform._prepare_singlehost_tpu_env")
 def test_startup_accepts_the_knob_unset(mock_prepare_env, mock_apply_patches,

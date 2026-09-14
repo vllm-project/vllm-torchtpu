@@ -6,8 +6,8 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec)
 
 from vllm_torchtpu.gdn_pool_layout import pooled_gdn_state_dtypes
-from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
+                                                    PallasMLAttentionBackend)
 
 
 def normalize_kv_cache_specs_for_tpu(

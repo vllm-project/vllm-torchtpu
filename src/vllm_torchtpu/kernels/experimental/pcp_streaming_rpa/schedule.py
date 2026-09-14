@@ -334,122 +334,115 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         partial = jnp.clip(cycle_offset - rank_start, 0, interleave_size_i32)
         return full_cycles * interleave_size_i32 + partial
 
-    tile_req_ids = []
-    tile_q_global_starts = []
-    tile_q_sizes = []
-    tile_q_hbm_offsets = []
-    tile_token_owner_starts = []
-    tile_request_absolute_query_starts = []
-    tile_current_effective_lens = []
-    tile_current_kv_hbm_starts = []
-    tile_writeback_hbm_prefixes = []
-    tile_capture_current_kv = []
-    tile_current_num_groups = []
-    tile_history_num_groups = []
+    # Construct the fixed-capacity request/tile/rank plan as one vectorized
+    # program.  The previous request x tile x rank Python loops emitted one
+    # copy of the scheduling arithmetic for every static slot (64 x 10 x 8 for
+    # the production Qwen shape), inflating StableHLO by hundreds of thousands
+    # of ops even though the computation is elementwise.  The flattened order
+    # below remains request-major, tile-major, rank-minor, so the Pallas ABI and
+    # runtime schedule are unchanged.
+    request_indices = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    tile_indices = jnp.arange(max_q_tiles, dtype=jnp.int32)
+    rank_indices = jnp.arange(pcp_size, dtype=jnp.int32)
 
-    rank_local_q_prefixes = jnp.zeros((pcp_size, ), dtype=jnp.int32)
-    rank_writeback_prefixes = jnp.zeros((pcp_size, ), dtype=jnp.int32)
-    for req_idx in range(max_num_seqs):
-        q_len_raw = cu_q_lens[req_idx + 1] - cu_q_lens[req_idx]
-        req_active = jnp.logical_and(req_idx < active_num_reqs, q_len_raw > 0)
-        q_len = jnp.where(req_active, q_len_raw, 0)
-        kv_len = jnp.where(req_active, kv_lens[req_idx], 0)
-        request_absolute_query_start = jnp.where(req_active, kv_len - q_len, 0)
-        token_owner_start = cu_q_lens[req_idx]
-        request_rank_local_q_starts = rank_local_q_prefixes
-        request_writeback_starts = rank_writeback_prefixes
-        full_history_num_groups = (request_absolute_query_start //
-                                   virtual_page_size_i32)
-        has_history_boundary = (request_absolute_query_start %
-                                virtual_page_size_i32 != 0)
+    q_len_raw = cu_q_lens[1:] - cu_q_lens[:-1]
+    req_active = jnp.logical_and(request_indices < active_num_reqs, q_len_raw
+                                 > 0)
+    q_len = jnp.where(req_active, q_len_raw, 0)
+    kv_len = jnp.where(req_active, kv_lens, 0)
+    request_absolute_query_start = jnp.where(req_active, kv_len - q_len, 0)
+    token_owner_start = cu_q_lens[:-1]
+    request_absolute_query_end = request_absolute_query_start + q_len
 
-        for tile_idx in range(max_q_tiles):
-            q_global_starts = []
-            q_hbm_offsets = []
-            q_sizes = []
-            current_effective_len = jnp.asarray(0, dtype=jnp.int32)
-            for consumer_rank in range(pcp_size):
-                q_global_start, q_tile_size, q_hbm_offset = _rank_tile(
-                    q_len,
-                    token_owner_start,
-                    request_absolute_query_start,
-                    request_rank_local_q_starts[consumer_rank],
-                    consumer_rank,
-                    tile_idx,
-                )
-                q_global_starts.append(q_global_start)
-                q_hbm_offsets.append(q_hbm_offset)
-                q_sizes.append(q_tile_size)
-                q_last_row = jnp.maximum(q_tile_size - 1, 0)
-                q_global_last = (
-                    q_global_start +
-                    (q_last_row // interleave_size_i32) * cycle_i32 +
-                    (q_last_row % interleave_size_i32))
-                request_relative_end = (q_global_last -
-                                        request_absolute_query_start + 1)
-                request_relative_end = jnp.where(q_tile_size > 0,
-                                                 request_relative_end, 0)
-                current_effective_len = jnp.maximum(current_effective_len,
-                                                    request_relative_end)
+    # Prefixes are the exclusive cumulative counts of all earlier requests.
+    # Computing every request's count first removes the only apparent loop
+    # carried state from the original implementation.
+    request_q_len = q_len[:, None]
+    request_token_owner_start = token_owner_start[:, None]
+    request_ranks = rank_indices[None, :]
+    *_, local_counts = _rank_request_layout(
+        request_q_len,
+        request_token_owner_start,
+        request_ranks,
+    )
+    local_counts = jnp.where(req_active[:, None], local_counts, 0)
+    rank_local_q_ends = jnp.cumsum(local_counts, axis=0)
+    request_rank_local_q_starts = rank_local_q_ends - local_counts
 
-            tile_active = current_effective_len > 0
-            owner_cycle_offset = jnp.mod(token_owner_start, cycle_i32)
-            current_num_groups = jnp.where(
-                tile_active,
-                (owner_cycle_offset + current_effective_len + cycle_i32 - 1) //
-                cycle_i32 + has_history_boundary.astype(jnp.int32),
-                0,
-            )
-            history_num_groups = jnp.where(
-                tile_active,
-                full_history_num_groups,
-                0,
-            )
-            capture_current_kv = jnp.logical_and(
-                tile_active, current_effective_len == q_len).astype(jnp.int32)
+    writeback_counts = (
+        _rank_token_count_before(request_absolute_query_end[:, None],
+                                 request_ranks) -
+        _rank_token_count_before(request_absolute_query_start[:, None],
+                                 request_ranks))
+    writeback_counts = jnp.where(req_active[:, None], writeback_counts, 0)
+    rank_writeback_ends = jnp.cumsum(writeback_counts, axis=0)
+    request_writeback_starts = rank_writeback_ends - writeback_counts
 
-            tile_req_ids.append(jnp.asarray(req_idx, dtype=jnp.int32))
-            tile_q_global_starts.append(jnp.stack(q_global_starts))
-            tile_q_sizes.append(jnp.stack(q_sizes))
-            tile_q_hbm_offsets.append(jnp.stack(q_hbm_offsets))
-            tile_token_owner_starts.append(token_owner_start)
-            tile_request_absolute_query_starts.append(
-                request_absolute_query_start)
-            tile_current_effective_lens.append(current_effective_len)
-            tile_current_kv_hbm_starts.append(request_rank_local_q_starts)
-            tile_writeback_hbm_prefixes.append(request_writeback_starts)
-            tile_capture_current_kv.append(capture_current_kv)
-            tile_current_num_groups.append(current_num_groups)
-            tile_history_num_groups.append(history_num_groups)
+    # Broadcast all request/tile/rank coordinates into [request, tile, rank].
+    q_global_starts, q_sizes, q_hbm_offsets = _rank_tile(
+        q_len[:, None, None],
+        token_owner_start[:, None, None],
+        request_absolute_query_start[:, None, None],
+        request_rank_local_q_starts[:, None, :],
+        rank_indices[None, None, :],
+        tile_indices[None, :, None],
+    )
+    q_last_row = jnp.maximum(q_sizes - 1, 0)
+    q_global_last = (q_global_starts +
+                     (q_last_row // interleave_size_i32) * cycle_i32 +
+                     (q_last_row % interleave_size_i32))
+    request_relative_end = (q_global_last -
+                            request_absolute_query_start[:, None, None] + 1)
+    request_relative_end = jnp.where(q_sizes > 0, request_relative_end, 0)
+    current_effective_lens = jnp.max(request_relative_end, axis=-1)
 
-        local_counts = []
-        writeback_counts = []
-        request_absolute_query_end = request_absolute_query_start + q_len
-        for rank in range(pcp_size):
-            *_, local_count = _rank_request_layout(q_len, token_owner_start,
-                                                   rank)
-            local_counts.append(jnp.where(req_active, local_count, 0))
-            cache_count = (
-                _rank_token_count_before(request_absolute_query_end, rank) -
-                _rank_token_count_before(request_absolute_query_start, rank))
-            writeback_counts.append(jnp.where(req_active, cache_count, 0))
-        rank_local_q_prefixes = rank_local_q_prefixes + jnp.stack(local_counts)
-        rank_writeback_prefixes = (rank_writeback_prefixes +
-                                   jnp.stack(writeback_counts))
+    tile_active = current_effective_lens > 0
+    owner_cycle_offset = jnp.mod(token_owner_start, cycle_i32)[:, None]
+    has_history_boundary = (request_absolute_query_start %
+                            virtual_page_size_i32 != 0)[:, None]
+    full_history_num_groups = (request_absolute_query_start //
+                               virtual_page_size_i32)[:, None]
+    current_num_groups = jnp.where(
+        tile_active,
+        (owner_cycle_offset + current_effective_lens + cycle_i32 - 1) //
+        cycle_i32 + has_history_boundary.astype(jnp.int32),
+        0,
+    )
+    history_num_groups = jnp.where(tile_active, full_history_num_groups, 0)
+    capture_current_kv = jnp.logical_and(
+        tile_active,
+        current_effective_lens == q_len[:, None],
+    ).astype(jnp.int32)
 
-    tile_req_ids = jnp.stack(tile_req_ids)
-    tile_q_global_starts = jnp.stack(tile_q_global_starts)
-    tile_q_sizes = jnp.stack(tile_q_sizes)
-    tile_q_hbm_offsets = jnp.stack(tile_q_hbm_offsets)
-    tile_token_owner_starts = jnp.stack(tile_token_owner_starts)
-    tile_request_absolute_query_starts = jnp.stack(
-        tile_request_absolute_query_starts)
-    tile_current_effective_lens = jnp.stack(tile_current_effective_lens)
-    tile_current_kv_hbm_starts = jnp.stack(tile_current_kv_hbm_starts)
-    tile_writeback_hbm_prefixes = jnp.stack(tile_writeback_hbm_prefixes)
-    tile_capture_current_kv = jnp.stack(tile_capture_current_kv)
-    current_num_groups = jnp.stack(tile_current_num_groups)
-    history_num_groups = jnp.stack(tile_history_num_groups)
+    num_request_tiles = max_num_seqs * max_q_tiles
+    tile_req_ids = jnp.broadcast_to(
+        request_indices[:, None],
+        (max_num_seqs, max_q_tiles),
+    ).reshape(num_request_tiles)
+    tile_q_global_starts = q_global_starts.reshape(num_request_tiles, pcp_size)
+    tile_q_sizes = q_sizes.reshape(num_request_tiles, pcp_size)
+    tile_q_hbm_offsets = q_hbm_offsets.reshape(num_request_tiles, pcp_size)
+    tile_token_owner_starts = jnp.broadcast_to(
+        token_owner_start[:, None],
+        (max_num_seqs, max_q_tiles),
+    ).reshape(num_request_tiles)
+    tile_request_absolute_query_starts = jnp.broadcast_to(
+        request_absolute_query_start[:, None],
+        (max_num_seqs, max_q_tiles),
+    ).reshape(num_request_tiles)
+    tile_current_effective_lens = current_effective_lens.reshape(
+        num_request_tiles)
+    tile_current_kv_hbm_starts = jnp.broadcast_to(
+        request_rank_local_q_starts[:, None, :],
+        (max_num_seqs, max_q_tiles, pcp_size),
+    ).reshape(num_request_tiles, pcp_size)
+    tile_writeback_hbm_prefixes = jnp.broadcast_to(
+        request_writeback_starts[:, None, :],
+        (max_num_seqs, max_q_tiles, pcp_size),
+    ).reshape(num_request_tiles, pcp_size)
+    tile_capture_current_kv = capture_current_kv.reshape(num_request_tiles)
+    current_num_groups = current_num_groups.reshape(num_request_tiles)
+    history_num_groups = history_num_groups.reshape(num_request_tiles)
     num_tiles = tile_req_ids.shape[0]
 
     def _broadcast_tile(values):

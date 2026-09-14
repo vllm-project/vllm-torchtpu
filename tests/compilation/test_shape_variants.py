@@ -495,3 +495,14 @@ def test_env_override_keeps_the_mega_artifact_off():
         # The write only means something while vLLM still reads this name.
         assert "VLLM_USE_MEGA_AOT_ARTIFACT" in vllm.envs.environment_variables
         assert vllm.envs.VLLM_USE_MEGA_AOT_ARTIFACT is False
+
+
+@pytest.mark.parametrize("field", ["guards", "expr"])
+def test_missing_guard_field_cannot_accept_a_bucket(field):
+    symbol = sympy.Symbol("s0", integer=True)
+    guard = SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))
+    env = SimpleNamespace(var_to_range={symbol: ValueRanges(2, 8192)},
+                          guards=[guard])
+    delattr(env if field == "guards" else guard, field)
+    with pytest.raises(AttributeError, match=field):
+        unsupported_reason(env, 2048)

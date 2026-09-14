@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly xprof capture for DeepSeek-V4-Flash. Serve geometry matches
 # deepseek-v4-flash-dp8-ep; the workload and the profiler differ.
-MODEL="deepseek-ai/DeepSeek-V4-Flash"
+MODEL="deepseek-ai/DeepSeek-V4-Flash-0731"
 TENSOR_PARALLELISM=1
 DATA_PARALLELISM=8
 ENABLE_EP=true
@@ -39,7 +39,8 @@ PROFILE_GCS_BASE="gs://$PROFILE_GCS_BUCKET/$PROFILE_GCS_PATH"
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
 SERVER_READY_WAIT_MIN=120
 
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash\"}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\"}"
 
 BENCHMARK_TEMPERATURE=0
-EVAL_TOLERANCE="0.02"
+# todo(patemotter) decrease tolerance to 0.02 once we have more nightly results
+EVAL_TOLERANCE="0.03"

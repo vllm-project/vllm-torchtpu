@@ -29,6 +29,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
     broadcast_minor, convert_to_target_bitwidth, get_dtype_packing,
     strided_load)
@@ -41,6 +43,8 @@ ONLINE_STATE_INIT_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE = 512
 TPU_HBM_ROW_TILE = 16
 ONLINE_STATE_PADDED_LANES = 128
+TPU_KV_DMA_ALIGNMENT = 128
+KVLayout = batched_rpa_configs.KVLayout
 
 
 def _pcp_write_captured_kv_kernel(
@@ -81,17 +85,74 @@ def _pcp_write_captured_kv_kernel(
         copy_op.wait()
 
 
+def _pcp_write_captured_kv_seq_along_lane_kernel(
+    num_segments_ref,
+    segment_descriptors_ref,
+    captured_kv_ref,
+    kv_cache_in_ref,
+    kv_cache_out_ref,
+    dma_sem,
+):
+    """Scatter sequence-last captured KV into page-bounded cache slices."""
+    del kv_cache_in_ref
+    num_segments = jnp.clip(num_segments_ref[0], 0,
+                            segment_descriptors_ref.shape[1])
+    page_size = kv_cache_out_ref.shape[-1]
+
+    def _copy_op(segment_idx):
+        source_start = pl.multiple_of(segment_descriptors_ref[0, segment_idx],
+                                      TPU_KV_DMA_ALIGNMENT)
+        destination_start = segment_descriptors_ref[1, segment_idx]
+        segment_len = pl.multiple_of(segment_descriptors_ref[2, segment_idx],
+                                     TPU_KV_DMA_ALIGNMENT)
+        destination_page = destination_start // page_size
+        destination_offset = pl.multiple_of(destination_start % page_size,
+                                            TPU_KV_DMA_ALIGNMENT)
+        return pltpu.make_async_copy(
+            src_ref=captured_kv_ref.at[
+                :,
+                :,
+                :,
+                pl.ds(source_start, segment_len),
+            ],
+            dst_ref=kv_cache_out_ref.at[
+                destination_page,
+                :,
+                :,
+                :,
+                pl.ds(destination_offset, segment_len),
+            ],
+            sem=dma_sem,
+        )
+
+    @pl.loop(0, num_segments)
+    def _start_segment(segment_idx):
+        _copy_op(segment_idx).start()
+
+    @pl.loop(0, num_segments)
+    def _wait_segment(segment_idx):
+        _copy_op(segment_idx).wait()
+
+
 def write_captured_kv_to_local_cache(
     kv_cache: jax.Array,
     captured_kv: jax.Array,
     segment_descriptors: jax.Array,
     num_segments: jax.Array,
+    *,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> jax.Array:
     """Write ring-captured KV with one single-output donated Pallas call."""
     if kv_cache.ndim < 2:
         raise ValueError(
             f"KV cache must have at least two dims: {kv_cache.shape}.")
-    if captured_kv.shape[1:] != kv_cache.shape[2:]:
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        if captured_kv.shape[:-1] != kv_cache.shape[1:-1]:
+            raise ValueError(
+                "SEQ_ALONG_LANE captured KV prefix must match the paged cache "
+                f"head layout: {captured_kv.shape[:-1]} vs "
+                f"{kv_cache.shape[1:-1]}.")
+    elif captured_kv.shape[1:] != kv_cache.shape[2:]:
         raise ValueError("Captured KV tail must match the paged cache tail: "
                          f"{captured_kv.shape[1:]} vs {kv_cache.shape[2:]}.")
     if segment_descriptors.ndim != 2 or segment_descriptors.shape[0] != 3:
@@ -99,12 +160,18 @@ def write_captured_kv_to_local_cache(
             "KV writeback segment descriptors must have shape [3, segments], "
             f"got {segment_descriptors.shape}.")
 
-    flat_cache = kv_cache.reshape((-1, *kv_cache.shape[2:]))
     num_segments = jnp.asarray(num_segments, dtype=jnp.int32).reshape((1, ))
     segment_descriptors = jnp.asarray(segment_descriptors, dtype=jnp.int32)
-    updated_flat_cache = pl.pallas_call(
-        _pcp_write_captured_kv_kernel,
-        out_shape=jax.ShapeDtypeStruct(flat_cache.shape, flat_cache.dtype),
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        write_kernel = _pcp_write_captured_kv_seq_along_lane_kernel
+        writeback_cache = kv_cache
+    else:
+        write_kernel = _pcp_write_captured_kv_kernel
+        writeback_cache = kv_cache.reshape((-1, *kv_cache.shape[2:]))
+    updated_cache = pl.pallas_call(
+        write_kernel,
+        out_shape=jax.ShapeDtypeStruct(writeback_cache.shape,
+                                       writeback_cache.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=(
@@ -119,29 +186,29 @@ def write_captured_kv_to_local_cache(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes),
         name="pcp_write_captured_kv_to_local_cache",
-    )(num_segments, segment_descriptors, captured_kv, flat_cache)
-    return updated_flat_cache.reshape(kv_cache.shape)
+    )(num_segments, segment_descriptors, captured_kv, writeback_cache)
+    return updated_cache.reshape(kv_cache.shape)
 
 
-def _validate_packed_kv_layout(q_local,
-                               kv_cache_local,
-                               *,
-                               k_scale: float | None = None,
-                               v_scale: float | None = None):
+def _validate_packed_kv_layout(
+        q_local,
+        kv_cache_local,
+        *,
+        kv_layout: KVLayout = (KVLayout.HEAD_ALONG_SUBLANE),
+        k_scale: float | None = None,
+        v_scale: float | None = None):
     """Validate PCP's physical packed KV layout against logical Q heads."""
     if q_local.ndim != 4:
         raise ValueError("PCP q_local must have shape "
                          "[tokens, kv_heads, q_per_kv, head_dim], got "
                          f"{q_local.shape}.")
     if kv_cache_local.ndim != 5:
-        raise ValueError("PCP kv_cache_local must have shape "
-                         "[pages, page_size, packed_kv_groups, kv_packing, "
-                         f"head_dim], got {kv_cache_local.shape}.")
+        raise ValueError("PCP kv_cache_local must be 5D, got "
+                         f"{kv_cache_local.shape}.")
 
     kv_heads = q_local.shape[1]
     q_per_kv = q_local.shape[2]
     head_dim = q_local.shape[-1]
-    packed_kv_groups = kv_cache_local.shape[2]
     kv_packing = kv_cache_local.shape[3]
     dtype_packing = get_dtype_packing(kv_cache_local.dtype)
     if kv_heads <= 0 or q_per_kv <= 0:
@@ -156,16 +223,33 @@ def _validate_packed_kv_layout(q_local,
                          f"shape_packing={kv_packing}, "
                          f"dtype_packing={dtype_packing}, "
                          f"dtype={kv_cache_local.dtype}.")
-    expected_packed_kv_groups = math.ceil((2 * kv_heads) / kv_packing)
-    if packed_kv_groups != expected_packed_kv_groups:
-        raise ValueError(
-            "PCP KV cache packed layout does not match logical KV heads: "
-            f"packed_kv_groups={packed_kv_groups}, "
-            f"expected={expected_packed_kv_groups}, {kv_heads=}, "
-            f"{kv_packing=}.")
-    if kv_cache_local.shape[-1] != head_dim:
-        raise ValueError("PCP KV cache head_dim must match Q head_dim: "
-                         f"{kv_cache_local.shape[-1]} vs {head_dim}.")
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        kv_layout_groups = kv_cache_local.shape[1]
+        if kv_layout_groups != 2 * kv_heads:
+            raise ValueError(
+                "PCP SEQ_ALONG_LANE cache must contain one K and V plane per "
+                f"KV head: planes={kv_layout_groups}, expected={2 * kv_heads}."
+            )
+        if kv_cache_local.shape[2] * kv_packing != head_dim:
+            raise ValueError(
+                "PCP SEQ_ALONG_LANE cache head_dim must match Q head_dim: "
+                f"{kv_cache_local.shape[2]} * {kv_packing} vs {head_dim}.")
+        if kv_packing != 4:
+            raise NotImplementedError(
+                "PCP SEQ_ALONG_LANE currently supports only FP8 KV cache, "
+                f"got packing={kv_packing}.")
+    else:
+        kv_layout_groups = kv_cache_local.shape[2]
+        expected_packed_kv_groups = math.ceil((2 * kv_heads) / kv_packing)
+        if kv_layout_groups != expected_packed_kv_groups:
+            raise ValueError(
+                "PCP KV cache packed layout does not match logical KV heads: "
+                f"packed_kv_groups={kv_layout_groups}, "
+                f"expected={expected_packed_kv_groups}, {kv_heads=}, "
+                f"{kv_packing=}.")
+        if kv_cache_local.shape[-1] != head_dim:
+            raise ValueError("PCP KV cache head_dim must match Q head_dim: "
+                             f"{kv_cache_local.shape[-1]} vs {head_dim}.")
     if (k_scale is None) != (v_scale is None):
         raise ValueError("PCP FP8 KV cache requires k_scale and v_scale to "
                          "be both None or both non-None.")
@@ -179,7 +263,7 @@ def _validate_packed_kv_layout(q_local,
             raise ValueError(
                 "PCP FP8 KV cache requires positive finite k_scale and "
                 "v_scale.")
-    return kv_heads, packed_kv_groups, kv_packing
+    return kv_heads, kv_layout_groups, kv_packing
 
 
 def _strided_load_packed_kv_group(kv_vmem_ref, slot, packed_group_idx):
@@ -224,6 +308,7 @@ def _consume_scheduled_kv_page_multi_head(
     k_scale,
     v_scale,
     causal,
+    kv_layout,
 ):
     if causal:
         q_global_start = sched_vmem_ref[consumer_rank, lane,
@@ -237,147 +322,173 @@ def _consume_scheduled_kv_page_multi_head(
         kv_valid_len = sched_vmem_ref[consumer_rank, lane,
                                       RuntimeScheduleField.KV_VALID_LEN]
     q_per_kv = q_vmem_ref.shape[2]
-    page_size = kv_vmem_ref.shape[2]
-    kv_block_tokens = kv_vmem_ref.shape[1] * page_size
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        kv_block_tokens = kv_vmem_ref.shape[-1]
+    else:
+        page_size = kv_vmem_ref.shape[2]
+        kv_block_tokens = kv_vmem_ref.shape[1] * page_size
     num_q_compute_blocks = q_vmem_ref.shape[0] // q_compute_size
     compute_dtype = q_vmem_ref.dtype
 
-    heads_per_group = kv_vmem_ref.shape[4] // 2
-    for packed_group_idx in range(kv_vmem_ref.shape[3]):
-        kv_pairs = _strided_load_packed_kv_group(kv_vmem_ref, slot,
-                                                 packed_group_idx)
-        for pair_idx, (k, v) in enumerate(kv_pairs):
-            kv_head_idx = packed_group_idx * heads_per_group + pair_idx
-            if kv_head_idx >= q_vmem_ref.shape[1]:
-                continue
-            if k_scale is not None:
-                k = (k.astype(jnp.float32) * k_scale).astype(compute_dtype)
-            if v_scale is not None:
-                v = (v.astype(jnp.float32) * v_scale).astype(compute_dtype)
-            if not causal:
-                k = k * sm_scale
+    def _consume_kv_head(k, v, kv_head_idx):
+        if k_scale is not None:
+            k = (k.astype(jnp.float32) * k_scale).astype(compute_dtype)
+        if v_scale is not None:
+            v = (v.astype(jnp.float32) * v_scale).astype(compute_dtype)
+        if not causal:
+            k = k * sm_scale
 
-            def _q_compute_loop(q_compute_idx, carry):
-                del carry
-                k_compute = k
-                v_compute = v
-                q_start = pl.multiple_of(q_compute_idx * q_compute_size,
-                                         q_compute_size)
-                q_slice = q_vmem_ref.at[
-                    pl.ds(q_start, q_compute_size),
-                    kv_head_idx,
-                    :,
-                    :,
-                ][...]
-                m_head = m_scratch_ref.at[
-                    kv_head_idx,
-                    pl.ds(q_start, q_compute_size),
-                    :,
-                    :,
-                ][...]
-                l_head = l_scratch_ref.at[
-                    kv_head_idx,
-                    pl.ds(q_start, q_compute_size),
-                    :,
-                    :,
-                ][...]
-                acc_head = acc_scratch_ref.at[
-                    kv_head_idx,
-                    pl.ds(q_start, q_compute_size),
-                    :,
-                    :,
-                ][...]
+        def _q_compute_loop(q_compute_idx, carry):
+            del carry
+            k_compute = k
+            v_compute = v
+            q_start = pl.multiple_of(q_compute_idx * q_compute_size,
+                                     q_compute_size)
+            q_slice = q_vmem_ref.at[
+                pl.ds(q_start, q_compute_size),
+                kv_head_idx,
+                :,
+                :,
+            ][...]
+            m_head = m_scratch_ref.at[
+                kv_head_idx,
+                pl.ds(q_start, q_compute_size),
+                :,
+                :,
+            ][...]
+            l_head = l_scratch_ref.at[
+                kv_head_idx,
+                pl.ds(q_start, q_compute_size),
+                :,
+                :,
+            ][...]
+            acc_head = acc_scratch_ref.at[
+                kv_head_idx,
+                pl.ds(q_start, q_compute_size),
+                :,
+                :,
+            ][...]
 
-                if causal:
-                    q_row = (
-                        q_start +
-                        lax.broadcasted_iota(jnp.int32,
-                                             (q_compute_size, q_per_kv, 1), 0))
-                    kv_local_pos = lax.broadcasted_iota(
-                        jnp.int32, (1, 1, kv_block_tokens), 2)
-                    q_valid = q_row < q_tile_size
-                    kv_valid = kv_local_pos < kv_valid_len
-                    q_slice = jnp.where(q_valid, q_slice, 0.0)
-                    kv_input_row = lax.broadcasted_iota(jnp.int32, k.shape, 0)
-                    k_compute = jnp.where(kv_input_row < kv_valid_len, k, 0.0)
-                    v_compute = jnp.where(kv_input_row < kv_valid_len, v, 0.0)
+            if causal:
+                q_row = (
+                    q_start +
+                    lax.broadcasted_iota(jnp.int32,
+                                         (q_compute_size, q_per_kv, 1), 0))
+                kv_local_pos = lax.broadcasted_iota(jnp.int32,
+                                                    (1, 1, kv_block_tokens), 2)
+                q_valid = q_row < q_tile_size
+                kv_valid = kv_local_pos < kv_valid_len
+                q_slice = jnp.where(q_valid, q_slice, 0.0)
+                kv_sequence_axis = (1 if kv_layout == KVLayout.SEQ_ALONG_LANE
+                                    else 0)
+                kv_input_pos = lax.broadcasted_iota(jnp.int32, k.shape,
+                                                    kv_sequence_axis)
+                k_compute = jnp.where(kv_input_pos < kv_valid_len, k, 0.0)
+                v_compute = jnp.where(kv_input_pos < kv_valid_len, v, 0.0)
 
-                scores = lax.dot_general(
-                    q_slice,
-                    k_compute,
-                    (((2, ), (1, )), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-
-                if causal:
-                    scores = scores * sm_scale
-                    q_interleave = interleave_size
-                    q_chunk_idx = lax.div(q_row, q_interleave)
-                    q_chunk_offset = lax.rem(q_row, q_interleave)
-                    q_pos = (q_global_start +
-                             q_chunk_idx * pcp_size * q_interleave +
-                             q_chunk_offset)
-                    kv_chunk_idx = lax.div(kv_local_pos, q_interleave)
-                    kv_chunk_offset = lax.rem(kv_local_pos, q_interleave)
-                    kv_pos = (kv_global_start +
-                              kv_chunk_idx * pcp_size * q_interleave +
-                              kv_chunk_offset)
-                    entry_valid = req_id != -1
-                    row_active = jnp.logical_and(entry_valid, q_valid)
-                    mask = jnp.logical_and(
-                        jnp.logical_and(q_pos >= kv_pos, kv_valid), q_valid)
-                    scores = jnp.where(mask, scores, -jnp.inf)
-                    scores = jnp.where(row_active, scores, 0.0)
-
-                m_curr = jnp.max(scores, axis=2, keepdims=True)
-                if causal:
-                    m_next = jnp.where(row_active, jnp.maximum(m_head, m_curr),
-                                       m_head)
-                else:
-                    m_next = jnp.maximum(m_head, m_curr)
-                m_next_broadcast = broadcast_minor(m_next, scores.shape)
-                p = jnp.exp(scores - m_next_broadcast)
-                alpha = jnp.exp(m_head - m_next)
-                if causal:
-                    p = jnp.where(row_active, p, 0.0)
-                    alpha = jnp.where(row_active, alpha, 1.0)
-                l_next = alpha * l_head + jnp.sum(p, axis=2, keepdims=True)
-                pv = lax.dot_general(
-                    p.astype(compute_dtype),
-                    v_compute,
-                    (((2, ), (0, )), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                alpha_broadcast = broadcast_minor(alpha, acc_head.shape)
-                acc_next = alpha_broadcast * acc_head + pv
-
-                m_scratch_ref.at[
-                    kv_head_idx,
-                    pl.ds(q_start, q_compute_size),
-                    :,
-                    :,
-                ][...] = m_next
-                l_scratch_ref.at[
-                    kv_head_idx,
-                    pl.ds(q_start, q_compute_size),
-                    :,
-                    :,
-                ][...] = l_next
-                acc_scratch_ref.at[
-                    kv_head_idx,
-                    pl.ds(q_start, q_compute_size),
-                    :,
-                    :,
-                ][...] = acc_next
-                return jnp.array(0, dtype=jnp.int32)
-
-            lax.fori_loop(
-                0,
-                num_q_compute_blocks,
-                _q_compute_loop,
-                jnp.array(0, dtype=jnp.int32),
-                unroll=True,
+            if kv_layout == KVLayout.SEQ_ALONG_LANE:
+                qk_dimensions = (((2, ), (0, )), ((), ()))
+            else:
+                qk_dimensions = (((2, ), (1, )), ((), ()))
+            scores = lax.dot_general(
+                q_slice,
+                k_compute,
+                qk_dimensions,
+                preferred_element_type=jnp.float32,
             )
+
+            if causal:
+                scores = scores * sm_scale
+                q_interleave = interleave_size
+                q_chunk_idx = lax.div(q_row, q_interleave)
+                q_chunk_offset = lax.rem(q_row, q_interleave)
+                q_pos = (q_global_start +
+                         q_chunk_idx * pcp_size * q_interleave +
+                         q_chunk_offset)
+                kv_chunk_idx = lax.div(kv_local_pos, q_interleave)
+                kv_chunk_offset = lax.rem(kv_local_pos, q_interleave)
+                kv_pos = (kv_global_start +
+                          kv_chunk_idx * pcp_size * q_interleave +
+                          kv_chunk_offset)
+                entry_valid = req_id != -1
+                row_active = jnp.logical_and(entry_valid, q_valid)
+                mask = jnp.logical_and(
+                    jnp.logical_and(q_pos >= kv_pos, kv_valid), q_valid)
+                scores = jnp.where(mask, scores, -jnp.inf)
+                scores = jnp.where(row_active, scores, 0.0)
+
+            m_curr = jnp.max(scores, axis=2, keepdims=True)
+            if causal:
+                m_next = jnp.where(row_active, jnp.maximum(m_head, m_curr),
+                                   m_head)
+            else:
+                m_next = jnp.maximum(m_head, m_curr)
+            m_next_broadcast = broadcast_minor(m_next, scores.shape)
+            p = jnp.exp(scores - m_next_broadcast)
+            alpha = jnp.exp(m_head - m_next)
+            if causal:
+                p = jnp.where(row_active, p, 0.0)
+                alpha = jnp.where(row_active, alpha, 1.0)
+            l_next = alpha * l_head + jnp.sum(p, axis=2, keepdims=True)
+            if kv_layout == KVLayout.SEQ_ALONG_LANE:
+                pv_dimensions = (((2, ), (1, )), ((), ()))
+            else:
+                pv_dimensions = (((2, ), (0, )), ((), ()))
+            pv = lax.dot_general(
+                p.astype(compute_dtype),
+                v_compute,
+                pv_dimensions,
+                preferred_element_type=jnp.float32,
+            )
+            alpha_broadcast = broadcast_minor(alpha, acc_head.shape)
+            acc_next = alpha_broadcast * acc_head + pv
+
+            m_scratch_ref.at[
+                kv_head_idx,
+                pl.ds(q_start, q_compute_size),
+                :,
+                :,
+            ][...] = m_next
+            l_scratch_ref.at[
+                kv_head_idx,
+                pl.ds(q_start, q_compute_size),
+                :,
+                :,
+            ][...] = l_next
+            acc_scratch_ref.at[
+                kv_head_idx,
+                pl.ds(q_start, q_compute_size),
+                :,
+                :,
+            ][...] = acc_next
+            return jnp.array(0, dtype=jnp.int32)
+
+        lax.fori_loop(
+            0,
+            num_q_compute_blocks,
+            _q_compute_loop,
+            jnp.array(0, dtype=jnp.int32),
+            unroll=True,
+        )
+
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        head_dim = kv_vmem_ref.shape[3] * kv_vmem_ref.shape[4]
+        for kv_head_idx in range(q_vmem_ref.shape[1]):
+            k = kv_vmem_ref[slot, 0, 2 * kv_head_idx, :, :, :].reshape(
+                head_dim, kv_block_tokens)
+            v = kv_vmem_ref[slot, 0, 2 * kv_head_idx + 1, :, :, :].reshape(
+                head_dim, kv_block_tokens)
+            _consume_kv_head(k, v, kv_head_idx)
+    else:
+        heads_per_group = kv_vmem_ref.shape[4] // 2
+        for packed_group_idx in range(kv_vmem_ref.shape[3]):
+            kv_pairs = _strided_load_packed_kv_group(kv_vmem_ref, slot,
+                                                     packed_group_idx)
+            for pair_idx, (k, v) in enumerate(kv_pairs):
+                kv_head_idx = packed_group_idx * heads_per_group + pair_idx
+                if kv_head_idx >= q_vmem_ref.shape[1]:
+                    continue
+                _consume_kv_head(k, v, kv_head_idx)
 
 
 def _reset_multi_head_online_state(m_scratch_ref, l_scratch_ref,
@@ -934,8 +1045,17 @@ def _store_compact_output_tile_multi_head(o_ref, o_vmem_ref, local_dma_sem,
 
 def _load_local_kv_page_all_heads_packed(kv_cache_ref, kv_vmem_ref, sem,
                                          sched_vmem_ref, lane, *,
-                                         packed_kv_groups):
+                                         packed_kv_groups, kv_layout):
     local_page_idx = sched_vmem_ref[0, lane, RuntimeScheduleField.KV_PAGE_IDX]
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        load = pltpu.make_async_copy(
+            src_ref=kv_cache_ref.at[0, local_page_idx, :, :, :, :],
+            dst_ref=kv_vmem_ref.at[0, 0, :, :, :, :],
+            sem=sem,
+        )
+        load.start()
+        load.wait()
+        return
     load = pltpu.make_async_copy(
         src_ref=kv_cache_ref.at[
             0,
@@ -961,6 +1081,7 @@ def _load_local_current_or_boundary_kv_all_heads_packed(
     lane,
     *,
     packed_kv_groups,
+    kv_layout,
 ):
     kv_hbm_offset = sched_vmem_ref[0, lane, RuntimeScheduleField.KV_HBM_OFFSET]
     kv_valid_len = sched_vmem_ref[0, lane, RuntimeScheduleField.KV_VALID_LEN]
@@ -969,6 +1090,15 @@ def _load_local_current_or_boundary_kv_all_heads_packed(
 
     @pl.when(load_history_boundary)
     def _load_history_boundary_page():
+        if kv_layout == KVLayout.SEQ_ALONG_LANE:
+            load = pltpu.make_async_copy(
+                src_ref=kv_cache_ref.at[0, local_page_idx, :, :, :, :],
+                dst_ref=kv_vmem_ref.at[0, 0, :, :, :, :],
+                sem=sem,
+            )
+            load.start()
+            load.wait()
+            return
         load = pltpu.make_async_copy(
             src_ref=kv_cache_ref.at[
                 0,
@@ -986,6 +1116,30 @@ def _load_local_current_or_boundary_kv_all_heads_packed(
 
     @pl.when(jnp.logical_and(~load_history_boundary, kv_valid_len > 0))
     def _load_current_kv():
+        if kv_layout == KVLayout.SEQ_ALONG_LANE:
+            seq_hbm_offset = pl.multiple_of(kv_hbm_offset,
+                                            TPU_KV_DMA_ALIGNMENT)
+            seq_valid_len = pl.multiple_of(kv_valid_len, TPU_KV_DMA_ALIGNMENT)
+            load = pltpu.make_async_copy(
+                src_ref=current_kv_ref.at[
+                    :,
+                    :,
+                    :,
+                    pl.ds(seq_hbm_offset, seq_valid_len),
+                ],
+                dst_ref=kv_vmem_ref.at[
+                    0,
+                    0,
+                    :,
+                    :,
+                    :,
+                    pl.ds(0, seq_valid_len),
+                ],
+                sem=sem,
+            )
+            load.start()
+            load.wait()
+            return
         load = pltpu.make_async_copy(
             src_ref=current_kv_ref.at[
                 pl.ds(kv_hbm_offset, kv_valid_len),
@@ -1052,6 +1206,8 @@ def _run_pcp_page_groups_multi_head(
     q_compute_size,
     sm_scale,
     packed_kv_groups,
+    page_size,
+    kv_layout,
     k_scale,
     v_scale,
     mesh_axis_names,
@@ -1111,7 +1267,7 @@ def _run_pcp_page_groups_multi_head(
             jnp.array(0, dtype=jnp.int32),
             state_mode=state_mode,
             pcp_size=pcp_size,
-            page_size=kv_group_ref.shape[2],
+            page_size=page_size,
             interleave_size=interleave_size,
             lane=lane,
         )
@@ -1164,7 +1320,7 @@ def _run_pcp_page_groups_multi_head(
             my_id,
             state_mode=state_mode,
             pcp_size=pcp_size,
-            page_size=kv_group_ref.shape[2],
+            page_size=page_size,
             interleave_size=interleave_size,
             lane=lane,
         )
@@ -1177,6 +1333,7 @@ def _run_pcp_page_groups_multi_head(
                 sched_vmem_ref,
                 lane,
                 packed_kv_groups=packed_kv_groups,
+                kv_layout=kv_layout,
             )
         else:
             _load_local_kv_page_all_heads_packed(
@@ -1186,6 +1343,7 @@ def _run_pcp_page_groups_multi_head(
                 sched_vmem_ref,
                 lane,
                 packed_kv_groups=packed_kv_groups,
+                kv_layout=kv_layout,
             )
 
         @pl.when(group_idx > 0)
@@ -1252,23 +1410,48 @@ def _run_pcp_page_groups_multi_head(
                 capture_active = capture_len > 0
                 safe_capture_src_offset = jnp.maximum(capture_src_offset, 0)
                 safe_capture_dst_offset = jnp.maximum(capture_dst_offset, 0)
-                capture_op = pltpu.make_async_copy(
-                    src_ref=kv_group_ref.at[
-                        curr_slot,
-                        0,
-                        pl.ds(safe_capture_src_offset, capture_len),
-                        :,
-                        :,
-                        :,
-                    ],
-                    dst_ref=captured_kv_ref.at[
-                        pl.ds(safe_capture_dst_offset, capture_len),
-                        :,
-                        :,
-                        :,
-                    ],
-                    sem=capture_dma_sem,
-                )
+                if kv_layout == KVLayout.SEQ_ALONG_LANE:
+                    seq_capture_src_offset = pl.multiple_of(
+                        safe_capture_src_offset, TPU_KV_DMA_ALIGNMENT)
+                    seq_capture_dst_offset = pl.multiple_of(
+                        safe_capture_dst_offset, TPU_KV_DMA_ALIGNMENT)
+                    seq_capture_len = pl.multiple_of(capture_len,
+                                                     TPU_KV_DMA_ALIGNMENT)
+                    capture_op = pltpu.make_async_copy(
+                        src_ref=kv_group_ref.at[
+                            curr_slot,
+                            0,
+                            :,
+                            :,
+                            :,
+                            pl.ds(seq_capture_src_offset, seq_capture_len),
+                        ],
+                        dst_ref=captured_kv_ref.at[
+                            :,
+                            :,
+                            :,
+                            pl.ds(seq_capture_dst_offset, seq_capture_len),
+                        ],
+                        sem=capture_dma_sem,
+                    )
+                else:
+                    capture_op = pltpu.make_async_copy(
+                        src_ref=kv_group_ref.at[
+                            curr_slot,
+                            0,
+                            pl.ds(safe_capture_src_offset, capture_len),
+                            :,
+                            :,
+                            :,
+                        ],
+                        dst_ref=captured_kv_ref.at[
+                            pl.ds(safe_capture_dst_offset, capture_len),
+                            :,
+                            :,
+                            :,
+                        ],
+                        sem=capture_dma_sem,
+                    )
 
                 @pl.when(capture_active)
                 def _start_capture():
@@ -1291,6 +1474,7 @@ def _run_pcp_page_groups_multi_head(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 causal=causal,
+                kv_layout=kv_layout,
             )
 
             if state_mode == "current":
@@ -1428,6 +1612,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
     max_page_groups,
     sm_scale,
     packed_kv_groups,
+    page_size,
+    kv_layout,
     k_scale,
     v_scale,
     mesh_axis_names,
@@ -1475,6 +1661,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
             packed_kv_groups=packed_kv_groups,
+            page_size=page_size,
+            kv_layout=kv_layout,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
@@ -1520,6 +1708,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     max_page_groups,
     sm_scale,
     packed_kv_groups,
+    page_size,
+    kv_layout,
     k_scale,
     v_scale,
     mesh_axis_names,
@@ -1573,6 +1763,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
             packed_kv_groups=packed_kv_groups,
+            page_size=page_size,
+            kv_layout=kv_layout,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
@@ -1703,6 +1895,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         q_block_size: int,
         sm_scale: float,
         interleave_size: int,
+        kv_layout: KVLayout,
         q_compute_size: int | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
@@ -1713,9 +1906,24 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
     head_dim = q_multi_head.shape[-1]
-    packed_kv_groups = current_kv_local.shape[1]
-    kv_packing = current_kv_local.shape[2]
-    page_size = kv_cache_local.shape[2]
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        packed_kv_groups = current_kv_local.shape[0]
+        page_size = kv_cache_local.shape[-1]
+        kv_vmem_shape = (2, 1, *kv_cache_local.shape[2:])
+        captured_kv_hbm_shape = (
+            *current_kv_local.shape[:-1],
+            local_tokens * pcp_size,
+        )
+    else:
+        packed_kv_groups = current_kv_local.shape[1]
+        kv_packing = current_kv_local.shape[2]
+        page_size = kv_cache_local.shape[2]
+        kv_vmem_shape = (2, 1, page_size, packed_kv_groups, kv_packing,
+                         head_dim)
+        captured_kv_hbm_shape = (
+            local_tokens * pcp_size,
+            *current_kv_local.shape[1:],
+        )
     num_tiles = tile_plan.shape[0]
     # One tile can need an owner-phase partial fresh group plus one old-cache
     # history-boundary group in addition to its full fresh groups.
@@ -1732,10 +1940,6 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         ONLINE_STATE_PADDED_LANES,
     )
     state_acc_hbm_shape = (kv_heads, local_tokens, q_per_kv, head_dim)
-    captured_kv_hbm_shape = (
-        local_tokens * pcp_size,
-        *current_kv_local.shape[1:],
-    )
     state_lm_scratch_shape = (
         kv_heads,
         q_block_size,
@@ -1754,6 +1958,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             max_page_groups=max_page_groups,
             sm_scale=sm_scale,
             packed_kv_groups=packed_kv_groups,
+            page_size=page_size,
+            kv_layout=kv_layout,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
@@ -1800,9 +2006,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
                            tile_plan.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
-                pltpu.VMEM(
-                    (2, 1, page_size, packed_kv_groups, kv_packing, head_dim),
-                    current_kv_local.dtype),
+                pltpu.VMEM(kv_vmem_shape, current_kv_local.dtype),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_acc_scratch_shape, jnp.float32),
@@ -1832,18 +2036,26 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         q_block_size: int,
         sm_scale: float,
         interleave_size: int,
+        kv_layout: KVLayout,
         q_compute_size: int | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
 ):
-    page_size = kv_cache_local.shape[2]
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
     head_dim = q_multi_head.shape[-1]
-    packed_kv_groups = kv_cache_local.shape[3]
-    kv_packing = kv_cache_local.shape[4]
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        page_size = kv_cache_local.shape[-1]
+        packed_kv_groups = kv_cache_local.shape[2]
+        kv_vmem_shape = (2, 1, *kv_cache_local.shape[2:])
+    else:
+        page_size = kv_cache_local.shape[2]
+        packed_kv_groups = kv_cache_local.shape[3]
+        kv_packing = kv_cache_local.shape[4]
+        kv_vmem_shape = (2, 1, page_size, packed_kv_groups, kv_packing,
+                         head_dim)
     num_tiles = tile_plan.shape[0]
     max_page_groups = num_tiles * block_tables.shape[1]
     num_lanes = 1
@@ -1868,6 +2080,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             max_page_groups=max_page_groups,
             sm_scale=sm_scale,
             packed_kv_groups=packed_kv_groups,
+            page_size=page_size,
+            kv_layout=kv_layout,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
@@ -1904,9 +2118,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
                            tile_plan.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
-                pltpu.VMEM(
-                    (2, 1, page_size, packed_kv_groups, kv_packing, head_dim),
-                    kv_cache_local.dtype),
+                pltpu.VMEM(kv_vmem_shape, kv_cache_local.dtype),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_acc_scratch_shape, jnp.float32),
@@ -2007,6 +2219,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         num_lanes: int = 1,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
 ):
@@ -2022,10 +2235,15 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     Args:
         q_local: [local_tokens, kv_heads, q_per_kv, head_dim] compact Q rows
             for the current PCP rank.
-        current_kv_local: [local_tokens, packed_kv_heads_x2, kv_packing,
-            head_dim] freshly computed packed KV rows on this compute rank.
-        kv_cache_local: [pages, page_size, packed_kv_heads_x2, kv_packing,
-            head_dim] local packed KV-cache shard.
+        current_kv_local: Freshly computed packed KV rows. Legacy layout is
+            [local_tokens, packed_kv_heads_x2, kv_packing, head_dim];
+            SEQ_ALONG_LANE is
+            [2 * kv_heads, head_dim / kv_packing, kv_packing, local_tokens].
+        kv_cache_local: Local packed KV-cache shard. Legacy layout is
+            [pages, page_size, packed_kv_heads_x2, kv_packing, head_dim];
+            SEQ_ALONG_LANE is
+            [pages, 2 * kv_heads, head_dim / kv_packing, kv_packing,
+            page_size].
         kv_lens: [max_num_seqs]. Total KV length for each request, including
             the query tokens in the current prefill chunk.
         page_indices: Flattened or 2D vLLM block table. Entries are reduced
@@ -2057,15 +2275,26 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     """
     _validate_packed_kv_layout(q_local,
                                kv_cache_local,
+                               kv_layout=kv_layout,
                                k_scale=k_scale,
                                v_scale=v_scale)
-    if current_kv_local.shape != (q_local.shape[0], *kv_cache_local.shape[2:]):
-        raise ValueError(
-            "Fresh packed KV layout must match local Q rows and cache tail: "
-            f"{current_kv_local.shape=} {q_local.shape[0]=} "
-            f"cache_tail={kv_cache_local.shape[2:]}.")
-
-    page_size = kv_cache_local.shape[1]
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        if (current_kv_local.shape[:-1] != kv_cache_local.shape[1:-1]
+                or current_kv_local.shape[-1] < q_local.shape[0]):
+            raise ValueError(
+                "SEQ_ALONG_LANE fresh KV must match the cache head layout and "
+                "cover all local Q rows: "
+                f"{current_kv_local.shape=} {q_local.shape[0]=} "
+                f"cache_head_layout={kv_cache_local.shape[1:-1]}.")
+        page_size = kv_cache_local.shape[-1]
+    else:
+        if current_kv_local.shape != (q_local.shape[0],
+                                      *kv_cache_local.shape[2:]):
+            raise ValueError(
+                "Fresh packed KV layout must match local Q rows and cache "
+                f"tail: {current_kv_local.shape=} {q_local.shape[0]=} "
+                f"cache_tail={kv_cache_local.shape[2:]}.")
+        page_size = kv_cache_local.shape[1]
     (tile_plan, block_tables, current_tile_ids, current_group_starts,
      current_meta, history_tile_ids, history_group_starts,
      history_meta) = (build_pcp_streaming_schedule_inputs_from_metadata_jax(
@@ -2097,6 +2326,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
+            kv_layout=kv_layout,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
@@ -2107,6 +2337,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         captured_kv_local,
         writeback_segment_descriptors,
         writeback_num_segments,
+        kv_layout=kv_layout,
     )
     history_output = (
         _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
@@ -2125,6 +2356,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
+            kv_layout=kv_layout,
             k_scale=k_scale,
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.layers.common.quantization import dtype_max
+from vllm_torchtpu.layers.core.quantization import dtype_max
 from vllm_torchtpu.utils import largest_divisor
 
 # Native lane count; the roped channels are the tail of the last lane block.

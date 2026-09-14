@@ -69,6 +69,34 @@ CASES = (
         "v_scale": 1.0,
     },
     {
+        "name": "fp8_mha_seq_along_lane",
+        "kv_dtype": "float8_e4m3fn",
+        "num_kv_heads": 2,
+        "q_per_kv": 1,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+        "kv_layout": "SEQ_ALONG_LANE",
+    },
+    {
+        "name": "fp8_mha_layout_reference",
+        "kv_dtype": "float8_e4m3fn",
+        "num_kv_heads": 2,
+        "q_per_kv": 1,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+        "layout_equivalence": True,
+    },
+    {
+        "name": "fp8_mha_seq_along_lane_equivalence",
+        "kv_dtype": "float8_e4m3fn",
+        "num_kv_heads": 2,
+        "q_per_kv": 1,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+        "kv_layout": "SEQ_ALONG_LANE",
+        "layout_equivalence": True,
+    },
+    {
         "name": "fp8_gqa_odd_kv_heads",
         "kv_dtype": "float8_e4m3fn",
         "num_kv_heads": 3,
@@ -186,7 +214,11 @@ def _torch_dtype(torch, name: str):
     raise ValueError(f"Unsupported dtype name: {name}")
 
 
-def _kv_cache_shape(num_kv_heads: int, kv_packing: int) -> tuple[int, ...]:
+def _kv_cache_shape(num_kv_heads: int, kv_packing: int,
+                    kv_layout: str) -> tuple[int, ...]:
+    if kv_layout == "SEQ_ALONG_LANE":
+        return (1, 2 * num_kv_heads, HEAD_DIM // kv_packing, kv_packing,
+                PAGE_SIZE)
     packed_kv_groups = math.ceil((2 * num_kv_heads) / kv_packing)
     return (1, PAGE_SIZE, packed_kv_groups, kv_packing, HEAD_DIM)
 
@@ -197,6 +229,7 @@ def _make_case_inputs(torch, case: dict[str, object]):
     num_q_heads = num_kv_heads * q_per_kv
     kv_dtype = _torch_dtype(torch, str(case["kv_dtype"]))
     kv_packing = 4 if case["kv_dtype"] == "float8_e4m3fn" else 2
+    kv_layout = str(case.get("kv_layout", "HEAD_ALONG_SUBLANE"))
 
     q = torch.zeros((LOCAL_TOKENS, num_q_heads, HEAD_DIM),
                     dtype=torch.bfloat16,
@@ -208,7 +241,25 @@ def _make_case_inputs(torch, case: dict[str, object]):
                    2.0,
                    dtype=torch.bfloat16,
                    device="tpu")
-    kv_cache = torch.zeros(_kv_cache_shape(num_kv_heads, kv_packing),
+    if case.get("layout_equivalence"):
+        rank = int(os.environ["RANK"])
+        absolute_positions = (
+            torch.arange(LOCAL_TOKENS, dtype=torch.float32, device="tpu") +
+            rank * LOCAL_TOKENS) / GLOBAL_TOKENS
+        q.zero_()
+        k.zero_()
+        v.zero_()
+        q[:, :, 0] = 1.0
+        q[:, 0, 1] = 0.5
+        q[:, 1, 1] = -0.5
+        k[:, 0, 0] = absolute_positions
+        k[:, 1, 0] = -absolute_positions
+        v[:, 0, 0] = absolute_positions
+        v[:, 0, 1] = 0.25
+        v[:, 1, 0] = 1.0 - absolute_positions
+        v[:, 1, 1] = -0.25
+    kv_cache = torch.zeros(_kv_cache_shape(num_kv_heads, kv_packing,
+                                           kv_layout),
                            dtype=kv_dtype,
                            device="tpu")
     seq_lens = torch.tensor([GLOBAL_TOKENS], dtype=torch.int32, device="tpu")
@@ -221,12 +272,14 @@ def _make_case_inputs(torch, case: dict[str, object]):
                       distribution)
 
 
-def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
+def _run_case(torch, sync, mesh, case: dict[str, object]):
+    from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
     from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
         PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, make_pcp_streaming_rpa_kernel,
         pcp_streaming_jax_op)
 
     kv_cache, args = _make_case_inputs(torch, case)
+    kv_layout = KVLayout[str(case.get("kv_layout", "HEAD_ALONG_SUBLANE"))]
     sync.synchronize([kv_cache, *args], wait=True)
     entry = make_pcp_streaming_rpa_kernel(
         q_scale=None,
@@ -241,6 +294,7 @@ def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
                                                  PAGE_SIZE)),
         q_block_size=LOCAL_TOKENS,
         q_compute_size=64,
+        kv_layout=kv_layout,
     )
     attention = pcp_streaming_jax_op(
         f"pcp_unified_head_matrix::{case['name']}",
@@ -253,15 +307,29 @@ def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
     kv_cache.copy_(new_kv_cache)
     sync.synchronize([kv_cache, output], wait=True)
     output_cpu = output.cpu().float()
-    max_abs = float((output_cpu - 2.0).abs().max().item())
-    if max_abs > 0.03:
-        raise AssertionError(f"{case['name']} output max_abs={max_abs}")
+    if case.get("layout_equivalence"):
+        max_abs = 0.0
+        comparison_output = output_cpu
+    else:
+        max_abs = float((output_cpu - 2.0).abs().max().item())
+        comparison_output = None
+        if max_abs > 0.03:
+            raise AssertionError(f"{case['name']} output max_abs={max_abs}")
+    cache_max_abs = 0.0
+    if (kv_layout == KVLayout.SEQ_ALONG_LANE
+            and not case.get("layout_equivalence")):
+        cached_v = kv_cache[:, 1::2].cpu().float()
+        cache_max_abs = float((cached_v - 2.0).abs().max().item())
+        if cache_max_abs > 0.03:
+            raise AssertionError(
+                f"{case['name']} cache V max_abs={cache_max_abs}")
     return {
         "name": case["name"],
         "output_max_abs": max_abs,
         "output_shape": tuple(output.shape),
         "kv_cache_shape": tuple(kv_cache.shape),
-    }
+        "cache_max_abs": cache_max_abs,
+    }, comparison_output
 
 
 def _run_worker(result_dir: Path) -> None:
@@ -288,9 +356,28 @@ def _run_worker(result_dir: Path) -> None:
         global_device_ids = _gather_global_device_ids(torch, dist,
                                                       tpu_distributed)
         mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME)
-        case_results = [_run_case(torch, sync, mesh, case) for case in CASES]
-        result = {"rank": rank, "cases": case_results}
-    except BaseException as exc:
+        case_results = []
+        comparison_outputs = []
+        for case in CASES:
+            case_result, comparison_output = _run_case(torch, sync, mesh, case)
+            case_results.append(case_result)
+            if comparison_output is not None:
+                comparison_outputs.append(comparison_output)
+        if len(comparison_outputs) != 2:
+            raise AssertionError(
+                f"Expected two layout comparison outputs, got "
+                f"{len(comparison_outputs)}.")
+        layout_max_abs = float(
+            (comparison_outputs[0] - comparison_outputs[1]).abs().max().item())
+        if layout_max_abs > 0.03:
+            raise AssertionError(
+                f"SEQ_ALONG_LANE vs legacy output max_abs={layout_max_abs}")
+        result = {
+            "rank": rank,
+            "cases": case_results,
+            "layout_equivalence_max_abs": layout_max_abs,
+        }
+    except BaseException as exc:  # noqa: BLE001 - report worker failures
         traceback.print_exc()
         result = {"rank": rank, "error": repr(exc)}
     finally:
@@ -298,7 +385,7 @@ def _run_worker(result_dir: Path) -> None:
         if initialized:
             try:
                 dist.destroy_process_group()
-            except Exception:
+            except Exception:  # noqa: BLE001 - best-effort worker cleanup
                 traceback.print_exc()
     if "error" in result:
         raise SystemExit(1)

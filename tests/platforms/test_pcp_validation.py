@@ -104,6 +104,7 @@ def test_static_validator_rejects_unsupported_platform_config(
         PcpStaticSupportValidator.validate_platform_config(
             config,
             multihost_backend=multihost_backend,
+            kv_cache_layout="NHD",
         )
 
 
@@ -111,6 +112,7 @@ def test_static_validator_accepts_supported_pcp_platform_config():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(),
         multihost_backend="",
+        kv_cache_layout="NHD",
     )
 
     assert config.enabled
@@ -121,6 +123,7 @@ def test_static_validator_accepts_moe_pcp_with_expert_parallel():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(is_moe_model=True, enable_expert_parallel=True),
         multihost_backend="",
+        kv_cache_layout="NHD",
     )
 
     assert config.is_moe is True
@@ -131,6 +134,7 @@ def test_static_validator_ignores_expert_parallel_without_pcp():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(pcp_size=1, is_moe_model=True),
         multihost_backend="",
+        kv_cache_layout="NHD",
     )
 
     assert config.enabled is False
@@ -141,6 +145,7 @@ def test_static_validator_accepts_pcp_when_model_is_not_moe(is_moe_model):
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(is_moe_model=is_moe_model),
         multihost_backend="",
+        kv_cache_layout="NHD",
     )
 
     assert config.is_moe is False
@@ -150,10 +155,41 @@ def test_static_validator_accepts_pcp_async_non_speculative_config():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(async_scheduling=True),
         multihost_backend="",
+        kv_cache_layout="NHD",
     )
 
     assert config.enabled
     assert config.async_scheduling is True
+
+
+def test_pcp_hnd_accepts_aligned_pcp_config():
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pcp_size=8, interleave_size=128),
+        multihost_backend="",
+        kv_cache_layout="HND",
+    )
+
+    assert config.enabled
+    assert config.pcp_size == 8
+
+
+def test_pcp_hnd_rejects_unaligned_interleave():
+    with pytest.raises(ValueError, match="multiple of 128"):
+        PcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(pcp_size=8, interleave_size=64),
+            multihost_backend="",
+            kv_cache_layout="HND",
+        )
+
+
+def test_hnd_without_pcp_remains_valid():
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pcp_size=1, interleave_size=64),
+        multihost_backend="",
+        kv_cache_layout="HND",
+    )
+
+    assert not config.enabled
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
@@ -166,6 +202,7 @@ def test_static_validator_accepts_pcp_mtp_k1_producer(async_scheduling):
             async_scheduling=async_scheduling,
         ),
         multihost_backend="",
+        kv_cache_layout="NHD",
     )
 
     assert config.pcp_mtp_k1_enabled is True
@@ -190,6 +227,7 @@ def test_static_validator_rejects_pcp_mtp_k1_kv_both():
         PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             multihost_backend="",
+            kv_cache_layout="NHD",
         )
 
 
@@ -202,6 +240,7 @@ def test_static_validator_does_not_restrict_non_pcp_mtp_k3_consumer():
             kv_role="kv_consumer",
         ),
         multihost_backend="",
+        kv_cache_layout="NHD",
     )
 
     assert config.enabled is False

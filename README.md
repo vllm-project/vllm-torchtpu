@@ -192,3 +192,20 @@ python3 examples/offline_inference.py \
   --tensor_parallel_size=2 \
   --enable-expert-parallel
 ```
+
+#### Pipeline Parallelism (PP)
+
+Each pipeline stage runs a slice of the layers on one core and hands its
+hidden states to the next stage with a collective-permute over ICI. Tensor
+parallelism inside a stage is not supported yet, so the worker count is
+`pipeline_parallel_size`.
+
+```bash
+python3 examples/offline_inference.py \
+  --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --pipeline-parallel-size=2 \
+  --tensor_parallel_size=1 \
+  --no-async-scheduling
+```

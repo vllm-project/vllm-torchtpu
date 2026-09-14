@@ -88,8 +88,15 @@ class PcpStaticSupportValidator:
         vllm_config: Any,
         *,
         multihost_backend: str | None,
+        kv_cache_layout: str,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
+        if (config.enabled and kv_cache_layout == "HND"
+                and config.interleave_size % 128 != 0):
+            raise ValueError(
+                "PCP with HND KV cache layout requires "
+                "cp_kv_cache_interleave_size to be a multiple of 128, "
+                f"got {config.interleave_size}.")
         if not config.enabled:
             return config
 

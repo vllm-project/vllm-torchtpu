@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for the production PCP JAX tile-plan scheduler."""
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -20,6 +22,35 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     TilePlanField, build_pcp_streaming_schedule_inputs_from_metadata_jax)
 
 pytestmark = pytest.mark.multichip
+
+
+def test_production_schedule_trace_remains_compact():
+    """Do not statically unroll every request/tile/rank schedule slot."""
+
+    def build(kv_lens, page_indices, cu_q_lens, distribution):
+        return build_pcp_streaming_schedule_inputs_from_metadata_jax(
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            global_bucket_tokens=32_768,
+            local_kv_cache_num_blocks=128,
+            page_size=768,
+            pcp_size=8,
+            interleave_size=256,
+            q_block_size=512,
+        )
+
+    traced = jax.make_jaxpr(build)(
+        jnp.zeros((64, ), dtype=jnp.int32),
+        jnp.zeros((64, 128), dtype=jnp.int32),
+        jnp.zeros((65, ), dtype=jnp.int32),
+        jnp.zeros((3, ), dtype=jnp.int32),
+    )
+
+    # The vectorized scheduler is currently about 365 top-level equations.
+    # The former 64 x 10 x 8 Python loops produced hundreds of thousands.
+    assert len(traced.jaxpr.eqns) < 1_000
 
 
 def test_metadata_jax_compact_plan_tracks_group_starts():

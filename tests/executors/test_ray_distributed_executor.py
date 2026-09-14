@@ -134,17 +134,14 @@ def test_cluster_reuses_supplied_placement(executor, backend):
 
 @pytest.mark.parametrize("failure,message",
                          [("platform", "does not support ray"),
-                          ("driver", "Current node has no TPU"),
-                          ("pipeline", "Cannot use PP across hosts")])
+                          ("driver", "Current node has no TPU")])
 def test_invalid_cluster_fails_before_placement(executor, backend, failure,
                                                 message):
     if failure == "platform":
         ray_executor.current_platform.ray_device_key = None
-    elif failure == "driver":
-        backend.get_runtime_context.return_value.get_node_id.return_value = "cpu"
     else:
-        executor.parallel_config.pipeline_parallel_size = 3
-    with pytest.raises((ValueError, AssertionError), match=message):
+        backend.get_runtime_context.return_value.get_node_id.return_value = "cpu"
+    with pytest.raises(ValueError, match=message):
         executor._initialize_ray_cluster()
     backend.util.placement_group.assert_not_called()
 
@@ -208,7 +205,7 @@ def test_worker_rank_environment_and_initialization_order(
     calls = executor.collective_rpc.call_args_list
     assert [c.args[0] for c in calls] == [
         "adjust_rank", "update_environment_variables", "init_worker",
-        "init_device", "initialize_pp_transfer_connect", "load_model"
+        "init_device", "load_model"
     ]
     assert calls[0].kwargs["args"] == ({1: 0, 3: 1, 0: 2, 2: 3}, )
     addresses = "10.0.0.1:8070,10.0.0.1:8071,10.0.0.2:8070,10.0.0.2:8071"
@@ -234,8 +231,6 @@ def test_worker_rank_environment_and_initialization_order(
     assert [args["local_rank"] for args in worker_args] == [0, 1, 0, 1]
     assert [args["is_driver_worker"]
             for args in worker_args] == [True, False, True, False]
-    assert [args["prev_worker_ip"] for args in worker_args
-            ] == ["", "10.0.0.1", "10.0.0.1", "10.0.0.2"]
     for rank, args in enumerate(worker_args):
         assert args["assigned_physical_gpu_ids"] == [0, 1]
         assert args["distributed_init_method"] == "tcp://10.0.0.1:9000"

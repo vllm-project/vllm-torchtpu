@@ -24,7 +24,7 @@ src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_OVERLAP_H0_DMA
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_OVERLAP_HT_DMA
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_PACKED_METADATA
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_PACK_HEAD_INV
-src/vllm_torchtpu/layers/common/pcp_sequence_layout.py:VLLM_TPU_DEBUG_PCP_LAYOUT
+src/vllm_torchtpu/layers/core/pcp_sequence_layout.py:VLLM_TPU_DEBUG_PCP_LAYOUT
 src/vllm_torchtpu/model_loader_patches.py:TPU_SHARDED_LOAD_SYNC_EVERY
 src/vllm_torchtpu/offload/raiden_connector.py:RAIDEN_DISABLE_SINGLETON_WORKER
 src/vllm_torchtpu/offload/raiden_store.py:RAIDEN_SHM_KEY

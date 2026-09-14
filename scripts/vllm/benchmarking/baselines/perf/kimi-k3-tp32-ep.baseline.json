@@ -1,10 +1,20 @@
 {
+  "_source": {
+    "url": "https://buildkite.com/vllm/vllm-torchtpu-ci/builds/1003",
+    "description": "Baseline adjusted down on purpose after PR #561 (issue #991): Kimi-K3 now runs on the unified KV pool by default, and the pooled KDA path is expected to be slower until it is optimized (with TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 the pre-#561 numbers come back, but that flag excludes prefix caching). Values from nightly ci build 1003 on main dd9db189 (median TTFT 995 ms -> 1573 ms, TPOT 18.95 -> 19.2 ms, 452 -> 434 tok/s); previous_values kept for when the pooled path is optimized.",
+    "previous_values": {
+      "median_tpot_ms": 18.9536309547045,
+      "median_ttft_ms": 995.1696610078216,
+      "output_token_throughput": 50.22148122390681,
+      "total_token_throughput": 451.9933310151613
+    }
+  },
   "isl8192_osl1024_c1": {
     "completed": 64,
-    "median_tpot_ms": 18.9536309547045,
-    "median_ttft_ms": 995.1696610078216,
+    "median_tpot_ms": 19.2,
+    "median_ttft_ms": 1573.3,
     "num_prompts": 64,
-    "output_token_throughput": 50.22148122390681,
-    "total_token_throughput": 451.9933310151613
+    "output_token_throughput": 48.26,
+    "total_token_throughput": 434.3
   }
 }

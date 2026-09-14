@@ -26,6 +26,8 @@ PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
 DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-0}"
+TPU_RAIDEN_PREFIX_AWARE_LOAD="${TPU_RAIDEN_PREFIX_AWARE_LOAD:-1}"
 # P4D4 uses a smaller per-worker premapped pool than the plugin-wide Raiden
 # default to reduce libtpu startup reservation time for this bounded case.
 TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-8589934592}"
@@ -105,6 +107,8 @@ export PREFILL_BLOCK_SIZE
 export DECODE_BLOCK_SIZE
 export ENABLE_PREFIX_CACHING
 export MAMBA_CACHE_MODE
+export VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+export TPU_RAIDEN_PREFIX_AWARE_LOAD
 export TPU_PREMAPPED_BUFFER_SIZE
 export TPU_PARALLEL_PRECOMPILE
 export NUM_GPU_BLOCKS_OVERRIDE
@@ -138,6 +142,22 @@ cd "${repo_root}"
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
 
+if ! grep -Fqx \
+    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" \
+    "${RUN_DIR}/launch_params.txt"; then
+  echo "Expected VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL} in launch_params.txt" >&2
+  exit 1
+fi
+echo "PREFIX_CACHE_RETENTION_INTERVAL_OK ${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}"
+
+if ! grep -Fqx \
+    "TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD}" \
+    "${RUN_DIR}/launch_params.txt"; then
+  echo "Expected TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD} in launch_params.txt" >&2
+  exit 1
+fi
+echo "RAIDEN_PREFIX_AWARE_LOAD_OK ${TPU_RAIDEN_PREFIX_AWARE_LOAD}"
+
 expected_prefill_scheduler_block_size=$((PREFILL_BLOCK_SIZE * PREFILL_PCP))
 expected_decode_scheduler_block_size="${DECODE_BLOCK_SIZE}"
 prefill_resolution="scheduler_block_size=${expected_prefill_scheduler_block_size} hash_block_size=${expected_prefill_scheduler_block_size}"
@@ -162,11 +182,30 @@ if ((P4D2_PREFIX_HIT_PROBE_COUNT < 2)); then
   echo "P4D2_PREFIX_HIT_PROBE_COUNT must be at least 2" >&2
   exit 2
 fi
+prefix_hit_probe_namespace="pc-retention-${BUILDKITE_JOB_ID:-local}-$$"
+if [[ "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" == "0" ]]; then
+  # Zero retention starts with no periodic Mamba checkpoints. Prime the full
+  # attention cache once so the next request discovers the shared-prefix
+  # junction and materializes the adaptive Mamba checkpoint. Keep this setup
+  # request outside the measured interval: the existing assertion then still
+  # requires every repeat after the adaptive request to hit one scheduler block.
+  python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
+    --host "${P4D2_BIND_HOST}" \
+    --port "${PROXY_PORT}" \
+    --model "${SERVED_MODEL_NAME}" \
+    --namespace "${prefix_hit_probe_namespace}" \
+    --prefix-hit-probe-only \
+    --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
+    --long-repeat-count 1 \
+    2>&1 | tee "${RUN_DIR}/logs/prefix_cache_retention_warmup.log"
+  echo "PREFIX_CACHE_RETENTION_WARMUP_OK 1"
+fi
 prefill_prefix_cache_hits_before="$(read_prefill_prefix_cache_hits)"
 python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
+  --namespace "${prefix_hit_probe_namespace}" \
   --prefix-hit-probe-only \
   --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
   --long-repeat-count "${P4D2_PREFIX_HIT_PROBE_COUNT}" \

@@ -373,7 +373,7 @@ def ragged_scatter(x: jax.Array, indices: jax.Array, start: jax.Array,
   The typical usage of this kernel is "unpermute" after GMM of the MOE layers.
   That is, replace `gmm2_res[topk_argsort_revert_indices]` with
   `ragged_scatter(x, topk_argsort_revert_indices, ..)` in
-  vllm_torchtpu/layers/common/fused_moe_gmm.py.
+  vllm_torchtpu/layers/core/fused_moe_gmm.py.
   """
 
     assert x.ndim == 2, "Ragged scatter only supports 2d inputs."

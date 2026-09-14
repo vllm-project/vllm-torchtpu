@@ -67,6 +67,7 @@ steps:
 
       - label: "Integration: qwen35-apc-correctness"
         key: "integration_qwen35_apc_correctness"
+        timeout_in_minutes: 30
         agents:
           queue: "tpu_v7x_8_queue"
         env:

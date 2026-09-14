@@ -9,13 +9,13 @@ import pytest
 import torch
 from vllm.distributed import parallel_state
 
-from vllm_torchtpu.distributed import pcp
+from vllm_torchtpu.distributed import mesh_utils, pcp
 
 
 @pytest.fixture(autouse=True)
 def isolated_caches(monkeypatch):
-    monkeypatch.setattr(pcp, "_LAYOUT_CACHE", {})
-    monkeypatch.setattr(pcp, "_MESH_CACHE", {})
+    monkeypatch.setattr(mesh_utils, "_LAYOUT_CACHE", {})
+    monkeypatch.setattr(mesh_utils, "_MESH_CACHE", {})
 
 
 @pytest.mark.parametrize("group", [
@@ -109,7 +109,7 @@ def test_global_rank_probe(monkeypatch, available, initialized, expected):
                         lambda: initialized)
     get_rank = Mock(return_value=7)
     monkeypatch.setattr(torch.distributed, "get_rank", get_rank)
-    assert pcp._get_current_global_rank() == expected
+    assert mesh_utils._get_current_global_rank() == expected
     assert get_rank.call_count == int(available and initialized)
 
 
@@ -121,7 +121,7 @@ def runtime():
 
 def test_native_device_id(monkeypatch, runtime):
     monkeypatch.setattr(runtime, "global_device_id", lambda: 9)
-    assert pcp._get_tpu_global_device_id() == 9
+    assert mesh_utils._get_tpu_global_device_id() == 9
 
 
 @pytest.mark.parametrize("devices",
@@ -130,7 +130,7 @@ def test_device_id_fallback(monkeypatch, runtime, devices):
     monkeypatch.setattr(runtime, "global_device_id",
                         Mock(side_effect=RuntimeError))
     monkeypatch.setattr(jax, "local_devices", lambda: devices)
-    assert pcp._get_tpu_global_device_id() == (
+    assert mesh_utils._get_tpu_global_device_id() == (
         17 if devices and hasattr(devices[0], "id") else 0)
 
 
@@ -138,7 +138,7 @@ def test_device_id_without_runtime(monkeypatch, runtime):
     monkeypatch.setattr(runtime, "global_device_id",
                         Mock(side_effect=RuntimeError))
     monkeypatch.setattr(jax, "local_devices", Mock(side_effect=RuntimeError))
-    assert pcp._get_tpu_global_device_id() == 0
+    assert mesh_utils._get_tpu_global_device_id() == 0
 
 
 @pytest.mark.parametrize("group", [None, SimpleNamespace(world_size=1)])
@@ -182,18 +182,21 @@ def test_rank_device_collective(monkeypatch, missing):
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     if missing:
         with pytest.raises(RuntimeError, match="empty entry"):
-            pcp._collect_rank_to_device_id(group, 6, 20)
+            mesh_utils._collect_rank_to_device_id(group, 6, 20)
     else:
-        assert pcp._collect_rank_to_device_id(group, 6, 20) == {6: 20, 2: 40}
+        assert mesh_utils._collect_rank_to_device_id(group, 6, 20) == {
+            6: 20,
+            2: 40
+        }
 
 
 def test_group_layout_orders_mapping_and_scopes_cache(monkeypatch):
     group = SimpleNamespace(world_size=4, ranks=[2, 4, 6, 8], rank_in_group=2)
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
-    monkeypatch.setattr(pcp, "_get_current_global_rank", lambda: 6)
-    monkeypatch.setattr(pcp, "_get_tpu_global_device_id", lambda: 10)
+    monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 6)
+    monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 10)
     gather = Mock(return_value={8: 30, 6: 10, 4: 20, 2: 40})
-    monkeypatch.setattr(pcp, "_collect_rank_to_device_id", gather)
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", gather)
     layout = pcp.get_pcp_group_layout()
     assert layout == pcp.PcpGroupLayout((2, 4, 6, 8), (40, 20, 10, 30), 2, 4)
     assert (layout.device_id, layout.prev_rank_in_group,
@@ -215,8 +218,8 @@ def test_ring_wraparound(rank, prev, next_rank):
 
 def test_single_rank_layout(monkeypatch):
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: None)
-    monkeypatch.setattr(pcp, "_get_current_global_rank", lambda: 6)
-    monkeypatch.setattr(pcp, "_get_tpu_global_device_id", lambda: 10)
+    monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 6)
+    monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 10)
     layout = pcp.get_pcp_group_layout()
     assert layout == pcp.PcpGroupLayout((6, ), (10, ), 0, 1)
     assert layout.prev_rank_in_group == layout.next_rank_in_group == 0
@@ -225,19 +228,20 @@ def test_single_rank_layout(monkeypatch):
 def test_layout_missing_rank_is_not_cached(monkeypatch):
     group = SimpleNamespace(world_size=2, ranks=[2, 6], rank_in_group=0)
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
-    monkeypatch.setattr(pcp, "_get_current_global_rank", lambda: 2)
-    monkeypatch.setattr(pcp, "_get_tpu_global_device_id", lambda: 10)
-    monkeypatch.setattr(pcp, "_collect_rank_to_device_id",
+    monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 2)
+    monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 10)
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id",
                         lambda *args: {2: 10})
     with pytest.raises(RuntimeError, match=r"missing=\[6\]"):
         pcp.get_pcp_group_layout()
-    assert pcp._LAYOUT_CACHE == {}
+    assert mesh_utils._LAYOUT_CACHE == {}
 
 
 def test_mesh_preserves_group_order_and_caches_by_axis_and_devices(
         monkeypatch):
     layout = pcp.PcpGroupLayout((2, 6), (30, 10), 0, 2)
-    monkeypatch.setattr(pcp, "get_pcp_group_layout", lambda: layout)
+    monkeypatch.setattr(mesh_utils, "get_cp_group_layout",
+                        lambda group: layout)
     monkeypatch.setattr(jax, "devices",
                         lambda: [SimpleNamespace(id=i) for i in [10, 20, 30]])
     mesh = Mock(side_effect=lambda *args, **kwargs: object())
@@ -253,9 +257,10 @@ def test_mesh_preserves_group_order_and_caches_by_axis_and_devices(
 
 
 def test_mesh_missing_device_is_not_cached(monkeypatch):
-    monkeypatch.setattr(pcp, "get_pcp_group_layout",
-                        lambda: pcp.PcpGroupLayout((2, 6), (30, 10), 0, 2))
+    monkeypatch.setattr(
+        mesh_utils, "get_cp_group_layout", lambda group: pcp.PcpGroupLayout(
+            (2, 6), (30, 10), 0, 2))
     monkeypatch.setattr(jax, "devices", lambda: [SimpleNamespace(id=30)])
     with pytest.raises(RuntimeError, match=r"missing=\[10\]"):
         pcp.get_or_create_pcp_mesh()
-    assert pcp._MESH_CACHE == {}
+    assert mesh_utils._MESH_CACHE == {}

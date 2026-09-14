@@ -13,6 +13,8 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    configs as batched_rpa_configs
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
     wrapper as batched_rpa_wrapper
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import \
     get_dtype_packing
@@ -23,6 +25,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import \
     _reshape_metadata_page_indices_jax
 
 PCP_AXIS_NAME = "pcp"
+
+KVLayout = batched_rpa_configs.KVLayout
 
 
 class _PCPQueryRowMapping(NamedTuple):
@@ -47,21 +51,66 @@ def _pack_kv_for_cache(
     k: jax.Array,
     v: jax.Array,
     cache_dtype: jnp.dtype,
+    *,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    page_size: int | None = None,
 ) -> jax.Array:
     """Pack K and V together before converting to the cache dtype."""
     dummy_q = jnp.zeros_like(k)
-    _, packed_kv = batched_rpa_wrapper.prepare_inputs(dummy_q, k, v, k.dtype,
-                                                      cache_dtype)
+    _, packed_kv = batched_rpa_wrapper.prepare_inputs(
+        dummy_q,
+        k,
+        v,
+        k.dtype,
+        cache_dtype,
+        kv_layout=kv_layout,
+    )
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        if page_size is None or page_size <= 0:
+            raise ValueError(
+                "PCP SEQ_ALONG_LANE KV packing requires page_size > 0.")
+        padded_tokens = math.ceil(packed_kv.shape[-1] / page_size) * page_size
+        packed_kv = jnp.pad(
+            packed_kv,
+            ((0, 0), (0, 0), (0, 0), (0, padded_tokens - packed_kv.shape[-1])),
+            constant_values=0,
+        )
     return packed_kv
+
+
+def _kv_cache_page_size(kv_cache: jax.Array, kv_layout: KVLayout) -> int:
+    if kv_cache.ndim != 5:
+        raise ValueError(f"PCP KV cache must be 5D, got {kv_cache.shape}.")
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        return int(kv_cache.shape[-1])
+    return int(kv_cache.shape[1])
 
 
 def _prepare_packed_kv_for_cache(
     k: jax.Array,
     v: jax.Array,
     kv_cache: jax.Array,
+    *,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> jax.Array:
     """Pack K/V once and adapt the packed tail to the cache layout."""
-    packed_kv = _pack_kv_for_cache(k, v, kv_cache.dtype)
+    page_size = _kv_cache_page_size(kv_cache, kv_layout)
+    packed_kv = _pack_kv_for_cache(k,
+                                   v,
+                                   kv_cache.dtype,
+                                   kv_layout=kv_layout,
+                                   page_size=page_size)
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        if packed_kv.shape[:-1] != kv_cache.shape[1:-1]:
+            raise ValueError(
+                "SEQ_ALONG_LANE fresh KV prefix must match the cache head "
+                f"layout: {packed_kv.shape[:-1]} vs {kv_cache.shape[1:-1]}.")
+        if packed_kv.shape[-1] < k.shape[0]:
+            raise ValueError(
+                "SEQ_ALONG_LANE fresh KV token extent must cover all local "
+                f"tokens: {packed_kv.shape[-1]} vs {k.shape[0]}.")
+        return packed_kv.astype(kv_cache.dtype)
+
     if packed_kv.shape[1:] != kv_cache.shape[2:]:
         packed_tail = 1
         for dim in packed_kv.shape[1:]:
@@ -78,7 +127,11 @@ def _prepare_packed_kv_for_cache(
     return packed_kv.astype(kv_cache.dtype)
 
 
-def _reshape_packed_kv_cache_for_attention(kv_cache: jax.Array) -> jax.Array:
+def _reshape_packed_kv_cache_for_attention(
+    kv_cache: jax.Array,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+) -> jax.Array:
+    del kv_layout
     expected_packing = get_dtype_packing(kv_cache.dtype)
     if kv_cache.shape[3] == expected_packing:
         return kv_cache
@@ -472,8 +525,15 @@ def _build_writeback_segment_descriptors(
     compact_slot_ids: jax.Array,
     writeback_count: jax.Array,
     max_segments: int = 4096,
+    *,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    page_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Coalesce dense captured rows into contiguous cache-copy segments."""
+    if kv_layout == KVLayout.SEQ_ALONG_LANE and (page_size is None
+                                                 or page_size <= 0):
+        raise ValueError(
+            "SEQ_ALONG_LANE writeback descriptors require page_size > 0.")
     capacity = int(compact_slot_ids.shape[0])
     num_descriptor_slots = min(capacity, max_segments)
     rows = jnp.arange(capacity, dtype=jnp.int32)
@@ -484,10 +544,14 @@ def _build_writeback_segment_descriptors(
                                       axis=0)
     previous_slots = jnp.concatenate(
         (jnp.asarray([-2], dtype=jnp.int32), compact_slot_ids[:-1]), axis=0)
+    discontinuous = compact_slot_ids != previous_slots + 1
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        crossed_page = ((compact_slot_ids // page_size)
+                        != (previous_slots // page_size))
+        discontinuous = jnp.logical_or(discontinuous, crossed_page)
     segment_starts = jnp.logical_and(
         active,
-        jnp.logical_or(jnp.logical_not(previous_active), compact_slot_ids
-                       != previous_slots + 1),
+        jnp.logical_or(jnp.logical_not(previous_active), discontinuous),
     )
     segment_ids = jnp.cumsum(segment_starts.astype(jnp.int32)) - 1
     num_segments = jnp.sum(segment_starts, dtype=jnp.int32)
@@ -566,6 +630,7 @@ def sharded_pcp_ragged_paged_attention(
     cp_kv_cache_interleave_size: int = 0,
     q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     q_compute_size: int | None = None,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ):
     """Runs streaming PCP RPA over local Q/K/V shards."""
     if attention_sink is not None:
@@ -590,12 +655,19 @@ def sharded_pcp_ragged_paged_attention(
     if not update_kv_cache:
         raise NotImplementedError(
             "PCP streaming RPA requires update_kv_cache=True.")
-    if (cp_kv_cache_interleave_size > kv_cache.shape[1]
-            or kv_cache.shape[1] % cp_kv_cache_interleave_size != 0):
+    page_size = _kv_cache_page_size(kv_cache, kv_layout)
+    if (kv_layout == KVLayout.SEQ_ALONG_LANE and
+        (page_size % 128 != 0 or cp_kv_cache_interleave_size % 128 != 0)):
+        raise NotImplementedError(
+            "PCP SEQ_ALONG_LANE UT path requires page_size and "
+            "cp_kv_cache_interleave_size to be multiples of 128, got "
+            f"{page_size=} {cp_kv_cache_interleave_size=}.")
+    if (cp_kv_cache_interleave_size > page_size
+            or page_size % cp_kv_cache_interleave_size != 0):
         raise NotImplementedError(
             "PCP streaming RPA requires page_size to be divisible by "
             "cp_kv_cache_interleave_size: "
-            f"page_size={kv_cache.shape[1]} "
+            f"page_size={page_size} "
             f"{cp_kv_cache_interleave_size=}.")
     if q.shape[0] % pcp_size != 0:
         raise ValueError("PCP streaming RPA requires q tokens to be evenly "
@@ -654,15 +726,17 @@ def sharded_pcp_ragged_paged_attention(
             rank_major_query_rows,
             block_tables,
             local_kv_cache_num_blocks=kv_cache.shape[0],
-            page_size=kv_cache.shape[1],
+            page_size=page_size,
             pcp_size=pcp_size,
             interleave_size=cp_kv_cache_interleave_size,
         )
         compact_slot_ids = _compact_writeback_slot_ids_for_cache_rank(
             writeback_mapping, cache_rank)
         writeback_count = writeback_mapping.writeback_counts[cache_rank]
-        packed_current_kv = _prepare_packed_kv_for_cache(
-            k_local, v_local, kv_cache)
+        packed_current_kv = _prepare_packed_kv_for_cache(k_local,
+                                                         v_local,
+                                                         kv_cache,
+                                                         kv_layout=kv_layout)
         if q_local.shape[1] % k_local.shape[1] != 0:
             raise ValueError("Q heads must be divisible by KV heads.")
         q_per_kv = q_local.shape[1] // k_local.shape[1]
@@ -681,11 +755,14 @@ def sharded_pcp_ragged_paged_attention(
                 ),
                 constant_values=0,
             )
-        attention_kv_cache = _reshape_packed_kv_cache_for_attention(kv_cache)
+        attention_kv_cache = _reshape_packed_kv_cache_for_attention(
+            kv_cache, kv_layout)
         segment_descriptors, num_segments = \
             _build_writeback_segment_descriptors(
                 compact_slot_ids,
                 writeback_count,
+                kv_layout=kv_layout,
+                page_size=page_size,
             )
         output, kv_cache = \
             pcp_streaming_attention_page_groups_packed_local_from_metadata(
@@ -705,6 +782,7 @@ def sharded_pcp_ragged_paged_attention(
             q_compute_size=q_compute_size,
             k_scale=k_scale,
             v_scale=v_scale,
+            kv_layout=kv_layout,
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=PCP_AXIS_NAME,
         )

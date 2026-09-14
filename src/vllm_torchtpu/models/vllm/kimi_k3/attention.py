@@ -29,11 +29,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.sequence_layout import \
-    is_pcp_streaming_attention_metadata
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op, build_kimi_pooled_kda_op)
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.sequence_layout import \
+    is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -220,7 +220,7 @@ class MultiHeadLatentAttention(nn.Module):
                 self.q_lora_rank,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ]
-            if getattr(config, "mla_use_output_gate", False):
+            if config.mla_use_output_gate:
                 qkv_a_output_sizes.append(config.num_attention_heads *
                                           self.v_head_dim)
                 self.fused_qkv_a_proj = MixedParallelMergedLinear(
@@ -274,8 +274,8 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.g_proj",
-        ) if (getattr(config, "mla_use_output_gate", False)
-              and not self.mla_gate_is_fused) else None)
+        ) if (config.mla_use_output_gate and not self.mla_gate_is_fused) else
+                       None)
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.v_head_dim,
             config.hidden_size,
@@ -284,6 +284,7 @@ class MultiHeadLatentAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         mla_modules = MLAModules(
+            g_proj=self.g_proj,
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
             rotary_emb=None,
@@ -297,12 +298,6 @@ class MultiHeadLatentAttention(nn.Module):
             is_sparse=False,
             topk_indices_buffer=None,
         )
-        # The TPU MLA wrapper supports K3's optional output gate, while the
-        # current upstream MLAModules dataclass does not expose that field.
-        # Attach it as backend-specific metadata instead of passing a stale
-        # constructor argument.
-        mla_modules.g_proj = self.g_proj
-        mla_modules.gate_is_fused = self.mla_gate_is_fused
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
             num_heads,
@@ -316,6 +311,7 @@ class MultiHeadLatentAttention(nn.Module):
             vllm_config.cache_config,
             quant_config,
             prefix,
+            gate_is_fused=self.mla_gate_is_fused,
         )
 
     def forward(

@@ -74,6 +74,20 @@ def _calculate_num_column_partitions(hidden_size: int, num_cores: int,
     return num_column_partitions
 
 
+def partition_counts(hidden_size: int, tpu_info) -> tuple[int, int]:
+    """Column and row partition counts of the SparseCore subcores for a width."""
+    sc_info = tpu_info.sparse_core
+    num_cores = sc_info.num_cores * sc_info.num_subcores
+    num_column_partitions = _calculate_num_column_partitions(
+        hidden_size, num_cores, tpu_info.num_lanes)
+    return num_column_partitions, num_cores // num_column_partitions
+
+
+def token_block_alignment(hidden_size: int, tpu_info) -> int:
+    """Destination-token granularity: one 64-token block per row partition."""
+    return partition_counts(hidden_size, tpu_info)[1] * _TOKEN_BLOCK
+
+
 def _main_kernel(
     x_hbm_ref: jax.Ref,
     route_metadata_hbm_ref: jax.Ref,
@@ -345,16 +359,13 @@ def ragged_gather_reduce(
     if x.shape[0] % 2:
         x = jnp.pad(x, ((0, 1), (0, 0)))
     num_tokens = input_size // reduce_group_size
-    num_cores = sc_info.num_cores * sc_info.num_subcores
-    num_lanes = pltpu.get_tpu_info().num_lanes
     hidden_size = x.shape[-1]
     if x.shape[0] > 1 << _ROUTE_INDEX_BITS:
         raise ValueError(
             f"destination-major prototype supports at most "
             f"{1 << _ROUTE_INDEX_BITS} source rows, got {x.shape[0]}")
-    num_column_partitions = _calculate_num_column_partitions(
-        hidden_size, num_cores, num_lanes)
-    num_row_partitions = num_cores // num_column_partitions
+    num_column_partitions, num_row_partitions = partition_counts(
+        hidden_size, pltpu.get_tpu_info())
 
     token_alignment = num_row_partitions * _TOKEN_BLOCK
     padded_num_tokens = _align_to(num_tokens, token_alignment)

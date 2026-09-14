@@ -27,10 +27,9 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
-from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.distributed.pcp_rank_order import (
     pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
-from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
+from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
@@ -78,13 +77,13 @@ class TPUWorker(WorkerBase):
         is_driver_worker: bool = False,
         devices=None,
         ip: str = "localhost",
-        prev_worker_ip: str = "localhost",
     ):
-        # Re-apply patches that were done in check_and_update_config.
-        # Workers may be spawned (not forked) so module-level patches
-        # from the parent process are lost.
-        from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
-        apply_tpu_patches()
+        from vllm_torchtpu import patch_registry
+
+        patch_registry.apply("worker_init")
+        # This process creates the worker's reply ring to the engine.
+        from vllm_torchtpu.distributed.pp_push import widen_message_rings
+        widen_message_rings(vllm_config)
 
         super().__init__(vllm_config=vllm_config,
                          local_rank=local_rank,
@@ -112,7 +111,6 @@ class TPUWorker(WorkerBase):
         # TPU-specific extras not in WorkerBase.
         self.devices = devices if devices is not None else []
         self.device_ranks = set(device.id for device in self.devices)
-        self.prev_worker_ip = prev_worker_ip
 
         if self.cache_config.cache_dtype == "auto":
             model_dtype = self.model_config.dtype
@@ -144,9 +142,6 @@ class TPUWorker(WorkerBase):
             self.profile_dir = torch_profiler_dir
             logger.info("Profiling enabled. Traces will be saved to: %s",
                         self.profile_dir)
-
-        # step_counter is used to calc uuid for intermediate tensor transfer.
-        self.step_counter = 0
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -406,16 +401,9 @@ class TPUWorker(WorkerBase):
         # here rather than costing a few percent unnoticed.
         verify_pcp_topology_order(group_ranks_by_name)
 
-        # TODO: Enable PP support. The old JAX-based PP init
-        # (jax_parallel_state.init_pp_distributed_environment) was removed
-        # during the torch_tpu migration. PP will need KV transfer init
-        # and proper rank assignment via torch.distributed.
-        is_first_rank = True
-        is_last_rank = True
-        if self.parallel_config.pipeline_parallel_size > 1:
-            is_first_rank = self.rank == 0
-            is_last_rank = (
-                self.rank == self.parallel_config.pipeline_parallel_size - 1)
+        pp_group = get_pp_group()
+        is_first_rank = pp_group.is_first_rank
+        is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
         self.model_runner = TPUModelRunner(
@@ -431,11 +419,6 @@ class TPUWorker(WorkerBase):
                     f"is_driver_worker={self.is_driver_worker} | ")
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
-
-    def initialize_pp_transfer_connect(self):
-        if self.rank == 0:
-            return
-        jax_parallel_state.connect(self.prev_worker_ip, self.rank - 1)
 
     def determine_available_memory(self) -> int:
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm
@@ -495,6 +478,15 @@ class TPUWorker(WorkerBase):
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
+
+    def pp_push(self):
+        return self.model_runner.pp_push()
+
+    def pp_settle(self):
+        return self.model_runner.pp_settle()
+
+    def profile_pipeline_chunks(self) -> dict:
+        return self.model_runner.profile_pipeline_chunks()
 
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
@@ -626,9 +618,9 @@ class TPUWorker(WorkerBase):
         return key
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        from vllm_torchtpu.platforms.tpu_platform import \
-            _apply_model_specific_patches
-        _apply_model_specific_patches(self.model_config)
+        from vllm_torchtpu import patch_registry
+
+        patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
