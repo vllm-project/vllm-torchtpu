@@ -116,18 +116,30 @@ markers = [
 [tool.pyrefly]
 project-includes = ["src"]
 
-# Start at `basic`, which covers unambiguous mistakes (undefined names, bad
-# unpacking, wrong keyword arguments). Raising this to `default` adds ~300 more
-# findings, mostly attribute and argument types on the JAX/torch boundary;
-# that is worth doing as follow-up work, not as part of enabling the checker.
-preset = "basic"
+# Errors listed in the baseline file do not fail the check; any error not
+# listed does. To retire an entry, fix the code and delete the entry, or
+# regenerate the file with `pyrefly check --update-baseline`.
+preset = "default"
+baseline = ".pyrefly-baseline.json"
 
-# CI runs pre-commit without installing our dependencies, and `vllm` is
-# installed as an editable package behind a custom path hook that no static
-# checker can resolve. Listing these makes an unresolved import degrade to
-# `Any` instead of erroring, so local and CI runs agree. `ignore-missing-imports`
-# only applies when the module is genuinely unresolvable - when a package is
-# installed with type information, it is still checked normally.
+# Entries match on file, error kind, and message text. A baselined error keeps
+# matching when lines move, and a new error of the same kind next to it is
+# still reported. The baseline can hide only an exact repeat of a recorded
+# message in the same file.
+baseline-matching-mode = "concise-description"
+baseline-format = "minimal"
+
+# Never consult a Python environment. Every third-party import resolves to
+# `Any`, so the hook, CI, and a bare `pyrefly check` report the same errors
+# and the baseline matches in all three. Without this, a checkout with a
+# populated venv reports about 1,200 extra errors that CI never sees.
+# With no interpreter to ask, the Python version must be stated too, or
+# pyrefly assumes its own default and stdlib stubs drift between runners.
+skip-interpreter-query = true
+python-version = "3.12"
+
+# With no environment to query, every import below is unresolvable. Listing
+# them makes an unresolved import degrade to `Any` instead of erroring.
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
