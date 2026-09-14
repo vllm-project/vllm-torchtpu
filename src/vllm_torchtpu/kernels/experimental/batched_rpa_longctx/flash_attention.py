@@ -28,10 +28,8 @@ def flash_attention_qk_softmax(
     l_prev: jax.Array,  # [KV, TQ, 128]
     is_last_k: jax.Ref,  # [B]
     *,
-    processed_q_len: list[jax.Array],  # [B]
-    processed_kv_len: list[jax.Array],  # [B]
+    custom_mask: jax.Array,
     cfgs: configs.RpaConfigs,
-    bq_start: int,
 ):
     """Flash attention kernel."""
     b, k_heads, tq, h_size = q.shape
@@ -73,48 +71,8 @@ def flash_attention_qk_softmax(
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
 
     qk_masked = []
-
-    kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
-    q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
-    q_iota //= cfgs.aligned_num_q_heads_per_kv_head
-    q_kv_diff = q_iota - kv_iota
-
     for b_idx in range(cfgs.block.batch_size):
-        # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
-        # compute as much as possible before involving vector compute. Therefore, we
-        # break down a computational steps into following equations to separate out
-        # scalar and vector compute.
-        # q_len = q_iota + (bq_start + processed_q_len)
-        # kv_len = kv_iota + processed_kv_len
-        # Step 1: q_len >= kv_len:
-        # Step 2:
-        #   q_iota + (bq_start + processed_q_len)
-        #   >= kv_iota + processed_kv_len
-        # Step 3:
-        #   q_iota - kv_iota
-        #   >= processed_kv_len - (bq_start + processed_q_len)
-        # Step 4:
-        #   q_kv_delta = q_iota - kv_iota
-        #   offset = processed_kv_len - (bq_start + processed_q_len)
-        offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
-        mask_b = q_kv_diff >= offset
-
-        if (sliding_window := cfgs.model.sliding_window) is not None:
-            # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
-            # to above, we want to minimize vector compute. Therefore, we break
-            # down computes into following steps.
-            # Step 1: q_len < sliding_window + kv_len
-            # Step 2:
-            #   q_iota + (bq_start + processed_q_len)
-            #   < sliding_window + kv_iota + processed_kv_len
-            # Step 3:
-            #   q_iota - kv_iota
-            #   < sliding_window + processed_kv_len - (bq_start + processed_q_len)
-            # Step 4:
-            #   q_kv_diff < sliding_window + offset
-            mask_b = jnp.logical_and(mask_b, q_kv_diff
-                                     < sliding_window + offset)
-
+        mask_b = custom_mask[b_idx]
         qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
 
@@ -143,7 +101,7 @@ def flash_attention_qk_softmax(
 
     l_next = jnp.stack(l_next_list, axis=0)
 
-    return p, alpha_list, m_prev, l_next
+    return p, alpha_list, m_next, l_next, m_prev
 
 
 def flash_attention_pv(

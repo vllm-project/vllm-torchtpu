@@ -592,3 +592,79 @@ def ragged_paged_attention(
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
 
     return o_hbm, kv_cache
+
+
+def schedule_capacity(
+    *,
+    mode: configs.RpaCase,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    num_seqs: int,
+    pages_per_seq: int,
+    page_size: int,
+    dtype_q: jnp.dtype,
+    dtype_kv: jnp.dtype,
+    kv_layout: configs.KVLayout | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> tuple[int, int, int]:
+    """How many (query block, KV block) pairs one step's kernel of ``mode``
+    can schedule, with the query and KV tile sizes it plans with:
+    (pairs, bq, bkv).
+
+    The kernel keeps its whole schedule in SMEM, sized by ``max_steps_ub``;
+    the schedule builder does not check that bound, so a step with more pairs
+    overruns SMEM. The pipeline needs ``n_buffer + 1`` spare entries. With
+    more than one batch lane the pairs are spread over the lanes and one lane
+    may hold up to one longest sequence's KV blocks more than its share, so
+    that is taken off as well.
+    """
+    if kv_layout is None:
+        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    model_cfgs = configs.ModelConfigs(num_q_heads=num_q_heads,
+                                      num_kv_heads=num_kv_heads,
+                                      head_dim=head_dim,
+                                      mask_value=0.0)
+    serve_cfgs = configs.ServingConfigs(
+        num_seqs=num_seqs,
+        page_size=page_size,
+        total_q_tokens=0,
+        num_page_indices=num_seqs * pages_per_seq,
+        dtype_q=jnp.dtype(dtype_q),
+        dtype_kv=jnp.dtype(dtype_kv),
+        dtype_out=jnp.dtype(dtype_q),
+        kv_layout=kv_layout,
+    )
+    decode, prefill = calculate_block_sizes(model_cfgs, serve_cfgs,
+                                            vmem_limit_bytes)
+    block = decode if mode == configs.RpaCase.DECODE else prefill
+    cfgs = configs.RpaConfigs(block=block,
+                              model=model_cfgs,
+                              serve=serve_cfgs,
+                              mode=mode,
+                              vmem_limit_bytes=vmem_limit_bytes)
+    per_lane = cfgs.max_steps_ub - block.n_buffer - 1
+    if block.batch_size > 1:
+        per_lane -= -(-pages_per_seq * page_size // block.bkv_sz)
+    return max(0, per_lane) * block.batch_size, block.bq_sz, block.bkv_sz
+
+
+def schedule_pairs(q_lens, kv_lens, bq: int, bkv: int) -> int:
+    """(query block, KV block) pairs the mixed-mode kernel visits for
+    sequences with ``q_lens`` new tokens at the end of ``kv_lens`` tokens of
+    context: every query block attends to the KV blocks up to its own last
+    token."""
+    import numpy as np
+    q = np.asarray(q_lens, dtype=np.int64)
+    kv = np.asarray(kv_lens, dtype=np.int64)
+    keep = q > 0
+    q, kv = q[keep], kv[keep]
+    if q.size == 0:
+        return 0
+    blocks = -(-q // bq)
+    i = np.arange(int(blocks.max()))
+    q_end = np.minimum((i[None, :] + 1) * bq, q[:, None])
+    k_end = -(-(kv[:, None] - q[:, None] + q_end) // bkv)
+    return int(np.where(i[None, :] < blocks[:, None], k_end, 0).sum())

@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 
 LKV_DIM = 512
@@ -41,14 +42,14 @@ class CsaGatherTest(parameterized.TestCase):
         num_tokens = pages * PAGE_SIZE
         nope_bytes = self.rng.integers(0, 256, (num_tokens, LKV_DIM), np.uint8)
         rope_bytes = self.rng.integers(
-            0, 256, (num_tokens, dsa_gather.TILE_LANE_BYTES), np.uint8)
+            0, 256, (num_tokens, kv_cache_utils.TILE_LANE_BYTES), np.uint8)
 
         nope_cache = jnp.asarray(nope_bytes).reshape(
-            pages, PAGE_SIZE, dsa_gather.TILE_SUBROWS,
-            dsa_gather.TILE_LANE_BYTES)
+            pages, PAGE_SIZE, kv_cache_utils.WORD_BYTES,
+            kv_cache_utils.TILE_LANE_BYTES)
         rope_cache = jnp.asarray(rope_bytes).reshape(
-            pages, PAGE_SIZE // dsa_gather.TILE_SUBROWS,
-            dsa_gather.TILE_SUBROWS, dsa_gather.TILE_LANE_BYTES)
+            pages, PAGE_SIZE // kv_cache_utils.WORD_BYTES,
+            kv_cache_utils.WORD_BYTES, kv_cache_utils.TILE_LANE_BYTES)
         return nope_cache, rope_cache, nope_bytes, rope_bytes
 
     def _check(self, nope_cache, rope_cache, nope_bytes, rope_bytes, indices):

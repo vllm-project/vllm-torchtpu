@@ -127,9 +127,9 @@ def unsupported_reason(shape_env: Any, size: int) -> str | None:
             return f"{symbol} <= {upper}"
 
     substitution = {symbol: size for symbol in symbols}
-    for guard in getattr(shape_env, "guards", ()):
-        expr = getattr(guard, "expr", None)
-        if expr is not None and _holds_at(expr, substitution) is False:
+    for guard in shape_env.guards:
+        expr = guard.expr
+        if _holds_at(expr, substitution) is False:
             return str(expr)
     return None
 

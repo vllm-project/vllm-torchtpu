@@ -67,10 +67,30 @@ def _clear_kv_cache_layout_cache():
     Memoized process-wide, so the first caller would pin the answer and a
     later `monkeypatch.setenv` would be silently ignored.
     """
-    from vllm.v1.attention.backends.utils import set_kv_cache_layout
+    try:
+        from vllm.v1.attention.backends.utils import set_kv_cache_layout
+    except ImportError:
+        yield
+        return
+
     set_kv_cache_layout(None)
     yield
     set_kv_cache_layout(None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_warning_once():
+    """`warning_once` dedups by message for the life of the process, so without
+    this a test passes or fails depending on what ran before it."""
+    try:
+        import vllm.logger
+    except ImportError:
+        yield
+        return
+
+    vllm.logger._print_warning_once.cache_clear()
+    yield
+    vllm.logger._print_warning_once.cache_clear()
 
 
 @pytest.fixture

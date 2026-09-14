@@ -180,6 +180,57 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      # DeepSeek-V4-Pro, two jobs in the deepseek-v4-flash shape but on the Ray
+      # path since the model spans two hosts.
+      - label: "Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
+        key: "perf_nightly_deepseek_v4_pro_dp16_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 600
+        agents:
+          queue: "tpu_v7x_16_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+          BENCHMARK_WARMUP_RUNS: "1"
+        commands:
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-pro-dp16-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-pro-dp16-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      - label: "Perf: Nightly deepseek-v4-pro xprof capture (TPU v7x-16)"
+        key: "perf_nightly_deepseek_v4_pro_xprof"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 600
+        agents:
+          queue: "tpu_v7x_16_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+          RUN_TYPE: "PROFILE"
+        commands:
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-pro-dp16-ep-profile --results-dir /perf_eval_results/deepseek-v4-pro-dp16-ep-profile"
+          - |
+            results_dir=perf_eval_results/deepseek-v4-pro-dp16-ep-profile
+            profile_dir=$$results_dir/profile
+            for phase in "$$profile_dir"/*/; do
+              [ -d "$$phase" ] || continue
+              echo "phase $$(basename "$$phase"): $$(find "$$phase" -name '*.xplane.pb' | wc -l) xplane files"
+            done
+            if ! find "$$profile_dir" -name '*.xplane.pb' -print -quit | grep -q .; then
+              echo "::error::No xplane traces under $$profile_dir; the profiler was armed but wrote nothing xprof can open."
+              exit 1
+            fi
+            # artifact_paths would upload the traces again, so drop them here.
+            dest=$$(jq -r '.profile_gcs_dir // ""' "$$results_dir/config.json")
+            if [ -z "$$dest" ]; then
+              echo "::error::config.json carries no profile_gcs_dir, so nothing states where these profiles belong."
+              exit 1
+            fi
+            gcloud storage cp -r "$$profile_dir"/* "$$dest/" \
+              && rm -rf "$$profile_dir"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Perf/Eval: Nightly deepseek-v4-flash-dp8-ep (TPU v7x-8)"
         key: "perf_nightly_deepseek_v4_flash_dp8_ep"
         if: 'build.env("NIGHTLY") == "1"'
@@ -190,7 +241,7 @@ steps:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/"
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash-0731/"
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep"
         artifact_paths:
           - "perf_eval_results/**/*"
@@ -206,7 +257,7 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           RUN_TYPE: "PROFILE"
         commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/"
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash-0731/"
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep-profile --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep-profile"
           - |
             results_dir=perf_eval_results/deepseek-v4-flash-dp8-ep-profile
@@ -244,32 +295,33 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      - label: "Perf: Nightly Kimi-K2.6 Real (TPU v7x-8)"
+      - label: "Perf/Eval: Nightly Kimi-K2.6 Real (TPU v7x-8)"
         key: "perf_nightly_kimi_k2_6_real"
         if: 'build.env("NIGHTLY") == "1"'
-        soft_fail: true
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
+          EVAL_SOFT_FAIL: "1"
         commands:
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --results-dir /perf_eval_results/kimik-2.6-w4a16-tp8-ep"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --run-lm-eval --results-dir /perf_eval_results/kimik-2.6-w4a16-tp8-ep"
         artifact_paths:
           - "perf_eval_results/**/*"
 
       # Kimi-K3 on the multihost tpu7x-32 pod (4 hosts x 8 chips): TP=32
-      # with EP, perf-only single-request latency probe at 8k in / 1k out.
+      # with EP: an 8k in / 1k out latency probe and MMLU-Pro accuracy eval.
       # The 1561 GB checkpoint streams from GCS with EP-sharded runai
       # streaming (--enable-ep-weight-filter, #373) — the pod has no data
       # disk that fits it. Runs through run_multihost.sh (Ray head+worker
       # containers), same as the GLM v7x-16 steps above. The generous
-      # timeout covers checkpoint stream + cold XLA compile; a warm run
-      # completes in about an hour. To validate or recalibrate, run this
+      # timeout covers checkpoint streaming, cold compilation, and eval.
+      # To validate or recalibrate performance, run this
       # step from a branch-local dev yml (see pipeline_dev.yml) and feed
       # two runs' perf_eval_results to check_regression.py --calibrate.
-      - label: "Perf: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
+      - label: "Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
         key: "perf_nightly_kimi_k3_tp32_ep"
         if: 'build.env("NIGHTLY") == "1"'
         timeout_in_minutes: 420
@@ -280,6 +332,6 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "14400"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
-          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --results-dir /perf_eval_results/kimi-k3-tp32-ep"
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --run-lm-eval --results-dir /perf_eval_results/kimi-k3-tp32-ep"
         artifact_paths:
           - "perf_eval_results/**/*"

@@ -51,6 +51,17 @@ class ModelConfigs:
         return self.num_q_heads // self.num_kv_heads
 
 
+class AttentionScope(enum.StrEnum):
+    """Which KV positions to attend to.
+  FULL:            attend all positions (default).
+  CACHE_ONLY:      attend only cached tokens, skip new tokens.
+  NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
+  """
+    FULL = enum.auto()
+    CACHE_ONLY = enum.auto()
+    NEW_TOKENS_ONLY = enum.auto()
+
+
 class KVLayout(enum.StrEnum):
     """Represents the different layouts for KV cache.
 
@@ -87,6 +98,14 @@ class ServingConfigs:
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
+    decode_query_size: int = 1
+    cp_group_size: int | None = None
+    attention_scope: AttentionScope = AttentionScope.FULL
+    return_lse: bool = False
+
+    @property
+    def max_decode_bkv_p_new(self) -> int:
+        return 1 + pl.cdiv(self.decode_query_size - 1, self.page_size)
 
     @property
     def pages_per_seq(self) -> int:
@@ -228,7 +247,7 @@ class RpaConfigs:
     @property
     def bkv_p_new(self) -> int:
         if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
-            return 1
+            return min(self.serve.max_decode_bkv_p_new, self.bkv_p)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.bkv_p + 1
         return self.bkv_p
@@ -336,12 +355,25 @@ class RpaConfigs:
     def dma_kv_new_size(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return 5
+        if (self.serve.kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+                and self.serve.cp_group_size is not None):
+            return 5
         return 4
 
     @property
     def lm_scratch_shape(self):
         num_lanes = pltpu.get_tpu_info().num_lanes
         return (
+            self.model.num_kv_heads,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+            num_lanes,
+        )
+
+    @property
+    def lse_vmem_shape(self):
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            self.block.batch_size,
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
             num_lanes,
@@ -443,3 +475,13 @@ class RpaConfigs:
                 f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
         if distribution.shape != (3, ):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+        # Context Parallel Support
+        if self.serve.cp_group_size is not None:
+            if self.serve.attention_scope == AttentionScope.FULL:
+                raise ValueError(
+                    "Context Parallel does not support AttentionScope.FULL"
+                    " where cache is sharded but current tokens is sequential")
+            if self.model.sliding_window is not None:
+                raise ValueError(
+                    "Context Parallel does not support sliding window right now"
+                )

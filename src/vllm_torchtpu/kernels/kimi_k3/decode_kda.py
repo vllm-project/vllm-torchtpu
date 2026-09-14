@@ -255,8 +255,8 @@ def decode_kda(
         dt_bias = jnp.zeros((n_v, d_k), dtype=jnp.float32)
     if dt_bias.shape != (n_v, d_k):
         raise ValueError(
-            f"dt_bias must be [n_v, d_k] = {(n_v, d_k)} for the decode kernel "
-            f"(chunk_kda takes it flat as [n_v * d_k]); got {dt_bias.shape}.")
+            f"dt_bias must be [n_v, d_k] = {(n_v, d_k)} for the decode kernel; "
+            f"got {dt_bias.shape}.")
 
     a_log_2d = a_log.reshape(n_v, 1)
 

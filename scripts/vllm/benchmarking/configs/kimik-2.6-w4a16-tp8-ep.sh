@@ -63,3 +63,15 @@ RANDOM_RANGE_RATIO="0.8"
 BENCHMARK_TEMPERATURE="0"
 PERF_TOLERANCE="0.05"
 EVAL_TOLERANCE="0.03"
+
+# Accuracy Evaluation Parameters
+# mmlu_pro only: mmlu_llama's few-shot turns arrive via continue_final_message,
+# and this chat template renders a prefilled assistant turn through its <think>
+# branch, so the shots come back malformed.
+LM_EVAL_TASKS="mmlu_pro"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=32,timeout=7200"
+# K2.6 gates reasoning on `thinking`, not the `enable_thinking` the harness
+# passes by default (chat_template.jinja L85/L107) -- with the default the
+# template opens an unclosed <think> and the answer never fits max_gen_toks.
+LM_EVAL_GEN_KWARGS='{"chat_template_kwargs": {"thinking": false}}'

@@ -39,12 +39,40 @@ _NUM_BLOCKS_OVERRIDE_REL_TOL = 0.005
 
 
 def reconcile_num_gpu_blocks_override(
-        worker_overrides: list[Optional[int]]) -> Optional[int]:
+        worker_overrides: list[Optional[int]],
+        workers_per_stage: Optional[int] = None) -> Optional[int]:
     """Return the agreed block-count override, or None if no worker set one.
 
     Raises ValueError when the spread across workers exceeds both the
     absolute and the relative tolerance -- that is a sizing bug, not jitter.
+
+    `workers_per_stage` splits `worker_overrides` (in rank order) into
+    pipeline stages. Stages hold different layers and so measure different
+    counts; agreement is checked within each stage and the smallest stage
+    value is pinned, since vLLM sizes every stage's pool to it. A stage
+    that set no override, because it holds no attention or no mamba layers,
+    is rejected when other stages did: vLLM would apply their value to it
+    too, against a capacity it never measured.
     """
+    if workers_per_stage and 0 < workers_per_stage < len(worker_overrides):
+        stage_values = [
+            reconcile_num_gpu_blocks_override(
+                worker_overrides[start:start + workers_per_stage])
+            for start in range(0, len(worker_overrides), workers_per_stage)
+        ]
+        if all(value is None for value in stage_values):
+            return None
+        missing = [i for i, value in enumerate(stage_values) if value is None]
+        if missing:
+            raise ValueError(
+                f"[kv-sizing] pipeline stage(s) {missing} set no compact-mamba "
+                "attention block count while the other stages did (per-stage "
+                f"values: {stage_values}). vLLM applies one block count to "
+                "every stage, and a stage that did not size its own pool has "
+                "no measured capacity for it. Partition the layers so every "
+                "stage holds both attention and mamba layers, or pin "
+                "--num-gpu-blocks-override.")
+        return min(stage_values)
     overrides = [ovr for ovr in worker_overrides if ovr is not None]
     if not overrides:
         return None

@@ -1,7 +1,7 @@
 import torch
 
-from vllm_torchtpu.layers.vllm import token_padding
-from vllm_torchtpu.layers.vllm.token_padding import TokenPaddingState
+from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 
 
 def test_local_suffix_update():

@@ -32,11 +32,11 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_torchtpu.layers.common.attention_metadata import (
+from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
+                                                    PallasMLAttentionBackend)
+from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
-from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
@@ -1818,9 +1818,9 @@ class TestAttentionMetadataBuilder:
             page_size_padded=256,
         )
         with patch(
-                "vllm_torchtpu.layers.common.attention_metadata.get_dcp_group"
+                "vllm_torchtpu.layers.core.attention_metadata.get_dcp_group"
         ) as mock_dcp, patch(
-                "vllm_torchtpu.layers.common.attention_metadata.get_pcp_group"
+                "vllm_torchtpu.layers.core.attention_metadata.get_pcp_group"
         ) as mock_pcp:
             mock_dcp.return_value.world_size = 4
             mock_pcp.return_value.world_size = 1
@@ -2724,7 +2724,7 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     the layout against an ambient config and the gap stays hidden. Missing it
     both ways is what let this reach CI as an `AssertionError: Current vLLM
     config is not set` at server startup."""
-    from vllm_torchtpu.layers.vllm.attention import \
+    from vllm_torchtpu.layers.adapter.attention import \
         PallasBatchedRPAAttentionBackend
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     vllm_config = SimpleNamespace(

@@ -13,12 +13,17 @@
 # limitations under the License.
 """Tests for TPUWorker"""
 
+import multiprocessing
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.v1.engine.core import EngineCoreProc
 
+import vllm_torchtpu as plugin
+from vllm_torchtpu import patch_registry
 from vllm_torchtpu.worker.tpu_worker import (TPUWorker,
                                              _configure_tpu_process_env)
 
@@ -65,7 +70,7 @@ def _build_worker(vllm_config, rank=0):
     # envs is deliberately not patched: __init__ reads nothing from it, and
     # profile() must see the real USE_PHASED_PROFILER that tests monkeypatch.
     with (
-            patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches"),
+            patch("vllm_torchtpu.patch_registry.apply"),
             patch(
                 "vllm_torchtpu.worker.tpu_worker.WorkerBase.__init__",
                 return_value=None,
@@ -300,3 +305,141 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     worker = TPUWorker.__new__(TPUWorker)
 
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
+
+
+def test_model_load_stage_precedes_runner(monkeypatch):
+    events = []
+    config = object()
+    monkeypatch.setattr(patch_registry, "apply",
+                        lambda stage, **kwargs: events.append((stage, kwargs)))
+    worker = SimpleNamespace(
+        model_config=config,
+        model_runner=SimpleNamespace(load_model=lambda: events.append("load")))
+    TPUWorker.load_model(worker)
+    assert events == [("model_load", {"model_config": config}), "load"]
+
+
+def test_real_patch_entrypoints_in_spawned_processes():
+    import subprocess
+    import sys
+
+    probe = Path(__file__).resolve()
+    source = probe.parents[2] / "src"
+    env = dict(os.environ, PYTHONPATH=str(source), JAX_PLATFORMS="tpu")
+    result = subprocess.run([sys.executable, str(probe)],
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=150)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS: spawned engine_core applied real patches" in result.stdout
+    assert "PASS: spawned worker_init applied real patches" in result.stdout
+
+
+_original_engine_run = EngineCoreProc.run_engine_core
+_PARENT_MARKER = "parent_process_only"
+
+
+def _check_engine_patches():
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.engine import core
+
+    assert _PARENT_MARKER not in patch_registry._applied
+    expected = {
+        p.target
+        for p in patch_registry.PATCHES if "engine_core" in p.stages
+    }
+    assert expected <= patch_registry._applied
+    assert core.resolve_kv_cache_block_sizes is kv_cache_utils.resolve_kv_cache_block_sizes
+    assert Scheduler._mamba_block_aligned_split._tpu_scheduler_block_size_patch
+    assert Scheduler._tpu_hybrid_producer_prefix_hit_patch
+    assert EngineCoreProc.run_engine_core is plugin._run_engine_core_with_tpu_patches
+    assert EngineCoreProc._tpu_original_run_engine_core is _original_engine_run
+    wrapper = Scheduler.__init__
+    patch_registry.apply("engine_core")
+    assert Scheduler.__init__ is wrapper
+
+
+def _engine_init(self, connection, *, engine_index, vllm_config):
+    _check_engine_patches()
+    assert engine_index == 0
+    connection.send(("engine_core", os.getpid()))
+    connection.close()
+    raise SystemExit(0)
+
+
+def _worker_entry(connection):
+    from vllm.config.compilation import CompilationConfig
+
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker, WorkerBase
+
+    assert _PARENT_MARKER not in patch_registry._applied
+    assert not any(
+        "worker_init" in p.stages and p.target in patch_registry._applied
+        for p in patch_registry.PATCHES)
+
+    def before_worker_base(self, **kwargs):
+        _check_engine_patches()
+        assert "vllm_torchtpu:_patch_vllm_disable_compile_ranges" in patch_registry._applied
+        assert CompilationConfig.get_compile_ranges(None) == []
+        wrapper = CompilationConfig.get_compile_ranges
+        patch_registry.apply("worker_init")
+        assert CompilationConfig.get_compile_ranges is wrapper
+        connection.send(("worker_init", os.getpid()))
+        connection.close()
+        raise SystemExit(0)
+
+    with patch.object(WorkerBase, "__init__", before_worker_base):
+        TPUWorker(vllm_config=None,
+                  local_rank=0,
+                  rank=0,
+                  distributed_init_method="tcp://127.0.0.1:29500")
+
+
+if __name__ == "__mp_main__":
+    # The constructor is the boundary preceding executor and TPU initialization.
+    EngineCoreProc.__init__ = _engine_init
+
+
+def _run_spawn_probes():
+    patch_registry.apply("platform_activation")
+    patch_registry._applied.add(_PARENT_MARKER)
+    context = multiprocessing.get_context("spawn")
+    processes = []
+    connections = []
+    try:
+        for stage, target in (("engine_core", EngineCoreProc.run_engine_core),
+                              ("worker_init", _worker_entry)):
+            parent, child = context.Pipe(duplex=False)
+            kwargs = {}
+            if stage == "engine_core":
+                kwargs["vllm_config"] = SimpleNamespace(
+                    parallel_config=SimpleNamespace(data_parallel_size=1,
+                                                    pipeline_parallel_size=1,
+                                                    numa_bind=False))
+            process = context.Process(target=target,
+                                      args=(child, ),
+                                      kwargs=kwargs)
+            process.start()
+            child.close()
+            processes.append(process)
+            connections.append((stage, parent))
+        for process, (stage, parent) in zip(processes, connections):
+            assert parent.poll(60), f"{stage} did not reach its entrypoint"
+            actual_stage, pid = parent.recv()
+            assert actual_stage == stage and pid != os.getpid()
+            process.join(10)
+            assert process.exitcode == 0, (stage, process.exitcode)
+            print(f"PASS: spawned {stage} applied real patches", flush=True)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(5)
+        for _, connection in connections:
+            connection.close()
+
+
+if __name__ == "__main__":
+    _run_spawn_probes()

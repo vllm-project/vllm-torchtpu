@@ -123,6 +123,41 @@ def test_propose_empty_batch():
     assert proposer.propose([], [], None, None) == []
 
 
+def test_precompile_skips_sub_block_draft_forward():
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.speculative_config.num_speculative_tokens = 7
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        context_proj=SimpleNamespace(weight=torch.empty((1, 32))),
+        embed_tokens=SimpleNamespace(weight=torch.empty((1, 1))),
+    ))
+    proposer.runner = SimpleNamespace(
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        max_num_blocks_per_req=4,
+        num_tokens_paddings=[1, 8, 16, 512],
+        _precompile_timed=mock.MagicMock(return_value=mock.MagicMock(
+            __enter__=mock.MagicMock(return_value=None),
+            __exit__=mock.MagicMock(return_value=False),
+        )),
+    )
+    proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
+    proposer._dummy_draft_forward = mock.MagicMock()
+
+    proposer.precompile()
+
+    assert [
+        call.kwargs["num_tokens"] for call in
+        proposer._dummy_precompute_and_update_kv_cache.call_args_list
+    ] == [1, 8, 16, 512]
+    # 1 is skipped (sub-block); 512 stays: _get_padded_len rounds the
+    # 8-req * 8-token upper bound (64) up to the next runner bucket.
+    assert [
+        call.kwargs["num_tokens"]
+        for call in proposer._dummy_draft_forward.call_args_list
+    ] == [8, 16, 512]
+
+
 def test_tpu_precompute_context_kv(device):
     # Setup dimension sizes
     L = 2  # layers

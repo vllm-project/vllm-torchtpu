@@ -9,7 +9,7 @@ from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-from vllm_torchtpu.layers.common.sequence_layout import (
+from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner, SequenceLayoutPlan)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -17,7 +17,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
-    from vllm_torchtpu.layers.common.attention_metadata import \
+    from vllm_torchtpu.layers.core.attention_metadata import \
         AttentionMetadataBuilderContext
 
 _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = (

@@ -605,9 +605,9 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 device_str: 1.0
             } for _ in range(self.parallel_config.world_size)]
         else:
-            assert pp_size == len(
-                nodes_with_device
-            ), f"Cannot use PP across hosts, please set --pipeline-parallel-size to 1 or {len(nodes_with_device)}"
+            # One bundle per pipeline stage, sized to the stage's devices.
+            # PACK fills a host before moving to the next, so consecutive
+            # stages share a host whenever the stage size allows it.
             num_devices_per_pp_rank = self.parallel_config.world_size // pp_size
             placement_group_specs = [{
                 device_str: num_devices_per_pp_rank
@@ -660,8 +660,10 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # measurement jitter exactly like TpuMultiprocExecutor: build 155
             # died here on a 3-block spread (6456..6459 at TP=32) because this
             # path still demanded exact agreement.
+            pc = self.vllm_config.parallel_config
             agreed = reconcile_num_gpu_blocks_override(
-                self.collective_rpc("get_num_gpu_blocks_override"))
+                self.collective_rpc("get_num_gpu_blocks_override"),
+                workers_per_stage=pc.world_size // pc.pipeline_parallel_size)
             if agreed is not None:
                 self.vllm_config.cache_config.num_gpu_blocks_override = agreed
 

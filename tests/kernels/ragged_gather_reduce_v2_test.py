@@ -20,6 +20,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
@@ -334,6 +335,7 @@ class ScatterTest(jtu.JaxTestCase):
         )
     ]
 
+    @pytest.mark.nightly
     @parameterized.parameters(*_perf_test_cases)
     def test_perf(
         self,

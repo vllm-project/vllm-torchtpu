@@ -1,0 +1,124 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 sweeps on the TPU v7x-32 pod. One pipeline file, two sweeps,
+# selected with the build env var K3_SWEEP:
+#
+#   K3_SWEEP=eval   (default)  accuracy vs lm_eval client concurrency
+#   K3_SWEEP=perf              InferenceX AgentX performance sweep
+#   K3_SWEEP=both              both, on two pods in parallel
+#
+# Both sweeps boot the server once and run every point against the live
+# server, draining the engine between points; results are Buildkite artifacts.
+#
+# HOW TO TRIGGER
+# ──────────────
+# Own Buildkite pipeline whose "Steps" setting is
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_k3_sweep.yml bash .buildkite/scripts/bootstrap_dev.sh
+# then "New Build" with K3_SWEEP (and any knobs below) in the build's
+# environment. Or select this file on vllm-torchtpu-dev with DEV_PIPELINE_FILE.
+#
+# K3_SWEEP=eval  — driver scripts/vllm/benchmarking/k3_eval_conc_sweep.sh
+#   Nightly kimi-k3-tp32-ep serve flags with a 16k context, max-num-seqs 256
+#   and matching compile buckets (config kimi-k3-tp32-ep-concsweep), then
+#   lm_eval for each task at each client concurrency in ascending order,
+#   plain-chat form, thinking off (the nightly's eval form). summary.md has
+#   one row per point.
+#     K3_SWEEP_CONC_LIST     default 1,2,4,8,16,32,64,128,256
+#     K3_SWEEP_TASKS         default mmlu_pro,gsm8k
+#     K3_SWEEP_GSM8K_LIMIT   default 128   (questions; raised to 2*conc above 64)
+#     K3_SWEEP_MMLU_LIMIT    default 10    (per subject x 14; raised to 2*conc/14 above 64)
+#     K3_SWEEP_CTX           default 16384
+#     K3_SWEEP_MAX_NUM_SEQS  default 256
+#     K3_SWEEP_GCS_ROOT      default empty (no GCS copy; artifacts only)
+#   Runtime at the defaults: ~30 min boot + ~90 min sweep.
+#
+# K3_SWEEP=perf  — driver scripts/vllm/benchmarking/k3_agentx_sweep.sh
+#   K3 AgentX server geometry (config kimi-k3-tp32-ep-agentx: TP32/EP, long
+#   context, tool-call + reasoning parsers, block size 256), a GSM8K probe on
+#   the fresh server, then the InferenceX AgentX trace replay (aiperf, Claude
+#   Code sessions) at each concurrency ascending. Summary table: output tok/s
+#   per chip, TTFT, TPOT, P90 interactivity, cache hit. A run below the
+#   model's native context replays only the traces that fit (the client logs
+#   how many), so it is a bring-up number, not a submission.
+#     K3_CONC_LIST         default 1,2,4,8   (none = GSM8K probe only)
+#     K3_CTX               default 131072    (max-model-len)
+#     K3_KV                default fp8       (fp8 | auto = bf16)
+#     K3_APC               default 0         (1 = prefix caching + unified KV pool)
+#     K3_SPEC              default none      (dspark = DSpark draft, synthetic acceptance)
+#     K3_FAST              default 1         (1 = 20 min windows; 0 = canonical 30 min)
+#     K3_GSM8K_LIMIT       default 100       (0 = skip the probe)
+#     K3_GSM8K_CONC        default 8         (comma list = one GSM8K run per value)
+#     K3_MOE_REQUANT       default 0         (512 = W4A8 MoE via MOE_REQUANTIZE_BLOCK_SIZE)
+#     K3_EXTRA_SERVE_ARGS  default empty     (prepended to the serve command)
+#     K3_IX_REF            default main      (InferenceX git ref to clone; set a commit SHA to
+#                                              pin a run for reproducibility, e.g. K3_IX_REF=9acf24c)
+#     K3_GCS_ROOT          default empty     (no GCS copy; artifacts only)
+#   Runtime at the defaults: ~25 min boot + ~30 min per concurrency (fast mode).
+#
+# Knobs are baked into the commands at upload time because run_multihost.sh
+# forwards only an allowlist of env vars into the containers. Knob values are
+# spliced into this file as text before it is parsed, so they must not contain
+# double quotes or `$` (a value that does breaks the upload, loudly).
+# K3_EXTRA_SERVE_ARGS is appended after the config's own flags, so it can
+# override any of them (vLLM takes the last occurrence of a flag); JSON-valued
+# flags cannot be passed through it because of the quoting rule above.
+
+steps:
+  - label: "K3_SWEEP must be eval, perf or both"
+    key: k3_sweep_bad_selector
+    if: 'build.env("K3_SWEEP") != null && build.env("K3_SWEEP") != "eval" && build.env("K3_SWEEP") != "perf" && build.env("K3_SWEEP") != "both"'
+    agents:
+      queue: cpu_64_core
+    commands:
+      - "echo 'K3_SWEEP=${K3_SWEEP:-} is not one of eval, perf, both; nothing was run' && exit 1"
+
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "K3 eval sweep: accuracy vs concurrency ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} ctx ${K3_SWEEP_CTX:-16384} max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256} (TPU v7x-32)"
+    key: k3_eval_conc_sweep
+    if: 'build.env("K3_SWEEP") == null || build.env("K3_SWEEP") == "eval" || build.env("K3_SWEEP") == "both"'
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_eval_conc_sweep.sh --results-dir /perf_eval_results/k3-eval-conc-sweep --conc-list ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} --tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} --gsm8k-limit ${K3_SWEEP_GSM8K_LIMIT:-128} --mmlu-limit ${K3_SWEEP_MMLU_LIMIT:-10} --ctx ${K3_SWEEP_CTX:-16384} --max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256} --gcs-root \"${K3_SWEEP_GCS_ROOT:-}\""
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "K3 perf sweep: AgentX conc ${K3_CONC_LIST:-1,2,4,8} ctx ${K3_CTX:-131072} kv ${K3_KV:-fp8} apc ${K3_APC:-0} spec ${K3_SPEC:-none} fast ${K3_FAST:-1} rq ${K3_MOE_REQUANT:-0} (TPU v7x-32)"
+    key: k3_agentx_sweep
+    if: 'build.env("K3_SWEEP") == "perf" || build.env("K3_SWEEP") == "both"'
+    depends_on: build_docker
+    timeout_in_minutes: 600
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --conc-list ${K3_CONC_LIST:-1,2,4,8} --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --moe-requant ${K3_MOE_REQUANT:-0} --ix-ref ${K3_IX_REF:-main} --extra-serve-args \"${K3_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_GCS_ROOT:-}\""
+    artifact_paths:
+      - "perf_eval_results/**/*"

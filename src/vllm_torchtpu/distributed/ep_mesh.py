@@ -31,9 +31,9 @@ that silently addresses the wrong device.
 
 from typing import Any
 
-from vllm_torchtpu.distributed.pcp import (_collect_rank_to_device_id,
-                                           _get_current_global_rank,
-                                           _get_tpu_global_device_id)
+from vllm_torchtpu.distributed.mesh_utils import (_collect_rank_to_device_id,
+                                                  _get_current_global_rank,
+                                                  _get_tpu_global_device_id)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)

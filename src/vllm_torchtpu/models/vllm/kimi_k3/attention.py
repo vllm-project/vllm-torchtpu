@@ -29,9 +29,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
-    build_kimi_dispatched_kda_op
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
+    build_kimi_dispatched_kda_op, build_kimi_pooled_kda_op)
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.sequence_layout import \
+    is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -218,7 +220,7 @@ class MultiHeadLatentAttention(nn.Module):
                 self.q_lora_rank,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ]
-            if getattr(config, "mla_use_output_gate", False):
+            if config.mla_use_output_gate:
                 qkv_a_output_sizes.append(config.num_attention_heads *
                                           self.v_head_dim)
                 self.fused_qkv_a_proj = MixedParallelMergedLinear(
@@ -272,8 +274,8 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.g_proj",
-        ) if (getattr(config, "mla_use_output_gate", False)
-              and not self.mla_gate_is_fused) else None)
+        ) if (config.mla_use_output_gate and not self.mla_gate_is_fused) else
+                       None)
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.v_head_dim,
             config.hidden_size,
@@ -282,6 +284,7 @@ class MultiHeadLatentAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         mla_modules = MLAModules(
+            g_proj=self.g_proj,
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
             rotary_emb=None,
@@ -295,12 +298,6 @@ class MultiHeadLatentAttention(nn.Module):
             is_sparse=False,
             topk_indices_buffer=None,
         )
-        # The TPU MLA wrapper supports K3's optional output gate, while the
-        # current upstream MLAModules dataclass does not expose that field.
-        # Attach it as backend-specific metadata instead of passing a stale
-        # constructor argument.
-        mla_modules.g_proj = self.g_proj
-        mla_modules.gate_is_fused = self.mla_gate_is_fused
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
             num_heads,
@@ -314,6 +311,7 @@ class MultiHeadLatentAttention(nn.Module):
             vllm_config.cache_config,
             quant_config,
             prefix,
+            gate_is_fused=self.mla_gate_is_fused,
         )
 
     def forward(
@@ -470,14 +468,28 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
         )
         self.kv_cache = None
-        # The dispatched op owns the short convolution as well: the fused decode
-        # kernel it routes decode rows to does the convolution itself, so it
-        # cannot be fed by a separate convolution op.
+        # The dispatched op owns the short convolution as well: the fused
+        # kernel does the convolution itself, so it cannot be fed by a separate
+        # convolution op.
         self.dispatched_kda_op = build_kimi_dispatched_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             state_dim_first=is_conv_state_dim_first(),
+        )
+        # Unified-pool variant: reads and writes both state regions through
+        # the single attention-shaped buffer; used when the runner binds the
+        # pool instead of the per-layer conv/recurrent caches. The manager
+        # block size lets the op derive the manager->pool-block split for
+        # its state-index remap. It is NOT final yet: the platform's
+        # block-size derivation for the pool runs after model construction
+        # (hybrid layers are built before the adjusted value exists), so the
+        # op reads cache_config.block_size per call, not here.
+        self.pooled_kda_op = build_kimi_pooled_kda_op(
+            prefix,
+            lower_bound=self.gate_lower_bound,
+            eps=config.rms_norm_eps,
+            vllm_config=vllm_config,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -563,6 +575,17 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if (metadata is None or self.kv_cache is None
                 or self.kv_cache[0].numel() == 0):
             output = torch.zeros_like(query)
+        elif len(self.kv_cache) == 1:
+            # Unified pool: the single attention-shaped buffer carries both
+            # KDA state regions.
+            output = self._core_attention_pooled(
+                mixed_qkv,
+                raw_gate,
+                beta,
+                output_gate,
+                self.kv_cache[0],
+                metadata,
+            ).flatten(1)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
             output = self.dispatched_kda_op(
@@ -584,3 +607,44 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         output, _ = self.o_proj(output)
         return output
+
+    def _core_attention_pooled(
+        self,
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        pool: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """KDA over the unified pool: conv and recurrent state live in the
+        pool's per-block byte regions and are gathered/scattered by the op."""
+        if is_pcp_streaming_attention_metadata(metadata):
+            raise NotImplementedError(
+                "KDA does not support PCP streaming prefill with the unified "
+                "KV pool")
+        if metadata.mamba_slot_read_offsets is not None:
+            # Speculative verify needs per-window state checkpoints; the
+            # pooled gather/scatter path keeps a single state per block.
+            raise NotImplementedError(
+                "Speculative decoding is not supported with pooled KDA")
+        state_indices = metadata.mamba_state_indices
+        if state_indices is None:
+            raise RuntimeError(
+                "Pooled KDA requires mamba_state_indices in the attention "
+                "metadata")
+        return self.pooled_kda_op(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            self.conv_weight_fused,
+            self.A_log,
+            self.dt_bias,
+            self.o_norm.weight,
+            metadata.query_start_loc,
+            state_indices,
+            metadata.seq_lens,
+            metadata.request_distribution,
+        )

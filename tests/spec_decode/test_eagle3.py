@@ -21,7 +21,7 @@ import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
-from vllm_torchtpu.layers.common.sequence_layout import (
+from vllm_torchtpu.layers.core.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL, SequenceLayoutDescriptor,
     SequenceLayoutKind, SequenceLayoutPlan)
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
@@ -1149,8 +1149,7 @@ def test_build_draft_attn_metadata_loop_cache(device):
     seq_lens swapped (advanced by +1), value-identical to a full rebuild."""
     import dataclasses as dc
 
-    from vllm_torchtpu.layers.common.attention_metadata import \
-        AttentionMetadata
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
     proposer = _make_proposer(draft_tp=1)
     proposer._draft_attn_layer_names = {"draft.attn.0"}
@@ -1238,8 +1237,7 @@ def test_build_draft_attn_metadata_loop_cache(device):
 def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     """Rebuilding draft metadata must preserve the target chunk's PCP
     descriptor; defaulting it to ALL selects an incompatible attention path."""
-    from vllm_torchtpu.layers.common.attention_metadata import \
-        AttentionMetadata
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer._draft_attn_layer_names = {"draft.attn.0"}

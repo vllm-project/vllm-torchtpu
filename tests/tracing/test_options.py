@@ -3,6 +3,8 @@ import pytest
 from vllm_torchtpu.tracing.options import (parse_profile_options,
                                            resolve_profile_dir_and_opts)
 
+pytestmark = pytest.mark.cpu_test
+
 
 def test_resolve_profile_dir_only():
     profile_dir, standard, advanced = resolve_profile_dir_and_opts(
