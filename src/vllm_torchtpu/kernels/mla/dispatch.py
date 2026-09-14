@@ -54,6 +54,31 @@ MASKED_DENSE_PREFILL_COST_MODEL = GLM52_TPU7X_PREFILL_COST_MODEL
 # decode path while serving no targeted prefill workload.
 MASKED_DENSE_MIN_TOKEN_BUCKET = 512
 
+# Two independent sparse-path tunings, set here rather than as kernel defaults
+# so the sparse kernel keeps its conservative behaviour for any future caller
+# and so each can be reverted on its own line.
+#
+# SPARSE_SKIP_PADDING_GATHER: a token bucket is padded up to a compiled size,
+# and the padding rows gather `index_topk` cache rows apiece that the attention
+# then multiplies by zero. Skipping whole gather windows that hold no live row
+# is a no-op when the bucket is full (R == P) and removes almost all of the
+# gather at decode (R == 1).
+#
+# SPARSE_ATTENTION_KERNEL_BATCH: not a tiling parameter -- it is the truncation
+# granularity of the attention grid, which stops at the last batch holding a
+# real token. A smaller value walks the same tokens in more, narrower grid
+# steps and truncates padding more finely. 4 is the measured turning point:
+# 16 -> 4 improves both decode and a full prefill chunk, while 4 -> 1 keeps
+# improving decode but regresses prefill ~11%, because a 64-token chunk then
+# costs 64 grid steps instead of 4.
+#
+# Measured per layer at the shipping gather geometry, GLM-5.2 128k/1k on
+# tpu7x 2x2x2 (device-time slope, chained-call regression):
+#   decode  R=1  of P=64:  131.90 us -> 40.16 us  (3.28x)
+#   prefill R=64 of P=64:  179.38 us -> 179.09 us (1.00x, neutral)
+SPARSE_SKIP_PADDING_GATHER = True
+SPARSE_ATTENTION_KERNEL_BATCH = 4
+
 
 def _resolve_masked_dense_limit(name: str, default: int) -> int:
     value = getattr(envs, name)
@@ -191,6 +216,8 @@ def ragged_paged_attention(
             request_distribution,
             sm_scale=sm_scale or 1.0,
             k_scale=k_scale or 1.0,
+            skip_padding_gather=SPARSE_SKIP_PADDING_GATHER,
+            attention_kernel_batch_size=SPARSE_ATTENTION_KERNEL_BATCH,
         )
 
     if not enable_masked_dense:

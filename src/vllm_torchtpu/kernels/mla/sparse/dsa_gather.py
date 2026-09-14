@@ -36,6 +36,8 @@ def main_kernel(
     subcore_axis_name: str,
     num_row_subchunks: int,
     num_streams: int,
+    skip_padding_windows: bool = False,
+    skip_mode: str = "when",
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
@@ -85,6 +87,19 @@ def main_kernel(
     def outer_pipeline(idx_ref):
         b = pl.program_id(0)
         out_row_base = (b * num_cores + core_index) * num_row_subchunks
+
+        # `SKIP_INDEX` in slot 0 means "every index in this window is padding".
+        # The caller only sets it for a whole window at once (see
+        # `mark_skippable_windows`), so slot 0 decides for all `row_chunk_size`
+        # of them and the flag needs no input of its own -- it rides in the
+        # index stream that is being DMA'd here regardless.
+        #
+        # Skipping leaves this window's `nope_out`/`rope_out` rows untouched.
+        # That is safe because every consumer already discards them: the
+        # attention kernel zeroes each gathered row past its token's `kv_len`
+        # (`kernel.py`, `load_bkv`), precisely because the padding tail could
+        # always decode to fp8 NaN. Untouched HBM is no worse than the
+        # scattered garbage that tail held before.
 
         # Subchunk handled by stream `s` at inner step `r`. `num_streams`
         # independent `pl.Indirect` gathers run concurrently per step, keeping
@@ -156,16 +171,51 @@ def main_kernel(
             (num_streams * rope_rows_per_stream, rope_out_i32.shape[1]),
             lambda r: (out_row_base // num_streams + r, 0),
         )
-        pltpu.emit_pipeline(
-            functools.partial(_body, nope_sem, nope_out_i32),
-            grid=(num_row_subchunks // num_streams, ),
-            in_specs=nope_in_specs + rope_in_specs,
-            out_specs=(rope_out_spec, ),
-        )(
-            *([nope_in_i32] * num_streams),
-            *([rope_in_i32] * num_streams),
-            rope_out_i32,
-        )
+        num_inner_steps = num_row_subchunks // num_streams
+
+        def run_gather_pipeline(steps=num_inner_steps):
+            pltpu.emit_pipeline(
+                functools.partial(_body, nope_sem, nope_out_i32),
+                grid=(steps, ),
+                in_specs=nope_in_specs + rope_in_specs,
+                out_specs=(rope_out_spec, ),
+            )(
+                *([nope_in_i32] * num_streams),
+                *([rope_in_i32] * num_streams),
+                rope_out_i32,
+            )
+
+        # The guard must sit *outside* `emit_pipeline` either way: the gather
+        # reads are issued by the pipeline's own `pl.Indirect` prefetch, so a
+        # predicate inside `_body` would suppress the stores and still pay for
+        # every read.
+        #
+        # Getting the predicate at all takes a detour. `idx_ref` is a VMEM
+        # block, and on SparseCore a rank-0 load is legal only out of SMEM --
+        # `sc_lowering.py` guards get and swap with the same XOR, so `idx_ref[0]`
+        # raises "Get only supports loading scalars from SMEM". The emulation
+        # below is the one the compiler's own error text prescribes: load a
+        # vector, then extract lane 0.
+        #
+        # Extract *then* compare, never `(v >= 0)[0]`: the rank-0 squeeze path
+        # only accepts 32-bit element types, and a bool is one byte.
+        first = idx_ref[pl.ds(0, row_subchunk_size)][0]
+
+        # Two ways to spend that predicate. Neither is lit upstream -- no test
+        # anywhere wraps `emit_pipeline` in a `pl.when`, and while a traced grid
+        # length is supported and tested, it is tested only on TensorCore. They
+        # fail differently, so both are kept until hardware says which lowers.
+        if not skip_padding_windows:
+            run_gather_pipeline()
+        elif skip_mode == "when":
+            pl.when(first >= 0)(run_gather_pipeline)
+        elif skip_mode == "grid":
+            # A zero-length pipeline runs no steps and issues no DMAs: the same
+            # statement as `pl.when`, without nesting the buffer and semaphore
+            # allocation inside an `scf.if` region.
+            run_gather_pipeline(jnp.where(first >= 0, num_inner_steps, 0))
+        else:
+            raise ValueError(f"unknown {skip_mode=}")
 
     pltpu.emit_pipeline(
         outer_pipeline,
@@ -177,11 +227,34 @@ def main_kernel(
     )(indices_hbm_ref)
 
 
-@functools.partial(jax.jit)
+# An index of `SKIP_INDEX` in the first slot of a gather window tells the kernel
+# that the whole window is padding and may be skipped. It is never dereferenced.
+SKIP_INDEX = -1
+
+_NUM_STREAMS = 4
+_NUM_ROW_SUBCHUNKS = 32
+
+
+def get_row_chunk_size() -> int:
+    """Indices handled by one SparseCore core per outer pipeline step.
+
+  This is the granularity at which `skip_padding_windows` can skip work, so a
+  caller marking windows with `SKIP_INDEX` must align its marks to it.
+  """
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    return sc_info.num_lanes * _NUM_ROW_SUBCHUNKS
+
+
+@functools.partial(jax.jit,
+                   static_argnames=("skip_padding_windows", "skip_mode"))
 def dsa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
+    *,
+    skip_padding_windows: bool = False,
+    skip_mode: str = "when",
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -194,6 +267,14 @@ def dsa_gather(
       TILE_LANE_BYTES) uint8. Each (1, TILE_LANE_BYTES) uint8 is token's rope.
       It encodes 128 (rope_out_cols) fp8 values.
     indices: (N,) int32. Token indices into the caches.
+    skip_padding_windows: when set, a window of `get_row_chunk_size()` indices
+      whose *first* entry is `SKIP_INDEX` is not gathered at all, and the
+      corresponding output rows are left untouched. Callers use this to avoid
+      moving rows that the consumer is going to mask away anyway; see
+      `kernel.mark_skippable_windows`.
+    skip_mode: how that skip is expressed -- "when" wraps the inner pipeline in
+      `pl.when`, "grid" gives it a traced grid length of 0. Same semantics; they
+      exist separately because the two lower differently.
 
   Returns:
     nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
@@ -226,8 +307,8 @@ def dsa_gather(
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
-    num_streams = 4
-    num_row_subchunks = 32
+    num_streams = _NUM_STREAMS
+    num_row_subchunks = _NUM_ROW_SUBCHUNKS
     assert (
         num_row_subchunks %
         num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."
@@ -236,7 +317,19 @@ def dsa_gather(
     block_size = row_chunk_size * num_cores
     out_pad_size = (
         (out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if skip_padding_windows and out_pad_size:
+        # Windows lying wholly past `out_size` are marked skippable -- today
+        # they gather index 0 `out_pad_size` times, which is the worst possible
+        # read-concentration pattern. A window straddling `out_size` still has a
+        # real first entry, so its tail keeps a legal (index 0) address.
+        pad_pos = out_size + jnp.arange(out_pad_size, dtype=jnp.int32)
+        window_start = (pad_pos // row_chunk_size) * row_chunk_size
+        indices = jnp.concatenate([
+            indices,
+            jnp.where(window_start >= out_size, SKIP_INDEX, 0),
+        ])
+    else:
+        indices = jnp.pad(indices, ((0, out_pad_size)))
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -250,6 +343,8 @@ def dsa_gather(
             subcore_axis_name=vector_mesh.subcore_axis_name,
             num_row_subchunks=num_row_subchunks,
             num_streams=num_streams,
+            skip_padding_windows=skip_padding_windows,
+            skip_mode=skip_mode,
         ),
         out_type=(
             jax.ShapeDtypeStruct(

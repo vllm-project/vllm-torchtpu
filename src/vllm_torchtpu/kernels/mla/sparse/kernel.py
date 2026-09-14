@@ -507,6 +507,8 @@ def prepare_outputs(
         "gather_and_attention_chunk_size",
         "vmem_limit_bytes",
         "return_lse",
+        "skip_padding_gather",
+        "skip_gather_mode",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -525,6 +527,8 @@ def sparse_ragged_paged_attention(
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     return_lse: bool = False,
+    skip_padding_gather: bool = False,
+    skip_gather_mode: str = "when",
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -546,6 +550,12 @@ def sparse_ragged_paged_attention(
     return_lse: also return the per-(token, head) log-sum-exp of the attention
       scores. Needed only when `topk_indices` holds a slice of a token's
       global top-k and the partial outputs of several ranks must be merged.
+    skip_padding_gather: skip gathering rows that lie entirely past a token's
+      `kv_len`, which the attention kernel zeroes on load regardless. Output is
+      unchanged; only the bytes moved differ. Requires `topk` to be a multiple
+      of the SparseCore gather window (silently inert otherwise).
+    skip_gather_mode: lowering strategy for that skip, "when" or "grid". See
+      `dsa_gather.dsa_gather`.
 
   Returns:
     The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -686,8 +696,27 @@ def sparse_ragged_paged_attention(
                                  tokens_per_seq,
                                  total_repeat_length=q.shape[0])
     assert topk_indices is not None
-    # TODO: skip gather for padding tokens in topk_indices.
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+
+    if skip_padding_gather:
+        # Rows past the last real token are bucket padding: the runner pads the
+        # token count up to the next bucket (minimum 16) and slices these away
+        # afterwards. Whatever the indexer left in their `topk_indices` is
+        # meaningless, but it is not necessarily "-1", so `kv_lens` above can
+        # still read full-length for them. Pin them to zero.
+        #
+        # This is what makes the skip safe rather than merely cheap: `load_bkv`
+        # zeroes every gathered row at or past `kv_len`, so a token with
+        # `kv_len == 0` reads none of its gathered rows -- the attention kernel
+        # cannot observe that they were never written. It also yields a defined
+        # output for these rows (all scores masked to `min` => uniform `p`,
+        # zeroed keys => `out == 0`, `lse == min + log(topk)`), which is the
+        # same sentinel the `lse` buffer is pre-filled with below.
+        kv_lens = jnp.where(
+            jnp.arange(q.shape[0], dtype=jnp.int32) < cu_q_lens[distribution[2]],
+            kv_lens,
+            0,
+        )
 
     seq_page_ids = topk_indices // page_size
     token_offset = topk_indices % page_size
@@ -712,6 +741,27 @@ def sparse_ragged_paged_attention(
     )
 
     assert page_ids.shape == (q.shape[0], topk)
+
+    # A gathered row at or past its token's `kv_len` is zeroed by the attention
+    # kernel before it is ever read (see `load_bkv`), so moving it is pure
+    # waste. The waste is not marginal: a DP decode step carries one real token
+    # per rank into a bucket of at least 16, so a 16-token bucket gathers
+    # `16 * topk` rows in order to use `topk` of them.
+    #
+    # The gather can only skip a whole window at a time, so mark a window iff
+    # *all* of it is at or past `kv_len`; entries past `kv_len` inside a
+    # surviving window keep the scattered address computed above.
+    skippable = None
+    if skip_padding_gather:
+        row_chunk_size = dsa_gather.get_row_chunk_size()
+        # Windows are carved out of the flattened (token, topk) index stream, so
+        # a window only speaks for one token when it nests inside a token's row.
+        if topk % row_chunk_size == 0:
+            offset_in_row = jnp.arange(topk, dtype=jnp.int32)
+            window_start = (offset_in_row // row_chunk_size) * row_chunk_size
+            skippable = window_start[None, :] >= kv_lens[:, None]
+        else:
+            skip_padding_gather = False
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
@@ -726,7 +776,11 @@ def sparse_ragged_paged_attention(
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
         indices = (page_ids[start_pos:end_pos, ...] * page_size +
-                   token_offset[start_pos:end_pos, ...]).reshape(-1)
+                   token_offset[start_pos:end_pos, ...])
+        if skippable is not None:
+            indices = jnp.where(skippable[start_pos:end_pos, ...],
+                                dsa_gather.SKIP_INDEX, indices)
+        indices = indices.reshape(-1)
 
         # For prefilling of short sequences (or early in the sequence), there are
         # very few number of KVs in the sequence, so different qs' selected topk
@@ -741,6 +795,8 @@ def sparse_ragged_paged_attention(
             cache_kv_nope,
             cache_kv_rope,
             indices,
+            skip_padding_windows=skip_padding_gather,
+            skip_mode=skip_gather_mode,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size,
