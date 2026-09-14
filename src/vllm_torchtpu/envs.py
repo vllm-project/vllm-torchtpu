@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
 def env_with_choices(
@@ -852,6 +853,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION":
     env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Chunk the vision encoder over video frames to bound peak VMEM: encode at
+    # most this many patches (t*h*w) per vision forward, then concatenate the
+    # per-chunk outputs. 0 disables (encode the whole video in one batch).
+    "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE":
+    env_nonnegative_int("MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0),
 }
 
 

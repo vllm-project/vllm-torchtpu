@@ -109,6 +109,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import maybe_create_mm_encoder_manager
+from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -2904,6 +2905,31 @@ class TPUModelRunner(GPUModelRunner):
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
+
+    def _execute_mm_encoder(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[torch.Tensor]:
+        """Run the vision encoder with optional video frame chunking.
+
+        A long video encoded in one shot makes the vision attention kernel
+        process every `t*h*w` patch in a single forward, which can exhaust
+        VMEM. `MM_ENCODER_FRAME_CHUNK_PATCH_SIZE` bounds each forward to that
+        many patches by splitting the clip on the temporal axis (bit-exact, see
+        `vllm_torchtpu.runner.mm_video_chunking`). Everything else — batching,
+        multimodal LoRA, `prompt_embeds`, the encoder cudagraph path and the
+        encoder cache — stays on the base `GPUModelRunner` implementation.
+
+        Args:
+            scheduler_output: Scheduler output containing the scheduled batch
+                and multimodal inputs.
+
+        Returns:
+            List of multimodal embedding tensors for inputs processed by the
+            encoder.
+        """
+        with chunked_video_encoding(self.model, self.model_config):
+            return super()._execute_mm_encoder(scheduler_output)
 
     def _get_model_inputs(
         self,
