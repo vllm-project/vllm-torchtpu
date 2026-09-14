@@ -33,6 +33,7 @@ from vllm_torchtpu.spec_decode.eagle3 import (
     Eagle3Proposer,
     _force_draft_tp1,
     _maybe_pad_dim0,
+    _static_shape_args,
 )
 
 
@@ -2223,3 +2224,51 @@ def test_kv_sharing_fails_closed_on_unsupported_backends(
 
     assert layer.self_attn.attn.kv_sharing_target_layer_name is None
     assert proposer._draft_kv_shared is False
+
+
+def test_static_shape_args_strips_dynamo_dynamic_marks():
+    """A marked tensor must not reach a `dynamic=False` compiled region.
+
+    `@support_torch_compile` calls `torch._dynamo.mark_dynamic` on the model's
+    `positions`/`input_ids` on every forward, which stamps
+    `_dynamo_dynamic_indices` onto the tensor object. The stamp outlives that
+    forward and outranks `dynamic=False`, so passing the same object straight
+    into one of the draft's static regions made dynamo lift a SymInt and
+    torch-tpu reject the graph outright. Regression guard for that path.
+    """
+
+    seen: list[frozenset | None] = []
+
+    @_static_shape_args
+    def region(a, b, *, c):
+        for t in (a, b, c):
+            seen.append(getattr(t, "_dynamo_dynamic_indices", None))
+        return a
+
+    marked = torch.zeros(4, 8)
+    torch._dynamo.mark_dynamic(marked, 0)
+    plain = torch.zeros(4, 8)
+    marked_kw = torch.zeros(4)
+    torch._dynamo.mark_dynamic(marked_kw, 0)
+
+    out = region(marked, plain, c=marked_kw)
+
+    assert seen == [None, None, None], (
+        f"a dynamic-dim mark reached the compiled region: {seen}"
+    )
+    # Aliased, not copied, and the caller's own marks are left intact so the
+    # model's next forward still sees what it marked.
+    assert out.data_ptr() == marked.data_ptr()
+    assert getattr(marked, "_dynamo_dynamic_indices", None) == {0}
+    assert getattr(marked_kw, "_dynamo_dynamic_indices", None) == {0}
+
+
+def test_static_shape_args_passes_non_tensors_through():
+    """Ints, None and other non-tensor args must survive unchanged."""
+
+    @_static_shape_args
+    def region(t, step_idx, flag=None):
+        return t, step_idx, flag
+
+    t, step_idx, flag = region(torch.zeros(2), 3, flag=None)
+    assert step_idx == 3 and flag is None and t.shape == (2,)
