@@ -18,6 +18,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 class TestTpuCompilerCache:
 
@@ -212,6 +214,8 @@ class TestTpuCompilerCache:
             "VLLM_TPU_DEBUG_PCP_LAYOUT",
             "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
             "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
@@ -263,6 +267,50 @@ class TestTpuCompilerCache:
 
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
+
+    @staticmethod
+    def _sc_offload_flags() -> list[str]:
+        return [
+            token for token in os.environ.get("LIBTPU_INIT_ARGS", "").split()
+            if "offload_min_size_in_bytes" in token
+        ]
+
+    @pytest.mark.parametrize("value,expected_flags", [
+        ("12345", 2),
+        ("auto", 2),
+        ("", 2),
+        ("0", 0),
+    ])
+    def test_env_override_sc_offload_threshold(self, value, expected_flags):
+        """An integer is used as given, unset/empty/auto resolves from the
+        chip family, and 0 sets no flag at all."""
+        env_mock = {
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
+            "TPU_ACCELERATOR_TYPE": "v6e-8",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
+
+            flags = self._sc_offload_flags()
+            assert len(flags) == expected_flags
+            if value == "12345":
+                assert all(flag.endswith("=12345") for flag in flags)
+
+    def test_env_override_sc_offload_bad_value_raises(self):
+        """A value that is neither an integer nor "auto" stops the package
+        import with an error that names the variable, rather than silently
+        running without the SC-offload flag."""
+        env_mock = {
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "banana",
+            "TPU_ACCELERATOR_TYPE": "v6e-8",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+            with pytest.raises(
+                    ValueError,
+                    match="SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"):
+                importlib.reload(vllm_torchtpu.env_override)
 
     def test_env_override_disables_breakable_cudagraph(self):
         """Verify that the TPU plugin always disables breakable cudagraph."""
