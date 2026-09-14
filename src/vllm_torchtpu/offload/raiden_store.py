@@ -301,6 +301,11 @@ class RaidenOffloadingManager(OffloadingManager):
         self._block_id_cls = store_types.RaidenBlockId
         self._raiden_id = self._store.raiden_id
 
+        # Buffer for sub-hashes evicted from the host LRU cache.
+        self._evicted_sub_hashes: list[bytes] = []
+        if hasattr(self._store, "set_eviction_callback"):
+            self._store.set_eviction_callback(self._on_eviction)
+
         # The connector's only cache-state bookkeeping, and it is
         # load-bearing: it bars a second admission of a key whose store job is
         # in flight (fence-parked or launched), covering the window between
@@ -601,6 +606,10 @@ class RaidenOffloadingManager(OffloadingManager):
         # consume the event stream are refused at startup (see
         # `TPURaidenStoreOffloadingSpec.__init__`).
         return []
+
+    def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
+        """Callback invoked by Raiden C++ store upon LRU cache eviction."""
+        self._evicted_sub_hashes.extend(evicted_hashes)
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         # Remote slices stashed by lookup() are consumed by prepare_load()
