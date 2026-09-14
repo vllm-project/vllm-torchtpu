@@ -723,8 +723,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The raiden library's shared-memory key, a string naming the segment
     # behind its shm-backed host pools. The TPU offloading connector cannot
     # serve those pools, so it refuses to start when the key is set at all.
+    # Read raw, not through env_str: the check must see the same bytes the
+    # raiden library sees, and a whitespace-only key still counts as set.
     "RAIDEN_SHM_KEY":
-    env_str("RAIDEN_SHM_KEY", ""),
+    lambda: os.getenv("RAIDEN_SHM_KEY", ""),
     # Seconds; upper bound on a scheduler-side drain of in-flight offload
     # jobs whose blocks are about to be reused.
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S":
