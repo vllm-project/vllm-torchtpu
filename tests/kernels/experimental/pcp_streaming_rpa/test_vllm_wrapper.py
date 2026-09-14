@@ -159,6 +159,19 @@ def test_packed_kv_layout_validation_rejects_wrong_physical_group_count():
                                               v_scale=0.5)
 
 
+def test_seq_along_lane_layout_validation_accepts_fp8_multi_head():
+    q_local = jnp.zeros((32, 2, 2, 128), dtype=jnp.bfloat16)
+    kv_cache_local = jnp.zeros((2, 4, 32, 4, 128), dtype=jnp.float8_e4m3fn)
+
+    assert pcp_kernel._validate_packed_kv_layout(
+        q_local,
+        kv_cache_local,
+        kv_layout=pcp_wrapper.KVLayout.SEQ_ALONG_LANE,
+        k_scale=0.5,
+        v_scale=0.5,
+    ) == (2, 4, 4)
+
+
 def test_prepare_packed_kv_accepts_equivalent_tail_layout(monkeypatch):
     packed_kv = jnp.arange(3 * 8 * 2 * 8,
                            dtype=jnp.float32).reshape(3, 8, 2, 8)
@@ -175,6 +188,33 @@ def test_prepare_packed_kv_accepts_equivalent_tail_layout(monkeypatch):
     prepared = pcp_wrapper._prepare_packed_kv_for_cache(k, v, kv_cache)
     expected = packed_kv.reshape(3, 16, 1, 8)
     np.testing.assert_array_equal(np.asarray(prepared), np.asarray(expected))
+
+
+def test_seq_along_lane_kv_packing_pads_inside_pcp_wrapper(monkeypatch):
+    packed_kv = jnp.ones((2, 32, 4, 384), dtype=jnp.bfloat16)
+    captured = {}
+
+    def fake_prepare_inputs(*_args, **kwargs):
+        captured["kwargs"] = kwargs
+        return None, packed_kv
+
+    monkeypatch.setattr(pcp_wrapper.batched_rpa_wrapper, "prepare_inputs",
+                        fake_prepare_inputs)
+
+    k = jnp.zeros((384, 1, 128), dtype=jnp.bfloat16)
+    padded = pcp_wrapper._pack_kv_for_cache(
+        k,
+        jnp.zeros_like(k),
+        jnp.float8_e4m3fn,
+        kv_layout=pcp_wrapper.KVLayout.SEQ_ALONG_LANE,
+        page_size=256,
+    )
+
+    assert "page_size" not in captured["kwargs"]
+    assert padded.shape == (2, 32, 4, 512)
+    np.testing.assert_array_equal(np.asarray(padded[..., :384]),
+                                  np.asarray(packed_kv))
+    np.testing.assert_array_equal(np.asarray(padded[..., 384:]), 0)
 
 
 def test_captured_kv_writeback_coalesces_contiguous_cache_slots():
@@ -212,6 +252,23 @@ def test_captured_kv_writeback_preserves_fully_fragmented_capacity():
                                   np.arange(16, dtype=np.int32) * 2)
     np.testing.assert_array_equal(np.asarray(descriptors[2]),
                                   np.ones(16, dtype=np.int32))
+
+
+def test_seq_along_lane_writeback_segments_stop_at_page_boundaries():
+    compact_slots = jnp.arange(256, dtype=jnp.int32)
+    descriptors, num_segments = \
+        pcp_wrapper._build_writeback_segment_descriptors(
+            compact_slots,
+            jnp.asarray(256),
+            kv_layout=pcp_wrapper.KVLayout.SEQ_ALONG_LANE,
+            page_size=128,
+        )
+
+    assert int(num_segments) == 2
+    np.testing.assert_array_equal(
+        np.asarray(descriptors[:, :2]),
+        np.asarray([[0, 128], [0, 128], [128, 128]], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(descriptors[:, 2:]), 0)
 
 
 def test_metadata_reconstruction_preserves_query_row_coordinates():
@@ -521,7 +578,7 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
         captured["num_segments"] = num_segments
         return jnp.full_like(q_streaming, 5), kv_cache
 
-    def fake_prepare_current(k_local, _v_local, cache):
+    def fake_prepare_current(k_local, _v_local, cache, **_kwargs):
         return jnp.zeros((k_local.shape[0], *cache.shape[2:]),
                          dtype=cache.dtype)
 
@@ -628,7 +685,7 @@ def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
         captured["writeback_called"] = True
         return jnp.full_like(q_streaming, 5), kv_cache
 
-    def fake_prepare_current(k_local, _v_local, cache):
+    def fake_prepare_current(k_local, _v_local, cache, **_kwargs):
         return jnp.zeros((k_local.shape[0], *cache.shape[2:]),
                          dtype=cache.dtype)
 

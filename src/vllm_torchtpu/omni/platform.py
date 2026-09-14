@@ -40,6 +40,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         head_size: int,
         allow_trtllm_default: bool = False,
     ) -> str:
+        from vllm_torchtpu.omni.patches import \
+            apply_omni_model_specific_patches
+
+        apply_omni_model_specific_patches()
         logger.info_once(
             "Using TpuSDPABackend for diffusion attention (requested: %s).",
             selected_backend)

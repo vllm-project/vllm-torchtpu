@@ -20,10 +20,10 @@ import pytest
 import torch
 import torch._dynamo
 
-from vllm_torchtpu.layers.vllm.sample.rejection_sampler import (
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID, RejectionSampler)
-from vllm_torchtpu.layers.vllm.sample.top_k_top_p import (MASKED_LOGIT_VALUE,
-                                                          apply_top_k_top_p)
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    MASKED_LOGIT_VALUE, apply_top_k_top_p)
 
 
 @pytest.fixture(autouse=True)

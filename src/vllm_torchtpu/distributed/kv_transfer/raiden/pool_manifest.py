@@ -38,7 +38,7 @@ from vllm_torchtpu.gdn_pool_layout import (pooled_gdn_conv_state_bytes,
                                            pooled_gdn_state_itemsize)
 
 from .tags import (TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM,
-                   TAG_MLA_NOPE, TAG_MLA_ROPE)
+                   TAG_MLA_NOPE, TAG_MLA_ROPE, class_tag, layer_tag)
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"
@@ -121,7 +121,8 @@ class PoolManifest:
         return counts
 
     def geometry_by_tag(self) -> dict[str, dict[str, int]]:
-        """Uniform (num_blocks, stride, live) per tag; raises on divergence."""
+        """Uniform (num_blocks, stride, live) per class tag; raises on
+        divergence. Per-layer tags fold into their class tag."""
         result: dict[str, dict[str, int]] = {}
         for pool in self.pools:
             geometry = {
@@ -129,14 +130,19 @@ class PoolManifest:
                 "block_stride_bytes": pool.block_stride_bytes,
                 "live_bytes_per_block": pool.live_bytes_per_block,
             }
-            existing = result.get(pool.tag)
+            tag = class_tag(pool.tag)
+            existing = result.get(tag)
             if existing is None:
-                result[pool.tag] = geometry
+                result[tag] = geometry
             elif existing != geometry:
                 raise ManifestError(
-                    f"pool geometry diverges within tag {pool.tag}: "
+                    f"pool geometry diverges within tag {tag}: "
                     f"{existing} vs {geometry} ({pool.layer_name})")
         return result
+
+    def pools_of_class(self, tag: str) -> list[PoolEntry]:
+        """Pools whose class tag is ``tag``, in manifest order."""
+        return [pool for pool in self.pools if class_tag(pool.tag) == tag]
 
     def pool_dicts(self) -> list[dict[str, Any]]:
         return [pool.to_pool_dict() for pool in self.pools]
@@ -528,12 +534,18 @@ def build_qwen35_pool_manifest(
     raw_tensors: Sequence[Any],
     gdn_geometry: GdnHeadGeometry,
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
+    per_layer_tags: bool = False,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
     Canonical pool order (must match on both transfer peers because pool
     indices travel on the wire): model layer order; within a GDN layer, conv
     before ssm.
+
+    ``per_layer_tags`` suffixes every tag with the layer index
+    (``fa.l3``, ``gdn.conv.g0.l0`` ...) so pools pair up by layer: a
+    pipeline-parallel producer registers only its own layers, and the
+    controller matches each of them to the same layer on the destination.
 
     ``mamba_group_ordinal_by_layer`` (opt-in, state-reshard deployments):
     suffixes GDN pool tags with the layer's mamba kv-cache-group ordinal
@@ -580,6 +592,15 @@ def build_qwen35_pool_manifest(
             flat.append((TAG_GDN_SSM + suffix, layer_name, states[1]))
         else:
             flat.append((TAG_FA, layer_name, cache))
+    if per_layer_tags:
+        tagged = []
+        for tag, layer_name, tensor in flat:
+            layer_index = layer_index_from_name(layer_name)
+            if layer_index is None:
+                raise ManifestError(
+                    f"per-layer pool tags need a layer index in {layer_name}")
+            tagged.append((layer_tag(tag, layer_index), layer_name, tensor))
+        flat = tagged
 
     binding, raw_index_by_pos = _binding_for(
         [(layer_name, tensor) for _, layer_name, tensor in flat], raw_tensors)
@@ -592,7 +613,7 @@ def build_qwen35_pool_manifest(
         itemsize = _element_size(tensor)
         dtype_tag = _dtype_tag(tensor)
 
-        if tag == TAG_FA:
+        if class_tag(tag) == TAG_FA:
             spec = _group_spec_for_layer(kv_cache_groups, layer_name)
             block_size = int(spec.block_size)
             num_kv_heads = int(spec.num_kv_heads)
@@ -628,7 +649,7 @@ def build_qwen35_pool_manifest(
                     f"GDN state {layer_name} nbytes {nbytes} is not "
                     f"divisible by num_blocks {num_blocks}")
             live_stride = nbytes // num_blocks
-            if tag.startswith(TAG_GDN_CONV):
+            if class_tag(tag).startswith(TAG_GDN_CONV):
                 regions = _gdn_conv_regions(conv_shape=shape,
                                             itemsize=itemsize,
                                             geometry=gdn_geometry)

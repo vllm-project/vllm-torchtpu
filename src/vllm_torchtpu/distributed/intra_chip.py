@@ -8,7 +8,7 @@ across a chip's cores even when the resulting exchange happens every layer:
 the halved HBM read beats the added on-chip hop.
 
 The group is deliberately separate from vLLM's TP group and from
-:mod:`vllm_torchtpu.layers.vllm.moe_hierarchical`, which only rewrites the
+:mod:`vllm_torchtpu.layers.adapter.moe_hierarchical`, which only rewrites the
 *numbers* in ``FusedMoEParallelConfig`` and keeps reducing over all of TP.
 """
 

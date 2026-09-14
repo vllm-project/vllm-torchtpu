@@ -28,8 +28,10 @@ class TpuMultiprocExecutor(MultiprocExecutor):
             # Compact-mamba sizing sets `num_gpu_blocks_override` on the worker's
             # cache_config during the RPC above; workers are separate processes, so
             # copy it to the engine-side config here.
+            pc = self.vllm_config.parallel_config
             agreed = reconcile_num_gpu_blocks_override(
-                self.collective_rpc("get_num_gpu_blocks_override"))
+                self.collective_rpc("get_num_gpu_blocks_override"),
+                workers_per_stage=pc.world_size // pc.pipeline_parallel_size)
             if agreed is not None:
                 self.vllm_config.cache_config.num_gpu_blocks_override = agreed
 

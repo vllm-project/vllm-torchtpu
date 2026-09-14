@@ -3,7 +3,7 @@
 This repository contains the integration of **TorchTPU** and **vLLM**. It is a vLLM platform plugin packaged as `vllm_torchtpu`, with TPU kernels and runtime code for TorchTPU.
 
 > [!IMPORTANT] Pre-Public Development Governance
-> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](docs/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
+> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
 
 ---
 
@@ -191,4 +191,21 @@ python3 examples/offline_inference.py \
   --max-num-batched-tokens 256 \
   --tensor_parallel_size=2 \
   --enable-expert-parallel
+```
+
+#### Pipeline Parallelism (PP)
+
+Each pipeline stage runs a slice of the layers on one core and hands its
+hidden states to the next stage with a collective-permute over ICI. Tensor
+parallelism inside a stage is not supported yet, so the worker count is
+`pipeline_parallel_size`.
+
+```bash
+python3 examples/offline_inference.py \
+  --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --pipeline-parallel-size=2 \
+  --tensor_parallel_size=1 \
+  --no-async-scheduling
 ```

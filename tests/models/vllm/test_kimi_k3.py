@@ -13,7 +13,7 @@ import torch.fx.experimental._config as fx_config
 from torch import nn
 from torch._dynamo import mark_dynamic
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.models.interfaces import supports_pp
@@ -24,11 +24,12 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
+import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
 from vllm_torchtpu.compilation.shape_variants import (trace_shape_env,
                                                       unsupported_reason)
 from vllm_torchtpu.layers import register_layers
-from vllm_torchtpu.layers.vllm.custom_ops import \
+from vllm_torchtpu.layers.adapter.custom_ops import \
     kda_attention_op as kimi_custom_ops
 from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiK3ForConditionalGeneration,
@@ -471,7 +472,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args) -> None:
+        def __init__(self, *args, gate_is_fused) -> None:
             super().__init__()
             self.mla_modules = args[8]
 
@@ -536,9 +537,10 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args) -> None:
+        def __init__(self, *args, gate_is_fused) -> None:
             super().__init__()
             self.mla_modules = args[8]
+            self.gate_is_fused = gate_is_fused
 
     monkeypatch.setattr(kimi_attention, "MultiHeadLatentAttentionWrapper",
                         FakeMLAWrapper)
@@ -572,7 +574,7 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
 
     assert layer.fused_qkv_a_proj.output_size == 8 + (8 + 2) + 4 * 4
     assert layer.g_proj is None
-    assert layer.mla_attn.mla_modules.gate_is_fused is True
+    assert layer.mla_attn.gate_is_fused is True
 
 
 @pytest.mark.parametrize("use_parameter_hook", [False, True],
@@ -688,6 +690,70 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
 
     output = layer(torch.arange(2), torch.ones(2, 4))
     assert calls == ["dispatched"]
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
+    )
+
+
+def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache() -> None:
+    """A one-tensor kv_cache means the unified pool: the layer must take the
+    pooled op and never the dense dispatched op."""
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.fused_fa_ga_proj = _Projection(4)
+    layer.f_a_proj = None
+    layer.g_proj = None
+    layer.local_projection_size = 4
+    layer.f_b_proj = _Projection(4)
+    layer.g_b_proj = _Projection(4)
+    layer.o_proj = _IdentityProjection()
+    layer.q_conv1d = _ConvWeight()
+    layer.k_conv1d = _ConvWeight()
+    layer.v_conv1d = _ConvWeight()
+    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
+    layer.o_norm = SimpleNamespace(weight=torch.ones(2))
+    layer.A_log = nn.Parameter(torch.zeros(2))
+    layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
+
+    pool = torch.zeros(2, 4, 2, 8)
+    layer.kv_cache = [pool]
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_slot_read_offsets=None,
+    )
+    layer._metadata = lambda: metadata
+
+    calls: list[str] = []
+
+    def pooled_kda_op(mixed_qkv, *args):
+        calls.append("pooled")
+        assert args[3] is pool
+        return mixed_qkv[:, :4].view(-1, 2, 2)
+
+    def unexpected(name):
+
+        def op(*args, **kwargs):
+            raise AssertionError(f"{name} must not run for the pooled cache")
+
+        return op
+
+    layer.pooled_kda_op = pooled_kda_op
+    layer.dispatched_kda_op = unexpected("dispatched_kda_op")
+    layer.sconv_op = unexpected("sconv_op")
+    layer.chunk_kda_op = unexpected("chunk_kda_op")
+    layer.kda_op = unexpected("kda_op")
+
+    output = layer(torch.arange(2), torch.ones(2, 4))
+    assert calls == ["pooled"]
     torch.testing.assert_close(
         output,
         torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
@@ -890,3 +956,104 @@ def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
     assert unsupported_reason(shape_env, 1) is None
     assert unsupported_reason(shape_env, 2) is not None
     assert unsupported_reason(shape_env, 512) is not None
+
+
+@pytest.mark.parametrize("field", [
+    "mla_use_output_gate", "activation_situ_beta",
+    "activation_situ_linear_beta", "attn_res_block_size"
+])
+def test_kimi_model_requires_declared_optional_config_fields(field):
+    config = KimiLinearConfig()
+    delattr(config, field)
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(
+        hf_text_config=config))
+    with pytest.raises(AttributeError, match=field):
+        KimiModel(vllm_config=vllm_config)
+
+
+@pytest.mark.parametrize("use_norm", [False, True])
+def test_latent_moe_norm_follows_the_config_flag(
+        monkeypatch: pytest.MonkeyPatch, use_norm: bool) -> None:
+
+    class Fake(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    monkeypatch.setattr(kimi_moe, "GateLinear", Fake)
+    monkeypatch.setattr(kimi_moe, "KimiMLP", Fake)
+    monkeypatch.setattr(kimi_moe, "make_latent_projection", Fake)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", lambda **kwargs: Fake())
+    norm_args: list[tuple] = []
+
+    class FakeNorm(nn.Module):
+
+        def __init__(self, *args) -> None:
+            super().__init__()
+            norm_args.append(args)
+
+    monkeypatch.setattr(kimi_moe, "RMSNorm", FakeNorm)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        num_experts=4,
+        num_experts_per_token=2,
+        moe_intermediate_size=32,
+        routed_expert_hidden_size=8,
+        latent_moe_use_norm=use_norm,
+    )
+    layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+
+    assert isinstance(layer.routed_expert_down_proj, Fake)
+    assert isinstance(layer.routed_expert_up_proj, Fake)
+    if use_norm:
+        assert isinstance(layer.routed_expert_norm, FakeNorm)
+        assert norm_args == [(8, config.rms_norm_eps)]
+    else:
+        assert layer.routed_expert_norm is None
+        assert norm_args == []
+
+
+@pytest.mark.parametrize("attn_res_block_size", [None, 4])
+def test_kimi_model_wires_declared_optional_features(
+        monkeypatch: pytest.MonkeyPatch,
+        attn_res_block_size: int | None) -> None:
+
+    class Recorder(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            self.args = args
+            self.kwargs = kwargs
+
+    for name in ("MultiHeadLatentAttention", "KimiDeltaAttention", "KimiMoE",
+                 "KimiMLP", "RMSNorm", "AttentionResidual",
+                 "VocabParallelEmbedding"):
+        monkeypatch.setattr(kimi_model, name, Recorder)
+    config = KimiLinearConfig(
+        num_hidden_layers=2,
+        hidden_act="situ",
+        activation_situ_beta=1.5,
+        activation_situ_linear_beta=0.5,
+        attn_res_block_size=attn_res_block_size,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=config),
+        quant_config=None,
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+    )
+
+    model = kimi_model.KimiModel(vllm_config=vllm_config)
+
+    uses_residual_blocks = attn_res_block_size is not None
+    assert model.attn_res_block_size == attn_res_block_size
+    assert hasattr(model, "output_attn_res") is uses_residual_blocks
+    assert len(model.layers) == 2
+    for layer in model.layers:
+        assert isinstance(layer.self_attn, Recorder)
+        assert layer.attn_res_block_size == attn_res_block_size
+        assert hasattr(layer, "self_attention_res") is uses_residual_blocks
+        assert hasattr(layer, "mlp_res") is uses_residual_blocks
+        assert layer.mlp.kwargs["situ_beta"] == 1.5
+        assert layer.mlp.kwargs["situ_linear_beta"] == 0.5

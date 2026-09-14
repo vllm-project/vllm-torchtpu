@@ -17,6 +17,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
@@ -61,6 +62,7 @@ class GatherTest(jtu.JaxTestCase):
 
         self.assertArraysEqual(actual, desired)
 
+    @pytest.mark.nightly
     def test_benchmark(self):
         benchmark_shapes = [
             # in_size, out_size, hidden_size

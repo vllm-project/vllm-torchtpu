@@ -36,14 +36,23 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from vllm import envs
 
 from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 
 
+def is_seq_along_lane_pool() -> bool:
+    """True if pool uses the SEQ_ON_LANE (nb, heads2, packed_d, pack, page_size) layout."""
+    return envs.VLLM_KV_CACHE_LAYOUT == "HND"
+
+
 def _pool_geometry(pool):
     """(block_size, payload dims between token and lane, lanes)."""
     assert pool.ndim >= 3, pool.shape
+    if is_seq_along_lane_pool():
+        page_size = pool.shape[-1]
+        return page_size, tuple(pool.shape[1:-1]), pool.shape[-1]
     return pool.shape[1], tuple(pool.shape[2:-1]), pool.shape[-1]
 
 
@@ -487,7 +496,10 @@ def v3_state_source(
     independent of ``num_speculative_tokens``.
     """
     block_size, payload, lanes = _pool_geometry(pool)
-    tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+    if is_seq_along_lane_pool():
+        tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
+    else:
+        tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
     recurrent_state_dtype = jnp.dtype(recurrent_state_dtype)
 
     ssm_rows = n_v * d_k
@@ -560,7 +572,9 @@ def v3_state_source(
         rows_used=conv_rows,
         rows_perm=conv_rows_perm,
     )
-
-    return gdn_v3_config.StateSourcePlan(stride=split,
-                                         conv=conv,
-                                         recurrent=ssm)
+    return gdn_v3_config.StateSourcePlan(
+        stride=split,
+        conv=conv,
+        recurrent=ssm,
+        whole_block_dma=is_seq_along_lane_pool(),
+    )

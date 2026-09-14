@@ -21,14 +21,14 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
-from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.sequence_layout import (
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 _PCP_LAYOUT_RANK = (
-    "vllm_torchtpu.layers.common.pcp_sequence_layout._get_native_pcp_rank")
-_PCP_LAYOUT_WORLD_SIZE = ("vllm_torchtpu.layers.common.pcp_sequence_layout."
+    "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank")
+_PCP_LAYOUT_WORLD_SIZE = ("vllm_torchtpu.layers.core.pcp_sequence_layout."
                           "_get_native_pcp_world_size")
 
 
@@ -114,6 +114,11 @@ def _make_runner(*,
     runner._cached_request_distribution = None
     runner._dp_target_bucket = None
     runner._has_mamba_state = False
+    # One pipeline stage: the runner embeds its own inputs.
+    runner._pp_is_first = True
+    runner._pp_is_last = True
+    # The stub runs no attention kernel: nothing to bound.
+    runner._check_attention_schedule = lambda *args: None
     # Spec-decode mamba rollback is inactive in these PCP layout tests; the
     # runner leaves the read-offset buffer unset (None) unless speculative
     # decoding is enabled, so _prepare_inputs / dummy_run skip the windowed
@@ -254,7 +259,8 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
     runner.maybe_select_dummy_loras = (
         lambda *_args, **_kwargs: contextlib.nullcontext())
     runner.forward_model = MagicMock(
-        side_effect=lambda input_ids, positions, inputs_embeds: (torch.zeros(
+        side_effect=lambda input_ids, positions, inputs_embeds,
+        intermediate_tensors=None: (torch.zeros(
             (positions.shape[-1], 4), dtype=torch.float32), None))
 
     TPUModelRunner._dummy_run(

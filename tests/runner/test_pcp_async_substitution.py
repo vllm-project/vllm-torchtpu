@@ -9,7 +9,7 @@ import numpy as np
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     build_pcp_rank_major_token_order
-from vllm_torchtpu.layers.common.sequence_layout import (
+from vllm_torchtpu.layers.core.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL, SequenceLayoutDescriptor,
     SequenceLayoutKind, SequenceLayoutPlan)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner

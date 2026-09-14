@@ -25,7 +25,7 @@ import torch
 from jax import lax
 
 from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select
-from vllm_torchtpu.layers.common.rowmax_topk import rowmax_topk
+from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 EXPERTS = 512
 TOPK = 10

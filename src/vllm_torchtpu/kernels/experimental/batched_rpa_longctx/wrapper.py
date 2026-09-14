@@ -35,10 +35,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
-                                                                    kernel,
-                                                                    schedule,
-                                                                    utils)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
+    configs, kernel, schedule, schedule_cp, utils)
 
 
 def prepare_inputs(
@@ -68,7 +66,6 @@ def prepare_inputs(
                                              num_sublanes * kv_packing)
     else:
         aligned_kv_head_dim = utils.align_to(actual_head_dim, num_lanes)
-
     # queries: (T, H, D) -> (T, H_kv, G, D)
     o_hbm_alias_q_hbm = (jnp.pad(
         q.reshape(
@@ -148,10 +145,8 @@ def get_kv_cache_shape(
     actual_num_kv_heads,
     actual_head_dim,
     kv_dtype,
-    kv_layout: configs.KVLayout | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
 ):
-    if kv_layout is None:
-        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     kv_packing = utils.get_dtype_packing(kv_dtype)
@@ -177,6 +172,7 @@ def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
+    decode_query_size: int = 1,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill."""
 
@@ -376,8 +372,8 @@ def calculate_block_sizes(
     # Fixed value based on experimental results.
     decode_batch_size = 8
     prefill_batch_size = 2
-
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer,
+                                               decode_query_size)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     return decode_block_sizes, prefill_block_sizes
@@ -401,8 +397,15 @@ def calculate_block_sizes(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
+        "decode_query_size",
+        "cp_group_size",
+        "attention_scope",
+        "return_lse",
     ),
-    donate_argnames=("queries", "keys", "values", "kv_cache"),
+    # Donation of transient inputs can fail for some runtime buffer layouts in
+    # the experimental tuning path. Keep donation only for kv_cache, which is
+    # the intended long-lived mutable state.
+    donate_argnames=("kv_cache", ),
 )
 def ragged_paged_attention(
     queries: jax.Array,
@@ -428,11 +431,15 @@ def ragged_paged_attention(
     debug_mode: bool = False,
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
-    skip_kv_update: bool = False,
-    kv_layout: configs.KVLayout | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    skip_kv_update: bool = True,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
+    cp_group_size: int | None = None,
+    cp_rank: jax.Array | None = None,
+    attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
+    return_lse: bool = False,
+) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
-
     Args:
         queries: [max_num_tokens, num_q_heads, head_dim]. Output of q projection.
         keys: [max_num_tokens, num_kv_heads, head_dim]. Output of k projection.
@@ -458,6 +465,8 @@ def ragged_paged_attention(
         q_scale: Quantization scale value of queries.
         k_scale: Quantization scale value of keys.
         v_scale: Quantization scale value of values.
+        decode_query_size: Number of query tokens in decode (1 by default, can be
+            higher in case of speculative decoding).
         chunk_prefill_size: Not used.
         decode_block_sizes: Kernel block size to use during decode.
         prefill_block_sizes: Kernel block size to use during prefill.
@@ -466,47 +475,45 @@ def ragged_paged_attention(
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
-        skip_kv_update: Cross-layer KV cache sharing. When True, this (shared)
-            layer reads its entire K/V span from the cache slot written by its
-            target layer earlier in the same forward pass, ignores its own k/v
-            inputs, and does not write the cache back. Inverse of upstream
-            tpu-inference's `update_kv_cache`.
-
+        cp_group_size: Size of the context parallelism (CP) group. KV cache is
+            sharded across devices in this group. Defaults to None.
+        cp_rank: Rank of the current device within the CP group, which determine
+            the token ownership. Defaults to None.
+        attention_scope: Which KV positions to attend to. FULL attends all
+            positions, CACHE_ONLY skips new tokens, NEW_TOKENS_ONLY skips cached
+            tokens. Defaults to FULL.
+        return_lse: If True, return log-sum-exp (lse) values along with the
+            output. Defaults to False.
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
-            kv_packing, head_dim]. Result of new kv cache where k & vs are
+        kv_packing, head_dim]. Result of new kv cache where k & vs are
             concatenated along num kv heads dim.
-    """
-
-    if kv_layout is None:
-        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
-
+        lse (only when return_lse=True): [max_num_tokens, num_q_heads].
+            Log-sum-exp values (m + log(l)) for each query token and head,
+            needed for merging partial attention results in CP.
+  """
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
         raise ValueError("Debug mode is not supported.")
-
     if out_dtype is None:
         out_dtype = queries.dtype
     if mask_value is None:
         mask_value = jnp.finfo(out_dtype).min
     if vmem_limit_bytes is None:
         vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
     else:
         page_size = kv_cache.shape[1]
-
     num_q_heads = queries.shape[1]
     head_dim = queries.shape[2]
     num_kv_heads = keys.shape[1]
     num_page_indices = page_indices.shape[0]
-
     model_cfgs = configs.ModelConfigs(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -528,8 +535,11 @@ def ragged_paged_attention(
         scale_k=k_scale,
         scale_v=v_scale,
         kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
+        cp_group_size=cp_group_size,
+        attention_scope=attention_scope,
+        return_lse=return_lse,
     )
-
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
         keys,
@@ -539,20 +549,62 @@ def ragged_paged_attention(
         kv_layout=kv_layout,
         page_size=page_size,
     )
-
     default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs, serve_cfgs, vmem_limit_bytes)
+        model_cfgs,
+        serve_cfgs,
+        vmem_limit_bytes,
+        decode_query_size=decode_query_size,
+    )
+    # Pre-allocate LSE buffer.
+    lse_hbm_init: jax.Array | None = None
+    if return_lse:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        q_packing = utils.get_dtype_packing(queries.dtype)
+        num_q_heads_per_kv_head = num_q_heads // num_kv_heads
+        aligned_num_q_heads_per_kv_head = utils.align_to(
+            num_q_heads_per_kv_head, q_packing)
+        max_tokens = queries.shape[0]
+        lse_hbm_init = jnp.full(
+            [
+                num_kv_heads,
+                max_tokens * aligned_num_q_heads_per_kv_head,
+                num_lanes,
+            ],
+            -jnp.inf,
+            dtype=out_dtype,
+        )
+    # Compute per-sequence length parameters for the kernel.
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    global_kv_cache_lens = kv_lens - q_lens
+    if attention_scope == configs.AttentionScope.CACHE_ONLY:
+        if cp_group_size is not None:
+            rank = cp_rank[0] if cp_rank is not None else 0
+            kv_cache_lens = utils.cp_local_cache_len(global_kv_cache_lens,
+                                                     cp_group_size, rank,
+                                                     page_size)
+        else:
+            kv_cache_lens = global_kv_cache_lens
+        kv_new_lens = jnp.zeros_like(q_lens)
+        q_offsets = kv_cache_lens
+    elif attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+        kv_cache_lens = global_kv_cache_lens
+        kv_new_lens = q_lens
+        q_offsets = global_kv_cache_lens
+    else:  # FULL
+        kv_cache_lens = global_kv_cache_lens
+        kv_new_lens = q_lens
+        q_offsets = global_kv_cache_lens
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
         o_hbm_alias_q_hbm: jax.Array,
         kv_cache: jax.Array,
+        lse_hbm_in: jax.Array | None,
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
         else:
             effective_blocks = prefill_block_sizes or default_prefill
-
         cfgs = configs.RpaConfigs(
             block=effective_blocks,
             model=model_cfgs,
@@ -570,37 +622,64 @@ def ragged_paged_attention(
             cu_q_lens=cu_q_lens,
             distribution=distribution,
         )
-
+        # Select metadata computer class.
+        if cp_group_size is not None:
+            computer_cls = schedule_cp.CPMetadataComputer
+            extra_scalars = (cp_rank, ) if cp_rank is not None else ()
+        else:
+            computer_cls = schedule.BaseMetadataComputer
+            extra_scalars = ()
         schedule_hbm = schedule.generate_rpa_metadata(
             cu_q_lens,
-            kv_lens,
+            q_offsets,
+            kv_cache_lens,
+            kv_new_lens,
             distribution,
             cfgs=cfgs,
-            skip_kv_update=skip_kv_update,
+            computer_cls=computer_cls,
+            extra_scalars=extra_scalars,
         )
-        return kernel.rpa_kernel(
+        result = kernel.rpa_kernel(
             cu_q_lens,
-            kv_lens,
+            q_offsets,
+            kv_cache_lens,
+            kv_new_lens,
             page_indices,
             schedule_hbm,
             o_hbm_alias_q_hbm,
             new_kv_hbm,
             kv_cache,
+            lse_hbm_in,
             cfgs=cfgs,
+            computer_cls=computer_cls,
         )
+        if return_lse:
+            o_out, kv_out, lse_out = result
+        else:
+            o_out, kv_out, _ = result
+            lse_out = None
+        return o_out, kv_out, lse_out
 
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.DECODE, q_hbm,
-                                                 kv_cache)
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.MIXED,
-                                                 o_hbm_alias_q_hbm, kv_cache)
-
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init)
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm)
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
     # after: [kv_heads, max_tokens, q_per_kv, d]
-
     # slice back to original shape if padded
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
-
-    return o_hbm, kv_cache
+    if not return_lse:
+        return o_hbm, kv_cache
+    # Reshape LSE from [num_kv_heads, max_tokens * aligned_num_q_heads_per_kv_head, num_lanes] to
+    # [max_tokens, num_q_heads].
+    max_tokens = queries.shape[0]
+    # Extract first lane (scalar LSE value per token-head pair).
+    lse = lse_hbm.reshape(num_kv_heads, max_tokens,
+                          aligned_num_q_heads_per_kv_head,
+                          num_lanes)[:, :max_tokens, :num_q_heads_per_kv_head,
+                                     0]
+    lse = lse.swapaxes(0, 1).reshape(max_tokens, num_q_heads)
+    return o_hbm, kv_cache, lse

@@ -8,6 +8,8 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 
 from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 
+pytestmark = pytest.mark.cpu_test
+
 
 def _config(*,
             pcp: int,

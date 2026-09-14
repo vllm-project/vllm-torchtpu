@@ -34,6 +34,8 @@ import torch
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
+pytestmark = pytest.mark.cpu_test
+
 T0 = dt.datetime(2026, 8, 20, 17, 40, 0)
 
 
@@ -59,7 +61,10 @@ def set_cache(monkeypatch, entries):
     stats = SimpleNamespace(per_entry_stats=list(entries),
                             num_cache_reqs=len(entries),
                             num_cache_hits=0)
-    monkeypatch.setattr(torch.tpu, "_get_cache_stats", lambda: stats)
+    monkeypatch.setattr(torch,
+                        "tpu",
+                        SimpleNamespace(_get_cache_stats=lambda: stats),
+                        raising=False)
 
 
 @contextlib.contextmanager
@@ -257,5 +262,8 @@ def test_disabled_paths_do_not_touch_the_cache(check, eager, monkeypatch):
     def boom():
         raise AssertionError("_get_cache_stats must not be called")
 
-    monkeypatch.setattr(torch.tpu, "_get_cache_stats", boom)
+    monkeypatch.setattr(torch,
+                        "tpu",
+                        SimpleNamespace(_get_cache_stats=boom),
+                        raising=False)
     runner._update_num_xla_graphs("init")

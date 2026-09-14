@@ -64,6 +64,18 @@ def parse_args():
                         action="store_false",
                         dest="enforce_eager",
                         help="Disable enforce eager mode (test failure path)")
+    parser.add_argument("--max-model-len",
+                        type=int,
+                        default=1536,
+                        help="Maximum model context length (default: 1536)")
+    parser.add_argument("--max-num-batched-tokens",
+                        type=int,
+                        default=1536,
+                        help="Maximum batched tokens (default: 1536)")
+    parser.add_argument("--gpu-memory-utilization",
+                        type=float,
+                        default=0.95,
+                        help="TPU memory utilization ratio (default: 0.95)")
     return parser.parse_args()
 
 
@@ -144,8 +156,9 @@ def main(args):
         tensor_parallel_size=args.tensor_parallel_size,
         pooler_config=PoolerConfig(task="embed"),
         trust_remote_code=True,
-        max_model_len=4096,
-        max_num_batched_tokens=16384,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
         disable_log_stats=True,
         disable_chunked_mm_input=True,

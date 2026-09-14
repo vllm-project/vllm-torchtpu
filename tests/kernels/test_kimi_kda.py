@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_torchtpu.kernels.kimi_k3 import kda_step, ragged_kda
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import \
     kimi_short_conv_scan
 
 

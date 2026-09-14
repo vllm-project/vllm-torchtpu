@@ -187,9 +187,9 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 for _ in range(num_devices):
                     placement_group_specs.append({device_str: 1.0})
         else:
-            assert pp_size == len(
-                nodes_with_device
-            ), f"Cannot use PP across hosts, please set --pipeline-parallel-size to 1 or {len(nodes_with_device)}"
+            # One bundle per pipeline stage, sized to the stage's devices.
+            # PACK fills a host before moving to the next, so consecutive
+            # stages share a host whenever the stage size allows it.
             num_devices_per_pp_rank = self.parallel_config.world_size // pp_size
             placement_group_specs = [{
                 device_str: num_devices_per_pp_rank
@@ -459,7 +459,6 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         for rank, (node_id, _) in enumerate(worker_node_and_physical_tpu_ids):
             local_rank = node_workers[node_id].index(rank)
             ip = sorted_worker_metadata[rank].ip
-            prev_ip = sorted_worker_metadata[rank - 1].ip if rank > 0 else ""
 
             worker_vllm_config = self.vllm_config
 
@@ -491,13 +490,10 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 is_driver_worker=(not self.parallel_config)
                 or (rank % self.parallel_config.tensor_parallel_size == 0),
                 ip=ip,
-                prev_worker_ip=prev_ip,
             )
             all_kwargs.append(kwargs)
         self.collective_rpc("init_worker", args=(all_kwargs, ))
         self.collective_rpc("init_device")
-        if self.parallel_config.pipeline_parallel_size > 1:
-            self.collective_rpc("initialize_pp_transfer_connect")
         self.collective_rpc("load_model")
         if self.use_ray_spmd_worker:
             for pp_rank in range(self.parallel_config.pipeline_parallel_size):
