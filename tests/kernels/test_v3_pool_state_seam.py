@@ -776,3 +776,215 @@ class TestPooledCallerV3:
                                    np.asarray(dense_out2),
                                    rtol=1e-3,
                                    atol=1e-3)
+
+
+def _packed_input_kwargs(seed, num_tokens):
+    kwargs = _rand_inputs(seed, num_tokens)
+    for name in ("qkv", "b", "a", "conv_weight", "conv_bias"):
+        kwargs[name] = (kwargs[name] * 0.05).astype(jnp.bfloat16)
+    kwargs["a_log"] *= 0.02
+    kwargs["dt_bias"] = kwargs["dt_bias"] * 0.02 - 2.0
+    return kwargs
+
+
+def _packed_read_states(pool, idx, split):
+    recurrent = pool_adapters.gather_region(pool,
+                                            idx,
+                                            tok0=0,
+                                            ntok=SSM_NTOK,
+                                            split=split,
+                                            out_dtype=jnp.float32,
+                                            out_lanes=D_V)
+    conv = pool_adapters.gather_region(pool,
+                                       idx,
+                                       tok0=CONV_TOK0,
+                                       ntok=CONV_NTOK,
+                                       split=split,
+                                       out_dtype=jnp.bfloat16)
+    return recurrent, conv[:, :CONV_ROWS]
+
+
+class TestPackedBF16PooledInput:
+    """Packed QKV preserves the pooled state and sequence-boundary contract."""
+
+    def test_empty_odd_start_has_zero_input_dma(self):
+        cfg = wrapper.config.GDNConfig(mode=wrapper.config.GDNMode.BATCHED,
+                                       dtypes=wrapper.config.Dtypes(
+                                           act_in=jnp.dtype(jnp.bfloat16),
+                                           act_out=jnp.dtype(jnp.bfloat16),
+                                           compute=jnp.dtype(jnp.float32),
+                                           recurrent_state=jnp.dtype(
+                                               jnp.float32),
+                                           conv_state=jnp.dtype(jnp.float32)),
+                                       batch_size=32,
+                                       dim_size=DIM,
+                                       kernel_size=KERNEL_SIZE,
+                                       tile_size=4,
+                                       num_kq_heads=N_KQ,
+                                       num_v_heads=N_V,
+                                       kq_head_dim=D_K,
+                                       v_head_dim=D_V,
+                                       state_plan=_plan())
+        row_base = cfg.qkv_row_alignment
+        metadata = wrapper.metadata.compute_batched_seq_metadata(
+            cfg,
+            seq_lens=jnp.array([7, 0, 0, 0], dtype=jnp.int32),
+            query_start_loc=jnp.array([row_base] + [row_base + 1] * 4,
+                                      dtype=jnp.int32),
+            state_indices=jnp.array([1, 0, 0, 0], dtype=jnp.int32),
+            read_offsets=jnp.zeros(4, dtype=jnp.int32),
+            end_seq=jnp.int32(4))
+        np.testing.assert_array_equal(metadata.p_id_to_r_base.data[1:],
+                                      [row_base + 1] * 3)
+        np.testing.assert_array_equal(metadata.p_id_to_qkv_r_base.data,
+                                      [row_base] * 4)
+        np.testing.assert_array_equal(metadata.p_id_to_qkv_r_size.data,
+                                      [cfg.qkv_row_alignment, 0, 0, 0])
+
+    def _step(self, pools, idx, kwargs, *, split=SPLIT):
+        before = [np.asarray(pool).view(np.uint16).copy() for pool in pools]
+        results = []
+        for packed, pool in zip((False, True), pools):
+            qkv = kwargs["qkv"]
+            if not packed:
+                qkv = qkv.astype(jnp.float32)
+            updated, output = wrapper.fused_conv1d_gdn(conv_state=None,
+                                                       recurrent_state=None,
+                                                       state_source=pool,
+                                                       state_plan=_plan(
+                                                           pool, split=split),
+                                                       state_indices=idx,
+                                                       **(kwargs | {
+                                                           "qkv": qkv
+                                                       }))
+            updated.block_until_ready()
+            output.block_until_ready()
+            assert pool.is_deleted(), "the pooled state buffer was not donated"
+            results.append((updated, output.astype(jnp.bfloat16)))
+
+        reference, candidate = results
+        np.testing.assert_allclose(np.asarray(candidate[1], dtype=np.float32),
+                                   np.asarray(reference[1], dtype=np.float32),
+                                   rtol=1e-5,
+                                   atol=1e-6,
+                                   equal_nan=False)
+        active_sequences = np.diff(np.asarray(kwargs["query_start_loc"])) > 0
+        checkpoint_idx = kwargs.get("ckpt_indices",
+                                    idx)[active_sequences].reshape(-1)
+        active_idx = checkpoint_idx[checkpoint_idx != 0]
+        if active_idx.size:
+            ref_recurrent, ref_conv = _packed_read_states(
+                reference[0], active_idx, split)
+            new_recurrent, new_conv = _packed_read_states(
+                candidate[0], active_idx, split)
+            np.testing.assert_allclose(np.asarray(new_recurrent),
+                                       np.asarray(ref_recurrent),
+                                       rtol=1e-5,
+                                       atol=1e-6,
+                                       equal_nan=False)
+            np.testing.assert_array_equal(
+                np.asarray(new_conv).view(np.uint16),
+                np.asarray(ref_conv).view(np.uint16))
+
+        touched = {int(i) for i in np.asarray(active_idx)}
+        for arm, (pool, _) in enumerate(results):
+            after = np.asarray(pool).view(np.uint16)
+            for manager in range(pool.shape[0] // split):
+                if manager not in touched:
+                    region = slice(manager * split, (manager + 1) * split)
+                    np.testing.assert_array_equal(after[region],
+                                                  before[arm][region])
+        return reference[0], candidate[0]
+
+    @pytest.mark.parametrize("schedule", [
+        "fresh_odd_tail", "resumed_odd_even", "mixed_decode_prefill",
+        "empty_odd_start", "all_empty_odd_start"
+    ])
+    def test_sequence_boundaries(self, schedule):
+        if schedule == "fresh_odd_tail":
+            starts, idx, distribution = [0, 1, 66, 129], [1, 2, 4], [0, 3, 3]
+            lengths, initial = [1, 65, 63], False
+        elif schedule == "resumed_odd_even":
+            starts, idx, distribution = [0, 65, 129, 131], [1, 2, 4], [0, 3, 3]
+            lengths, initial = [76, 71, 5], True
+        elif schedule == "mixed_decode_prefill":
+            starts, idx, distribution = [0, 1, 2, 67, 131], [1, 2, 3,
+                                                             4], [2, 4, 4]
+            lengths, initial = [8, 9, 72, 71], True
+        elif schedule == "empty_odd_start":
+            starts, idx, distribution = [0, 1, 1, 65, 65], [2, 3, 4,
+                                                            0], [2, 4, 4]
+            lengths, initial = [8, 0, 71, 0], True
+        else:
+            starts, idx, distribution = [1, 1, 1, 1, 1], [1, 2, 3,
+                                                          4], [4, 4, 4]
+            lengths, initial = [0, 0, 0, 0], False
+        idx = jnp.asarray(idx, dtype=jnp.int32)
+        pool = _garbage_pool(101)
+        active_idx = idx[idx != 0]
+        if initial:
+            keys = jax.random.split(jax.random.key(102), 2)
+            pool = _write_states(
+                pool,
+                jax.random.normal(keys[0],
+                                  (active_idx.size, N_V, D_K, D_V)) * 0.01,
+                jax.random.normal(keys[1],
+                                  (active_idx.size, KERNEL_SIZE - 1, DIM)) *
+                0.01, active_idx)
+        kwargs = _packed_input_kwargs(103, max(starts[-1], 1)) | dict(
+            query_start_loc=jnp.asarray(starts, dtype=jnp.int32),
+            distribution=jnp.asarray(distribution, dtype=jnp.int32),
+            seq_lens=jnp.asarray(lengths, dtype=jnp.int32))
+        self._step((jnp.copy(pool), jnp.copy(pool)), idx, kwargs)
+
+    @pytest.mark.parametrize("offset", range(16))
+    def test_prefill_row_offsets(self, offset):
+        idx = jnp.array([1, 2], dtype=jnp.int32)
+        keys = jax.random.split(jax.random.key(130), 2)
+        pool = _write_states(
+            _garbage_pool(131),
+            jax.random.normal(keys[0], (2, N_V, D_K, D_V)) * 0.01,
+            jax.random.normal(keys[1], (2, KERNEL_SIZE - 1, DIM)) * 0.01, idx)
+        kwargs = _packed_input_kwargs(132 + offset, offset + 65) | dict(
+            query_start_loc=jnp.array([0, offset, offset + 65],
+                                      dtype=jnp.int32),
+            distribution=jnp.array([0, 2, 2], dtype=jnp.int32),
+            seq_lens=jnp.array([offset + 7, 72], dtype=jnp.int32))
+        self._step((jnp.copy(pool), jnp.copy(pool)), idx, kwargs)
+
+    def test_chunked_prefill_carries_both_states(self):
+        idx = jnp.array([1, 3], dtype=jnp.int32)
+        initial = _garbage_pool(110)
+        pools = (jnp.copy(initial), jnp.copy(initial))
+        for seed, starts, lengths in ((111, [0, 65, 129], [65, 64]),
+                                      (112, [0, 63, 128], [128, 129])):
+            kwargs = _packed_input_kwargs(seed, starts[-1]) | dict(
+                query_start_loc=jnp.asarray(starts, dtype=jnp.int32),
+                distribution=jnp.array([0, 2, 2], dtype=jnp.int32),
+                seq_lens=jnp.asarray(lengths, dtype=jnp.int32))
+            pools = self._step(pools, idx, kwargs)
+
+    @pytest.mark.parametrize("split", [6, 1],
+                             ids=["kernel_grained", "manager"])
+    def test_checkpoint_read_offsets(self, split):
+        schedule = TestPooledSpecWindows()
+        pool = schedule._pool(split)
+        idx = jnp.array([4, 1, 3], dtype=jnp.int32)
+        checkpoint_idx = jnp.array([[4, 7], [1, 9], [3, 5]], dtype=jnp.int32)
+        keys = jax.random.split(jax.random.key(120), 2)
+        pool = _write_states_split(
+            pool,
+            jax.random.normal(keys[0], (3, N_V, D_K, D_V)) * 0.01,
+            jax.random.normal(keys[1], (3, KERNEL_SIZE - 1, DIM)) * 0.01, idx,
+            split)
+        pools = (jnp.copy(pool), jnp.copy(pool))
+        for step_num, step in enumerate(schedule._steps()):
+            kwargs = _packed_input_kwargs(
+                121 + step_num, step["num_tokens"]) | dict(
+                    query_start_loc=step["query_start_loc"],
+                    distribution=step["distribution"],
+                    seq_lens=step["seq_lens"],
+                    num_spec_tokens=schedule.NUM_SPEC,
+                    read_offsets=step["read_offsets"],
+                    ckpt_indices=checkpoint_idx)
+            pools = self._step(pools, idx, kwargs, split=split)

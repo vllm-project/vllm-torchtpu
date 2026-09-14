@@ -90,6 +90,8 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
+    p_id_to_qkv_r_base: SmemWrapper | None = None
+    p_id_to_qkv_r_size: SmemWrapper | None = None
 
     @classmethod
     def create(
@@ -108,6 +110,19 @@ class MetadataRef:
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
+        qkv_r_base = qkv_r_size = None
+        alignment = cfgs.qkv_row_alignment
+        if alignment > 1:
+            qkv_base = p_id_to_r_base // alignment * alignment
+            # Empty slots do not fetch the native tile containing their start.
+            qkv_size = jnp.where(
+                p_id_to_r_size > 0,
+                pl.cdiv(p_id_to_r_base + p_id_to_r_size, alignment) * alignment
+                - qkv_base,
+                0,
+            )
+            qkv_r_base = SmemWrapper(qkv_base, shape)
+            qkv_r_size = SmemWrapper(qkv_size, shape)
         return cls(
             num_tiles=num_tiles,
             p_id_to_s_idx=SmemWrapper(p_id_to_s_idx, shape),
@@ -119,6 +134,8 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+            p_id_to_qkv_r_base=qkv_r_base,
+            p_id_to_qkv_r_size=qkv_r_size,
         )
 
     def __len__(self) -> int:
@@ -177,9 +194,20 @@ class InBufferedRef(BaseBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
+        if vmem_ref.dtype == jnp.bfloat16:
+            row_bases = self.metadata_ref.p_id_to_qkv_r_base
+            row_sizes = self.metadata_ref.p_id_to_qkv_r_size
+        else:
+            row_bases = self.metadata_ref.p_id_to_r_base
+            row_sizes = self.metadata_ref.p_id_to_r_size
+        assert row_bases is not None and row_sizes is not None
+
         for idx in range(self.cfg.seq_tile_size):
-            r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
-            dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+            r_base = row_bases[p_id, idx]
+            dma_size = row_sizes[p_id, idx]
+            if vmem_ref.dtype == jnp.bfloat16:
+                r_base = pl.multiple_of(r_base, self.cfg.qkv_row_alignment)
+                dma_size = pl.multiple_of(dma_size, self.cfg.qkv_row_alignment)
             pltpu.make_async_copy(
                 src_ref.at[pl.ds(r_base, dma_size)],
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
@@ -194,9 +222,14 @@ class InBufferedRef(BaseBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
+        row_sizes = (self.metadata_ref.p_id_to_qkv_r_size if vmem_ref.dtype
+                     == jnp.bfloat16 else self.metadata_ref.p_id_to_r_size)
+        assert row_sizes is not None
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
-            dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
+            dma_size += row_sizes[p_id, idx]
+        if vmem_ref.dtype == jnp.bfloat16:
+            dma_size = pl.multiple_of(dma_size, self.cfg.qkv_row_alignment)
 
         pltpu.make_async_copy(
             vmem_ref.at[0, pl.ds(0, dma_size)],
@@ -605,7 +638,10 @@ def create_allocs(
             "Compact external state outputs do not support checkpoint "
             f"windows, got window_size={cfg.window_size}.")
 
-    qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
+    if cfg.dtypes.act_in_packing > 1:
+        qkv_shape = (cfg.seq_tile_size, cfg.num_qkv_rows, cfg.dim_size)
+    else:
+        qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
     # Same shape as b under GDN; under KDA the gate is per-channel, so it is
     # d_k times wider (see GDNConfig.gate_dim).

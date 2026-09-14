@@ -20,7 +20,36 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import typed_ldst
+from vllm_torchtpu.kernels.causal_conv1d import strided_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
+
+
+def load_qkv_as_fp32(
+    qkv_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+    qkv_scratch_ref: jax.Ref | None = None,
+) -> jax.Array:
+    """Load native QKV into FP32 [seq, chunk, 1, dim] for convolution."""
+    if cfg.dtypes.act_in_packing == 1:
+        return qkv_slot_ref[...].astype(jnp.float32)
+
+    assert qkv_scratch_ref is not None
+    tokens_per_seq = []
+    for idx in range(cfg.seq_tile_size):
+        qkv_scratch_ref[idx, ...] = strided_ldst.load_large_to_compact(
+            qkv_slot_ref.at[idx], jnp.float32)
+        row_offset = (metadata_ref.p_id_to_r_base[p_id, idx] %
+                      cfg.qkv_row_alignment)
+        tokens = qkv_scratch_ref[idx, pl.ds(row_offset, cfg.chunk_size), ...]
+        # Aligned DMA can include adjacent sequences, and its unread tail is
+        # uninitialized. Only this tile's real tokens enter convolution.
+        real_size = metadata_ref.p_id_to_r_size[p_id, idx]
+        valid = jnp.arange(cfg.chunk_size)[:, None, None] < real_size
+        tokens_per_seq.append(jnp.where(valid, tokens, 0))
+
+    return jnp.stack(tokens_per_seq, axis=0)
 
 
 def load_strided_heads(vmem_ref: jax.Ref,

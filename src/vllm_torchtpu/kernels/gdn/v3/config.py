@@ -47,6 +47,10 @@ class Dtypes:
     recurrent_state: jnp.dtype
     conv_state: jnp.dtype
 
+    @property
+    def act_in_packing(self) -> int:
+        return 4 // self.act_in.itemsize
+
 
 @dataclasses.dataclass(frozen=True)
 class StateRegion:
@@ -134,6 +138,17 @@ class GDNConfig:
         if self.mode == GDNMode.PER_SEQ:
             return 1
         return self.tile_size
+
+    @property
+    def qkv_row_alignment(self) -> int:
+        if self.dtypes.act_in_packing > 1:
+            return pltpu.get_tpu_info().get_sublane_tiling(self.dtypes.act_in)
+        return 1
+
+    @property
+    def num_qkv_rows(self) -> int:
+        alignment = self.qkv_row_alignment
+        return pl.cdiv(self.chunk_size + alignment - 1, alignment) * alignment
 
     @property
     def prev_kernel_size(self) -> int:
@@ -254,7 +269,13 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
-        return dict(
+        scratches = dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
         )
+        if self.dtypes.act_in_packing > 1:
+            scratches["qkv_out_scratch_ref"] = pltpu.VMEM(
+                (self.seq_tile_size, self.num_qkv_rows, 1, self.dim_size),
+                jnp.float32)
+
+        return scratches
