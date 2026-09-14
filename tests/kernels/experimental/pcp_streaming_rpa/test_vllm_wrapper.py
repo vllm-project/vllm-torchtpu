@@ -305,14 +305,14 @@ def test_metadata_reconstruction_preserves_query_row_coordinates():
 
 
 def test_query_row_mapping_separates_owner_and_request_absolute_starts():
-    common_kwargs = {
-        "q_lens": jnp.asarray([3, 4], dtype=jnp.int32),
-        "token_owner_starts": jnp.asarray([0, 3], dtype=jnp.int32),
-        "request_absolute_starts": jnp.asarray([5, 100], dtype=jnp.int32),
-        "local_padded_tokens": 4,
-        "pcp_size": 2,
-        "interleave_size": 2,
-    }
+    common_kwargs = dict(
+        q_lens=jnp.asarray([3, 4], dtype=jnp.int32),
+        token_owner_starts=jnp.asarray([0, 3], dtype=jnp.int32),
+        request_absolute_starts=jnp.asarray([5, 100], dtype=jnp.int32),
+        local_padded_tokens=4,
+        pcp_size=2,
+        interleave_size=2,
+    )
 
     rank_0 = pcp_wrapper._compute_pcp_local_query_row_mapping(pcp_rank=0,
                                                               **common_kwargs)
