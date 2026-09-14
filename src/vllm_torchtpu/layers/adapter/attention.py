@@ -9,7 +9,8 @@ import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config import (VllmConfig, get_current_vllm_config,
+                         get_current_vllm_config_or_none)
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
@@ -626,10 +627,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         # rejects any other page size in non-PCP mode. PCP streaming supports
         # each 128-aligned page size listed below.
         if get_kv_cache_layout() == "HND":
-            vllm_config = get_current_vllm_config_or_none()
-            parallel_config = getattr(vllm_config, "parallel_config", None)
-            if (getattr(parallel_config, "prefill_context_parallel_size", 1)
-                    > 1):
+            parallel_config = get_current_vllm_config().parallel_config
+            if parallel_config.prefill_context_parallel_size > 1:
                 return [128, 256, 512, 1024, 2048, 4096]
             return [128]
         return [256]
