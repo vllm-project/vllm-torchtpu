@@ -23,8 +23,8 @@ If you encounter a bug or have a feature request, please search [existing issues
 ## Directory Structure
 We choose to follow a similar directory structure as vLLM:
 * `src/vllm_torchtpu/layers/`:
-  * `common` contains shared layers and building blocks used across implementations
-  * `vllm` contains custom layer adaptations and wrappers for vLLM models
+  * `core` contains JAX-side numeric and layout logic (attention interface/metadata, quantization, sequence layouts)
+  * `adapter` contains the torch/vLLM-facing adapter layer (quantization methods, `custom_ops/` JAX op bridges, attention backends)
 * `src/vllm_torchtpu/models/`:
   * `vllm` contains model implementations and architectures supported on TPU
 

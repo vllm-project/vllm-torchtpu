@@ -78,20 +78,22 @@ from vllm_torchtpu.kv_cache_materializer import (
     materialize_kv_cache_tensors)
 from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
-from vllm_torchtpu.layers.common.attention_metadata import (
+from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.attention import (
+    TPU_STR_DTYPE_TO_TORCH_DTYPE, PallasAttentionBackend,
+    PallasMLAttentionBackend)
+from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import \
+    copy_mamba_state_blocks
+from vllm_torchtpu.layers.adapter.quantization import \
+    get_tpu_quantization_config
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import \
+    RejectionSampler
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext, stage_block_table_uploads)
-from vllm_torchtpu.layers.common.sequence_layout import (
+from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
-from vllm_torchtpu.layers.vllm import token_padding
-from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
-from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
-    copy_mamba_state_blocks
-from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
-from vllm_torchtpu.layers.vllm.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
@@ -2605,12 +2607,6 @@ class TPUModelRunner(GPUModelRunner):
         current_req_ids = set(
             self.input_batch.req_ids[:self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
-        if not previous_req_ids:
-            # An empty map means the previous step committed no tokens at all:
-            # every request in request_seq_lens was a partial (chunked-prefill)
-            # chunk.
-            self._pre_async_results = None
-            return
         if any(req_id in current_req_ids for req_id in previous_req_ids):
             return
         self._modify_prev_results()
@@ -4603,7 +4599,7 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
-        from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
+        from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
             VllmCompressedTensorsW4ANMxfp4MoEMethod
         uses_mxfp4_moe = any(
             isinstance(getattr(module, "quant_method", None),
@@ -4619,7 +4615,7 @@ class TPUModelRunner(GPUModelRunner):
         self._initialize_quantization_kernels()
 
     def _initialize_quantization_kernels(self):
-        from vllm_torchtpu.layers.vllm.linear_common import (
+        from vllm_torchtpu.layers.adapter.linear_common import (
             _get_quantized_matmul_fp4_op, _get_quantized_matmul_op)
 
         with set_current_vllm_config(self.vllm_config):
@@ -4632,7 +4628,7 @@ class TPUModelRunner(GPUModelRunner):
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
         if self._attention_kernels_initialized and not force:
             return
-        from vllm_torchtpu.layers.vllm.attention import (
+        from vllm_torchtpu.layers.adapter.attention import (
             _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
             _pallas_rpa_kernel_local)
 
@@ -4934,7 +4930,7 @@ class TPUModelRunner(GPUModelRunner):
         runs another attention kernel."""
         if self._attention_capacity_known:
             return self._attention_capacity
-        from vllm_torchtpu.layers.vllm.attention import \
+        from vllm_torchtpu.layers.adapter.attention import \
             PallasBatchedRPAAttentionBackend
         backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         capacity = None
@@ -4947,7 +4943,7 @@ class TPUModelRunner(GPUModelRunner):
                 configs as rpa_configs
             from vllm_torchtpu.kernels.experimental.batched_rpa import \
                 wrapper as rpa_batched
-            from vllm_torchtpu.layers.vllm.attention import \
+            from vllm_torchtpu.layers.adapter.attention import \
                 KV_LAYOUT_BY_VLLM_LAYOUT
             layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
             page_size = (self._attention_kernel_block_size
@@ -5977,7 +5973,7 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         from vllm.compilation.wrapper import reset_compile_wrapper
 
-        from vllm_torchtpu.layers.vllm.linear_common import (
+        from vllm_torchtpu.layers.adapter.linear_common import (
             _get_quantized_matmul_fp4_op, _get_quantized_matmul_op)
 
         # set_current_vllm_config is required for the post-reset compile
@@ -6773,7 +6769,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Pre-build and cache bundled RPA kernels across all attention layers before torch.compile tracing.
         if self._kv_cache_bundle is not None:
-            from vllm_torchtpu.layers.vllm.attention import \
+            from vllm_torchtpu.layers.adapter.attention import \
                 PallasAttentionBackendImpl
             layers = get_layers_from_vllm_config(self.vllm_config, Attention)
             # Only enter wrapper context when eligible attention layers are present.

@@ -392,3 +392,14 @@ def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
 
     with pytest.raises(RuntimeError, match="No group accessor"):
         order_mod.verify_pcp_topology_order({"ep": [[0, 1]]})
+
+
+@pytest.mark.parametrize("field", [
+    "prefill_context_parallel_size", "nnodes", "data_parallel_size",
+    "tensor_parallel_size", "pipeline_parallel_size"
+])
+def test_missing_parallel_field_cannot_select_a_default_topology(field):
+    config = _config()
+    delattr(config.parallel_config, field)
+    with pytest.raises(AttributeError, match=field):
+        order_mod.resolve_pcp_topology_order(config)

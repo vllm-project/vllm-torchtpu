@@ -36,12 +36,12 @@ if TYPE_CHECKING:
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import \
     fused_reverse_rope_wo_a_projection
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
     BATCH_AXIS, VllmDeepseekV4SWACache, _attention_csa, _attention_hca,
     get_packed_mla_head_size)
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import \
     VllmDeepseekCompressor
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_indexer import \
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import \
     VllmDeepseekV4Indexer
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
@@ -215,7 +215,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         return num_heads
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
+        from vllm_torchtpu.layers.adapter.attention import \
+            PallasAttentionBackend
         return PallasAttentionBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:

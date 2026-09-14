@@ -21,14 +21,14 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
-from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.sequence_layout import (
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 _PCP_LAYOUT_RANK = (
-    "vllm_torchtpu.layers.common.pcp_sequence_layout._get_native_pcp_rank")
-_PCP_LAYOUT_WORLD_SIZE = ("vllm_torchtpu.layers.common.pcp_sequence_layout."
+    "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank")
+_PCP_LAYOUT_WORLD_SIZE = ("vllm_torchtpu.layers.core.pcp_sequence_layout."
                           "_get_native_pcp_world_size")
 
 

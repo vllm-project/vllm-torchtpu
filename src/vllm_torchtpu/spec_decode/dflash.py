@@ -15,9 +15,9 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
-from vllm_torchtpu.layers.common.attention_metadata import (
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilderContext)
-from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context

@@ -59,24 +59,23 @@ def resolve_pcp_topology_order(
     and unmeasurable slowdown.
     """
     parallel_config = vllm_config.parallel_config
-    pcp_size = int(
-        getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    pcp_size = int(parallel_config.prefill_context_parallel_size)
 
     # Not applicable: no ring exists.
     if pcp_size <= 1:
         return None
 
     # Not applicable: PCP runner path does not support TPU multihost yet.
-    nnodes = int(getattr(parallel_config, "nnodes", 1) or 1)
+    nnodes = int(parallel_config.nnodes)
     if nnodes > 1:
         logger.info(
             "Topology aware mesh not applied: nnodes=%d. Topology aware "
             "mesh is currently only supported for single host", nnodes)
         return None
 
-    dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
-    tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
-    pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+    dp_size = int(parallel_config.data_parallel_size)
+    tp_size = int(parallel_config.tensor_parallel_size)
+    pp_size = int(parallel_config.pipeline_parallel_size)
 
     # PcpStaticSupportValidator rejects PCP with pipeline parallelism before
     # any worker spawns, so reaching here with pp > 1 means that gate moved or

@@ -11,7 +11,7 @@ from vllm_torchtpu.kv_cache_materializer import (
     format_kv_cache_layout_summary, materialize_kv_cache_tensors)
 from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
-from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 
 class FakeAttentionBackend:

@@ -49,6 +49,7 @@ nav:
     - 'Out-of-Tree Usage': getting_started/out-of-tree.md
   - 'Recommended Models and Features': recommended_models_features.md
   - Developer Guides:
+    - 'TPU patch mechanism': tpu_patch_mechanism.md
     - 'JAX Model Development': developer_guides/jax_model_development.md
     - 'Torch Model Development': developer_guides/torchax_model_development.md
   - 'TPU Recipes (external)': https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/inference/trillium/vLLM

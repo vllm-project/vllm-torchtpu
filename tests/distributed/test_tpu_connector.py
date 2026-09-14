@@ -1035,6 +1035,49 @@ class TestTPURaidenConnectorScheduler:
             with pytest.raises(ValueError, match="must cover every PCP"):
                 producer.request_finished(req, [100])
 
+    @pytest.mark.parametrize("interleave_size,transfers", [(256, False),
+                                                           (64, True)])
+    def test_v3_stage3_finish_applies_the_pcp_interleave_minimum(
+            self, interleave_size, transfers):
+        """A PCP producer skips transfers shorter than pcp * interleave."""
+        cfg = _make_vllm_config(is_producer=True,
+                                block_size=16,
+                                pcp_size=8,
+                                interleave_size=interleave_size)
+        with patch(f"{_MOD}.dist_utils.get_kv_ips",
+                   return_value="127.0.0.1"), \
+             patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
+            producer = TPURaidenConnectorScheduler(cfg)
+        req = MagicMock()
+        req.request_id = f"interleave-{interleave_size}"
+        req.kv_transfer_params = None
+        req.prompt_token_ids = [0] * 1025
+        req.num_prompt_tokens = 1025
+        req.num_computed_tokens = 1025
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        # 1024 transferred tokens fill 8 scheduler blocks of 16 * 8 tokens.
+        block_ids = list(range(100, 108))
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                           "producer-engine-9",
+                           create=True), patch(
+                               f"{_MOD}.tpu_envs."
+                               "TPU_RAIDEN_TRANSFER_PARALLELISM",
+                               8,
+                               create=True), patch(f"{_MOD}.get_uuid",
+                                                   return_value=777):
+            delay, params = producer.request_finished(req, block_ids)
+        if transfers:
+            assert delay is True
+            assert params["num_tokens"] == 1024
+        else:
+            assert (delay, params) == (False, {})
+
     def test_v3_stage3_finish_dedup_refuses_unsafe_inflight_eviction(self):
         producer = _make_raiden_scheduler(is_producer=True,
                                           block_size=4096,

@@ -9,43 +9,40 @@ logger = init_logger(__name__)
 
 
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
-    """Require a common local prefix hit on a hybrid KV producer.
+    """Use a common local prefix boundary for hybrid TPU producers.
 
-    vLLM 0.26.1rc0 lets a hybrid model with any KV connector resume from the
-    deepest per-group local hit. That is valid on a consumer when the connector
-    transfers the missing groups, but a producer has no external state to fill
-    the gap. In particular, FA can have a cached page where Mamba has no state
-    checkpoint, and resuming from the FA-only boundary corrupts generation.
-
-    This is the producer-only subset of the reconciliation merged upstream in
-    vllm-project/vllm#48425. Keep it local to the coordinator instance so
-    consumer-side divergent lookup and remote suffix transfer are unchanged.
+    vLLM 0.27.0 assumes every KV connector can complete a divergent local
+    hybrid hit by restoring the recurrent state missing at the deeper
+    full-attention boundary. The Raiden offloading path used by GPC does not
+    provide that contract. Backport the conservative behavior from vLLM
+    #50344 at the producer manager instance boundary, while preserving
+    ``shared_prefix_boundary`` for adaptive Mamba checkpoint retention.
+    Stage-3 Raiden consumers support divergent hits and are unaffected.
     """
     from types import MethodType
 
     from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 
     kv_transfer_config = scheduler.vllm_config.kv_transfer_config
-    coordinator = scheduler.kv_cache_manager.coordinator
+    manager = scheduler.kv_cache_manager
     if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
             or not scheduler.has_mamba_layers
-            or not isinstance(coordinator, HybridKVCacheCoordinator)):
+            or not isinstance(manager.coordinator, HybridKVCacheCoordinator)):
         return
 
-    def find_common_prefix_hit(self, block_hashes, max_cache_hit_length):
-        blocks, hit_length, _ = self.find_longest_cache_hit(
-            block_hashes, max_cache_hit_length)
-        per_group_hits = (hit_length, ) * len(
-            self.kv_cache_config.kv_cache_groups)
-        return blocks, per_group_hits
+    def get_common_prefix_hit_for_connector(self, request):
+        blocks, hit_length, shared_prefix_boundary = self.get_computed_blocks(
+            request)
+        return blocks, hit_length, shared_prefix_boundary, False
 
-    coordinator.find_longest_cache_hit_per_group = MethodType(
-        find_common_prefix_hit, coordinator)
-    logger.info("Reconciled hybrid producer prefix hits to a common boundary.")
+    manager.get_computed_blocks_for_connector = MethodType(
+        get_common_prefix_hit_for_connector, manager)
+    logger.info(
+        "Reconciled hybrid TPU producer prefix hits to a common boundary.")
 
 
 def _patch_vllm_hybrid_producer_prefix_hits() -> None:
-    """Backport vLLM's hybrid connector hit reconciliation to 0.26.0."""
+    """Backport connector-scoped hybrid hit handling from vLLM #50344."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
     if Scheduler.__dict__.get("_tpu_hybrid_producer_prefix_hit_patch", False):
@@ -252,7 +249,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         if getattr(self.moe_config, "skip_final_all_reduce", False):
             return original.fget(self)
         try:
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
         except ImportError:
             return original.fget(self)
@@ -312,7 +309,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
             return fused_moe_ep_supported(getattr(self, "_quant_method", None))
 
@@ -525,14 +522,9 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
-    _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_vllm_mamba_split_scheduler_block_size()
-    _patch_vllm_offloading_config_build()
-    # Platform activation can happen from inside the first Scheduler.__init__.
-    # Install this constructor patch at the engine-core boundary instead, before
-    # the first scheduler is created.
-    _patch_vllm_hybrid_producer_prefix_hits()
-    _patch_vllm_merge_multimodal_embeddings()
+    from vllm_torchtpu import patch_registry
+
+    patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import \
         patch_engine_core_for_pp_chunks
     from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave

@@ -27,7 +27,7 @@ import pytest
 
 from vllm_torchtpu.kernels.kimi_k3 import ragged_kda
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import \
     kimi_short_conv_scan
 
 HEADS = 2

@@ -17,7 +17,7 @@ import pytest
 
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     _build_fused_core, _pooled_kda_core)
 
 # Kimi-Linear TP8 shard geometry on an MLA pool.

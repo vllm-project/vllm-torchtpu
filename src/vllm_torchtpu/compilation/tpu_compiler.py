@@ -141,26 +141,26 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
-    "vllm_torchtpu/layers/common",
-    "vllm_torchtpu/layers/vllm/attention.py",
-    "vllm_torchtpu/layers/vllm/cp_attention.py",
-    "vllm_torchtpu/layers/vllm/custom_ops",
-    "vllm_torchtpu/layers/vllm/fused_moe.py",
+    "vllm_torchtpu/layers/core",
+    "vllm_torchtpu/layers/adapter/attention.py",
+    "vllm_torchtpu/layers/adapter/cp_attention.py",
+    "vllm_torchtpu/layers/adapter/custom_ops",
+    "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
-    "vllm_torchtpu/layers/vllm/fused_moe_ep.py",
+    "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` fixes the device ORDER
     # the kernel's remote DMAs resolve their peer coordinates against, so an
     # edit to the ordering changes where every routed row goes without
     # changing a byte of the kernel.
     "vllm_torchtpu/distributed/ep_mesh.py",
-    "vllm_torchtpu/layers/vllm/linear_common.py",
-    "vllm_torchtpu/layers/vllm/router_topk.py",
-    "vllm_torchtpu/layers/vllm/quantization",
-    "vllm_torchtpu/layers/vllm/vision_attention.py",
+    "vllm_torchtpu/layers/adapter/linear_common.py",
+    "vllm_torchtpu/layers/adapter/router_topk.py",
+    "vllm_torchtpu/layers/adapter/quantization",
+    "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
 )
 

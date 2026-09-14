@@ -26,7 +26,7 @@ that regime it wins by a lot, because many query tokens then select overlapping
 KV rows and the gather hot-spots on the same cache lines.
 
 Both kernels read the same `(nope, rope)` uint8 caches, in the layout
-`layers/vllm/attention.py::get_sparse_kv_cache_shapes` allocates:
+`layers/adapter/attention.py::get_sparse_kv_cache_shapes` allocates:
 
     nope: uint8[total_pages, page_size,     4, 128]
           token `t` of page `p` is row `p * page_size + t`, holding 512

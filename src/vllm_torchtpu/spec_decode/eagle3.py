@@ -16,7 +16,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_torchtpu.layers.common.attention_metadata import \
+from vllm_torchtpu.layers.core.attention_metadata import \
     AttentionMetadataBuilderContext
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \

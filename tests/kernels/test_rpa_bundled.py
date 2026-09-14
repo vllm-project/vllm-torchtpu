@@ -252,7 +252,7 @@ def test_bundled_interface_forwards_scale_softcap_causal():
     propagated down to the underlying Pallas kernel rather than falling back to default values.
     """
     _require_tpu()
-    from vllm_torchtpu.layers.common.attention_interface import (
+    from vllm_torchtpu.layers.core.attention_interface import (
         AttentionMetadata, attention, attention_bundled)
 
     c = _cfg()

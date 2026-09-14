@@ -5,8 +5,8 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, MambaSpec,
 
 from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
-from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
+                                                    PallasMLAttentionBackend)
 
 pytestmark = pytest.mark.cpu_test
 

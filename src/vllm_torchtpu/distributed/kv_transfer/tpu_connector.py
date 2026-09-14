@@ -1320,9 +1320,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         if not _use_raiden_glm_admission() and pcp_size > 1:
             # The interleave minimum applies to PCP sources only.
-            interleave_size = int(
-                getattr(parallel_config, "cp_kv_cache_interleave_size", 256)
-                or 256)
+            interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
             min_transfer_tokens = pcp_size * interleave_size
             if (num_tokens < min_transfer_tokens):
                 return False, {}
@@ -2294,9 +2292,8 @@ class TPURaidenConnectorWorker:
         tp_local_heads = self._local_head_count(total_heads)
         if tp_local_heads <= 0:
             return 0
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        pcp_size = int(
-            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        parallel_config = self.vllm_config.parallel_config
+        pcp_size = int(parallel_config.prefill_context_parallel_size)
         if tp_local_heads % pcp_size:
             raise ValueError(
                 f"TP-local GDN heads={tp_local_heads} must be divisible by "
@@ -3241,7 +3238,7 @@ class TPURaidenConnectorWorker:
                 raise TypeError(
                     "Stage-3 consumer requires controller load metadata, got "
                     f"{type(req_meta).__name__}")
-            if getattr(req_meta, "release_only", False):
+            if req_meta.release_only:
                 self._stage3_release_producer_registration(
                     destination_req_id, req_meta, synchronous=synchronous)
                 continue
@@ -3321,8 +3318,7 @@ class TPURaidenConnectorWorker:
             fa_tag_count = len(transfer_tags)
             dst_blocks = list(local_blocks) * len(transfer_tags)
             dst_counts = [len(local_blocks)] * len(transfer_tags)
-            mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids",
-                                            None)
+            mamba_state_block_ids = req_meta.mamba_state_block_ids
             if self._stage3_state_group_count:
                 if not mamba_state_block_ids or len(
                         mamba_state_block_ids
@@ -3339,7 +3335,7 @@ class TPURaidenConnectorWorker:
             # are not prefix-decomposable and always transfer whole
             # (skip 0). Omit the kwarg entirely when there is no clip so
             # skip-free requests stay byte-identical on the wire.
-            skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
+            skip_tokens = req_meta.skip_tokens
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
