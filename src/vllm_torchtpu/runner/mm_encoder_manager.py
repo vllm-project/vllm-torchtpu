@@ -1,14 +1,53 @@
-from typing import Any, Dict
+import time
+from typing import Any, Dict, List, Mapping
 
 import torch
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _tensors_of(values: Mapping[Any, Any]) -> List[torch.Tensor]:
+    """The tensors in ``values``, for synchronization.
+
+    Input and output dicts on the encoder path legitimately carry ``None`` for
+    optional entries, and ``synchronize_tensors`` rejects the whole list if one
+    slips in.
+    """
+    return [v for v in values.values() if isinstance(v, torch.Tensor)]
+
+
+def _brief(exc: Exception, limit: int = 300) -> str:
+    """An exception's message, without a full tensor repr in the log.
+
+    A pybind arity mismatch echoes every argument it was invoked with, which on
+    this path is several thousand lines of padded template.
+    """
+    text = " ".join(str(exc).split())
+    return text if len(text) <= limit else text[:limit] + " [...]"
+
+
+def _drain_pending() -> None:
+    """Materialize whatever the failed warmup step left in the lazy graph.
+
+    Ops traced but never synchronized stay pending and get fused into the next
+    budget's encoder program, so each successive budget compiles a strictly
+    larger graph: one such failure took the boot-time encoder precompile from
+    52s total to 5, then 8, then more minutes *per budget*. Dropping the
+    warmup's work is fine; leaving it queued is not.
+    """
+    try:
+        synchronize_tensors(wait=True)
+    except Exception as e:
+        logger.warning(
+            "[mm_encoder_manager] Could not drain the pending "
+            "graph after a warmup failure: %s", _brief(e))
 
 
 class MMEncoderManager(EncoderCudaGraphManager):
@@ -76,6 +115,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 for path, budgets in self.path_token_budgets.items()
             }
 
+        # Pinned host staging buffers for _pad_to_template, keyed by
+        # (path, budget, key), plus how far each was last dirtied.
+        self._host_stage: Dict[tuple, torch.Tensor] = {}
+        self._host_stage_dirty: Dict[tuple, int] = {}
+
         # We compile the forward pass function using the TPU backend.
         # This acts as our XLA cache. We compile it once, and it will generate
         # separate XLA graphs for each unique budget size passed to it.
@@ -89,13 +133,67 @@ class MMEncoderManager(EncoderCudaGraphManager):
             f"[mm_encoder_manager] Initialized XLA path_budgets={self.path_token_budgets} "
             f"max_batch_size={self.max_batch_size}")
 
+    # Keys whose leading dim scales with the image and which are therefore
+    # sliced/concatenated per item before any budget padding happens.
+    _HOST_STAGED_KEYS = ("pixel_values", "grid_thws")
+
+    def execute(self, mm_kwargs: Dict[str, Any]) -> Any:
+        """Land the batch on the host, then run the normal budget path.
+
+        ``_execute_local`` slices and re-concatenates ``pixel_values`` per
+        item (``select_encoder_cudagraph_items``) and ``_pad_to_template``
+        then pads it to a budget. On TPU a device tensor whose leading dim
+        depends on the image size keys every XLA program it feeds, so doing
+        either of those on-device compiles a fresh program for every new
+        image shape. Moving the batch to the host once, up front, makes all
+        of that plain CPU work and leaves exactly one device transfer -- the
+        static budget-shaped H2D in ``_pad_to_template``.
+        """
+        staged = None
+        for key in self._HOST_STAGED_KEYS:
+            val = mm_kwargs.get(key)
+            if isinstance(val, torch.Tensor) and val.device.type != "cpu":
+                if staged is None:
+                    staged = dict(mm_kwargs)
+                staged[key] = val.cpu()
+        return super().execute(staged if staged is not None else mm_kwargs)
+
+    def _host_stage_buffer(self, path: str, budget: int, key: str,
+                           tmpl: torch.Tensor) -> torch.Tensor:
+        """Reusable pinned host buffer shaped like ``tmpl``.
+
+        One per (path, budget, key); the shape is static, so allocating it
+        once keeps the padding path allocation-free after the first call.
+        """
+        cache_key = (path, budget, key)
+        buf = self._host_stage.get(cache_key)
+        if buf is None:
+            buf = torch.zeros(tmpl.shape, dtype=tmpl.dtype)
+            try:
+                buf = buf.pin_memory()
+            except (RuntimeError, NotImplementedError):
+                pass  # pinning is an optimization, not a requirement
+            self._host_stage[cache_key] = buf
+            self._host_stage_dirty[cache_key] = 0
+        return buf
+
     def _pad_to_template(
         self,
         replay_values: Dict[str, torch.Tensor],
         budget: int,
         path: str = "default",
     ) -> Dict[str, torch.Tensor]:
-        """Zero-pads dynamic multimodal inputs up to the static budget template."""
+        """Zero-pads dynamic multimodal inputs up to the static budget template.
+
+        The padding is staged on the *host* rather than on the TPU. A device
+        tensor whose leading dim varies with the image size keys every XLA
+        program that takes it as an input, so the obvious device-side
+        ``dst[:n].copy_(src)`` recompiles once per distinct image size --
+        measured at 2 new XLA programs and seconds of stall per new size,
+        which is the bulk of multimodal TTFT. Padding on the host means the
+        only device-visible transfer happens at the static template shape, so
+        the program set is keyed on the budget alone.
+        """
         template = self.budget_templates[path][budget]
         padded: Dict[str, torch.Tensor] = {}
 
@@ -116,10 +214,27 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 padded[key] = src.to(device=tmpl.device)
                 continue
 
-            padding_logic = self.config.padding_logics.get(
-                key, self._copy_padded_buffer)
-            padding_logic(tmpl, src)
-            padded[key] = tmpl
+            padding_logic = self.config.padding_logics.get(key)
+            if padding_logic is not None:
+                # Model-supplied logic owns its own shape discipline.
+                padding_logic(tmpl, src)
+                padded[key] = tmpl
+                continue
+
+            stage = self._host_stage_buffer(path, budget, key, tmpl)
+            cache_key = (path, budget, key)
+            n = src.shape[0]
+            # Re-zero only the region a previous call dirtied; the rest of the
+            # staging buffer is already zero.
+            prev = self._host_stage_dirty[cache_key]
+            if prev > n:
+                stage[n:prev].zero_()
+            self._host_stage_dirty[cache_key] = n
+            stage[:n].copy_(src if src.device.type == "cpu" else src.cpu())
+            # Static-shape H2D: this is the only device op keyed on `budget`.
+            # Blocking on purpose -- `stage` is reused across calls, so an
+            # in-flight async copy could be overwritten by the next batch.
+            padded[key] = stage.to(tmpl.device)
 
         return padded
 
@@ -138,7 +253,98 @@ class MMEncoderManager(EncoderCudaGraphManager):
         except Exception as e:
             logger.warning(
                 "[mm_encoder_manager] Failed to precompile vision encoder "
-                "for budget=%d, path='%s': %s", token_budget, path, e)
+                "for budget=%d, path='%s': %s", token_budget, path, _brief(e))
+            _drain_pending()
+            return
+
+        self._capture_budget_glue(out, token_budget, path=path)
+
+    @torch.no_grad()
+    def _capture_budget_glue(self,
+                             out: torch.Tensor,
+                             token_budget: int,
+                             path: str = "default") -> None:
+        """Prime the eager ops on either side of the compiled forward.
+
+        ``_capture_budget_graph`` hands the device-resident template straight
+        to the compiled forward, so it compiles the encoder graph and nothing
+        else. A real request also runs ``_pad_to_template`` before it and
+        ``postprocess_encoder_output`` after it, and both of those are ordinary
+        lazy-tensor ops whose programs are keyed on shapes the template alone
+        never produces. Left uncovered they compile on the first request that
+        reaches each shape -- 43 XLA entries over the first 40 distinct images
+        on Kimi K3, none of them the encoder graph itself.
+
+        Both shape sets are finite and known here, so they are compiled at boot
+        instead.
+        """
+        start = time.perf_counter()
+        template = self.budget_templates[path][token_budget]
+
+        # _pad_to_template: the staged host->device copy. A src shorter than
+        # the template is what routes through the staging buffer at all; the
+        # transfer itself is at the template shape either way.
+        replay = {
+            key: tmpl[:1].cpu()
+            for key, tmpl in template.items()
+            if isinstance(tmpl, torch.Tensor) and tmpl.ndim >= 1
+            and tmpl.shape[0] > 1
+        }
+        if replay:
+            try:
+                padded = self._pad_to_template(replay, token_budget, path=path)
+                synchronize_tensors(_tensors_of(padded), wait=True)
+            except Exception as e:
+                logger.warning(
+                    "[mm_encoder_manager] Failed to precompile the padding "
+                    "path for budget=%d, path='%s': %s", token_budget, path,
+                    _brief(e))
+                _drain_pending()
+            finally:
+                # Undo the warmup's dirty rows so the first real request sees
+                # the zero-filled buffer the padding contract promises.
+                for key in replay:
+                    cache_key = (path, token_budget, key)
+                    stage = self._host_stage.get(cache_key)
+                    if stage is not None:
+                        stage.zero_()
+                        self._host_stage_dirty[cache_key] = 0
+
+        # postprocess_encoder_output: one index_select per item, keyed on
+        # (rows in this budget's packed output, per-item bucket). Only the
+        # bucketed override has a shape set small enough to enumerate; the
+        # upstream exact-length slicing is unbounded and cannot be primed.
+        if not (envs.TPU_MM_BUCKET_SCATTER
+                and hasattr(self.model, "mm_embed_bucket")):
+            return
+        if not isinstance(out, torch.Tensor) or out.ndim < 1:
+            return
+
+        buckets = 0
+        bucket = getattr(self.model, "MM_EMBED_BUCKET_MIN", 64)
+        while bucket <= out.shape[0]:
+            try:
+                dest: Dict[int, torch.Tensor] = {}
+                self.model.postprocess_encoder_output({path: out}, [0],
+                                                      [bucket],
+                                                      dest,
+                                                      clone=True)
+                synchronize_tensors(_tensors_of(dest), wait=True)
+            except Exception as e:
+                logger.warning(
+                    "[mm_encoder_manager] Failed to precompile the "
+                    "postprocess path for budget=%d, bucket=%d, path='%s': %s",
+                    token_budget, bucket, path, _brief(e))
+                _drain_pending()
+                break
+            buckets += 1
+            bucket *= 2
+
+        logger.info(
+            "[mm_encoder_manager] Primed glue for budget=%d path='%s': "
+            "%d embed bucket(s) over %d packed rows in %.2f [secs].",
+            token_budget, path, buckets, out.shape[0],
+            time.perf_counter() - start)
 
     @torch.no_grad()
     def _run_budget_graph(

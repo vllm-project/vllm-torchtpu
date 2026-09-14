@@ -26,11 +26,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.models import vision as vision_utils
 from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid,
+                                                   SupportsEncoderCudaGraph,
                                                    SupportsMultiModal,
                                                    SupportsQuant)
 from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
 from vllm.model_executor.models.kimi_k25_vit import (
-    KimiK25MultiModalProjector, vision_tower_forward)
+    KimiK25MultiModalProjector, mm_projector_forward,
+    tpool_patch_merger_packed, vision_tower_forward)
 from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                                               _flatten_embeddings,
                                               init_vllm_registered_model,
@@ -45,6 +47,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -55,6 +58,37 @@ from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
 
 logger = init_logger(__name__)
+
+_CPU = torch.device("cpu")
+
+
+class _HostMirror:
+    """A module stand-in that answers a few attribute reads from the host.
+
+    Used to run a model method against CPU copies of the tables it reads,
+    without touching the real module or reimplementing the method. Reads that
+    are not overridden fall through to the wrapped module, and a method reached
+    that way is rebound to the mirror so that nested ``self.`` reads inside it
+    see the overrides too.
+
+    A mirror rather than a clone because the tables in question hang off
+    ``vision_tower.encoder``, which is far too large to copy; a reimplementation
+    rather than a mirror would have to stay numerically identical to the model
+    it feeds, which is exactly the kind of thing that drifts silently.
+    """
+
+    def __init__(self, module: object, **overrides: object) -> None:
+        self.__dict__["_module"] = module
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name: str) -> object:
+        value = getattr(self._module, name)
+        func = getattr(value, "__func__", None)
+        if func is not None and getattr(value, "__self__",
+                                        None) is self._module:
+            return func.__get__(
+                self)  # so its own self.<override> reads hit us
+        return value
 
 
 class KimiDecoderLayer(nn.Module):
@@ -430,7 +464,8 @@ def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
     dummy_inputs=KimiK3DummyInputsBuilder,
 )
 class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
-                                     SupportsQuant, HasInnerState, IsHybrid):
+                                     SupportsEncoderCudaGraph, SupportsQuant,
+                                     HasInnerState, IsHybrid):
     """Kimi-K3 with upstream preprocessing and TPU model execution."""
 
     supports_encoder_tp_data = True
@@ -564,6 +599,323 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
             mm_projector=self.mm_projector,
             use_data_parallel=False,
         )
+
+    # -- SupportsEncoderCudaGraph protocol methods --
+
+    supports_encoder_cudagraph = True
+
+    def get_encoder_cudagraph_config(self):
+        from vllm.v1.worker.encoder_cudagraph_defs import \
+            EncoderCudaGraphConfig
+        return EncoderCudaGraphConfig(
+            modalities=["image"],
+            buffer_keys=[
+                "pixel_values",
+                "rope_freqs_cis",
+                "cu_seqlens",
+                "sequence_lengths",
+                "max_seqlen",
+                "pos_embeds",
+                "merge_gather_idx",
+            ],
+            out_hidden_size=self.hidden_size,
+        )
+
+    def get_input_modality(self, mm_kwargs: dict[str, object]) -> str:
+        del mm_kwargs
+        return "image"
+
+    def get_max_frames_per_video(self) -> int:
+        return 1
+
+    def get_encoder_cudagraph_budget_range(
+        self,
+        vllm_config: VllmConfig,
+    ) -> tuple[int, int]:
+        # Min: a 224x224 image -> 16x16 patches (patch_size=14) -> 2x2
+        # merge -> 8x8 = 64 output tokens (mirrors Qwen2.5-VL's estimate).
+        min_budget = 64
+        max_budget = min(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.model_config.max_model_len,
+        )
+        return (min_budget, max_budget)
+
+    @staticmethod
+    def _grid_thw_list(grid_thws: object) -> list[list[int]]:
+        return (grid_thws.tolist()
+                if isinstance(grid_thws, torch.Tensor) else grid_thws)
+
+    # Smallest per-item vision-token bucket; matches the 64-token floor used
+    # by get_encoder_cudagraph_budget_range.
+    MM_EMBED_BUCKET_MIN = 64
+
+    @classmethod
+    def mm_embed_bucket(cls, num_tokens: int) -> int:
+        """Round a per-item vision token count up to a power of two."""
+        bucket = cls.MM_EMBED_BUCKET_MIN
+        while bucket < num_tokens:
+            bucket *= 2
+        return bucket
+
+    def postprocess_encoder_output(
+        self,
+        outputs: dict[str, torch.Tensor],
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, object] | None = None,
+    ) -> None:
+        """Split the packed encoder output into bucket-padded per-item slices.
+
+        The default ``scatter_output_slices`` cuts exact-length slices
+        (``output[off:off + n]``). On TPU both bounds are image-dependent, so
+        every distinct image size compiles a fresh XLA program -- and so does
+        everything downstream that consumes the odd-sized result. Gathering a
+        power-of-two number of rows instead keeps the shape set logarithmic
+        in the image size. The extra rows are junk (they repeat the last row
+        of the packed buffer); callers bound reads by the true token count,
+        which they already know host-side from ``mm_position.length``.
+        """
+        if not envs.TPU_MM_BUCKET_SCATTER:
+            from vllm.model_executor.models.utils import scatter_output_slices
+            scatter_output_slices(outputs["default"], indices,
+                                  per_item_out_tokens, dest, clone)
+            return
+
+        del clone, batch_mm_kwargs  # index_select already returns a new tensor
+        output = outputs["default"]
+        last_row = output.shape[0] - 1
+        offset = 0
+        for idx in indices:
+            num_tokens = per_item_out_tokens[idx]
+            padded = self.mm_embed_bucket(num_tokens)
+            # Host-built and fixed-length, so the gather is keyed on
+            # (packed budget, bucket) rather than on the image size.
+            src_idx = torch.arange(offset, offset + padded, dtype=torch.long)
+            src_idx.clamp_(max=last_row)
+            dest[idx] = output.index_select(0, src_idx.to(output.device))
+            # Cut the lazy graph here, one item at a time, so this gather is
+            # its own program keyed on (packed rows, bucket) -- the pair
+            # _capture_budget_glue already primes at boot. Left pending it
+            # instead fuses into whatever traces next: the caller caches this
+            # tensor and the decoder scatters it into the token buffer, so the
+            # program that finally gets built is keyed on the *product* of the
+            # two shape sets, plus the batch's bucket multiset. wait=False
+            # enqueues the gather without blocking on it.
+            synchronize_tensors(dest[idx], wait=False)
+            offset += num_tokens
+
+    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, object]):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
+        merge_h, merge_w = self.vision_tower.merge_kernel_size
+        grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
+        return [
+            EncoderItemSpec(
+                input_size=t * h * w,
+                output_tokens=t * (h // merge_h) * (w // merge_w),
+            ) for t, h, w in grid_thw_list
+        ]
+
+    def select_encoder_cudagraph_items(
+        self,
+        mm_kwargs: dict[str, object],
+        indices: list[int],
+    ) -> dict[str, object]:
+        pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
+        grid_thws = cast(torch.Tensor, mm_kwargs["grid_thws"])
+        grid_thw_list = self._grid_thw_list(grid_thws)
+
+        if len(indices) == 0:
+            return {
+                "pixel_values": pixel_values[:0],
+                "grid_thws": grid_thws[:0],
+            }
+
+        patches_per_item = [t * h * w for t, h, w in grid_thw_list]
+        cum = [0]
+        for p in patches_per_item:
+            cum.append(cum[-1] + p)
+        selected_pv = torch.cat(
+            [pixel_values[cum[i]:cum[i + 1]] for i in indices])
+        return {
+            "pixel_values": selected_pv,
+            "grid_thws": grid_thws[indices],
+        }
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import \
+            EncoderCudaGraphCaptureInputs
+        del max_frames_per_batch  # image-only modality
+
+        merge_h, merge_w = self.vision_tower.merge_kernel_size
+        # Ceil so captured capacity is never smaller than token_budget when
+        # it doesn't divide evenly by max_batch_size.
+        per_item_output = (token_budget + max_batch_size - 1) // max_batch_size
+        grid_config = [[1, merge_h, per_item_output * merge_w]
+                       for _ in range(max_batch_size)]
+
+        # vision_tower.patch_size is the raw (unnormalized, often a plain
+        # int) HF config value; patch_embed.patch_size is always the
+        # normalized (h, w) tuple.
+        patch_h, patch_w = self.vision_tower.patch_embed.patch_size
+        in_channels = self.vision_tower.patch_embed.proj.in_channels
+        total_patches = sum(t * h * w for t, h, w in grid_config)
+        dummy_pixel_values = torch.randn(total_patches,
+                                         in_channels,
+                                         patch_h,
+                                         patch_w,
+                                         device=device,
+                                         dtype=dtype)
+
+        # max_seqlen gets baked into the compiled graph as a constant (not
+        # replayed -- see MMEncoderManager._pad_to_template's ndim==0
+        # passthrough), so it must cover the worst single-item-consumes-
+        # the-whole-budget replay case.
+        metadata = self.vision_tower.prepare_encoder_cudagraph_metadata(
+            grid_config,
+            max_batch_size=max_batch_size,
+            max_seqlen_override=token_budget * merge_h * merge_w,
+            device=device,
+        )
+        values = dict(metadata)
+        values["pixel_values"] = dummy_pixel_values
+        return EncoderCudaGraphCaptureInputs(values=values)
+
+    def _host_vision_tower(self):
+        """The vision tower with its two per-image tables mirrored on the host.
+
+        ``prepare_encoder_cudagraph_metadata`` computes two of its outputs from
+        tables that live on the TPU: ``rope_freqs_cis`` slices the rope table to
+        ``[:h, :w]``, and ``pos_embeds`` bicubic-interpolates the learned
+        position embedding to the image's exact ``(h, w)``. Both are device
+        arithmetic keyed on the image size, so each distinct image compiles a
+        fresh XLA program -- measured at exactly one per distinct image over the
+        first 40 images of an MMMU run. They are created inside
+        ``_run_budget_graph``, downstream of the budget padding, so no amount of
+        boot-time per-budget precompilation covers them.
+
+        Neither table depends on anything the device produced -- the rope table
+        is a deterministic function of the config and the position embedding is
+        a frozen weight -- so mirroring both on the host turns the whole
+        computation into plain CPU work. The result then reaches the device
+        through ``_pad_to_template``, at the static budget shape.
+        """
+        mirror = getattr(self, "_host_vision_tower_mirror", None)
+        if mirror is None:
+            tower = self.vision_tower
+            pos_emb = tower.patch_embed.pos_emb
+            rope_2d = tower.encoder.rope_2d
+            mirror = _HostMirror(
+                tower,
+                patch_embed=_HostMirror(
+                    tower.patch_embed,
+                    pos_emb=_HostMirror(
+                        pos_emb,
+                        weight=pos_emb.weight.detach().to(_CPU),
+                        time_weight=pos_emb.time_weight.detach().to(_CPU),
+                    ),
+                ),
+                encoder=_HostMirror(
+                    tower.encoder,
+                    rope_2d=_HostMirror(
+                        rope_2d,
+                        # Built here rather than copied off the module: the
+                        # device buffer is created lazily by whichever call
+                        # comes first, so it may not exist yet.
+                        freqs_cis=rope_2d._precompute_freqs_cis(_CPU),
+                    ),
+                ),
+            )
+            self._host_vision_tower_mirror = mirror
+        return mirror
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, object],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import \
+            EncoderCudaGraphReplayBuffers
+        del max_frames_per_batch
+        pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
+        grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
+        if envs.TPU_MM_HOST_ENCODER_METADATA:
+            tower = self._host_vision_tower()
+            device = _CPU
+        else:
+            tower = self.vision_tower
+            device = pixel_values.device
+        metadata = tower.prepare_encoder_cudagraph_metadata(
+            grid_thw_list,
+            max_batch_size=max_batch_size,
+            device=device,
+        )
+        values = dict(metadata)
+        values["pixel_values"] = pixel_values
+        return EncoderCudaGraphReplayBuffers(values=values)
+
+    def encoder_cudagraph_forward(
+        self,
+        values: dict[str, torch.Tensor],
+        path: str = "default",
+    ) -> torch.Tensor:
+        pixel_values = values.pop("pixel_values")
+        merge_gather_idx = values.pop("merge_gather_idx")
+        pos_embeds = values.pop("pos_embeds")
+        hidden_states = self.vision_tower.patch_embed(pixel_values,
+                                                      None,
+                                                      pos_embeds=pos_embeds)
+        hidden_states = self.vision_tower.encoder(hidden_states,
+                                                  None,
+                                                  encoder_metadata=values)
+        merged = tpool_patch_merger_packed(hidden_states, merge_gather_idx)
+        return self.mm_projector(merged)
+
+    def encoder_eager_forward(
+        self,
+        mm_kwargs: dict[str, object],
+        path: str = "default",
+    ) -> torch.Tensor:
+        # LOCAL-ONLY forward, mirroring Qwen3-VL's encoder_eager_forward.
+        # Under mm-encoder-tp-mode=data the manager/runner has ALREADY
+        # sharded the batch across TP ranks before calling this, so
+        # embedding the full batch via vision_tower_forward's
+        # run_dp_sharded_mrope_vision_model (Kimi's 12 vision heads < TP=8
+        # force vision data-parallelism) would launch a cross-rank
+        # all_gather that only the ranks hitting this eager fallback join --
+        # ranks whose items fit a budget graph never issue it, so the
+        # collective desyncs and the whole engine deadlocks (observed as
+        # "No available shared memory broadcast block found" every 60s with
+        # workers idle). Process only this rank's own subset: the runner
+        # gathers the per-rank outputs at the DP level afterwards.
+        pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
+        # MMEncoderManager.execute lands the batch on the host so the budget
+        # path stays free of image-shape-keyed XLA programs. This fallback
+        # runs the tower directly, so it has to put the batch back.
+        if pixel_values.device.type == "cpu":
+            pixel_values = pixel_values.to(self.device)
+        grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
+        encoder_metadata = self.vision_tower.encoder.prepare_encoder_metadata(
+            grid_thw_list, device=pixel_values.device)
+        vt_outputs = self.vision_tower(
+            pixel_values,
+            grid_thw_list,
+            encoder_metadata=encoder_metadata,
+        )
+        outputs = mm_projector_forward(self.mm_projector, list(vt_outputs))
+        return torch.cat(list(outputs), dim=0)
 
     def embed_input_ids(
         self,
