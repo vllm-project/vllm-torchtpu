@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """All-gather matmul kernel's tuned block sizes."""
 
+import re
+
 import jax
 
 # key:
@@ -21,6 +23,10 @@ TUNED_BLOCK_SIZES = {
     (6, 2048, 57344, 8192, 'bfloat16', 8): (1024, 8192),
     (6, 4096, 51200, 5120, 'bfloat16', 8): (3200, 5120),
     (6, 8192, 51200, 5120, 'bfloat16', 8): (1280, 5120),
+    (7, 1024, 57344, 8192, 'bfloat16', 16): (3584, 8192),
+    (7, 2048, 57344, 8192, 'bfloat16', 16): (3584, 8192),
+    (7, 256, 57344, 8192, 'bfloat16', 16): (1792, 8192),
+    (7, 512, 57344, 8192, 'bfloat16', 16): (3584, 2048),
     # go/keep-sorted end
 }
 
@@ -32,8 +38,11 @@ def get_tpu_version() -> int:
         return -1
     if kind.endswith(' lite'):
         kind = kind[:-len(' lite')]
-    assert kind[:-1] == 'TPU v', kind
-    return int(kind[-1])
+
+    # v6: "TPU v6"
+    # v7: "TPU7x"
+    assert kind[:3] == 'TPU', kind
+    return int(re.search(r'\d+', kind).group())
 
 
 def get_key(
