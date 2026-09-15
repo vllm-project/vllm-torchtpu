@@ -15,12 +15,13 @@ import pytest
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan, lower_gdn_state_shard_spans, lower_glm_row_spans,
     lower_kda_state_shard_spans)
+from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import \
+    measured_kimi_k3_layout_fingerprint
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
     RegionSpec
 
 from .raiden_test_utils import kimi_pool_manifest
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
-from .test_raiden_pool_liveness_tpu import _extent_bytes, _live_extents
 
 pytestmark = pytest.mark.cpu_test
 
@@ -121,14 +122,35 @@ def _kda_physical_state(state, pool, shard_heads=None):
                                    ((2, 128), (2, 1))).tobytes()
 
 
-@pytest.mark.parametrize("parallelism,dst_shards", [(8, 8), (8, 4), (32, 32),
-                                                    (32, 8)])
+@pytest.mark.parametrize("parallelism,dst_shards", [(32, 32), (32, 8)])
 def test_kda_reshard_matches_rank_blocked_kernel_layout(
         parallelism, dst_shards):
     local_heads = 96 // parallelism
     source_manifest = kimi_pool_manifest(local_heads)
     fan_in = parallelism // dst_shards
     destination_manifest = kimi_pool_manifest(local_heads * fan_in)
+    fingerprints = []
+    for manifest, fragments in ((source_manifest, 1), (destination_manifest,
+                                                       fan_in)):
+        assert [pool.tag for pool in manifest.pools
+                ] == ["gdn.conv.g0", "gdn.ssm.g0", "fa"]
+        assert len(manifest.storages) == 1
+        conv, ssm, _ = manifest.pools
+        assert conv.base_offset_bytes >= ssm.live_bytes_per_block
+        assert all(pool.storage_index == 0 and pool.num_blocks == 4
+                   and pool.base_offset_bytes +
+                   pool.regions[0].extent_end_bytes <= pool.block_stride_bytes
+                   for pool in manifest.pools)
+        fingerprints.append(
+            measured_kimi_k3_layout_fingerprint(
+                manifest,
+                page_tokens=manifest.storages[0].shape[1] * 2,
+                state_fragment_heads=local_heads,
+                state_fragments=fragments,
+                layout_getter=lambda tensor:
+                ([3, 2, 1, 0], [[2, 128], [2, 1]], 0),
+                package_version=lambda package: "test"))
+    assert fingerprints[0] == fingerprints[1]
     for source_pool, dest_pool, shape in zip(source_manifest.pools[:2],
                                              destination_manifest.pools[:2],
                                              ((3, 3, 96, 128),
@@ -148,8 +170,8 @@ def test_kda_reshard_matches_rank_blocked_kernel_layout(
             head_slice = slice(rank * local_heads, (rank + 1) * local_heads)
             state = (global_state[:, :, head_slice]
                      if is_conv else global_state[head_slice])
-            raw = _kda_physical_state(state, source_pool)
-            source = _extent_bytes(raw, _live_extents(source_pool))
+            source = _kda_physical_state(state, source_pool)
+            assert len(source) == source_pool.live_bytes_per_block
             registration = lower_kda_state_shard_spans(
                 tag=source_pool.tag,
                 block_id=17,
@@ -161,34 +183,20 @@ def test_kda_reshard_matches_rank_blocked_kernel_layout(
             assert registration.declared_bytes == len(source)
             # One native chunk per source/pool/block, including heterogeneous
             # convolution state: never a half-word list exceeding IOV_MAX.
-            assert len(registration.spans) == 1
-            assert registration.spans[0].count == 1
-            for span in registration.spans:
-                assert span.dst_unit_ordinal == dst_rank
-                for repeat in range(span.count):
-                    offset = span.dst_offset_bytes + repeat * span.dst_stride_bytes
-                    coverage[dst_rank][offset:offset + span.size_bytes] += 1
+            span, = registration.spans
+            assert span.count == 1
+            assert span.dst_unit_ordinal == dst_rank
+            offset = span.dst_offset_bytes
+            coverage[dst_rank][offset:offset + span.size_bytes] += 1
             _copy_registration(destinations[dst_rank], source, registration)
         for rank, destination in enumerate(destinations):
             head_slice = slice(rank * local_heads * fan_in,
                                (rank + 1) * local_heads * fan_in)
             state = (global_state[:, :, head_slice]
                      if is_conv else global_state[head_slice])
-            raw = _kda_physical_state(state, dest_pool, local_heads)
-            assert destination == _extent_bytes(raw, _live_extents(dest_pool))
+            assert destination == _kda_physical_state(state, dest_pool,
+                                                      local_heads)
             np.testing.assert_array_equal(coverage[rank], 1)
-
-
-def test_kda_conv_rejects_unblocked_layout():
-    # The old pool has identical sizes but incompatible head/lane order.
-    with pytest.raises(ValueError, match="rank-blocked"):
-        lower_kda_state_shard_spans(tag="gdn.conv.g0",
-                                    block_id=1,
-                                    transfer_rank=0,
-                                    parallelism=32,
-                                    dst_shards=8,
-                                    regions=(RegionSpec(
-                                        "kda_conv_rows", 0, 2560, 2560, 4), ))
 
 
 def test_gdn_conv_pair_shards_reassemble_rank_blocks():

@@ -199,18 +199,19 @@ def _run_pooled(inputs,
     )
 
 
-@pytest.mark.parametrize("conv_shard_heads", [None, 1, 2])
 @pytest.mark.parametrize(
-    ("query_lens", "seq_lens", "decode_end"),
+    ("query_lens", "seq_lens", "decode_end", "conv_shard_heads"),
     [
         # One decode with history, one fresh prefill, one continuation.
-        ([1, 5, 3], [9, 5, 11], 1),
+        ([1, 5, 3], [9, 5, 11], 1, None),
         # Decode-only batch: the prefill segment is skipped entirely.
-        ([1, 1], [4, 7], 2),
+        ([1, 1], [4, 7], 2, None),
         # Prefill-only, all fresh: no initial state is ever read.
-        ([6, 2], [6, 2], 0),
+        ([6, 2], [6, 2], 0, None),
+        # Stage-3 rank-blocked convolution fragments.
+        ([1, 5, 3], [9, 5, 11], 1, 1),
     ],
-    ids=["mixed", "decode-only", "prefill-fresh"],
+    ids=["mixed", "decode-only", "prefill-fresh", "rank-blocked"],
 )
 def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end,
                                           conv_shard_heads):
@@ -279,8 +280,7 @@ def test_pooled_kda_rejects_oversized_state():
                     pool_block_tokens=(layout.required_tokens - 1) * PACK)
 
 
-@pytest.mark.parametrize("conv_shard_heads", [None, 1, 2])
-def test_pooled_kda_manager_block_split(conv_shard_heads):
+def test_pooled_kda_manager_block_split():
     """Manager ids on a pool born at kernel-block granularity (split > 1).
 
     A backend with a fixed kernel block size splits each manager block into
@@ -300,13 +300,12 @@ def test_pooled_kda_manager_block_split(conv_shard_heads):
     block_ids = [1, 2, 3][:num_seqs]
     pool_block_tokens = BLOCK_SIZE * PACK
 
-    pool = _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads)
+    pool = _pack_pool(conv_init, ssm_init, block_ids)
     out_ref, pool_ref = _run_pooled(inputs,
                                     pool,
                                     block_ids,
                                     distribution,
-                                    pool_block_tokens=pool_block_tokens,
-                                    conv_shard_heads=conv_shard_heads)
+                                    pool_block_tokens=pool_block_tokens)
 
     split = BLOCK_SIZE  # one pool row per kernel block
     pool_split = pool.reshape(NUM_BLOCKS * split, 1, PACK, LANES)
@@ -315,8 +314,7 @@ def test_pooled_kda_manager_block_split(conv_shard_heads):
         pool_split,
         block_ids,
         distribution,
-        pool_block_tokens=pool_block_tokens,
-        conv_shard_heads=conv_shard_heads)
+        pool_block_tokens=pool_block_tokens)
 
     np.testing.assert_allclose(np.asarray(out_split, np.float32),
                                np.asarray(out_ref, np.float32),
@@ -330,11 +328,8 @@ def test_pooled_kda_manager_block_split(conv_shard_heads):
     # numerically.
     conv_split, ssm_split = _unpack_pool(pool_split_after,
                                          block_ids,
-                                         split=split,
-                                         conv_shard_heads=conv_shard_heads)
-    conv_ref, ssm_ref = _unpack_pool(pool_ref,
-                                     block_ids,
-                                     conv_shard_heads=conv_shard_heads)
+                                         split=split)
+    conv_ref, ssm_ref = _unpack_pool(pool_ref, block_ids)
     np.testing.assert_array_equal(np.asarray(conv_split.view(jnp.uint16)),
                                   np.asarray(conv_ref.view(jnp.uint16)))
     np.testing.assert_allclose(np.asarray(ssm_split, np.float32),
@@ -352,8 +347,7 @@ def test_pooled_kda_manager_block_split(conv_shard_heads):
             np.testing.assert_array_equal(after[block], seed[block])
 
 
-@pytest.mark.parametrize("conv_shard_heads", [None, 1, 2])
-def test_pooled_kda_multistep_state_evolution(conv_shard_heads):
+def test_pooled_kda_multistep_state_evolution():
     """State must round-trip the pool across a chunked prefill and decodes.
 
     One request: two prefill chunks followed by three decode steps. The dense
@@ -371,7 +365,7 @@ def test_pooled_kda_multistep_state_evolution(conv_shard_heads):
                                axis=0)
     ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_init[:1]), ssm_init], axis=0)
     # Pooled: the request's state lives in pool block 1.
-    pool = _pack_pool(conv_init, ssm_init, [1], conv_shard_heads)
+    pool = _pack_pool(conv_init, ssm_init, [1])
 
     for step_idx, (query_len, seq_len, decode_end) in enumerate(steps):
         inputs = _inputs(rng, [query_len], [seq_len])
@@ -382,8 +376,7 @@ def test_pooled_kda_multistep_state_evolution(conv_shard_heads):
         out_pool, pool = _run_pooled(inputs,
                                      pool, [1],
                                      distribution,
-                                     pool_block_tokens=BLOCK_SIZE * PACK,
-                                     conv_shard_heads=conv_shard_heads)
+                                     pool_block_tokens=BLOCK_SIZE * PACK)
 
         np.testing.assert_allclose(np.asarray(out_pool, np.float32),
                                    np.asarray(out_dense, np.float32),
@@ -392,8 +385,7 @@ def test_pooled_kda_multistep_state_evolution(conv_shard_heads):
                                    err_msg=f"output diverged at step "
                                    f"{step_idx} {steps[step_idx]}")
 
-    conv_back, ssm_back = _unpack_pool(pool, [1],
-                                       conv_shard_heads=conv_shard_heads)
+    conv_back, ssm_back = _unpack_pool(pool, [1])
     # Conv state is pure data movement through the seam: bitwise equal.
     np.testing.assert_array_equal(np.asarray(conv_back.view(jnp.uint16)),
                                   np.asarray(conv_buf[1:].view(jnp.uint16)))

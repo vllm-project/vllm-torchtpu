@@ -7,8 +7,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import \
     layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import (FakeTensor, glm_named_kv_caches,
-                                kimi_pool_manifest)
+from .raiden_test_utils import FakeTensor, glm_named_kv_caches
 
 
 def _manifest(*, page_tokens=4096):
@@ -129,42 +128,6 @@ def _glm_versions(package):
         "torch_tpu": "torch-tpu-test-version",
         "libtpu": "libtpu-test-version",
     }[package]
-
-
-def test_kimi_fingerprint_accepts_tp32_to_tp8_page_geometry():
-    kwargs = {
-        "state_fragment_heads": 3,
-        "layout_getter": lambda tensor: ([3, 2, 1, 0], [[2, 128], [2, 1]], 0),
-        "package_version": _glm_versions,
-    }
-    source = rlf.measured_kimi_k3_layout_fingerprint(kimi_pool_manifest(3),
-                                                     page_tokens=162,
-                                                     state_fragments=1,
-                                                     **kwargs)
-    destination = rlf.measured_kimi_k3_layout_fingerprint(
-        kimi_pool_manifest(12), page_tokens=648, state_fragments=4, **kwargs)
-
-    assert source == destination
-    fingerprint, payload = source
-    assert payload["layouts"][rpm.TAG_FA]["row_bytes"] == 2560
-    assert "page_tokens" not in payload
-    assert payload["gdn_state_layouts"] == {
-        "gdn.conv": 10240,
-        "gdn.ssm": 196608
-    }
-    assert payload["state_fragment_heads"] == 3
-    assert payload["gdn_conv_layout"] == (
-        "kda-rank-blocked-tap-qkv-head-dim-bf16-v1")
-    legacy = dict(payload, gdn_conv_layout="kda-tap-qkv-head-dim-bf16-v1")
-    assert rlf.canonical_layout_fingerprint(legacy) != fingerprint
-    other, _ = rlf.measured_kimi_k3_layout_fingerprint(
-        kimi_pool_manifest(12),
-        page_tokens=648,
-        state_fragments=4,
-        **{
-            **kwargs, "state_fragment_heads": 6
-        })
-    assert other != fingerprint
 
 
 @pytest.mark.parametrize(

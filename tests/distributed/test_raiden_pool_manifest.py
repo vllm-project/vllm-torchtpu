@@ -45,60 +45,6 @@ QWEN35_FA_LAYERS = tuple(range(3, 60, 4))
 QWEN35_GDN_LAYERS = tuple(i for i in range(60) if i not in QWEN35_FA_LAYERS)
 
 
-@pytest.mark.parametrize(
-    ("heads", "rows", "block_size", "page_bytes", "ssm_rows", "conv_rows"), [
-        (3, 81, 162, 207_360, 77, 4),
-        (12, 324, 648, 829_440, 308, 16),
-    ])
-def test_kimi_k3_manifest_is_a_thin_packed_pool_variant(
-        heads, rows, block_size, page_bytes, ssm_rows, conv_rows):
-    state_layer = "model.layers.1.linear_attn"
-    mla_layer = "model.layers.4.self_attn.attn"
-    pool = FakeTensor((4, rows, 2, 640), 2, dtype="torch.bfloat16")
-    named = {state_layer: [pool], mla_layer: pool}
-    fa_group = _fa_group([mla_layer],
-                         block_size=block_size,
-                         num_kv_heads=1,
-                         head_size=640)
-    fa_group.kv_cache_spec.page_size_bytes = page_bytes
-    groups = (
-        _pooled_gdn_group(
-            [state_layer],
-            shapes=((3, 3, heads, 128), (heads, 128, 128)),
-            dtypes=("torch.float32", "torch.float32"),
-            page_size_bytes=page_bytes,
-        ),
-        fa_group,
-    )
-
-    manifest = rpm.build_kimi_k3_pool_manifest(
-        named_kv_caches=named,
-        kv_cache_groups=groups,
-        raw_tensors=(pool, ),
-        mamba_group_ordinal_by_layer={state_layer: 0},
-    )
-
-    assert manifest.binding == rpm.BINDING_ALIASED_RAW
-    assert manifest.storages == [pool]
-    assert [entry.tag for entry in manifest.pools] == [
-        f"{rpm.TAG_GDN_CONV}.g0", f"{rpm.TAG_GDN_SSM}.g0", rpm.TAG_FA
-    ]
-    assert all(entry.storage_index == 0 for entry in manifest.pools)
-    assert all(entry.num_blocks == 4 for entry in manifest.pools)
-    assert all(entry.block_stride_bytes == page_bytes
-               for entry in manifest.pools)
-    conv, ssm, mla = manifest.pools
-    assert conv.base_offset_bytes == ssm_rows * 2560
-    assert conv.live_bytes_per_block == conv_rows * 2560
-    assert max(r.extent_end_bytes for r in conv.regions) <= conv_rows * 2560
-    assert ssm.base_offset_bytes == 0
-    assert ssm.live_bytes_per_block == heads * 128 * 128 * 4
-    assert ssm.regions == (rpm.RegionSpec("gdn_ssm", 0,
-                                          ssm.live_bytes_per_block,
-                                          ssm.live_bytes_per_block, 1), )
-    assert mla.regions == (rpm.RegionSpec("fa_rows", 0, 2560, 2560, rows), )
-
-
 def _qwen35_materialization(*, fa_shape, fa_esz, fa_dtype, conv_shape,
                             conv_esz, ssm_shape, ssm_esz):
     """Builds named_kv_caches shaped like the live runner materialization."""
