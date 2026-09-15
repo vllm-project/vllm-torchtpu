@@ -33,8 +33,9 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         SlidingWindowSpec)
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
-                                                    PallasMLAttentionBackend)
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackend, PallasBatchedRPAAttentionBackend,
+    PallasMLAttentionBackend)
 from vllm_torchtpu.layers.core.attention_metadata import \
     AttentionMetadataBuilder
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
@@ -936,23 +937,28 @@ class TestKVCacheManager:
         assert self.runner._kv_cache_bundle is None
         assert self.runner._kv_cache_bundle_layer_index == {}
 
-    def test_initialize_kv_cache_multi_group(self):
-        """Multi-group initialize_kv_cache: verify the four behaviors
-        added with the builder migration: (1) attn_groups gets one shared
-        TPU builder per kv_cache_group, (2) may_reinitialize_input_batch is
-        called with per-group block_sizes, (3) empty_slot_mappings has one
-        entry per group (consumed by upstream _build_attention_metadata),
-        and (4) compatible groups share one full physical pool."""
+    @pytest.mark.usefixtures("vllm_config_context")
+    @pytest.mark.parametrize("full_heads,full_head_size,dtype,backend", [
+        (2, 128, torch.bfloat16, PallasAttentionBackend),
+        (1, 256, torch.bfloat16, PallasBatchedRPAAttentionBackend),
+        (1, 256, torch.float8_e4m3fn, PallasBatchedRPAAttentionBackend),
+    ])
+    def test_initialize_kv_cache_multi_group(self, full_heads, full_head_size,
+                                             dtype, backend):
+        """Different attention geometries share the full scheduler block pool."""
+        page_bytes = max(
+            backend.get_kv_cache_page_size_bytes(16, heads, head_size, dtype)
+            for heads, head_size in [(full_heads, full_head_size), (2, 128)])
         full_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=16384)
+                                      num_kv_heads=full_heads,
+                                      head_size=full_head_size,
+                                      dtype=dtype,
+                                      page_size_padded=page_bytes)
         sliding_spec = SlidingWindowSpec(block_size=16,
                                          num_kv_heads=2,
                                          head_size=128,
-                                         dtype=torch.bfloat16,
-                                         page_size_padded=16384,
+                                         dtype=dtype,
+                                         page_size_padded=page_bytes,
                                          sliding_window=32)
         kv_cache_groups = [
             KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=full_spec),
@@ -962,7 +968,8 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=4,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 4, shared_by=["attn.0", "attn.1"]),
+                KVCacheTensor(size=page_bytes * 4,
+                              shared_by=["attn.0", "attn.1"]),
             ],
             kv_cache_groups=kv_cache_groups,
         )
@@ -984,9 +991,10 @@ class TestKVCacheManager:
 
         with patch(
                 'vllm_torchtpu.utils.tpu_bind_kv_cache'
-        ) as mock_bind, patch(
-                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
-                return_value=False):
+        ) as mock_bind, patch.object(
+                TpuPlatform, '_find_non_ssm_backend', return_value=backend
+        ), patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
+                 return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config)
 
         # (1) One shared TPU builder per group, in the parent's
@@ -1013,11 +1021,12 @@ class TestKVCacheManager:
         for tensor in self.runner.empty_slot_mappings.values():
             assert tensor.numel() == 0
 
-        # (4) Both groups address the scheduler's complete ID range through
-        # the same physical allocation.
         caches = mock_bind.call_args.args[0]
-        assert caches["attn.0"] is caches["attn.1"]
-        assert caches["attn.0"].untyped_storage().nbytes() == 16384 * 4
+        first, second = caches["attn.0"], caches["attn.1"]
+        assert first is second
+        assert first.shape[0] == kv_cache_config.num_blocks
+        assert first.untyped_storage().nbytes() == page_bytes * 4
+        assert first.stride(0) * dtype.itemsize == page_bytes
         caches["attn.0"][kv_cache_config.num_blocks - 1].fill_(1)
         assert torch.all(caches["attn.1"][-1] == 1)
 

@@ -3,6 +3,7 @@
 
 import functools
 import inspect
+import math
 from typing import Any, ClassVar
 
 import jax
@@ -173,6 +174,18 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    pool_shape = kv_cache.shape
+    if kv_cache.ndim == 3:
+        backend = (PallasAttentionBackend
+                   if kv_layout is None else PallasBatchedRPAAttentionBackend)
+        native_shape = backend.get_kv_cache_shape(
+            1, pool_shape[1], key.shape[1], query.shape[2],
+            pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype])
+        native_page_elements = math.prod(native_shape[1:])
+        # A padded pool page can span several of this layer's native pages.
+        page_stride = math.prod(pool_shape[1:]) // native_page_elements
+        kv_cache = kv_cache.reshape(-1, *native_shape[1:])
+        block_tables = block_tables * page_stride
     metadata = AttentionMetadata(
         input_positions=
         None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
@@ -202,7 +215,7 @@ def _pallas_rpa_kernel_impl(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
     )
-    return new_kv_cache, outputs
+    return new_kv_cache.reshape(pool_shape), outputs
 
 
 def _pallas_rpa_kernel_default(
@@ -1186,7 +1199,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
         # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
-        if self._pool_is_seq_along_lane:
+        if kv_cache.ndim == 3:
+            pool_head_dim = self.head_size
+        elif self._pool_is_seq_along_lane:
             pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
         else:
             pool_head_dim = kv_cache.shape[-1]

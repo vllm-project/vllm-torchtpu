@@ -1224,17 +1224,8 @@ class KVCacheManager:
                     isinstance(spec, AttentionSpec)
                     and not isinstance(spec, MLAAttentionSpec)
                     for _, spec in shared_specs)):
-                # `shared_by` describes one allocation. Different attention
-                # groups own disjoint scheduler block IDs inside that pool, so
-                # every layer must see the full `num_blocks` range through the
-                # same physical tensor.
-                if self.runner.use_spmd:
-                    tp_size = self.runner.parallel_config.tensor_parallel_size
-                    for _, spec in shared_specs:
-                        assert isinstance(spec, AttentionSpec)
-                        assert spec.num_kv_heads % tp_size == 0, (
-                            f"num_kv_heads {spec.num_kv_heads} must be "
-                            f"divisible by tp_size {tp_size} under SPMD mode")
+                # Groups use disjoint block IDs within the same allocation;
+                # every layer needs the scheduler's full block range.
                 shared_attention_cache = materialize_shared_attention_cache(
                     layer_specs=shared_specs,
                     tensor_size=tensor_size,
@@ -1244,9 +1235,6 @@ class KVCacheManager:
                 )
                 num_blocks = kv_cache_config.num_blocks
             elif len(shared_by) > 1:
-                # Heterogeneous attention/mamba pools cannot share one strongly
-                # typed TPU tensor. Their page-size compensation makes this
-                # byte split match the scheduler's reduced block count.
                 total_group_page_size = 0
                 for name in shared_by:
                     spec = layer_name_to_spec[name]

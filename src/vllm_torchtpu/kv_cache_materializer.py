@@ -204,56 +204,33 @@ def materialize_shared_attention_cache(
     attn_backend: Any,
     device: torch.device,
 ) -> torch.Tensor:
-    """Materialize one physical pool shared by compatible attention groups."""
+    """Allocate one tensor for attention groups sharing scheduler pages."""
     if not layer_specs:
-        raise ValueError(
-            "layer_specs must contain at least one attention layer")
-
-    layouts: list[tuple[str, tuple[int, ...], torch.dtype]] = []
-    for layer_name, spec in layer_specs:
+        raise ValueError("layer_specs must contain an attention layer")
+    spec = layer_specs[0][1]
+    page_elements = tensor_size // (num_blocks * spec.dtype.itemsize)
+    shapes = []
+    for name, layer_spec in layer_specs:
+        if (layer_spec.dtype != spec.dtype
+                or layer_spec.block_size != spec.block_size
+                or layer_spec.page_size_bytes * num_blocks != tensor_size):
+            raise ValueError(f"Incompatible shared KV cache spec for {name}")
         shape = tuple(
-            attn_backend.get_kv_cache_shape(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                spec.dtype,
-            ))
-        layouts.append((layer_name, shape, spec.dtype))
-
-    _, pool_shape, pool_dtype = layouts[0]
-    incompatible = [(name, shape, dtype) for name, shape, dtype in layouts[1:]
-                    if shape != pool_shape or dtype != pool_dtype]
-    if incompatible:
-        raise ValueError(
-            "Layers sharing a KVCacheTensor must have the same TPU KV cache "
-            f"shape and dtype: expected shape={pool_shape}, dtype={pool_dtype}; "
-            f"got {incompatible}")
-
-    for layer_name, spec in layer_specs:
-        declared_size = spec.page_size_bytes * num_blocks
-        if declared_size != tensor_size:
+            attn_backend.get_kv_cache_shape(num_blocks, spec.block_size,
+                                            layer_spec.num_kv_heads,
+                                            layer_spec.head_size, spec.dtype))
+        if page_elements % math.prod(shape[1:]):
             raise ValueError(
-                f"KV cache byte budget for {layer_name} is {tensor_size}, "
-                f"but its spec requires {declared_size} bytes")
-
-    physical_size = (math.prod(pool_shape) * torch.empty(
-        (), dtype=pool_dtype).element_size())
-    if physical_size != tensor_size:
-        raise ValueError(
-            f"Shared TPU KV cache shape {pool_shape} with dtype {pool_dtype} "
-            f"uses {physical_size} bytes, but its budget is {tensor_size} bytes"
-        )
-
-    first_spec = layer_specs[0][1]
-    return make_attention_cache_tensor(
-        spec=first_spec,
-        attn_backend=attn_backend,
-        num_blocks=num_blocks,
-        kernel_block_size=first_spec.block_size,
-        cache_dtype=pool_dtype,
-        device=device,
-    )
+                f"Shared pool page must contain whole native pages for {name}")
+        shapes.append(shape)
+    pool_shape = shapes[0]
+    if (any(shape != pool_shape for shape in shapes)
+            or math.prod(pool_shape[1:]) != page_elements):
+        # Keep one tensor across custom-op calls; form native views in JAX.
+        # Shape: (scheduler pages, tokens per page, padded KV elements).
+        pool_shape = (num_blocks, spec.block_size,
+                      page_elements // spec.block_size)
+    return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
 
 def _can_allocate_attention_cache_directly(
