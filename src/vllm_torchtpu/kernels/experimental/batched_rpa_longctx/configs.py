@@ -124,6 +124,16 @@ class ServingConfigs:
         return utils.get_dtype_packing(self.dtype_q)
 
     @property
+    def q_head_alignment(self) -> int:
+        # LSE flattens [tokens, Q heads per KV head] into the HBM row axis.
+        # Every request's DMA offset must start on a full sublane tile, even
+        # when there are only 1, 2 or 4 Q heads per KV head. Use the same
+        # padding for Q, output and LSE; their public shapes stay unchanged.
+        if self.return_lse:
+            return max(self.packing_q, pltpu.get_tpu_info().num_sublanes)
+        return self.packing_q
+
+    @property
     def packing_kv(self) -> int:
         return utils.get_dtype_packing(self.dtype_kv)
 
@@ -285,8 +295,8 @@ class RpaConfigs:
 
     @property
     def aligned_num_q_heads_per_kv_head(self) -> int:
-        packing_q = self.serve.packing_q
-        return utils.align_to(self.model.num_q_heads_per_kv_head, packing_q)
+        return utils.align_to(self.model.num_q_heads_per_kv_head,
+                              self.serve.q_head_alignment)
 
     @property
     def kv_hbm_stride(self) -> int:

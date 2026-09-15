@@ -22,10 +22,10 @@ including the real Pallas custom ops. The longctx cases pass the layout
 explicitly to the underlying wrapper, to distinguish adapter wiring failures
 from kernel failures. Neither path replaces or patches a kernel.
 
-The TP8 matrix uses 64 global Q heads and (global KV heads, DCP size) of
-(4, 2) and (2, 4). Every rank has eight Q heads and one KV head.
-Both passes use Q head counts divisible by eight to isolate KV layout
-support from the separate small-Q-head LSE alignment issue.
+The TP8 matrix uses 16 global Q heads and (global KV heads, DCP size) of
+(4, 2), (2, 4), and (1, 8). Every rank has two Q heads and one KV head.
+The 64-global-Q-head DCP2/4 cases remain as alignment controls, with eight
+local Q heads per rank.
 
 Each configuration tests every rank of one representative DCP group, with
 the ranks running independently on one TPU. The other groups in TP8 have
@@ -59,8 +59,13 @@ _FP8 = torch.float8_e4m3fn
 # (global Q heads, global KV heads, DCP size). All TP replicas of a KV head
 # belong to the same DCP group, so every rank still holds ONE local KV head.
 _PARALLEL_CASES = (
+    # Eight local Q heads provide alignment controls.
     (64, 4, 2),
     (64, 2, 4),
+    # Two local Q heads exercise LSE writeback with small groups.
+    (16, 4, 2),
+    (16, 2, 4),
+    (16, 1, 8),
 )
 
 

@@ -47,6 +47,7 @@ def prepare_inputs(
     kv_dtype: jnp.dtype,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
+    q_head_alignment: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
 
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
@@ -56,8 +57,8 @@ def prepare_inputs(
     q_packing = utils.get_dtype_packing(q_dtype)
     kv_packing = utils.get_dtype_packing(kv_dtype)
 
-    aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head,
-                                                     q_packing)
+    aligned_num_q_heads_per_kv_head = utils.align_to(
+        num_q_heads_per_kv_head, q_head_alignment or q_packing)
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     aligned_q_head_dim = utils.align_to(actual_head_dim, num_lanes)
@@ -183,7 +184,7 @@ def calculate_block_sizes(
     # Calculate aligned model dimensions.
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
-        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q)
+        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.q_head_alignment)
     aligned_num_q_heads = (aligned_num_q_heads_per_kv_head *
                            model_cfgs.num_kv_heads)
 
@@ -548,6 +549,7 @@ def ragged_paged_attention(
         kv_cache.dtype,
         kv_layout=kv_layout,
         page_size=page_size,
+        q_head_alignment=serve_cfgs.q_head_alignment,
     )
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs,
@@ -559,10 +561,9 @@ def ragged_paged_attention(
     lse_hbm_init: jax.Array | None = None
     if return_lse:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        q_packing = utils.get_dtype_packing(queries.dtype)
         num_q_heads_per_kv_head = num_q_heads // num_kv_heads
         aligned_num_q_heads_per_kv_head = utils.align_to(
-            num_q_heads_per_kv_head, q_packing)
+            num_q_heads_per_kv_head, serve_cfgs.q_head_alignment)
         max_tokens = queries.shape[0]
         lse_hbm_init = jnp.full(
             [
