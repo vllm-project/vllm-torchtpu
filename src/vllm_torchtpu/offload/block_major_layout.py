@@ -85,6 +85,41 @@ def _canonical_layout_fingerprint(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def block_major_layer_indices(
+    kv_cache_config: KVCacheConfig,
+    fragment_row_bytes: int,
+) -> dict[str, int]:
+    """Read layer positions from vLLM's native block-outermost placement."""
+    tensors = kv_cache_config.kv_cache_tensors
+    sizes = {tensor.size for tensor in tensors}
+    if len(sizes) != 1:
+        raise ValueError(
+            "VLLM_TPU_BLOCK_MAJOR_KV=1: backing sizes are not uniform")
+    size = sizes.pop()
+    row_bytes, remainder = divmod(size, kv_cache_config.num_blocks)
+    if remainder or row_bytes % fragment_row_bytes:
+        raise ValueError(
+            "VLLM_TPU_BLOCK_MAJOR_KV=1: backing allocation does not "
+            "tile whole scheduler blocks and fragment pages")
+    result = {}
+    for tensor in tensors:
+        if tensor.block_stride != row_bytes:
+            raise ValueError(
+                "VLLM_TPU_BLOCK_MAJOR_KV=1: placement is not block-major")
+        for index, name in enumerate(tensor.layers):
+            offset = tensor.offset + index * tensor.layer_stride
+            if offset % fragment_row_bytes or not 0 <= offset < row_bytes:
+                raise ValueError(
+                    "VLLM_TPU_BLOCK_MAJOR_KV=1: fragment page offset "
+                    f"does not match kernel-row bytes: {name}={offset}")
+            result[name] = offset // fragment_row_bytes
+    if set(result.values()) != set(range(row_bytes // fragment_row_bytes)):
+        raise ValueError(
+            "VLLM_TPU_BLOCK_MAJOR_KV=1: placement does not tile kernel-row bytes (empty fragments)"
+        )
+    return result
+
+
 def resolve_block_major_contract(
     vllm_config: VllmConfig,
     kv_cache_config: KVCacheConfig,
@@ -111,7 +146,6 @@ def resolve_block_major_contract(
     from vllm_torchtpu.offload.raiden_store import (is_multi_shapes_geometry,
                                                     resolve_kernel_geometry)
 
-    kv_cache_tensors = kv_cache_config.kv_cache_tensors
     (kernel_block_size, per_block_shape, kv_dtype,
      device_block_size) = resolve_kernel_geometry(vllm_config, kv_cache_config)
     if is_multi_shapes_geometry(per_block_shape):
@@ -136,29 +170,13 @@ def resolve_block_major_contract(
     fragment_row_bytes = (int(np.prod(per_block_shape)) *
                           torch.empty(0, dtype=kv_dtype).element_size())
 
-    sizes = {int(t.size) for t in kv_cache_tensors}
-    if len(sizes) != 1:
-        raise ValueError(
-            "VLLM_TPU_BLOCK_MAJOR_KV=1: kv_cache_tensors are not uniform "
-            f"({len(sizes)} distinct sizes: {sorted(sizes)}); a bundle "
-            "requires every fragment to hold identical rows")
-    per_fragment_size = sizes.pop()
-    num_blocks = kv_cache_config.num_blocks
-    if per_fragment_size % num_blocks != 0:
-        raise ValueError("VLLM_TPU_BLOCK_MAJOR_KV=1: fragment size "
-                         f"{per_fragment_size} is not whole scheduler blocks "
-                         f"(num_blocks={num_blocks})")
-    per_fragment_page = per_fragment_size // num_blocks
-    if per_fragment_page != factor * fragment_row_bytes:
-        raise ValueError(
-            "VLLM_TPU_BLOCK_MAJOR_KV=1: fragment page bytes "
-            f"{per_fragment_page} != device_block_size_factor {factor} x "
-            f"kernel-row bytes {fragment_row_bytes}; the resolved attention "
-            "geometry does not tile the kv_cache_tensors")
-
-    fragment_order = tuple(
-        f"{idx}:{tensor.shared_by[0]}(+{len(tensor.shared_by) - 1})"
-        for idx, tensor in enumerate(kv_cache_tensors))
+    indices = block_major_layer_indices(kv_cache_config, fragment_row_bytes)
+    fragment_count = len(set(indices.values()))
+    fragment_layers = [[] for _ in range(fragment_count)]
+    for name, index in indices.items():
+        fragment_layers[index].append(name)
+    fragment_order = tuple(f"{index}:{names[0]}(+{len(names) - 1})"
+                           for index, names in enumerate(fragment_layers))
 
     logical_fingerprint = _canonical_layout_fingerprint({
         "layout":
@@ -166,7 +184,7 @@ def resolve_block_major_contract(
         "layout_version":
         BLOCK_MAJOR_LAYOUT_VERSION,
         "fragment_count":
-        len(kv_cache_tensors),
+        fragment_count,
         "fragment_order":
         list(fragment_order),
         "fragment_row_bytes":
@@ -182,9 +200,9 @@ def resolve_block_major_contract(
     })
 
     contract = BlockMajorContract(
-        fragment_count=len(kv_cache_tensors),
+        fragment_count=fragment_count,
         fragment_row_bytes=fragment_row_bytes,
-        bundle_row_bytes=len(kv_cache_tensors) * fragment_row_bytes,
+        bundle_row_bytes=fragment_count * fragment_row_bytes,
         logical_fingerprint=logical_fingerprint,
     )
     logger.info(

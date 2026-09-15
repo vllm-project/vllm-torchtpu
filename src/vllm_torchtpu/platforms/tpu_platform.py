@@ -431,6 +431,13 @@ class TpuPlatform(Platform):
             os.environ.pop("WORLD_SIZE", None)
             return
 
+        # PjRt's distributed bootstrap requires a native endpoint even when
+        # vLLM uses a c10d FileStore. Select it once before spawning workers,
+        # alongside the shared slice topology, so every rank inherits it.
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(portpicker.pick_unused_port())
+
         sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
         sb_count = len(sb_addresses.split(",")) if sb_addresses else 0
         if sb_count != world_size:
@@ -572,12 +579,27 @@ class TpuPlatform(Platform):
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-        kv_cache_layout = "NHD"
-        if parallel_config.prefill_context_parallel_size > 1:
-            from vllm.config import set_current_vllm_config
-            from vllm.v1.attention.backends.utils import get_kv_cache_layout
-            with set_current_vllm_config(vllm_config):
-                kv_cache_layout = get_kv_cache_layout()
+        # TPU's page geometry and block-size selection depend on layout while
+        # loading the model, before engine-core's post-load resolution. Resolve
+        # explicitly here through vLLM's API and publish the same CacheConfig
+        # value to workers, rather than maintaining a process-global getter.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm.v1.attention.backends.utils import (
+            get_flashinfer_layout_string, resolve_kv_cache_layout)
+
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
+        backend = (PallasBatchedRPAAttentionBackend
+                   if vllm_config.attention_config.backend
+                   == AttentionBackendEnum.CUSTOM else PallasAttentionBackend)
+        supported = [
+            layout.name for layout in backend.supported_kv_cache_layouts()
+        ]
+        if (vllm_config.model_config is not None and "DeepseekV4ForCausalLM"
+                in vllm_config.model_config.architectures):
+            supported = ["BLHNC"]
+        layout = resolve_kv_cache_layout(vllm_config, [supported])
+        kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             multihost_backend=envs.TPU_MULTIHOST_BACKEND,

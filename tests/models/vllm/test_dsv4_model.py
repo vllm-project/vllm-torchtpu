@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.utils import WeightsMapper
 
 import vllm_torchtpu.models.vllm.deepseek_v4.model as model_mod
 from vllm_torchtpu.models.vllm import register_models
@@ -35,6 +36,42 @@ def test_deepseek_v4_model_registration():
     assert entry is not None, "DeepseekV4ForCausalLM is not registered"
     model_cls = entry.load_model_cls()
     assert model_cls is DeepseekV4ForCausalLM
+
+
+@pytest.mark.cpu_test
+def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
+    model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.embed_tokens = nn.Embedding(2, 3)
+    model.model.mtp_adapter = nn.Linear(3, 2, bias=False)
+    model.lm_head = nn.Linear(3, 2, bias=False)
+    # A rename that introduces the skipped substring distinguishes filtering
+    # mapped names from filtering only raw checkpoint names.
+    model.hf_to_vllm_mapper |= WeightsMapper(
+        orig_to_new_prefix={"draft.": "model.mtp."})
+    embedding = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    head = embedding + 10
+    adapter = embedding + 20
+    loaded = model.load_weights(
+        iter([
+            ("mtp.0.weight", head),
+            ("layers.0.mtp.weight", head),
+            ("layers.0.aux_mtp.weight", head),
+            ("draft.0.weight", head),
+            ("embed.weight", embedding),
+            ("head.weight", head),
+            ("model.mtp_adapter.weight", adapter),
+        ]))
+    assert loaded == {
+        "model.embed_tokens.weight", "lm_head.weight",
+        "model.mtp_adapter.weight"
+    }
+    torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
+    torch.testing.assert_close(model.lm_head.weight, head)
+    torch.testing.assert_close(model.model.mtp_adapter.weight, adapter)
+    with pytest.raises(ValueError, match="not_in_model"):
+        model.load_weights([("not_in_model.weight", head)])
 
 
 # --------------------------------------------------------------------------

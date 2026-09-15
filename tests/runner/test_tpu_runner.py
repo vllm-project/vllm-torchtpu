@@ -1426,15 +1426,14 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     the layout against an ambient config and the gap stays hidden. Missing it
     both ways is what let this reach CI as an `AssertionError: Current vLLM
     config is not set` at server startup."""
+    from vllm.config import CacheConfig
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
     from vllm_torchtpu.layers.adapter.attention import \
         PallasBatchedRPAAttentionBackend
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            block_size=16,
-            user_specified_block_size=False,
-            block_size_unaligned=16,
-        ),
+        cache_config=CacheConfig(),
         model_config=SimpleNamespace(
             use_mla=False,
             is_hybrid=False,
@@ -1446,6 +1445,7 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         kv_transfer_config=None,
     )
+    resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
     with patch.object(TpuPlatform,
                       "_find_non_ssm_backend",
                       return_value=PallasBatchedRPAAttentionBackend):

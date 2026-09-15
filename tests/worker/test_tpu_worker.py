@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
@@ -415,9 +416,7 @@ def _run_spawn_probes():
             kwargs = {}
             if stage == "engine_core":
                 kwargs["vllm_config"] = SimpleNamespace(
-                    parallel_config=SimpleNamespace(data_parallel_size=1,
-                                                    pipeline_parallel_size=1,
-                                                    numa_bind=False))
+                    parallel_config=ParallelConfig(numa_bind=False))
             process = context.Process(target=target,
                                       args=(child, ),
                                       kwargs=kwargs)

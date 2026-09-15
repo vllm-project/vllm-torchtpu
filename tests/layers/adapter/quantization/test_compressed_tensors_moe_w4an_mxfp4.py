@@ -11,7 +11,8 @@ class FakeRoutedExperts(RoutedExperts):
 
     def __init__(self, experts_per_token=2):
         torch.nn.Module.__init__(self)
-        self.moe_config = MagicMock()
+        # Gated MoE metadata consumed by native checkpoint allocation.
+        self.moe_config = MagicMock(w13_num_shards=2)
         self.moe_config.experts_per_token = experts_per_token
         self.moe_config.moe_parallel_config = MagicMock()
         self.moe_config.moe_parallel_config.use_ep = False
@@ -30,7 +31,7 @@ class FakeRoutedExperts(RoutedExperts):
 
 
 def test_mxfp4_create_weights_and_process():
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.experts_per_token = 2
@@ -59,6 +60,8 @@ def test_mxfp4_create_weights_and_process():
     assert hasattr(layer, "w13_weight_scale")
     assert hasattr(layer, "w2_weight_packed")
     assert hasattr(layer, "w2_weight_scale")
+    assert layer.w13_weight_packed.shape == (num_experts, 128, 64)
+    assert layer.w13_weight_scale.shape == (num_experts, 128, 4)
 
     # Simulate loading weights via the hook
     weight_loader = layer.w13_weight_packed.weight_loader
@@ -138,7 +141,7 @@ def test_mxfp4_create_weights_and_process():
 
 
 def test_mxfp4_apply_masks_padded_token_routes():
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
@@ -178,7 +181,7 @@ def test_mxfp4_apply_masks_padded_token_routes():
 
 def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
     """The decode-shaped MoE call must not mix otherwise identical rows."""
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.experts_per_token = 16
@@ -284,7 +287,7 @@ def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
 
 
 def test_mxfp4_create_weights_does_not_zero_initialize():
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
@@ -306,7 +309,7 @@ def test_mxfp4_create_weights_does_not_zero_initialize():
 
 
 def test_mxfp4_processes_directly_materialized_dummy_weights():
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.experts_per_token = 2
@@ -322,6 +325,9 @@ def test_mxfp4_processes_directly_materialized_dummy_weights():
         intermediate_size_per_partition=64,
         params_dtype=torch.bfloat16,
     )
+
+    assert layer.w13_weight_packed.shape == (2, 128, 64)
+    assert layer.w13_weight_scale.shape == (2, 128, 4)
 
     # vLLM's dummy loader initializes materialized parameters without calling
     # the checkpoint weight-loader hook, so no CPU scratchpads are created.
@@ -342,7 +348,7 @@ def test_mxfp4_processes_directly_materialized_dummy_weights():
 
 
 def test_mxfp4_initializes_integer_dummy_weights():
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.experts_per_token = 2
@@ -375,7 +381,7 @@ def test_mxfp4_initializes_integer_dummy_weights():
 
 
 def test_mxfp4_preserves_integer_checkpoint_weights():
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.experts_per_token = 2
@@ -408,7 +414,7 @@ def test_mxfp4_preserves_integer_checkpoint_weights():
 
 
 def test_mxfp4_neutralizes_only_unloaded_padded_scales():
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.intermediate_size_per_partition = 64
@@ -444,7 +450,7 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
 def test_mxfp4_requantize_block():
     from vllm_torchtpu.layers.core.quantization import (
         dequantize_mxfp4_packed, fp4_indices_to_float, quantize_tensor_to_fp4)
-    moe_config = MagicMock()
+    moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
     moe_config.experts_per_token = 2

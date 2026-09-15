@@ -684,10 +684,6 @@ class VllmTPUMLAAttention(MLAAttention):
                 k_pe: torch.Tensor,
                 output: torch.Tensor | None = None,
                 **kwargs) -> torch.Tensor:
-        if self.calculate_kv_scales:
-            torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe,
-                                                self.layer_name)
-
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
         return self.impl.forward(

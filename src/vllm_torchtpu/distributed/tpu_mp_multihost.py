@@ -131,6 +131,10 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     local_world_size = parallel_config.local_world_size
     total_chips = local_world_size * nnodes
     master_addr = parallel_config.master_addr
+    # Native PjRt validates this endpoint independently of vLLM's c10d
+    # FileStore. Every host already agrees on the configured master pair.
+    os.environ.setdefault("MASTER_ADDR", master_addr)
+    os.environ.setdefault("MASTER_PORT", str(parallel_config.master_port))
     rendezvous_port = _rendezvous_port(parallel_config.master_port)
 
     logger.info(

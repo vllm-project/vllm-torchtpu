@@ -43,7 +43,6 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
@@ -1280,10 +1279,12 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        return self.kv_cache_manager.get_kv_cache_spec()
+        with set_current_vllm_config(self.vllm_config):
+            return self.kv_cache_manager.get_kv_cache_spec()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        with set_current_vllm_config(self.vllm_config):
+            self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -1386,11 +1387,11 @@ class TPUModelRunner(GPUModelRunner):
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
             return
-        layer_to_raw: dict[str, torch.Tensor] = {}
-        for raw, kv_cache_tensor in zip(raw_tensors,
-                                        kv_cache_config.kv_cache_tensors):
-            for layer_name in kv_cache_tensor.shared_by:
-                layer_to_raw[layer_name] = raw
+        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+        layer_to_raw = {
+            name: raw_tensors[index]
+            for name, index in layer_to_pool_index(kv_cache_config).items()
+        }
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
         manager_page_bytes: int | None = None
@@ -4121,7 +4122,8 @@ class TPUModelRunner(GPUModelRunner):
             use_max_model_len)
         capacity = self._attention_capacity.get((num_seqs, pages_per_seq))
         if capacity is None:
-            layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+            layout = KV_LAYOUT_BY_VLLM_LAYOUT[
+                self.cache_config.get_resolved_kv_cache_layout()]
             shared = dict(
                 num_q_heads=self.model_config.get_num_attention_heads(
                     self.parallel_config),

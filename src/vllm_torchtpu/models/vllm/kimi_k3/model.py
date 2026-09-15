@@ -404,14 +404,13 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 else:
                     yield name, loaded_weight
 
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."]
-                           if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
+        skip_mapper = (WeightsMapper(orig_to_new_prefix={"lm_head.": None})
+                       if self.config.tie_word_embeddings else None)
         # load_weights fully consumes the generator before returning, so
         # loaded_experts is complete when the union is taken.
-        ordinary_loaded = loader.load_weights(_ordinary_weights())
+        ordinary_loaded = loader.load_weights(_ordinary_weights(),
+                                              mapper=skip_mapper)
         return loaded_experts | ordinary_loaded
 
 

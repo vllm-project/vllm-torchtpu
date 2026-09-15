@@ -187,6 +187,49 @@ def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
     assert weight.shard_id == 0
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
+def test_weight_loader_preserves_lm_head_skip_and_streaming(tied) -> None:
+    model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=None,
+                                   q_lora_rank=None,
+                                   tie_word_embeddings=tied)
+    model.model = nn.Module()
+    model.model.embed_tokens = nn.Embedding(2, 3)
+    # The production constructor creates a separate head even with the flag
+    # enabled; native alias detection alone cannot replace its skip policy.
+    model.lm_head = nn.Linear(3, 2, bias=False)
+    model.lm_head_extra = nn.Linear(3, 2, bias=False)
+    with torch.no_grad():
+        model.lm_head.weight.fill_(-1)
+    embedding = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    head = embedding + 10
+    extra = embedding + 20
+
+    def checkpoint():
+        yield "language_model.model.embed_tokens.weight", embedding
+        yield "language_model.lm_head.weight", head
+        # Verify dense checkpoint tensors are consumed before advancing the
+        # stream, rather than first being retained in a full-checkpoint list.
+        torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
+        if tied:
+            yield "language_model.lm_head.extra.unexpected.weight", head
+        yield "language_model.lm_head_extra.weight", extra
+
+    loaded = model.load_weights(checkpoint())
+    expected = {"model.embed_tokens.weight", "lm_head_extra.weight"}
+    if not tied:
+        expected.add("lm_head.weight")
+    assert loaded == expected
+    torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
+    torch.testing.assert_close(model.lm_head_extra.weight, extra)
+    torch.testing.assert_close(model.lm_head.weight,
+                               torch.full_like(head, -1) if tied else head)
+    with pytest.raises(ValueError, match="not_in_model"):
+        model.load_weights([("not_in_model.weight", head)])
+
+
 def test_expert_weight_loader_uses_current_fused_moe_names() -> None:
     model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
     nn.Module.__init__(model)

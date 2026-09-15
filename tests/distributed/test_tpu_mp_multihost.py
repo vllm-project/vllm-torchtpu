@@ -26,6 +26,8 @@ from vllm_torchtpu.platforms import tpu_platform
 @pytest.fixture(autouse=True)
 def isolated_environment(monkeypatch):
     for key in (
+            "MASTER_ADDR",
+            "MASTER_PORT",
             "TORCH_TPU_MP_RENDEZVOUS_PORT",
             "TORCH_TPU_BASE_PORT",
             "TORCH_TPU_SLICEBUILDER_ADDRESSES",
@@ -119,8 +121,11 @@ def test_mp_bootstrap_and_reentry(monkeypatch, bootstrap, rank, base_port):
     assert os.environ["TPU_NUM_HOSTS"] == "2"
     assert os.environ["NODE_RANK"] == str(rank)
     assert os.environ["TORCH_TPU_XPROF_SESSION_ID"] == "session"
+    assert os.environ["MASTER_ADDR"] == config.master_addr
+    assert os.environ["MASTER_PORT"] == str(config.master_port)
     mp.prepare_mp_multihost_env(config)
     assert rendezvous.call_count == 1
+    assert os.environ["MASTER_PORT"] == str(config.master_port)
 
 
 def test_single_host_skips_rendezvous(bootstrap):
