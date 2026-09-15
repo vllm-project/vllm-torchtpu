@@ -3875,11 +3875,6 @@ class TPUModelRunner(GPUModelRunner):
             input_ids = self._profile_input("ids", (self.max_num_tokens, ),
                                             torch.int32)[:num_tokens].to(
                                                 self.device)
-        else:
-            input_ids = torch.zeros((num_tokens),
-                                    dtype=torch.int32).to(self.device)
-        inputs_embeds = None
-        if profiling:
             # One prefill request, or several of at most the model length
             # when a bucket exceeds it.
             profile_query_lens = []
@@ -3892,7 +3887,10 @@ class TPUModelRunner(GPUModelRunner):
                 f"profiling {num_tokens} tokens needs {actual_num_reqs} "
                 f"requests, the batch holds {num_reqs}")
         else:
+            input_ids = torch.zeros((num_tokens),
+                                    dtype=torch.int32).to(self.device)
             actual_num_reqs = min(num_tokens, num_reqs)
+        inputs_embeds = None
         if self.uses_mrope:
             position_ids = torch.zeros((3, num_tokens),
                                        dtype=torch.int32).to(self.device)
