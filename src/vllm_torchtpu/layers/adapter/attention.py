@@ -1090,6 +1090,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         dcp_configured = (parallel_config is not None and getattr(
             parallel_config, 'decode_context_parallel_size', 1) > 1)
         if dcp_configured:
+            # TODO(kwang3939): forward decode_query_size to the DCP ops
             self.decode_query_size = 1
             dcp_group = _get_dcp_group()
             if dcp_group is not None:
