@@ -21,14 +21,14 @@ def test_channel_scale_keeps_existing_layout():
     assert normalize_projection_scale((256, 512), scale) is scale
 
 
-def test_block_grid_and_gmm_layout_agree():
+def test_block_grid_and_linear_runtime_layout_agree():
     grid = jnp.array([[1., 2., 3., 4.], [5., 6., 7., 8.]])
     expected = np.repeat(np.asarray(grid), 128, axis=0).T
-    gmm = jnp.asarray(expected)[None, :, None, :]
+    linear_runtime = jnp.asarray(expected)[None, :, None, :]
     np.testing.assert_array_equal(normalize_projection_scale((256, 512), grid),
                                   expected)
-    np.testing.assert_array_equal(normalize_projection_scale((256, 512), gmm),
-                                  expected)
+    np.testing.assert_array_equal(
+        normalize_projection_scale((256, 512), linear_runtime), expected)
 
 
 def test_n_only_blocks_use_full_k_fast_path():
