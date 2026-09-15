@@ -100,7 +100,14 @@ def calculate_and_store_out(
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
         lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
-        lse_o_vref[b_idx] = lse_val.astype(cfgs.serve.dtype_out)
+        # Store through packed words, as for O. Keeping tokens separate in
+        # the buffer lets DMA copy complete token records even for small GQA
+        # groups, without padding the attention computation to eight heads.
+        lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
+        lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
+        lse_val = pltpu.bitcast(lse_val.astype(cfgs.serve.dtype_out),
+                                jnp.uint32).reshape(lse_ref.shape)
+        utils.strided_store(lse_ref, 0, lse_ref.shape[0], 1, lse_val)
 
     if cfgs.fuse_accum:
         for b in range(cfgs.batch_size):
