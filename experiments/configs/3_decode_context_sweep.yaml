@@ -1,0 +1,19 @@
+# Goal: Benchmark Context-Scaled Decode Performance
+# Importance: Tests the incremental cost of generating tokens (throughput) as the
+# past KV-cache context scales up in size. Identifies the point where memory bandwidth
+# bottlenecks token generation.
+mode: profile
+
+engine_args:
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 65600
+env_vars:
+  VLLM_ENABLE_V1_MULTIPROCESSING: '0'
+sweep_matrix:
+  output_len: [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+  batch_size: [16]
+  input_len: [64]
+  model: [google/gemma-4-12B-it]
