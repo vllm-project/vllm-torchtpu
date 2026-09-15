@@ -708,6 +708,7 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
+        self.reorder_batch_threshold = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
         self.structured_decoding_manager = StructuredDecodingManager(self)
@@ -2086,6 +2087,9 @@ class TPUModelRunner(GPUModelRunner):
                         num_windowed_reqs: int | None = None):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
+        rpa_num_decode_reqs = (num_windowed_reqs
+                               if self.reorder_batch_threshold > 1 else
+                               num_decode_reqs)
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -2209,7 +2213,7 @@ class TPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_per_req)
         self._check_attention_schedule(
             num_reqs, num_scheduled_tokens_per_req,
-            max(0, min(num_decode_reqs - start_index, num_reqs)))
+            max(0, min(rpa_num_decode_reqs - start_index, num_reqs)))
 
         request_major_input_ids_cpu: torch.Tensor
         if self._pcp_mtp_k1_enabled:
@@ -2386,7 +2390,7 @@ class TPUModelRunner(GPUModelRunner):
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
             # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
             chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
+                0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
@@ -2411,13 +2415,13 @@ class TPUModelRunner(GPUModelRunner):
         # Spec decode with mamba layers: the GDN kernel's windowed segment
         # covers 1-token decodes AND speculative verify windows (the batch is
         # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa),
-        # while RPA keeps its 1-token-decode-only front segment.
+        # while RPA includes verify only when its decode tile supports it.
         mamba_request_distribution = None
         if self.mamba_slot_read_offsets is not None:
             chunk_num_windowed = max(
                 0, min(num_windowed_reqs - start_index, num_reqs))
             chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
+                0, min(rpa_num_decode_reqs - start_index, num_reqs))
             # One H2D copy, two views (see the staging tensor's comment for
             # why these must not be independent device tensors). Overrides
             # the RPA tensor built above so both fields always come from the
@@ -3802,6 +3806,7 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config,
                                              AttentionLayerBase)
         initialized_count = 0
+        decode_query_sizes = []
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                             vllm_config=self.vllm_config):
             for name, attn_layer in layers.items():
@@ -3817,11 +3822,14 @@ class TPUModelRunner(GPUModelRunner):
                         attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
                         attn_layer.impl._kernel_op_prefix = (
                             "pallas::rpa_kernel_local")
+                        attn_layer.impl.decode_query_size = 1
                         logger.info(
                             "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
                             " | DRAFT_KV_BLOCK_CAP=%d", name,
                             _DRAFT_KV_BLOCK_CAP)
                     attn_layer.impl.initialize_kernel(attn_layer)
+                    decode_query_sizes.append(
+                        attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
             # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
@@ -3846,6 +3854,7 @@ class TPUModelRunner(GPUModelRunner):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
+        self.reorder_batch_threshold = min(decode_query_sizes, default=1)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)

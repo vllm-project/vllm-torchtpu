@@ -1035,6 +1035,78 @@ class TestReorderBatchForRpa:
         assert runner.input_batch.req_ids[2] == "pf"
 
 
+class TestInitializeAttentionKernelsThreshold:
+    """`reorder_batch_threshold` is the smallest DECODE query width across the
+    kernels `_initialize_attention_kernels` builds, draft layers included."""
+
+    def _make_runner(self, widths, draft_names=(), draft_tp=2):
+        from vllm_torchtpu.layers.adapter.attention import \
+            PallasAttentionBackendImpl
+        runner = MagicMock(spec=TPUModelRunner)
+        runner._attention_kernels_initialized = False
+        runner.model = None
+        runner.mesh = MagicMock()
+        runner.vllm_config = MagicMock()
+        runner.reorder_batch_threshold = 1
+        runner.drafter = SimpleNamespace(
+            _draft_attn_layer_names=set(draft_names))
+        runner.speculative_config = SimpleNamespace(
+            draft_tensor_parallel_size=draft_tp)
+        runner._initialize_attention_kernels = (
+            TPUModelRunner._initialize_attention_kernels.__get__(runner))
+        layers = {}
+        for name, width in widths.items():
+            impl = MagicMock(spec=PallasAttentionBackendImpl)
+            impl.decode_query_size = width
+            layers[name] = SimpleNamespace(impl=impl)
+        return runner, layers
+
+    def _run(self, runner, layers):
+        with patch("vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+                   return_value=layers), \
+             patch("vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context"):
+            runner._initialize_attention_kernels()
+
+    def test_uniform_width(self):
+        runner, layers = self._make_runner({"a": 4, "b": 4})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 4
+        for layer in layers.values():
+            layer.impl.initialize_kernel.assert_called_once()
+
+    def test_min_across_layers(self):
+        runner, layers = self._make_runner({"a": 4, "b": 1})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 1
+
+    def test_relocated_draft_forces_one_token_decode(self):
+        runner, layers = self._make_runner({
+            "target": 4,
+            "draft": 4
+        },
+                                           draft_names=("draft", ),
+                                           draft_tp=1)
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 1
+        assert layers["target"].impl.decode_query_size == 4
+        assert runner.reorder_batch_threshold == 1
+
+    def test_sharded_draft_keeps_width(self):
+        runner, layers = self._make_runner({
+            "target": 4,
+            "draft": 4
+        },
+                                           draft_names=("draft", ),
+                                           draft_tp=2)
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 4
+
+    def test_no_pallas_layers(self):
+        runner, layers = self._make_runner({})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 1
+
+
 class TestMambaSlotReadOffsets:
     """Unit tests for the per-slot mamba read-offset scatter used to roll back
     rejected speculative tokens by *selection* (base_slot + offset)."""

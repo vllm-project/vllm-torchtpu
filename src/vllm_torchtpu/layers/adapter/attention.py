@@ -393,6 +393,7 @@ def _pallas_rpa_kernel_batched(
     skip_kv_update: bool,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout,
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -411,7 +412,9 @@ def _pallas_rpa_kernel_batched(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=ragged_paged_attention_batched,
+        rpa_func=(functools.partial(ragged_paged_attention_batched,
+                                    decode_query_size=decode_query_size) if
+                  decode_query_size > 1 else ragged_paged_attention_batched),
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
@@ -646,6 +649,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # as a method. Subclasses override this to select a different kernel.
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
+    decode_query_size: int = 1
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -755,7 +759,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale, v_scale, use_pcp_streaming,
                       cp_kv_cache_interleave_size, max_model_len,
-                      pcp_kv_layout)
+                      pcp_kv_layout, self.decode_query_size)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -772,7 +776,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         self.sliding_window, self.scale, self.logits_soft_cap,
                         id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
                         use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask, pcp_kv_layout)
+                        max_model_len, self.use_causal_mask, pcp_kv_layout, self.decode_query_size)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -796,7 +800,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
-            # Prepare wrapper function with static arguments.
+            entry_params = inspect.signature(self._kernel_entry).parameters
+            entry_kwargs = {}
+            if "kv_layout" in entry_params:
+                entry_kwargs["kv_layout"] = self.kv_layout
+            if "decode_query_size" in entry_params:
+                entry_kwargs["decode_query_size"] = self.decode_query_size
             wrapped_fn = functools.partial(
                 self._kernel_entry,
                 mesh=mesh,
@@ -808,10 +817,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale=v_scale,
                 skip_kv_update=skip_kv_update,
                 use_causal_mask=self.use_causal_mask,
-                **({
-                    "kv_layout": self.kv_layout
-                } if "kv_layout" in inspect.signature(
-                    self._kernel_entry).parameters else {}),
+                **entry_kwargs,
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -1068,6 +1074,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                           parallel_config.prefill_context_parallel_size > 1)
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
+            self.decode_query_size = 1
             self.rpa_kernel = self._build_rpa_kernel(
                 q_scale,
                 k_scale,
@@ -1082,6 +1089,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         dcp_configured = (parallel_config is not None and getattr(
             parallel_config, 'decode_context_parallel_size', 1) > 1)
         if dcp_configured:
+            self.decode_query_size = 1
             dcp_group = _get_dcp_group()
             if dcp_group is not None:
                 self.dcp_world_size = int(dcp_group.world_size)
@@ -1310,6 +1318,14 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        vllm_config = get_current_vllm_config_or_none()
+        spec = vllm_config.speculative_config if vllm_config else None
+        if (spec is not None and envs.USE_BATCHED_RPA_LONGCTX
+                and self.head_size != 64):
+            self.decode_query_size = spec.num_speculative_tokens + 1
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

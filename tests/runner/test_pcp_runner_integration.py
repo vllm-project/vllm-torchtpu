@@ -18,12 +18,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
+from vllm_torchtpu.runner.speculative_decoding_manager import \
+    SpeculativeDecodingManager
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 _PCP_LAYOUT_RANK = (
@@ -48,7 +51,8 @@ def _make_runner(*,
                  scheduled_tokens,
                  token_paddings,
                  uses_mrope=False,
-                 pcp_mtp_k1_enabled=False):
+                 pcp_mtp_k1_enabled=False,
+                 pcp_size=2):
     num_reqs = len(scheduled_tokens)
     max_model_len = max(64, max(prompt_tokens) + 16)
     max_num_reqs = 8
@@ -70,10 +74,11 @@ def _make_runner(*,
     runner.supports_mm_inputs = False
     runner.lora_config = None
     runner.speculative_config = None
+    runner.reorder_batch_threshold = 1
     runner._pcp_mtp_k1_enabled = pcp_mtp_k1_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
-        prefill_context_parallel_size=2,
+        prefill_context_parallel_size=pcp_size,
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
         pipeline_parallel_size=1,
@@ -235,6 +240,75 @@ def _scheduler_output(scheduled_tokens):
         },
         scheduled_spec_decode_tokens={},
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("bucket", [1, 4])
+@pytest.mark.parametrize("chunk_size", [1, 2, 8])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_prepare_inputs_routes_reordered_verify_per_chunk(
+        bucket, chunk_size, hybrid):
+    """Protect the real prepare-inputs boundary, not a hand-made distribution.
+
+    Both RPA routes must keep prefill in MIXED. Hybrid GDN always includes
+    verification, independently of whether the RPA bucket is widened.
+    """
+    scheduled = [16, 3, 1, 3, 1]
+    runner = _make_runner(num_computed_tokens=[0, 8, 8, 8, 8],
+                          prompt_tokens=[16, 8, 8, 8, 8],
+                          scheduled_tokens=scheduled,
+                          token_paddings=[256],
+                          pcp_size=1)
+    runner.reorder_batch_threshold = bucket
+    runner.num_reqs_max_model_len = chunk_size
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    runner.spec_decode_manager = SpeculativeDecodingManager(runner)
+    if hybrid:
+        runner.mamba_slot_read_offsets = torch.zeros(8, dtype=torch.int32)
+        runner._combined_request_distribution_cpu = torch.zeros(
+            6, dtype=torch.int32)
+    sched = _scheduler_output(scheduled)
+    sched.scheduled_spec_decode_tokens = {"req1": [1, 2], "req3": [3, 4]}
+    batch = runner.input_batch
+
+    def swap_states(i, j):
+        batch.req_ids[i], batch.req_ids[j] = batch.req_ids[j], batch.req_ids[i]
+        batch.req_id_to_index[batch.req_ids[i]] = i
+        batch.req_id_to_index[batch.req_ids[j]] = j
+        for array in (batch.num_computed_tokens_cpu, batch.num_prompt_tokens,
+                      batch.token_ids_cpu):
+            array[[i, j]] = array[[j, i]]
+        table = batch.block_table[0]._table
+        table[[i, j]] = table[[j, i]]
+
+    batch.swap_states = swap_states
+    num_decode, num_windowed = TPUModelRunner._reorder_batch_for_rpa(
+        runner, sched)
+    assert (num_decode, num_windowed) == (2, 4)
+    assert [sched.num_scheduled_tokens[r]
+            for r in batch.req_ids] == [1, 1, 3, 3, 16]
+    # Independent per-request expectations in the reordered batch.
+    rpa_membership = [True, True, bucket > 1, bucket > 1, False]
+    gdn_membership = [True, True, True, True, False]
+    start = 0
+    while start < 5:
+        prepared = TPUModelRunner._prepare_inputs(runner, sched, start,
+                                                  num_decode, num_windowed)
+        metadata = prepared[0]["layer.0"]
+        end = prepared[4]
+        expected_decode = sum(rpa_membership[start:end])
+        assert metadata.request_distribution.tolist() == [
+            expected_decode, expected_decode, end - start
+        ]
+        expected_lengths = [1, 1, 3, 3, 16][start:end]
+        assert torch.diff(
+            metadata.query_start_loc)[:end -
+                                      start].tolist() == expected_lengths
+        if hybrid:
+            expected_windowed = sum(gdn_membership[start:end])
+            assert runner._attn_metadata_builder_ctx.mamba_request_distribution.tolist(
+            ) == [expected_windowed, expected_windowed, end - start]
+        start = end
 
 
 def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
