@@ -40,7 +40,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
-    materialize_kv_cache_tensors)
+    materialize_kv_cache_tensors, materialize_shared_attention_cache)
 from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
 from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
@@ -1215,14 +1215,38 @@ class KVCacheManager:
 
         for kv_cache_tensor in ([] if _is_ds_v4 else
                                 kv_cache_config.kv_cache_tensors):
-            # If the KV cache tensor is shared by multiple layers, then we
-            # duplicate cache for each layer and `num_blocks` is calculated
-            # based on the total size of the shared cache.
-            # Otherwise, `num_blocks` is calculated based on the size of the
-            # single layer's KV cache spec.
             tensor_size = kv_cache_tensor.size
             shared_by = kv_cache_tensor.shared_by
-            if len(shared_by) > 1:
+            shared_specs = [(name, _per_layer_spec(name))
+                            for name in shared_by]
+            shared_attention_cache = None
+            if (len(shared_by) > 1 and not use_block_major and all(
+                    isinstance(spec, AttentionSpec)
+                    and not isinstance(spec, MLAAttentionSpec)
+                    for _, spec in shared_specs)):
+                # `shared_by` describes one allocation. Different attention
+                # groups own disjoint scheduler block IDs inside that pool, so
+                # every layer must see the full `num_blocks` range through the
+                # same physical tensor.
+                if self.runner.use_spmd:
+                    tp_size = self.runner.parallel_config.tensor_parallel_size
+                    for _, spec in shared_specs:
+                        assert isinstance(spec, AttentionSpec)
+                        assert spec.num_kv_heads % tp_size == 0, (
+                            f"num_kv_heads {spec.num_kv_heads} must be "
+                            f"divisible by tp_size {tp_size} under SPMD mode")
+                shared_attention_cache = materialize_shared_attention_cache(
+                    layer_specs=shared_specs,
+                    tensor_size=tensor_size,
+                    num_blocks=kv_cache_config.num_blocks,
+                    attn_backend=backend_cls,
+                    device=self.runner.device,
+                )
+                num_blocks = kv_cache_config.num_blocks
+            elif len(shared_by) > 1:
+                # Heterogeneous attention/mamba pools cannot share one strongly
+                # typed TPU tensor. Their page-size compensation makes this
+                # byte split match the scheduler's reduced block count.
                 total_group_page_size = 0
                 for name in shared_by:
                     spec = layer_name_to_spec[name]
@@ -1316,7 +1340,9 @@ class KVCacheManager:
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
                             f"tp_size {tp_size} under SPMD mode")
-                    if use_block_major and layer_name in bundle_view_by_name:
+                    if shared_attention_cache is not None:
+                        kv_caches[layer_name] = shared_attention_cache
+                    elif use_block_major and layer_name in bundle_view_by_name:
                         # Bind the strided per-layer view sharing storage with self._kv_cache_bundle.
                         kv_caches[layer_name] = bundle_view_by_name[layer_name]
                     else:

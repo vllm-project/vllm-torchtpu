@@ -1,3 +1,4 @@
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -193,6 +194,66 @@ def make_attention_cache_tensor(
         cache_dtype_str=cache_dtype,
     )
     return torch.zeros(shape, dtype=spec.dtype, device=device)
+
+
+def materialize_shared_attention_cache(
+    *,
+    layer_specs: Sequence[tuple[str, AttentionSpec]],
+    tensor_size: int,
+    num_blocks: int,
+    attn_backend: Any,
+    device: torch.device,
+) -> torch.Tensor:
+    """Materialize one physical pool shared by compatible attention groups."""
+    if not layer_specs:
+        raise ValueError(
+            "layer_specs must contain at least one attention layer")
+
+    layouts: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+    for layer_name, spec in layer_specs:
+        shape = tuple(
+            attn_backend.get_kv_cache_shape(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+            ))
+        layouts.append((layer_name, shape, spec.dtype))
+
+    _, pool_shape, pool_dtype = layouts[0]
+    incompatible = [(name, shape, dtype) for name, shape, dtype in layouts[1:]
+                    if shape != pool_shape or dtype != pool_dtype]
+    if incompatible:
+        raise ValueError(
+            "Layers sharing a KVCacheTensor must have the same TPU KV cache "
+            f"shape and dtype: expected shape={pool_shape}, dtype={pool_dtype}; "
+            f"got {incompatible}")
+
+    for layer_name, spec in layer_specs:
+        declared_size = spec.page_size_bytes * num_blocks
+        if declared_size != tensor_size:
+            raise ValueError(
+                f"KV cache byte budget for {layer_name} is {tensor_size}, "
+                f"but its spec requires {declared_size} bytes")
+
+    physical_size = (math.prod(pool_shape) * torch.empty(
+        (), dtype=pool_dtype).element_size())
+    if physical_size != tensor_size:
+        raise ValueError(
+            f"Shared TPU KV cache shape {pool_shape} with dtype {pool_dtype} "
+            f"uses {physical_size} bytes, but its budget is {tensor_size} bytes"
+        )
+
+    first_spec = layer_specs[0][1]
+    return make_attention_cache_tensor(
+        spec=first_spec,
+        attn_backend=attn_backend,
+        num_blocks=num_blocks,
+        kernel_block_size=first_spec.block_size,
+        cache_dtype=pool_dtype,
+        device=device,
+    )
 
 
 def _can_allocate_attention_cache_directly(
