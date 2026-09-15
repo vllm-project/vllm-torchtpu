@@ -612,15 +612,18 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             if single_bkv_block:
                 end_bkv_idx = 1
             else:
+                if non_causal_block:
+                    # Draft block mode: every query in the block may attend
+                    # to the whole block, which ends at kv_len, not at this
+                    # bq block's last query.
+                    q_pos_end = kv_len
+                else:
+                    # Causal: no query sees past its own position, so the
+                    # last query of this bq block bounds the keys needed.
+                    q_pos_end = jnp.minimum(
+                        kv_len - q_len + (bq_idx + 1) * bq_sz, kv_len)
                 end_bkv_idx = jnp.maximum(
-                    cdiv(
-                        jnp.minimum(kv_len - q_len +
-                                    (bq_idx + 1) * bq_sz, kv_len) -
-                        cur_start_offset,
-                        bkv_sz,
-                    ),
-                    1,
-                )
+                    cdiv(q_pos_end - cur_start_offset, bkv_sz), 1)
 
             def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx):
                 next_bkv_idx = bkv_idx + 1

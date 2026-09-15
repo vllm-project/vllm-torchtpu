@@ -338,7 +338,9 @@ class CorrectnessTest(parameterized.TestCase):
                                 kv_lens,
                                 cu_q_lens,
                                 distribution,
-                                non_causal_block=False):
+                                non_causal_block=False,
+                                num_queries_per_block=8,
+                                num_kv_pages_per_block=2):
         total_tokens = q.shape[0]
         out_base, self.ref_cache, l_base, m_base = ref_implementation(
             q,
@@ -366,8 +368,8 @@ class CorrectnessTest(parameterized.TestCase):
                 self.attention_sinks,
                 sm_scale=1.0,
                 sliding_window=self.sliding_window,
-                num_queries_per_block=8,
-                num_kv_pages_per_block=2,
+                num_queries_per_block=num_queries_per_block,
+                num_kv_pages_per_block=num_kv_pages_per_block,
                 q_compute_block_size=2,
                 logical_page_size=self.page_size,
                 non_causal_block=non_causal_block,
@@ -469,7 +471,17 @@ class CorrectnessTest(parameterized.TestCase):
         self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens,
                                      distribution)
 
-    def test_non_causal_block(self):
+    @parameterized.named_parameters(
+        # bq >= block: the block sits in one query block.
+        ("one_bq_block", 8, 2),
+        # bq < block and bkv small enough that the single-bkv-block
+        # shortcut is off: the block spans three query blocks, so the
+        # walked key range must reach kv_len, not just each bq block's
+        # last query.
+        ("spans_bq_blocks", 2, 1),
+    )
+    def test_non_causal_block(self, num_queries_per_block,
+                              num_kv_pages_per_block):
         """Draft (DSpark/DFlash) block mode: bidirectional in-block attention.
 
         Step 1 builds per-sequence context causally (also revalidating the
@@ -511,12 +523,15 @@ class CorrectnessTest(parameterized.TestCase):
                             self.q_dtype)
         new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
         distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
-        self.run_and_compare_outputs(q,
-                                     new_kv,
-                                     self.kv_lens,
-                                     cu_q_lens,
-                                     distribution,
-                                     non_causal_block=True)
+        self.run_and_compare_outputs(
+            q,
+            new_kv,
+            self.kv_lens,
+            cu_q_lens,
+            distribution,
+            non_causal_block=True,
+            num_queries_per_block=num_queries_per_block,
+            num_kv_pages_per_block=num_kv_pages_per_block)
 
 
 if __name__ == "__main__":
