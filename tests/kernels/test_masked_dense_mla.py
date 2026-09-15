@@ -632,5 +632,56 @@ class AnalyticCausalMaskTest(MaskedDenseTestBase):
             )
 
 
+class SparseChunkRowContractTest(MaskedDenseTestBase):
+    """Rows the sparse kernel may write past its token end.
+
+    Masked-dense routing runs a sparse prefix over the query/output buffer the
+    masked-dense suffix reads afterwards, and restores only the rows that
+    `sparse_attention_chunk` documents it may overwrite past the split.
+    """
+
+    def test_rows_past_token_end(self):
+        tokens = 128
+        batch = sparse_mla_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE
+        pages = self._block_tables(1)
+        caches, _, _ = self._fill_cache([192], pages, 1.0)
+        query = self._random_queries(tokens)
+        original = np.asarray(query).copy()
+        topk = jnp.asarray(
+            self._topk_rows(
+                tokens, np.zeros(tokens, np.int32), [192], 2048, lambda _: 96
+            )
+        )
+        distribution = jnp.array([0, 0, 1], jnp.int32)
+
+        def attend(end):
+            # One sequence ending at `end`, so the kernel's token end is `end`.
+            return np.asarray(
+                sparse_mla_kernel.sparse_ragged_paged_attention(
+                    query,
+                    *caches,
+                    topk,
+                    pages,
+                    jnp.array([0, end], jnp.int32),
+                    distribution,
+                    sm_scale=self.sm_scale,
+                )
+            )
+
+        expected = attend(tokens)
+        for end in (0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 127):
+            with self.subTest(end=end):
+                result = attend(end)
+                np.testing.assert_allclose(
+                    result[:end, :, :LKV_DIM],
+                    expected[:end, :, :LKV_DIM],
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+                np.testing.assert_array_equal(
+                    result[end + batch - 1 :], original[end + batch - 1 :]
+                )
+
+
 if __name__ == "__main__":
     absltest.main()

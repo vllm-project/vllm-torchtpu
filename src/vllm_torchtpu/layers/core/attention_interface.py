@@ -941,10 +941,10 @@ def sparse_mla_attention(
             rope_spec=rope_spec,
         )
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         if not masked_dense_routing.applies(
             ql_nope, q_pe, kv_cache_nope, kv_cache_rope, topk_idx, cache_layout
         ):
+            q = jnp.concatenate([ql_nope, q_pe], axis=-1)
             output = sparse_mla_kernel.sparse_ragged_paged_attention(
                 q,
                 kv_cache_nope,
@@ -957,11 +957,20 @@ def sparse_mla_attention(
                 k_scale=dequant_scale,
                 cache_layout=cache_layout,
             )
+
+            lkv_dim = ql_nope.shape[-1]
+            # The kernel's output is lkv_dim + rope_dim wide because it attends
+            # over concatenated (nope + rope) keys. Only the nope part is the
+            # MLA value (P @ latent); drop the rope tail before the W_UV
+            # projection.
+            output = output[..., :lkv_dim]
         else:
             # Opt-in GLM-5.2 experiment (TPU_MLA_MASKED_DENSE_ENABLED=1): the
-            # step may run on the masked-dense kernel instead.
-            output = masked_dense_routing.ragged_paged_attention(
-                q,
+            # step may run wholly or partly on the masked-dense kernel. The
+            # result is already lkv_dim wide.
+            output = masked_dense_routing.attention_from_parts(
+                ql_nope,
+                q_pe,
                 kv_cache_nope,
                 kv_cache_rope,
                 topk_idx,
@@ -972,12 +981,7 @@ def sparse_mla_attention(
                 sm_scale=sm_scale or 1.0,
                 k_scale=dequant_scale,
             )
-
-        lkv_dim = ql_nope.shape[-1]
-        # The kernel's output is lkv_dim + rope_dim wide because it attends
-        # over concatenated (nope + rope) keys. Only the nope part is the MLA
-        # value (P @ latent); drop the rope tail before the W_UV projection.
-        return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
+        return output, kv_cache_nope, kv_cache_rope
 
     output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
         shard_map.shard_map(

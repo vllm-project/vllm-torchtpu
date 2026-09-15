@@ -18,6 +18,17 @@ after `applies` accepts the call's static shapes. The exact profile, the
 calibrated cost selection and the device-side choice between the sparse and
 masked-dense kernels all live here, so the sparse path, the runner and the
 attention metadata carry no routing state.
+
+Each step runs one of three routes, selected on device:
+
+    analytic, bitmap   masked-dense for every request, or a sparse prefix of
+                       one-token decodes and over-limit requests followed by a
+                       masked-dense suffix
+    sparse             the sparse kernel's stages for the whole step
+
+The runner may order requests as `[decode][longest KV ... shortest KV]`, but
+nothing here relies on that: each masked-dense route derives its split from
+device tensors and is not selected unless the sparse requests form a prefix.
 """
 
 import functools
@@ -35,10 +46,7 @@ from vllm_torchtpu.kernels.mla.masked_dense.cost_model import (
 from vllm_torchtpu.kernels.mla.masked_dense.kernel import (
     masked_dense_ragged_paged_attention,
 )
-from vllm_torchtpu.kernels.mla.sparse.kernel import (
-    TENSORCORE_CACHE_LAYOUT,
-    sparse_ragged_paged_attention,
-)
+from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
 
 # This profile is deliberately exact. The opt-in is process-wide, while the
 # sparse MLA wrapper is generic to vLLM's DeepSeekV2-style model family. An
@@ -60,6 +68,9 @@ MASKED_DENSE_PREFILL_COST_MODEL = GLM52_TPU7X_PREFILL_COST_MODEL
 # dynamic dispatcher would add branch and compilation cost to the common
 # decode path while serving no targeted prefill workload.
 MASKED_DENSE_MIN_TOKEN_BUCKET = 512
+# A 1,024-token TPU7x sweep found a split with 256 masked-dense suffix rows
+# slower than sparse-only, while 512 suffix rows was faster.
+MASKED_DENSE_MIN_SUFFIX_TOKENS = 512
 
 
 def _resolve_masked_dense_limit(name: str, default: int) -> int:
@@ -125,7 +136,7 @@ def applies(
     )
     return bool(
         envs.TPU_MLA_MASKED_DENSE_ENABLED
-        and cache_layout == TENSORCORE_CACHE_LAYOUT
+        and cache_layout == sparse_kernel.TENSORCORE_CACHE_LAYOUT
         and query.shape[0] >= MASKED_DENSE_MIN_TOKEN_BUCKET
         and matches_glm52_tpu7x_profile(
             query, kv_cache_nope, kv_cache_rope, topk_indices
@@ -133,82 +144,133 @@ def applies(
     )
 
 
-def _masked_dense_prefill_cost_tier(
+def split_point(
+    seq_lens: jax.Array,
+    request_distribution: jax.Array,
+    limit: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Splits a step into a sparse prefix and a masked-dense suffix.
+
+    The prefix holds every one-token decode and every request whose KV length
+    exceeds `limit`. Returns `(split_seq, contiguous)`: the split is usable
+    only when `contiguous`, i.e. those requests are exactly `[0, split_seq)`.
+    """
+    seq_ids = jnp.arange(seq_lens.shape[0])
+    active = seq_ids < request_distribution[2]
+    in_prefix = active & ((seq_ids < request_distribution[0]) | (seq_lens > limit))
+    split_seq = jnp.sum(in_prefix).astype(jnp.int32)
+    contiguous = jnp.all(~active | (in_prefix == (seq_ids < split_seq)))
+    return split_seq, contiguous
+
+
+def select_tier(
     seq_lens: jax.Array,
     request_distribution: jax.Array,
     query_start_loc: jax.Array,
     limits: tuple[int, int],
     cost_model: MaskedDensePrefillCostModel | None = None,
 ) -> jax.Array:
-    """Select analytic, bitmap, or sparse for a prefill-only request grid."""
+    """Selects 0 (analytic), 1 (bitmap) or 2 (sparse) for one step.
+
+    `limits` is (analytic, bitmap); zero disables a tier. A masked-dense tier
+    is a candidate when its split is contiguous, leaves at least one request
+    for the masked-dense kernel and, if it has a sparse prefix, at least
+    `MASKED_DENSE_MIN_SUFFIX_TOKENS` masked-dense tokens. The cheapest
+    candidate under the calibrated cost model wins.
+    """
     if cost_model is None:
         cost_model = MASKED_DENSE_PREFILL_COST_MODEL
-    analytic_limit, bitmap_limit = limits
+    unavailable = jnp.iinfo(jnp.int32).max
+    max_num_seqs = seq_lens.shape[0]
     num_seqs = request_distribution[2]
-    seq_ids = jnp.arange(seq_lens.shape[0])
+    seq_ids = jnp.arange(max_num_seqs)
     active = seq_ids < num_seqs
-    seq_ok = jnp.where(active, seq_lens, 0)
-    longest = jnp.max(seq_ok)
-    q_lens = (
-        query_start_loc[1 : seq_lens.shape[0] + 1]
-        - query_start_loc[: seq_lens.shape[0]]
-    )
-    kv_blocks = (seq_ok + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
+    q_lens = query_start_loc[1 : max_num_seqs + 1] - query_start_loc[:max_num_seqs]
+    kv_blocks = (jnp.where(active, seq_lens, 0) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
     q_blocks = (q_lens + QUERY_BLOCK_SIZE - 1) // QUERY_BLOCK_SIZE
-    q_kv_blocks = jnp.sum(jnp.where(active, q_blocks * kv_blocks, 0))
     num_tokens = query_start_loc[num_seqs]
 
-    shared_grid = cost_model.q_kv_block_ns * q_kv_blocks
-    analytic_cost = (
-        cost_model.analytic_fixed_ns
-        + cost_model.analytic_token_ns * num_tokens
-        + shared_grid
-    )
-    bitmap_cost = (
-        cost_model.bitmap_fixed_ns
-        + cost_model.bitmap_token_ns * num_tokens
-        + shared_grid
-    )
+    def masked_dense_cost(limit, fixed_ns, token_ns, bitmap):
+        if limit == 0:
+            return jnp.array(unavailable, jnp.int32)
+        split_seq, contiguous = split_point(seq_lens, request_distribution, limit)
+        split_token = query_start_loc[split_seq]
+        suffix_tokens = num_tokens - split_token
+        suffix = active & (seq_ids >= split_seq)
+        suffix_grid = jnp.sum(jnp.where(suffix, q_blocks * kv_blocks, 0))
+        # The CSA bitmap is generated for every query row, prefix included.
+        dense_tokens = num_tokens if bitmap else suffix_tokens
+        cost = (
+            fixed_ns + token_ns * dense_tokens + cost_model.q_kv_block_ns * suffix_grid
+        )
+        cost = cost + jnp.where(
+            split_seq > 0,
+            cost_model.sparse_fixed_ns + cost_model.sparse_token_ns * split_token,
+            0,
+        )
+        valid = (
+            contiguous
+            & (split_seq < num_seqs)
+            & ((split_seq == 0) | (suffix_tokens >= MASKED_DENSE_MIN_SUFFIX_TOKENS))
+        )
+        return jnp.where(valid, cost, unavailable)
+
+    analytic_limit, bitmap_limit = limits
     sparse_cost = cost_model.sparse_fixed_ns + cost_model.sparse_token_ns * num_tokens
-    analytic_valid = (analytic_limit > 0) & (longest <= analytic_limit)
-    bitmap_valid = (bitmap_limit > 0) & (longest <= bitmap_limit)
-    unavailable = jnp.iinfo(jnp.int32).max
     costs = jnp.stack(
         (
-            jnp.where(analytic_valid, analytic_cost, unavailable),
-            jnp.where(bitmap_valid, bitmap_cost, unavailable),
+            masked_dense_cost(
+                analytic_limit,
+                cost_model.analytic_fixed_ns,
+                cost_model.analytic_token_ns,
+                bitmap=False,
+            ),
+            masked_dense_cost(
+                bitmap_limit,
+                cost_model.bitmap_fixed_ns,
+                cost_model.bitmap_token_ns,
+                bitmap=True,
+            ),
             sparse_cost,
         )
     )
     return jnp.argmin(costs).astype(jnp.int32)
 
 
-def masked_dense_prefill_mla_tier(
-    seq_lens: jax.Array,
-    request_distribution: jax.Array,
-    query_start_loc: jax.Array,
-    limits: tuple[int, int],
-    cost_model: MaskedDensePrefillCostModel | None = None,
-) -> jax.Array:
-    """Select a tier, forcing any one-token decode prefix to sparse."""
+def _sparse_prefix(q, split_token, run_chunk):
+    """Sparse attention for query rows `[0, split_token)`, in place.
 
-    # One-token decode prefixes remain sparse in PR1. Keep the reductions and
-    # cost arithmetic inside the untaken branch for standalone callers. The
-    # production dispatcher moves this guard around the attention operations.
-    has_decode = request_distribution[0] > 0
+    `run_chunk(q, start_pos, token_end)` runs one sparse chunk. Its attention
+    grid may overwrite up to `attention_kernel_batch_size - 1` rows at or after
+    `token_end` (see `sparse_attention_chunk`); those rows still hold suffix
+    queries for the masked-dense kernel, so they are saved and restored.
 
-    def _prefill_tier(_):
-        return _masked_dense_prefill_cost_tier(
-            seq_lens, request_distribution, query_start_loc, limits, cost_model
+    A split always leaves at least `MASKED_DENSE_MIN_SUFFIX_TOKENS` suffix
+    rows, so chunks starting in that tail are not emitted. Earlier chunks are
+    skipped on device once they start past the split.
+    """
+    num_rows = q.shape[0]
+    chunk_size = sparse_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE
+    window = min(sparse_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE - 1, num_rows)
+    first = jnp.minimum(split_token, num_rows - window)
+    saved = jax.lax.dynamic_slice_in_dim(q, first, window)
+    for start_pos in range(0, num_rows - MASKED_DENSE_MIN_SUFFIX_TOKENS, chunk_size):
+        q = jax.lax.cond(
+            start_pos < split_token,
+            functools.partial(run_chunk, start_pos=start_pos, token_end=split_token),
+            lambda x: x,
+            q,
         )
-
-    return jax.lax.cond(
-        has_decode, lambda _: jnp.array(2, jnp.int32), _prefill_tier, None
+    written = jax.lax.dynamic_slice_in_dim(q, first, window)
+    suffix_rows = (first + jnp.arange(window)) >= split_token
+    return jax.lax.dynamic_update_slice_in_dim(
+        q, jnp.where(suffix_rows[:, None, None], saved, written), first, 0
     )
 
 
-def ragged_paged_attention(
-    q: jax.Array,
+def attention_from_parts(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
     topk_indices: jax.Array,
@@ -217,26 +279,51 @@ def ragged_paged_attention(
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
     *,
-    sm_scale: float | None = None,
-    k_scale: float | None = None,
+    sm_scale: float,
+    k_scale: float,
 ) -> jax.Array:
-    """Dispatch one traced DSA step for a call `applies` accepted."""
-    limits = (MASKED_DENSE_ANALYTIC_LIMIT, MASKED_DENSE_LIMIT)
+    """MLA attention for a call `applies` accepted.
 
-    def _sparse():
-        return sparse_ragged_paged_attention(
+    Returns `[tokens, heads, ql_nope.shape[-1]]`. Each route concatenates the
+    query parts and crops its own output: under the torch-tpu lowering an array
+    crossing a `lax.switch`/`lax.cond` boundary is copied, so the full-width
+    query and output stay inside the routes.
+    """
+    num_rows, num_heads, latent_width = ql_nope.shape
+    chunk_size = sparse_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE
+
+    def query():
+        return sparse_kernel.prepare_q_inputs(jnp.concatenate([ql_nope, q_pe], axis=-1))
+
+    def crop(q):
+        return q[:, :num_heads, :latent_width]
+
+    # Query-independent, so it is prepared once outside the conditionals and
+    # layers that share these indexer outputs can share it too.
+    kv_lens, physical_indices = sparse_kernel.prepare_gather_indices(
+        topk_indices,
+        block_tables,
+        query_start_loc,
+        page_size=kv_cache_nope.shape[1],
+        total_num_pages=kv_cache_nope.shape[0],
+    )
+
+    def sparse_chunk(q, start_pos, token_end):
+        return sparse_kernel.sparse_attention_chunk(
             q,
             kv_cache_nope,
             kv_cache_rope,
-            topk_indices,
-            block_tables,
-            query_start_loc,
-            request_distribution,
-            sm_scale=sm_scale or 1.0,
-            k_scale=k_scale or 1.0,
+            kv_lens,
+            physical_indices,
+            None,
+            start_pos=start_pos,
+            end_pos=min(start_pos + chunk_size, num_rows),
+            token_end=token_end,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
         )
 
-    def _masked_dense(max_kv_len):
+    def masked_dense(q, max_kv_len, sequence_start=None):
         return masked_dense_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -246,40 +333,50 @@ def ragged_paged_attention(
             block_tables,
             query_start_loc,
             request_distribution,
-            sm_scale=sm_scale or 1.0,
-            k_scale=k_scale or 1.0,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
             max_kv_len=max_kv_len,
             num_kv_pages_per_block=MASKED_DENSE_KV_PAGES_PER_BLOCK,
             num_queries_per_block=MASKED_DENSE_QUERIES_PER_BLOCK,
+            sequence_start=sequence_start,
         )
+
+    def sparse_route():
+        q = query()
+        token_end = query_start_loc[request_distribution[2]]
+        for start_pos in range(0, num_rows, chunk_size):
+            q = sparse_chunk(q, start_pos, token_end)
+        return crop(q)
+
+    def masked_dense_route(limit, max_kv_len):
+        split_seq, _ = split_point(seq_lens, request_distribution, limit)
+
+        def whole(_):
+            return crop(masked_dense(query(), max_kv_len))
+
+        def split(_):
+            q = _sparse_prefix(query(), query_start_loc[split_seq], sparse_chunk)
+            return crop(masked_dense(q, max_kv_len, split_seq))
+
+        return jax.lax.cond(split_seq > 0, split, whole, None)
 
     page_span = block_tables.shape[0] // seq_lens.shape[0] * kv_cache_nope.shape[1]
-    branches, tier_limits = [], list(limits)
-    for slot, bound in enumerate(limits):
-        bound = min(_align_to(bound, MASKED_DENSE_KV_BLOCK), page_span)
-        if bound == 0 or (slot == 0 and bound > topk_indices.shape[-1]):
-            tier_limits[slot] = 0
+    branches, tier_limits = [], []
+    for slot, limit in enumerate((MASKED_DENSE_ANALYTIC_LIMIT, MASKED_DENSE_LIMIT)):
+        max_kv_len = min(_align_to(limit, MASKED_DENSE_KV_BLOCK), page_span)
+        if max_kv_len == 0 or (slot == 0 and max_kv_len > topk_indices.shape[-1]):
+            tier_limits.append(0)
         else:
-            branches.append(functools.partial(_masked_dense, bound))
-    branches.append(_sparse)
+            tier_limits.append(limit)
+            branches.append(functools.partial(masked_dense_route, limit, max_kv_len))
+    branches.append(sparse_route)
 
     if len(branches) == 1:
-        return _sparse()
-
-    def _dispatch_prefill(_):
-        tier = _masked_dense_prefill_cost_tier(
-            seq_lens, request_distribution, query_start_loc, tuple(tier_limits)
-        )
-        if len(branches) == 2:
-            kept = 0 if tier_limits[0] else 1
-            return jax.lax.cond(
-                tier == kept, lambda _: branches[0](), lambda _: branches[1](), None
-            )
-        return jax.lax.switch(tier, branches)
-
-    # PR1 deliberately keeps batches with a decode prefix on sparse. Put that
-    # decision around the kernel launches themselves: mixed/decode steps take
-    # one conditional directly to sparse and never enter the cost selector or
-    # three-way switch.
-    has_decode = request_distribution[0] > 0
-    return jax.lax.cond(has_decode, lambda _: _sparse(), _dispatch_prefill, None)
+        return sparse_route()
+    tier = select_tier(
+        seq_lens, request_distribution, query_start_loc, tuple(tier_limits)
+    )
+    if len(branches) == 2:
+        kept = 0 if tier_limits[0] else 1
+        return jax.lax.cond(tier == kept, branches[0], branches[1])
+    return jax.lax.switch(tier, branches)

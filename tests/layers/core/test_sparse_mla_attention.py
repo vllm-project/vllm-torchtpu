@@ -676,8 +676,8 @@ class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):
             )
 
 
-class MaskedDensePrefillTierTest(parameterized.TestCase):
-    """Prefill cost tier: 0 analytic, 1 CSA bitmap, 2 sparse gather.
+class MaskedDenseTierTest(parameterized.TestCase):
+    """Route selection: 0 analytic, 1 CSA bitmap, 2 sparse gather.
 
     Pure jnp on tiny arrays, so it runs anywhere and can cover cases the
     numeric tests below cannot reach cheaply.
@@ -690,7 +690,7 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
         starts[1 : len(q_lens) + 1] = np.cumsum(q_lens)
         starts[len(q_lens) + 1 :] = sum(q_lens)
         return int(
-            masked_dense_routing.masked_dense_prefill_mla_tier(
+            masked_dense_routing.select_tier(
                 jnp.asarray(seq_lens, jnp.int32),
                 jnp.asarray(distribution, jnp.int32),
                 jnp.asarray(starts, jnp.int32),
@@ -705,9 +705,20 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
         self.assertEqual(self._tier([6144], [1024], [0, 0, 1]), 1)
         self.assertEqual(self._tier([7168], [1024], [0, 0, 1]), 2)
 
-    @parameterized.parameters(([1], [1, 1, 1]), ([1, 1024], [1, 1, 2]))
-    def test_any_decode_forces_sparse(self, q_lens, distribution):
-        self.assertEqual(self._tier([1024] * len(q_lens), q_lens, distribution), 2)
+    def test_decode_only_uses_sparse(self):
+        self.assertEqual(self._tier([1024], [1], [1, 1, 1]), 2)
+
+    def test_decode_prefix_and_short_suffix_can_split(self):
+        self.assertEqual(self._tier([9000, 1024], [1, 1024], [1, 1, 2]), 0)
+
+    def test_long_prefix_and_short_suffix_can_split(self):
+        self.assertEqual(self._tier([8192, 1024], [512, 512], [0, 0, 2]), 0)
+
+    def test_noncontiguous_prefix_falls_back_to_sparse(self):
+        self.assertEqual(self._tier([1024, 8192, 1024], [512] * 3, [0, 0, 3]), 2)
+
+    def test_small_suffix_uses_sparse(self):
+        self.assertEqual(self._tier([8192, 9216, 8192, 1536], [256] * 4, [0, 0, 4]), 2)
 
     def test_cost_sums_multiple_prefill_requests(self):
         self.assertEqual(self._tier([1024, 2048], [512, 512], [0, 0, 2]), 0)
@@ -725,17 +736,44 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
         self.assertEqual(self._tier([8], [8], [0, 0, 1], (0, 6144)), 1)
         self.assertEqual(self._tier([8], [8], [0, 0, 1], GATHER_ONLY), 2)
 
+    def test_split_point(self):
+        seq_lens = jnp.asarray([80, 100, 40, 100000], jnp.int32)
+        split_seq, contiguous = masked_dense_routing.split_point(
+            seq_lens, jnp.asarray([1, 1, 3], jnp.int32), 64
+        )
+        self.assertEqual(int(split_seq), 2)
+        self.assertTrue(bool(contiguous))
+        split_seq, contiguous = masked_dense_routing.split_point(
+            jnp.asarray([40, 100, 40], jnp.int32), jnp.asarray([0, 0, 3], jnp.int32), 64
+        )
+        self.assertEqual(int(split_seq), 1)
+        self.assertFalse(bool(contiguous))
+
+
+# Flag off: the layer's original sparse call, the reference for every route.
+ORIGINAL_SPARSE = None
+
+# (name, q_lens, seq_lens, num_decode). `seq_lens` may be longer than `q_lens`
+# to stand in for the runner's padding past `num_seqs`.
+ROUTE_COMPOSITIONS = (
+    ("whole", [40, 24], [40, 24], 0),
+    ("long_prefix", [24, 40], [100, 40], 0),
+    ("decode_prefix", [1, 40], [80, 40], 1),
+    ("prefix_on_batch_boundary", [16, 48], [100, 48], 0),
+    ("prefix_near_end", [56, 8], [100, 8], 0),
+)
+
 
 class MaskedDenseDispatchTest(parameterized.TestCase):
-    """End to end: every tier of the dispatch computes the same attention.
+    """End to end: every route computes the same attention as sparse.
 
     The branch taken is not observable from Python -- it is a `jax.lax.switch`
     inside the traced function -- so the check is indirect. Each case runs the
-    same batch twice, once under limits that route it to a masked-dense tier
-    and once pinned to the gather kernel, and the two outputs must agree to
-    tolerance. They are not bit-identical in general: the gather kernel does a
-    single-block softmax while masked-dense runs an online FlashAttention-2
-    softmax over streamed blocks.
+    same batch under routing and through the layer's original sparse call, and
+    the two outputs must agree to tolerance. Masked-dense results are not
+    bit-identical in general: the gather kernel does a single-block softmax
+    while masked-dense runs an online FlashAttention-2 softmax over streamed
+    blocks.
     """
 
     TOPK = 128
@@ -747,7 +785,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("sparse MLA kernels require a TPU (SparseCore).")
 
-    def _run(self, q_lens, seq_lens, num_decode, limits):
+    def _run(self, q_lens, seq_lens, num_decode, limits, min_suffix_tokens=None):
         """Runs one step under `limits` and returns the attention output.
 
         Any prior context is written by a preceding prefill step, so every
@@ -775,7 +813,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
                 prior,
                 prior,
                 0,
-                GATHER_ONLY,
+                ORIGINAL_SPARSE,
                 rng,
                 block_tables,
                 mesh,
@@ -794,6 +832,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
             pad_seqs,
             num_seqs,
             seq_lens,
+            min_suffix_tokens=min_suffix_tokens,
         )
         assert np.any(out), "degenerate case: both kernels would return zeros"
         return out
@@ -811,8 +850,13 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         pad_seqs,
         num_seqs,
         seq_lens=None,
+        min_suffix_tokens=None,
     ):
-        """One `sparse_mla_attention` call; returns (caches, output)."""
+        """One `sparse_mla_attention` call; returns (caches, output).
+
+        `limits=ORIGINAL_SPARSE` disables routing, so the layer takes its
+        original sparse call.
+        """
         total = sum(q_lens)
         num_tokens = max(TOKEN_PAD, math.ceil(total / TOKEN_PAD) * TOKEN_PAD)
         starts = np.zeros(pad_seqs + 1, np.int32)
@@ -843,14 +887,33 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
             dtype=jnp.bfloat16,
         )
 
-        with (
-            _masked_dense_limits(*limits),
-            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
-            mock.patch.object(masked_dense_routing, "MASKED_DENSE_MIN_TOKEN_BUCKET", 0),
-            mock.patch.object(
-                masked_dense_routing, "matches_glm52_tpu7x_profile", return_value=True
-            ),
-        ):
+        routed = limits is not ORIGINAL_SPARSE
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", routed)
+            )
+            if routed:
+                stack.enter_context(_masked_dense_limits(*limits))
+                stack.enter_context(
+                    mock.patch.object(
+                        masked_dense_routing, "MASKED_DENSE_MIN_TOKEN_BUCKET", 0
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        masked_dense_routing,
+                        "matches_glm52_tpu7x_profile",
+                        return_value=True,
+                    )
+                )
+            if min_suffix_tokens is not None:
+                stack.enter_context(
+                    mock.patch.object(
+                        masked_dense_routing,
+                        "MASKED_DENSE_MIN_SUFFIX_TOKENS",
+                        min_suffix_tokens,
+                    )
+                )
             nope, rope, output = attention_interface.sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -905,48 +968,85 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
             limits=(128, 4096),
         ),
     )
-    def test_masked_dense_agrees_with_gather(
+    def test_masked_dense_agrees_with_sparse(
         self, q_lens, seq_lens, num_decode, limits
     ):
         np.testing.assert_allclose(
             self._run(q_lens, seq_lens, num_decode, limits),
-            self._run(q_lens, seq_lens, num_decode, GATHER_ONLY),
+            self._run(q_lens, seq_lens, num_decode, ORIGINAL_SPARSE),
             rtol=2e-2,
             atol=2e-2,
         )
 
     @parameterized.named_parameters(
-        # One over-limit sequence pushes the whole step to the gather kernel,
-        # short neighbour included -- the dispatch is per step.
+        # A noncontiguous long request keeps the whole step on sparse.
         dict(
-            testcase_name="one_long_sequence",
+            testcase_name="noncontiguous_long_sequence",
             q_lens=[40, 24],
             seq_lens=[40, 100],
             num_decode=0,
             limits=(32, 64),
         ),
-        # A one-token decode prefix keeps PR1 on the original sparse path.
         dict(
-            testcase_name="decode_always_sparse",
+            testcase_name="decode_only",
             q_lens=[1, 1],
             seq_lens=[80, 96],
             num_decode=2,
             limits=(4096, 4096),
         ),
+        # The suffix is under MASKED_DENSE_MIN_SUFFIX_TOKENS.
         dict(
-            testcase_name="mixed_always_sparse",
+            testcase_name="short_suffix",
             q_lens=[1, 40],
             seq_lens=[80, 40],
             num_decode=1,
             limits=(4096, 4096),
         ),
+        # Every masked-dense tier disabled.
+        dict(
+            testcase_name="gather_only",
+            q_lens=[40, 24],
+            seq_lens=[40, 24],
+            num_decode=0,
+            limits=GATHER_ONLY,
+        ),
     )
-    def test_routes_to_gather(self, q_lens, seq_lens, num_decode, limits):
-        """Routed to the gather kernel, so bit-identical to the pinned run."""
+    def test_sparse_route_is_the_original_sparse_call(
+        self, q_lens, seq_lens, num_decode, limits
+    ):
+        """The sparse route uses the same stages, so it is bit-identical."""
         np.testing.assert_array_equal(
             self._run(q_lens, seq_lens, num_decode, limits),
-            self._run(q_lens, seq_lens, num_decode, GATHER_ONLY),
+            self._run(q_lens, seq_lens, num_decode, ORIGINAL_SPARSE),
         )
+
+    @parameterized.named_parameters(
+        (f"{name}_tier{tier}", tier, q_lens, seq_lens, num_decode)
+        for name, q_lens, seq_lens, num_decode in ROUTE_COMPOSITIONS
+        for tier in (0, 1, 2)
+    )
+    def test_forced_route_matches_original_sparse(
+        self, tier, q_lens, seq_lens, num_decode
+    ):
+        """Every route, including split steps, against the original call.
+
+        The tier is forced through a device operand so all branches compile.
+        The minimum suffix is lifted so these small steps can split.
+        """
+        offset = (tier - seq_lens[0]) % 3
+        with mock.patch.object(
+            masked_dense_routing,
+            "select_tier",
+            side_effect=lambda lengths, *a, **k: (lengths[0] + offset) % 3,
+        ):
+            actual = self._run(
+                q_lens, seq_lens, num_decode, (64, 4096), min_suffix_tokens=0
+            )
+        expected = self._run(q_lens, seq_lens, num_decode, ORIGINAL_SPARSE)
+        if tier == 2:
+            np.testing.assert_array_equal(actual, expected)
+        else:
+            np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 class MaskedDenseDispatchSetupTest(parameterized.TestCase):
@@ -969,8 +1069,8 @@ class MaskedDenseDispatchSetupTest(parameterized.TestCase):
         mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
         with mock.patch.object(
             masked_dense_routing,
-            "ragged_paged_attention",
-            side_effect=lambda q, *args, **kwargs: q,
+            "attention_from_parts",
+            side_effect=lambda ql_nope, q_pe, *args, **kwargs: ql_nope,
         ):
             caches, output = case._step(
                 _empty_pair(),
@@ -992,6 +1092,280 @@ class MaskedDenseDispatchSetupTest(parameterized.TestCase):
             self.assertEqual(cache.dtype, spec.jax_dtype)
             self.assertTrue(np.any(np.asarray(cache)))
             np.testing.assert_array_equal(np.asarray(cache)[1:], 0)
+
+
+class SparseMlaLayerBranchTest(parameterized.TestCase):
+    """The layer calls the sparse kernel directly unless routing applies."""
+
+    @parameterized.parameters(False, True)
+    def test_layer_branch(self, applies):
+        if jax.devices()[0].platform == "cpu":
+            self.enter_context(
+                mock.patch.object(
+                    attention_interface,
+                    "update_sparse_mla_kv_cache",
+                    autospec=True,
+                    side_effect=kv_cache_utils.update_sparse_mla_kv_cache_jax,
+                )
+            )
+        case = MaskedDenseDispatchTest()
+        case.k_scale = 1.5
+        case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
+        with (
+            mock.patch.object(
+                attention_interface.sparse_mla_kernel,
+                "sparse_ragged_paged_attention",
+                side_effect=lambda q, *a, **k: q,
+            ) as sparse,
+            mock.patch.object(
+                masked_dense_routing,
+                "attention_from_parts",
+                side_effect=lambda ql_nope, *a, **k: ql_nope,
+            ) as routed,
+            mock.patch.object(masked_dense_routing, "applies", return_value=applies),
+        ):
+            _, output = case._step(
+                _empty_pair(),
+                [8],
+                [8],
+                0,
+                GATHER_ONLY,
+                np.random.default_rng(99),
+                jnp.arange(PAGES_PER_SEQ, dtype=jnp.int32),
+                mesh,
+                1,
+                1,
+            )
+        self.assertEqual(output.shape, (8, NUM_HEADS, LKV_DIM))
+        self.assertEqual(routed.call_count, int(applies))
+        self.assertEqual(sparse.call_count, int(not applies))
+
+
+def _cond_boundaries(jaxpr, depth=0):
+    """(nesting depth, aval) of every cond operand and result."""
+    for eqn in jaxpr.eqns:
+        inner_depth = depth
+        if eqn.primitive.name == "cond":
+            inner_depth = depth + 1
+            for var in list(eqn.invars[1:]) + list(eqn.outvars):
+                yield inner_depth, var.aval
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, (list, tuple)) else [param]:
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    yield from _cond_boundaries(inner, inner_depth)
+
+
+class MaskedDenseRouteCompositionTest(parameterized.TestCase):
+    """How `attention_from_parts` composes its routes, with kernels stubbed.
+
+    The sparse chunk stub scales the rows it owns by 5 and, like the real
+    attention grid, overwrites rows just past its token end. The masked-dense
+    stub scales every row from `sequence_start` by 7, or all rows by 3 when it
+    covers the whole step. The tier is forced through a device operand, so all
+    branches compile and the selected one runs on CPU.
+    """
+
+    NUM_TOKENS = 64
+    TOPK = 128
+    LIMITS = (64, 4096)
+    OVERWRITTEN = -1e4
+
+    @classmethod
+    def _fake_sparse_chunk(cls, q, *args, start_pos, end_pos, token_end, **kwargs):
+        del args, kwargs
+        rows = jnp.arange(q.shape[0])[:, None, None]
+        in_chunk = (rows >= start_pos) & (rows < end_pos)
+        owned = in_chunk & (rows < token_end)
+        overwritten = (
+            in_chunk
+            & (rows >= token_end)
+            & (
+                rows
+                < token_end + sparse_mla_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE - 1
+            )
+        )
+        return jnp.where(owned, q * 5, jnp.where(overwritten, cls.OVERWRITTEN, q))
+
+    @staticmethod
+    def _fake_masked_dense(
+        q,
+        nope,
+        rope,
+        seq_lens,
+        topk,
+        block_tables,
+        starts,
+        distribution,
+        *,
+        sequence_start,
+        **kwargs,
+    ):
+        del nope, rope, seq_lens, topk, block_tables, distribution, kwargs
+        if sequence_start is None:
+            return q * 3
+        rows = jnp.arange(q.shape[0])[:, None, None]
+        return jnp.where(rows >= starts[sequence_start], q * 7, q)
+
+    def _operands(self, q_lens, seq_lens, num_decode):
+        rng = np.random.default_rng(7)
+        num_seqs = len(q_lens)
+        starts = np.zeros(num_seqs + 1, np.int32)
+        starts[1:] = np.cumsum(q_lens)
+        nope, rope = _empty_pair()
+        return (
+            jnp.asarray(
+                rng.standard_normal((self.NUM_TOKENS, NUM_HEADS, LKV_DIM)), jnp.float32
+            ),
+            jnp.asarray(
+                rng.standard_normal((self.NUM_TOKENS, NUM_HEADS, ROPE_DIM)), jnp.float32
+            ),
+            nope,
+            rope,
+            jnp.asarray(_causal_topk([0] * self.NUM_TOKENS, self.TOPK)),
+            jnp.asarray(seq_lens, jnp.int32),
+            jnp.arange(num_seqs * PAGES_PER_SEQ, dtype=jnp.int32),
+            jnp.asarray(starts),
+            jnp.asarray([num_decode, num_decode, num_seqs], jnp.int32),
+        )
+
+    def _route(self):
+        def fn(*operands_and_tier):
+            *operands, forced = operands_and_tier
+            with (
+                mock.patch.object(
+                    sparse_mla_kernel,
+                    "sparse_attention_chunk",
+                    side_effect=self._fake_sparse_chunk,
+                ),
+                mock.patch.object(
+                    sparse_mla_kernel,
+                    "prepare_gather_indices",
+                    side_effect=lambda topk, *a, **k: (
+                        jnp.zeros(topk.shape[:1], jnp.int32),
+                        topk,
+                    ),
+                ),
+                mock.patch.object(
+                    masked_dense_routing,
+                    "masked_dense_ragged_paged_attention",
+                    side_effect=self._fake_masked_dense,
+                ),
+                mock.patch.object(
+                    masked_dense_routing, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0
+                ),
+                _masked_dense_limits(*self.LIMITS),
+                mock.patch.object(
+                    masked_dense_routing,
+                    "select_tier",
+                    side_effect=lambda *a, **k: forced,
+                ),
+            ):
+                return masked_dense_routing.attention_from_parts(
+                    *operands, sm_scale=1.0, k_scale=1.0
+                )
+
+        return fn
+
+    @parameterized.named_parameters(
+        (f"{name}_tier{tier}", tier, q_lens, seq_lens, num_decode)
+        for name, q_lens, seq_lens, num_decode in ROUTE_COMPOSITIONS
+        for tier in (0, 1, 2)
+    )
+    def test_route_rows(self, tier, q_lens, seq_lens, num_decode):
+        operands = self._operands(q_lens, seq_lens, num_decode)
+        total = sum(q_lens)
+        ql_nope = np.asarray(operands[0])[:total]
+        actual = np.asarray(
+            jax.jit(self._route())(*operands, jnp.asarray(tier, jnp.int32))
+        )
+        self.assertEqual(actual.shape, operands[0].shape)
+
+        factors = np.full(total, 5.0)
+        if tier < 2:
+            split_seq = sum(
+                1
+                for s, length in enumerate(seq_lens[: len(q_lens)])
+                if s < num_decode or length > self.LIMITS[tier]
+            )
+            split_token = sum(q_lens[:split_seq])
+            if split_seq == 0:
+                factors[:] = 3.0
+            else:
+                factors[split_token:] = 7.0
+        np.testing.assert_allclose(
+            actual[:total], ql_nope * factors[:, None, None], rtol=1e-6
+        )
+
+    @parameterized.named_parameters(
+        (name, q_lens, seq_lens, num_decode)
+        for name, q_lens, seq_lens, num_decode in ROUTE_COMPOSITIONS
+    )
+    def test_switch_and_split_do_not_carry_the_query(
+        self, q_lens, seq_lens, num_decode
+    ):
+        """The switch and the split conditional carry only the query parts.
+
+        The per-chunk conditionals of a sparse prefix (depth 3) do carry the
+        padded query; whether that copy costs more than the gathers it skips
+        is a measurement, not something this test decides.
+        """
+        operands = self._operands(q_lens, seq_lens, num_decode)
+        jaxpr = jax.make_jaxpr(self._route())(*operands, jnp.asarray(1, jnp.int32))
+        boundaries = list(_cond_boundaries(jaxpr.jaxpr))
+        self.assertNotEmpty(boundaries)
+        query_widths = (
+            LKV_DIM + ROPE_DIM,
+            sparse_mla_kernel.align_to(LKV_DIM + ROPE_DIM, 128),
+        )
+        for depth, aval in boundaries:
+            if depth <= 2 and getattr(aval, "ndim", 0) == 3:
+                self.assertNotIn(aval.shape[-1], query_widths)
+
+
+class SparsePrefixTest(parameterized.TestCase):
+    """`_sparse_prefix` keeps the suffix rows the sparse grid overwrites."""
+
+    NUM_ROWS = 128
+
+    @parameterized.parameters(1, 15, 16, 17, 63, 64, 65, 100, 113, 127)
+    def test_suffix_rows_are_restored(self, split_token):
+        q = jnp.asarray(
+            np.random.default_rng(3).standard_normal((self.NUM_ROWS, 2, 8)), jnp.float32
+        )
+
+        def run_chunk(q, start_pos, token_end):
+            return MaskedDenseRouteCompositionTest._fake_sparse_chunk(
+                q,
+                start_pos=start_pos,
+                end_pos=min(start_pos + 64, self.NUM_ROWS),
+                token_end=token_end,
+            )
+
+        with mock.patch.object(
+            masked_dense_routing, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0
+        ):
+            out = np.asarray(
+                jax.jit(
+                    lambda q, split: masked_dense_routing._sparse_prefix(
+                        q, split, run_chunk
+                    )
+                )(q, jnp.asarray(split_token, jnp.int32))
+            )
+        expected = np.asarray(q).copy()
+        expected[:split_token] *= 5
+        np.testing.assert_array_equal(out, expected)
+
+    def test_chunks_in_the_minimum_suffix_are_not_emitted(self):
+        q = jnp.zeros((1024, 2, 8), jnp.float32)
+        jaxpr = jax.make_jaxpr(
+            lambda q, split: masked_dense_routing._sparse_prefix(
+                q, split, lambda q, **k: q
+            )
+        )(q, jnp.asarray(1, jnp.int32))
+        conds = [e for e in jaxpr.jaxpr.eqns if e.primitive.name == "cond"]
+        self.assertLen(conds, (1024 - 512) // 64)
 
 
 class MaskedDenseLimitResolutionTest(parameterized.TestCase):
@@ -1101,50 +1475,3 @@ class MaskedDenseProfileTest(parameterized.TestCase):
                 cache_layout="sparsecore",
             )
         )
-
-
-class SparseMlaLayerBranchTest(parameterized.TestCase):
-    """The layer calls the sparse kernel directly unless routing applies."""
-
-    @parameterized.parameters(False, True)
-    def test_layer_branch(self, applies):
-        if jax.devices()[0].platform == "cpu":
-            self.enter_context(
-                mock.patch.object(
-                    attention_interface,
-                    "update_sparse_mla_kv_cache",
-                    autospec=True,
-                    side_effect=kv_cache_utils.update_sparse_mla_kv_cache_jax,
-                )
-            )
-        case = MaskedDenseDispatchTest()
-        case.k_scale = 1.5
-        case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
-        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
-        with (
-            mock.patch.object(
-                attention_interface.sparse_mla_kernel,
-                "sparse_ragged_paged_attention",
-                side_effect=lambda q, *a, **k: q,
-            ) as sparse,
-            mock.patch.object(
-                masked_dense_routing,
-                "ragged_paged_attention",
-                side_effect=lambda q, *a, **k: q,
-            ) as routed,
-            mock.patch.object(masked_dense_routing, "applies", return_value=applies),
-        ):
-            case._step(
-                _empty_pair(),
-                [8],
-                [8],
-                0,
-                GATHER_ONLY,
-                np.random.default_rng(99),
-                jnp.arange(PAGES_PER_SEQ, dtype=jnp.int32),
-                mesh,
-                1,
-                1,
-            )
-        self.assertEqual(routed.call_count, int(applies))
-        self.assertEqual(sparse.call_count, int(not applies))

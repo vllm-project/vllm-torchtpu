@@ -11,11 +11,11 @@ Both kernels compute GLM-5.2's DSA attention over the same paged
   and the gather hot-spots when many tokens select overlapping rows, which is
   exactly what happens while a sequence is short.
 
-The production dispatcher considers masked-dense only for prefill-only
-batches. This script measures the crossover at GLM-5.2's serving geometry and
-also times the complete enabled-dispatch wrapper against direct sparse for
-prefill, decode, and mixed steps. Decode-sized token buckets bypass dispatch
-statically; larger mixed buckets exercise the runtime sparse fallback.
+The production routing can run a step wholly on masked-dense, or split it
+into a sparse prefix and a masked-dense suffix. This script measures the
+crossover at GLM-5.2's serving geometry and also times the complete enabled
+routing wrapper against direct sparse for prefill, decode, and mixed steps.
+Decode-sized token buckets keep the original sparse call statically.
 
     prefill step:  1 sequence  x 1024 query tokens
     decode step:  64 sequences x    1 query token
@@ -216,10 +216,6 @@ def _build_wrapper(enable_dispatch: bool):
     """Stable production-equivalent cache-update + attention executable."""
     mesh = Mesh(np.asarray(jax.local_devices()[:1]), ("model",))
     sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
-    limits = (
-        masked_dense_routing.MASKED_DENSE_ANALYTIC_LIMIT,
-        masked_dense_routing.MASKED_DENSE_LIMIT,
-    )
 
     def integrated(
         ql_nope,
@@ -262,10 +258,15 @@ def _build_wrapper(enable_dispatch: bool):
             nope_spec=nope_spec,
             rope_spec=rope_spec,
         )
-        q = jnp.concatenate((ql_nope, q_pe), axis=-1)
 
-        def gather(_):
-            return sparse.sparse_ragged_paged_attention(
+        # Mirrors the sparse MLA layer: the original sparse call unless the
+        # masked-dense routing applies to this token bucket.
+        if not (
+            enable_dispatch
+            and ql_nope.shape[0] >= masked_dense_routing.MASKED_DENSE_MIN_TOKEN_BUCKET
+        ):
+            q = jnp.concatenate((ql_nope, q_pe), axis=-1)
+            output = sparse.sparse_ragged_paged_attention(
                 q,
                 nope,
                 rope,
@@ -276,44 +277,21 @@ def _build_wrapper(enable_dispatch: bool):
                 sm_scale=sm_scale,
                 k_scale=1.0,
             )
-
-        if (
-            not enable_dispatch
-            or q.shape[0] < masked_dense_routing.MASKED_DENSE_MIN_TOKEN_BUCKET
-        ):
-            output = gather(None)
-        else:
-
-            def dense(max_kv_len, _):
-                return masked_dense.masked_dense_ragged_paged_attention(
-                    q,
-                    nope,
-                    rope,
-                    seq_lens,
-                    topk,
-                    pages,
-                    starts,
-                    distribution,
-                    sm_scale=sm_scale,
-                    k_scale=1.0,
-                    max_kv_len=max_kv_len,
-                    num_kv_pages_per_block=(1, 1, 1),
-                    num_queries_per_block=(1, 32, 32),
-                )
-
-            tier = masked_dense_routing.masked_dense_prefill_mla_tier(
-                seq_lens, distribution, starts, limits
-            )
-            output = jax.lax.switch(
-                tier,
-                (
-                    functools.partial(dense, limits[0]),
-                    functools.partial(dense, limits[1]),
-                    gather,
-                ),
-                operand=None,
-            )
-        return output[..., :LKV_DIM], nope, rope
+            return output[..., :LKV_DIM], nope, rope
+        output = masked_dense_routing.attention_from_parts(
+            ql_nope,
+            q_pe,
+            nope,
+            rope,
+            topk,
+            seq_lens,
+            pages,
+            starts,
+            distribution,
+            sm_scale=sm_scale,
+            k_scale=1.0,
+        )
+        return output, nope, rope
 
     in_specs = (
         P(None, None, None),
