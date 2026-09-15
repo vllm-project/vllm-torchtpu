@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import asyncio
 import codecs
 import itertools
 import logging
@@ -63,6 +64,99 @@ def _proxy_latency_interval() -> float:
 
 
 _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Retries here are deliberately limited to failures that provably occur before
+# any request byte is written to the socket, so the backend holds no state for
+# the request and a replay is indistinguishable from a first attempt:
+#   ConnectError   - the TCP/TLS connection was never established.
+#   ConnectTimeout - timed out establishing that connection.
+#   PoolTimeout    - timed out waiting for a free slot in the local pool, so we
+#                    never even got a socket to write to.
+# ConnectTimeout and PoolTimeout subclass TimeoutException, *not* ConnectError,
+# so they have to be named explicitly.
+#
+# Anything that fails *after* the request hits the wire (ReadError, WriteError,
+# ReadTimeout, 5xx) must NOT be retried from this proxy: vLLM derives its
+# internal request id straight from the X-Request-Id header we send, so a
+# replay is seen by the engine as the same request arriving twice. That trips
+# `assert existing.streaming_queue is not None, "duplicate request id"` in
+# Scheduler.add_request, which raises inside the engine loop and takes down the
+# whole EngineCore rather than failing the single request. On the decode hop it
+# additionally collides with the Raiden Stage-3 KV registration keyed by the
+# same id. Recovering those cases requires re-running prefill under a fresh
+# request id to mint a new KV uuid, which has to happen at the request-flow
+# level (see _handle_completions), not inside a per-hop wrapper.
+_PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout,
+                    httpx.PoolTimeout)
+_MAX_ATTEMPTS = max(1, _env_int("PROXY_MAX_ATTEMPTS", 5))
+_RETRY_BASE_DELAY_S = _env_float("PROXY_RETRY_BASE_DELAY_S", 0.5)
+
+
+def _log_unsafe_transport_failure(phase: str,
+                                  request_id: str,
+                                  exc: Exception,
+                                  detail: str = "") -> None:
+    """Flag a failure that cannot be retried safely at this layer."""
+    msg = (f"[UNSAFE-{phase}] req_id={request_id} failed after the request "
+           f"was already sent: {exc!r}. Not retrying: the server may have "
+           f"admitted this request, and replaying it with the same "
+           f"X-Request-Id would collide with the in-flight vLLM request id "
+           f"(and the Raiden KV registration on the decode hop). Recovery "
+           f"needs a fresh request id + new KV uuid and must be handled at "
+           f"the request-flow level, not in this per-hop retry wrapper.")
+    if detail:
+        msg = f"{msg} {detail}"
+    print(msg, flush=True)
+    logger.error(msg)
+
+
+async def _backoff_before_retry(attempt: int, phase: str, request_id: str,
+                                exc: Exception) -> None:
+    delay = _RETRY_BASE_DELAY_S * (2**attempt)
+    msg = (f"[RETRY-{phase}] attempt {attempt + 1}/{_MAX_ATTEMPTS} "
+           f"failed for req_id={request_id}: {exc!r}, "
+           f"retrying in {delay:.1f}s")
+    print(msg, flush=True)
+    logger.warning(msg)
+    await asyncio.sleep(delay)
+
+
+async def _post_with_retries(client_info: dict, endpoint: str, req_data: dict,
+                             headers: dict, request_id: str, phase: str):
+    """POST to a backend, retrying only connection-establishment failures."""
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = await client_info['client'].post(endpoint,
+                                                        json=req_data,
+                                                        headers=headers)
+            response.raise_for_status()
+            return response
+        except _PRE_SEND_ERRORS as e:
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            await _backoff_before_retry(attempt, phase, request_id, e)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                _log_unsafe_transport_failure(phase, request_id, e)
+            raise
+        except httpx.TransportError as e:
+            _log_unsafe_transport_failure(phase, request_id, e)
+            raise
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
@@ -140,7 +234,18 @@ async def lifespan(app: FastAPI):
     app.state.prefill_clients = []
     app.state.decode_clients = []
 
-    limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+    # keepalive_expiry must stay *below* the backend's keep-alive timeout,
+    # otherwise the pool hands out sockets the server has already reaped and
+    # the next request dies with ReadError/RemoteProtocolError -- which we
+    # cannot retry safely (see _PRE_SEND_ERRORS above). vLLM runs uvicorn with
+    # timeout_keep_alive=VLLM_HTTP_TIMEOUT_KEEP_ALIVE, default 5s, and httpx's
+    # own default expiry is also 5.0, so out of the box the two race exactly.
+    # 4.0 buys a second of margin; raise VLLM_HTTP_TIMEOUT_KEEP_ALIVE on the
+    # backends if you want longer-lived connections.
+    keepalive_expiry = _env_float("PROXY_KEEPALIVE_EXPIRY_S", 4.0)
+    limits = httpx.Limits(max_connections=None,
+                          max_keepalive_connections=None,
+                          keepalive_expiry=keepalive_expiry)
 
     # Create prefill clients
     for i, (host, port) in enumerate(global_args.prefiller_instances):
@@ -286,12 +391,12 @@ async def send_request_to_prefill(client_info: dict, endpoint: str,
         "X-Request-Id": request_id
     }
 
-    response = await client_info['client'].post(endpoint,
-                                                json=req_data,
-                                                headers=headers)
-    response.raise_for_status()
-
-    return response
+    return await _post_with_retries(client_info,
+                                    endpoint,
+                                    req_data,
+                                    headers,
+                                    request_id,
+                                    phase="PREFILL")
 
 
 async def render_completion_prompt(client_info: dict, endpoint: str,
@@ -306,12 +411,12 @@ async def render_completion_prompt(client_info: dict, endpoint: str,
         "X-Request-Id": request_id
     }
 
-    response = await client_info['client'].post(endpoint,
-                                                json=req_data,
-                                                headers=headers)
-    response.raise_for_status()
-
-    return response
+    return await _post_with_retries(client_info,
+                                    endpoint,
+                                    req_data,
+                                    headers,
+                                    request_id,
+                                    phase="RENDER")
 
 
 async def stream_from_decode(client_info: dict, endpoint: str, req_data: dict,
@@ -325,19 +430,45 @@ async def stream_from_decode(client_info: dict, endpoint: str, req_data: dict,
         "X-Request-Id": request_id
     }
 
-    async with client_info['client'].stream("POST",
-                                            endpoint,
-                                            json=req_data,
-                                            headers=headers) as response:
-        response.raise_for_status()
-        encoder = _AsciiSafeStreamEncoder()
-        async for chunk in response.aiter_bytes():
-            chunk = encoder.encode(chunk)
-            if chunk:
-                yield chunk
-        chunk = encoder.encode(final=True)
-        if chunk:
-            yield chunk
+    for attempt in range(_MAX_ATTEMPTS):
+        yielded_any = False
+        try:
+            async with client_info['client'].stream(
+                    "POST", endpoint, json=req_data,
+                    headers=headers) as response:
+                if response.status_code >= 400:
+                    # Streaming responses are not read on entry, so pull the
+                    # body first or the raised error carries no vLLM detail.
+                    await response.aread()
+                response.raise_for_status()
+                encoder = _AsciiSafeStreamEncoder()
+                async for chunk in response.aiter_bytes():
+                    chunk = encoder.encode(chunk)
+                    if chunk:
+                        yielded_any = True
+                        yield chunk
+                chunk = encoder.encode(final=True)
+                if chunk:
+                    yielded_any = True
+                    yield chunk
+            return
+        except _PRE_SEND_ERRORS as e:
+            # Never reached the decode server, so the KV handle minted by
+            # prefill is still parked and unclaimed: safe to re-send as-is.
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            await _backoff_before_retry(attempt, "DECODE", request_id, e)
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            if yielded_any:
+                detail = ("Stream had already emitted bytes to the client, "
+                          "so the response is truncated.")
+            else:
+                detail = ("Failed before the first byte; the client will "
+                          "still see HTTP 200 followed by an empty/short "
+                          "body because StreamingResponse has already "
+                          "flushed headers.")
+            _log_unsafe_transport_failure("DECODE", request_id, e, detail)
+            raise
 
 
 async def _handle_completions(api: str, request: Request):
