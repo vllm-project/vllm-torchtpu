@@ -3871,27 +3871,14 @@ class TPUModelRunner(GPUModelRunner):
 
         # A profile batch carries random values so every token row routes
         # on its own, as real tokens do; a warmup batch traces shapes only.
-        if self.supports_mm_inputs:
-            input_ids = None
-            if profiling:
-                inputs_embeds = self._profile_input(
-                    "embeds", (self.max_num_tokens, self.inputs_embeds_size),
-                    self.dtype)[:num_tokens].to(self.device)
-            else:
-                inputs_embeds = torch.zeros(
-                    (num_tokens, self.inputs_embeds_size),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+        if profiling:
+            input_ids = self._profile_input("ids", (self.max_num_tokens, ),
+                                            torch.int32)[:num_tokens].to(
+                                                self.device)
         else:
-            if profiling:
-                input_ids = self._profile_input("ids", (self.max_num_tokens, ),
-                                                torch.int32)[:num_tokens].to(
-                                                    self.device)
-            else:
-                input_ids = torch.zeros((num_tokens),
-                                        dtype=torch.int32).to(self.device)
-            inputs_embeds = None
+            input_ids = torch.zeros((num_tokens),
+                                    dtype=torch.int32).to(self.device)
+        inputs_embeds = None
         if profiling:
             # One prefill request, or several of at most the model length
             # when a bucket exceeds it.
@@ -4022,12 +4009,6 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
                 num_tokens, zeros=not profiling, random=profiling)
-        if profiling:
-            # The inputs reach the device before the clock starts.
-            inputs = [t for t in (input_ids, inputs_embeds) if t is not None]
-            if intermediate_tensors is not None:
-                inputs += list(intermediate_tensors.tensors.values())
-            synchronize_tensors(inputs)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -4043,6 +4024,17 @@ class TPUModelRunner(GPUModelRunner):
                     kv_cache_bundle=self._kv_cache_bundle,
                 ),
         ):
+            if self.supports_mm_inputs and self._pp_is_first:
+                input_ids, inputs_embeds = self._get_model_inputs(
+                    input_ids, None)
+            if profiling:
+                # The inputs reach the device before the clock starts.
+                inputs = [
+                    t for t in (input_ids, inputs_embeds) if t is not None
+                ]
+                if intermediate_tensors is not None:
+                    inputs += list(intermediate_tensors.tensors.values())
+                synchronize_tensors(inputs)
             started = time.perf_counter()
             out, _ = self.forward_model(
                 input_ids=input_ids,
