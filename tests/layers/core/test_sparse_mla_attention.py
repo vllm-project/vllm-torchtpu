@@ -720,6 +720,17 @@ class MaskedDenseTierTest(parameterized.TestCase):
     def test_small_suffix_uses_sparse(self):
         self.assertEqual(self._tier([8192, 9216, 8192, 1536], [256] * 4, [0, 0, 4]), 2)
 
+    def test_small_all_short_prefill_still_uses_masked_dense(self):
+        self.assertEqual(self._tier([128], [128], [0, 0, 1]), 0)
+
+    def test_measured_mixed_crossover(self):
+        self.assertEqual(
+            self._tier([9216] * 63 + [5120], [1] * 63 + [961], [63, 63, 64]), 1
+        )
+        self.assertEqual(
+            self._tier([9216] * 63 + [6144], [1] * 63 + [961], [63, 63, 64]), 2
+        )
+
     def test_cost_sums_multiple_prefill_requests(self):
         self.assertEqual(self._tier([1024, 2048], [512, 512], [0, 0, 2]), 0)
 
