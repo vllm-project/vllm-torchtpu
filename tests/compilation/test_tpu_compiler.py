@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+
 
 class TestTpuCompilerCache:
 
@@ -279,9 +281,8 @@ class TestTpuCompilerCache:
         "value,expected_threshold",
         [
             ("12345", 12345),
-            # v6e resolves "auto" to its per-tensor-core VMEM size.
-            ("auto", 134217728),
-            ("", 134217728),
+            ("auto", _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"]),
+            ("", _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"]),
             ("0", None),
         ],
     )
