@@ -708,6 +708,7 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
+        # Maximum query length to be considered a decode.
         self.reorder_batch_threshold = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()

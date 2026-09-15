@@ -776,7 +776,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         self.sliding_window, self.scale, self.logits_soft_cap,
                         id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
                         use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask, pcp_kv_layout, self.decode_query_size)
+                        max_model_len, self.use_causal_mask, pcp_kv_layout,
+                        self.decode_query_size)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -1323,6 +1324,8 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         super().__init__(*args, **kwargs)
         vllm_config = get_current_vllm_config_or_none()
         spec = vllm_config.speculative_config if vllm_config else None
+        # Run K + 1 verify tokens in the DECODE stage.
+        # head_dim 64 is rerouted to the hd64 kernel.
         if (spec is not None and envs.USE_BATCHED_RPA_LONGCTX
                 and self.head_size != 64):
             self.decode_query_size = spec.num_speculative_tokens + 1
