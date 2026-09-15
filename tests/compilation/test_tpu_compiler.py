@@ -200,6 +200,18 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
+            "DEBUG_TPU_LOCAL_RANK_OFFSET",
+            "RAIDEN_DISABLE_SINGLETON_WORKER",
+            "RAIDEN_SHM_KEY",
+            "SPEC_WARMUP",
+            "TORCH_TPU_BASE_PORT",
+            "TORCH_TPU_MP_RENDEZVOUS_PORT",
+            "TPU_LOCAL_RANK_OFFSET",
+            "TPU_SHARDED_LOAD_SYNC_EVERY",
+            "VLLM_TORCHTPU_IPC_KEY",
+            "VLLM_TPU_DEBUG_PCP_LAYOUT",
+            "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
+            "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED

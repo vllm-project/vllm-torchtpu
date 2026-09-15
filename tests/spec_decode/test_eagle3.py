@@ -34,7 +34,8 @@ def _make_proposer(draft_tp: int | None = 1,
                    target_tp: int = 1,
                    method: str = "eagle3") -> Eagle3Proposer:
     speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp,
-                                         method=method)
+                                         method=method,
+                                         draft_model_config=None)
     parallel_config = SimpleNamespace(tensor_parallel_size=target_tp)
     vllm_config = SimpleNamespace(speculative_config=speculative_config,
                                   parallel_config=parallel_config)
@@ -1429,3 +1430,606 @@ def test_build_draft_attn_metadata_cache_cleared_per_propose(device):
     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
     assert proposer.propose([], [], None, None) == []
     assert proposer._draft_md_cache == {}
+
+
+# ---------------------------------------------------------------------------
+# MTP IndexShare (GLM-5.2 / DeepSeek-V3.2)
+# ---------------------------------------------------------------------------
+
+
+class _FakeMlaAttn:
+
+    def __init__(self, buf):
+        self.topk_indices_buffer = buf
+
+
+class _FakeMtpLayer:
+
+    def __init__(self, buf):
+        self.mtp_block = SimpleNamespace(self_attn=SimpleNamespace(
+            mla_attn=_FakeMlaAttn(buf)))
+
+
+class _FakeMtpModel:
+    """Stands in for DeepSeekMultiTokenPredictor: one shared buffer, front
+    anchored compaction, and a runtime skip_topk toggle."""
+
+    def __init__(self, buf, num_layers: int = 1):
+        self.layers = {
+            str(78 + i): _FakeMtpLayer(buf)
+            for i in range(num_layers)
+        }
+        self.skip_topk = None
+
+    def set_skip_topk(self, skip: bool):
+        self.skip_topk = skip
+
+    def compact_topk_indices(self, slot_ids):
+        num_slots = slot_ids.numel()
+        for layer in self.layers.values():
+            buf = layer.mtp_block.self_attn.mla_attn.topk_indices_buffer
+            buf[:num_slots] = buf[slot_ids]
+
+
+def _mtp_proposer_with_buffer(buf,
+                              share: bool = True,
+                              num_layers: int = 1,
+                              max_num_reqs: int = 2,
+                              num_tokens_paddings=(2, 4, 6, 8)):
+    proposer = _make_proposer(method="mtp")
+    proposer.draft_model = SimpleNamespace(
+        model=_FakeMtpModel(buf, num_layers))
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(index_share_for_mtp_iteration=share))
+    # `_init_mtp_index_sharing` checks the buffer against the loop bucket it
+    # will be indexed by, which comes off the runner's token paddings.
+    proposer.runner.max_num_reqs = max_num_reqs
+    proposer.runner.num_tokens_paddings = list(num_tokens_paddings)
+    proposer.vllm_config.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=buf.shape[0])
+    proposer._init_mtp_index_sharing()
+    return proposer
+
+
+def test_index_sharing_off_when_checkpoint_does_not_ask():
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer = _mtp_proposer_with_buffer(buf, share=False)
+    assert proposer._share_mtp_indices is False
+    assert proposer._mtp_topk_buffers == []
+
+
+def test_index_sharing_seeds_buffer_with_padding_sentinel():
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer = _mtp_proposer_with_buffer(buf)
+    assert proposer._share_mtp_indices is True
+    # -1 is the sparse-MLA padding sentinel; an unwritten row must not gather.
+    assert torch.equal(buf, torch.full((8, 4), -1, dtype=torch.int32))
+
+
+def test_index_sharing_dedupes_aliased_buffers():
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer = _mtp_proposer_with_buffer(buf, num_layers=3)
+    assert len(proposer._mtp_topk_buffers) == 1
+
+
+def test_compact_gathers_last_token_rows_to_front():
+    buf = torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4)
+    proposer = _mtp_proposer_with_buffer(buf.clone())
+    live = proposer._mtp_topk_buffers[0]
+    live.copy_(buf)
+
+    # Two requests whose last tokens sit at rows 1 and 4 of the step-0 forward.
+    saved = proposer._mtp_compact_and_save(torch.tensor([1, 4]))
+
+    assert torch.equal(live[0], buf[1])
+    assert torch.equal(live[1], buf[4])
+    assert torch.equal(saved[0], torch.stack([buf[1], buf[4]]))
+
+
+def test_second_chunk_step0_clobbers_first_chunk_rows_and_restore_fixes_it():
+    """The buffer is one tensor indexed by position-in-the-current-forward, so
+    chunk 1's step-0 indexer write lands on chunk 0's compacted rows. The
+    snapshot taken at compaction time is what makes IndexShare correct for more
+    than one chunk."""
+    buf = torch.zeros(6, 4, dtype=torch.int32)
+    proposer = _mtp_proposer_with_buffer(buf)
+    live = proposer._mtp_topk_buffers[0]
+
+    # Chunk 0 step 0 writes its per-token rows, then compacts + snapshots.
+    live.copy_(torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4))
+    chunk0_rows = torch.stack([live[1].clone(), live[4].clone()])
+    saved0 = proposer._mtp_compact_and_save(torch.tensor([1, 4]))
+    assert torch.equal(live[:2], chunk0_rows)
+
+    # Chunk 1 step 0 writes over the front of the same buffer.
+    live.copy_(torch.full((6, 4), 99, dtype=torch.int32))
+    saved1 = proposer._mtp_compact_and_save(torch.tensor([0, 2]))
+    assert not torch.equal(live[:2], chunk0_rows)  # chunk 0's rows are gone
+
+    # Restoring before chunk 0's loop-step forward brings them back.
+    proposer._mtp_restore_topk(saved0)
+    assert torch.equal(live[:2], chunk0_rows)
+    # ... and chunk 1's snapshot is still intact for its own turn.
+    proposer._mtp_restore_topk(saved1)
+    assert torch.equal(live[:2], torch.full((2, 4), 99, dtype=torch.int32))
+
+
+def test_skip_topk_toggle_is_noop_without_sharing():
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer = _mtp_proposer_with_buffer(buf, share=False)
+    proposer._mtp_set_skip_topk(True)
+    assert proposer.draft_model.model.skip_topk is None
+
+
+def test_skip_topk_toggle_applies_with_sharing():
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer = _mtp_proposer_with_buffer(buf)
+    proposer._mtp_set_skip_topk(False)
+    assert proposer.draft_model.model.skip_topk is False
+    proposer._mtp_set_skip_topk(True)
+    assert proposer.draft_model.model.skip_topk is True
+
+
+def test_propose_index_share_order_across_two_chunks():
+    """End-to-end ordering: compact+snapshot each chunk right after its step 0,
+    and restore each chunk's rows before its own loop-step forward. Which
+    program each step runs, and the skip_topk it runs with, is decided inside
+    _forward_draft and tested through it below."""
+    device = torch.device("cpu")
+    K = 3
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=4,
+                                    req_ids=["r0", "r1", "r2", "r3"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[2, 4, 8],
+        max_num_reqs=2,
+        uses_mrope=False,
+        num_reqs_max_model_len=2,
+        num_reqs_most_model_len=None,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    proposer.vllm_config.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=8)
+
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer.draft_model = SimpleNamespace(model=_FakeMtpModel(buf))
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(index_share_for_mtp_iteration=True))
+    proposer._init_mtp_index_sharing()
+    assert proposer._share_mtp_indices is True
+
+    chunks = []
+    for ci in range(2):
+        chunks.append(
+            _make_chunk(
+                input_ids=torch.zeros(2, dtype=torch.int32, device=device),
+                position_ids=torch.zeros(2, dtype=torch.int32, device=device),
+                query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+                start_index=ci * 2,
+                num_reqs=2,
+                hidden=1,
+                device=device,
+                hidden_states=torch.zeros((2, 1), device=device),
+                attn_ctx=SimpleNamespace(use_max_model_len=True),
+            ))
+    proposer.draft_chunks = chunks
+    proposer._prepare_draft_inputs = lambda *_a, **_k: (
+        torch.zeros(2, dtype=torch.int32, device=device),
+        torch.zeros(2, dtype=torch.int32, device=device),
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        np.zeros(2, dtype=np.int32),
+    )
+    proposer._loop_bucket = lambda n: 2
+
+    trace = []
+    # Distinct per-chunk step-0 index rows, so a restore mix-up is visible.
+    step0_rows = {
+        0: torch.tensor([[10, 11, 12, 13], [14, 15, 16, 17]],
+                        dtype=torch.int32),
+        1: torch.tensor([[20, 21, 22, 23], [24, 25, 26, 27]],
+                        dtype=torch.int32),
+    }
+    live = proposer._mtp_topk_buffers[0]
+    # DraftChunkInputs holds tensors, so `==` is ambiguous; key by identity.
+    chunk_ids = {id(c): i for i, c in enumerate(chunks)}
+
+    def fake_forward(*, chunk, step_idx, **_k):
+        ci = chunk_ids[id(chunk)]
+        if step_idx == 0:
+            # Simulate the indexer writing this chunk's per-token rows.
+            live[:2] = step0_rows[ci]
+        else:
+            trace.append((step_idx, ci, live[:2].clone()))
+        return (torch.zeros((2, 1),
+                            device=device), torch.zeros((2, 1), device=device))
+
+    proposer._forward_draft = fake_forward
+    proposer._draft_gather_carries = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2]
+                                                           )
+    proposer._draft_propose_token = lambda lh: torch.zeros(
+        2, dtype=torch.int32, device=device)
+
+    proposer.propose(
+        sampled_token_ids=[[1], [2], [3], [4]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+
+    # Every loop-step forward saw its OWN chunk's step-0 rows, at every step.
+    assert len(trace) == (K - 1) * 2
+    for step_idx, ci, seen in trace:
+        assert torch.equal(seen, step0_rows[ci]), (
+            f"step {step_idx} chunk {ci} read the wrong chunk's indices")
+
+
+# --------------------------------------------------------------------------
+# DSA (sparse-MLA) draft KV-cache validation
+# --------------------------------------------------------------------------
+
+
+def _dsa_layer_classes():
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+
+    class _FakeIndexerCache(DeepseekV32IndexerCache):
+        # The real __init__ registers itself in static_forward_context and
+        # needs a CacheConfig; only isinstance matters here.
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+    class _FakeMlaLayer(MLAAttention):
+
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+    return _FakeIndexerCache, _FakeMlaLayer
+
+
+def _dsa_draft_proposer(layers, specs, draft_tp=8, target_tp=8):
+    proposer = _make_proposer(draft_tp=draft_tp,
+                              target_tp=target_tp,
+                              method="mtp")
+    proposer.runner.get_kv_cache_spec.return_value = specs
+    return proposer, set(layers)
+
+
+def test_validate_dsa_draft_is_a_noop_for_a_non_sparse_draft():
+    """An eagle3 / plain-MTP draft has no lightning indexer, so the check must
+    not even ask the runner for specs (it is called on every load)."""
+    proposer = _make_proposer(method="eagle3")
+    layers = {"draft.attn": torch.nn.Module()}
+    proposer._validate_dsa_draft(layers, {"draft.attn"})
+    proposer.runner.get_kv_cache_spec.assert_not_called()
+
+
+def test_validate_dsa_draft_rejects_an_indexer_without_mla():
+    indexer_cls, _ = _dsa_layer_classes()
+    layers = {"d.indexer.k_cache": indexer_cls()}
+    proposer, names = _dsa_draft_proposer(layers, {})
+    with pytest.raises(RuntimeError, match="no MLA attention layer"):
+        proposer._validate_dsa_draft(layers, names)
+
+
+def test_validate_dsa_draft_rejects_a_replicated_draft():
+    """The sparse-MLA and indexer Pallas ops are mesh-sharded with no LOCAL
+    variant to relocate to, unlike the dense RPA path."""
+    indexer_cls, mla_cls = _dsa_layer_classes()
+    layers = {
+        "d.indexer.k_cache": indexer_cls(),
+        "d.attn": mla_cls(),
+    }
+    proposer, names = _dsa_draft_proposer(layers, {}, draft_tp=1, target_tp=8)
+    with pytest.raises(NotImplementedError,
+                       match="draft_tensor_parallel_size=1"):
+        proposer._validate_dsa_draft(layers, names)
+
+
+def test_validate_dsa_draft_rejects_a_layer_with_no_kv_cache_spec():
+    """A layer the runner's spec walk skipped is allocated no KV cache, and the
+    indexer then returns an unwritten top-k buffer with no error anywhere."""
+    indexer_cls, mla_cls = _dsa_layer_classes()
+    layers = {
+        "d.indexer.k_cache": indexer_cls(),
+        "d.attn": mla_cls(),
+    }
+    # Only the MLA layer got a spec.
+    proposer, names = _dsa_draft_proposer(layers, {"d.attn": object()})
+    with pytest.raises(RuntimeError, match="no KVCacheSpec"):
+        proposer._validate_dsa_draft(layers, names)
+
+
+def test_validate_dsa_draft_accepts_fully_registered_layers():
+    indexer_cls, mla_cls = _dsa_layer_classes()
+    layers = {
+        "d.indexer.k_cache": indexer_cls(),
+        "d.attn": mla_cls(),
+        # A target layer of the same types must not be pulled in: the check
+        # only ever looks at the draft's half of the registry.
+        "t.attn": mla_cls(),
+    }
+    specs = {"d.attn": object(), "d.indexer.k_cache": object()}
+    proposer, _ = _dsa_draft_proposer(layers, specs)
+    proposer._validate_dsa_draft(layers, {"d.attn", "d.indexer.k_cache"})
+
+
+def test_index_sharing_rejects_a_topk_buffer_smaller_than_the_loop_bucket():
+    """The buffer is sized in tokens but indexed by request in the K-loop."""
+    buf = torch.zeros(4, 4, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="topk_indices_buffer"):
+        _mtp_proposer_with_buffer(buf,
+                                  max_num_reqs=6,
+                                  num_tokens_paddings=(2, 4, 8))
+
+
+def test_validate_dsa_draft_allows_a_single_chip_tp1_run():
+    """draft_tp=1 with target_tp=1 sets `_draft_replicated`, but nothing is
+    sharded there -- only a draft replicated *below* the target's TP is a
+    problem."""
+    indexer_cls, mla_cls = _dsa_layer_classes()
+    layers = {
+        "d.indexer.k_cache": indexer_cls(),
+        "d.attn": mla_cls(),
+    }
+    specs = {"d.attn": object(), "d.indexer.k_cache": object()}
+    proposer, names = _dsa_draft_proposer(layers,
+                                          specs,
+                                          draft_tp=1,
+                                          target_tp=1)
+    proposer._validate_dsa_draft(layers, names)
+
+
+def _nextn_layers(num_layers: int, with_shared_head: bool):
+    """Nextn layers shaped like DeepSeekMTP's (`shared_head.head` per layer) or
+    like Qwen3.5 MTP's (no per-layer head; one top-level lm_head instead)."""
+    if with_shared_head:
+        return [
+            SimpleNamespace(shared_head=SimpleNamespace(head=object()))
+            for _ in range(num_layers)
+        ]
+    return [SimpleNamespace() for _ in range(num_layers)]
+
+
+def test_validate_mtp_layer_count_rejects_multi_layer_per_layer_heads():
+    """DeepSeek-style: the proposer reads logits off layer 0's head at every
+    step, and only the layer that ran at step 0 has its top-k buffer written."""
+    proposer = _make_proposer(method="mtp")
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        num_mtp_layers=2, layers=_nextn_layers(2, with_shared_head=True)))
+    with pytest.raises(NotImplementedError,
+                       match="num_nextn_predict_layers=2"):
+        proposer._validate_mtp_layer_count()
+
+
+def test_validate_mtp_layer_count_allows_multi_layer_single_head():
+    """Qwen3.5-style: several nextn layers under one top-level lm_head and no
+    indexer. Neither failure mode applies, so the count alone must not refuse
+    it."""
+    proposer = _make_proposer(method="mtp")
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        num_mtp_layers=3, layers=_nextn_layers(3, with_shared_head=False)))
+    proposer._validate_mtp_layer_count()
+
+
+def test_validate_mtp_layer_count_accepts_a_single_layer_checkpoint():
+    proposer = _make_proposer(method="mtp")
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        num_mtp_layers=1, layers=_nextn_layers(1, with_shared_head=True)))
+    proposer._validate_mtp_layer_count()
+
+
+def test_validate_mtp_layer_count_is_a_noop_for_a_non_mtp_draft():
+    """An eagle3 draft has no nextn layers to count."""
+    proposer = _make_proposer(method="eagle3")
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace())
+    proposer._validate_mtp_layer_count()
+
+
+# --------------------------------------------------------------------------
+# IndexShare's second compiled program (draft steps 1+)
+# --------------------------------------------------------------------------
+
+
+class _RecordingProgram:
+    """Stands in for a compiled draft program and records every call."""
+
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+
+    def __call__(self, **kwargs):
+        self.log.append((self.name, kwargs["spec_step_idx"]))
+        return kwargs["hidden_states"]
+
+
+def _forward_draft_harness(monkeypatch):
+    """A proposer whose real _forward_draft runs on plain CPU tensors, with
+    contexts and attention metadata stubbed out as in the saved-draft-config
+    test. Which program a step runs does not depend on the device."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.draft_vllm_config = object()
+    proposer.runner = SimpleNamespace(mesh=object(),
+                                      _dp_num_tokens_across_dp=lambda n: n)
+    proposer._build_draft_attn_metadata = lambda **_kwargs: {}
+
+    def null(*_args, **_kwargs):
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(e3, "set_model_tag", null)
+    monkeypatch.setattr(e3, "set_forward_context", null)
+    monkeypatch.setattr(e3, "set_vllm_model_wrapper_context", null)
+
+    def run(step_idx):
+        return proposer._forward_draft(
+            chunk=SimpleNamespace(),
+            input_ids=torch.zeros(2, dtype=torch.int32),
+            positions=torch.zeros(2, dtype=torch.int32),
+            target_hidden_states=torch.zeros((2, 2)),
+            step_idx=step_idx,
+            seq_lens_delta=step_idx,
+            num_rejected_np=None,
+        )
+
+    return proposer, run
+
+
+def test_forward_draft_without_index_share_runs_the_draft_at_every_step(
+        monkeypatch):
+    """Every other drafter keeps exactly one compiled program: no second
+    program is consulted and skip_topk is never touched."""
+    proposer, run = _forward_draft_harness(monkeypatch)
+    log = []
+    draft = _RecordingProgram("draft", log)
+    draft.model = mock.MagicMock()
+    proposer.draft_model = draft
+
+    for step in range(3):
+        run(step)
+
+    assert log == [("draft", 0), ("draft", 1), ("draft", 2)]
+    draft.model.set_skip_topk.assert_not_called()
+
+
+def test_forward_draft_routes_index_share_loop_steps_to_their_own_program(
+        monkeypatch):
+    """Step 0 runs the draft with the indexer on; steps 1+ run the loop-step
+    program with it off. skip_topk is set before each call because a program
+    bakes it in on its first run. That first run of the loop-step program is
+    repeated once (compile, then run), and never again."""
+    proposer, run = _forward_draft_harness(monkeypatch)
+    log = []
+    fake_mtp = _FakeMtpModel(torch.zeros(8, 4, dtype=torch.int32))
+    skips = []
+    set_skip = fake_mtp.set_skip_topk
+
+    def record_skip(skip):
+        skips.append(skip)
+        set_skip(skip)
+
+    fake_mtp.set_skip_topk = record_skip
+    draft = _RecordingProgram("draft", log)
+    draft.model = fake_mtp
+    proposer.draft_model = draft
+    proposer._share_mtp_indices = True
+    proposer._mtp_loop_model = _RecordingProgram("loop", log)
+
+    for _ in range(2):  # two propose rounds with K = 3
+        for step in range(3):
+            run(step)
+
+    assert log == [("draft", 0), ("loop", 1), ("loop", 1), ("loop", 2),
+                   ("draft", 0), ("loop", 1), ("loop", 2)]
+    assert skips == [False, True, True, False, True, True]
+    assert fake_mtp.skip_topk is True
+
+
+def test_loop_step_program_runs_the_drafts_own_forward():
+    """With compilation off the program is plain Python, which isolates the
+    delegation: the draft's own forward, on the draft object, with every
+    argument passed through."""
+    from vllm.config import CompilationMode
+
+    from vllm_torchtpu.spec_decode.mtp_loop_model import MtpLoopStepModel
+
+    seen = {}
+
+    class _Mtp(torch.nn.Module):
+
+        def forward(self,
+                    input_ids,
+                    positions,
+                    hidden_states,
+                    intermediate_tensors=None,
+                    inputs_embeds=None,
+                    spec_step_idx=0):
+            seen.update(self=self,
+                        positions=positions,
+                        intermediate=intermediate_tensors,
+                        embeds=inputs_embeds,
+                        step=spec_step_idx)
+            return hidden_states + 1
+
+    mtp = _Mtp()
+    config = SimpleNamespace(compilation_config=SimpleNamespace(
+        mode=CompilationMode.NONE))
+    program = MtpLoopStepModel(vllm_config=config,
+                               prefix="mtp_index_share_loop",
+                               mtp=mtp)
+    positions = torch.arange(2, dtype=torch.int32)
+
+    out = program(input_ids=torch.zeros(2, dtype=torch.int32),
+                  positions=positions,
+                  hidden_states=torch.zeros(2, 3),
+                  spec_step_idx=2)
+
+    assert torch.equal(out, torch.ones(2, 3))
+    assert seen["self"] is mtp and seen["positions"] is positions
+    assert seen["intermediate"] is None and seen["embeds"] is None
+    assert seen["step"] == 2
+    assert program.prefix == "mtp_index_share_loop"
+
+
+def test_build_mtp_loop_model_uses_the_draft_config_and_its_own_prefix(
+        monkeypatch):
+    """Built like the draft itself: under the draft's config (the compile
+    wrapper reads the current one), wrapping the draft, in a cache folder of
+    its own."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    import vllm_torchtpu.spec_decode.mtp_loop_model as mlm
+
+    proposer = _mtp_proposer_with_buffer(torch.zeros(8, 4, dtype=torch.int32))
+    proposer.draft_model._dynamic_arg_dims = dict(mlm.MTP_DYNAMIC_ARG_DIMS)
+    proposer.draft_vllm_config = object()
+    current = []
+    built = {}
+
+    @contextlib.contextmanager
+    def set_current(config):
+        current.append(config)
+        yield
+
+    class _Program:
+
+        def __init__(self, **kwargs):
+            built.update(kwargs, current=list(current))
+
+    def null(*_args, **_kwargs):
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(e3, "set_model_tag", null)
+    monkeypatch.setattr(e3, "set_vllm_model_wrapper_context", null)
+    monkeypatch.setattr(e3, "set_current_vllm_config", set_current)
+    monkeypatch.setattr(mlm, "MtpLoopStepModel", _Program)
+
+    proposer._build_mtp_loop_model()
+
+    assert isinstance(proposer._mtp_loop_model, _Program)
+    assert built["vllm_config"] is proposer.draft_vllm_config
+    assert built["mtp"] is proposer.draft_model
+    assert built["prefix"] == "mtp_index_share_loop"
+    assert built["current"] == [proposer.draft_vllm_config]
+    assert proposer._share_mtp_indices is True
+    assert proposer._mtp_loop_model_warm is False
+
+
+def test_index_share_turns_off_when_its_loop_step_program_cannot_be_built():
+    """IndexShare is either fully on, with its second program, or off -- never
+    left in place doing nothing. A draft whose compiled argument dims differ
+    from the loop-step program's is one way the build can fail."""
+    proposer = _mtp_proposer_with_buffer(torch.zeros(8, 4, dtype=torch.int32))
+    assert proposer._share_mtp_indices is True
+    proposer.draft_model._dynamic_arg_dims = {"input_ids": 0}
+
+    proposer._build_mtp_loop_model()
+
+    assert proposer._share_mtp_indices is False
+    assert proposer._mtp_topk_buffers == []
+    assert proposer._mtp_loop_model is None
+    # With sharing off, the toggle no longer reaches the model.
+    proposer._mtp_set_skip_topk(True)
+    assert proposer.draft_model.model.skip_topk is None

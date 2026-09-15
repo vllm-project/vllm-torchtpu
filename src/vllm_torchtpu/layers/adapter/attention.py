@@ -51,6 +51,7 @@ from vllm_torchtpu.layers.core.sequence_layout import \
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -594,9 +595,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
         kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
-        # Only a real SEQ_ALONG_LANE allocation needs the wrapper, which reads
-        # lane/sublane geometry off the device and so needs a JAX TPU client --
-        # the scheduler process calls this and owns no chip.
+        # Only a real SEQ_ALONG_LANE allocation needs the wrapper; the other
+        # cases are byte-identical to the inherited shape:
         #   is_auto         -> vLLM's dtype-less probe for the num_blocks axis
         #   head_size == 64 -> hd64 kernel, allocates HEAD_ALONG_SUBLANE anyway
         #   HEAD_ALONG_SUBLANE -> inherited shape is byte-identical
@@ -608,6 +608,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 num_blocks, block_size, num_kv_heads, head_size,
                 cache_dtype_str)
         torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        # Resolve the chip here rather than in the kernel: the scheduler
+        # process calls this and owns no chip, so the wrapper must not query a
+        # live device.
         return rpa_batched_wrapper.get_kv_cache_shape(
             total_num_pages=num_blocks,
             page_size=block_size,
@@ -615,6 +618,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             actual_head_dim=head_size,
             kv_dtype=pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
             kv_layout=rpa_batched_wrapper.configs.KVLayout(kv_layout),
+            chip_version=get_chip_version(),
         )
 
     @staticmethod

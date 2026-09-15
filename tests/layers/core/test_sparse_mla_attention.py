@@ -59,6 +59,15 @@ ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
                                         KVCacheLayout.TENSORCORE, TOTAL_PAGES,
                                         PAGE_SIZE, ROPE_DIM, KV_PACKING)
 
+NOPE_SC_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
+                                           KVCacheLayout.SPARSECORE,
+                                           TOTAL_PAGES, PAGE_SIZE, LKV_DIM,
+                                           KV_PACKING)
+ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
+                                           KVCacheLayout.SPARSECORE,
+                                           TOTAL_PAGES, PAGE_SIZE, ROPE_DIM,
+                                           KV_PACKING)
+
 _LIMIT_NAMES = ("MASKED_DENSE_ANALYTIC_LIMIT", "MASKED_DENSE_LIMIT")
 
 # Pinned to the gather kernel: every masked-dense tier disabled.
@@ -90,10 +99,10 @@ def _noop():
     yield
 
 
-def _empty_pair():
+def _empty_pair(nope_spec=NOPE_SPEC, rope_spec=ROPE_SPEC):
     """Zeroed (nope, rope) caches in dsa_gather's native tiled layouts."""
-    return (jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
-            jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype))
+    return (jnp.zeros(nope_spec.shape, nope_spec.jax_dtype),
+            jnp.zeros(rope_spec.shape, rope_spec.jax_dtype))
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -163,16 +172,40 @@ class SparseMlaAttentionTest(parameterized.TestCase):
               distribution,
               block_tables,
               mesh,
-              force_sparse=False):
+              force_sparse=False,
+              *,
+              nope_spec=NOPE_SPEC,
+              rope_spec=ROPE_SPEC):
         with (_masked_dense_limits(*GATHER_ONLY) if force_sparse else _noop()):
-            return self._call_inner(kv_cache, ql_nope, q_pe, kv_c_fp8,
-                                    k_pe_fp8, topk_rows, seq_lens,
-                                    query_start_loc, distribution,
-                                    block_tables, mesh)
+            return self._call_inner(kv_cache,
+                                    ql_nope,
+                                    q_pe,
+                                    kv_c_fp8,
+                                    k_pe_fp8,
+                                    topk_rows,
+                                    seq_lens,
+                                    query_start_loc,
+                                    distribution,
+                                    block_tables,
+                                    mesh,
+                                    nope_spec=nope_spec,
+                                    rope_spec=rope_spec)
 
-    def _call_inner(self, kv_cache, ql_nope, q_pe, kv_c_fp8, k_pe_fp8,
-                    topk_rows, seq_lens, query_start_loc, distribution,
-                    block_tables, mesh):
+    def _call_inner(self,
+                    kv_cache,
+                    ql_nope,
+                    q_pe,
+                    kv_c_fp8,
+                    k_pe_fp8,
+                    topk_rows,
+                    seq_lens,
+                    query_start_loc,
+                    distribution,
+                    block_tables,
+                    mesh,
+                    *,
+                    nope_spec=NOPE_SPEC,
+                    rope_spec=ROPE_SPEC):
         nope_cache, rope_cache, output = \
             attention_interface.sparse_mla_attention(
             ql_nope,
@@ -187,12 +220,51 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             jnp.asarray(query_start_loc, dtype=jnp.int32),
             jnp.asarray(distribution, dtype=jnp.int32),
             mesh,
-            NOPE_SPEC,
-            ROPE_SPEC,
+            nope_spec,
+            rope_spec,
             sm_scale=self.sm_scale,
             k_scale=self.k_scale,
         )
         return (nope_cache, rope_cache), output
+
+    def test_sparsecore_writer_to_attention(self):
+        """The uint32 writer feeds the SparseCore-layout mode directly."""
+        self._require_tpu()
+        q_len = 64
+        kv_c, k_pe = self._random_latents(q_len)
+        kv_c_fp8 = _quantize_fp8(kv_c, self.k_scale)
+        k_pe_fp8 = _quantize_fp8(k_pe, self.k_scale)
+        ql_nope, q_pe = self._random_queries(q_len)
+        topk_rows = _causal_topk(list(range(q_len)), q_len)
+
+        cache, output = self._call(
+            _empty_pair(NOPE_SC_SPEC, ROPE_SC_SPEC),
+            ql_nope,
+            q_pe,
+            kv_c_fp8,
+            k_pe_fp8,
+            topk_rows,
+            [q_len],
+            [0, q_len],
+            [0, 1, 1],
+            self._block_tables(1),
+            self._make_mesh(),
+            nope_spec=NOPE_SC_SPEC,
+            rope_spec=ROPE_SC_SPEC,
+        )
+
+        self.assertEqual(cache[0].dtype, jnp.uint32)
+        self.assertEqual(cache[1].dtype, jnp.uint32)
+        expected, valid = self._reference(
+            ql_nope,
+            q_pe,
+            topk_rows,
+            [q_len],
+            [0, q_len],
+            [_dequantize(kv_c_fp8, self.k_scale)],
+            [_dequantize(k_pe_fp8, self.k_scale)],
+        )
+        self._check(output, expected, valid)
 
     def _reference(self, ql_nope, q_pe, topk_rows, q_lens, query_start_loc,
                    kv_c_deq, k_pe_deq):
@@ -748,3 +820,31 @@ class MaskedDenseProfileTest(parameterized.TestCase):
                 jax.ShapeDtypeStruct((3, ), jnp.int32))
         self.assertIs(result, sentinel)
         sparse.assert_called_once()
+
+    def test_native_cache_layout_bypasses_masked_dense_dispatch(self):
+        q, _, _, topk = self._operands()
+        nope = jax.ShapeDtypeStruct((8, 1024, 128), jnp.uint32)
+        rope = jax.ShapeDtypeStruct((8, 256, 128), jnp.uint32)
+        sentinel = object()
+        with (mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
+              mock.patch.object(mla_dispatch,
+                                "sparse_ragged_paged_attention",
+                                return_value=sentinel) as sparse,
+              mock.patch.object(
+                  mla_dispatch,
+                  "_masked_dense_prefill_cost_tier",
+                  side_effect=AssertionError(
+                      "native caches require sparse attention"))):
+            result = mla_dispatch.ragged_paged_attention(
+                q,
+                nope,
+                rope,
+                topk,
+                jax.ShapeDtypeStruct((64, ), jnp.int32),
+                jax.ShapeDtypeStruct((64 * 9, ), jnp.int32),
+                jax.ShapeDtypeStruct((65, ), jnp.int32),
+                jax.ShapeDtypeStruct((3, ), jnp.int32),
+                cache_layout="sparsecore")
+        self.assertIs(result, sentinel)
+        sparse.assert_called_once()
+        self.assertEqual(sparse.call_args.kwargs["cache_layout"], "sparsecore")

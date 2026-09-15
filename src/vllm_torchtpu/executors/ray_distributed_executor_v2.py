@@ -34,6 +34,7 @@ from vllm.v1.executor.ray_utils import (WORKER_SPECIFIC_ENV_VARS,
                                         get_bundles_sorted_by_node)
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.executors.kv_block_override import \
     reconcile_num_gpu_blocks_override
@@ -362,7 +363,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             host_rank_offset[ip] = offset
             offset += chips_per_host[ip]
 
-        base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
+        base_port = tpu_envs.TORCH_TPU_BASE_PORT
         sb_addresses = [
             f"{ip}:{base_port + chip}" for ip in host_order
             for chip in range(chips_per_host[ip])

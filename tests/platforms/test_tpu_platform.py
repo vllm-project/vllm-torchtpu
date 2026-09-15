@@ -33,8 +33,6 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform, _validate_phased_profiling_config, get_tpu_multihost_topology)
-from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
-                                             _debug_tpu_local_rank_offset)
 
 
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
@@ -92,15 +90,19 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
 
 
 def test_debug_tpu_local_rank_offset_env(monkeypatch):
-    monkeypatch.delenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, raising=False)
-    assert _debug_tpu_local_rank_offset() == 0
+    """0 when unset, an int otherwise, and an error that names the variable
+    when the value does not parse."""
+    from vllm_torchtpu import envs
 
-    monkeypatch.setenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "4")
-    assert _debug_tpu_local_rank_offset() == 4
+    monkeypatch.delenv("DEBUG_TPU_LOCAL_RANK_OFFSET", raising=False)
+    assert envs.DEBUG_TPU_LOCAL_RANK_OFFSET == 0
 
-    monkeypatch.setenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "not-an-int")
-    with pytest.raises(ValueError, match=DEBUG_TPU_LOCAL_RANK_OFFSET_ENV):
-        _debug_tpu_local_rank_offset()
+    monkeypatch.setenv("DEBUG_TPU_LOCAL_RANK_OFFSET", "4")
+    assert envs.DEBUG_TPU_LOCAL_RANK_OFFSET == 4
+
+    monkeypatch.setenv("DEBUG_TPU_LOCAL_RANK_OFFSET", "not-an-int")
+    with pytest.raises(ValueError, match="DEBUG_TPU_LOCAL_RANK_OFFSET"):
+        _ = envs.DEBUG_TPU_LOCAL_RANK_OFFSET
 
 
 def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(
@@ -673,13 +675,13 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     targets = [
         (modeling.Qwen3VLModel, "get_rope_index"),
         (modeling.Qwen3VLVisionAttention, "forward"),
-        (torch.Tensor, "masked_scatter_"),
-        (torch.Tensor, "masked_scatter"),
-        (torch, "masked_scatter"),
-        (torch, "repeat_interleave"),
-        (torch, "cumsum"),
-        (torch.Tensor, "cumsum"),
     ]
+    for name in ("Qwen3VLVisionModel", "Qwen3VisionTransformerPretrainedModel",
+                 "Qwen3_VisionTransformerPretrainedModel",
+                 "Qwen3_VisionTransformer", "Qwen3VisionTransformer"):
+        cls = getattr(modeling, name, None)
+        if cls is not None and (cls, "forward") not in targets:
+            targets.append((cls, "forward"))
     originals = [getattr(target, name) for target, name in targets]
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
@@ -695,13 +697,6 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
         reg.apply("model_load", model_config=qwen_model)
         reg.apply("platform_activation", model_config=qwen_model)
     assert [getattr(target, name) for target, name in targets] == wrappers
-    assert torch.cumsum(torch.tensor([1, 2, 3]), 0).tolist() == [1, 3, 6]
-    assert torch.repeat_interleave(torch.tensor([1, 2]),
-                                   2).tolist() == [1, 1, 2, 2]
-    assert torch.masked_scatter(torch.zeros(3),
-                                torch.tensor([True, False, True]),
-                                torch.tensor([4.,
-                                              5.])).tolist() == [4., 0., 5.]
 
 
 def test_engine_core_stage_precedes_original_entrypoint(monkeypatch):
@@ -749,6 +744,8 @@ def test_multimodal_stage_refreshes_direct_imports(isolated_registry,
 def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
     import builtins
 
+    from vllm_torchtpu.models.vllm import qwen3_vl_patch
+
     original_import = builtins.__import__
     original_cumsum = torch.cumsum
 
@@ -759,5 +756,180 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", unavailable)
     config = SimpleNamespace(hf_config=None, model="Qwen/Qwen3-VL-4B")
-    assert tpu_platform._apply_model_specific_patches(config) is None
+    assert qwen3_vl_patch.maybe_patch_qwen3_vl(config) is None
     assert torch.cumsum is original_cumsum
+
+
+class TestQwen3VLModelPatches:
+    """Tests for Qwen3-VL platform and model-level patches."""
+
+    def test_is_qwen3_vl_model(self):
+        from vllm_torchtpu.models.vllm.qwen3_vl_patch import _is_qwen3_vl_model
+
+        # None config
+        assert not _is_qwen3_vl_model(None)
+
+        # Matched by model_type
+        cfg1 = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_vl",
+                                                         architectures=[]),
+                               model="some-model")
+        assert _is_qwen3_vl_model(cfg1)
+
+        # Matched by architectures
+        cfg2 = SimpleNamespace(hf_config=SimpleNamespace(
+            model_type="custom",
+            architectures=["Qwen3VLForConditionalGeneration"]),
+                               model="some-model")
+        assert _is_qwen3_vl_model(cfg2)
+
+        # Matched by model name
+        cfg3 = SimpleNamespace(hf_config=SimpleNamespace(model_type="other",
+                                                         architectures=[]),
+                               model="Qwen/Qwen3-VL-Embedding-8B")
+        assert _is_qwen3_vl_model(cfg3)
+
+        # Unrelated model
+        cfg4 = SimpleNamespace(hf_config=SimpleNamespace(
+            model_type="llama", architectures=["LlamaForCausalLM"]),
+                               model="meta-llama/Llama-3-8B")
+        assert not _is_qwen3_vl_model(cfg4)
+
+    def test_qwen3_vl_get_rope_index_signature_binding_and_grid_fixing(self):
+        from vllm_torchtpu.models.vllm.qwen3_vl_patch import \
+            _patch_qwen3_vl_get_rope_index
+
+        called_kwargs = {}
+
+        class FakeQwen3VLModel:
+
+            def get_rope_index(self,
+                               input_ids=None,
+                               image_grid_thw=None,
+                               video_grid_thw=None,
+                               attention_mask=None):
+                called_kwargs["input_ids"] = input_ids
+                called_kwargs["image_grid_thw"] = image_grid_thw
+                called_kwargs["video_grid_thw"] = video_grid_thw
+                called_kwargs["attention_mask"] = attention_mask
+                return torch.tensor([1, 2, 3])
+
+        fake_modeling = SimpleNamespace(Qwen3VLModel=FakeQwen3VLModel)
+        _patch_qwen3_vl_get_rope_index(fake_modeling)
+
+        # Idempotence: second call should be a no-op
+        _patch_qwen3_vl_get_rope_index(fake_modeling)
+
+        inst = FakeQwen3VLModel()
+
+        # Test 1D image_grid_thw is unsqueezed to 2D
+        grid_1d = torch.tensor([1, 28, 28])
+        res = inst.get_rope_index(image_grid_thw=grid_1d)
+        assert called_kwargs["image_grid_thw"].shape == (1, 3)
+        assert called_kwargs["input_ids"] is None  # Not fabricated
+        assert torch.equal(res, torch.tensor([1, 2, 3]))
+
+        # Test 2D image_grid_thw is preserved
+        grid_2d = torch.tensor([[1, 28, 28], [1, 14, 14]])
+        inst.get_rope_index(image_grid_thw=grid_2d)
+        assert called_kwargs["image_grid_thw"].shape == (2, 3)
+
+        # Test positional args binding
+        inst.get_rope_index(None, grid_1d, None)
+        assert called_kwargs["image_grid_thw"].shape == (1, 3)
+
+    def test_qwen3_vl_vision_attention_cu_seqlens_cpu_transfer(self):
+        from vllm_torchtpu.models.vllm.qwen3_vl_patch import \
+            _patch_qwen3_vl_vision_attention
+
+        called = {}
+
+        class FakeVisionAttention:
+
+            def forward(self,
+                        hidden_states,
+                        cu_seqlens=None,
+                        rotary_pos_emb=None):
+                called["cu_seqlens"] = cu_seqlens
+                return hidden_states
+
+        fake_modeling = SimpleNamespace(
+            Qwen3VLVisionAttention=FakeVisionAttention)
+        _patch_qwen3_vl_vision_attention(fake_modeling)
+
+        # Idempotence
+        _patch_qwen3_vl_vision_attention(fake_modeling)
+
+        inst = FakeVisionAttention()
+        cu_seqlens = torch.tensor([0, 10, 20])
+        inst.forward(torch.randn(20, 16), cu_seqlens=cu_seqlens)
+        assert called["cu_seqlens"].device.type == "cpu"
+        assert torch.equal(called["cu_seqlens"], torch.tensor([0, 10, 20]))
+
+    def test_qwen3_vl_scoped_torch_ops_context_manager(self):
+        from vllm_torchtpu.models.vllm.qwen3_vl_patch import (
+            _patched_masked_scatter, _scoped_qwen3_vl_torch_ops)
+
+        orig_cumsum = torch.cumsum
+        orig_repeat_interleave = torch.repeat_interleave
+        orig_masked_scatter = torch.masked_scatter
+
+        with _scoped_qwen3_vl_torch_ops():
+            # Scoped overrides are active
+            assert torch.cumsum != orig_cumsum
+            assert torch.repeat_interleave != orig_repeat_interleave
+            assert torch.masked_scatter != orig_masked_scatter
+
+            # Nested scope
+            with _scoped_qwen3_vl_torch_ops():
+                pass
+
+            assert torch.cumsum != orig_cumsum
+
+        # Restored after context exit
+        assert torch.cumsum == orig_cumsum
+        assert torch.repeat_interleave == orig_repeat_interleave
+        assert torch.masked_scatter == orig_masked_scatter
+
+        # Test masked_scatter size mismatch error
+        class MockTPUTensor(torch.Tensor):
+
+            @property
+            def device(self):
+                return torch.device("tpu")
+
+        inp = torch.zeros(4).as_subclass(MockTPUTensor)
+        mask = torch.tensor([True, True, True, False])
+        short_source = torch.tensor([1.0, 2.0])
+
+        with pytest.raises(RuntimeError, match="Number of source elements"):
+            _patched_masked_scatter(inp, mask, short_source)
+
+    def test_qwen3_vl_vision_transformer_candidate_class_names(self):
+        from vllm_torchtpu.models.vllm.qwen3_vl_patch import \
+            _patch_qwen3_vl_vision_transformer
+
+        class FakeQwen3VLVisionModel:
+
+            def forward(self, hidden_states):
+                # Verify that scoped ops are active inside vision encoder forward
+                assert torch.cumsum != torch._orig_cumsum_ref
+                return hidden_states
+
+        orig_cumsum = torch.cumsum
+        torch._orig_cumsum_ref = orig_cumsum
+        try:
+            fake_modeling = SimpleNamespace(
+                Qwen3VLVisionModel=FakeQwen3VLVisionModel)
+            _patch_qwen3_vl_vision_transformer(fake_modeling)
+
+            # Idempotence: calling again is a no-op
+            _patch_qwen3_vl_vision_transformer(fake_modeling)
+
+            inst = FakeQwen3VLVisionModel()
+            out = inst.forward(torch.tensor([1, 2, 3]))
+            assert torch.equal(out, torch.tensor([1, 2, 3]))
+            # Outside vision forward, torch ops are restored
+            assert torch.cumsum == orig_cumsum
+        finally:
+            if hasattr(torch, "_orig_cumsum_ref"):
+                delattr(torch, "_orig_cumsum_ref")

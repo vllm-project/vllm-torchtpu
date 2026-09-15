@@ -15,9 +15,13 @@ from vllm_torchtpu.omni.platform import OmniTpuPlatform
 pytestmark = pytest.mark.cpu_test
 
 
-def test_register_omni_tpu_platform():
-    result = register_omni_tpu_platform()
-    assert result == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
+def test_register_omni_tpu_platform(monkeypatch):
+    monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 0)
+    assert register_omni_tpu_platform() is None
+
+    monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 8)
+    assert register_omni_tpu_platform(
+    ) == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
 
 
 def test_platform_attributes():

@@ -69,6 +69,7 @@ from vllm.v1.kv_offload.base import (CanonicalKVCacheRef, CanonicalKVCaches,
                                      OffloadKey)
 from vllm.v1.outputs import KVConnectorOutput
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (AdmissionOp,
                                                 RaidenLoadStoreSpec,
@@ -291,7 +292,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # Opt in to uniform cross-layer KV cache allocation when block-major layout is enabled.
         # Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()` preconditions to enable
         # bundled tensor allocation in the TPU model runner.
-        from vllm_torchtpu import envs as tpu_envs
         return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
@@ -303,14 +303,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # The raiden singleton worker cannot coexist with this connector: the
         # disagg stack runs its own control plane in the same process and the
         # two collide on ports.
-        singleton_env = os.environ.get("RAIDEN_DISABLE_SINGLETON_WORKER")
-        if singleton_env is not None and singleton_env not in ("1", "true"):
+        if not tpu_envs.RAIDEN_DISABLE_SINGLETON_WORKER:
             raise ValueError(
                 "TPURaidenOffloadingConnector requires the raiden singleton "
                 "worker to be disabled (it collides with the in-process "
-                "control plane's ports), but RAIDEN_DISABLE_SINGLETON_WORKER="
-                f"{singleton_env!r} was set explicitly. Unset it or set it "
-                "to '1'.")
+                "control plane's ports), but RAIDEN_DISABLE_SINGLETON_WORKER "
+                "was explicitly set to off. Unset it or set it to '1'.")
         os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
 
         # Call through module to preserve PCP-aware patch on build_offloading_config.

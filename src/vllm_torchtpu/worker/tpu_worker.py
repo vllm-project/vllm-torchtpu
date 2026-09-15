@@ -36,7 +36,6 @@ from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
-DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
 
 
 def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
@@ -44,15 +43,6 @@ def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
     rank = (int(transfer_rank) if transfer_rank is not None else int(
         get_tensor_model_parallel_rank()))
     return get_pp_group().rank_in_group, rank
-
-
-def _debug_tpu_local_rank_offset() -> int:
-    value = os.environ.get(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "0") or "0"
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{DEBUG_TPU_LOCAL_RANK_OFFSET_ENV} must be an int, "
-                         f"got {value!r}") from exc
 
 
 def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
@@ -332,7 +322,7 @@ class TPUWorker(WorkerBase):
                 local_world = os.environ.get(
                     "LOCAL_WORLD_SIZE") or pc.world_size
                 local_rank_for_init = int(self.local_rank)
-                debug_local_rank_offset = _debug_tpu_local_rank_offset()
+                debug_local_rank_offset = envs.DEBUG_TPU_LOCAL_RANK_OFFSET
                 tpu_local_rank_env = (local_rank_for_init +
                                       debug_local_rank_offset)
                 tpu_local_world = int(local_world)
@@ -342,23 +332,22 @@ class TPUWorker(WorkerBase):
                         debug_local_rank_offset + pc.world_size)
                     logger.info(
                         "DEBUG TPU local rank offset applied: rank=%d "
-                        "local_rank=%d %s=%d -> tpu_local_rank=%d "
-                        "tpu_local_world=%d", self.rank, self.local_rank,
-                        DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
-                        debug_local_rank_offset, tpu_local_rank_env,
-                        tpu_local_world)
+                        "local_rank=%d DEBUG_TPU_LOCAL_RANK_OFFSET=%d -> "
+                        "tpu_local_rank=%d tpu_local_world=%d", self.rank,
+                        self.local_rank, debug_local_rank_offset,
+                        tpu_local_rank_env, tpu_local_world)
                 init_rank = self.rank
                 init_world = pc.world_size
                 dist_world_size = pc.world_size
                 _configure_tpu_process_env(self.rank, tpu_local_rank_env,
                                            pc.world_size, tpu_local_world)
-            if int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"):
+            if envs.TPU_LOCAL_RANK_OFFSET:
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "
                     "offset=%d -> tpu_local_rank=%d tpu_local_world=%d",
                     self.rank,
                     self.local_rank,
-                    int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"),
+                    envs.TPU_LOCAL_RANK_OFFSET,
                     binding.local_rank,
                     binding.local_world_size,
                 )

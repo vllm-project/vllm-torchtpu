@@ -23,6 +23,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
+                                             iter_mtp_shared_heads,
                                              maybe_share_embeddings,
                                              maybe_share_lm_head)
 from vllm_torchtpu.utils import synchronize_tensors
@@ -64,6 +65,26 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def _collect_topk_indices_buffers(mtp_model) -> list[torch.Tensor]:
+    """The distinct `topk_indices_buffer` tensors of a DSA MTP draft.
+
+    Mirrors the traversal in `DeepSeekMultiTokenPredictor.compact_topk_indices`
+    (`layer.mtp_block.self_attn.mla_attn`). Layers commonly alias one buffer, so
+    de-duplicate by identity to avoid saving and restoring it several times.
+    """
+    buffers: list[torch.Tensor] = []
+    seen: set[int] = set()
+    for layer in mtp_model.layers.values():
+        mtp_block = getattr(layer, "mtp_block", None)
+        self_attn = getattr(mtp_block, "self_attn", None)
+        mla_attn = getattr(self_attn, "mla_attn", None)
+        buf = getattr(mla_attn, "topk_indices_buffer", None)
+        if buf is not None and id(buf) not in seen:
+            seen.add(id(buf))
+            buffers.append(buf)
+    return buffers
 
 
 class Eagle3Proposer:
@@ -132,6 +153,15 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
+        # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
+        self._share_mtp_indices = False
+        # The distinct topk_indices_buffer tensors of the draft's MTP layers.
+        self._mtp_topk_buffers: list[torch.Tensor] = []
+        # IndexShare's second compiled program, for draft steps 1+. Built in
+        # load_model, and only when IndexShare is on.
+        self._mtp_loop_model: torch.nn.Module | None = None
+        # Whether that program has run once (its first run compiles it).
+        self._mtp_loop_model_warm = False
 
     def load_model(self, target_model) -> None:
         """Load the draft model and share embeddings/lm_head with target.
@@ -153,6 +183,7 @@ class Eagle3Proposer:
 
         if self.runner._pcp_mtp_k1_enabled is True:
             self._validate_pcp_draft_model(draft_attn_layer_names)
+        self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 
         maybe_share_embeddings(self.draft_model, target_model,
                                self._draft_tp_matches_target)
@@ -175,6 +206,224 @@ class Eagle3Proposer:
                 ) from e
             set_eagle3_aux_hidden_state_layers(target_model,
                                                self.speculative_config)
+        self._validate_mtp_layer_count()
+        self._init_mtp_index_sharing()
+        if self._share_mtp_indices:
+            self._build_mtp_loop_model()
+
+    def _validate_mtp_layer_count(self) -> None:
+        """One nextn layer only: the proposer's per-step wiring assumes it.
+
+        A DeepSeek-style MTP checkpoint may ship several nextn layers, and
+        `DeepSeekMultiTokenPredictor` then cycles them by
+        `spec_step_idx % num_mtp_layers`. Two things here assume a single
+        layer, and both go wrong quietly if there is more than one:
+
+        * `_draft_propose_token` calls `compute_logits(hidden)` and takes the
+          default `spec_step_idx=0`, so every step's logits come off layer 0's
+          `shared_head` -- while the forward that produced `hidden` ran layer
+          `step % num_mtp_layers`. Head and body disagree from step 1 on.
+        * Each `DeepSeekMultiTokenPredictorLayer` allocates its *own*
+          `topk_indices_buffer`, but only the layer that ran at draft step 0
+          has one written. `_mtp_compact_and_save` would gather garbage rows
+          out of the others, and every later step would read a buffer no
+          indexer ever filled.
+
+        Neither raises on its own, so refuse the checkpoint here instead. Every
+        released DeepSeek / GLM MTP checkpoint sets this to 1.
+
+        Both problems need a head *per nextn layer*, so that is what gates the
+        refusal -- not the layer count alone. Most MTP classes (Qwen3.5 /
+        Qwen3-Next, MiMo, ERNIE, Gemma4, ...) also expose `num_mtp_layers`,
+        but cycle their nextn layers under one top-level `lm_head` and carry
+        no indexer: the logits never depend on which layer ran, and there is
+        no top-k buffer to share. They work with any layer count and must not
+        be turned away here. Every DSA draft is a `DeepSeekMTP`, which does
+        have per-layer heads, so the second problem is covered by the same
+        test.
+        """
+        if self.speculative_config.method != "mtp":
+            return
+        mtp_model = getattr(self.draft_model, "model", None)
+        num_mtp_layers = getattr(mtp_model, "num_mtp_layers", None)
+        if num_mtp_layers is None or num_mtp_layers <= 1:
+            return
+        if not any(True for _ in iter_mtp_shared_heads(self.draft_model)):
+            return
+        raise NotImplementedError(
+            f"The MTP draft has num_nextn_predict_layers={num_mtp_layers} "
+            "with a separate shared_head per layer. This proposer reads "
+            "logits off layer 0's shared_head at every draft step, and "
+            "IndexShare only ever fills the top-k buffer of the layer that "
+            "ran at step 0. Use a single-layer MTP checkpoint.")
+
+    def _init_mtp_index_sharing(self) -> None:
+        """Enable IndexShare when a DSA MTP checkpoint asks for it.
+
+        GLM-5.2 trains its MTP layer *with* IndexShare: draft step 0 computes
+        the sparse top-k and steps 1..K-1 reuse it. That is not merely a
+        speedup. Because the reused index set was computed before the draft's
+        own token existed, it can never point at that token, so every draft
+        step attends only to KV derived from target hidden states -- the
+        property GLM calls KVShare. Recomputing the indices per step lets a
+        draft step attend to its own draft-derived KV, which is the
+        train/inference mismatch IndexShare was introduced to remove and costs
+        acceptance rate. So this is on whenever the checkpoint asks for it,
+        for any chunk count.
+        """
+        self._share_mtp_indices = False
+        self._mtp_topk_buffers = []
+        if self.speculative_config.method != "mtp":
+            return
+        draft_config = self.speculative_config.draft_model_config
+        hf_config = getattr(draft_config, "hf_config", None)
+        if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+            return
+
+        mtp_model = getattr(self.draft_model, "model", None)
+        if mtp_model is None or not hasattr(mtp_model, "set_skip_topk"):
+            logger.warning(
+                "Draft config sets index_share_for_mtp_iteration but %s "
+                "exposes no set_skip_topk; drafting without IndexShare, which "
+                "lowers the acceptance rate this checkpoint was trained for.",
+                type(self.draft_model).__name__)
+            return
+
+        self._mtp_topk_buffers = _collect_topk_indices_buffers(mtp_model)
+        if not self._mtp_topk_buffers:
+            logger.warning(
+                "Draft config sets index_share_for_mtp_iteration but no MTP "
+                "layer exposes a topk_indices_buffer; drafting without "
+                "IndexShare.")
+            return
+
+        # The buffer is sized `max_num_batched_tokens` rows -- one per token of
+        # a first-pass forward -- but the loop steps index it by *request*:
+        # compaction gathers to rows [0 : p] and each loop forward reads that
+        # same prefix, where p is the loop bucket for the chunk's request
+        # count. p is a token-padding bucket, so it is bounded by the largest
+        # bucket the runner will ever pick for `max_num_reqs` requests. Check
+        # that against the rows actually allocated rather than trusting
+        # max_num_batched_tokens >= max_num_seqs to hold: if it does not, the
+        # compaction store and the loop-step read both run off the end of the
+        # buffer.
+        # `_loop_bucket` is the same function with a DP-lockstep branch that
+        # is a no-op at this input (it clamps num_reqs up to max_num_reqs,
+        # which is what is already being asked for), so call the padding
+        # helper straight and keep load-time out of `_draft_has_moe`.
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+        required_rows = _get_padded_token_len(self.runner.num_tokens_paddings,
+                                              self.runner.max_num_reqs)
+        for buf in self._mtp_topk_buffers:
+            if buf.shape[0] < required_rows:
+                sched = self.vllm_config.scheduler_config
+                raise RuntimeError(
+                    "The MTP draft's topk_indices_buffer holds "
+                    f"{buf.shape[0]} rows but IndexShare compacts and reads "
+                    f"up to {required_rows} (the loop bucket for "
+                    f"max_num_reqs={self.runner.max_num_reqs}). The buffer is "
+                    "allocated from max_num_batched_tokens="
+                    f"{sched.max_num_batched_tokens}; raise it to at least "
+                    "the loop bucket, or lower max_num_seqs.")
+
+        # A loop step reads the buffer without the indexer having written it
+        # this step; -1 is the sparse-MLA padding sentinel (kv_len counts
+        # `!= -1`), so an unwritten row degrades to an empty attend instead of
+        # an out-of-range gather. Matters for the EP-DP dummy draft, which
+        # replays loop-step forwards on a rank that never ran a real propose.
+        for buf in self._mtp_topk_buffers:
+            buf.fill_(-1)
+
+        self._share_mtp_indices = True
+
+    def _build_mtp_loop_model(self) -> None:
+        """Give IndexShare's draft steps 1+ a compiled program of their own.
+
+        On TPU the draft forward is compiled once and vLLM drops the guards
+        that would recompile it, so the MTP attention's `skip_topk` check is
+        baked in by the first trace -- a step-0 pass, with the indexer on --
+        and flipping `skip_topk` later changes nothing. `MtpLoopStepModel`
+        runs the same draft forward over the same weights, KV caches and top-k
+        table as a second program, which `_draft_model_for_step` first runs
+        with `skip_topk` True. The target needs nothing like this: each of its
+        layers gets a fixed `skip_topk` when it is built.
+
+        Only IndexShare drafts get here, so every other drafter keeps exactly
+        one compiled program. If the program can't be built, IndexShare is
+        switched off rather than left in place doing nothing.
+        """
+        try:
+            from vllm_torchtpu.spec_decode.mtp_loop_model import (
+                MTP_DYNAMIC_ARG_DIMS, MtpLoopStepModel)
+            draft_dims = getattr(self.draft_model, "_dynamic_arg_dims", None)
+            if (draft_dims is not None
+                    and dict(draft_dims) != MTP_DYNAMIC_ARG_DIMS):
+                raise ValueError(
+                    f"the draft compiles with dynamic dims {dict(draft_dims)} "
+                    f"but the loop-step program uses {MTP_DYNAMIC_ARG_DIMS}")
+            # Built the way _load_draft_model builds the draft: the compile
+            # wrapper takes its config from the current one.
+            with set_model_tag("eagle_head"), set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+            ), set_current_vllm_config(self.draft_vllm_config):
+                self._mtp_loop_model = MtpLoopStepModel(
+                    vllm_config=self.draft_vllm_config,
+                    prefix="mtp_index_share_loop",
+                    mtp=self.draft_model)
+        except Exception:
+            logger.warning(
+                "Could not build IndexShare's loop-step program; drafting "
+                "without IndexShare, which lowers the acceptance rate this "
+                "checkpoint was trained for.",
+                exc_info=True)
+            self._share_mtp_indices = False
+            self._mtp_topk_buffers = []
+            self._mtp_loop_model = None
+            return
+        self._mtp_loop_model_warm = False
+        logger.info(
+            "MTP IndexShare enabled: draft step 0 computes the sparse top-k, "
+            "steps 1+ reuse it in a separately compiled program "
+            "(%d buffer(s)).", len(self._mtp_topk_buffers))
+
+    def _draft_model_for_step(self, step_idx: int):
+        """The compiled program draft step `step_idx` runs.
+
+        Without IndexShare that is always the draft itself. With it, step 0
+        runs the draft (indexer on) and steps 1+ the loop-step program
+        (indexer off). `skip_topk` is set before every call, but it only
+        matters on each program's first run, when it gets baked in.
+        """
+        if self._mtp_loop_model is None:
+            return self.draft_model
+        loop_step = step_idx > 0
+        self._mtp_set_skip_topk(loop_step)
+        return self._mtp_loop_model if loop_step else self.draft_model
+
+    def _mtp_set_skip_topk(self, skip: bool) -> None:
+        if self._share_mtp_indices:
+            self.draft_model.model.set_skip_topk(skip)
+
+    def _mtp_compact_and_save(
+            self, gather_indices: torch.Tensor) -> list[torch.Tensor]:
+        """Compact step 0's per-token top-k rows to one row per request, then
+        snapshot them.
+
+        Step 0 writes one buffer row per token of the chunk's forward; the loop
+        steps read row i for request i, so the rows have to be gathered to the
+        front first. The snapshot is what makes this correct for more than one
+        chunk: the buffer is a single tensor indexed by
+        position-in-the-current-forward, so the *next* chunk's step-0 indexer
+        write lands on exactly these rows and destroys them.
+        """
+        self.draft_model.model.compact_topk_indices(gather_indices)
+        num_rows = gather_indices.shape[0]
+        return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
+
+    def _mtp_restore_topk(self, saved: list[torch.Tensor]) -> None:
+        """Put this chunk's step-0 rows back at the front before its forward."""
+        for buf, rows in zip(self._mtp_topk_buffers, saved):
+            buf[:rows.shape[0]] = rows
 
     def _load_draft_model(self) -> None:
         logger.info(f"Loading {self.speculative_config.method} draft model...")
@@ -213,6 +462,113 @@ class Eagle3Proposer:
                 raise NotImplementedError(
                     "PCP MTP draft requires FullAttentionSpec for layer "
                     f"{layer_name}, got {type(spec).__name__}")
+
+    @staticmethod
+    def _split_dsa_draft_layers(
+        all_attn_layers: dict[str, AttentionLayerBase],
+        draft_attn_layer_names: set[str],
+    ) -> tuple[list[str], list[str]]:
+        """Split a DSA draft's attention layers into (indexer K caches, MLA).
+
+        Returns two empty lists for any draft with no lightning indexer, which
+        is every non-DSA draft: eagle3, Qwen3.5 MTP, DFlash/DSpark, and a
+        pre-V3.2 DeepSeek MTP.
+        """
+        try:
+            from vllm.model_executor.layers.attention.mla_attention import \
+                MLAAttention
+            from vllm.model_executor.models.deepseek_v2 import \
+                DeepseekV32IndexerCache
+        except ImportError:
+            # A vLLM build without DSA cannot have loaded a DSA draft.
+            return [], []
+
+        indexer_names = sorted(
+            name for name in draft_attn_layer_names
+            if isinstance(all_attn_layers.get(name), DeepseekV32IndexerCache))
+        if not indexer_names:
+            return [], []
+        mla_names = sorted(
+            name for name in draft_attn_layer_names
+            if isinstance(all_attn_layers.get(name), MLAAttention))
+        return indexer_names, mla_names
+
+    def _validate_dsa_draft(self, all_attn_layers: dict[str,
+                                                        AttentionLayerBase],
+                            draft_attn_layer_names: set[str]) -> None:
+        """Prove a sparse-attention (DSA) draft's KV caches are usable.
+
+        A GLM-5.2 / DeepSeek-V3.2 MTP draft owns two KV caches per MTP layer:
+        the MLA latent cache and the lightning indexer's fp8 K cache. Both are
+        `AttentionLayerBase`s that register themselves in the *shared*
+        `static_forward_context` -- the draft's compilation config is a shallow
+        copy of the target's, so the two models write into one registry -- and
+        both therefore reach `TPUModelRunner.get_kv_cache_spec` and, via the
+        registry diff above, `_draft_attn_layer_names`. Registration needs no
+        new code; what it needs is a check that the generic path really covered
+        them, because every way it can fail is silent.
+
+        A layer whose module type falls through the spec walk's trailing
+        `else: continue` gets no `KVCacheSpec`. The KV cache manager then
+        allocates nothing for it, its `kv_cache` stays a 0-element tensor, and
+        `VllmTPUSparseAttnIndexer.forward_oot` returns the top-k buffer without
+        having written it. The draft attends to whatever that buffer held --
+        all -1 once `_init_mtp_index_sharing` seeds it, i.e. nothing at all --
+        so every proposal comes out of an empty attend and the acceptance rate
+        collapses to roughly what an unconditioned draft would get. No
+        exception is raised anywhere along that path, which is exactly why it
+        is worth one check at load.
+        """
+        indexer_names, mla_names = self._split_dsa_draft_layers(
+            all_attn_layers, draft_attn_layer_names)
+        if not indexer_names:
+            return
+
+        if not mla_names:
+            raise RuntimeError(
+                "The draft model registered a DSA lightning indexer "
+                f"({indexer_names[0]}) but no MLA attention layer. The "
+                "indexer only scores and selects KV positions; sparse MLA "
+                "is what reads them. A draft with one and not the other "
+                "cannot run.")
+
+        # Only a draft replicated *below* the target's TP is a problem. At
+        # target_tp == 1 both flags are set and nothing is sharded either way.
+        if self._draft_replicated and not self._draft_tp_matches_target:
+            target_tp = self.vllm_config.parallel_config.tensor_parallel_size
+            raise NotImplementedError(
+                "A DSA (sparse-MLA) draft cannot run replicated "
+                "(draft_tensor_parallel_size=1). Its sparse-MLA and "
+                "lightning-indexer Pallas ops are built against the runner's "
+                "full TP mesh, and unlike the dense RPA path -- where "
+                "`_initialize_attention_kernels` swaps in a LOCAL "
+                "(non-shard_map) kernel for a replicated draft -- there is no "
+                "single-device variant to relocate them to, so the kernels "
+                "would shard head-parallel work over weights loaded "
+                "unsharded. Set draft_tensor_parallel_size to the target's "
+                f"tensor_parallel_size ({target_tp}).")
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+        unregistered = [
+            name for name in (*mla_names, *indexer_names)
+            if name not in kv_cache_specs
+        ]
+        if unregistered:
+            missing_types = sorted({
+                type(all_attn_layers[name]).__name__
+                for name in unregistered
+            })
+            raise RuntimeError(
+                "These DSA draft layers got no KVCacheSpec, so no KV cache "
+                "would be allocated for them and the draft would silently "
+                f"attend to nothing: {unregistered}. "
+                "`TPUModelRunner.get_kv_cache_spec` needs a branch for their "
+                f"module types ({missing_types}).")
+
+        logger.info(
+            "DSA draft KV caches registered: %d sparse-MLA layer(s) %s, "
+            "%d lightning-indexer K cache(s) %s.", len(mla_names), mla_names,
+            len(indexer_names), indexer_names)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -347,6 +703,9 @@ class Eagle3Proposer:
         uses_aux_hidden_state = self._draft_uses_aux_hidden_state()
         draft_tokens_per_chunk = []
         is_async = next_tokens_per_chunk is not None
+        # IndexShare: each chunk's step-0 top-k rows, saved right after its
+        # compaction (see _mtp_compact_and_save).
+        saved_topk_per_chunk: list[list[torch.Tensor]] = []
         for ci, chunk in enumerate(chunks):
             if uses_aux_hidden_state:
                 with set_model_tag("eagle_head"):
@@ -392,6 +751,11 @@ class Eagle3Proposer:
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
             owner_mask = last_token_indices.ge(0)
             safe_gather_indices = last_token_indices.clamp_min(0)
+            if self._share_mtp_indices:
+                # Clamped, not raw: a PCP-localized index is -1 for a row this
+                # rank does not own, and -1 would wrap to the buffer's last row.
+                saved_topk_per_chunk.append(
+                    self._mtp_compact_and_save(safe_gather_indices))
             hidden_carry, positions_carry, last_hidden_carry = (
                 self._draft_gather_carries(hidden, positions, last_hidden,
                                            safe_gather_indices))
@@ -460,6 +824,13 @@ class Eagle3Proposer:
                                  device=runner.device))
             for step in range(1, K):
                 for ci, chunk in enumerate(chunks):
+                    if self._share_mtp_indices:
+                        # The loop is step-major, so chunks interleave and each
+                        # one finds the buffer holding its predecessor's rows.
+                        # Restore unconditionally: one rule, no dependence on
+                        # the chunk count. With a single chunk this is a
+                        # self-copy of a few hundred KiB.
+                        self._mtp_restore_topk(saved_topk_per_chunk[ci])
                     loop_positions[ci] = loop_positions[ci] + 1
                     # Prev step's [p] tokens feed directly — already bucketed.
                     loop_input_ids = draft_tokens_per_chunk[ci][-1]
@@ -929,6 +1300,7 @@ class Eagle3Proposer:
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
 
+        model = self._draft_model_for_step(step_idx)
         with set_model_tag("eagle_head"), set_forward_context(
                 attn_metadata,
                 self.draft_vllm_config,
@@ -937,7 +1309,18 @@ class Eagle3Proposer:
                     num_tokens),
         ), set_vllm_model_wrapper_context(mesh=self.runner.mesh,
                                           vllm_config=self.draft_vllm_config):
-            out = self.draft_model(**kwargs)
+            if (model is self._mtp_loop_model
+                    and not self._mtp_loop_model_warm):
+                # This call traces and compiles the loop-step program. Like
+                # the draft's own first call (see the retry in
+                # TPUModelRunner._warmup_spec_decode), its output can carry
+                # symbolic sizes that the dynamic=False helpers after it
+                # reject, so run the step once more now that it's compiled.
+                # The repeat writes the same KV entries again, and a loop step
+                # only reads the top-k table.
+                model(**kwargs)
+                self._mtp_loop_model_warm = True
+            out = model(**kwargs)
 
         return self._unwrap_model_out(out)
 
@@ -959,7 +1342,24 @@ class Eagle3Proposer:
         self._precompile_compute_logits()
 
     def _draft_hidden_size(self) -> int:
-        return self.draft_model.config.hidden_size
+        """Width of the hidden state the draft's lm_head consumes.
+
+        Prefer the built draft's own config: that is the value every draft
+        resolved today already reports, so this stays a no-op for them.
+
+        Some drafts are loaded under a *wrapper* config that keeps the text
+        dims on a nested `text_config` and exposes no top-level `hidden_size`
+        at all -- Gemma-4 MTP's `Gemma4AssistantConfig` and Qwen3.5 MTP's
+        `Qwen3_5MoeConfig` are both like this. Reading `hidden_size` off the
+        wrapper raises AttributeError, and the one width it *does* expose
+        (`backbone_hidden_size`) is the TARGET's, not the draft's. Fall back
+        to vLLM's already-resolved text config for those.
+        """
+        hidden_size = getattr(self.draft_model.config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = (self.speculative_config.draft_model_config.
+                           hf_text_config.hidden_size)
+        return hidden_size
 
     def _draft_uses_aux_hidden_state(self) -> bool:
         """Whether this draft checkpoint feeds combine_hidden_states the
@@ -1244,7 +1644,12 @@ class Eagle3Proposer:
             )
             with set_model_tag("eagle_head"):
                 tok = self._draft_propose_token(first_pass_carry)
-            # Mirror the K-1 loop steps: forward @p -> lm head @p.
+            # Mirror the K-1 loop steps: forward @p -> lm head @p. Under
+            # IndexShare, _forward_draft routes these to the loop-step program
+            # exactly as a real propose does, so this rank runs the same
+            # programs, and the same collectives, as its peers. They read the
+            # top-k table without having written it this step; load_model
+            # seeds it with -1 so that read stays in range.
             for step in range(1, K):
                 last_hidden, _ = self._forward_draft(
                     chunk=chunk,

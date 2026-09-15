@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu import envs
 
 _RCP_LN2 = 1.0 / math.log(2)
 
@@ -1274,8 +1275,7 @@ def _chunk_kda_fwd_native_segids_impl(
             segment_ids = jnp.broadcast_to(segment_ids, (B, T))
 
     NT = T // BT
-    packed_metadata = (only_fwd
-                       and os.environ.get("KDA_PACKED_METADATA", "1") == "1")
+    packed_metadata = only_fwd and envs.KDA_PACKED_METADATA
     chunk_kind, seg_first, seg_last, seg_id = _build_chunk_metadata(
         segment_ids, BT)
     next_kind = jnp.concatenate(
@@ -1325,9 +1325,9 @@ def _chunk_kda_fwd_native_segids_impl(
     seg_first_padded = jnp.pad(seg_first, ((0, 0), (0, NT_meta_PAD - NT_meta)))
     seg_last_padded = jnp.pad(seg_last, ((0, 0), (0, NT_meta_PAD - NT_meta)))
 
-    env_mini_batch = os.environ.get("KDA_FWD_MB") if only_fwd else None
-    if mini_batch is None and env_mini_batch:
-        mini_batch = int(env_mini_batch)
+    env_mini_batch = envs.KDA_FWD_MB if only_fwd else None
+    if mini_batch is None and env_mini_batch is not None:
+        mini_batch = env_mini_batch
     if mini_batch is not None:
         MB = mini_batch
     elif only_fwd:
@@ -1363,25 +1363,22 @@ def _chunk_kda_fwd_native_segids_impl(
     # 64x64 mask on the Stage 4 dependency chain.  Keep the training lowering
     # unchanged because it shares this kernel body.
     skip_stage4_mask = only_fwd
-    pack_head_inv = (only_fwd and MB % 2 == 0
-                     and os.environ.get("KDA_PACK_HEAD_INV", "1") == "1")
+    pack_head_inv = (only_fwd and MB % 2 == 0 and envs.KDA_PACK_HEAD_INV)
     clip_beta_in_kernel = only_fwd
-    overlap_h0_dma = (only_fwd
-                      and os.environ.get("KDA_OVERLAP_H0_DMA", "1") == "1")
-    overlap_ht_dma = (only_fwd
-                      and os.environ.get("KDA_OVERLAP_HT_DMA", "1") == "1")
+    overlap_h0_dma = only_fwd and envs.KDA_OVERLAP_H0_DMA
+    overlap_ht_dma = only_fwd and envs.KDA_OVERLAP_HT_DMA
     _prec = jax.lax.Precision.DEFAULT if use_neumann else jax.lax.Precision.HIGHEST
 
     # Prepare h0: broadcast to [1, H, 1, K_PAD, V_ALIGNED] so each grid point
     # can read its own MB-sized block via _h0_map (avoids OOB on dim1).
     has_h0 = initial_state is not None
-    state_dma_override = os.environ.get("KDA_MANUAL_STATE_DMA")
-    manual_state_dma = (N_max >= 6 if state_dma_override is None else
-                        state_dma_override == "1")
-    h0_dma_override = os.environ.get("KDA_MANUAL_H0_DMA")
+    state_dma_override = envs.KDA_MANUAL_STATE_DMA
+    manual_state_dma = (N_max >= 6
+                        if state_dma_override is None else state_dma_override)
+    h0_dma_override = envs.KDA_MANUAL_H0_DMA
     manual_h0_dma = (
         only_fwd and has_h0
-        and (N_max > 6 if h0_dma_override is None else h0_dma_override == "1"))
+        and (N_max > 6 if h0_dma_override is None else h0_dma_override))
     if has_h0:
         h0 = initial_state
         if h0.ndim == 4:
@@ -1495,10 +1492,10 @@ def _chunk_kda_fwd_native_segids_impl(
     else:
         o_spec = pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_out_map)
     store_final_state = output_final_state or store_h
-    ht_dma_override = os.environ.get("KDA_MANUAL_HT_DMA")
-    manual_ht_dma = (only_fwd and store_final_state
-                     and (manual_state_dma if ht_dma_override is None else
-                          ht_dma_override == "1"))
+    ht_dma_override = envs.KDA_MANUAL_HT_DMA
+    manual_ht_dma = (
+        only_fwd and store_final_state
+        and (manual_state_dma if ht_dma_override is None else ht_dma_override))
     ht_spec = ((pl.BlockSpec(
         memory_space=pl.ANY) if manual_ht_dma else pl.BlockSpec(
             [N_max, MB, 1, K_PAD, V_ALIGNED],

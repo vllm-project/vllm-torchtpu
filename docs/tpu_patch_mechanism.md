@@ -57,6 +57,30 @@ Prefer an explicit callback for additions. The existing bare-module entry for
 `vllm_torchtpu.layers.adapter.vision_attention` relies on import side effects; the
 registry does not reload modules.
 
+### Adding model-specific patches
+
+To add TPU patches or workarounds for a new model architecture or family:
+
+1. Implement the patch callback in `src/vllm_torchtpu/models/vllm/<model_name>_patch.py`
+   (e.g., `maybe_patch_<model>`).
+2. Inside the callback:
+   - Accept `model_config: Optional["ModelConfig"] = None`.
+   - Inspect `model_config` to check if it matches the target model family.
+   - Return `False` if `model_config` is `None` or non-matching, allowing retry at
+     later lifecycle stages (e.g., `model_load`).
+   - If matched, apply the model-specific patches and return `None` (or any non-`False`
+     value) to mark the patch complete.
+3. Append a new `Patch` entry under the `# Model-specific patches` section of `PATCHES`
+   in `src/vllm_torchtpu/patch_registry.py`:
+
+```python
+Patch(
+    "vllm_torchtpu.models.vllm.<model_name>_patch:maybe_patch_<model>",
+    ("platform_activation", "model_load"),
+    model_config=True,
+),
+```
+
 ## Completion, retries, and model selection
 
 A callback normally returns `None`, including when it intentionally does nothing
@@ -66,7 +90,7 @@ Retry requires another `apply` call to one of the patch's registered stages.
 
 With `model_config=True`, check model eligibility inside the callback. Return
 `False` when a missing or nonmatching configuration should allow a later attempt.
-For example, `_apply_model_specific_patches` returns `False` for a non-Qwen3-VL
+For example, `maybe_patch_qwen3_vl` returns `False` for a non-Qwen3-VL
 configuration and is registered at `platform_activation` and `model_load`.
 Completion is keyed by target, not by model configuration, so a completed callback
 does not run again for a different model in the same process.

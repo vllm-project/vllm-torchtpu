@@ -163,7 +163,7 @@ echo "ports: server=${PORT} registry=${REGISTRY_PORT}\
 # ---------------------------------------------------------------------------
 # Version preflight: the runtime must match pyproject.toml exactly.
 # ---------------------------------------------------------------------------
-RAIDEN_PIN="$(sed -nE 's/^[[:space:]]*"tpu-raiden-torch==([^"]+)".*/\1/p' \
+RAIDEN_PIN="$(sed -nE 's/^[[:space:]]*"tpu-(raiden|sync)-torch==([^"]+)".*/\2/p' \
   "${repo_root}/pyproject.toml" | head -1)"
 [[ -n "${RAIDEN_PIN}" ]] \
   || fail "no tpu-raiden-torch== pin found in pyproject.toml"
@@ -173,7 +173,10 @@ import importlib.metadata
 import sys
 
 raiden_pin = sys.argv[1]
-raiden_installed = importlib.metadata.version("tpu-raiden-torch")
+try:
+    raiden_installed = importlib.metadata.version("tpu-sync-torch")
+except importlib.metadata.PackageNotFoundError:
+    raiden_installed = importlib.metadata.version("tpu-raiden-torch")
 if raiden_installed != raiden_pin:
     raise SystemExit(
         f"installed tpu-raiden-torch {raiden_installed} != pyproject pin "

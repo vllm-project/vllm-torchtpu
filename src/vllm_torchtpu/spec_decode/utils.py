@@ -180,8 +180,57 @@ def maybe_share_embeddings(draft_model: torch.nn.Module,
             populate_draft_embed_from_target(draft_model, target_embed)
 
 
+def iter_mtp_shared_heads(draft_model: torch.nn.Module):
+    """Yield the per-layer ``shared_head`` modules of a DeepSeek-style MTP draft.
+
+    DeepSeek / GLM-5.2 MTP (`DeepSeekMTP`) has no top-level `lm_head`: each MTP
+    layer owns the head at `model.layers.<N>.shared_head.head`, and
+    `compute_logits` reaches it through there. Drafts that do carry a top-level
+    head (eagle3, Qwen3.5 MTP) have no `shared_head` and yield nothing, so
+    callers can walk this unconditionally.
+    """
+    inner = getattr(draft_model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        return
+    items = (layers.values()
+             if isinstance(layers, torch.nn.ModuleDict) else layers)
+    for layer in items:
+        shared_head = getattr(layer, "shared_head", None)
+        if shared_head is not None and hasattr(shared_head, "head"):
+            yield shared_head
+
+
+def resolve_draft_logits_processor(draft_model: torch.nn.Module):
+    """The draft's `LogitsProcessor`, wherever the draft class keeps it.
+
+    Eagle3 / DFlash / Qwen3.5-MTP drafts expose it at the top level; a
+    DeepSeek-style MTP draft keeps it on the inner `DeepSeekMultiTokenPredictor`
+    (`draft_model.model.logits_processor`) and has none at the top level.
+    """
+    lp = getattr(draft_model, "logits_processor", None)
+    if lp is None:
+        inner = getattr(draft_model, "model", None)
+        lp = getattr(inner, "logits_processor", None)
+    return lp
+
+
 def populate_draft_lm_head_from_target(
         draft_model: torch.nn.Module, target_lm_head: torch.nn.Module) -> None:
+    shared_heads = list(iter_mtp_shared_heads(draft_model))
+    if shared_heads:
+        full_dev, org_vocab, dim, draft_device = gather_sharded_weight(
+            target_lm_head)
+        for shared_head in shared_heads:
+            shared_head.head.weight = Parameter(full_dev, requires_grad=False)
+            if draft_device.type == "tpu":
+                synchronize_tensors(shared_head.head.weight)
+        logger.info(
+            "Populated %d MTP shared_head.head module(s) with a full "
+            "replicated copy of the target lm_head: %d x %d per worker.",
+            len(shared_heads), org_vocab, dim)
+        return
+
     draft_lm_head = draft_model.model.lm_head if hasattr(
         draft_model, "model") and hasattr(draft_model.model,
                                           "lm_head") else getattr(
@@ -231,12 +280,26 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
             logger.info(
                 "Sharing the target's lm_head with the draft using the same TP layout."
             )
+            # A DeepSeek-style MTP draft (DeepSeek / GLM-5.2) keeps its head at
+            # model.layers.<N>.shared_head.head and has no top-level lm_head, so
+            # the attribute walk below would bind a dead attribute and leave the
+            # real head as loaded -- NaN logits when the checkpoint omits a copy
+            # of the head at the MTP path. Bind the shared heads explicitly.
+            shared_heads = list(iter_mtp_shared_heads(draft_model))
+            for shared_head in shared_heads:
+                del shared_head.head
+                shared_head.head = target_lm_head
+            if shared_heads:
+                logger.info(
+                    "Shared the target's lm_head with %d MTP "
+                    "shared_head.head module(s).", len(shared_heads))
+
             if hasattr(draft_model, "lm_head"):
                 draft_model.lm_head = target_lm_head
             elif hasattr(draft_model, "model") and hasattr(
                     draft_model.model, "lm_head"):
                 draft_model.model.lm_head = target_lm_head
-            else:
+            elif not shared_heads:
                 draft_model.lm_head = target_lm_head
         elif materialize_if_mismatched:
             logger.info("Populating draft's own lm_head with a host-gathered, "
@@ -246,12 +309,19 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
     # We must override _gather_logits for replicated draft models even if we don't share the lm_head,
     # because the draft model's logits_processor will still try to gather logits across TP=1.
     if draft_replicated:
-        lp = getattr(draft_model, "logits_processor", None)
-        if lp is not None:
-            assert hasattr(lp, "_gather_logits"), (
-                "draft logits_processor has no _gather_logits to override; "
-                "vLLM may have renamed it.")
-            lp._gather_logits = lambda logits: logits
+        lp = resolve_draft_logits_processor(draft_model)
+        if lp is None:
+            raise RuntimeError(
+                "A replicated (draft_tp=1) draft needs its LogitsProcessor to "
+                "skip the TP all-gather, but "
+                f"{type(draft_model).__name__} exposes none at "
+                "`logits_processor` or `model.logits_processor`. Without the "
+                "override the draft would gather over a TP group it is not "
+                "sharded across.")
+        assert hasattr(lp, "_gather_logits"), (
+            "draft logits_processor has no _gather_logits to override; "
+            "vLLM may have renamed it.")
+        lp._gather_logits = lambda logits: logits
 
 
 # Noise-token id resolution order, mirroring upstream

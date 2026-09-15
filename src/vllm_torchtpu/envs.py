@@ -101,6 +101,26 @@ if TYPE_CHECKING:
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
+    KDA_MANUAL_STATE_DMA: bool | None = None
+    KDA_MANUAL_H0_DMA: bool | None = None
+    KDA_MANUAL_HT_DMA: bool | None = None
+    KDA_OVERLAP_H0_DMA: bool = True
+    KDA_OVERLAP_HT_DMA: bool = True
+    KDA_PACK_HEAD_INV: bool = True
+    KDA_PACKED_METADATA: bool = True
+    KDA_FWD_MB: int | None = None
+    SPEC_WARMUP: bool = True
+    RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
+    RAIDEN_SHM_KEY: str = ""
+    VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
+    VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TORCHTPU_IPC_KEY: str = ""
+    TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
+    VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
+    TPU_LOCAL_RANK_OFFSET: int = 0
+    DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
+    TORCH_TPU_BASE_PORT: int = 8070
+    TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
 
 
 def env_with_choices(
@@ -183,7 +203,12 @@ def env_int(env_name: str, default: int) -> Callable[[], int]:
         value = os.getenv(env_name)
         if value is None or value.strip() == "":
             return default
-        return int(value)
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be an integer."
+            ) from exc
 
     return _get_int_env
 
@@ -215,7 +240,12 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
         value = os.getenv(env_name)
         if value is None or value.strip() == "":
             return default
-        return float(value)
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be a number."
+            ) from exc
 
     return _get_float_env
 
@@ -668,6 +698,76 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for p in os.getenv("QUANTIZE_ON_LOAD_PREFIXES", "").split(",")
         if p.strip()
     ],
+    # Kimi K3 KDA kernel DMA and performance tuning knobs.
+    "KDA_MANUAL_STATE_DMA":
+    env_optional_bool("KDA_MANUAL_STATE_DMA"),
+    "KDA_MANUAL_H0_DMA":
+    env_optional_bool("KDA_MANUAL_H0_DMA"),
+    "KDA_MANUAL_HT_DMA":
+    env_optional_bool("KDA_MANUAL_HT_DMA"),
+    "KDA_OVERLAP_H0_DMA":
+    env_bool("KDA_OVERLAP_H0_DMA", default=True),
+    "KDA_OVERLAP_HT_DMA":
+    env_bool("KDA_OVERLAP_HT_DMA", default=True),
+    "KDA_PACK_HEAD_INV":
+    env_bool("KDA_PACK_HEAD_INV", default=True),
+    "KDA_PACKED_METADATA":
+    env_bool("KDA_PACKED_METADATA", default=True),
+    "KDA_FWD_MB":
+    env_optional_int("KDA_FWD_MB"),
+
+    # Startup and host-side knobs. None of them change what gets compiled;
+    # each is also listed in _TPU_COMPILE_ENV_IGNORED so it stays out of the
+    # compile-cache key.
+
+    # Run the real spec-decode dispatch once at startup so the first request
+    # does not pay for those compiles. Off skips that warmup.
+    "SPEC_WARMUP":
+    env_bool("SPEC_WARMUP", default=True),
+    # Raiden library switch, on by default. The TPU offloading connector
+    # cannot run next to the raiden singleton worker, so it rejects an
+    # explicit off and exports the variable as on for the raiden library.
+    "RAIDEN_DISABLE_SINGLETON_WORKER":
+    env_bool("RAIDEN_DISABLE_SINGLETON_WORKER", default=True),
+    # The raiden library's shared-memory key, a string naming the segment
+    # behind its shm-backed host pools. The TPU offloading connector cannot
+    # serve those pools, so it refuses to start when the key is set at all.
+    # Read raw, not through env_str: the check must see the same bytes the
+    # raiden library sees, and a whitespace-only key still counts as set.
+    "RAIDEN_SHM_KEY":
+    lambda: os.getenv("RAIDEN_SHM_KEY", ""),
+    # Seconds; upper bound on a scheduler-side drain of in-flight offload
+    # jobs whose blocks are about to be reused.
+    "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S":
+    env_float("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
+    # How many times an offload save whose transfer failed is retried.
+    "VLLM_TPU_OFFLOAD_SAVE_RETRIES":
+    env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # Secret for the KV-transfer IPC socket; "" derives one from the host.
+    # Read raw, not through env_str: a secret's bytes must not be trimmed.
+    "VLLM_TORCHTPU_IPC_KEY":
+    lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
+    # Sync the device every N tensors during sharded EP weight loading so
+    # queued host copies are released; 0 disables the periodic sync.
+    "TPU_SHARDED_LOAD_SYNC_EVERY":
+    env_int("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
+    # Log the PCP sequence layout window on every step.
+    "VLLM_TPU_DEBUG_PCP_LAYOUT":
+    env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
+    # Added to every worker's local rank when it binds to a physical chip.
+    # worker/tpu_rank_binding.py reads it from the env mapping it is given.
+    "TPU_LOCAL_RANK_OFFSET":
+    env_int("TPU_LOCAL_RANK_OFFSET", 0),
+    # Same offset for the legacy worker init path; debug only.
+    "DEBUG_TPU_LOCAL_RANK_OFFSET":
+    env_int("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
+    # First slicebuilder port; each chip on a host takes base + local rank.
+    "TORCH_TPU_BASE_PORT":
+    env_int("TORCH_TPU_BASE_PORT", 8070),
+    # TCPStore port for the mp multihost rendezvous; unset means the vLLM
+    # coordination port plus one.
+    "TORCH_TPU_MP_RENDEZVOUS_PORT":
+    env_optional_int("TORCH_TPU_MP_RENDEZVOUS_PORT"),
 }
 
 

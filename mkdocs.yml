@@ -41,19 +41,23 @@ theme:
     - toc.follow
 
 nav:
-  - Home: README.md
-  - Getting Started:
-    - TPU Setup: getting_started/tpu_setup.md
-    - Installation: getting_started/installation.md
-    - Quickstart: getting_started/quickstart.md
-    - 'Out-of-Tree Usage': getting_started/out-of-tree.md
-  - 'Recommended Models and Features': recommended_models_features.md
+  - Home: index.md
   - Developer Guides:
+    - Pre-Public Dev Guide: PRE_PUBLIC_DEV_GUIDE.md
+    - TorchTPU Compilation: torch_tpu_compilation.md
     - 'TPU patch mechanism': tpu_patch_mechanism.md
-    - 'JAX Model Development': developer_guides/jax_model_development.md
-    - 'Torch Model Development': developer_guides/torchax_model_development.md
-  - 'TPU Recipes (external)': https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/inference/trillium/vLLM
-  - 'Profiling' : profiling.md
+    - Profiling: profiling.md
+    - Docker: docker.md
+  - Contributing: https://github.com/vllm-project/vllm-torchtpu/blob/main/CONTRIBUTING.md
+
+validation:
+  nav:
+    omitted_files: info
+    not_found: warn
+  links:
+    not_found: ignore
+    absolute_links: ignore
+    unrecognized_links: ignore
 plugins:
   - search
   - same-dir
@@ -80,7 +84,13 @@ markdown_extensions:
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  - pymdownx.snippets:
+      # Resolve snippet paths against the repo root (where README.md lives),
+      # independent of the current working directory.
+      base_path: !relative $config_dir
+      # Fail the build instead of silently rendering an empty page if a
+      # snippet target goes missing.
+      check_paths: true
   # For emoji and icons
   - pymdownx.emoji:
       emoji_index: !!python/name:material.extensions.emoji.twemoji

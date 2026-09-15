@@ -424,7 +424,7 @@ print(json.dumps({
     "vllm_torchtpu_file": vllm_torchtpu.__file__,
     "torch_version": torch.__version__,
     "torch_tpu_version": dist_version("torch-tpu"),
-    "tpu_raiden_torch_version": dist_version("tpu-raiden-torch"),
+    "tpu_raiden_torch_version": dist_version("tpu-sync-torch") or dist_version("tpu-raiden-torch"),
     "raiden_native_file": _tpu_raiden_torch.__file__,
     "vllm_torchtpu_fingerprint": package_fingerprint(vllm_torchtpu, {".py", ".so"}),
     "tpu_raiden_fingerprint": package_fingerprint(tpu_sync, {".py", ".so"}),

@@ -171,11 +171,12 @@ def ragged_paged_attention(
     *,
     sm_scale: float | None = None,
     k_scale: float | None = None,
+    cache_layout: str = "tensorcore",
 ) -> jax.Array:
     """Dispatch one traced DSA step without changing the layer interface."""
     limits = (MASKED_DENSE_ANALYTIC_LIMIT, MASKED_DENSE_LIMIT)
     enable_masked_dense = bool(
-        envs.TPU_MLA_MASKED_DENSE_ENABLED
+        cache_layout == "tensorcore" and envs.TPU_MLA_MASKED_DENSE_ENABLED
         and q.shape[0] >= MASKED_DENSE_MIN_TOKEN_BUCKET
         and matches_glm52_tpu7x_profile(q, kv_cache_nope, kv_cache_rope,
                                         topk_indices))
@@ -191,6 +192,7 @@ def ragged_paged_attention(
             request_distribution,
             sm_scale=sm_scale or 1.0,
             k_scale=k_scale or 1.0,
+            cache_layout=cache_layout,
         )
 
     if not enable_masked_dense:
