@@ -226,10 +226,10 @@ def materialize_shared_attention_cache(
     pool_shape = shapes[0]
     if (any(shape != pool_shape for shape in shapes)
             or math.prod(pool_shape[1:]) != page_elements):
-        # Keep one tensor across custom-op calls; form native views in JAX.
-        # Shape: (scheduler pages, tokens per page, padded KV elements).
-        pool_shape = (num_blocks, spec.block_size,
-                      page_elements // spec.block_size)
+        # Keep the packed dtype axis separate when reinterpreting head shapes.
+        packing = 4 // spec.dtype.itemsize
+        pool_shape = (num_blocks, spec.block_size, packing,
+                      page_elements // (spec.block_size * packing))
     return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
 
