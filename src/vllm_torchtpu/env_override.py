@@ -134,12 +134,11 @@ def _fetch_tpu_type_from_metadata() -> str | None:
 
 
 def _resolve_sc_offload_threshold_bytes() -> int | None:
-    # An explicit positive value wins; 0 or negative means no flag. None
-    # (the variable was unset or "auto") falls through to the chip-family
-    # table below.
+    # An explicit value wins, with 0 meaning no flag. None (the variable
+    # was unset or "auto") falls through to the chip-family table below.
     override = envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES
     if override is not None:
-        return override if override > 0 else None
+        return override or None
 
     tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
     if not tpu_type:

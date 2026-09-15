@@ -275,15 +275,20 @@ class TestTpuCompilerCache:
             if "offload_min_size_in_bytes" in token
         ]
 
-    @pytest.mark.parametrize("value,expected_flags", [
-        ("12345", 2),
-        ("auto", 2),
-        ("", 2),
-        ("0", 0),
-    ])
-    def test_env_override_sc_offload_threshold(self, value, expected_flags):
-        """An integer is used as given, unset/empty/auto resolves from the
-        chip family, and 0 sets no flag at all."""
+    @pytest.mark.parametrize(
+        "value,expected_threshold",
+        [
+            ("12345", 12345),
+            # v6e resolves "auto" to its per-tensor-core VMEM size.
+            ("auto", 134217728),
+            ("", 134217728),
+            ("0", None),
+        ],
+    )
+    def test_env_override_sc_offload_threshold(self, value,
+                                               expected_threshold):
+        """An explicit value is used as given, unset/empty/auto resolves
+        from the chip family, and 0 sets no flag at all."""
         env_mock = {
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
             "TPU_ACCELERATOR_TYPE": "v6e-8",
@@ -292,17 +297,19 @@ class TestTpuCompilerCache:
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
-            flags = self._sc_offload_flags()
-            assert len(flags) == expected_flags
-            if value == "12345":
-                assert all(flag.endswith("=12345") for flag in flags)
+            expected = [] if expected_threshold is None else [
+                f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes="
+                f"{expected_threshold}" for op in ("all_reduce", "all_gather")
+            ]
+            assert self._sc_offload_flags() == expected
 
-    def test_env_override_sc_offload_bad_value_raises(self):
-        """A value that is neither an integer nor "auto" stops the package
-        import with an error that names the variable, rather than silently
-        running without the SC-offload flag."""
+    @pytest.mark.parametrize("value", ["banana", "-1"])
+    def test_env_override_sc_offload_bad_value_raises(self, value):
+        """A value that is not "auto" or a non-negative integer stops the
+        package import with an error that names the variable, rather than
+        silently running without the SC-offload flag."""
         env_mock = {
-            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "banana",
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
             "TPU_ACCELERATOR_TYPE": "v6e-8",
         }
         with patch.dict(os.environ, env_mock, clear=True):
@@ -311,6 +318,26 @@ class TestTpuCompilerCache:
                     ValueError,
                     match="SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"):
                 importlib.reload(vllm_torchtpu.env_override)
+
+    def test_envs_module_imports_only_the_standard_library(self):
+        """env_override.py imports envs while the package's own __init__ is
+        still running, which is only safe while envs.py depends on nothing
+        in this package."""
+        import ast
+        import sys
+
+        import vllm_torchtpu.envs
+        tree = ast.parse(Path(vllm_torchtpu.envs.__file__).read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(
+                    alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        assert imported <= sys.stdlib_module_names, (
+            f"envs.py imports non-stdlib modules: "
+            f"{sorted(imported - sys.stdlib_module_names)}")
 
     def test_env_override_disables_breakable_cudagraph(self):
         """Verify that the TPU plugin always disables breakable cudagraph."""

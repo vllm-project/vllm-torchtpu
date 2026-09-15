@@ -277,19 +277,19 @@ def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
     return _get_optional_bool_env
 
 
-def env_int_or_auto(env_name: str) -> Callable[[], int | None]:
-    """Integer knob where unset, empty or ``auto`` (any case) reads as
-    ``None``, meaning the caller picks the value itself. Anything else must
-    parse as an integer."""
-    parse_int = env_int(env_name, 0)
+def env_nonnegative_int_or_auto(env_name: str) -> Callable[[], int | None]:
+    """Size knob where unset, empty or ``auto`` (any case) reads as ``None``,
+    meaning the caller picks the value itself. Anything else must parse as
+    an integer that is not negative."""
+    parse_int = env_nonnegative_int(env_name, 0)
 
-    def _get_int_or_auto_env() -> int | None:
+    def _get_nonnegative_int_or_auto_env() -> int | None:
         value = os.getenv(env_name)
         if value is None or value.strip().lower() in ("", "auto"):
             return None
         return parse_int()
 
-    return _get_int_or_auto_env
+    return _get_nonnegative_int_or_auto_env
 
 
 def env_optional_int(env_name: str) -> Callable[[], int | None]:
@@ -781,9 +781,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT":
     lambda: os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
     # SparseCore offload threshold in bytes; None means "auto" and
-    # env_override.py resolves it from the chip family.
+    # env_override.py resolves it from the chip family. 0 sets no flag.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES":
-    env_int_or_auto("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"),
+    env_nonnegative_int_or_auto("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"),
 }
 
 
