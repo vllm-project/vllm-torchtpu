@@ -90,10 +90,14 @@ steps:
       # Representative correctness cases run on PRs; the full parameter
       # matrix and acceptance-rate tests run nightly. Split by example because
       # the suite is a single file. bktec balances using recorded test durations.
+      #
+      # RUN_SPEC_DECODE_TESTS is set by bootstrap.sh from the PR diff and
+      # interpolated at upload; the two PR steps below run only for diffs that
+      # touch speculative decoding.
       - label: "Unit Tests - Speculative Decoding (PR)"
         key: "unit_tests_spec_decode_pr"
         <<: *unit_test_defaults
-        if: 'build.env("NIGHTLY") != "1"'
+        if: 'build.env("NIGHTLY") != "1" && "${RUN_SPEC_DECODE_TESTS:-true}" == "true"'
         parallelism: 3
         env:
           # bktec enumerates the examples to split with a plain
@@ -117,7 +121,7 @@ steps:
       - label: "Unit Tests - Speculative Decoding Multichip (PR)"
         key: "unit_tests_spec_decode_multichip_pr"
         <<: *unit_test_defaults
-        if: 'build.env("NIGHTLY") != "1"'
+        if: 'build.env("NIGHTLY") != "1" && "${RUN_SPEC_DECODE_TESTS:-true}" == "true"'
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:

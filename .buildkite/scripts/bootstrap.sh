@@ -46,6 +46,12 @@ determine_job_priority() {
   echo "$priority"
 }
 
+# Join path patterns into one alternation anchored at the start of a path.
+path_regex() {
+  local IFS='|'
+  echo "^($*)"
+}
+
 JOB_PRIORITY=$(determine_job_priority)
 export JOB_PRIORITY
 buildkite-agent meta-data set "JOB_PRIORITY" "$JOB_PRIORITY"
@@ -57,6 +63,13 @@ if [[ "${BUILDKITE_MESSAGE:-}" =~ \[skip[[:space:]]ci\] || "${BUILDKITE_MESSAGE:
   echo "Commit message contains [skip ci]. Skipping build."
   exit 0
 fi
+
+# Suites that only exercise one subsystem are gated on the paths that
+# subsystem lives in. A build with no pull request has no diff to gate on and
+# runs everything.
+RUN_SPEC_DECODE_TESTS=true
+RUN_INTEGRATION_TESTS=true
+RUN_PERF_EVAL=true
 
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
   BASE_BRANCH=${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-"main"}
@@ -81,6 +94,91 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
     exit 0
   else
     echo "Code files changed. Proceeding with pipeline upload."
+  fi
+
+  # --- Decide which optional suites this diff needs ---
+  echo "--- :mag: Selecting suites for this diff"
+
+  # Paths a suite is sensitive to, one per entry, joined by path_regex into a
+  # single anchored alternation for grep -E. Each entry is matched against the
+  # start of a path, so a trailing / means "this directory" and a trailing $
+  # means "this file exactly".
+
+  # Speculative decoding gets its own PR steps on the v7x-2 and v7x-8 queues,
+  # and they are the largest single consumer of both. Run them for changes to
+  # the spec-decode module, the runner that drives it, the sampler it depends
+  # on, its own tests, or the CI wiring that executes it. Changes elsewhere
+  # reach the full matrix through the unconditional nightly suite.
+  SPEC_DECODE_PATHS=(
+    'src/vllm_torchtpu/spec_decode/'
+    'src/vllm_torchtpu/runner/'
+    'src/vllm_torchtpu/layers/vllm/sample/'
+    'tests/spec_decode/'
+    'tests/entrypoints/llm/test_speculative_decoding\.py$'
+    '\.buildkite/pipeline_tests\.yml$'
+    '\.buildkite/scripts/run_in_docker\.sh$'
+  )
+
+  # The integration and perf/eval suites both stand up a server and drive it
+  # end to end, one for correctness and one for a number. Neither can be moved
+  # by a diff that changes only unit tests, docs or CI metadata.
+  NON_RUNTIME_PATHS=(
+    'tests/'
+    'docs/'
+    '\.github/'
+    '\.buildkite/'
+    '.*\.md$'
+  )
+
+  # The files that define or launch each suite are the exception to that rule:
+  # a diff touching one of them has to run the suite it changes.
+  INTEGRATION_INPUT_PATHS=(
+    '\.buildkite/pipeline_integration\.yml$'
+    '\.buildkite/scripts/run_in_docker\.sh$'
+    '\.buildkite/scripts/run_[a-z_]*multihost[a-z_]*\.sh$'
+    'scripts/vllm/integration/'
+    'examples/disagg/'
+  )
+
+  # scripts/vllm/benchmarking/ holds both the eval runners and the recorded
+  # baselines the regression check compares against, so a change to either
+  # side of that comparison runs the suite.
+  PERF_INPUT_PATHS=(
+    '\.buildkite/pipeline_perf\.yml$'
+    '\.buildkite/scripts/run_in_docker\.sh$'
+    '\.buildkite/scripts/run_[a-z_]*multihost[a-z_]*\.sh$'
+    '\.buildkite/scripts/stage_model_snapshot\.sh$'
+    'scripts/vllm/benchmarking/'
+  )
+
+  # The gates need a file list to reason about, and [ci full] in the commit
+  # message overrides them for a change whose blast radius the paths do not
+  # describe. Either way the build runs every suite.
+  APPLY_SUITE_GATES=true
+  if [[ -z "${FILES_CHANGED}" ]]; then
+    APPLY_SUITE_GATES=false
+    echo "No file list to gate on. Running every suite."
+  elif [[ "${BUILDKITE_MESSAGE:-}" =~ \[ci[[:space:]]full\] ]]; then
+    APPLY_SUITE_GATES=false
+    echo "Commit message contains [ci full]. Running every suite."
+  fi
+
+  if [[ "${APPLY_SUITE_GATES}" == "true" ]] \
+    && ! grep -qE "$(path_regex "${SPEC_DECODE_PATHS[@]}")" <<< "${FILES_CHANGED}"; then
+    RUN_SPEC_DECODE_TESTS=false
+    echo "No speculative decoding paths changed. Skipping the spec-decode PR steps."
+  fi
+
+  if [[ "${APPLY_SUITE_GATES}" == "true" ]] \
+    && ! grep -qvE "$(path_regex "${NON_RUNTIME_PATHS[@]}")" <<< "${FILES_CHANGED}"; then
+    if ! grep -qE "$(path_regex "${INTEGRATION_INPUT_PATHS[@]}")" <<< "${FILES_CHANGED}"; then
+      RUN_INTEGRATION_TESTS=false
+      echo "Only tests, docs and CI metadata changed. Skipping the integration suites."
+    fi
+    if ! grep -qE "$(path_regex "${PERF_INPUT_PATHS[@]}")" <<< "${FILES_CHANGED}"; then
+      RUN_PERF_EVAL=false
+      echo "Only tests, docs and CI metadata changed. Skipping the perf/eval suites."
+    fi
   fi
 
   # --- Require the 'ready' label before spending agent time on a PR ---
@@ -144,11 +242,18 @@ echo "--- Starting Buildkite Bootstrap"
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.
 
-echo "Uploading Perf and Eval Pipeline"
-upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
+if [[ "${RUN_PERF_EVAL}" == "true" ]]; then
+  echo "Uploading Perf and Eval Pipeline"
+  upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
+fi
 
-echo "Uploading Integration Tests Pipeline"
-upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
+if [[ "${RUN_INTEGRATION_TESTS}" == "true" ]]; then
+  echo "Uploading Integration Tests Pipeline"
+  upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
+fi
+
+# Read by the spec-decode PR steps' `if` expressions, interpolated at upload.
+export RUN_SPEC_DECODE_TESTS
 
 echo "Uploading Unit Tests Pipeline"
 upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
