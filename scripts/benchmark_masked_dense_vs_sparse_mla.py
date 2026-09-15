@@ -55,10 +55,12 @@ from jax.sharding import PartitionSpec as P
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_cache
 from vllm_torchtpu.kernels.mla.masked_dense import csa_mask
 from vllm_torchtpu.kernels.mla.masked_dense import kernel as masked_dense
+from vllm_torchtpu.kernels.mla.masked_dense import (
+    routing as masked_dense_routing,
+)
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse
 
 # GLM-5.2-FP8, read off the checkpoint config.
@@ -214,7 +216,10 @@ def _build_wrapper(enable_dispatch: bool):
     """Stable production-equivalent cache-update + attention executable."""
     mesh = Mesh(np.asarray(jax.local_devices()[:1]), ("model",))
     sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
-    limits = (mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT, mla_dispatch.MASKED_DENSE_LIMIT)
+    limits = (
+        masked_dense_routing.MASKED_DENSE_ANALYTIC_LIMIT,
+        masked_dense_routing.MASKED_DENSE_LIMIT,
+    )
 
     def integrated(
         ql_nope,
@@ -274,7 +279,7 @@ def _build_wrapper(enable_dispatch: bool):
 
         if (
             not enable_dispatch
-            or q.shape[0] < mla_dispatch.MASKED_DENSE_MIN_TOKEN_BUCKET
+            or q.shape[0] < masked_dense_routing.MASKED_DENSE_MIN_TOKEN_BUCKET
         ):
             output = gather(None)
         else:
@@ -296,7 +301,7 @@ def _build_wrapper(enable_dispatch: bool):
                     num_queries_per_block=(1, 32, 32),
                 )
 
-            tier = mla_dispatch.masked_dense_prefill_mla_tier(
+            tier = masked_dense_routing.masked_dense_prefill_mla_tier(
                 seq_lens, distribution, starts, limits
             )
             output = jax.lax.switch(
@@ -412,8 +417,10 @@ def _run_point(
             k_scale=1.0,
         )
 
-    analytic_bound = min(mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT, MAX_MODEL_LEN)
-    bitmap_bound = min(mla_dispatch.MASKED_DENSE_LIMIT, MAX_MODEL_LEN)
+    analytic_bound = min(
+        masked_dense_routing.MASKED_DENSE_ANALYTIC_LIMIT, MAX_MODEL_LEN
+    )
+    bitmap_bound = min(masked_dense_routing.MASKED_DENSE_LIMIT, MAX_MODEL_LEN)
 
     def mask_fn():
         return csa_mask.generate_mask_sc(c["topk_indices"], bitmap_bound)

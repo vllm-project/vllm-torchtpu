@@ -34,13 +34,13 @@ from absl.testing import parameterized
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
-from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
     SparseMLAKVCacheSpec,
 )
+from vllm_torchtpu.kernels.mla.masked_dense import routing as masked_dense_routing
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.core import attention_interface
 
@@ -104,7 +104,7 @@ def _masked_dense_limits(*limits: int):
     setting `os.environ`.
     """
     assert len(limits) == len(_LIMIT_NAMES)
-    module = mla_dispatch
+    module = masked_dense_routing
     saved = [getattr(module, n) for n in _LIMIT_NAMES]
     for name, value in zip(_LIMIT_NAMES, limits):
         setattr(module, name, value)
@@ -690,7 +690,7 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
         starts[1 : len(q_lens) + 1] = np.cumsum(q_lens)
         starts[len(q_lens) + 1 :] = sum(q_lens)
         return int(
-            mla_dispatch.masked_dense_prefill_mla_tier(
+            masked_dense_routing.masked_dense_prefill_mla_tier(
                 jnp.asarray(seq_lens, jnp.int32),
                 jnp.asarray(distribution, jnp.int32),
                 jnp.asarray(starts, jnp.int32),
@@ -846,9 +846,9 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         with (
             _masked_dense_limits(*limits),
             mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
-            mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_TOKEN_BUCKET", 0),
+            mock.patch.object(masked_dense_routing, "MASKED_DENSE_MIN_TOKEN_BUCKET", 0),
             mock.patch.object(
-                mla_dispatch, "matches_glm52_tpu7x_profile", return_value=True
+                masked_dense_routing, "matches_glm52_tpu7x_profile", return_value=True
             ),
         ):
             nope, rope, output = attention_interface.sparse_mla_attention(
@@ -968,7 +968,7 @@ class MaskedDenseDispatchSetupTest(parameterized.TestCase):
         case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
         mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
         with mock.patch.object(
-            mla_dispatch,
+            masked_dense_routing,
             "ragged_paged_attention",
             side_effect=lambda q, *args, **kwargs: q,
         ):
@@ -1000,7 +1000,7 @@ class MaskedDenseLimitResolutionTest(parameterized.TestCase):
     ENV = "TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN"
 
     def _resolve(self, default=6144):
-        return mla_dispatch._resolve_masked_dense_limit(self.ENV, default)
+        return masked_dense_routing._resolve_masked_dense_limit(self.ENV, default)
 
     def test_masked_dense_routing_is_opt_in(self):
         getter = envs.environment_variables["TPU_MLA_MASKED_DENSE_ENABLED"]
@@ -1044,69 +1044,107 @@ class MaskedDenseProfileTest(parameterized.TestCase):
         )
 
     def test_exact_glm52_profile_is_enabled(self):
-        self.assertTrue(mla_dispatch.matches_glm52_tpu7x_profile(*self._operands()))
+        self.assertTrue(
+            masked_dense_routing.matches_glm52_tpu7x_profile(*self._operands())
+        )
 
     @parameterized.parameters(dict(heads=16), dict(topk=1024), dict(page_size=512))
     def test_other_sparse_mla_profiles_fall_back(self, **overrides):
         self.assertFalse(
-            mla_dispatch.matches_glm52_tpu7x_profile(*self._operands(**overrides))
+            masked_dense_routing.matches_glm52_tpu7x_profile(
+                *self._operands(**overrides)
+            )
         )
 
-    @parameterized.parameters(16, 32, 64, 128, 256)
-    def test_decode_sized_bucket_bypasses_dispatch(self, tokens):
-        q, nope, rope, topk = self._operands(tokens=tokens)
-        sentinel = object()
-        with (
-            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
-            mock.patch.object(
-                mla_dispatch, "sparse_ragged_paged_attention", return_value=sentinel
-            ) as sparse,
-            mock.patch.object(
-                mla_dispatch,
-                "_masked_dense_prefill_cost_tier",
-                side_effect=AssertionError("small buckets must not build dispatch"),
-            ),
-        ):
-            result = mla_dispatch.ragged_paged_attention(
-                q,
-                nope,
-                rope,
+    def _applies(
+        self,
+        *,
+        enabled=True,
+        nope=None,
+        rope=None,
+        cache_layout="tensorcore",
+        **overrides,
+    ):
+        q, default_nope, default_rope, topk = self._operands(**overrides)
+        tokens, heads, _ = q.shape
+        ql_nope = jax.ShapeDtypeStruct((tokens, heads, 512), q.dtype)
+        q_pe = jax.ShapeDtypeStruct((tokens, heads, 64), q.dtype)
+        with mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", enabled):
+            return masked_dense_routing.applies(
+                ql_nope,
+                q_pe,
+                nope or default_nope,
+                rope or default_rope,
                 topk,
-                jax.ShapeDtypeStruct((64,), jnp.int32),
-                jax.ShapeDtypeStruct((64 * 9,), jnp.int32),
-                jax.ShapeDtypeStruct((65,), jnp.int32),
-                jax.ShapeDtypeStruct((3,), jnp.int32),
+                cache_layout,
             )
-        self.assertIs(result, sentinel)
-        sparse.assert_called_once()
 
-    def test_native_cache_layout_bypasses_masked_dense_dispatch(self):
-        q, _, _, topk = self._operands()
-        nope = jax.ShapeDtypeStruct((8, 1024, 128), jnp.uint32)
-        rope = jax.ShapeDtypeStruct((8, 256, 128), jnp.uint32)
-        sentinel = object()
-        with (
-            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
-            mock.patch.object(
-                mla_dispatch, "sparse_ragged_paged_attention", return_value=sentinel
-            ) as sparse,
-            mock.patch.object(
-                mla_dispatch,
-                "_masked_dense_prefill_cost_tier",
-                side_effect=AssertionError("native caches require sparse attention"),
-            ),
-        ):
-            result = mla_dispatch.ragged_paged_attention(
-                q,
-                nope,
-                rope,
-                topk,
-                jax.ShapeDtypeStruct((64,), jnp.int32),
-                jax.ShapeDtypeStruct((64 * 9,), jnp.int32),
-                jax.ShapeDtypeStruct((65,), jnp.int32),
-                jax.ShapeDtypeStruct((3,), jnp.int32),
+    def test_exact_profile_applies(self):
+        self.assertTrue(self._applies())
+
+    def test_disabled_flag_keeps_sparse(self):
+        self.assertFalse(self._applies(enabled=False))
+
+    @parameterized.parameters(16, 32, 64, 128, 256)
+    def test_decode_sized_bucket_keeps_sparse(self, tokens):
+        self.assertFalse(self._applies(tokens=tokens))
+
+    @parameterized.parameters(dict(heads=16), dict(topk=1024), dict(page_size=512))
+    def test_other_profiles_keep_sparse(self, **overrides):
+        self.assertFalse(self._applies(**overrides))
+
+    def test_native_cache_layout_keeps_sparse(self):
+        self.assertFalse(
+            self._applies(
+                nope=jax.ShapeDtypeStruct((8, 1024, 128), jnp.uint32),
+                rope=jax.ShapeDtypeStruct((8, 256, 128), jnp.uint32),
                 cache_layout="sparsecore",
             )
-        self.assertIs(result, sentinel)
-        sparse.assert_called_once()
-        self.assertEqual(sparse.call_args.kwargs["cache_layout"], "sparsecore")
+        )
+
+
+class SparseMlaLayerBranchTest(parameterized.TestCase):
+    """The layer calls the sparse kernel directly unless routing applies."""
+
+    @parameterized.parameters(False, True)
+    def test_layer_branch(self, applies):
+        if jax.devices()[0].platform == "cpu":
+            self.enter_context(
+                mock.patch.object(
+                    attention_interface,
+                    "update_sparse_mla_kv_cache",
+                    autospec=True,
+                    side_effect=kv_cache_utils.update_sparse_mla_kv_cache_jax,
+                )
+            )
+        case = MaskedDenseDispatchTest()
+        case.k_scale = 1.5
+        case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
+        with (
+            mock.patch.object(
+                attention_interface.sparse_mla_kernel,
+                "sparse_ragged_paged_attention",
+                side_effect=lambda q, *a, **k: q,
+            ) as sparse,
+            mock.patch.object(
+                masked_dense_routing,
+                "ragged_paged_attention",
+                side_effect=lambda q, *a, **k: q,
+            ) as routed,
+            mock.patch.object(masked_dense_routing, "applies", return_value=applies),
+        ):
+            case._step(
+                _empty_pair(),
+                [8],
+                [8],
+                0,
+                GATHER_ONLY,
+                np.random.default_rng(99),
+                jnp.arange(PAGES_PER_SEQ, dtype=jnp.int32),
+                mesh,
+                1,
+                1,
+            )
+        self.assertEqual(routed.call_count, int(applies))
+        self.assertEqual(sparse.call_count, int(not applies))

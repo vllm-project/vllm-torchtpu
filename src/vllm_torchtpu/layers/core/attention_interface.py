@@ -27,13 +27,13 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
-from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
 )
+from vllm_torchtpu.kernels.mla.masked_dense import routing as masked_dense_routing
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
@@ -942,19 +942,36 @@ def sparse_mla_attention(
         )
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        output = mla_dispatch.ragged_paged_attention(
-            q,
-            kv_cache_nope,
-            kv_cache_rope,
-            topk_idx,
-            seq_lens_,
-            block_tables_,
-            query_start_loc_,
-            request_distribution_,
-            sm_scale=sm_scale or 1.0,
-            k_scale=dequant_scale,
-            cache_layout=cache_layout,
-        )
+        if not masked_dense_routing.applies(
+            ql_nope, q_pe, kv_cache_nope, kv_cache_rope, topk_idx, cache_layout
+        ):
+            output = sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                block_tables_,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                cache_layout=cache_layout,
+            )
+        else:
+            # Opt-in GLM-5.2 experiment (TPU_MLA_MASKED_DENSE_ENABLED=1): the
+            # step may run on the masked-dense kernel instead.
+            output = masked_dense_routing.ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                seq_lens_,
+                block_tables_,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+            )
 
         lkv_dim = ql_nope.shape[-1]
         # The kernel's output is lkv_dim + rope_dim wide because it attends
