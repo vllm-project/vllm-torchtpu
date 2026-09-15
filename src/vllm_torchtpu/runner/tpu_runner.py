@@ -77,6 +77,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.runner import graph_probe
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import \
@@ -1011,6 +1012,10 @@ class TPUModelRunner(GPUModelRunner):
     # attribute has to be assigned above that call to exist in time.
     _xla_graphs_checked_at = None
 
+    # Which pass is tracing the multimodal glue, so a dumped graph says whether
+    # it came from the warmup sweep or from a served step. Diagnostics only.
+    _mm_glue_phase = "run"
+
     @staticmethod
     def _describe_xla_graph(entry) -> str:
         """One line describing a cache entry, from whatever fields it carries.
@@ -1116,6 +1121,22 @@ class TPUModelRunner(GPUModelRunner):
                             len(fresh) - self._MAX_DESCRIBED_GRAPHS)
 
         self.num_xla_graphs += new_compiled_graphs
+
+    def _graph_probe(self, tag: str, **fields) -> None:
+        """Attribute newly-created XLA cache entries to a region of the step.
+
+        ``_update_num_xla_graphs`` only reports a per-step total under the
+        catch-all ``decoding_step`` label, which is useless for finding *which*
+        op keeps producing fresh shapes. This narrows it down: call it around a
+        region and it logs the entry-count delta since the previous probe plus
+        whatever shape fields the caller thinks are the suspects. Gated off by
+        default because ``_get_cache_stats`` walks the whole cache.
+
+        The counter lives in ``graph_probe`` rather than on the runner so that
+        probe points inside the encoder manager share it and the regions still
+        partition the total.
+        """
+        graph_probe.probe(tag, **fields)
 
     def _reorder_batch_for_rpa(
             self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:
@@ -2706,6 +2727,10 @@ class TPUModelRunner(GPUModelRunner):
             # sweep compiles. wait=False enqueues without blocking the host.
             if mm_scatter_ops:
                 synchronize_tensors(wait=False)
+                # Whatever the flush just built belongs to the step's prefix,
+                # not to the glue; charging both to one probe makes a varying
+                # prefix look like the glue recompiling.
+                graph_probe.probe("mm_glue_prefix")
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
@@ -2730,11 +2755,21 @@ class TPUModelRunner(GPUModelRunner):
                 # It also shrinks the sweep's product: one embedding program
                 # per token bucket plus one small scatter per (token,
                 # embedding) pair, instead of a full embedding lookup per pair.
+                captured_embed = graph_probe.capture_graph(inputs_embeds)
                 synchronize_tensors(inputs_embeds, wait=False)
+                graph_probe.write_graph(
+                    captured_embed, f"embed_{self._mm_glue_phase}"
+                    f"_ntok{inputs_embeds.shape[0]}")
+                graph_probe.probe("mm_token_embed")
 
                 inputs_embeds = self._scatter_mm_embeds(
                     inputs_embeds, mm_scatter_ops)
+                captured = graph_probe.capture_graph(inputs_embeds)
                 synchronize_tensors(inputs_embeds, wait=False)
+                graph_probe.write_graph(
+                    captured, f"glue_{self._mm_glue_phase}"
+                    f"_ntok{inputs_embeds.shape[0]}"
+                    f"_nmm{mm_scatter_ops[0][1].shape[0]}")
 
             return None, inputs_embeds
         else:
@@ -2885,9 +2920,13 @@ class TPUModelRunner(GPUModelRunner):
                 scheduler_output.scheduled_encoder_inputs)
             if has_encoder_inputs:
                 synchronize_tensors()
+            self._graph_probe("pre_mm_encoder")
             self._execute_mm_encoder(scheduler_output)
             if has_encoder_inputs:
                 synchronize_tensors()
+            self._graph_probe("mm_encoder",
+                              n_enc=len(
+                                  scheduler_output.scheduled_encoder_inputs))
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
@@ -3001,6 +3040,12 @@ class TPUModelRunner(GPUModelRunner):
              draft_sequence_layout_plan) = (self._prepare_inputs(
                  scheduler_output, start_index, num_decode_reqs,
                  num_windowed_reqs))
+            graph_probe.probe_boundary(
+                "prepare_inputs",
+                n_req=padded_num_reqs,
+                chunk=f"{chunk_index}/{target_num_chunks}",
+                attn=lambda: graph_probe.shape_key(attn_metadata),
+            )
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -3024,12 +3069,19 @@ class TPUModelRunner(GPUModelRunner):
                     input_ids, spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices)
             draft_input_ids_src = input_ids
+            graph_probe.probe_boundary(
+                "token_substitution",
+                n_sub=(0 if cur_input_indices is None else
+                       len(cur_input_indices)),
+                chunk=f"{chunk_index}/{target_num_chunks}",
+            )
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
             # covers requests [start_index, end_index) in req order). Offsets
             # come from the host-side cumsum, so no per-chunk device sync.
             chunk_mm_inputs = None
             chunk_scatter_ops = None
+            n_mm_probe = 0
             if is_mm_embed_full is not None:
                 tok_start = int(mm_tok_cumsum[start_index])
                 tok_end = int(mm_tok_cumsum[end_index])
@@ -3043,6 +3095,7 @@ class TPUModelRunner(GPUModelRunner):
                         self.get_model().mm_embed_bucket,
                         input_ids.device,
                     )
+                    n_mm_probe = sum(o[1].shape[0] for o in chunk_scatter_ops)
                     chunk_embeds = []
                 elif mm_cumsum_np is not None:
                     mm_start = int(mm_cumsum_np[tok_start])
@@ -3050,9 +3103,15 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = (
                         [mm_embeds_flat[mm_start:mm_start +
                                         mm_cnt]] if mm_cnt > 0 else [])
+                    n_mm_probe = mm_cnt
                 else:
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
+            graph_probe.probe_boundary(
+                "mm_chunk_plan",
+                n_scatter=len(chunk_scatter_ops or ()),
+                chunk=f"{chunk_index}/{target_num_chunks}",
+            )
 
             self._record_input_staging_fence()
             if self._pp_is_first:
@@ -3062,6 +3121,20 @@ class TPUModelRunner(GPUModelRunner):
                 # Later stages start from the previous stage's hidden
                 # states; the token ids only size the forward.
                 inputs_embeds = None
+            # Boundary probes: without a drain, whichever of these two regions
+            # happens to sync first is charged for the other's programs too,
+            # and the counts cannot be read as "this region compiled that".
+            graph_probe.probe_boundary(
+                "get_model_inputs",
+                n_tok=input_ids.shape[0]
+                if input_ids is not None else inputs_embeds.shape[0],
+                n_mm=n_mm_probe,
+                n_scatter=len(chunk_scatter_ops or ()),
+                chunk=f"{chunk_index}/{target_num_chunks}",
+                scatter=lambda: ",".join(
+                    f"idx{tuple(o[1].shape)}@enc{tuple(o[0].shape)}"
+                    for o in (chunk_scatter_ops or ())),
+            )
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -3127,6 +3200,14 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+            graph_probe.probe_boundary(
+                "backbone",
+                n_tok=num_tokens_padded,
+                n_req=padded_num_reqs,
+                chunk=f"{chunk_index}/{target_num_chunks}",
+                embeds=inputs_embeds is not None,
+                attn=lambda: graph_probe.shape_key(attn_metadata),
+            )
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
@@ -3155,6 +3236,10 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
+            graph_probe.probe_boundary("logits",
+                                       n_tok=num_tokens_padded,
+                                       n_req=padded_num_reqs,
+                                       idx=tuple(logits_indices.shape))
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
@@ -3674,6 +3759,9 @@ class TPUModelRunner(GPUModelRunner):
                         logprobs.cu_num_generated_tokens)
                     combined_logprobs.append(sliced_logprobs)
 
+                graph_probe.probe_boundary("sampling",
+                                           n_reqs=num_reqs,
+                                           logits=tuple(logits.shape))
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
 
@@ -5057,20 +5145,35 @@ class TPUModelRunner(GPUModelRunner):
         buckets = self._mm_embed_buckets()
         if not buckets:
             return
-        for num_tokens in self.num_tokens_paddings:
-            # A run longer than the chunk cannot occur: the scatter is
-            # clipped to the tokens the chunk actually holds.
-            fits = [b for b in buckets if b <= num_tokens]
-            if not fits:
-                continue
-            logger.info("  -- num_tokens: %d, mm buckets: %s", num_tokens,
-                        fits)
-            for bucket in fits:
-                self._dummy_run(num_tokens,
-                                self.num_reqs_max_model_len,
-                                self.max_num_blocks_per_req,
-                                use_max_model_len=True,
-                                mm_embed_bucket=bucket)
+        # A second pass over the same pairs must compile nothing. It is the
+        # cheapest way to tell a sweep that misses shapes from a sweep whose
+        # own programs are not reproducible: if pass 2 reports new entries,
+        # the pairs are not the whole key and no amount of sweeping them will
+        # empty the runtime misses.
+        passes = 2 if envs.TPU_GRAPH_PROBE else 1
+        self._mm_glue_phase = "sweep"
+        try:
+            for pass_index in range(passes):
+                for num_tokens in self.num_tokens_paddings:
+                    # A run longer than the chunk cannot occur: the scatter is
+                    # clipped to the tokens the chunk actually holds.
+                    fits = [b for b in buckets if b <= num_tokens]
+                    if not fits:
+                        continue
+                    logger.info("  -- num_tokens: %d, mm buckets: %s",
+                                num_tokens, fits)
+                    for bucket in fits:
+                        self._dummy_run(num_tokens,
+                                        self.num_reqs_max_model_len,
+                                        self.max_num_blocks_per_req,
+                                        use_max_model_len=True,
+                                        mm_embed_bucket=bucket)
+                if passes > 1:
+                    self._update_num_xla_graphs(
+                        f"multimodal input embeds pass {pass_index + 1}")
+                self._mm_glue_phase = "resweep"
+        finally:
+            self._mm_glue_phase = "run"
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.

@@ -108,6 +108,10 @@ if TYPE_CHECKING:
     KDA_PACKED_METADATA: bool = True
     KDA_FWD_MB: int | None = None
     TPU_MM_BUCKET_SCATTER: bool = True
+    TPU_GRAPH_PROBE: bool = False
+    TPU_GRAPH_PROBE_DRAIN: bool = True
+    TPU_GRAPH_PROBE_KEY_DIR: str = ""
+    TPU_GRAPH_PROBE_MLIR_DIR: str = ""
 
 
 def env_with_choices(
@@ -692,6 +696,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # concat + masked-scatter, which recompiles once per distinct image size.
     "TPU_MM_BUCKET_SCATTER":
     env_bool("TPU_MM_BUCKET_SCATTER", default=True),
+    # Debug: log which region of a decode step created new XLA cache entries.
+    # vLLM's own counter only reports a per-step total, which cannot tell a
+    # recompiling glue op from a recompiling model. Off by default because
+    # reading the cache stats walks every entry.
+    "TPU_GRAPH_PROBE":
+    env_bool("TPU_GRAPH_PROBE", default=False),
+
+    # Whether the boundary probes drain the lazy graph before reading the
+    # counter. Draining buys exact attribution but changes what gets compiled:
+    # under DEFER_AND_FUSE a program is created at the sync, so a drained run
+    # fuses differently from production and reports more entries than
+    # production creates. Turn it off to measure the real thing.
+    "TPU_GRAPH_PROBE_DRAIN":
+    env_bool("TPU_GRAPH_PROBE_DRAIN", default=True),
+
+    # Where to collect the compilation cache's per-miss keys. The runtime
+    # prints those as bare writes to fd 2, which is not the same path as the
+    # Python logger and does not reliably survive to a server log; pointing
+    # this at a directory gives each process its own file, which also restores
+    # the rank attribution a single shared stderr throws away.
+    "TPU_GRAPH_PROBE_KEY_DIR":
+    lambda: os.getenv("TPU_GRAPH_PROBE_KEY_DIR", ""),
+
+    # Where to write the MLIR of a deferred graph just before it is built.
+    # A cache entry carries a duration and a read count but no identity, so a
+    # probe can say a region compiled twice at the same shapes and not say how
+    # the two programs differ. The graph text is the identity, and diffing the
+    # warmup's against the serving step's is what turns "still recompiles" into
+    # a named cause.
+    "TPU_GRAPH_PROBE_MLIR_DIR":
+    lambda: os.getenv("TPU_GRAPH_PROBE_MLIR_DIR", ""),
 }
 
 

@@ -297,6 +297,22 @@ start_vllm_server() {
         bash "$SCRIPT_DIR/cleanup_server.sh"
     fi
 
+    # Header so server.log is self-contained -- the exact launch command
+    # lands in the log itself, not only in the launcher's stdout. Appended,
+    # so a relaunch into the same results dir gets its own header. The env
+    # filter keeps the knobs that change engine behaviour (and drops
+    # anything token/key/secret shaped).
+    {
+        echo "================================================"
+        echo "[server_cmd] $server_cmd"
+        echo "[cwd] $(pwd)"
+        echo "[started] $(date -Is)"
+        env | grep -E '^(VLLM|TPU|XLA|LIBTPU|PJRT)_' \
+            | grep -viE '(TOKEN|KEY|SECRET|PASSWORD)' \
+            | sort | sed 's/^/[env] /'
+        echo "================================================"
+    } >> "$RESULTS_DIR/server.log"
+
     $server_cmd >> "$RESULTS_DIR/server.log" 2>&1 &
     SERVER_PID=$!
     echo "Server started (pid=$SERVER_PID)"

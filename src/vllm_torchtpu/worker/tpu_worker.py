@@ -405,6 +405,12 @@ class TPUWorker(WorkerBase):
         is_first_rank = pp_group.is_first_rank
         is_last_rank = pp_group.is_last_rank
 
+        # Before the model runner exists, so the boot precompile's misses are
+        # keyed too -- comparing a boot key against a runtime key is the whole
+        # point of having them.
+        from vllm_torchtpu.runner import graph_probe
+        graph_probe.enable_miss_keys()
+
         # TODO: Fix device assignment
         self.model_runner = TPUModelRunner(
             self.vllm_config,

@@ -6,6 +6,7 @@ from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import graph_probe
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -160,14 +161,17 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.max_batch_size,
             self.max_frames_per_batch,
             path=path)
+        graph_probe.probe_boundary("mm_replay_meta", budget=token_budget)
 
         # Pad dynamic inputs to strictly match the static budget shape
         padded = self._pad_to_template(replay.values, token_budget, path=path)
+        graph_probe.probe_boundary("mm_pad", budget=token_budget)
 
         # Run encoder with eager fallback on compilation/execution failure
         try:
             out_tensor = self._compiled_budget_forward(dict(padded), path=path)
             self.graph_hits += num_items
+            graph_probe.probe_boundary("mm_forward", budget=token_budget)
             return out_tensor
         except Exception as e:
             logger.warning(
