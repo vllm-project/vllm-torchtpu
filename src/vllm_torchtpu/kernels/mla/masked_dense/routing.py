@@ -380,3 +380,32 @@ def attention_from_parts(
         kept = 0 if tier_limits[0] else 1
         return jax.lax.cond(tier == kept, branches[0], branches[1])
     return jax.lax.switch(tier, branches)
+
+
+def groups_requests(
+    attn_module,
+    kv_cache_specs,
+    page_size: int,
+    decode_context_parallel_size: int,
+) -> bool:
+    """Whether the runner should order a sparse MLA layer's requests by length.
+
+    The static counterpart of `applies`, evaluated from the layer's
+    configuration when its KV cache is allocated. Ordering by KV length only
+    helps this routing, so other models keep their request order. The kernel
+    query is the `kv_lora_rank`-wide latent plus the rope part.
+    """
+    indexer = getattr(attn_module, "indexer", None)
+    topk = getattr(indexer, "topk_tokens", getattr(attn_module, "topk_tokens", None))
+    return bool(
+        decode_context_parallel_size == 1
+        and all(
+            spec.layout.value == sparse_kernel.TENSORCORE_CACHE_LAYOUT
+            for spec in kv_cache_specs
+        )
+        and attn_module.num_heads == GLM52_NUM_HEADS
+        and attn_module.kv_lora_rank == GLM52_NOPE_DIM
+        and attn_module.qk_rope_head_dim == GLM52_ROPE_DIM
+        and topk == GLM52_INDEX_TOPK
+        and page_size == GLM52_PAGE_SIZE
+    )

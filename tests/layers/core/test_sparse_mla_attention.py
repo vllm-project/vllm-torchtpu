@@ -1486,3 +1486,36 @@ class MaskedDenseProfileTest(parameterized.TestCase):
                 cache_layout="sparsecore",
             )
         )
+
+
+class MaskedDenseRequestGroupingTest(parameterized.TestCase):
+    """`groups_requests`: the runner's static eligibility per sparse layer."""
+
+    @staticmethod
+    def _groups(*, layout=KVCacheLayout.TENSORCORE, page_size=1024, dcp=1, **layer):
+        attrs = dict(
+            num_heads=64,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            indexer=mock.Mock(topk_tokens=2048),
+        )
+        attrs.update(layer)
+        specs = (mock.Mock(layout=layout), mock.Mock(layout=layout))
+        return masked_dense_routing.groups_requests(
+            mock.Mock(**attrs), specs, page_size, dcp
+        )
+
+    def test_glm52_layer_groups_requests(self):
+        self.assertTrue(self._groups())
+
+    @parameterized.named_parameters(
+        dict(testcase_name="heads", num_heads=16),
+        dict(testcase_name="latent", kv_lora_rank=448),
+        dict(testcase_name="rope", qk_rope_head_dim=32),
+        dict(testcase_name="topk", indexer=mock.Mock(topk_tokens=1024)),
+        dict(testcase_name="page_size", page_size=512),
+        dict(testcase_name="native_layout", layout=KVCacheLayout.SPARSECORE),
+        dict(testcase_name="decode_context_parallel", dcp=2),
+    )
+    def test_other_layers_keep_order(self, **overrides):
+        self.assertFalse(self._groups(**overrides))

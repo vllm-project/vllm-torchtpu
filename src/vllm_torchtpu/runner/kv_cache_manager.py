@@ -55,6 +55,7 @@ from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.kernels.mla.masked_dense import routing as masked_dense_routing
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
@@ -1594,6 +1595,16 @@ class KVCacheManager:
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
                         )
+                        # Order requests by KV length only when every sparse
+                        # MLA layer matches the masked-dense routing profile.
+                        groups = masked_dense_routing.groups_requests(
+                            attn_module,
+                            specs,
+                            kv_cache_spec.block_size,
+                            self.runner.parallel_config.decode_context_parallel_size,
+                        )
+                        if self.runner._masked_dense_groups_requests is not False:
+                            self.runner._masked_dense_groups_requests = groups
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = allocate_attention_region(
                             region,

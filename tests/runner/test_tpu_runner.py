@@ -1134,21 +1134,30 @@ class TestReorderBatchForRpa:
     returned (num_decode, num_windowed) split is fed to both RPA (decode-only
     front) and the GDN windowed kernel (decode + verify)."""
 
-    def _make_runner(self):
+    def _make_runner(self, groups_requests=False):
         runner = MagicMock(spec=TPUModelRunner)
         runner.input_batch = MagicMock()
+        runner._masked_dense_groups_requests = groups_requests
         runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
             runner
         )
+        runner._order_prefills_by_kv_len = (
+            TPUModelRunner._order_prefills_by_kv_len.__get__(runner)
+        )
         return runner
 
-    def _batch(self, runner, req_ids):
+    def _batch(self, runner, req_ids, computed=None):
         ib = runner.input_batch
         ib.req_ids = list(req_ids)
         ib.num_reqs = len(req_ids)
+        ib.num_computed_tokens_cpu = list(computed or [0] * len(req_ids))
 
         def swap_states(i, j):
             ib.req_ids[i], ib.req_ids[j] = ib.req_ids[j], ib.req_ids[i]
+            ib.num_computed_tokens_cpu[i], ib.num_computed_tokens_cpu[j] = (
+                ib.num_computed_tokens_cpu[j],
+                ib.num_computed_tokens_cpu[i],
+            )
 
         ib.swap_states.side_effect = swap_states
 
@@ -1203,6 +1212,75 @@ class TestReorderBatchForRpa:
         assert num_windowed == 2
         assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
         assert runner.input_batch.req_ids[2] == "pf"
+
+    def test_masked_dense_orders_by_kv_length(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(
+            runner,
+            ["short", "long", "decode", "medium"],
+            computed=[1000, 7000, 9000, 3000],
+        )
+        sched = self._sched(
+            {
+                "short": 512,
+                "long": 32,
+                "decode": 1,
+                "medium": 256,
+            }
+        )
+        with patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED", True):
+            assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        assert runner.input_batch.req_ids == ["decode", "long", "medium", "short"]
+
+    def test_ordering_moves_request_state_and_keeps_ties(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(
+            runner,
+            ["short", "decode", "tie_a", "tie_b"],
+            computed=[2500, 9000, 3900, 3400],
+        )
+        sched = self._sched(
+            {
+                "short": 100,
+                "decode": 1,
+                "tie_a": 100,
+                "tie_b": 600,
+            }
+        )
+        with patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED", True):
+            assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "decode"
+        assert ids[-1] == "short"
+        assert set(ids[1:3]) == {"tie_a", "tie_b"}
+        assert dict(zip(ids, runner.input_batch.num_computed_tokens_cpu)) == {
+            "short": 2500,
+            "decode": 9000,
+            "tie_a": 3900,
+            "tie_b": 3400,
+        }
+
+    @pytest.mark.parametrize(
+        "groups_requests,enabled", [(False, True), (True, False), (None, True)]
+    )
+    def test_order_kept_unless_grouping_applies(self, groups_requests, enabled):
+        runner = self._make_runner(groups_requests=groups_requests)
+        self._batch(runner, ["short", "long"], computed=[1000, 7000])
+        with patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED", enabled):
+            assert runner._reorder_batch_for_rpa(
+                self._sched({"short": 512, "long": 32})
+            ) == (0, 0)
+        assert runner.input_batch.req_ids == ["short", "long"]
+
+    def test_speculative_step_keeps_existing_segments(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(runner, ["short", "verify", "long"], computed=[1000, 9000, 7000])
+        sched = self._sched(
+            {"short": 32, "verify": 3, "long": 32}, spec_reqs=("verify",)
+        )
+        with patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED", True):
+            assert runner._reorder_batch_for_rpa(sched) == (0, 1)
+        assert runner.input_batch.req_ids == ["verify", "short", "long"]
 
 
 class TestInitializeAttentionKernelsThreshold:

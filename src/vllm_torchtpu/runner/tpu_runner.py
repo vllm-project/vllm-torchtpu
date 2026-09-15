@@ -761,6 +761,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # Pallas attention bookkeeping.
         self._attention_kernels_initialized = False
+        # Set while allocating KV caches: whether every sparse MLA layer
+        # matches the masked-dense routing profile, so requests may be ordered
+        # by KV length. None until a sparse MLA layer is allocated.
+        self._masked_dense_groups_requests: bool | None = None
 
         # CPU staging tensors (TPU prepares inputs on CPU then transfers).
         self.input_ids_cpu = torch.zeros(
@@ -1426,7 +1430,46 @@ class TPUModelRunner(GPUModelRunner):
         num_windowed = num_decode
         if spec_decode_tokens and num_decode < num_reqs:
             num_windowed = partition(num_decode, num_reqs - 1, 1)
+        if (
+            not spec_decode_tokens
+            and self._masked_dense_groups_requests
+            and envs.TPU_MLA_MASKED_DENSE_ENABLED
+        ):
+            self._order_prefills_by_kv_len(num_decode, num_reqs, scheduler_output)
         return num_decode, num_windowed
+
+    def _order_prefills_by_kv_len(
+        self, start: int, end: int, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Order requests `[start, end)` by KV length, longest first.
+
+        Used only with the opt-in masked-dense MLA routing, which can run a
+        sparse prefix of long requests and a masked-dense suffix of short ones.
+        The routing re-derives and validates any split on device, so this order
+        affects performance only. Ties keep their current order, and
+        `swap_states` moves every request-associated buffer with its request.
+        """
+        tail: list[str] = []
+        kv_lens: dict[str, int] = {}
+        position: dict[str, int] = {}
+        for i in range(start, end):
+            req_id = self.input_batch.req_ids[i]
+            assert req_id is not None
+            tail.append(req_id)
+            kv_lens[req_id] = int(self.input_batch.num_computed_tokens_cpu[i]) + int(
+                scheduler_output.num_scheduled_tokens[req_id]
+            )
+            position[req_id] = i
+        for dst, req_id in enumerate(
+            sorted(tail, key=kv_lens.__getitem__, reverse=True), start
+        ):
+            src = position[req_id]
+            if src != dst:
+                displaced = self.input_batch.req_ids[dst]
+                assert displaced is not None
+                self.input_batch.swap_states(dst, src)
+                position[displaced] = src
+                position[req_id] = dst
 
     def _build_attention_metadata(
         self,
