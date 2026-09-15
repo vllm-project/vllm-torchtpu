@@ -33,6 +33,20 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   oidc-lifetime: 7200
 
 steps:
+  - label: "Type Check - Full Environment"
+    key: "typecheck_full"
+    depends_on: "build_docker"
+    agents:
+      queue: "cpu_64_core"
+    env:
+      CPU_ONLY: "1"
+    commands:
+      # Runs pyrefly inside the CI image, where torch, jax and vllm resolve,
+      # against .pyrefly-baseline-full.json. The pre-commit hook checks the
+      # same code with those packages unresolved and cannot see errors at
+      # that boundary.
+      - bash .buildkite/scripts/run_in_docker.sh bash tools/typecheck_full.sh
+
   - label: "Unit Tests - CPU (PR)"
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults

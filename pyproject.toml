@@ -185,9 +185,11 @@ baseline-matching-mode = "concise-description"
 baseline-format = "minimal"
 
 # Never consult a Python environment. Every third-party import resolves to
-# `Any`, so the hook, CI, and a bare `pyrefly check` report the same errors
-# and the baseline matches in all three. Without this, a checkout with a
-# populated venv reports about 1,200 extra errors that CI never sees.
+# `Any`, so the pre-commit hook, its CI job, and a bare `pyrefly check`
+# report the same errors and the baseline above matches in all three.
+# tools/typecheck_full.sh passes the CI image's site-packages explicitly and
+# uses .pyrefly-baseline-full.json, so calls into torch, jax and vllm are
+# checked there against their real signatures.
 # With no interpreter to ask, the Python version must be stated too, or
 # pyrefly assumes its own default and stdlib stubs drift between runners.
 skip-interpreter-query = true
