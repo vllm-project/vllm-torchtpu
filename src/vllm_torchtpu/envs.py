@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    TPU_FP4_GMM_LAZY_SCALE_EXPANSION: bool = False
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
@@ -377,6 +378,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
+    # Opt in before model loading to lazily expand FP4 GMM E8M0 scales.
+    # Keep checkpoint scales as uint8 in HBM; decode each tile in VMEM and
+    # cast before broadcasting for weight dequantization. Defaults to off.
+    # Currently supported by the MXFP4 MoE loader; setting
+    # MOE_REQUANTIZE_BLOCK_SIZE retains decoded FP32 scales instead.
+    # Changing this setting requires reloading the model.
+    "TPU_FP4_GMM_LAZY_SCALE_EXPANSION":
+    env_bool("TPU_FP4_GMM_LAZY_SCALE_EXPANSION"),
     # Specify requantization block size for MoE weights. When unset, NVFP4
     # expert-parallel layers admitted with USE_MOE_FUSED_EP_KERNEL and
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.

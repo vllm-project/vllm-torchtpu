@@ -535,10 +535,13 @@ def fused_moe_func(
     supported. Weights must be packed along the contracting dimension (K-axis) in LSB-first order.
     """
 
-    # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N] expected by gmm_v2.
-    if w1_scale is not None and w1_scale.ndim == 3:
+    # Floating-point scales use a singleton broadcast axis in gmm_v2.
+    # Encoded uint8 scales stay 3D through the Pallas boundary.
+    if (w1_scale is not None and w1_scale.ndim == 3
+            and w1_scale.dtype != jnp.uint8):
         w1_scale = jnp.expand_dims(w1_scale, 2)
-    if w2_scale is not None and w2_scale.ndim == 3:
+    if (w2_scale is not None and w2_scale.ndim == 3
+            and w2_scale.dtype != jnp.uint8):
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape

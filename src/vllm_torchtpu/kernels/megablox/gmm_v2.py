@@ -150,6 +150,18 @@ def get_packing_factor(storage_dtype: jnp.dtype,
 # Define data classes.
 
 
+def decode_e8m0_scale(scale: jax.Array) -> jax.Array:
+    """Decode a uint8 scale tile, matching the loader's 2**(byte - 127).
+
+    Construct FP32 exponent bits instead of running a general pow/exp. Byte
+    zero is the subnormal 2**-127; byte 255 is +inf, matching e8m0_to_fp32
+    (rather than the NaN of the native float8_e8m0fnu dtype).
+    """
+    bits = scale.astype(jnp.uint32) << 23
+    bits = jnp.where(scale == 0, jnp.uint32(0x00400000), bits)
+    return lax.bitcast_convert_type(bits, jnp.float32)
+
+
 class RhsRef(ABC):
     """Abstract class that defines interfaces for rhs values."""
 
@@ -158,8 +170,13 @@ class RhsRef(ABC):
         ...
 
     @abstractmethod
-    def get_scale(self, replicate_size: int | None = None) -> jax.Array:
-        """Returns scale array, optionally replicated across sublanes."""
+    def get_scale(self,
+                  replicate_size: int | None = None,
+                  runtime_dtype: jnp.dtype | None = None) -> jax.Array:
+        """Load scales, casting encoded scales before replication if requested.
+
+        Floating-point scales retain their existing dtype and load path.
+        """
         ...
 
     @abstractmethod
@@ -179,8 +196,26 @@ class WeightsRef(RhsRef):
     def get_weight(self) -> jax.Array:
         return self.weight[...]
 
-    def get_scale(self, replicate_size: int | None = None) -> jax.Array:
+    def get_scale(self,
+                  replicate_size: int | None = None,
+                  runtime_dtype: jnp.dtype | None = None) -> jax.Array:
         assert self.scale is not None
+        if self.scale.dtype == jnp.uint8:
+            # The pipeline has already DMA'd only this tile into VMEM.
+            # Decode before replication so we operate once per scale, not
+            # once per weight in the quantization block.
+            scale = decode_e8m0_scale(self.scale[...])
+            if runtime_dtype is not None:
+                # Narrow the small scale tile before broadcasting and before
+                # the fused gate/up interleave, rather than casting a full
+                # weight-sized FP32 scale vector in the consumer.
+                scale = scale.astype(runtime_dtype)
+            if scale.ndim == 2:
+                scale = scale[:, None, :]
+            if replicate_size is not None:
+                scale = jnp.broadcast_to(
+                    scale, (scale.shape[0], replicate_size, scale.shape[2]))
+            return scale
         if replicate_size is not None:
             # Perform zero-stride load for efficient broadcasting across sublanes.
             return self.scale[:, pl.ds(0, replicate_size, 0), :]
@@ -204,9 +239,11 @@ class FusedWeightsRef(RhsRef):
         w_up = self.up.get_weight()
         return interleave_lane(w_gate, w_up)
 
-    def get_scale(self, replicate_size: int | None = None) -> jax.Array:
-        s_gate = self.gate.get_scale(replicate_size)
-        s_up = self.up.get_scale(replicate_size)
+    def get_scale(self,
+                  replicate_size: int | None = None,
+                  runtime_dtype: jnp.dtype | None = None) -> jax.Array:
+        s_gate = self.gate.get_scale(replicate_size, runtime_dtype)
+        s_up = self.up.get_scale(replicate_size, runtime_dtype)
         return interleave_lane(s_gate, s_up)
 
     def get_bias(self) -> jax.Array:
@@ -247,6 +284,7 @@ class InputConfigs:
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
+    scale_dtype: jnp.dtype = jnp.dtype(jnp.float32)
 
     @property
     def should_unpack(self) -> bool:
@@ -287,6 +325,15 @@ class GmmConfigs:
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
+
+    @property
+    def use_compact_scale_layout(self) -> bool:
+        # uint8 HBM DMA slices must align quant-block rows to the packed
+        # four-row tile. Keep the legacy broadcast axis for smaller slices.
+        return (self.rhs_cfgs.scale_dtype == jnp.uint8
+                and self.rhs_cfgs.quant_block_size is not None
+                and self.tiles.tile_k %
+                (4 * self.rhs_cfgs.quant_block_size) == 0)
 
     @property
     def out_size_n(self) -> int:
@@ -335,6 +382,8 @@ class IndexMaps:
         k_row = k_id * self.cfgs.tiles.tile_k
         b_row = k_row // self.cfgs.rhs_cfgs.quant_block_size
         b_tile_id = b_row // self.cfgs.num_quant_blocks_per_tile_k
+        if self.cfgs.use_compact_scale_layout:
+            return (group_id, b_tile_id, n_id)
         return (group_id, b_tile_id, 0, n_id)
 
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
@@ -377,8 +426,12 @@ def generate_block_specs(
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
+        scale_shape = ((None, cfgs.num_quant_blocks_per_tile_k,
+                        cfgs.tiles.tile_n) if cfgs.use_compact_scale_layout
+                       else (None, cfgs.num_quant_blocks_per_tile_k, 1,
+                             cfgs.tiles.tile_n))
         rhs_scale_block_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            scale_shape,
             index_map.rhs_scale_index_map,
         )
 
@@ -457,7 +510,8 @@ def inner_kernel(
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         if cfgs.rhs_cfgs.should_dequantize_before_matmul:
             tiled_rhs_scale = tiled_rhs_ref.get_scale(
-                replicate_size=rhs_qbs).astype(cfgs.lhs_cfgs.dtype)
+                replicate_size=rhs_qbs,
+                runtime_dtype=cfgs.lhs_cfgs.dtype).astype(cfgs.lhs_cfgs.dtype)
             num_blocks = cfgs.num_quant_blocks_per_tile_k
             tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
                 num_blocks, rhs_qbs, rhs_tile_n)
@@ -1015,6 +1069,8 @@ def calculate_tiling(
         if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
             num_quant_blocks_per_tile_k = pl.cdiv(tk,
                                                   rhs_cfgs.quant_block_size)
+            # Keep the FP32 allowance for the decoded tile even when the
+            # pipelined HBM input is uint8. Do not grow tiles on that saving.
             rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * 4
         rhs_bias_vmem = 0
         if rhs_cfgs.has_bias:
@@ -1104,7 +1160,10 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
+        expected_scale_shape = ((size_group, num_quant_blocks,
+                                 size_n) if rhs_scale.dtype == jnp.uint8 else
+                                (size_group, num_quant_blocks, 1, size_n))
+        assert rhs_scale.shape == expected_scale_shape
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1, )
@@ -1147,7 +1206,8 @@ def get_cost_estimate(cfgs: GmmConfigs):
     rhs_bytes = rhs_size * rhs_bits // 8
     if cfgs.rhs_cfgs.has_scale:
         num_quant_blocks = pl.cdiv(dims.size_k, cfgs.rhs_cfgs.quant_block_size)
-        rhs_bytes += dims.size_group * num_quant_blocks * dims.size_n * fp32_bytes
+        rhs_bytes += (dims.size_group * num_quant_blocks * dims.size_n *
+                      cfgs.rhs_cfgs.scale_dtype.itemsize)
     if cfgs.rhs_cfgs.has_bias:
         rhs_bytes += dims.size_group * dims.size_n * fp32_bytes
 
@@ -1210,6 +1270,9 @@ def make_gmm_configs(
         dtype=rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
+        scale_dtype=(jnp.dtype(jnp.uint8)
+                     if rhs_scale is not None and rhs_scale.dtype == jnp.uint8
+                     else jnp.dtype(jnp.float32)),
     )
 
     lhs_q_dtype = None
@@ -1319,7 +1382,11 @@ def gmm_v2(
         lhs: lhs with shape [size_m, size_k].
         rhs: rhs with shape  native -> [size_group, size_k, size_n], packed -> [size_group, size_k/8, size_n]
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
-        rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
+        rhs_scale: Floating-point scales have shape [size_group, num_blocks, 1, out_size].
+            Encoded uint8 scales use [size_group, num_blocks, out_size] to
+            avoid a full-tensor layout conversion at the Pallas boundary.
+            uint8 inputs encode E8M0 exponents and are decoded inside each
+            VMEM tile; floating-point inputs contain already decoded scales.
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
@@ -1378,7 +1445,10 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
-        rhs_scale = rhs_scale.astype(jnp.float32)
+        if rhs_scale.dtype != jnp.uint8:
+            rhs_scale = rhs_scale.astype(jnp.float32)
+        elif not cfgs.use_compact_scale_layout:
+            rhs_scale = rhs_scale[:, :, None, :]
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)

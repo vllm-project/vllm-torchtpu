@@ -140,11 +140,17 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_weight_packed = self._loaded_data(layer.w2_weight_packed).to("tpu")
         w2_weight_scale = self._loaded_data(layer.w2_weight_scale).to("tpu")
 
-        # Convert e8m0 scales to fp32
-        w13_scale = e8m0_to_fp32(w13_weight_scale)
-        w2_scale = e8m0_to_fp32(w2_weight_scale)
-
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
+        # Preserve the one-byte checkpoint representation until the GMM
+        # pipeline loads a scale tile into VMEM. Requantization needs decoded
+        # input scales and produces general (not E8M0) FP32 output scales.
+        if envs.TPU_FP4_GMM_LAZY_SCALE_EXPANSION and requant_block is None:
+            w13_scale = w13_weight_scale
+            w2_scale = w2_weight_scale
+        else:
+            w13_scale = e8m0_to_fp32(w13_weight_scale)
+            w2_scale = e8m0_to_fp32(w2_weight_scale)
+
         if requant_block is not None:
             requant_block = int(requant_block)
 
@@ -158,19 +164,24 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 )
 
             # Apply XLA fused requantization and kmajor layout shift
-            w13_weight, w13_scale_4d = requant_load_kmajor_fp4(
+            w13_weight, w13_kernel_scale = requant_load_kmajor_fp4(
                 _fresh(w13_weight_packed), w13_scale, requant_block)
-            w2_weight, w2_scale_4d = requant_load_kmajor_fp4(
+            w2_weight, w2_kernel_scale = requant_load_kmajor_fp4(
                 _fresh(w2_weight_packed), w2_scale, requant_block)
         else:
 
             def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
                 # scale shape: [E, N, num_blocks]
-                # gmm_v2 scale layout: [E, num_blocks, 1, N]
-                return _fresh(scale.movedim(-1, 1).unsqueeze(-2))
+                # Keep encoded scales compact through the Pallas boundary.
+                # The singleton broadcast axis belongs inside the VMEM tile;
+                # storing it in HBM forces a uint8 layout copy on every call.
+                scale = scale.movedim(-1, 1)
+                if scale.dtype != torch.uint8:
+                    scale = scale.unsqueeze(-2)
+                return _fresh(scale)
 
-            w13_scale_4d = _to_kernel_scale(w13_scale)
-            w2_scale_4d = _to_kernel_scale(w2_scale)
+            w13_kernel_scale = _to_kernel_scale(w13_scale)
+            w2_kernel_scale = _to_kernel_scale(w2_scale)
 
             # Unpack to native fp4 in the kernel's K-major layout once at load
             # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
@@ -186,9 +197,9 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         # Update layer parameters
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale_4d,
+        layer.w13_weight_scale = torch.nn.Parameter(w13_kernel_scale,
                                                     requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale_4d,
+        layer.w2_weight_scale = torch.nn.Parameter(w2_kernel_scale,
                                                    requires_grad=False)
 
         # Remove packed attributes

@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
@@ -29,7 +30,11 @@ class FakeRoutedExperts(RoutedExperts):
         return expert_id
 
 
-def test_mxfp4_create_weights_and_process():
+@pytest.mark.parametrize("runtime_scale_cast", [False, True])
+def test_mxfp4_create_weights_and_process(monkeypatch, runtime_scale_cast):
+    monkeypatch.setenv("TPU_FP4_GMM_LAZY_SCALE_EXPANSION",
+                       str(int(runtime_scale_cast)))
+    monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
     moe_config = MagicMock()
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
@@ -113,14 +118,28 @@ def test_mxfp4_create_weights_and_process():
     assert layer.w2_weight.shape == (4, 64, 64)
 
     # w13_scale_4d: [E, num_blocks, 1, N] -> [4, 4, 1, 128]
-    assert layer.w13_weight_scale.shape == (4, 4, 1, 128)
+    assert layer.w13_weight_scale.shape == ((4, 4,
+                                             128) if runtime_scale_cast else
+                                            (4, 4, 1, 128))
     # w2_scale_4d: [E, num_blocks, 1, N] -> [4, 2, 1, 128]
-    assert layer.w2_weight_scale.shape == (4, 2, 1, 128)
+    assert layer.w2_weight_scale.shape == ((4, 2,
+                                            128) if runtime_scale_cast else
+                                           (4, 2, 1, 128))
 
     assert layer.w13_weight.dtype == getattr(torch, "float4_e2m1fn_x2",
                                              layer.w13_weight.dtype)
     assert layer.w2_weight.dtype == getattr(torch, "float4_e2m1fn_x2",
                                             layer.w2_weight.dtype)
+
+    expected_dtype = torch.uint8 if runtime_scale_cast else torch.float32
+    for scale in (layer.w13_weight_scale, layer.w2_weight_scale):
+        assert scale.dtype == expected_dtype
+        expected_value = 1 if runtime_scale_cast else 2.0**-126
+        torch.testing.assert_close(scale.cpu(),
+                                   torch.full_like(scale.cpu(),
+                                                   expected_value),
+                                   rtol=0,
+                                   atol=0)
 
     # 3. _forward_monolithic_tpu
     x = torch.randn(2, 128, dtype=torch.bfloat16)
@@ -176,8 +195,13 @@ def test_mxfp4_apply_masks_padded_token_routes():
     assert mock_gmm.call_args.kwargs["skip_padded_tokens"] is True
 
 
-def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
+@pytest.mark.parametrize("runtime_scale_cast", [False, True])
+def test_mxfp4_duplicate_active_rows_with_padding_are_identical(
+        monkeypatch, runtime_scale_cast):
     """The decode-shaped MoE call must not mix otherwise identical rows."""
+    monkeypatch.setenv("TPU_FP4_GMM_LAZY_SCALE_EXPANSION",
+                       str(int(runtime_scale_cast)))
+    monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
     moe_config = MagicMock()
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
@@ -441,7 +465,10 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     assert not w2_scale[:, :, 1:].any()
 
 
-def test_mxfp4_requantize_block():
+@pytest.mark.parametrize("runtime_scale_cast", [False, True])
+def test_mxfp4_requantize_block(monkeypatch, runtime_scale_cast):
+    monkeypatch.setenv("TPU_FP4_GMM_LAZY_SCALE_EXPANSION",
+                       str(int(runtime_scale_cast)))
     from vllm_torchtpu.layers.core.quantization import (
         dequantize_mxfp4_packed, fp4_indices_to_float, quantize_tensor_to_fp4)
     moe_config = MagicMock()

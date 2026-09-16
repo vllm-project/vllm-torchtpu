@@ -27,7 +27,8 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2, interleave_lane,
+                                                   decode_e8m0_scale, gmm_v2,
+                                                   interleave_lane,
                                                    situ_and_mul)
 
 _GroupConfig = collections.namedtuple(
@@ -470,3 +471,93 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def test_decode_e8m0_scale_all_bytes():
+    encoded = np.arange(256, dtype=np.uint8)
+    with np.errstate(over="ignore"):
+        expected = np.ldexp(np.ones(256, dtype=np.float32),
+                            encoded.astype(np.int32) - 127)
+    actual = np.asarray(jax.jit(decode_e8m0_scale)(jnp.asarray(encoded)))
+    # Bitwise comparison also covers subnormal byte 0, exponent 254, and inf.
+    np.testing.assert_array_equal(actual.view(np.uint32),
+                                  expected.view(np.uint32))
+
+
+@pytest.mark.parametrize("batch_size", [1, 129])
+@pytest.mark.parametrize("fuse_act", [None, "situ:4.0:25.0"])
+@pytest.mark.parametrize("block_size", [32, 256])
+def test_gmm_runtime_e8m0_scales_match_fp32(batch_size, fuse_act, block_size):
+    _require_tpu()
+    key = jax.random.key(42)
+    lhs = jax.random.normal(key, (batch_size, 512), dtype=jnp.bfloat16)
+    rhs = jax.random.randint(key, (3, 512, 512), -6,
+                             7).astype(jnp.float4_e2m1fn)
+    scales = jax.random.randint(key, (3, 512 // block_size, 1, 512), 120,
+                                130).astype(jnp.uint8)
+    fp32_scales = jnp.exp2(scales.astype(jnp.float32) - 127)
+    # Empty experts, an unaligned M boundary, and a nonzero EP group offset.
+    groups = jnp.array([0, batch_size // 2, 0, batch_size - batch_size // 2],
+                       dtype=jnp.int32)
+    kwargs = dict(
+        group_offset=jnp.array([1], dtype=jnp.int32),
+        fuse_act=fuse_act,
+        tile_info=TileSizes(tile_m=min(128, batch_size),
+                            tile_k=256,
+                            tile_n=256,
+                            bucket_base=min(16, batch_size)),
+    )
+    expected = gmm_v2(lhs, rhs, groups, rhs_scale=fp32_scales, **kwargs)
+    actual = gmm_v2(lhs, rhs, groups, rhs_scale=scales.squeeze(2), **kwargs)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+@pytest.mark.parametrize("in_size,out_size,fuse_act", [
+    (3584, 6144, "situ:4.0:25.0"),
+    (3072, 3584, None),
+])
+@pytest.mark.parametrize("batch_size,active_rows,active_experts", [
+    (16, 16, 2),
+    (16, 16, 16),
+    (16, 2, 2),
+    (8192, 1024, 28),
+])
+def test_gmm_runtime_e8m0_kimi_k3_default_tiles(in_size, out_size, fuse_act,
+                                                batch_size, active_rows,
+                                                active_experts):
+    _require_tpu()
+    key = jax.random.key(7)
+    lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.randint(key, (28, in_size, out_size), -6,
+                             7).astype(jnp.float4_e2m1fn)
+    scales = jax.random.randint(key, (28, in_size // 32, 1, out_size), 120,
+                                124).astype(jnp.uint8)
+    fp32_scales = jnp.exp2(scales.astype(jnp.float32) - 127)
+    if active_experts == 2:
+        first = max(1, active_rows // 2 - 1)
+        counts = [first] + [0] * 26 + [active_rows - first]
+    else:
+        counts = [active_rows // active_experts] * active_experts
+        for i in range(active_rows % active_experts):
+            counts[i] += 1
+        counts += [0] * (28 - active_experts)
+    groups = jnp.array(counts, dtype=jnp.int32)
+    # Production EP may use only a small prefix of the padded routed rows.
+    # Uncomputed rows are intentionally unspecified with zero_init disabled.
+    expected = gmm_v2(lhs,
+                      rhs,
+                      groups,
+                      rhs_scale=fp32_scales,
+                      fuse_act=fuse_act,
+                      maybe_quantize_lhs=False,
+                      zero_initialize=False)
+    actual = gmm_v2(lhs,
+                    rhs,
+                    groups,
+                    rhs_scale=scales.squeeze(2),
+                    fuse_act=fuse_act,
+                    maybe_quantize_lhs=False,
+                    zero_initialize=False)
+    np.testing.assert_array_equal(
+        np.asarray(actual)[:active_rows],
+        np.asarray(expected)[:active_rows])
