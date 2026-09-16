@@ -31,7 +31,9 @@ def run_test(model_name, expected_value, more_args=None):
     print(f"Running test for model: {model_name}")
 
     if model_name in ["Qwen/Qwen3-30B-A3B", "Qwen/Qwen2.5-VL-7B-Instruct"]:
-        model_args = f"pretrained={model_name},max_model_len=4096,max_num_batched_tokens=16384"
+        model_args = (
+            f"pretrained={model_name},max_model_len=4096,max_num_batched_tokens=16384"
+        )
     else:
         model_args = f"pretrained={model_name},max_model_len=4096"
 
@@ -47,14 +49,18 @@ def run_test(model_name, expected_value, more_args=None):
 
     measured_value = results["results"][TASK][FILTER]
     print(f"measured accuracy: {measured_value}")
-    assert measured_value >= expected_value - RTOL, f"Expected: {expected_value} |  Measured: {measured_value}"
+    assert measured_value >= expected_value - RTOL, (
+        f"Expected: {expected_value} |  Measured: {measured_value}"
+    )
 
 
-@pytest.mark.skipif(not current_platform.is_cuda()
-                    and not current_platform.is_tpu(),
-                    reason="V1 is currently only supported on CUDA and TPU")
-def test_lm_eval_accuracy_v1_engine(monkeypatch: pytest.MonkeyPatch,
-                                    request: pytest.FixtureRequest):
+@pytest.mark.skipif(
+    not current_platform.is_cuda() and not current_platform.is_tpu(),
+    reason="V1 is currently only supported on CUDA and TPU",
+)
+def test_lm_eval_accuracy_v1_engine(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+):
     """Run with the V1 Engine."""
     model = request.config.getoption("--model-name")
     print(f"Testing model: {model}...")
@@ -82,11 +88,13 @@ def test_lm_eval_accuracy_v1_engine(monkeypatch: pytest.MonkeyPatch,
         run_test(model, expected_value, more_args)
 
 
-@pytest.mark.skipif(not current_platform.is_cuda()
-                    and not current_platform.is_tpu(),
-                    reason="V1 is currently only supported on CUDA and TPU")
+@pytest.mark.skipif(
+    not current_platform.is_cuda() and not current_platform.is_tpu(),
+    reason="V1 is currently only supported on CUDA and TPU",
+)
 def test_lm_eval_accuracy_v1_engine_fp8_kv_cache(
-        monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+):
     """Run with the V1 Engine."""
     fp8_kv_model = request.config.getoption("--fp8-kv-model-name")
     print(f"Testing fp8_kv_model: {fp8_kv_model}...")

@@ -125,7 +125,6 @@ select = ["E4", "E7", "E9", "F", "I"]
 # under [tool.ruff.format] and in the isort and yapf excludes in
 # .pre-commit-config.yaml; all three move together, otherwise two tools format the
 # same file.
-"scripts/**" = ["I"]
 "src/**" = ["I"]
 "tests/**" = ["I"]
 
@@ -133,7 +132,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 docstring-code-format = true
 
 # Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
-exclude = ["scripts/**", "src/**", "tests/**"]
+exclude = ["src/**", "tests/**"]
 
 [tool.pyrefly]
 project-includes = ["src"]
