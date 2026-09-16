@@ -287,6 +287,7 @@ common_args=(
   --no-disable-hybrid-kv-cache-manager
   --attention-backend "${ATTENTION_BACKEND}"
   --mamba-cache-mode "${MAMBA_CACHE_MODE}"
+  --prefix-cache-retention-interval "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}"
   --enable-prompt-tokens-details
   --no-enable-log-requests
 )
