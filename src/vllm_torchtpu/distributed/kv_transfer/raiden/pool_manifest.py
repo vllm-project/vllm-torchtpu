@@ -29,7 +29,8 @@ constructed.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (pooled_gdn_conv_state_bytes,

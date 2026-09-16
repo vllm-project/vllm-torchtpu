@@ -270,7 +270,7 @@ def request_reviewers(
     owners: list[str],
     pr: str | None,
     repo: str | None,
-    style: "Style",
+    style: Style,
 ) -> None:
     """Request review from the given owners on a PR."""
     handles = [o.lstrip("@") for o in owners]

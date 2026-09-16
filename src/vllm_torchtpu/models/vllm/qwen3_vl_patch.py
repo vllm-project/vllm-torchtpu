@@ -6,7 +6,7 @@ import functools
 import inspect
 import sys
 import threading
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -88,11 +88,10 @@ def _patched_masked_scatter(input: torch.Tensor, mask: torch.Tensor,
     return orig_fn(input, mask, source)
 
 
-def _patched_repeat_interleave(
-        input: torch.Tensor,
-        repeats: Union[torch.Tensor, int],
-        dim: Optional[int] = None,
-        output_size: Optional[int] = None) -> torch.Tensor:
+def _patched_repeat_interleave(input: torch.Tensor,
+                               repeats: torch.Tensor | int,
+                               dim: int | None = None,
+                               output_size: int | None = None) -> torch.Tensor:
     if (isinstance(input, torch.Tensor) and input.device.type == "tpu"
             and input.dtype
             in (torch.int64, torch.int32, torch.int16, torch.bool)):

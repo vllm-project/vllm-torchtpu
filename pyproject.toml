@@ -123,8 +123,37 @@ force-exclude = true
 
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
-# I import sorting. Line length (E501) is in E5 and is not selected.
-select = ["E4", "E7", "E9", "F", "I"]
+# I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
+# G logging calls, ISC string concatenation.
+# Line length (E501) is in E5 and is not selected.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+
+ignore = [
+    # Off on purpose, matching upstream vllm.
+    "B905",   # zip() without an explicit strict=
+    "B007",   # loop control variable not used in the body
+    "UP032",  # .format() that could be an f-string
+
+    # Firing today and not fixed yet. None of these has an automatic fix, so
+    # each one is a follow-up change. Delete the entry once its count is zero.
+    "B023",    # 46  closure captures a loop variable
+    "G004",    # 39  f-string passed to a logging call
+    "SIM108",  # 15  if/else that could be a conditional expression
+    "SIM102",  # 13  nested if that could be one
+    "SIM105",  # 12  try/except/pass that could be contextlib.suppress
+    "SIM117",  # 17  nested with statements
+    "UP022",   #  4  subprocess stdout=PIPE, stderr=PIPE
+    "ISC002",  #  3  implicit string concatenation over several lines
+    "B904",    #  2  raise inside except without from
+    "SIM103",  #  2  returning a condition through if/else
+    "SIM401",  #  2  if/else that could be dict.get
+    "B011",    #  1  assert False
+    "B020",    #  1  loop variable shadows the iterable
+    "SIM115",  #  1  open() outside a context manager
+    "UP031",   #  1  printf-style string formatting
+    "UP040",   #  1  TypeAlias that could be the type statement
+    "UP047",   #  1  generic function that could use PEP 695 syntax
+]
 
 [tool.ruff.lint.per-file-ignores]
 # isort and yapf still own these paths. The same list appears in `exclude`

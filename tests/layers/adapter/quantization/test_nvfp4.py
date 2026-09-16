@@ -362,18 +362,14 @@ class TestNvfp4MoEMethod:
                 mock_moe_create_weights):
             method.create_weights(layer, 4, 128, 64, torch.bfloat16)
 
-        assert (getattr(
-            layer.w13_weight_scale,
-            "quant_method") == FusedMoeWeightScaleSupported.BLOCK.value)
-        assert (getattr(
-            layer.w2_weight_scale,
-            "quant_method") == FusedMoeWeightScaleSupported.BLOCK.value)
-        assert (getattr(
-            layer.w13_weight_scale_2,
-            "quant_method") == FusedMoeWeightScaleSupported.TENSOR.value)
-        assert (getattr(
-            layer.w2_weight_scale_2,
-            "quant_method") == FusedMoeWeightScaleSupported.TENSOR.value)
+        assert (layer.w13_weight_scale.quant_method ==
+                FusedMoeWeightScaleSupported.BLOCK.value)
+        assert (layer.w2_weight_scale.quant_method ==
+                FusedMoeWeightScaleSupported.BLOCK.value)
+        assert (layer.w13_weight_scale_2.quant_method ==
+                FusedMoeWeightScaleSupported.TENSOR.value)
+        assert (layer.w2_weight_scale_2.quant_method ==
+                FusedMoeWeightScaleSupported.TENSOR.value)
 
     def test_process_weights_validation_guards(self):
         method = VllmNvfp4MoEMethod(

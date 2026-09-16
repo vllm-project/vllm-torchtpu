@@ -7,7 +7,8 @@ Moved verbatim out of `TPUModelRunner`; see vllm-project/vllm-torchtpu#713.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.v1.kv_cache_interface import (KVCacheConfig, KVCacheSpec,

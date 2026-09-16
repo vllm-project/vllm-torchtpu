@@ -1,13 +1,14 @@
 import ctypes
 import gc
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch.nn import Parameter
 
 
 def get_cpu_weight_loader_hook(layer: torch.nn.Module,
-                               orig_loader: Optional[Callable],
+                               orig_loader: Callable | None,
                                tp_size: int,
                                tp_rank: int,
                                is_param_transposed: bool = True) -> Callable:

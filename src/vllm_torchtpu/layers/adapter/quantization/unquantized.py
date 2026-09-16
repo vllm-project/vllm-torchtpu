@@ -34,7 +34,7 @@ and uses our native TorchTPU + Pallas kernels.
 4. apply() routes to our TPU Pallas local-topk MoE kernels
 """
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -105,7 +105,7 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # Left in vLLM's [n_out, n_in] for a consumer that reads it raw.
@@ -158,7 +158,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[QuantizeMethodBase]:
+    ) -> QuantizeMethodBase | None:
         """
         Return the appropriate quantization method for a layer.
 

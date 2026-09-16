@@ -85,7 +85,7 @@ def test_enable_pipelined_collective_allows_pcp():
 )
 def test_supports_internal_mk_property(method_cls):
     """Verify supports_internal_mk is True when chunk_size > 0, False when 0 across all 6 quantization classes."""
-    prop = getattr(method_cls, "supports_internal_mk")
+    prop = method_cls.supports_internal_mk
     assert isinstance(prop, property)
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):

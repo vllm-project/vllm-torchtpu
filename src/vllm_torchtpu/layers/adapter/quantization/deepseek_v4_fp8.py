@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
-
 import torch
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -72,7 +70,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[Union[vllm_linear.LinearMethodBase, QuantizeMethodBase]]:
+    ) -> vllm_linear.LinearMethodBase | QuantizeMethodBase | None:
         if isinstance(layer, vllm_linear.LinearBase):
             linear_config = self.get_linear_config(layer)
             if is_layer_skipped(

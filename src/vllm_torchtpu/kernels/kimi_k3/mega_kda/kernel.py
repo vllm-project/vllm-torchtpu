@@ -1668,7 +1668,7 @@ _chunk_kda_fwd_native_segids = jax.jit(
 )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _native_residual_layout_jit_for_sharding(sharding):
     """JIT variant whose ABI accepts the Pallas Aqk/Akk physical layout."""
     from jax._src.layout import Format, Layout
