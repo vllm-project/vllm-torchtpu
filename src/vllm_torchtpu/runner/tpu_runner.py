@@ -3750,6 +3750,9 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        if self.lora_config:
+            self.model = self.load_lora_model(self.model, self.vllm_config,
+                                              self.device)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
