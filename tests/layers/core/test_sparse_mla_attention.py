@@ -1151,6 +1151,10 @@ class SparseMlaLayerBranchTest(parameterized.TestCase):
         self.assertEqual(output.shape, (8, NUM_HEADS, LKV_DIM))
         self.assertEqual(routed.call_count, int(applies))
         self.assertEqual(sparse.call_count, int(not applies))
+        if applies:
+            self.assertNotIn("q_concat", routed.call_args.kwargs)
+            self.assertEqual(routed.call_args.args[0].shape[-1], LKV_DIM)
+            self.assertEqual(routed.call_args.args[1].shape[-1], ROPE_DIM)
 
 
 def _cond_boundaries(jaxpr, depth=0):
@@ -1184,7 +1188,9 @@ class MaskedDenseRouteCompositionTest(parameterized.TestCase):
     OVERWRITTEN = -1e4
 
     @classmethod
-    def _fake_sparse_chunk(cls, q, *args, start_pos, end_pos, token_end, **kwargs):
+    def _fake_sparse_chunk(
+        cls, q, *args, start_pos, end_pos, token_end, preserve_suffix=False, **kwargs
+    ):
         del args, kwargs
         rows = jnp.arange(q.shape[0])[:, None, None]
         in_chunk = (rows >= start_pos) & (rows < end_pos)
@@ -1197,6 +1203,8 @@ class MaskedDenseRouteCompositionTest(parameterized.TestCase):
                 < token_end + sparse_mla_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE - 1
             )
         )
+        if preserve_suffix:
+            overwritten = jnp.zeros_like(overwritten)
         return jnp.where(owned, q * 5, jnp.where(overwritten, cls.OVERWRITTEN, q))
 
     @staticmethod
@@ -1336,12 +1344,12 @@ class MaskedDenseRouteCompositionTest(parameterized.TestCase):
 
 
 class SparsePrefixTest(parameterized.TestCase):
-    """`_sparse_prefix` keeps the suffix rows the sparse grid overwrites."""
+    """Prefix routing skips chunks outside its owned rows."""
 
     NUM_ROWS = 128
 
     @parameterized.parameters(1, 15, 16, 17, 63, 64, 65, 100, 113, 127)
-    def test_suffix_rows_are_restored(self, split_token):
+    def test_suffix_rows_are_preserved(self, split_token):
         q = jnp.asarray(
             np.random.default_rng(3).standard_normal((self.NUM_ROWS, 2, 8)), jnp.float32
         )
@@ -1352,6 +1360,7 @@ class SparsePrefixTest(parameterized.TestCase):
                 start_pos=start_pos,
                 end_pos=min(start_pos + 64, self.NUM_ROWS),
                 token_end=token_end,
+                preserve_suffix=True,
             )
 
         with mock.patch.object(
@@ -1377,6 +1386,76 @@ class SparsePrefixTest(parameterized.TestCase):
         )(q, jnp.asarray(1, jnp.int32))
         conds = [e for e in jaxpr.jaxpr.eqns if e.primitive.name == "cond"]
         self.assertLen(conds, (1024 - 512) // 64)
+
+    @parameterized.parameters(
+        (0, 64, 17, 32),
+        (64, 128, 17, 0),
+        (0, 64, 100, 64),
+    )
+    def test_sparse_attention_chunk_valid_indices(
+        self, start_pos, end_pos, token_end, expected_batch_rows
+    ):
+        topk = 8
+        chunk_size = end_pos - start_pos
+        q = jnp.zeros((self.NUM_ROWS, NUM_HEADS, LKV_DIM + ROPE_DIM), jnp.bfloat16)
+        nope, rope = _empty_pair()
+        kv_lens = jnp.ones((self.NUM_ROWS,), jnp.int32)
+        physical_indices = jnp.zeros((self.NUM_ROWS, topk), jnp.int32)
+        captured = {}
+
+        def fake_gather(nope_c, rope_c, flat_indices, *, num_valid_indices):
+            del nope_c, rope_c, flat_indices
+            captured["num_valid_indices"] = int(num_valid_indices)
+            return (
+                jnp.zeros(
+                    (
+                        chunk_size * topk,
+                        kv_cache_utils.WORD_BYTES,
+                        kv_cache_utils.TILE_LANE_BYTES,
+                    ),
+                    jnp.uint8,
+                ),
+                jnp.zeros(
+                    (chunk_size * topk, kv_cache_utils.TILE_LANE_BYTES), jnp.uint8
+                ),
+            )
+
+        def fake_pallas_call(*args, **kwargs):
+            del args, kwargs
+
+            def kernel(_kv_lens, bounds, _sems, q_in, *_rest):
+                captured["bounds"] = [int(x) for x in bounds]
+                return q_in
+
+            return kernel
+
+        with (
+            mock.patch.object(
+                sparse_mla_kernel.dsa_gather, "dsa_gather", side_effect=fake_gather
+            ),
+            mock.patch.object(
+                sparse_mla_kernel.pl, "pallas_call", side_effect=fake_pallas_call
+            ),
+        ):
+            sparse_mla_kernel.sparse_attention_chunk(
+                q,
+                nope,
+                rope,
+                kv_lens,
+                physical_indices,
+                None,
+                start_pos=start_pos,
+                end_pos=end_pos,
+                token_end=jnp.asarray(token_end, jnp.int32),
+                sm_scale=1.0,
+                k_scale=1.0,
+                preserve_suffix=True,
+                attention_kernel_batch_size=16,
+            )
+        self.assertEqual(captured["num_valid_indices"], expected_batch_rows * topk)
+        self.assertEqual(
+            captured["bounds"], [start_pos, start_pos + expected_batch_rows, token_end]
+        )
 
 
 class MaskedDenseLimitResolutionTest(parameterized.TestCase):

@@ -139,6 +139,7 @@ def _attention_kernel(
     sm_scale: float,
     k_scale: float = 1.0,
     batch_size: int = 1,
+    preserve_suffix: bool = False,
     return_lse: bool = False,
     sparsecore_layout: bool = False,
 ):
@@ -187,6 +188,8 @@ def _attention_kernel(
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
+    if preserve_suffix:
+        prefix_end = start_end_seq_idx_ref[2]
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
@@ -299,6 +302,18 @@ def _attention_kernel(
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx, :]
+
+        if preserve_suffix:
+            # Split routing owns only the prefix, including in the last
+            # rounded batch. Leave suffix queries untouched in HBM.
+            rows = jnp.minimum(batch_size, prefix_end - seq_idx_start)
+            _async_copy(
+                vmem_ref.at[pl.ds(0, rows)],
+                o_hbm_ref.at[pl.ds(seq_idx_start, rows)],
+                sem,
+                wait,
+            )
+            return
 
         if not wait:
             _async_copy(
@@ -420,7 +435,13 @@ def _attention_kernel(
 
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
-            wait_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
+            # This slot holds the transfer from two batches earlier.
+            sent_start = (
+                batch_start_seq_idx - 2 * batch_size
+                if preserve_suffix
+                else batch_start_seq_idx
+            )
+            wait_send_bo_batch(sent_start, bo_sem_idx)
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
@@ -472,15 +493,18 @@ def _attention_kernel(
 
     @pl.when(batch_end_seq_idx == end_seq_idx - 1)
     def epilogue():
-        # The first argument "0" for seq_idx_start does not matter here.
-        wait_send_bo_batch(0, 0)
+        # Partial stores must wait for the same byte count as their send.
+        last_even = (pl.num_programs(0) - 1) // 2 * 2
+        sent_start = start_seq_idx + last_even * batch_size if preserve_suffix else 0
+        wait_send_bo_batch(sent_start, 0)
         if return_lse:
             _send_blse_batch(0, 0, wait=True)
 
         @pl.when(pl.num_programs(0) >= 2)
         def _wait_1():
-            # The first argument "0" for seq_idx_start does not matter here.
-            wait_send_bo_batch(0, 1)
+            last_odd = (pl.num_programs(0) - 2) // 2 * 2 + 1
+            sent_start = start_seq_idx + last_odd * batch_size if preserve_suffix else 0
+            wait_send_bo_batch(sent_start, 1)
             if return_lse:
                 _send_blse_batch(0, 1, wait=True)
 
@@ -790,6 +814,7 @@ def sparse_attention_chunk(
     token_end: jax.Array,  # i32
     sm_scale: float,
     k_scale: float,
+    preserve_suffix: bool = False,
     attention_kernel_batch_size: int = DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     cache_layout: str = TENSORCORE_CACHE_LAYOUT,
@@ -802,10 +827,13 @@ def sparse_attention_chunk(
     The output aliases `q`. Returns the updated `q`, or `(q, lse)` when `lse`
     is given. The attention grid is rounded up to its kernel batch size, so
     up to `attention_kernel_batch_size - 1` rows at or after `token_end` may
-    also be overwritten; rows further on keep their input values.
+    also be overwritten; rows further on keep their input values. Private
+    split routing sets `preserve_suffix` to restrict stores to owned rows.
     """
     return_lse = lse is not None
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    if preserve_suffix and (return_lse or sparsecore_layout):
+        raise ValueError("Prefix stores require TensorCore caches without LSE")
     _, num_q_heads, head_dim = q.shape
     topk = physical_indices.shape[-1]
     chunk_size = end_pos - start_pos
@@ -869,9 +897,12 @@ def sparse_attention_chunk(
         # (+ blse when the log-sum-exp is exported).
         scratch_shapes.append(pltpu.SemaphoreType.DMA((5 if return_lse else 4, 2)))
 
+        bounds = [start_seq_idx, end_seq_idx]
+        if preserve_suffix:
+            bounds.append(token_end)
         scalar_prefetches = (
             kv_lens,
-            jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
+            jnp.array(bounds, jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
             jnp.zeros((2,), jnp.int32),
         )
@@ -887,6 +918,7 @@ def sparse_attention_chunk(
                     sm_scale=sm_scale,
                     k_scale=k_scale,
                     batch_size=batch_size,
+                    preserve_suffix=preserve_suffix,
                     return_lse=return_lse,
                     sparsecore_layout=sparsecore_layout,
                 ),

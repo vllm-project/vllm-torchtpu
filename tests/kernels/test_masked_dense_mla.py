@@ -636,8 +636,8 @@ class SparseChunkRowContractTest(MaskedDenseTestBase):
     """Rows the sparse kernel may write past its token end.
 
     Masked-dense routing runs a sparse prefix over the query/output buffer the
-    masked-dense suffix reads afterwards, and restores only the rows that
-    `sparse_attention_chunk` documents it may overwrite past the split.
+    masked-dense suffix reads afterwards. Prefix stores must leave that suffix
+    bitwise unchanged, including across donated calls and DMA buffer reuse.
     """
 
     def test_rows_past_token_end(self):
@@ -681,6 +681,76 @@ class SparseChunkRowContractTest(MaskedDenseTestBase):
                 np.testing.assert_array_equal(
                     result[end + batch - 1 :], original[end + batch - 1 :]
                 )
+
+    def test_prefix_stores_preserve_suffix_with_donation(self):
+        tokens = 128
+        pages = self._block_tables(1)
+        caches, _, _ = self._fill_cache([192], pages, 1.0)
+        query = self._random_queries(tokens)
+        original = np.asarray(query).copy()
+        topk = jnp.asarray(
+            self._topk_rows(
+                tokens, np.zeros(tokens, np.int32), [192], 2048, lambda _: 96
+            )
+        )
+        starts = jnp.array([0, tokens], jnp.int32)
+        kv_lens, indices = sparse_mla_kernel.prepare_gather_indices(
+            topk,
+            pages,
+            starts,
+            page_size=caches[0].shape[1],
+            total_num_pages=caches[0].shape[0],
+        )
+        expected = np.asarray(
+            sparse_mla_kernel.sparse_ragged_paged_attention(
+                query,
+                *caches,
+                topk,
+                pages,
+                starts,
+                jnp.array([0, 0, 1], jnp.int32),
+                sm_scale=self.sm_scale,
+            )
+        )
+
+        def prefix(q, end, nope, rope, lengths, physical):
+            q = sparse_mla_kernel.prepare_q_inputs(q)
+            for start in range(0, tokens, 64):
+
+                def chunk(q, start=start):
+                    return sparse_mla_kernel.sparse_attention_chunk(
+                        q,
+                        nope,
+                        rope,
+                        lengths,
+                        physical,
+                        None,
+                        start_pos=start,
+                        end_pos=start + 64,
+                        token_end=end,
+                        sm_scale=self.sm_scale,
+                        k_scale=1.0,
+                        preserve_suffix=True,
+                    )
+
+                q = jax.lax.cond(start < end, chunk, lambda q: q, q)
+            return q[..., : original.shape[-1]]
+
+        compiled = jax.jit(prefix, donate_argnums=(0,))
+        # Both DMA slots, every final-batch residue and the chunk boundary.
+        for end in (*range(81), 95, 96, 97, 111, 112, 113, 127, 128):
+            with self.subTest(end=end):
+                result = np.asarray(
+                    compiled(
+                        jnp.array(original),
+                        jnp.asarray(end, jnp.int32),
+                        *caches,
+                        kv_lens,
+                        indices,
+                    )
+                )
+                np.testing.assert_array_equal(result[:end], expected[:end])
+                np.testing.assert_array_equal(result[end:], original[end:])
 
 
 if __name__ == "__main__":

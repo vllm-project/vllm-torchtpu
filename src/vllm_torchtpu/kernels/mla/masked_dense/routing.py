@@ -240,10 +240,8 @@ def select_tier(
 def _sparse_prefix(q, split_token, run_chunk):
     """Sparse attention for query rows `[0, split_token)`, in place.
 
-    `run_chunk(q, start_pos, token_end)` runs one sparse chunk. Its attention
-    grid may overwrite up to `attention_kernel_batch_size - 1` rows at or after
-    `token_end` (see `sparse_attention_chunk`); those rows still hold suffix
-    queries for the masked-dense kernel, so they are saved and restored.
+    `run_chunk` must preserve rows at or after `token_end`: they still hold
+    queries for the masked-dense suffix.
 
     A split always leaves at least `MASKED_DENSE_MIN_SUFFIX_TOKENS` suffix
     rows, so chunks starting in that tail are not emitted. Earlier chunks are
@@ -251,9 +249,6 @@ def _sparse_prefix(q, split_token, run_chunk):
     """
     num_rows = q.shape[0]
     chunk_size = sparse_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE
-    window = min(sparse_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE - 1, num_rows)
-    first = jnp.minimum(split_token, num_rows - window)
-    saved = jax.lax.dynamic_slice_in_dim(q, first, window)
     for start_pos in range(0, num_rows - MASKED_DENSE_MIN_SUFFIX_TOKENS, chunk_size):
         q = jax.lax.cond(
             start_pos < split_token,
@@ -261,11 +256,7 @@ def _sparse_prefix(q, split_token, run_chunk):
             lambda x: x,
             q,
         )
-    written = jax.lax.dynamic_slice_in_dim(q, first, window)
-    suffix_rows = (first + jnp.arange(window)) >= split_token
-    return jax.lax.dynamic_update_slice_in_dim(
-        q, jnp.where(suffix_rows[:, None, None], saved, written), first, 0
-    )
+    return q
 
 
 def attention_from_parts(
@@ -314,7 +305,7 @@ def attention_from_parts(
         total_num_pages=kv_cache_nope.shape[0],
     )
 
-    def sparse_chunk(q, start_pos, token_end):
+    def sparse_chunk(q, start_pos, token_end, *, preserve_suffix=False):
         return sparse_kernel.sparse_attention_chunk(
             q,
             kv_cache_nope,
@@ -327,6 +318,7 @@ def attention_from_parts(
             token_end=token_end,
             sm_scale=sm_scale,
             k_scale=k_scale,
+            preserve_suffix=preserve_suffix,
         )
 
     def masked_dense(q, max_kv_len, sequence_start=None):
@@ -361,7 +353,11 @@ def attention_from_parts(
             return crop(masked_dense(query(), max_kv_len))
 
         def split(_):
-            q = _sparse_prefix(query(), query_start_loc[split_seq], sparse_chunk)
+            q = _sparse_prefix(
+                query(),
+                query_start_loc[split_seq],
+                functools.partial(sparse_chunk, preserve_suffix=True),
+            )
             return crop(masked_dense(q, max_kv_len, split_seq))
 
         return jax.lax.cond(split_seq > 0, split, whole, None)
