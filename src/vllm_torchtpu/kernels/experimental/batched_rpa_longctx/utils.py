@@ -55,8 +55,10 @@ def broadcast_minor(src, shape):
 def get_dtype_packing(dtype):
     return 32 // jax.dtypes.itemsize_bits(dtype)
 
+
 def get_dtype_bits(dtype):
     return jax.dtypes.itemsize_bits(dtype)
+
 
 def strided_load(ref, start_row, num_rows, step, *, dtype=None):
     """Loads data from HBM with strided access, handling 128-lane alignment."""

@@ -843,6 +843,7 @@ def rpa_metadata_schedule_kernel(
         schedule_ref: Scratch memory where schedule results gets written.
         dma_sem: Semaphore used for writing scheduler output to HBM.
         cfgs: Configuration of the kernel.
+        computer_cls: Metadata computer class to use for schedule generation.
     """
 
     # Step 1: Compute and fill scheduler metadata.

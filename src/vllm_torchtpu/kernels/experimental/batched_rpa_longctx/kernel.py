@@ -669,8 +669,7 @@ def rpa_kernel(
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
-            head_dim]. Result of new kv cache where k & vs are
-            concatenated along num kv heads dim.
+            head_dim]. Result of new kv cache.
         lse_out: [max_num_tokens, num_q_heads] LSE values, or None.
   """
     return_lse = cfgs.serve.return_lse
