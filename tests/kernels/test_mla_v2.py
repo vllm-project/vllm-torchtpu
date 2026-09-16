@@ -223,3 +223,89 @@ def test_batched_decode_matches_unbatched_decode() -> None:
         np.asarray(batched_cache),
         np.asarray(unbatched_cache),
     )
+
+
+def test_mixed_q_split_matches_unsplit_mixed_mode() -> None:
+    """Mixed prefill+decode with mixed_q_split > 1 must numerically match unsplit execution."""
+    num_q_heads = 12
+    num_decode = 2
+    num_prefill = 2
+    prefill_len = 64
+    num_seqs = num_decode + num_prefill
+    total_tokens = num_decode * 1 + num_prefill * prefill_len
+    lkv_dim = 512
+    r_dim = 64
+    padded_r_dim = 128
+    page_size = 16
+    packing = 2
+    pages_per_seq = (prefill_len + page_size - 1) // page_size
+
+    ql_nope = (
+        jnp.arange(num_q_heads * total_tokens * lkv_dim, dtype=jnp.int32) %
+        31).astype(jnp.bfloat16).reshape(num_q_heads, total_tokens, lkv_dim)
+    q_pe = (jnp.arange(total_tokens * num_q_heads * r_dim, dtype=jnp.int32) %
+            29).astype(jnp.bfloat16).reshape(total_tokens, num_q_heads, r_dim)
+    new_kv_c = (jnp.arange(total_tokens * lkv_dim, dtype=jnp.int32) %
+                23).astype(jnp.bfloat16).reshape(total_tokens, lkv_dim)
+    new_k_pe = (jnp.arange(total_tokens * r_dim, dtype=jnp.int32) % 19).astype(
+        jnp.bfloat16).reshape(total_tokens, r_dim)
+
+    cache_kv = jnp.zeros(
+        (
+            num_seqs * pages_per_seq,
+            page_size // packing,
+            packing,
+            lkv_dim + padded_r_dim,
+        ),
+        jnp.bfloat16,
+    )
+    seq_lens = jnp.array([16, 16, prefill_len, prefill_len], dtype=jnp.int32)
+    block_tables = jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32)
+    query_start_loc = jnp.array([0, 1, 2, 2 + prefill_len, total_tokens],
+                                dtype=jnp.int32)
+    request_distribution = jnp.array([num_decode, num_decode, num_seqs],
+                                     dtype=jnp.int32)
+
+    unsplit_out, unsplit_cache = mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv.copy(),
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        num_kv_pages_per_block=(1, 1, 1),
+        num_queries_per_block=(1, 16, 16),
+        mixed_q_split=1,
+    )
+    split_out, split_cache = mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv.copy(),
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        num_kv_pages_per_block=(1, 1, 1),
+        num_queries_per_block=(1, 16, 32),
+        mixed_q_split=2,
+    )
+    unsplit_out.block_until_ready()
+    split_out.block_until_ready()
+    unsplit_cache.block_until_ready()
+    split_cache.block_until_ready()
+
+    np.testing.assert_allclose(
+        np.asarray(split_out),
+        np.asarray(unsplit_out),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(split_cache),
+        np.asarray(unsplit_cache),
+    )

@@ -19,6 +19,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.mla import MLAModules
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend, PallasMLAttentionBackendImpl)
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
@@ -27,6 +28,101 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import \
     VllmFp8LinearMethodTPU
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+
+def test_mla_attention_interface_mixed_q_split(monkeypatch):
+    """Verify mla_attention passes MIXED_Q_SPLIT and MIXED_NUM_QUERIES_PER_BLOCK to mla_ragged_paged_attention."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.layers.core import attention_interface
+
+    assert "MIXED_Q_SPLIT" in TpuPlatform.additional_env_vars
+    assert "MIXED_NUM_QUERIES_PER_BLOCK" in TpuPlatform.additional_env_vars
+    assert "MIXED_NUM_KV_PAGES_PER_BLOCK" in TpuPlatform.additional_env_vars
+
+    num_tokens = 10
+    num_heads = 64
+    lkv_dim = 512
+    r_dim = 64
+    num_blocks = 16
+    page_size_per_packing = 256
+    kv_packing = 4
+
+    q = jnp.ones((num_tokens, num_heads, lkv_dim), dtype=jnp.bfloat16)
+    q_rope = jnp.ones((num_tokens, num_heads, r_dim), dtype=jnp.bfloat16)
+    k = jnp.ones((num_tokens, lkv_dim), dtype=jnp.bfloat16)
+    k_rope = jnp.ones((num_tokens, r_dim), dtype=jnp.bfloat16)
+    cache = jnp.zeros(
+        (num_blocks, page_size_per_packing, kv_packing, lkv_dim + 128),
+        dtype=jnp.float8_e4m3fn)
+
+    md = SimpleNamespace(
+        seq_lens=jnp.array([5, 5], dtype=jnp.int32),
+        block_tables=jnp.zeros((18, ), dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 5, 10], dtype=jnp.int32),
+        request_distribution=jnp.array([0, 0, 2], dtype=jnp.int32),
+    )
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model", ))
+
+    expected_kernel_out = jnp.full((num_heads, num_tokens, lkv_dim),
+                                   0.5,
+                                   dtype=jnp.bfloat16)
+    expected_new_cache = cache
+
+    mock_mla_kernel = MagicMock(return_value=(expected_kernel_out,
+                                              expected_new_cache))
+    monkeypatch.setattr(attention_interface, "mla_ragged_paged_attention",
+                        mock_mla_kernel)
+
+    # 1. Unset env vars (None): falls back to mixed_tuned from get_tuned_params
+    monkeypatch.setattr(envs, "MIXED_Q_SPLIT", None)
+    monkeypatch.setattr(envs, "MIXED_NUM_QUERIES_PER_BLOCK", None)
+    monkeypatch.setattr(envs, "MIXED_NUM_KV_PAGES_PER_BLOCK", None)
+    new_cache, out = attention_interface.mla_attention(
+        q_TNA=q,
+        q_rope_TNH=q_rope,
+        k_SA=k,
+        k_rope_SH=k_rope,
+        kv_cache=cache,
+        md=md,
+        mesh=mesh,
+        num_attention_heads=num_heads,
+        qk_nope_head_dim=lkv_dim,
+        sm_scale=0.1,
+    )
+    mock_mla_kernel.assert_called_once()
+    args, kwargs = mock_mla_kernel.call_args
+    assert args[0].shape == (num_heads, num_tokens, lkv_dim)
+    assert out.shape == (num_tokens, num_heads, lkv_dim)
+    assert kwargs["num_kv_pages_per_block"][1:] == (1, 1)
+    assert kwargs["num_queries_per_block"][1:] == (16, 16)
+    assert kwargs["mixed_q_split"] == 1
+    assert kwargs["sm_scale"] == 0.1
+
+    # 2. Overridden env vars (MIXED_Q_SPLIT=16, MIXED_NUM_QUERIES_PER_BLOCK=64, MIXED_NUM_KV_PAGES_PER_BLOCK=4): overrides mixed_tuned
+    mock_mla_kernel.reset_mock()
+    monkeypatch.setattr(envs, "MIXED_Q_SPLIT", 16)
+    monkeypatch.setattr(envs, "MIXED_NUM_QUERIES_PER_BLOCK", 64)
+    monkeypatch.setattr(envs, "MIXED_NUM_KV_PAGES_PER_BLOCK", 4)
+    attention_interface.mla_attention(
+        q_TNA=q,
+        q_rope_TNH=q_rope,
+        k_SA=k,
+        k_rope_SH=k_rope,
+        kv_cache=cache,
+        md=md,
+        mesh=mesh,
+        num_attention_heads=num_heads,
+        qk_nope_head_dim=lkv_dim,
+        sm_scale=0.1,
+    )
+    mock_mla_kernel.assert_called_once()
+    _, kwargs = mock_mla_kernel.call_args
+    assert kwargs["num_kv_pages_per_block"][1:] == (1, 4)
+    assert kwargs["num_queries_per_block"][1:] == (16, 64)
+    assert kwargs["mixed_q_split"] == 16
 
 
 def test_pallas_mla_attention_backend():

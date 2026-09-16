@@ -46,6 +46,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    MIXED_Q_SPLIT: int | None = None
+    MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
+    MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -499,6 +502,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    "MIXED_Q_SPLIT":
+    env_optional_int("MIXED_Q_SPLIT"),
+    "MIXED_NUM_QUERIES_PER_BLOCK":
+    env_optional_int("MIXED_NUM_QUERIES_PER_BLOCK"),
+    "MIXED_NUM_KV_PAGES_PER_BLOCK":
+    env_optional_int("MIXED_NUM_KV_PAGES_PER_BLOCK"),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.

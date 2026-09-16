@@ -37,15 +37,18 @@ ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
 the blockwise Pallas kernel path instead.
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
 from vllm.model_executor.layers.linear import (
-    LinearBase, register_weight_loader_v2_supported_method)
+    LinearBase, UnquantizedLinearMethod,
+    register_weight_loader_v2_supported_method)
 from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -71,11 +74,18 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
+from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
+    OnlineFp8Policy, map_online_fp8, quantize_online_fp8)
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (dequantize_tensor,
                                                     quantize_tensor)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 
 logger = init_logger(__name__)
 
@@ -622,7 +632,16 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             store_dtype=store_dtype,
         )
 
-    def get_quant_method(
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
+        super().apply_vllm_mapper(hf_to_vllm_mapper)
+        map_online_fp8(self, hf_to_vllm_mapper)
+
+    def get_quant_method(self, layer: torch.nn.Module,
+                         prefix: str) -> QuantizeMethodBase | None:
+        base_method = self._get_checkpoint_quant_method(layer, prefix)
+        return resolve_online_fp8(self, layer, prefix, base_method)
+
+    def _get_checkpoint_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
@@ -989,6 +1008,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Skip Fp8LinearMethod.__init__ which has GPU-specific code
         # (CUDA capability, Marlin, cutlass, W8A8BlockFp8LinearOp).
         # Set only the attributes that create_weights() reads.
+        self.prefix = prefix
+        self.online_fp8 = False
+        self.online_fp8_policy: OnlineFp8Policy | None = None
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
@@ -1006,12 +1028,20 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
 
-        self._linear_quant_config = _get_linear_quant_config(
-            self.linear_config)
+        if quant_config.is_checkpoint_fp8_serialized:
+            self._linear_quant_config = _get_linear_quant_config(
+                self.linear_config)
+        else:
+            # Load-time quantization has its own fixed per-channel contract.
+            self._linear_quant_config = ("float8_e4m3fn", torch.float8_e4m3fn,
+                                         None, False)
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
                        params_dtype, **extra_weight_attrs):
+        if self.online_fp8:
+            # Define the per-layer state before the post-load hook can run.
+            layer._tpu_online_fp8_processed = False
         if self.quant_config.is_checkpoint_fp8_serialized:
             Fp8LinearMethod.create_weights(self, layer,
                                            input_size_per_partition,
@@ -1062,6 +1092,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert dense linear checkpoint weights to runtime FP8."""
+        if self.online_fp8:
+            if layer._tpu_online_fp8_processed:
+                return
+            if layer.weight.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"Online FP8 requires BF16 checkpoint weights: "
+                    f"{self.prefix} has {layer.weight.dtype}")
         if self.quant_config.is_checkpoint_fp8_serialized:
             weight, weight_scale, requant_dtype_name, requant_block_size = (
                 _process_fp8_linear_weights(
@@ -1072,6 +1109,10 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     linear_config=self.linear_config,
                     linear_quant_config=self._linear_quant_config,
                 ))
+        elif self.online_fp8:
+            weight, weight_scale, requant_block_size = quantize_online_fp8(
+                layer.weight.data, self.online_fp8_policy)
+            requant_dtype_name = "fp8"
         else:
             # Respect configured TPU quantization settings (dtype, block size, kernel flags) on load.
             linear_quant_config = getattr(self, "_linear_quant_config", None)
@@ -1148,6 +1189,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if layer.weight.device.type == "tpu":
             synchronize_tensors([layer.weight, layer.weight_scale])
 
+        if self.online_fp8:
+            layer._tpu_online_fp8_processed = True
+
         scale_desc = ("per-channel" if requant_block_size is None else
                       str(requant_block_size))
         logger.info_once("FP8 linear weights requantized for runtime: "
@@ -1169,3 +1213,31 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+
+def resolve_online_fp8(
+    config: VllmFp8Config | VllmNvfp4Config,
+    layer: torch.nn.Module,
+    prefix: str,
+    base_method: QuantizeMethodBase | None,
+) -> QuantizeMethodBase | None:
+    policy = config.online_fp8_policy
+    if policy is None:
+        return base_method
+    selected, aliases = policy.select(prefix, config.packed_modules_mapping)
+    if not selected:
+        return base_method
+    if not isinstance(layer, LinearBase):
+        raise ValueError(
+            f"Online FP8 target is not a supported Linear: {prefix}")
+    if not isinstance(base_method, UnquantizedLinearMethod):
+        raise ValueError(f"Online FP8 target {prefix} already has checkpoint "
+                         f"method {type(base_method).__name__}")
+    online_config = VllmFp8Config(is_checkpoint_fp8_serialized=False,
+                                  activation_scheme="dynamic",
+                                  weight_block_size=None)
+    method = VllmFp8LinearMethodTPU(online_config, prefix=prefix)
+    method.online_fp8 = True
+    method.online_fp8_policy = policy
+    policy.selected[prefix] = aliases
+    return method
