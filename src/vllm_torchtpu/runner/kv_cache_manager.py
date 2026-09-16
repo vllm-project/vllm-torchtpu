@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec,
@@ -271,13 +272,59 @@ class KVCacheManager:
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        return normalize_kv_cache_specs_for_tpu(
+        kv_cache_spec = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
             exempt_layers=ds_v4_layers,
             attention_backend=backend_cls,
         )
+        if (hma_enabled and has_attention and not has_mamba
+                and not ds_v4_layers and not self.runner._unified_kv_layout):
+            kv_cache_spec = self._pad_native_attention_regions(
+                kv_cache_spec, backend_cls)
+        return kv_cache_spec
+
+    def _pad_native_attention_regions(
+        self,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        backend_cls: type[AttentionBackend],
+    ) -> dict[str, KVCacheSpec]:
+        # vLLM overlays groups in one byte allocation, but TPU attention
+        # kernels donate native typed arrays. Different geometries need
+        # separate arrays; identical geometries can share an array across
+        # groups because each block ID belongs to only one group at a time.
+        groups = get_kv_cache_groups(self.runner.vllm_config,
+                                     kv_cache_specs.copy())
+        if len(groups) <= 1:
+            return kv_cache_specs
+        native_pages = {}
+        for group in groups:
+            spec = group.kv_cache_spec
+            assert isinstance(spec, AttentionSpec), (
+                "Pure-attention HMA groups must have one attention spec", spec)
+            backend = (PallasMLAttentionBackend if isinstance(
+                spec, MLAAttentionSpec) else backend_cls)
+            shape = tuple(
+                backend.get_kv_cache_shape(1, spec.block_size,
+                                           spec.num_kv_heads, spec.head_size,
+                                           spec.dtype))
+            native_pages[shape,
+                         spec.dtype] = math.prod(shape) * spec.dtype.itemsize
+        if len(native_pages) <= 1:
+            return kv_cache_specs
+        # Each layer position can contain at most one array of each native
+        # geometry. Repeated groups with the same geometry add no HBM cost.
+        page_bytes = max(
+            sum(native_pages.values()),
+            max(spec.page_size_bytes for spec in kv_cache_specs.values()))
+        logger.info(
+            "Pure-attention HMA: budgeting %d native cache geometries per "
+            "layer region, %d bytes per block", len(native_pages), page_bytes)
+        return {
+            name: dataclasses.replace(spec, page_size_padded=page_bytes)
+            for name, spec in kv_cache_specs.items()
+        }
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -1172,27 +1219,36 @@ class KVCacheManager:
         # non-unified Mamba path instead budgets separate typed arrays in
         # _update_mamba_page_size_padded and must keep those allocations.
         share_attention_regions = not kv_cache_config.has_mamba_layers
-        attention_regions: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
+        attention_regions: dict[tuple[int, int],
+                                dict[tuple[tuple[tuple[int, ...], torch.dtype],
+                                           ...], tuple[torch.Tensor,
+                                                       ...]]] = {}
 
         def allocate_attention_region(
             region: tuple[int, int],
             geometry: list[tuple[tuple[int, ...], torch.dtype]],
         ) -> tuple[torch.Tensor, ...]:
-            if share_attention_regions and region in attention_regions:
-                caches = attention_regions[region]
-                actual = [(tuple(cache.shape), cache.dtype)
-                          for cache in caches]
-                if actual != geometry:
-                    raise NotImplementedError(
-                        "Aliased TPU attention layers require identical native "
-                        f"cache geometry: region={region}, expected={geometry}, "
-                        f"existing={actual}")
-                return caches
+            if share_attention_regions:
+                native_caches = attention_regions.setdefault(region, {})
+                key = tuple(geometry)
+                if key in native_caches:
+                    return native_caches[key]
+                allocated_bytes = sum(cache.nbytes
+                                      for caches in native_caches.values()
+                                      for cache in caches)
+                required_bytes = sum(
+                    math.prod(shape) * dtype.itemsize
+                    for shape, dtype in geometry)
+                budget = kv_cache_config.num_blocks * region[1]
+                assert allocated_bytes + required_bytes <= budget, (
+                    "Native TPU attention arrays exceed the padded region "
+                    f"budget: region={region}, allocated={allocated_bytes}, "
+                    f"required={required_bytes}, budget={budget}")
             caches = tuple(
                 torch.zeros(shape, dtype=dtype).to(self.runner.device)
                 for shape, dtype in geometry)
             if share_attention_regions:
-                attention_regions[region] = caches
+                native_caches[key] = caches
             return caches
 
         for kv_cache_tensor in ([] if _is_ds_v4 else

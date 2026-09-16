@@ -1028,8 +1028,8 @@ class TestKVCacheManager:
                 'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
                 return_value=False):
             if alias_head_size != 128:
-                with pytest.raises(NotImplementedError,
-                                   match="identical native cache geometry"):
+                with pytest.raises(AssertionError,
+                                   match="exceed the padded region budget"):
                     self.runner.initialize_kv_cache(config)
                 return
             self.runner.initialize_kv_cache(config)
@@ -1044,6 +1044,77 @@ class TestKVCacheManager:
         assert torch.all(caches["swa.0"][num_blocks - 1] == 7)
         assert torch.count_nonzero(caches["full.0"][:num_blocks - 1]) == 0
         assert torch.count_nonzero(caches["full.1"]) == 0
+
+    @pytest.mark.parametrize("sliding_heads, sliding_page_bytes", [
+        (4, 524288),
+        (8, 1048576),
+    ])
+    def test_gemma_hma_native_geometries_fit_scheduler_budget(
+            self, sliding_heads, sliding_page_bytes):
+        """Different native shapes need separate, fully budgeted TPU arrays."""
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_config_from_groups, get_kv_cache_groups)
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        self.runner.block_size = 256
+        self.runner.cache_config.block_size = 256
+        self.runner.cache_config.kv_cache_layout = "LBNHC"
+        self.runner.kv_cache_dtype = torch.float8_e4m3fn
+        self.runner.scheduler_config.disable_hybrid_kv_cache_manager = False
+        layers = {}
+        for prefix, count, heads, head_size, window in [
+            ("full", 2, 1, 512, None),
+            ("swa", 6, sliding_heads, 256, 1024),
+        ]:
+            for index in range(count):
+                layer = _attention_layer_mock()
+                layer.attn_type = AttentionType.DECODER
+                layer.num_kv_heads = heads
+                layer.head_size = head_size
+                layer.sliding_window = window
+                layer.kv_sharing_target_layer_name = None
+                layers[f"{prefix}.{index}"] = layer
+        with patch(
+                'vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config',
+                return_value=layers):
+            specs = self.runner.get_kv_cache_spec()
+        groups = get_kv_cache_groups(self.runner.vllm_config, specs)
+        assert len(groups) == 4
+        assert sum(
+            isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            for group in groups) == 3
+        num_blocks = 4
+        # Two layer regions, each storing one full and one sliding geometry.
+        # Three sliding groups must reuse the same two native arrays.
+        budget = num_blocks * 2 * (524288 + sliding_page_bytes)
+        config = get_kv_cache_config_from_groups(self.runner.vllm_config,
+                                                 groups, budget)
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.input_batch = SimpleNamespace(block_table=[
+            SimpleNamespace(max_num_blocks_per_req=4,
+                            get_cpu_tensor=lambda: self.runner.block_table_cpu)
+            for _ in groups
+        ])
+        with patch('vllm_torchtpu.utils.tpu_bind_kv_cache') as bind, patch(
+                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
+                return_value=False):
+            self.runner.initialize_kv_cache(config)
+        caches = bind.call_args.args[0]
+        unique = {id(cache): cache for cache in caches.values()}
+        assert config.num_blocks == num_blocks
+        assert len(unique) == 4
+        assert sum(cache.nbytes for cache in unique.values()) == budget
+        assert caches["full.0"].shape == (4, 256, 1, 4, 512)
+        assert caches["swa.0"].shape == (4, 256, sliding_heads // 2, 4, 256)
+        assert caches["full.0"] is not caches["swa.0"]
+        assert caches["swa.0"] is caches["swa.1"] is caches["swa.2"]
+        assert caches["swa.3"] is caches["swa.4"] is caches["swa.5"]
+        caches["swa.0"][-1].fill_(7)
+        assert torch.all(caches["swa.2"][-1].float() == 7)
+        assert torch.count_nonzero(caches["swa.0"][:-1].float()) == 0
+        assert torch.count_nonzero(caches["swa.3"].float()) == 0
+        assert torch.count_nonzero(caches["full.0"].float()) == 0
 
     def test_initialize_kv_cache_multi_group(self):
         """Multi-group initialize_kv_cache: verify the three new behaviors

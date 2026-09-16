@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
@@ -318,6 +319,39 @@ def test_model_load_stage_precedes_runner(monkeypatch):
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")))
     TPUWorker.load_model(worker)
     assert events == [("model_load", {"model_config": config}), "load"]
+
+
+@pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1),
+                                                              (False, 2)])
+def test_warmup_restores_runtime_threads_without_overriding_user_choice(
+        monkeypatch, managed_by_vllm, runtime_threads):
+    from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    if managed_by_vllm:
+        monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
+    else:
+        monkeypatch.delenv(OMP_NUM_THREADS_SET_BY_VLLM, raising=False)
+
+    warmup_threads = []
+
+    def capture_model():
+        warmup_threads.append(torch.get_num_threads())
+
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=capture_model),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(2)
+        result = TPUWorker.compile_or_warm_up_model(worker)
+        assert warmup_threads == [2]
+        assert torch.get_num_threads() == runtime_threads
+        assert result.language_model == worker.compilation_config.compilation_time
+        assert result.encoder == 0.0
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 def test_real_patch_entrypoints_in_spawned_processes():
