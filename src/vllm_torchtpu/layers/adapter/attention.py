@@ -151,7 +151,10 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
 
 def _reshape_packed_kv_cache(kv_cache: jax.Array,
                              shape: tuple[int, ...]) -> jax.Array:
-    # Keep packed bytes together so XLA can reinterpret the pool without a copy.
+    if kv_cache.shape[-2:] == shape[-2:]:
+        return kv_cache.reshape(shape)
+    # Changing head width must preserve the packed sublane axis; a plain
+    # reshape interleaves packed bytes and can require a full-pool copy.
     packed = kv_cache.transpose(3, 0, 1, 2, 4)
     packed_shape = (shape[3], *shape[:3], shape[4])
     return packed.reshape(packed_shape).transpose(1, 2, 3, 0, 4)
