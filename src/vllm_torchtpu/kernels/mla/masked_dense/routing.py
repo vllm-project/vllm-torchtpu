@@ -397,6 +397,14 @@ def groups_requests(
     """
     indexer = getattr(attn_module, "indexer", None)
     topk = getattr(indexer, "topk_tokens", getattr(attn_module, "topk_tokens", None))
+    if not isinstance(topk, int):
+        buf = getattr(
+            attn_module,
+            "topk_indices_buffer",
+            getattr(getattr(attn_module, "impl", None), "topk_indices_buffer", None),
+        )
+        if buf is not None and getattr(buf, "ndim", 0) >= 2:
+            topk = int(buf.shape[-1])
     return bool(
         decode_context_parallel_size == 1
         and all(

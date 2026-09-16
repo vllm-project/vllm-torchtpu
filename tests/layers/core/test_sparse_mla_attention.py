@@ -1508,6 +1508,15 @@ class MaskedDenseRequestGroupingTest(parameterized.TestCase):
     def test_glm52_layer_groups_requests(self):
         self.assertTrue(self._groups())
 
+    def test_glm52_shared_indexer_layer_groups_requests(self):
+        buf = mock.Mock(ndim=2, shape=(16, 2048))
+        self.assertTrue(self._groups(indexer=None, topk_indices_buffer=buf))
+        self.assertFalse(
+            self._groups(
+                indexer=None, topk_indices_buffer=mock.Mock(ndim=2, shape=(16, 1024))
+            )
+        )
+
     @parameterized.named_parameters(
         dict(testcase_name="heads", num_heads=16),
         dict(testcase_name="latent", kv_lora_rank=448),
