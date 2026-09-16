@@ -979,7 +979,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             self.kv_port = [int(p) + 2 * dp_rank * tp_size for p in port_base]
         else:
             self.kv_port = int(port_base) + 2 * dp_rank * tp_size
-        logger.info("~~~~~~~~TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
+        logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
 
     def on_new_request(self, request: "Request") -> None:
@@ -3717,8 +3717,7 @@ class TPURaidenConnectorWorker:
             self._stage3_finished_loads_pending_cleanup.intersection(
                 self._stage3_terminal_loads))
         for req_id in cleanup_req_ids:
-            if (not self.is_producer
-                    and req_id in self._load_block_ids
+            if (not self.is_producer and req_id in self._load_block_ids
                     and req_id not in self._reported_recving):
                 done_recving.add(req_id)
             source_req_id = self._stage3_source_req_ids.pop(req_id, None)
