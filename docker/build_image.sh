@@ -9,14 +9,13 @@ Builds the vllm-torchtpu image from the repository root as the docker context.
 
 Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
-  -b, --base-image IMAGE   Base image to build from
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev or ci (default: prod)
   -h, --help               Show this help and exit
 
 Examples:
   ./docker/build_image.sh
-  ./docker/build_image.sh -t my-vllm-image -b my-base-image
+  ./docker/build_image.sh -t my-vllm-image
   ./docker/build_image.sh -s /path/to/vllm/source
 
 The Dockerfile copies <repo>/vllm into the image. The script stages that
@@ -28,7 +27,6 @@ USAGE
 
 # Default values
 IMAGE_TAG="vllm-torchtpu-local"
-BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-20260915"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
@@ -38,10 +36,6 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -t|--image-tag)
       IMAGE_TAG="$2"
-      shift 2
-      ;;
-    -b|--base-image)
-      BASE_IMAGE="$2"
       shift 2
       ;;
     -s|--vllm-source)
@@ -70,7 +64,6 @@ done
 
 echo "===> Building vllm-torchtpu image..."
 echo "Image Tag: $IMAGE_TAG"
-echo "Base Image: $BASE_IMAGE"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -164,7 +157,6 @@ DOCKER_ARGS=(
   -f "${SCRIPT_DIR}/Dockerfile" \
   -t "${IMAGE_TAG}" \
   --target "${TARGET}" \
-  --build-arg BASE_IMAGE="${BASE_IMAGE}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
