@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -101,6 +102,84 @@ def _warn_if_kv_cache_is_padded(
         "multiple of 128, lowering tensor parallelism (more KV heads per rank) "
         "or enabling attention data parallelism avoids it.", actual / unpadded,
         num_kv_heads, head_size, dtype, backend.get_name())
+
+
+def shared_kv_tensor_num_blocks(
+    tensor_size: int,
+    specs: Sequence[KVCacheSpec],
+    attention_backend: type | None,
+    expected_num_blocks: int,
+) -> int:
+    """Block count of the per-layer tensors carved out of one shared KV tensor.
+
+    vLLM sizes a tensor shared by several layers as
+    ``num_blocks x page_size_padded`` and addresses it with block ids below
+    ``expected_num_blocks``. The runner allocates one tensor per layer out of
+    that budget, so the count is the budget divided by the TPU-actual page
+    sizes of the sharing layers.
+
+    For a tensor that holds Mamba layers, the attention page is the one the
+    serving backend lays out (``PallasMLAttentionBackend`` for an
+    ``MLAAttentionSpec``, ``attention_backend`` otherwise) and the Mamba page
+    is vLLM's unpadded one. The result is capped at ``expected_num_blocks``,
+    since vLLM never uses a higher block id, and a result below it raises,
+    since those block ids would read and write out of bounds.
+
+    A tensor shared only by attention layers keeps the RPA page formula for
+    every layer and returns the divided count unchanged; a count below
+    ``expected_num_blocks`` is logged as a warning.
+    """
+    has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
+    per_block = 0
+    for spec in specs:
+        if isinstance(spec, MambaSpec):
+            per_block += dataclasses.replace(
+                spec, page_size_padded=None).page_size_bytes
+        elif isinstance(spec, AttentionSpec):
+            if not has_mamba:
+                backend = PallasAttentionBackend
+            elif isinstance(spec, MLAAttentionSpec):
+                backend = PallasMLAttentionBackend
+            elif attention_backend is not None:
+                backend = attention_backend
+            else:
+                raise ValueError(
+                    "no attention backend for a shared KV tensor with an "
+                    f"attention layer ({type(spec).__name__})")
+            per_block += backend.get_kv_cache_page_size_bytes(
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+            )
+        else:
+            raise NotImplementedError(
+                f"Unsupported KV cache spec in a shared tensor: {type(spec)!r}"
+            )
+    num_blocks = tensor_size // per_block
+    backend_name = getattr(attention_backend, "__name__", None)
+    if num_blocks == expected_num_blocks:
+        return num_blocks
+    if not has_mamba:
+        if num_blocks < expected_num_blocks:
+            logger.warning(
+                "[kv-alloc] attention-only shared KV tensor: size=%d B, "
+                "per-block=%d B -> %d blocks per layer, vLLM num_blocks=%d "
+                "(backend %s)", tensor_size, per_block, num_blocks,
+                expected_num_blocks, backend_name)
+        return num_blocks
+    if num_blocks < expected_num_blocks:
+        raise ValueError(
+            f"[kv-alloc] a shared KV tensor of {tensor_size} B holds "
+            f"{num_blocks} blocks at {per_block} B per block, but vLLM will "
+            f"hand out {expected_num_blocks} block ids; the ids past the "
+            f"tensor would read and write out of bounds (backend "
+            f"{backend_name}).")
+    logger.info(
+        "[kv-alloc] shared KV tensor: size=%d B, per-block=%d B -> %d blocks, "
+        "capped at vLLM num_blocks=%d", tensor_size, per_block, num_blocks,
+        expected_num_blocks)
+    return expected_num_blocks
 
 
 class KVCacheManager:
@@ -1228,31 +1307,12 @@ class KVCacheManager:
             tensor_size = kv_cache_tensor.size
             shared_by = kv_cache_tensor.shared_by
             if len(shared_by) > 1:
-                total_group_page_size = 0
-                for name in shared_by:
-                    spec = layer_name_to_spec[name]
-                    # Use the per-layer *TPU-actual* per-block bytes so the
-                    # sum equals the `page_size_padded` that
-                    # `update_mamba_page_size_padded` installed on every
-                    # spec (== attn_page + N × mamba_unpadded). For
-                    # attention, the TPU-actual size includes dtype-
-                    # specific packing (e.g., fp8 KV packs 4 elements per
-                    # 32-bit word) which `spec.real_page_size_bytes`
-                    # doesn't account for — on fp8 models they differ by
-                    # 2×, which would break the num_blocks match here.
-                    if isinstance(spec, MambaSpec):
-                        total_group_page_size += dataclasses.replace(
-                            spec, page_size_padded=None).page_size_bytes
-                    elif isinstance(spec, AttentionSpec):
-                        total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                            spec.block_size,
-                            spec.num_kv_heads,
-                            spec.head_size,
-                            spec.dtype,
-                        )
-                    else:
-                        raise NotImplementedError
-                num_blocks = tensor_size // total_group_page_size
+                num_blocks = shared_kv_tensor_num_blocks(
+                    tensor_size,
+                    [layer_name_to_spec[name] for name in shared_by],
+                    TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+                    kv_cache_config.num_blocks,
+                )
             else:
                 num_blocks = kv_cache_config.num_blocks
 

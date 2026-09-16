@@ -354,6 +354,75 @@ class TestKVCacheManager:
         assert isinstance(created_caches["attn.0"], torch.Tensor)
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
 
+    @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
+    @patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
+           return_value=False)
+    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
+    def test_initialize_kv_cache_mla_and_mamba_shared_tensor(
+            self, mock_input_batch, mock_has_kv_transfer, mock_bind_kv_cache):
+        """An MLA attention layer sharing a tensor with three KDA layers gets
+        one page per vLLM block id: the tensor is sized with the MLA page
+        (256 x 640 B), not the RPA layout of the same spec."""
+        num_blocks = 300
+        mamba_num_blocks = 17
+        mla_page = 256 * 640
+        kda_slot = 280_576
+        uniform_size = mla_page + 3 * kda_slot
+        tensor_size = uniform_size * num_blocks
+
+        attn_spec = MLAAttentionSpec(block_size=256,
+                                     num_kv_heads=1,
+                                     head_size=576,
+                                     dtype=torch.float8_e4m3fn,
+                                     page_size_padded=uniform_size)
+        mamba_spec = MambaSpec(block_size=256,
+                               shapes=[(3, 3, 4, 128), (4, 128, 128)],
+                               dtypes=[torch.float32, torch.float32],
+                               page_size_padded=uniform_size)
+        layer_names = ["attn.0", "mamba.0", "mamba.1", "mamba.2"]
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
+            KVCacheGroupSpec(layer_names=["mamba.0"],
+                             kv_cache_spec=mamba_spec),
+            KVCacheGroupSpec(layer_names=["mamba.1"],
+                             kv_cache_spec=mamba_spec),
+            KVCacheGroupSpec(layer_names=["mamba.2"],
+                             kv_cache_spec=mamba_spec),
+        ]
+        kv_cache_config = KVCacheConfig(num_blocks=num_blocks,
+                                        kv_cache_tensors=[
+                                            KVCacheTensor(
+                                                size=tensor_size,
+                                                shared_by=layer_names)
+                                        ],
+                                        kv_cache_groups=kv_cache_groups)
+
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        mock_block_tables = []
+        for _ in kv_cache_groups:
+            mock_bt = MagicMock()
+            mock_bt.max_num_blocks_per_req = 1
+            mock_bt.get_cpu_tensor.return_value = torch.zeros(
+                (1, 1), dtype=torch.int32)
+            mock_block_tables.append(mock_bt)
+        mock_input_batch.return_value.block_table = mock_block_tables
+        self.runner.input_batch = mock_input_batch.return_value
+        self.runner.kv_caches = []
+        self.runner._mamba_num_blocks = mamba_num_blocks
+        self.runner.initialize_kv_cache(kv_cache_config)
+
+        created_caches = mock_bind_kv_cache.call_args[0][0]
+        attn_cache = created_caches["attn.0"]
+        assert attn_cache.shape[0] == num_blocks
+        assert attn_cache.numel() * attn_cache.element_size() == (num_blocks *
+                                                                  mla_page)
+        for name in ["mamba.0", "mamba.1", "mamba.2"]:
+            assert created_caches[name][0].shape == (mamba_num_blocks, 3, 3, 4,
+                                                     128)
+            assert created_caches[name][1].shape == (mamba_num_blocks, 4, 128,
+                                                     128)
+
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
