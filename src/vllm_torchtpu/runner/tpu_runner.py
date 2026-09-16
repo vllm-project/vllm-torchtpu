@@ -1672,8 +1672,11 @@ class TPUModelRunner(GPUModelRunner):
         self._pending_mamba_state_copies.clear()
 
     def _prepare_async_token_substitution_indices(
-        self, start_index: int, num_reqs: int,
-        num_scheduled_tokens_per_req: np.ndarray
+        self,
+        start_index: int,
+        num_reqs: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+        scheduler_output=None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if self._pre_async_results is None:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -1682,6 +1685,8 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
         layout_plan = self._last_sequence_layout_plan
+        sched_flags = getattr(scheduler_output, "scheduled_spec_decode_flags",
+                              None) if scheduler_output is not None else None
 
         # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
         # starts at `position * stride`.
@@ -1699,12 +1704,21 @@ class TPUModelRunner(GPUModelRunner):
             if req_id not in self._pre_async_results.req_id_to_index_copy:
                 continue
 
+            req_flags = sched_flags.get(req_id) if sched_flags else None
             # Map this request's last `n_sched` input slots to its source span
             # `[position*stride .. +n_sched-1]`. Non-spec (stride 1, n_sched 1)
             # reduces to the original single-slot mapping.
             src_start = (self._pre_async_results.req_id_to_index_copy[req_id] *
                          stride)
             for j in range(n_sched):
+                # When GaaD grammar jump top-up (flag == 2) or empty padding
+                # (flag == 0) is present on host, do not overwrite input_ids[j]
+                # with stale unvalidated device draft tokens from next_tokens_tpu.
+                if j >= 1 and req_flags is not None:
+                    draft_idx = j - 1
+                    if draft_idx < len(
+                            req_flags) and req_flags[draft_idx] != 1:
+                        continue
                 request_major_index = acc_cur_len - n_sched + j
                 if layout_plan is None:
                     cur_input_index = request_major_index
@@ -2335,8 +2349,12 @@ class TPUModelRunner(GPUModelRunner):
                                         dtype=np.int32)
             if num_draft_tokens.any():
                 spec_decode_metadata = self.spec_decode_manager.get_spec_decode_metadata(
-                    num_draft_tokens, self.query_start_loc_np[1:num_reqs + 1],
-                    padded_num_reqs)
+                    num_draft_tokens,
+                    self.query_start_loc_np[1:num_reqs + 1],
+                    padded_num_reqs,
+                    scheduled_spec_decode_flags=getattr(
+                        scheduler_output, "scheduled_spec_decode_flags", None),
+                )
 
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
@@ -2475,7 +2493,11 @@ class TPUModelRunner(GPUModelRunner):
 
         # Prepare token substitution indices
         cur_input_indices, pre_next_tokens_indices = self._prepare_async_token_substitution_indices(
-            start_index, num_reqs, num_scheduled_tokens_per_req)
+            start_index,
+            num_reqs,
+            num_scheduled_tokens_per_req,
+            scheduler_output=scheduler_output,
+        )
 
         self._collect_mamba_state_seed_copies(scheduler_output, start_index,
                                               num_reqs)

@@ -271,14 +271,73 @@ def _topup_draft_token_ids(scheduler: Any,
                                     len(spec_tokens) + max(0, remaining))
 
         validated_draft = grammar.validate_tokens(list(spec_tokens))
-        topup = propose_jump_topup(grammar, tokenizer, validated_draft,
-                                   effective_spec_tokens, _STATS)
+        topup, topup_flags = propose_jump_topup_with_flags(
+            grammar, tokenizer, validated_draft, effective_spec_tokens, _STATS)
         if topup:
-            spec_tokens.extend(topup)
+            spec_tokens[:] = validated_draft + topup
+
+
+def _topup_scheduled_spec_decode_tokens(scheduler: Any,
+                                        scheduler_output: Any) -> None:
+    """Tops up validated async speculative draft tokens in scheduler_output and populates draft flags."""
+    if scheduler_output is None:
+        return
+    sched_spec = getattr(scheduler_output, "scheduled_spec_decode_tokens",
+                         None)
+    if not sched_spec:
+        return
+    manager = getattr(scheduler, "structured_output_manager", None)
+    tokenizer = getattr(manager, "tokenizer", None) if manager else None
+
+    if getattr(scheduler_output, "scheduled_spec_decode_flags", None) is None:
+        scheduler_output.scheduled_spec_decode_flags = {}
+    sched_flags = scheduler_output.scheduled_spec_decode_flags
+    num_invalid_map = getattr(scheduler_output, "num_invalid_spec_tokens",
+                              None)
+    if num_invalid_map is None:
+        num_invalid_map = {}
+        scheduler_output.num_invalid_spec_tokens = num_invalid_map
+
+    for req_id, spec_tokens in sched_spec.items():
+        orig_budget = len(spec_tokens)
+        num_invalid = num_invalid_map.get(req_id, 0)
+        valid_len = max(0, orig_budget - num_invalid)
+        validated_draft = list(spec_tokens[:valid_len])
+
+        topup: list[int] = []
+        topup_flags: list[int] = []
+        request = scheduler.requests.get(req_id) if hasattr(
+            scheduler, "requests") else None
+        if (request is not None and not request.is_finished()
+                and not getattr(request, "is_prefill_chunk", False)
+                and tokenizer is not None):
+            can_advance = (not hasattr(manager, "should_advance")
+                           or manager.should_advance(request))
+            structured_req = getattr(request, "structured_output_request",
+                                     None)
+            grammar = getattr(structured_req, "grammar",
+                              None) if structured_req else None
+            if can_advance and grammar is not None:
+                remaining = request.max_tokens - len(
+                    request.output_token_ids) - 1
+                effective_spec_tokens = min(orig_budget,
+                                            valid_len + max(0, remaining))
+                topup, topup_flags = propose_jump_topup_with_flags(
+                    grammar, tokenizer, validated_draft, effective_spec_tokens,
+                    _STATS)
+
+        num_jump = len(topup)
+        new_num_invalid = max(0, orig_budget - valid_len - num_jump)
+        if num_jump > 0:
+            spec_tokens[:] = (validated_draft + topup + [-1] * new_num_invalid)
+            num_invalid_map[req_id] = new_num_invalid
+
+        sched_flags[req_id] = ([DRAFT_FLAG_MODEL] * valid_len + topup_flags +
+                               [DRAFT_FLAG_EMPTY] * new_num_invalid)
 
 
 def _topup_running_requests(scheduler: Any) -> None:
-    """Fills each structured request's unused speculative slots."""
+    """Fills each structured request's unused speculative slots and records flags."""
     num_spec_tokens = getattr(scheduler, "num_spec_tokens", 0)
     if num_spec_tokens <= 0:
         return
@@ -306,31 +365,36 @@ def _topup_running_requests(scheduler: Any) -> None:
         if grammar is None:
             continue
 
-        draft = request.spec_token_ids
-        # Never speculate past the request's own output allowance; the bonus
-        # token of this step consumes one of the remaining slots.
+        draft = list(request.spec_token_ids)
         remaining = request.max_tokens - len(request.output_token_ids) - 1
         effective_spec_tokens = min(num_spec_tokens,
                                     len(draft) + max(0, remaining))
-        topup = propose_jump_topup(grammar, tokenizer, draft,
-                                   effective_spec_tokens, _STATS)
+        topup, topup_flags = propose_jump_topup_with_flags(
+            grammar, tokenizer, draft, effective_spec_tokens, _STATS)
         if topup:
             request.spec_token_ids = draft + topup
+            request.spec_token_flags = ([DRAFT_FLAG_MODEL] * len(draft) +
+                                        topup_flags)
+        else:
+            request.spec_token_flags = [DRAFT_FLAG_MODEL] * len(draft)
 
     if _STATS.calls and (_STATS.calls % 10 == 0 or _STATS.hits > 0):
         logger.info("TPU grammar jump decoding: %s", _STATS.summary())
 
 
 def _patch_vllm_grammar_jump_decoding() -> None:
-    """Wraps ``Scheduler.update_draft_token_ids`` and ``Scheduler.update_draft_token_ids_in_output``
-
-    with the grammar jump draft top-up.
+    """Wraps ``Scheduler.update_draft_token_ids``, ``Scheduler.update_draft_token_ids_in_output``,
+    and ``Scheduler.schedule`` with the grammar jump draft top-up and flag propagation.
     """
     from vllm_torchtpu import envs
     if not envs.VLLM_TPU_JUMP_DECODING:
         return
 
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.sched.scheduler import Scheduler
+
+    if not hasattr(SchedulerOutput, "scheduled_spec_decode_flags"):
+        SchedulerOutput.scheduled_spec_decode_flags = None
 
     if getattr(Scheduler, "_tpu_grammar_jump_patched", False):
         return
@@ -345,21 +409,47 @@ def _patch_vllm_grammar_jump_decoding() -> None:
     original_update_in_output = getattr(Scheduler,
                                         "update_draft_token_ids_in_output",
                                         None)
+    original_schedule = getattr(Scheduler, "schedule", None)
 
-    def update_draft_token_ids(self, draft_token_ids) -> None:
-        _topup_draft_token_ids(self, draft_token_ids)
-        original_update(self, draft_token_ids)
+    def update_draft_token_ids(self, draft_token_ids, *args, **kwargs) -> None:
+        original_update(self, draft_token_ids, *args, **kwargs)
         _topup_running_requests(self)
 
     def update_draft_token_ids_in_output(self, draft_token_ids,
-                                         scheduler_output) -> None:
-        _topup_draft_token_ids(self, draft_token_ids, scheduler_output)
+                                         scheduler_output, *args,
+                                         **kwargs) -> None:
         if original_update_in_output is not None:
-            original_update_in_output(self, draft_token_ids, scheduler_output)
+            original_update_in_output(self, draft_token_ids, scheduler_output,
+                                      *args, **kwargs)
+        _topup_scheduled_spec_decode_tokens(self, scheduler_output)
+
+    def schedule(self, *args, **kwargs):
+        req_flags = {}
+        for r in getattr(self, "running", ()):
+            flags = getattr(r, "spec_token_flags", None)
+            if flags:
+                req_flags[r.request_id] = list(flags)
+                r.spec_token_flags = None
+        out = original_schedule(self, *args, **kwargs)
+        if req_flags and hasattr(out, "scheduled_spec_decode_tokens"):
+            sched_flags = {}
+            for req_id, spec_tokens in out.scheduled_spec_decode_tokens.items(
+            ):
+                if req_id in req_flags:
+                    f = req_flags[req_id][:len(spec_tokens)]
+                    if len(f) < len(spec_tokens):
+                        f.extend([DRAFT_FLAG_MODEL] *
+                                 (len(spec_tokens) - len(f)))
+                    sched_flags[req_id] = f
+            if sched_flags:
+                out.scheduled_spec_decode_flags = sched_flags
+        return out
 
     Scheduler.update_draft_token_ids = update_draft_token_ids
     if original_update_in_output is not None:
         Scheduler.update_draft_token_ids_in_output = update_draft_token_ids_in_output
+    if original_schedule is not None:
+        Scheduler.schedule = schedule
 
     Scheduler._tpu_grammar_jump_patched = True
     logger.info("Applied TPU patch: grammar jump decoding draft top-up.")
