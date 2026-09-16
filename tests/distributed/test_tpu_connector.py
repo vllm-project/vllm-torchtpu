@@ -26,7 +26,8 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
-    TpuKVConnectorPromMetrics, TpuKVConnectorStats)
+    DEFAULT_LABEL_VALUE, METRIC_TYPE_COUNTER, METRIC_TYPE_GAUGE,
+    METRIC_TYPE_HISTOGRAM, TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
@@ -4219,6 +4220,184 @@ class TestTPUConnectorStats(unittest.TestCase):
         stats = TPUConnectorWorker.get_kv_connector_stats(worker)
         assert stats is not None
         assert stats.data["prefill_queue_length"] == [1]
+
+    def test_tpu_connector_stats_constants(self):
+        assert METRIC_TYPE_HISTOGRAM == "histogram"
+        assert METRIC_TYPE_COUNTER == "counter"
+        assert METRIC_TYPE_GAUGE == "gauge"
+        assert DEFAULT_LABEL_VALUE == ""
+
+    def test_dynamic_metrics_registration_and_observation(self):
+        mock_telemetry = MagicMock()
+        mock_desc = MagicMock()
+        mock_desc.name = "dma_latency_ms"
+        mock_desc.help = "DMA latency"
+        mock_desc.type = "histogram"
+        mock_desc.buckets = [1.0, 10.0, 100.0]
+        mock_desc.label_names = []
+        mock_telemetry.get_metric_metadata.return_value = [mock_desc]
+
+        with patch(
+                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+                return_value=mock_telemetry
+        ), patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"):
+            registry = CollectorRegistry()
+            metric_types = {
+                Gauge: partial(Gauge, registry=registry),
+                Counter: partial(Counter, registry=registry),
+                Histogram: partial(Histogram, registry=registry),
+            }
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+
+            assert "tpu_raiden_dma_latency_ms" in metrics.dynamic_metrics
+
+            mock_data = {
+                "tpu_raiden_dma_latency_ms": [5.0, 15.0],
+            }
+            metrics.observe(mock_data, engine_idx=0)
+
+            mtype, per_engine_obj, label_names = metrics.dynamic_metrics[
+                "tpu_raiden_dma_latency_ms"]
+            hist = per_engine_obj[0]
+            assert hist._sum.get() == 20.0
+
+    def test_multi_dimensional_labeled_metrics_registration_and_observation(
+            self):
+        mock_telemetry = MagicMock()
+        mock_desc1 = MagicMock()
+        mock_desc1.name = "sent_bytes_total"
+        mock_desc1.help = "Sent bytes"
+        mock_desc1.type = "counter"
+        mock_desc1.label_names = ["direction"]
+
+        mock_desc2 = MagicMock()
+        mock_desc2.name = "transfer_duration_ms"
+        mock_desc2.help = "Transfer duration"
+        mock_desc2.type = "histogram"
+        mock_desc2.buckets = [1.0, 10.0, 100.0]
+        mock_desc2.label_names = ["direction", "mode"]
+
+        mock_desc3 = MagicMock()
+        mock_desc3.name = "buffer_allocated_bytes"
+        mock_desc3.help = "Allocated buffer bytes"
+        mock_desc3.type = "gauge"
+        mock_desc3.label_names = ["buffer_type"]
+
+        mock_telemetry.get_metric_metadata.return_value = [
+            mock_desc1, mock_desc2, mock_desc3
+        ]
+
+        with patch(
+                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+                return_value=mock_telemetry
+        ), patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"):
+            registry = CollectorRegistry()
+            metric_types = {
+                Gauge: partial(Gauge, registry=registry),
+                Counter: partial(Counter, registry=registry),
+                Histogram: partial(Histogram, registry=registry),
+            }
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+
+            assert "tpu_raiden_sent_bytes_total" in metrics.dynamic_metrics
+            assert "tpu_raiden_transfer_duration_ms" in metrics.dynamic_metrics
+            assert "tpu_raiden_buffer_allocated_bytes" in metrics.dynamic_metrics
+
+            mock_data = {
+                'tpu_raiden_sent_bytes_total{direction="push"}': [1024.0],
+                'tpu_raiden_sent_bytes_total{direction="pull"}': [512.0],
+                'tpu_raiden_transfer_duration_ms{direction="pull",mode="direct"}':
+                [15.5],
+                'tpu_raiden_buffer_allocated_bytes{buffer_type="host_dram"}':
+                [4096.0],
+            }
+            metrics.observe(mock_data, engine_idx=0)
+
+            counter_obj = metrics.dynamic_metrics[
+                "tpu_raiden_sent_bytes_total"][1]
+            push_counter = counter_obj.labels(model_name="my_model",
+                                              engine="0",
+                                              direction="push")
+            pull_counter = counter_obj.labels(model_name="my_model",
+                                              engine="0",
+                                              direction="pull")
+            assert push_counter._value.get() == 1024.0
+            assert pull_counter._value.get() == 512.0
+
+            hist_obj = metrics.dynamic_metrics[
+                "tpu_raiden_transfer_duration_ms"][1]
+            pull_direct_hist = hist_obj.labels(model_name="my_model",
+                                               engine="0",
+                                               direction="pull",
+                                               mode="direct")
+            assert pull_direct_hist._sum.get() == 15.5
+
+            gauge_obj = metrics.dynamic_metrics[
+                "tpu_raiden_buffer_allocated_bytes"][1]
+            host_gauge = gauge_obj.labels(model_name="my_model",
+                                          engine="0",
+                                          buffer_type="host_dram")
+            assert host_gauge._value.get() == 4096.0
+
+            # Test observation with extra unexpected labels (safely ignored)
+            mock_data_extra = {
+                'tpu_raiden_sent_bytes_total{direction="push",unexpected="ignore"}':
+                [100.0],
+            }
+            metrics.observe(mock_data_extra, engine_idx=0)
+            assert push_counter._value.get() == 1124.0
+
+    def test_get_raiden_metric_definitions_with_none_labelnames(self):
+        mock_telemetry = MagicMock()
+        mock_desc1 = MagicMock()
+        mock_desc1.name = "unlabeled_metric"
+        mock_desc1.help = "Unlabeled metric"
+        mock_desc1.type = "counter"
+        mock_desc1.label_names = None
+
+        mock_desc2 = MagicMock()
+        mock_desc2.name = "labeled_metric"
+        mock_desc2.help = "Labeled metric"
+        mock_desc2.type = "gauge"
+        mock_desc2.label_names = ["dim"]
+
+        mock_desc3 = MagicMock()
+        mock_desc3.name = "hist_metric"
+        mock_desc3.help = "Hist metric"
+        mock_desc3.type = "histogram"
+        mock_desc3.buckets = [1.0, 10.0]
+        mock_desc3.label_names = None
+
+        mock_telemetry.get_metric_metadata.return_value = [
+            mock_desc1, mock_desc2, mock_desc3
+        ]
+
+        with patch(
+                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+                return_value=mock_telemetry
+        ), patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"):
+            self.metrics.labelnames = None
+            self.metrics._labelnames = None
+
+            defs = self.metrics._get_raiden_metric_definitions(labelnames=None)
+            assert "tpu_raiden_unlabeled_metric" in defs
+            assert "tpu_raiden_labeled_metric" in defs
+            assert "tpu_raiden_hist_metric" in defs
+            assert isinstance(defs["tpu_raiden_unlabeled_metric"][1], dict)
+            assert 0 in defs["tpu_raiden_unlabeled_metric"][1]
+            assert defs["tpu_raiden_unlabeled_metric"][2] == []
+            assert defs["tpu_raiden_labeled_metric"][2] == ["dim"]
+            assert defs["tpu_raiden_hist_metric"][2] == []
 
 
 # ---------------------------------------------------------------------------
