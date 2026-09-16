@@ -115,6 +115,26 @@ markers = [
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
 ]
 
+[tool.ruff.lint]
+# E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
+# I import sorting. Line length (E501) is in E5 and is not selected.
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# isort and yapf still own these paths. The same list appears in `exclude`
+# under [tool.ruff.format] and in the isort and yapf excludes in
+# .pre-commit-config.yaml; all three move together, otherwise two tools format the
+# same file.
+"scripts/**" = ["I"]
+"src/**" = ["I"]
+"tests/**" = ["I"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
+exclude = ["scripts/**", "src/**", "tests/**"]
+
 [tool.pyrefly]
 project-includes = ["src"]
 
