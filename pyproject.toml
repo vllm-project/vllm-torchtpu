@@ -115,6 +115,12 @@ markers = [
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
 ]
 
+[tool.ruff]
+# Without this, ruff ignores its `exclude` lists for any path named directly
+# on the command line, which is exactly how pre-commit invokes it. Setting it
+# makes `exclude` hold for both `ruff format .` and the hook.
+force-exclude = true
+
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
 # I import sorting. Line length (E501) is in E5 and is not selected.
