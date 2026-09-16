@@ -13,16 +13,28 @@
 # limitations under the License.
 """Load-time configurable FP8 for selected unquantized TPU Linear layers."""
 
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
-from vllm.model_executor.layers.linear import (LinearBase,
-                                               UnquantizedLinearMethod)
+from vllm.config import VllmConfig
+from vllm.model_executor.layers.quantization.base_config import \
+    QuantizationConfig
 
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.layers.core.quantization import (_safe_inverse_scale,
+                                                    quantize_tensor)
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
+
+QuantConfigT = TypeVar("QuantConfigT", bound=QuantizationConfig | None)
 
 logger = init_logger(__name__)
 
@@ -37,7 +49,7 @@ class OnlineFp8Policy:
     selected: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, value):
+    def from_dict(cls, value: dict[str, Any] | None) -> OnlineFp8Policy | None:
         if value is None:
             return None
         if not isinstance(value, dict):
@@ -83,11 +95,12 @@ class OnlineFp8Policy:
         return cls(list(dict.fromkeys(targets)), list(dict.fromkeys(exclude)),
                    scheme, block)
 
-    def apply_mapper(self, mapper):
+    def apply_mapper(self, mapper: WeightsMapper) -> None:
         self.targets = mapper.apply_list(self.targets)
         self.exclude = mapper.apply_list(self.exclude)
 
-    def select(self, prefix, packed_mapping):
+    def select(self, prefix: str,
+               packed_mapping: dict[str, list[str]]) -> tuple[bool, list[str]]:
         parent, _, leaf = prefix.rpartition(".")
         aliases = [
             f"{parent}.{part}" if parent else part
@@ -111,52 +124,32 @@ class OnlineFp8Policy:
         return all(choices), aliases
 
 
-def attach_online_fp8(config, vllm_config):
+def attach_online_fp8(config: QuantConfigT,
+                      vllm_config: VllmConfig) -> QuantConfigT:
     """Keep the checkpoint config intact; attach independent per-model state."""
     policy = OnlineFp8Policy.from_dict(
         vllm_config.additional_config.get("tpu_online_fp8"))
     if policy is not None:
-        if config.get_name() not in ("fp8", "modelopt_fp4"):
+        if (not isinstance(config, VllmQuantConfig)
+                or config.get_name() not in ("fp8", "modelopt_fp4")):
             raise ValueError("tpu_online_fp8 supports FP8 and ModelOpt NVFP4 "
                              "checkpoint configurations")
         config.online_fp8_policy = policy
     return config
 
 
-def map_online_fp8(config, mapper):
-    policy = getattr(config, "online_fp8_policy", None)
+def map_online_fp8(config: VllmQuantConfig, mapper: WeightsMapper) -> None:
+    policy = config.online_fp8_policy
     if policy is not None:
         policy.apply_mapper(mapper)
 
 
-def resolve_online_fp8(config, layer, prefix, base_method):
-    policy = getattr(config, "online_fp8_policy", None)
-    if policy is None:
-        return base_method
-    selected, aliases = policy.select(prefix, config.packed_modules_mapping)
-    if not selected:
-        return base_method
-    if not isinstance(layer, LinearBase):
-        raise ValueError(
-            f"Online FP8 target is not a supported Linear: {prefix}")
-    if not isinstance(base_method, UnquantizedLinearMethod):
-        raise ValueError(f"Online FP8 target {prefix} already has checkpoint "
-                         f"method {type(base_method).__name__}")
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-        VllmFp8Config, VllmFp8LinearMethodTPU)
-    online_config = VllmFp8Config(is_checkpoint_fp8_serialized=False,
-                                  activation_scheme="dynamic",
-                                  weight_block_size=None)
-    method = VllmFp8LinearMethodTPU(online_config, prefix=prefix)
-    method.online_fp8 = True
-    method.online_fp8_policy = policy
-    policy.selected[prefix] = aliases
-    return method
-
-
-def validate_online_fp8(model, config):
+def validate_online_fp8(model: torch.nn.Module,
+                        config: QuantizationConfig | None) -> None:
     """Audit once after loading, before compilation or accepting requests."""
-    policy = getattr(config, "online_fp8_policy", None)
+    if not isinstance(config, VllmQuantConfig):
+        return
+    policy = config.online_fp8_policy
     if policy is None:
         return
     validated = set()
@@ -218,16 +211,14 @@ def validate_online_fp8(model, config):
                 len(validated))
 
 
-def quantize_online_fp8(weight, policy):
+def quantize_online_fp8(
+    weight: torch.Tensor, policy: OnlineFp8Policy
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     """Quantize a loaded local [N, K] shard; expand only scales along N."""
-    from vllm_torchtpu.layers.core.quantization import quantize_tensor
-
     n_out, k_in = weight.shape
     scheme = policy.weight_scheme
     weight = weight.to(torch.float32)
     if scheme == "per_tensor":
-        from vllm_torchtpu.layers.core.quantization import _safe_inverse_scale
-
         # Keep the matrix layout: flattening tens of millions of elements
         # into one TPU lane dimension makes load-time compilation expensive.
         abs_max = weight.abs().amax(dim=1, keepdim=True).amax(dim=0,

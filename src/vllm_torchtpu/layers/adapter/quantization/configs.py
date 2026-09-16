@@ -17,6 +17,8 @@ Base configuration classes for TPU quantization.
 These classes provide the foundation for all TPU-specific quantization configs.
 """
 
+from typing import TYPE_CHECKING
+
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -24,6 +26,10 @@ from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+        OnlineFp8Policy
 
 logger = init_logger(__name__)
 
@@ -72,6 +78,9 @@ class VllmQuantConfig:
         - get_name(): Return the quantization method name
         - get_quant_method(): Return the appropriate quantization method for a layer
     """
+
+    # Optional per-model policy; enabled configs assign their own instance.
+    online_fp8_policy: "OnlineFp8Policy | None" = None
 
     # Class-level config storage (set once, shared by all instances)
     vllm_config: VllmConfig = None

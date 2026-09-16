@@ -62,6 +62,8 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.adapter.quantization import \
     get_tpu_quantization_config
+from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+    validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import \
     RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
@@ -3744,8 +3746,6 @@ class TPUModelRunner(GPUModelRunner):
              set_current_vllm_config(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
-        from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
-            validate_online_fp8
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if envs.TPU_ROPE_CACHE_TRUNCATE:
