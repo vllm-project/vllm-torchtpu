@@ -11,7 +11,7 @@ import vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter as pcp_
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl, PallasBatchedRPAAttentionBackend,
-    PallasBatchedRPAAttentionBackendImpl)
+    PallasBatchedRPAAttentionBackendImpl, _pallas_rpa_kernel_local)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
@@ -255,6 +255,57 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
         _impl().initialize_kernel(_layer())
 
     assert calls == [(True, 4)]
+
+
+def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
+        monkeypatch, vllm_config_context):
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_build_rpa_kernel",
+                        lambda self, *args, **kwargs: MagicMock())
+    impl = _batched_impl()
+    assert impl.runs_batched_rpa_schedule()
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        impl.initialize_kernel(_layer())
+
+    assert not impl.runs_batched_rpa_schedule()
+
+
+def test_only_the_batched_kernel_keeps_a_schedule_in_smem(
+        monkeypatch, vllm_config_context):
+    monkeypatch.delenv("USE_BATCHED_RPA_LONGCTX", raising=False)
+    # The batched backend on a plain layer: the batched kernel runs.
+    assert _batched_impl().runs_batched_rpa_schedule()
+    # The default backend runs RPA v3.
+    assert not _impl().runs_batched_rpa_schedule()
+    # head_dim 64 selects the head-dim-64 kernel on either backend.
+    hd64 = PallasBatchedRPAAttentionBackendImpl(num_heads=2,
+                                                head_size=64,
+                                                scale=1.0,
+                                                num_kv_heads=1,
+                                                alibi_slopes=None,
+                                                sliding_window=None,
+                                                kv_cache_dtype="bfloat16")
+    assert not hd64.runs_batched_rpa_schedule()
+
+    # DCP runs the two-pass long-context kernels.
+    dcp = _batched_impl()
+    dcp.dcp_world_size = 2
+    assert not dcp.runs_batched_rpa_schedule()
+
+    # A block-major KV bundle runs the bundled kernel.
+    bundled = _batched_impl()
+    bundled.rpa_kernel_bundled = MagicMock()
+    assert not bundled.runs_batched_rpa_schedule()
+
+    # A tp=1 draft rebound to the local entry runs RPA v3.
+    draft = _batched_impl()
+    draft._kernel_entry = _pallas_rpa_kernel_local
+    assert not draft.runs_batched_rpa_schedule()
+
+    # The long-context fork replaces the batched kernel wholesale.
+    monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
+    assert not _batched_impl().runs_batched_rpa_schedule()
 
 
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(

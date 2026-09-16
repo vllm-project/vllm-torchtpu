@@ -894,8 +894,13 @@ class KVCacheManager:
                     kv_cache_spec = kv_cache_spec.copy_with_new_block_size(
                         kernel_block_size)
                     if isinstance(kv_cache_spec, FullAttentionSpec):
+                        # The schedule check sizes the batched kernel's
+                        # table from this group's page size and block
+                        # table width.
                         self.runner._attention_kernel_block_size = (
                             kernel_block_size)
+                        self.runner._attention_kv_cache_group_id = (
+                            group.kv_cache_group_id)
                 builder = AttentionMetadataBuilder(
                     kv_cache_spec,
                     group.layer_names,

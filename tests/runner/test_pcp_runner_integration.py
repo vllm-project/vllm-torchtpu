@@ -87,7 +87,8 @@ def _make_runner(*,
         parallel_config=runner.parallel_config,
         scheduler_config=runner.scheduler_config,
         speculative_config=None,
-        kv_transfer_config=None)
+        kv_transfer_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}))
     runner.sequence_layout_planner = create_sequence_layout_planner(
         runner.vllm_config)
     runner.cache_config = SimpleNamespace(num_gpu_blocks=8,
@@ -122,8 +123,14 @@ def _make_runner(*,
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True
     runner._pp_is_last = True
-    # The stub runs no attention kernel: nothing to bound.
-    runner._check_attention_schedule = lambda *args: None
+    # The real schedule check; the stub registers no attention layer, so no
+    # kernel bounds the step.
+    runner._attention_capacity = {}
+    runner._attention_runs_batched_kernel = None
+    runner._attention_schedule_capacity = types.MethodType(
+        TPUModelRunner._attention_schedule_capacity, runner)
+    runner._check_attention_schedule = types.MethodType(
+        TPUModelRunner._check_attention_schedule, runner)
     # Spec-decode mamba rollback is inactive in these PCP layout tests; the
     # runner leaves the read-offset buffer unset (None) unless speculative
     # decoding is enabled, so _prepare_inputs / dummy_run skip the windowed
@@ -378,6 +385,27 @@ def test_prepare_inputs_builds_rank_local_partial_layout(monkeypatch):
     torch.testing.assert_close(
         logits_indices.cpu(), torch.tensor([271] + [-1] * 7,
                                            dtype=torch.int32))
+
+
+def test_prepare_inputs_pcp_long_context_step_is_not_bounded(monkeypatch):
+    # One 64K-token step of one request: far past the batched kernel's SMEM
+    # schedule, which no layer here runs.
+    scheduled = [65536]
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=scheduled,
+                          scheduled_tokens=scheduled,
+                          token_paddings=[65536])
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    attn_metadata, *_ = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 0, 0)
+
+    assert runner._attention_schedule_capacity() is None
+    md = attn_metadata["layer.0"]
+    assert md.sequence_layout_protocol == "pcp_streaming"
+    assert runner.seq_lens_np[0] == 65536
 
 
 def test_prepare_inputs_pcp_mtp_snapshots_request_major_tokens_before_pack(
