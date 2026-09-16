@@ -84,6 +84,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
+from vllm_torchtpu.kernels.mla.masked_dense import routing as masked_dense_routing
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
@@ -1430,46 +1431,10 @@ class TPUModelRunner(GPUModelRunner):
         num_windowed = num_decode
         if spec_decode_tokens and num_decode < num_reqs:
             num_windowed = partition(num_decode, num_reqs - 1, 1)
-        if (
-            not spec_decode_tokens
-            and self._masked_dense_groups_requests
-            and envs.TPU_MLA_MASKED_DENSE_ENABLED
-        ):
-            self._order_prefills_by_kv_len(num_decode, num_reqs, scheduler_output)
+        masked_dense_routing.maybe_order_prefills_by_kv_len(
+            self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+        )
         return num_decode, num_windowed
-
-    def _order_prefills_by_kv_len(
-        self, start: int, end: int, scheduler_output: "SchedulerOutput"
-    ) -> None:
-        """Order requests `[start, end)` by KV length, longest first.
-
-        Used only with the opt-in masked-dense MLA routing, which can run a
-        sparse prefix of long requests and a masked-dense suffix of short ones.
-        The routing re-derives and validates any split on device, so this order
-        affects performance only. Ties keep their current order, and
-        `swap_states` moves every request-associated buffer with its request.
-        """
-        tail: list[str] = []
-        kv_lens: dict[str, int] = {}
-        position: dict[str, int] = {}
-        for i in range(start, end):
-            req_id = self.input_batch.req_ids[i]
-            assert req_id is not None
-            tail.append(req_id)
-            kv_lens[req_id] = int(self.input_batch.num_computed_tokens_cpu[i]) + int(
-                scheduler_output.num_scheduled_tokens[req_id]
-            )
-            position[req_id] = i
-        for dst, req_id in enumerate(
-            sorted(tail, key=kv_lens.__getitem__, reverse=True), start
-        ):
-            src = position[req_id]
-            if src != dst:
-                displaced = self.input_batch.req_ids[dst]
-                assert displaced is not None
-                self.input_batch.swap_states(dst, src)
-                position[displaced] = src
-                position[req_id] = dst
 
     def _build_attention_metadata(
         self,

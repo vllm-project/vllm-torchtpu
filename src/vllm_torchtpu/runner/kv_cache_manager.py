@@ -1595,16 +1595,9 @@ class KVCacheManager:
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
                         )
-                        # Order requests by KV length only when every sparse
-                        # MLA layer matches the masked-dense routing profile.
-                        groups = masked_dense_routing.groups_requests(
-                            attn_module,
-                            specs,
-                            kv_cache_spec.block_size,
-                            self.runner.parallel_config.decode_context_parallel_size,
+                        masked_dense_routing.update_runner_profile(
+                            self.runner, attn_module, specs, kv_cache_spec.block_size
                         )
-                        if self.runner._masked_dense_groups_requests is not False:
-                            self.runner._masked_dense_groups_requests = groups
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = allocate_attention_region(
                             region,

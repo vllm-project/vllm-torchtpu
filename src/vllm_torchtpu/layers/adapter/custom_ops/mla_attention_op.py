@@ -634,7 +634,6 @@ class VllmTPUMLAAttention(MLAAttention):
         self.dcp_q_replicate = dcp_q_replicate
 
         # For compatibility reasons.
-        self.topk_indices_buffer = extra_impl_args.get("topk_indices_buffer")
         self.prefix = prefix
         self.kv_sharing_target_layer_name = None
         self.attn_type = AttentionType.DECODER
@@ -866,7 +865,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             dcp_q_replicate=self.dcp_q_replicate and self.is_sparse,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
-            topk_indices_buffer=self.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 

@@ -281,6 +281,7 @@ def attention_from_parts(
     *,
     sm_scale: float,
     k_scale: float,
+    q_concat: jax.Array | None = None,
 ) -> jax.Array:
     """MLA attention for a call `applies` accepted.
 
@@ -293,7 +294,12 @@ def attention_from_parts(
     chunk_size = sparse_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE
 
     def query():
-        return sparse_kernel.prepare_q_inputs(jnp.concatenate([ql_nope, q_pe], axis=-1))
+        q_full = (
+            q_concat
+            if q_concat is not None
+            else jnp.concatenate([ql_nope, q_pe], axis=-1)
+        )
+        return sparse_kernel.prepare_q_inputs(q_full)
 
     def crop(q):
         return q[:, :num_heads, :latent_width]
@@ -382,6 +388,54 @@ def attention_from_parts(
     return jax.lax.switch(tier, branches)
 
 
+def ragged_paged_attention(
+    q: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    k_scale: float = 1.0,
+    cache_layout: str = sparse_kernel.TENSORCORE_CACHE_LAYOUT,
+) -> jax.Array:
+    """Dispatches between sparse and opt-in masked-dense MLA attention."""
+    ql_nope = q[..., :GLM52_NOPE_DIM]
+    q_pe = q[..., GLM52_NOPE_DIM:]
+    if not applies(
+        ql_nope, q_pe, kv_cache_nope, kv_cache_rope, topk_indices, cache_layout
+    ):
+        return sparse_kernel.sparse_ragged_paged_attention(
+            q,
+            kv_cache_nope,
+            kv_cache_rope,
+            topk_indices,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            cache_layout=cache_layout,
+        )
+    return attention_from_parts(
+        ql_nope,
+        q_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_indices,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        q_concat=q,
+    )
+
+
 def groups_requests(
     attn_module,
     kv_cache_specs,
@@ -405,6 +459,9 @@ def groups_requests(
         )
         if buf is not None and getattr(buf, "ndim", 0) >= 2:
             topk = int(buf.shape[-1])
+    topk_matches = (
+        topk == GLM52_INDEX_TOPK if isinstance(topk, int) else indexer is None
+    )
     return bool(
         decode_context_parallel_size == 1
         and all(
@@ -414,6 +471,78 @@ def groups_requests(
         and attn_module.num_heads == GLM52_NUM_HEADS
         and attn_module.kv_lora_rank == GLM52_NOPE_DIM
         and attn_module.qk_rope_head_dim == GLM52_ROPE_DIM
-        and topk == GLM52_INDEX_TOPK
+        and topk_matches
         and page_size == GLM52_PAGE_SIZE
     )
+
+
+def update_runner_profile(
+    runner,
+    attn_module,
+    kv_cache_specs,
+    page_size: int,
+) -> None:
+    """Update runner's static eligibility for masked-dense request ordering."""
+    if getattr(runner, "_masked_dense_groups_requests", None) is False:
+        return
+    dcp_size = getattr(
+        getattr(runner, "parallel_config", None),
+        "decode_context_parallel_size",
+        1,
+    )
+    runner._masked_dense_groups_requests = groups_requests(
+        attn_module, kv_cache_specs, page_size, dcp_size
+    )
+
+
+def order_prefills_by_kv_len(
+    runner,
+    start: int,
+    end: int,
+    scheduler_output,
+) -> None:
+    """Order requests `[start, end)` by KV length, longest first.
+
+    Used only with the opt-in masked-dense MLA routing, which can run a
+    sparse prefix of long requests and a masked-dense suffix of short ones.
+    The routing re-derives and validates any split on device, so this order
+    affects performance only. Ties keep their current order, and
+    `swap_states` moves every request-associated buffer with its request.
+    """
+    tail: list[str] = []
+    kv_lens: dict[str, int] = {}
+    position: dict[str, int] = {}
+    for i in range(start, end):
+        req_id = runner.input_batch.req_ids[i]
+        assert req_id is not None
+        tail.append(req_id)
+        kv_lens[req_id] = int(runner.input_batch.num_computed_tokens_cpu[i]) + int(
+            scheduler_output.num_scheduled_tokens[req_id]
+        )
+        position[req_id] = i
+    for dst, req_id in enumerate(
+        sorted(tail, key=kv_lens.__getitem__, reverse=True), start
+    ):
+        src = position[req_id]
+        if src != dst:
+            displaced = runner.input_batch.req_ids[dst]
+            assert displaced is not None
+            runner.input_batch.swap_states(dst, src)
+            position[displaced] = src
+            position[req_id] = dst
+
+
+def maybe_order_prefills_by_kv_len(
+    runner,
+    num_decode: int,
+    num_reqs: int,
+    scheduler_output,
+    spec_decode_tokens,
+) -> None:
+    """Order non-speculative prefill requests by KV length when enabled."""
+    if (
+        not spec_decode_tokens
+        and getattr(runner, "_masked_dense_groups_requests", None)
+        and envs.TPU_MLA_MASKED_DENSE_ENABLED
+    ):
+        order_prefills_by_kv_len(runner, num_decode, num_reqs, scheduler_output)

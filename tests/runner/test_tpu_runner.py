@@ -1141,9 +1141,6 @@ class TestReorderBatchForRpa:
         runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
             runner
         )
-        runner._order_prefills_by_kv_len = (
-            TPUModelRunner._order_prefills_by_kv_len.__get__(runner)
-        )
         return runner
 
     def _batch(self, runner, req_ids, computed=None):

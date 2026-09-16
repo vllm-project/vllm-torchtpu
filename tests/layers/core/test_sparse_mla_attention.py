@@ -1509,6 +1509,7 @@ class MaskedDenseRequestGroupingTest(parameterized.TestCase):
         self.assertTrue(self._groups())
 
     def test_glm52_shared_indexer_layer_groups_requests(self):
+        self.assertTrue(self._groups(indexer=None, topk_indices_buffer=None))
         buf = mock.Mock(ndim=2, shape=(16, 2048))
         self.assertTrue(self._groups(indexer=None, topk_indices_buffer=buf))
         self.assertFalse(
