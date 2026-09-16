@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
+    VLLM_TPU_JUMP_DECODING: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -499,6 +500,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Fill unused speculative slots with deterministic grammar jump-forward
+    # tokens (structured output). Requires speculative decoding to be
+    # configured; pair with structured_outputs_config.disable_any_whitespace,
+    # since optional whitespace leaves almost no JSON position deterministic.
+    "VLLM_TPU_JUMP_DECODING":
+    env_bool("VLLM_TPU_JUMP_DECODING", default=False),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

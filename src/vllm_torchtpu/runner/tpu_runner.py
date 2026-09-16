@@ -3273,6 +3273,7 @@ class TPUModelRunner(GPUModelRunner):
                                   dtype=torch.float32,
                                   device=target_logits.device,
                                   generator=sampling_generator)
+        draft_flags = getattr(md, "draft_flags", None)
         if all_greedy:
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
@@ -3284,6 +3285,7 @@ class TPUModelRunner(GPUModelRunner):
                 max_draft_tokens=self.speculative_config.
                 num_speculative_tokens,
                 accept_u=accept_u,
+                draft_flags=draft_flags,
             )
         assert accept_u is not None
         recover_u = torch.rand_like(target_logits,
@@ -3303,6 +3305,7 @@ class TPUModelRunner(GPUModelRunner):
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
+            draft_flags=draft_flags,
         )
 
     def sample_tokens(

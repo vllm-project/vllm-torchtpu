@@ -67,6 +67,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        draft_flags: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -82,6 +83,7 @@ class RejectionSampler:
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=do_sampling,
+            draft_flags=draft_flags,
         )
 
     def forward(
@@ -99,6 +101,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        draft_flags: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -120,6 +123,8 @@ class RejectionSampler:
       recover_u: Uniform random values used to sample recovered tokens.
       do_sampling: Whether to use probabilistic rejection sampling. False
         keeps the existing greedy rejection path.
+      draft_flags: Optional per-token draft flags (0=EMPTY, 1=MODEL, 2=GRAMMAR).
+        Tokens with flag == 2 bypass rejection and are unconditionally accepted.
 
     Returns:
       A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -146,6 +151,7 @@ class RejectionSampler:
                 recover_u,
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
+                draft_flags,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -160,6 +166,7 @@ class RejectionSampler:
             accept_u,
             self.synthetic_conditional_rates,
             self.synthetic_mode,
+            draft_flags,
         )
 
 
@@ -202,6 +209,7 @@ def _greedy_rejection_sample_with_segment(
     accept_u: torch.Tensor | None,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -236,6 +244,9 @@ def _greedy_rejection_sample_with_segment(
                         & (draft_token_ids >= 0))
         else:
             accepted = draft_token_ids == target_logits_argmax
+        if draft_flags is not None:
+            is_grammar = (draft_flags.to(device) == 2)
+            accepted = is_grammar | accepted
         mismatch_indices = torch.where(
             valid_slot_mask & ~accepted,
             group_indices,
@@ -347,6 +358,7 @@ def _random_rejection_sample_with_segment(
     recover_u: torch.Tensor,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -378,6 +390,9 @@ def _random_rejection_sample_with_segment(
         accepted = accept_u < conditional_rates
     else:
         accepted = target_token_probs >= accept_u
+    if draft_flags is not None:
+        is_grammar = (draft_flags.to(device) == 2)
+        accepted = is_grammar | accepted
     accepted = accepted & valid_draft_token_ids
 
     # On rejection, resample from the residual max(0, p - q). With q a delta at
