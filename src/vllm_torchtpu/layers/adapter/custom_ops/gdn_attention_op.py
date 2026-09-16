@@ -644,7 +644,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         def wrapped_fn(
             hidden_states: jax.Array,
             qkvz_weight: jax.Array,
-            qkvz_weight_scale: jax.Array,
             b: jax.Array,
             a: jax.Array,
             recurrent_state: jax.Array,
@@ -656,6 +655,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             query_start_loc: jax.Array,
             distribution: jax.Array,
             seq_lens: jax.Array,
+            qkvz_weight_scale: jax.Array | None,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             return run_jax_gdn_attention_pooled_pcp_prefill_projection(
                 hidden_states,
@@ -689,7 +689,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         input_partition_specs = (
             PartitionSpec("pcp"),  # hidden states
             PartitionSpec(),  # QKVZ weight
-            PartitionSpec(),  # QKVZ weight scale
             PartitionSpec("pcp"),  # b
             PartitionSpec("pcp"),  # a
             PartitionSpec("pcp"),  # recurrent_state pool (rank-local, axis 0)
@@ -701,6 +700,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             PartitionSpec(),  # query_start_loc
             PartitionSpec(),  # request_distribution
             PartitionSpec(),  # seq_lens
+            PartitionSpec(),  # optional QKVZ weight scale
         )
         output_partition_specs = (
             PartitionSpec("pcp"),  # new pool
@@ -710,14 +710,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         gdn_jax_op = pcp_streaming_jax_op(
             op_name,
             wrapped_fn,
-            donate_argnums=(5, ),
+            # Keep optional operands after the pool so filtering None at the
+            # TorchTPU boundary cannot change the donated tensor's index.
+            donate_argnums=(4, ),
             mesh=pcp_mesh,
             input_partition_specs=input_partition_specs,
             output_partition_specs=output_partition_specs,
         )
 
-        def _fake_gdn(hidden_states, _weight, _scale, _b, _a, recurrent_state,
-                      *args, **kwargs):
+        def _fake_gdn(hidden_states, _weight, _b, _a, recurrent_state, *args,
+                      **kwargs):
             num_tokens = hidden_states.size(0)
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
             output = torch.empty(out_shape,
@@ -730,19 +732,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         def gdn_impl(
                 hidden_states: torch.Tensor, qkvz_weight: torch.Tensor,
-                qkvz_weight_scale: torch.Tensor, b: torch.Tensor,
+                qkvz_weight_scale: torch.Tensor | None, b: torch.Tensor,
                 a: torch.Tensor, recurrent_state: torch.Tensor,
                 conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
                 A_log: torch.Tensor, dt_bias: torch.Tensor,
                 state_indices: torch.Tensor, query_start_loc: torch.Tensor,
                 request_distribution: torch.Tensor,
                 seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            new_rec, outputs, z = gdn_jax_op(hidden_states, qkvz_weight,
-                                             qkvz_weight_scale, b, a,
+            new_rec, outputs, z = gdn_jax_op(hidden_states, qkvz_weight, b, a,
                                              recurrent_state, conv_weight,
                                              conv_bias, A_log, dt_bias,
                                              state_indices, query_start_loc,
-                                             request_distribution, seq_lens)
+                                             request_distribution, seq_lens,
+                                             qkvz_weight_scale)
             # Match the non-PCP pooled path: donation aliases the Pallas
             # result to the input pool, while copy_ exposes the mutation to
             # the surrounding compiled graph without rebinding its storage.
@@ -752,8 +754,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return gdn_impl
 
     def _require_pcp_projection_parameters(
-            self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the Qwen3.5 FP8 QKVZ parameters required by fusion."""
+            self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return BF16 or tensor/channel/block-scaled FP8 QKVZ parameters."""
         if (hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz")
                 or self.gqa_interleaved_layout):
             raise RuntimeError("GDN pooled PCP prefill requires the Qwen3.5 "
@@ -763,13 +765,25 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         weight = getattr(projection, "weight", None)
         weight_scale = getattr(projection, "weight_scale", None)
         bias = getattr(projection, "bias", None)
-        if (weight is None or weight_scale is None
-                or weight.dtype != torch.float8_e4m3fn
-                or weight_scale.dtype != torch.float32
-                or weight_scale.ndim != 1 or bias is not None):
+        if weight is None or weight.ndim != 2 or bias is not None:
             raise RuntimeError(
-                "GDN pooled PCP prefill requires bias-free float8_e4m3fn "
-                "QKVZ weights with a rank-1 FP32 scale.")
+                "GDN pooled PCP prefill requires bias-free rank-2 QKVZ weights."
+            )
+        if weight.dtype == torch.bfloat16:
+            if weight_scale is not None:
+                raise RuntimeError("BF16 QKVZ weights must not have a scale.")
+        elif weight.dtype == torch.float8_e4m3fn:
+            if weight_scale is None or weight_scale.dtype != torch.float32:
+                raise RuntimeError("FP8 QKVZ weights require an FP32 scale.")
+            from vllm_torchtpu.kernels.gdn.v3.projection_scale import \
+                projection_scale_layout
+            try:
+                projection_scale_layout(weight.shape, weight_scale.shape)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+        else:
+            raise RuntimeError("GDN pooled PCP prefill requires BF16 or "
+                               "float8_e4m3fn QKVZ weights.")
         return weight, weight_scale
 
     def _has_active_pooled_pcp_state(self, kv_cache) -> bool:

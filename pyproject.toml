@@ -64,7 +64,9 @@ test = [
     "pytest",
     "pytest-mock",
     "pytest-timeout",
+    "pytest-cov",
     "parameterized",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.27.0#subdirectory=tests/vllm_test_utils",
 ]
 
 # Dev tools (linting, formatting)

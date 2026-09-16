@@ -140,9 +140,43 @@ fi
 
 echo "--- Starting Buildkite Bootstrap"
 
+# Resolve and Publish Version Metadata
+INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
+
+# Sanity-check the pipeline slug to catch renames or typos immediately
+if [ "${BUILDKITE:-false}" == "true" ] || [ -n "${BUILDKITE_PIPELINE_SLUG:-}" ]; then
+  case "${BUILDKITE_PIPELINE_SLUG:-}" in
+    "vllm-torchtpu-ci"|"vllm-torchtpu-dev"|"${INTEGRATION_SLUG}")
+      ;;
+    *)
+      echo "ERROR: Unrecognized BUILDKITE_PIPELINE_SLUG '${BUILDKITE_PIPELINE_SLUG:-}'. Expected one of: vllm-torchtpu-ci, vllm-torchtpu-dev, ${INTEGRATION_SLUG}" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
+  # Integration pipeline tests upstream HEAD
+  VLLM_COMMIT_HASH=$(git ls-remote "https://github.com/vllm-project/vllm.git" HEAD | awk '{ print $1 }')
+else
+  # Standard builds test the pinned LKG version
+  VLLM_COMMIT_HASH=$(get_vllm_commit_hash)
+fi
+
+# Support manual developer override via environment variable
+VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH_OVERRIDE:-$VLLM_COMMIT_HASH}"
+buildkite-agent meta-data set "VLLM_COMMIT_HASH" "${VLLM_COMMIT_HASH}"
+echo "Using vLLM commit: ${VLLM_COMMIT_HASH}"
+
 # Since Buildkite prepends uploaded steps (inserts in reverse order),
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.
+
+if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
+  # Upload promote step FIRST so Buildkite places it LAST after test steps (Step 8)
+  echo "Uploading Promotion Pipeline Fragment"
+  upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
+fi
 
 echo "Uploading Perf and Eval Pipeline"
 upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"

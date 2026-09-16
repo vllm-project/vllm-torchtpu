@@ -21,6 +21,8 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
@@ -596,6 +598,13 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         assert np.any(np.array(pcp_pool).view(np.uint8))
 
 
+@pytest.mark.parametrize("projection_dtype,weight_scheme", [
+    pytest.param(jnp.bfloat16, "none", id="bf16"),
+    pytest.param(jnp.float8_e4m3fn, "channel", id="fp8-channel"),
+    pytest.param(jnp.float8_e4m3fn, "tensor", id="fp8-tensor"),
+    pytest.param(jnp.float8_e4m3fn, "block_k", id="fp8-block-k128"),
+    pytest.param(jnp.float8_e4m3fn, "block_nk", id="fp8-block-n512-k128"),
+])
 @pytest.mark.parametrize(
     ("lengths", "token_owner_starts", "request_absolute_starts",
      "recurrent_state_dtype"),
@@ -603,8 +612,8 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
 )
 def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         lengths, token_owner_starts, request_absolute_starts,
-        recurrent_state_dtype):
-    """Cover PCP stage metadata, FP8 projection, and pooled GDN."""
+        recurrent_state_dtype, projection_dtype, weight_scheme):
+    """Cover PCP stage metadata, native BF16/FP8 projection, and pooled GDN."""
     pcp_size = 2
     lengths = np.asarray(lengths, dtype=np.int32)
     token_owner_starts = (np.zeros_like(lengths) if token_owner_starts is None
@@ -634,28 +643,60 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     num_tokens = int(lengths.sum())
     num_blocks = len(lengths) + 1
     qkv_dim = 2 * n_kq * d_k + n_v * d_v
-    hidden_size = qkv_dim + n_v * d_v
+    qkvz_dim = qkv_dim + n_v * d_v
+    hidden_size = qkvz_dim
 
     keys = jax.random.split(jax.random.key(0), 9)
     hidden = jax.random.normal(keys[0], (num_tokens, hidden_size),
                                dtype=jnp.bfloat16)
     weight_f32 = 0.02 * jax.random.normal(
         keys[7],
-        (hidden_size, hidden_size),
+        (qkvz_dim, hidden_size),
         dtype=jnp.float32,
     )
-    qkvz_weight, qkvz_weight_scale = quantized_matmul_util.quantize_tensor(
-        weight_f32,
-        jnp.float8_e4m3fn,
-    )
-    qkvz_weight_scale = qkvz_weight_scale[:, 0]
     # `qkvz_weight` is N-major `[n_out, n_in]` to match the projection kernel;
     # `xla_quantized_matmul` takes the canonical (k, n) layout.
-    projected_qkvz = quantized_matmul_util.xla_quantized_matmul(
-        hidden,
-        qkvz_weight.T,
-        qkvz_weight_scale,
-    )
+    if projection_dtype == jnp.bfloat16:
+        qkvz_weight = weight_f32.astype(jnp.bfloat16)
+        qkvz_weight_scale = None
+        projected_qkvz = jnp.matmul(hidden,
+                                    qkvz_weight.T,
+                                    preferred_element_type=jnp.float32).astype(
+                                        jnp.bfloat16)
+    elif weight_scheme == "channel":
+        qkvz_weight, qkvz_weight_scale = quantized_matmul_util.quantize_tensor(
+            weight_f32, projection_dtype)
+        qkvz_weight_scale = qkvz_weight_scale[:, 0]
+        projected_qkvz = quantized_matmul_util.xla_quantized_matmul(
+            hidden, qkvz_weight.T, qkvz_weight_scale)
+    else:
+        if weight_scheme == "tensor":
+            qkvz_weight_scale = jnp.max(jnp.abs(weight_f32)) / 448.0
+            full_scale = jnp.broadcast_to(qkvz_weight_scale, weight_f32.shape)
+        else:
+            block_k = 128
+            block_n = 1 if weight_scheme == "block_k" else 512
+            # Strong variation across K blocks catches incorrect global scaling.
+            weight_f32 *= jnp.repeat(
+                jnp.geomspace(0.25, 4., hidden_size // block_k),
+                block_k)[None, :]
+            grid = weight_f32.reshape(qkvz_dim // block_n, block_n,
+                                      hidden_size // block_k, block_k)
+            scales = jnp.max(jnp.abs(grid), axis=(1, 3)) / 448.0
+            full_scale = jnp.repeat(jnp.repeat(scales, block_n, axis=0),
+                                    block_k,
+                                    axis=1)
+            qkvz_weight_scale = (scales.T[None, :, None, :]
+                                 if weight_scheme == "block_k" else scales)
+        qkvz_weight = jnp.clip(weight_f32 / full_scale, -448.,
+                               448.).astype(projection_dtype)
+        x_q, x_scale = quantized_matmul_util.quantize_tensor(
+            hidden, projection_dtype)
+        # Independent dense dequantized-weight reference, not the kernel's
+        # block accumulation loop or its scale-normalization helper.
+        projected_qkvz = ((x_q.astype(
+            jnp.float32) @ (qkvz_weight.astype(jnp.float32) * full_scale).T) *
+                          x_scale).astype(jnp.bfloat16)
     mixed_qkv = projected_qkvz[:, :qkv_dim]
     ref_z = projected_qkvz[:, qkv_dim:]
     b = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
@@ -674,7 +715,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     distribution = jnp.asarray((0, len(lengths), len(lengths)),
                                dtype=jnp.int32)
     seq_lens = jnp.asarray(request_absolute_starts + lengths, dtype=jnp.int32)
-    (_, _), ref_output = gdn_v3_wrapper.fused_conv1d_gdn(
+    (ref_conv, ref_recurrent), ref_output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
@@ -739,11 +780,14 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     pool_kernel_block_tokens = 256
     pool_block_tokens = 512
     pool_split = pool_block_tokens // pool_kernel_block_tokens
+    # The Qwen3.8 K=8/V=32 shape needs four local recurrent heads. Match its
+    # production pool capacity while keeping the smaller PCP2 cases unchanged.
+    pool_tail_lanes = max(4, 2 * (n_v // pcp_size))
     local_pool_shape = (
         num_blocks * pool_split,
         pool_kernel_block_tokens,
         1,
-        4,
+        pool_tail_lanes,
         128,
     )
     global_pool_shape = (pcp_size * local_pool_shape[0], *local_pool_shape[1:])
@@ -760,7 +804,8 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         run_jax_gdn_attention_pooled_pcp_prefill_projection(
             shard_tokens(packed_hidden),
             replicate(qkvz_weight),
-            replicate(qkvz_weight_scale),
+            replicate(qkvz_weight_scale)
+            if qkvz_weight_scale is not None else None,
             shard_tokens(packed_b),
             shard_tokens(packed_a),
             pool,
@@ -793,16 +838,69 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         restored[token_order[valid]] = packed[valid]
         return restored[:num_tokens]
 
+    tolerance = 2e-2 if projection_dtype == jnp.bfloat16 else 5e-2
     np.testing.assert_allclose(
         restore_request_order(pcp_output),
         np.asarray(ref_output).reshape(num_tokens, -1),
-        rtol=5e-2,
-        atol=5e-2,
+        rtol=tolerance,
+        atol=tolerance,
     )
+    local_n_kq, local_n_v = n_kq // pcp_size, n_v // pcp_size
+    local_conv_dim = 2 * local_n_kq * d_k + local_n_v * d_v
+    layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=local_n_v * d_k * d_v *
+        jnp.dtype(recurrent_state_dtype).itemsize,
+        conv_bytes=(kernel_size - 1) * local_conv_dim * 2,
+        token_bytes=int(np.prod(local_pool_shape[2:])),
+    )
+
+    def read_local_states(local_pool):
+        conv = pool_adapters.gather_region(local_pool,
+                                           state_indices,
+                                           tok0=layout.ssm_tokens,
+                                           ntok=layout.conv_tokens,
+                                           out_dtype=jnp.bfloat16,
+                                           split=pool_split)
+        conv = conv.reshape(len(lengths),
+                            -1)[:, :(kernel_size - 1) * local_conv_dim]
+        recurrent = pool_adapters.gather_region(
+            local_pool,
+            state_indices,
+            tok0=0,
+            ntok=layout.ssm_tokens,
+            out_dtype=recurrent_state_dtype,
+            out_lanes=d_v if recurrent_state_dtype == jnp.float32 else None,
+            split=pool_split)
+        return (conv.reshape(len(lengths), kernel_size - 1, local_conv_dim),
+                recurrent.reshape(len(lengths), local_n_v, d_k, d_v))
+
+    pcp_conv, pcp_recurrent = jax.shard_map(read_local_states,
+                                            mesh=mesh,
+                                            in_specs=P("pcp"),
+                                            out_specs=(P("pcp"), P("pcp")),
+                                            check_vma=False)(new_pool)
+    q, k, v = np.split(
+        np.asarray(ref_conv)[1:], [n_kq * d_k, 2 * n_kq * d_k], -1)
+    expected_conv = np.concatenate([
+        np.concatenate(
+            [np.split(part, pcp_size, axis=-1)[rank]
+             for part in (q, k, v)], -1) for rank in range(pcp_size)
+    ])
+    expected_recurrent = np.concatenate(
+        np.split(np.asarray(ref_recurrent)[1:], pcp_size, axis=1))
+    np.testing.assert_allclose(np.asarray(pcp_conv),
+                               expected_conv,
+                               rtol=tolerance,
+                               atol=tolerance)
+    np.testing.assert_allclose(np.asarray(pcp_recurrent),
+                               expected_recurrent,
+                               rtol=tolerance,
+                               atol=tolerance)
+    actual_z = restore_request_order(pcp_z)
+    expected_z = np.asarray(ref_z).reshape(num_tokens, -1)
     np.testing.assert_allclose(
-        restore_request_order(pcp_z),
-        np.asarray(ref_z).reshape(num_tokens, -1),
-        rtol=5e-2,
-        atol=5e-2,
+        actual_z,
+        expected_z,
+        rtol=tolerance,
+        atol=tolerance,
     )
-    assert np.any(np.asarray(new_pool).view(np.uint8))

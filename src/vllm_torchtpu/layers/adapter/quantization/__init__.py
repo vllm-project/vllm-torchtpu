@@ -40,6 +40,8 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import \
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+    attach_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.unquantized import \
     VllmUnquantizedConfig
 from vllm_torchtpu.layers.core import quant_methods
@@ -93,5 +95,6 @@ def get_tpu_quantization_config(
     # Register the TPU quant method name so vLLM uses our custom config
     model_config.quantization = quant_methods.get_tpu_quant_method(
         quant_config_cls.get_name())
-    return VllmConfig.get_quantization_config(model_config,
-                                              vllm_config.load_config)
+    config = VllmConfig.get_quantization_config(model_config,
+                                                vllm_config.load_config)
+    return attach_online_fp8(config, vllm_config)

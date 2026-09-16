@@ -39,7 +39,9 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 (google-pytorch/torch_tpu#1560).
 """
 
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -66,6 +68,8 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import resolve_online_fp8
+from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
 from vllm_torchtpu.layers.core.quant_methods import NVFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (dequantize_tensor,
                                                     pack_fp4_indices,
@@ -73,6 +77,9 @@ from vllm_torchtpu.layers.core.quantization import (dequantize_tensor,
                                                     unpack_uint8_to_fp4)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to, synchronize_tensors
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
 
@@ -215,7 +222,16 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
     def get_name(cls) -> str:
         return NVFP4
 
-    def get_quant_method(
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
+        super().apply_vllm_mapper(hf_to_vllm_mapper)
+        map_online_fp8(self, hf_to_vllm_mapper)
+
+    def get_quant_method(self, layer: torch.nn.Module,
+                         prefix: str) -> QuantizeMethodBase | None:
+        base_method = self._get_checkpoint_quant_method(layer, prefix)
+        return resolve_online_fp8(self, layer, prefix, base_method)
+
+    def _get_checkpoint_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,

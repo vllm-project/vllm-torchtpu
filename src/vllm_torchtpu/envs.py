@@ -46,6 +46,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    MIXED_Q_SPLIT: int | None = None
+    MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
+    MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -107,6 +110,8 @@ if TYPE_CHECKING:
     KDA_PACK_HEAD_INV: bool = True
     KDA_PACKED_METADATA: bool = True
     KDA_FWD_MB: int | None = None
+    TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
+    SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -273,6 +278,21 @@ def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
         return parse_bool()
 
     return _get_optional_bool_env
+
+
+def env_nonnegative_int_or_auto(env_name: str) -> Callable[[], int | None]:
+    """Size knob where unset, empty or ``auto`` (any case) reads as ``None``,
+    meaning the caller picks the value itself. Anything else must parse as
+    an integer that is not negative."""
+    parse_int = env_nonnegative_int(env_name, 0)
+
+    def _get_nonnegative_int_or_auto_env() -> int | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip().lower() in ("", "auto"):
+            return None
+        return parse_int()
+
+    return _get_nonnegative_int_or_auto_env
 
 
 def env_optional_int(env_name: str) -> Callable[[], int | None]:
@@ -482,6 +502,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    "MIXED_Q_SPLIT":
+    env_optional_int("MIXED_Q_SPLIT"),
+    "MIXED_NUM_QUERIES_PER_BLOCK":
+    env_optional_int("MIXED_NUM_QUERIES_PER_BLOCK"),
+    "MIXED_NUM_KV_PAGES_PER_BLOCK":
+    env_optional_int("MIXED_NUM_KV_PAGES_PER_BLOCK"),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.
@@ -759,6 +785,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # coordination port plus one.
     "TORCH_TPU_MP_RENDEZVOUS_PORT":
     env_optional_int("TORCH_TPU_MP_RENDEZVOUS_PORT"),
+    # Directory for the on-disk TorchTPU compilation cache; read raw because
+    # env_override.py copies it verbatim into the TORCH_TPU_INTERNAL_* vars.
+    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT":
+    lambda: os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
+    # SparseCore offload threshold in bytes; None means "auto" and
+    # env_override.py resolves it from the chip family. 0 sets no flag.
+    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES":
+    env_nonnegative_int_or_auto("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"),
 }
 
 

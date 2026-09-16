@@ -17,6 +17,8 @@
 # Can be sourced by run_multihost.sh or executed directly as a wrapper.
 # shellcheck disable=SC2154
 
+export MULTIHOST_RUN_LOG="${MULTIHOST_RUN_LOG:-perf_eval_results/multihost.log}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # If executed directly instead of sourced, delegate to run_multihost.sh --backend ray

@@ -1,3 +1,27 @@
+# Coverage configuration for the unit-test coverage measurement pipeline
+# (.buildkite/pipeline_coverage.yml).
+#
+# parallel/concurrency/sigterm make coverage follow the engine-core and
+# worker processes vLLM spawns during E2E tests and flush their data on
+# SIGTERM; without them only the pytest parent process is measured and
+# runner/worker/executor coverage is drastically understated.
 [run]
+branch = true
+parallel = true
+concurrency = multiprocessing
+sigterm = true
+
+# Map the container install locations back to the checkout so data files
+# collected inside the CI image can be combined and reported on any agent.
+[report]
 omit =
-    src/vllm_torchtpu/*
+    */tests/*
+    /workspace/*
+
+[paths]
+source =
+    src/vllm_torchtpu
+    /root/torchtpu-vllm/src/vllm_torchtpu
+    /workspace/vllm-torchtpu/src/vllm_torchtpu
+    /workspace/torchtpu-vllm/src/vllm_torchtpu
+    */site-packages/vllm_torchtpu
