@@ -20,7 +20,9 @@ RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-bu
 # intermediate steps do not fail preloading a library that is not there yet.
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
 
-# The interpreter lives in /usr/local; some scripts hardcode /usr/bin/python3.
+# The interpreter lives in /usr/local, so Debian's usual /usr/bin/python3 does
+# not exist. Nothing in this repo needs it, but third-party tooling run inside
+# the image may assume the Debian path.
 RUN ln -sf "$(command -v python)" /usr/bin/python3 && \
     pip install --no-cache-dir uv
 
@@ -74,7 +76,7 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
     apt-get update && apt-get install -y google-cloud-cli gcsfuse && \
     rm -rf /var/lib/apt/lists/*
 
-# Clear PYTHONPATH inherited from base image if any
+# Start from an empty PYTHONPATH; the dev and prod stages set their own.
 ENV PYTHONPATH=""
 
 WORKDIR /workspace/vllm-torchtpu
