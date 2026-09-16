@@ -18,7 +18,7 @@ from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
                                           get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
-                                             get_pp_group,
+                                             get_dp_group, get_pp_group,
                                              get_tensor_model_parallel_rank,
                                              init_distributed_environment)
 from vllm.v1 import utils as vllm_utils
@@ -424,6 +424,13 @@ class TPUWorker(WorkerBase):
                    "correspondingly.")
             logger.info(msg)
             return kv_cache_memory_bytes
+
+        # EP profiling issues collectives across independently started DP
+        # engines. Ensure every peer has completed loading before any engine
+        # enters the profiling run.
+        if (utils.get_dp_size(self.parallel_config) > 1
+                and self.parallel_config.enable_expert_parallel):
+            get_dp_group().barrier()
 
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
