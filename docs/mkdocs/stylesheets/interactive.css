@@ -67,7 +67,7 @@
 
 /* Vibrant PyTorch / SGLang orange-red color for active */
 .cg-btn.active {
-    background-color: var(--md-typeset-a-color); 
+    background-color: var(--md-typeset-a-color);
     color: white;
     border-color: var(--md-typeset-a-color);
     box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);

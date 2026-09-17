@@ -17,23 +17,23 @@
 /* Interactive UI Components Logic */
 
 const COMMAND_DATA = {
-    "uv_pip": { 
-        cmd: `# 1. Create a working directory:\nmkdir ~/work-dir\ncd ~/work-dir\n\n# 2. Install uv and set up a Python virtual environment:\n# If you prefer standard pip, simply use \`python3.12 -m venv vllm_env\`\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 3. Use the following command to install vllm-tpu using uv or pip:\nuv pip install vllm-tpu\n# Or instead: pip install vllm-tpu`, 
-        inst: "Install the latest official release using uv pip for any supported TPU." 
+    "uv_pip": {
+        cmd: `# 1. Create a working directory:\nmkdir ~/work-dir\ncd ~/work-dir\n\n# 2. Install uv and set up a Python virtual environment:\n# If you prefer standard pip, simply use \`python3.12 -m venv vllm_env\`\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 3. Use the following command to install vllm-tpu using uv or pip:\nuv pip install vllm-tpu\n# Or instead: pip install vllm-tpu`,
+        inst: "Install the latest official release using uv pip for any supported TPU."
     },
-    "docker": { 
+    "docker": {
         "latest": {
-            cmd: `export DOCKER_URI=vllm/vllm-tpu:latest\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`, 
-            inst: "Run the official <strong>release</strong> Docker container (<code>vllm/vllm-tpu:latest</code>). Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory." 
+            cmd: `export DOCKER_URI=vllm/vllm-tpu:latest\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
+            inst: "Run the official <strong>release</strong> Docker container (<code>vllm/vllm-tpu:latest</code>). Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory."
         },
         "nightly": {
-            cmd: `export DOCKER_URI=vllm/vllm-tpu:nightly\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`, 
-            inst: "Run the pre-built <strong>nightly</strong> Docker container (<code>vllm/vllm-tpu:nightly</code>) containing the latest development changes. Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory." 
+            cmd: `export DOCKER_URI=vllm/vllm-tpu:nightly\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
+            inst: "Run the pre-built <strong>nightly</strong> Docker container (<code>vllm/vllm-tpu:nightly</code>) containing the latest development changes. Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory."
         }
     },
-    "source": { 
-        cmd: `# 1. Install system dependencies:\nsudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev\n\n# 2. Clone the vllm and tpu-inference repositories:\ngit clone https://github.com/vllm-project/tpu-inference.git\nexport VLLM_COMMIT_HASH=$(cat tpu-inference/.buildkite/vllm_lkg.version)\ngit clone https://github.com/vllm-project/vllm.git\ncd vllm\ngit checkout "\${VLLM_COMMIT_HASH}"\ncd ..\n\n# 3. Install uv and set up a Python virtual environment:\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 4. Install vllm from source, targeting the TPU device:\ncd vllm\nuv pip install -r requirements/tpu.txt --torch-backend=cpu\nVLLM_TARGET_DEVICE="tpu" uv pip install -e . --no-build-isolation\ncd ..\n\n# 5. Install tpu-inference from source:\ncd tpu-inference\nuv pip install -e .\ncd ..`, 
-        inst: "For debugging or development purposes, you can install <code>tpu-inference</code> from source. <code>tpu-inference</code> is a plugin for <code>vllm</code>, so you need to install both from source." 
+    "source": {
+        cmd: `# 1. Install system dependencies:\nsudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev\n\n# 2. Clone the vllm and tpu-inference repositories:\ngit clone https://github.com/vllm-project/tpu-inference.git\nexport VLLM_COMMIT_HASH=$(cat tpu-inference/.buildkite/vllm_lkg.version)\ngit clone https://github.com/vllm-project/vllm.git\ncd vllm\ngit checkout "\${VLLM_COMMIT_HASH}"\ncd ..\n\n# 3. Install uv and set up a Python virtual environment:\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 4. Install vllm from source, targeting the TPU device:\ncd vllm\nuv pip install -r requirements/tpu.txt --torch-backend=cpu\nVLLM_TARGET_DEVICE="tpu" uv pip install -e . --no-build-isolation\ncd ..\n\n# 5. Install tpu-inference from source:\ncd tpu-inference\nuv pip install -e .\ncd ..`,
+        inst: "For debugging or development purposes, you can install <code>tpu-inference</code> from source. <code>tpu-inference</code> is a plugin for <code>vllm</code>, so you need to install both from source."
     }
 };
 
@@ -143,19 +143,19 @@ function updateProvisionGenerator() {
     const activeHw = document.querySelector('#prov-generator .cg-btn[data-group="prov_hw"].active');
     const activeChips = document.querySelector('#prov-generator .cg-btn[data-group="prov_chips"].active');
     const activeModel = document.querySelector('#prov-generator .cg-btn[data-group="prov_model"].active');
-    
+
     if (!activeHw || !activeChips) return;
-    
+
     const hw = activeHw.getAttribute('data-val');
     let chips = activeChips.getAttribute('data-val');
     let model = activeModel ? activeModel.getAttribute('data-val') : 'standard';
-    
+
     const data = PROVISION_DATA[hw];
-    
+
     const cmdEl = document.getElementById('prov-output-command');
     const instEl = document.getElementById('prov-output-instructions');
     const containerEl = document.querySelector('#prov-generator .cg-output-container');
-    
+
     if (cmdEl && instEl && data) {
         // Grey out invalid chip counts for this hardware
         if (data.valid_chips) {
@@ -273,7 +273,7 @@ function initCommandGenerator() {
     // Shared logic for both generators
     const btns = document.querySelectorAll('.cg-btn');
     if (btns.length === 0) return;
-    
+
     btns.forEach(btn => {
         if (btn.dataset.cgInitialized === 'true') return;
         btn.dataset.cgInitialized = 'true';
@@ -289,7 +289,7 @@ function initCommandGenerator() {
             // Add to clicked
             this.classList.add('active');
             this.setAttribute('aria-pressed', 'true');
-            
+
             if (group.startsWith('prov_')) {
                 updateProvisionGenerator();
             } else {
@@ -297,7 +297,7 @@ function initCommandGenerator() {
             }
         });
     });
-    
+
     updateCommandGenerator();
     updateProvisionGenerator();
 }
@@ -328,7 +328,7 @@ function initSimpleSearch() {
 
         const searchWrapper = document.createElement('div');
         searchWrapper.className = 'custom-tab-search';
-        searchWrapper.style.marginLeft = 'auto'; 
+        searchWrapper.style.marginLeft = 'auto';
         searchWrapper.style.display = 'flex';
         searchWrapper.style.alignItems = 'center';
         searchWrapper.style.paddingRight = '8px';
