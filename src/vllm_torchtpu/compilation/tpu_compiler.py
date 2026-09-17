@@ -175,11 +175,13 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    # Still listed: on this base `pp_shift.py` is a second caller, so the
+    # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
-    # And the mesh they export with: `build_ep_mesh` fixes the device ORDER
-    # the kernel's remote DMAs resolve their peer coordinates against, so an
-    # edit to the ordering changes where every routed row goes without
-    # changing a byte of the kernel.
+    # And the mesh they export with. Since google-pytorch/torch_tpu#3522 the
+    # order is the process group's rank order rather than something
+    # `build_ep_mesh` chooses, but the file still decides the axis and the
+    # shape the kernel exports against.
     "vllm_torchtpu/distributed/ep_mesh.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
