@@ -17,6 +17,18 @@ WORKDIR /workspace/vllm-torchtpu
 # Copy pyproject.toml to extract dependencies and read settings
 COPY pyproject.toml .
 
+# If VLLM_COMMIT_HASH is passed (e.g., testing upstream HEAD in CI),
+# dynamically update pyproject.toml inside the container before building.
+ARG VLLM_COMMIT_HASH
+RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
+      sed -i -E "s|(git\+https://github\.com/vllm-project/vllm\.git@)[a-zA-Z0-9.-]+|\1${VLLM_COMMIT_HASH}|g" pyproject.toml; \
+    fi
+
+# Note: we **intentionally** set VLLM_TARGET_DEVICE="empty", see README.
+ENV CXX=g++
+ENV CC=gcc
+ENV VLLM_TARGET_DEVICE=empty
+
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -27,9 +39,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
     export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
     export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
-    export CXX=g++; \
-    export CC=gcc; \
-    export VLLM_TARGET_DEVICE=empty; \
     uv pip install --system \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
@@ -45,8 +54,8 @@ FROM base AS ci
 # Copy bktec binary from Buildkite Test Engine client image
 COPY --from=buildkite/test-engine-client /usr/local/bin/bktec /usr/local/bin/bktec
 
-# Install tools needed for CI (git, gcloud, lsof, fuser)
-RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg git lsof psmisc lsb-release && \
+# Install tools needed for CI (gcloud, lsof, fuser, compilers)
+RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg lsof psmisc lsb-release && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-$(lsb_release -c -s) main" | tee -a /etc/apt/sources.list.d/gcsfuse.list && \
@@ -65,11 +74,9 @@ RUN git config --global --add safe.directory /workspace/vllm-torchtpu && \
     ln -sfnT /workspace/vllm-torchtpu /root/torchtpu-vllm && \
     ln -sfnT /workspace/vllm-torchtpu /workspace/torchtpu-vllm
 
-# Note: we **intentionally** set VLLM_TARGET_DEVICE="empty", see README.
-ENV VLLM_TARGET_DEVICE="empty"
-
 # Variant 3: Developer Image (Dev Variant with test/benchmark tools)
 # This variant contains all source code and is intended for active development.
+# It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
 
 # Pre-install test and benchmarking dependencies before copying full source tree
@@ -82,6 +89,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra benchmarking
 
 COPY . .
+
+# If VLLM_COMMIT_HASH is passed (e.g., testing upstream HEAD in CI),
+# dynamically update pyproject.toml inside the container after COPY . .
+# so changes made during the base stage are not overwritten.
+ARG VLLM_COMMIT_HASH
+RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
+      sed -i -E "s|(git\+https://github\.com/vllm-project/vllm\.git@)[a-zA-Z0-9.-]+|\1${VLLM_COMMIT_HASH}|g" pyproject.toml; \
+    fi
+
 # Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -94,12 +110,13 @@ ARG VLLM_SOURCE
 # Copy vllm source (might be empty if not provided)
 COPY vllm /workspace/vllm-torchtpu/vllm
 
-# Install vllm from source if requested.
-# If VLLM_SOURCE is provided, we build it in editable mode.
+# Install vllm from source if requested, otherwise clean up dummy dir
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -n "$VLLM_SOURCE" ]; then \
       uv pip install --system --no-deps \
         -e /workspace/vllm-torchtpu/vllm ; \
+    else \
+      rm -rf /workspace/vllm-torchtpu/vllm ; \
     fi
 
 ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
@@ -112,9 +129,23 @@ CMD ["/bin/bash"]
 FROM base AS prod
 WORKDIR /workspace/vllm-torchtpu
 COPY . .
+
+# If VLLM_COMMIT_HASH is passed (e.g., testing upstream HEAD in CI),
+# dynamically update pyproject.toml inside the container after COPY . .
+# so changes made during the base stage are not overwritten.
+ARG VLLM_COMMIT_HASH
+RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
+      sed -i -E "s|(git\+https://github\.com/vllm-project/vllm\.git@)[a-zA-Z0-9.-]+|\1${VLLM_COMMIT_HASH}|g" pyproject.toml; \
+    fi
+
+# Use --no-deps to preserve layer caching since dependencies were already resolved and installed in base.
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
-    uv pip install --system .
+    uv pip install --system --no-deps .
+
+RUN if [ -z "$VLLM_SOURCE" ] && [ -d /workspace/vllm-torchtpu/vllm ]; then \
+      rm -rf /workspace/vllm-torchtpu/vllm ; \
+    fi
 
 RUN mkdir -p /root /workspace && \
     ln -sfnT /workspace/vllm-torchtpu /root/torchtpu-vllm && \

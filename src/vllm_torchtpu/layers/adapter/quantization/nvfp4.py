@@ -347,7 +347,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason)
+            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason,
+            register_score_bias_buffer)
 
         # Preserve main's explicit requantization recipe for the GMM path.
         # Automatic requantization is committed only for an admitted W4A8 op.
@@ -409,6 +410,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
+            register_score_bias_buffer(layer)
             # Do the scale layout conversion once, outside compiled forward.
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
@@ -435,11 +437,12 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer")
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            fused_moe_ep, fused_moe_ep_supported)
+            fused_moe_ep, fused_moe_ep_supported, score_bias_operand)
         if fused_moe_ep_supported(self):
             return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
                                 layer._tpu_fused_w13_scale,
-                                layer._tpu_fused_w2_scale, router_logits)
+                                layer._tpu_fused_w2_scale, router_logits,
+                                score_bias_operand(layer))
 
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

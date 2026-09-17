@@ -185,6 +185,108 @@ def kda_attention_ref(
     return (new_conv_state, new_recurrent_state), output
 
 
+def kda_attention_spec_ref(
+    qkv: jnp.ndarray,
+    b: jnp.ndarray,
+    a: jnp.ndarray,
+    conv_state: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    conv_weight: jnp.ndarray,
+    conv_bias: jnp.ndarray | None,
+    a_log: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    distribution: jnp.ndarray,
+    read_offsets: jnp.ndarray,
+    num_spec_seqs: int,
+    seq_lens: jnp.ndarray,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    gate_lower_bound: float | None,
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """Token reference for KDA verify windows and their checkpoints."""
+    del distribution
+    new_conv_state = jnp.array(conv_state)
+    new_recurrent_state = jnp.array(recurrent_state)
+    output = np.zeros((qkv.shape[0], n_v * d_v), np.float64)
+    a_log_np = np.asarray(a_log, np.float64).reshape(n_v, 1)
+    dt_bias_np = np.asarray(dt_bias, np.float64).reshape(n_v, d_k)
+
+    for req_idx in range(num_spec_seqs):
+        base = int(state_indices[req_idx])
+        read_slot = base + int(read_offsets[req_idx])
+        start = int(query_start_loc[req_idx])
+        end = int(query_start_loc[req_idx + 1])
+        query_len = end - start
+        if query_len <= 0:
+            continue
+
+        has_init = bool((seq_lens[req_idx] - query_len) > 0)
+        c_state = (conv_state[read_slot]
+                   if has_init else jnp.zeros_like(conv_state[read_slot]))
+        running = np.asarray(
+            recurrent_state[read_slot]
+            if has_init else jnp.zeros_like(recurrent_state[read_slot]),
+            np.float64,
+        ).copy()
+
+        x_full = jnp.concatenate([c_state, qkv[start:end]], axis=0)
+        acc = jnp.zeros((query_len, qkv.shape[-1]), dtype=jnp.float32)
+        for k_idx in range(kernel_size):
+            acc += (x_full[k_idx:k_idx + query_len].astype(jnp.float32) *
+                    conv_weight[:, 0, k_idx].astype(jnp.float32)[None, :])
+        if conv_bias is not None:
+            acc += conv_bias.astype(jnp.float32)[None, :]
+        conv_out = jax.nn.silu(acc).astype(qkv.dtype)
+        for t in range(query_len):
+            new_conv_state = new_conv_state.at[base + t].set(
+                x_full[t + 1:t + kernel_size])
+
+        conv_out_np = np.asarray(conv_out, np.float64)
+        key_dim = n_kq * d_k
+        q_seq = conv_out_np[:, :key_dim].reshape(query_len, n_kq, d_k)
+        k_seq = conv_out_np[:,
+                            key_dim:2 * key_dim].reshape(query_len, n_kq, d_k)
+        v_seq = conv_out_np[:, 2 * key_dim:].reshape(query_len, n_v, d_v)
+        if n_v != n_kq:
+            repeat_factor = n_v // n_kq
+            q_seq = np.repeat(q_seq, repeat_factor, axis=1)
+            k_seq = np.repeat(k_seq, repeat_factor, axis=1)
+        q_seq = _l2_normalize(q_seq) * float(d_k**-0.5)
+        k_seq = _l2_normalize(k_seq)
+        # Production activates beta in fp32, then stores it in the model
+        # activation dtype before the recurrent update.
+        beta_seq = np.asarray(
+            jax.nn.sigmoid(b[start:end].astype(jnp.float32)).astype(b.dtype),
+            np.float64,
+        )
+        a_seq = np.asarray(a[start:end],
+                           np.float64).reshape(query_len, n_v, d_k)
+        if gate_lower_bound is None:
+            gate_seq = (-np.exp(a_log_np) *
+                        np.logaddexp(0.0, a_seq + dt_bias_np))
+        else:
+            gate_seq = gate_lower_bound * np.exp(
+                -np.logaddexp(0.0, -(np.exp(a_log_np) * (a_seq + dt_bias_np))))
+
+        for t in range(query_len):
+            running *= np.exp(gate_seq[t])[:, :, None]
+            prediction = np.einsum("hk,hkv->hv", k_seq[t], running)
+            delta = beta_seq[t][:, None] * (v_seq[t] - prediction)
+            running += k_seq[t][:, :, None] * delta[:, None, :]
+            output[start + t] = np.einsum("hk,hkv->hv", q_seq[t],
+                                          running).reshape(-1)
+            new_recurrent_state = new_recurrent_state.at[base + t].set(
+                jnp.asarray(running, recurrent_state.dtype))
+
+    return (new_conv_state,
+            new_recurrent_state), jnp.asarray(output, qkv.dtype)
+
+
 _SHAPES = (
     dict(
         name="decode_only",
@@ -234,6 +336,11 @@ def _cases():
             case["testcase_name"] = f"{case.pop('name')}_{gate_name}"
             case["gate_lower_bound"] = lower_bound
             yield case
+            if shape["distribution"][0] == 0:
+                yield dict(case,
+                           testcase_name=case["testcase_name"] +
+                           "_prefill_only",
+                           prefill_only=True)
 
 
 class KdaAttentionV3Test(parameterized.TestCase):
@@ -244,7 +351,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
                                         q_loc,
                                         distribution,
                                         gate_lower_bound,
-                                        n_v=4):
+                                        n_v=4,
+                                        prefill_only=False):
         # K3 and Kimi-Linear both run KDA without GQA, so n_kq == n_v.
         n_kq = n_v
         d_k = d_v = 128
@@ -307,10 +415,11 @@ class KdaAttentionV3Test(parameterized.TestCase):
             wrapper.fused_conv1d_gdn,
             static_argnames=[
                 "n_kq", "n_v", "d_k", "d_v", "kernel_size", "attention_mode",
-                "gate_lower_bound"
+                "gate_lower_bound", "prefill_only"
             ],
         )
-        (_, out_state), out = kda_jitted(**common_kwargs)
+        (_, out_state), out = kda_jitted(**common_kwargs,
+                                         prefill_only=prefill_only)
 
         # Tighter than the GDN v3 suite's 2e-2/2e-2 on purpose. KDA feeds the
         # output through an L2 norm and a d_k**-0.5 scale, so |out| peaks
@@ -331,6 +440,122 @@ class KdaAttentionV3Test(parameterized.TestCase):
 
     @parameterized.named_parameters(
         dict(
+            testcase_name="tp32_multi_tile_recurrent_window",
+            num_heads=3,
+            spec_lengths=[1, 6, 3, 8, 5, 2, 7, 4] * 4,
+            read_offsets=[0, 2, 4, 6, 0, 2, 4, 6] * 4,
+        ),
+        dict(
+            testcase_name="tp8_large_recurrent_window",
+            num_heads=12,
+            spec_lengths=[1, 6, 3, 8, 5, 2, 7, 4],
+            read_offsets=[0, 2, 4, 6, 0, 2, 4, 6],
+        ),
+    )
+    def test_speculative_window_checkpoints(self, num_heads, spec_lengths,
+                                            read_offsets):
+        """An 8-token K3 verify window stays in one kernel invocation.
+
+        This covers ragged windows, rollback reads from non-zero checkpoints,
+        TP8's large FP32 recurrent-state window, and enough TP32 sequences to
+        pipeline multiple tiles. Every real token must write its conv and
+        recurrent state to ``base + t``; padded tail slots must remain
+        untouched.
+        """
+        n_kq = n_v = num_heads
+        d_k = d_v = 128
+        kernel_size = 4
+        num_spec_tokens = 7
+        window = num_spec_tokens + 1
+        num_seqs = len(spec_lengths)
+        q_loc = jnp.array(np.concatenate([[0], np.cumsum(spec_lengths)]),
+                          dtype=jnp.int32)
+        distribution = jnp.array([num_seqs, num_seqs, num_seqs],
+                                 dtype=jnp.int32)
+        state_indices = jnp.array([1 + i * window for i in range(num_seqs)],
+                                  dtype=jnp.int32)
+        num_blocks = 1 + num_seqs * window
+        read_offsets_arr = jnp.array(read_offsets, dtype=jnp.int32)
+        seq_lens = jnp.array([32 + length for length in spec_lengths],
+                             dtype=jnp.int32)
+        dim_size = 2 * n_kq * d_k + n_v * d_v
+
+        rngs = iter(jax.random.split(jax.random.key(11), 8))
+        qkv = jax.random.normal(next(rngs), (sum(spec_lengths), dim_size),
+                                dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs), (sum(spec_lengths), n_v),
+                              dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs), (sum(spec_lengths), n_v * d_k),
+                              dtype=jnp.bfloat16)
+        conv_state = jax.random.normal(
+            next(rngs),
+            (num_blocks, kernel_size - 1, dim_size),
+            dtype=jnp.bfloat16,
+        )
+        recurrent_state = jax.random.normal(next(rngs),
+                                            (num_blocks, n_v, d_k, d_v))
+        conv_weight = jax.random.normal(next(rngs), (dim_size, 1, kernel_size),
+                                        dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v, ))
+        dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
+
+        common_kwargs = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            conv_weight=conv_weight,
+            conv_bias=None,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            gate_lower_bound=-5.0,
+        )
+
+        (ref_conv, ref_rec), ref_out = kda_attention_spec_ref(
+            **common_kwargs,
+            read_offsets=read_offsets_arr,
+            num_spec_seqs=num_seqs,
+        )
+        # `fused_conv1d_gdn` already owns its jit/static-argument contract and
+        # donates both cache inputs. Build the reference first: reading either
+        # original cache after this call is invalid once JAX reuses it.
+        (new_conv, new_rec), out = wrapper.fused_conv1d_gdn(
+            **common_kwargs,
+            read_offsets=read_offsets_arr,
+            num_spec_tokens=num_spec_tokens,
+            batched_only=True,
+            attention_mode=config.AttentionMode.KDA,
+        )
+
+        np.testing.assert_allclose(out, ref_out, rtol=2e-2, atol=5e-3)
+        for slot in range(num_blocks):
+            np.testing.assert_allclose(
+                new_conv[slot],
+                ref_conv[slot],
+                rtol=2e-2,
+                atol=5e-3,
+                err_msg=f"conv checkpoint mismatch at slot {slot}",
+            )
+            np.testing.assert_allclose(
+                new_rec[slot],
+                ref_rec[slot],
+                rtol=2e-2,
+                atol=1e-2,
+                err_msg=f"recurrent checkpoint mismatch at slot {slot}",
+            )
+
+    @parameterized.named_parameters(
+        dict(
             testcase_name="bound_under_gdn",
             overrides=dict(attention_mode=config.AttentionMode.GDN,
                            gate_lower_bound=-5.0),
@@ -340,11 +565,6 @@ class KdaAttentionV3Test(parameterized.TestCase):
             testcase_name="non_negative_bound",
             overrides=dict(gate_lower_bound=0.0),
             error=ValueError,
-        ),
-        dict(
-            testcase_name="speculative_decoding",
-            overrides=dict(num_spec_tokens=1),
-            error=NotImplementedError,
         ),
     )
     def test_rejects(self, overrides, error):

@@ -1,0 +1,26 @@
+steps:
+  - label: ":arrow_up: Promote vLLM to Last Known Good (LKG)"
+    key: "promote_lkg"
+    depends_on:
+      # --- Integration Tests ---
+      - "integration_qwen35_pcp4_dp4_disagg_correctness"
+      - "integration_qwen35_pcp8_dp8_disagg_correctness"
+      - "integration_qwen35_gpc_correctness"
+      - "integration_qwen35_apc_correctness"
+      - "integration_qwen35_gpc_global_dram_pool"
+      - "vllm_torchtpu_multihost_presubmit"
+      - "integration_compilation_cache_e2e"
+      # --- Perf & Eval Tests ---
+      - "perf_eval_general_tpu_v7x_8"
+      - "perf_qwen3_0_6b_tp1"
+      # --- Unit Tests ---
+      - "unit_tests_general_pr"
+      - "unit_tests_multichip_pr"
+      - "unit_tests_spec_decode_pr"
+      - "unit_tests_spec_decode_multichip_pr"
+    agents:
+      queue: cpu
+    commands:
+      - |
+        VLLM_LKG_HASH=$$(buildkite-agent meta-data get "VLLM_COMMIT_HASH")
+        bash .buildkite/scripts/update_lkg_version.sh "$$VLLM_LKG_HASH"

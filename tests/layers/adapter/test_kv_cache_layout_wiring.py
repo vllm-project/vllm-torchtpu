@@ -467,3 +467,35 @@ def test_default_layout_shape_needs_no_tpu_client(nhd, monkeypatch,
                                       dtype) == BASE.get_kv_cache_shape(
                                           4, 128, num_kv_heads, head_size,
                                           dtype)
+
+
+def test_shape_needs_no_config_for_the_probe_and_hd64(monkeypatch):
+    """Two calls must answer without reading the KV layout at all.
+
+    Reading it falls through to the KV connector, which needs a current vLLM
+    config. vLLM's `OffloadingConnectorWorker.register_kv_caches` probes this
+    method with no dtype and no config, and head_dim 64 routes to the hd64
+    kernel, which ignores the layout. Resolving the layout before those two
+    early returns made both raise `Current vLLM config is not set`.
+
+    Deliberately no config fixture: the other tests here wrap the body in
+    `set_current_vllm_config`, which is exactly what hides this.
+    """
+    from vllm import envs as vllm_envs
+    from vllm.v1.attention.backends.utils import set_kv_cache_layout
+
+    was_cached = vllm_envs._is_envs_cache_enabled()
+    vllm_envs.disable_envs_cache()
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    set_kv_cache_layout(None)
+    try:
+        assert (BATCHED.get_kv_cache_shape(4, 128, 1, 256,
+                                           "auto") == BASE.get_kv_cache_shape(
+                                               4, 128, 1, 256, "auto"))
+        assert (BATCHED.get_kv_cache_shape(4, 128, 1, 64,
+                                           BF16) == BASE.get_kv_cache_shape(
+                                               4, 128, 1, 64, BF16))
+    finally:
+        set_kv_cache_layout(None)
+        if was_cached:
+            vllm_envs.enable_envs_cache()
