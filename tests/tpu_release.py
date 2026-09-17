@@ -42,9 +42,10 @@ def tpu_device_owners() -> dict[str, int]:
             continue
         try:
             target = os.readlink(link)
-        except OSError:
+        except FileNotFoundError:
             # The process exited while the scan was walking its table, which
-            # is the outcome this module waits for.
+            # is the outcome this module waits for. Every other error is left
+            # to propagate.
             continue
         if _TPU_NODE.fullmatch(target):
             owners[target] = int(pid)
