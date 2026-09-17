@@ -17,14 +17,16 @@ GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
 
 def get_tpu_metadata(key: str = "") -> str | None:
     try:
+        clean_key = key.lstrip("/")
+        url = os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, clean_key)
         accelerator_type_request = requests.get(
-            os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),
+            url,
             headers=GCE_TPU_HEADERS,
             timeout=5,
         )
-        if (accelerator_type_request.status_code == 200
-                and accelerator_type_request.text):
-            return accelerator_type_request.text
+        if accelerator_type_request.status_code == 200:
+            text = accelerator_type_request.text.strip()
+            return text if text else None
         elif accelerator_type_request.status_code == 404:
             logger.debug(
                 "TPU GCE Metadata attribute %r not found (status code 404).",
@@ -32,18 +34,23 @@ def get_tpu_metadata(key: str = "") -> str | None:
         else:
             logger.error(
                 "Unable to poll TPU GCE Metadata for %r. Got "
-                f"status code: {accelerator_type_request.status_code} and "
-                f"content: {accelerator_type_request.text}", key)
+                "status code: %s and content: %s",
+                key,
+                accelerator_type_request.status_code,
+                accelerator_type_request.text,
+            )
     except requests.RequestException as e:
         logger.error("Unable to poll the TPU GCE Metadata: %s", e)
     return None
 
 
-def get_tpu_type() -> str:
+def get_tpu_type() -> str | None:
     tpu_type = envs.TPU_ACCELERATOR_TYPE
     if tpu_type is None:
         tpu_type = get_tpu_metadata(key="accelerator-type")
-    return tpu_type
+    if tpu_type:
+        tpu_type = tpu_type.strip()
+    return tpu_type or None
 
 
 @functools.cache
@@ -70,11 +77,13 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
         return pltpu.ChipVersion.TPU_7X
 
 
-def get_node_name() -> str:
+def get_node_name() -> str | None:
     tpu_name = envs.TPU_NAME
     if not tpu_name:
         tpu_name = get_tpu_metadata(key="instance-id")
-    return tpu_name
+    if tpu_name:
+        tpu_name = tpu_name.strip()
+    return tpu_name or None
 
 
 def get_node_worker_id() -> int:
@@ -84,7 +93,14 @@ def get_node_worker_id() -> int:
         worker_id = get_tpu_metadata(key="agent-worker-number")
     if worker_id is None:
         return 0
-    return int(worker_id)
+    try:
+        return int(worker_id)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid TPU worker ID %r; defaulting to worker ID 0.",
+            worker_id,
+        )
+        return 0
 
 
 def get_num_cores_per_chip() -> int:
@@ -104,6 +120,6 @@ def get_num_chips() -> int:
             int(entry) for entry in vfio_entries if entry.isdigit()
         ]
         return len(numeric_entries)
-    except FileNotFoundError as e:
+    except OSError as e:
         logger.warning("Failed to detect number of TPUs: %s", e)
         return 0
