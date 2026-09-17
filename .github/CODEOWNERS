@@ -15,8 +15,9 @@
 
 # Documentation
 /docs/ @bvrockwell @RobMulla @QiliangCui @qizzzh @maxwillzq
-/README.md @bvrockwell @QiliangCui @qizzzh
+/README.md @bvrockwell @RobMulla @QiliangCui @qizzzh
 /CONTRIBUTING.md @bvrockwell @RobMulla @QiliangCui @qizzzh
+/mkdocs.yml @bvrockwell @RobMulla @QiliangCui @qizzzh
 
 # Kernel Implementations
 /src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh
