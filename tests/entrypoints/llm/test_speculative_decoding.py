@@ -30,12 +30,37 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from tpu_release import wait_for_tpu_release
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
+
+
+@pytest.fixture(autouse=True)
+def _release_tpu_between_tests(request):
+    """Hold the next test until the finished one has given its chips back.
+
+    Tests here that tear an engine down in the test body leave nothing waiting
+    on it, so the next test's first engine races the previous one's workers for
+    the same device. This supplies that wait.
+
+    It is scoped to this module rather than to every test because other suites
+    keep a module-scoped engine alive on purpose, and waiting for those to exit
+    between tests would never finish.
+
+    A failed test is skipped. Its engine is still referenced by the traceback
+    pytest is holding, so the chips stay busy until the report is written, and
+    charging the full timeout there would bury the assertion that matters.
+    """
+    yield
+    report = getattr(request.node, "report_call", None)
+    if report is not None and report.failed:
+        return
+    wait_for_tpu_release()
+
 
 # Spec-decode e2e integration suite, split across the PR and nightly steps in
 # `.buildkite/pipeline_tests.yml`:
@@ -396,8 +421,7 @@ def _engine(model_name: str, speculative_config: dict | None, kwargs: dict):
         engine.shutdown()
         del llm, engine
         cleanup_dist_env_and_memory()
-        # Waiting for TPUs to be fully released.
-        time.sleep(15)
+        wait_for_tpu_release()
 
 
 def _test_correctness_helper(
@@ -894,7 +918,7 @@ def test_sd_correctness_greedy_multi_chunk(
         ref_llm.llm_engine.engine_core.shutdown()
         del ref_llm
         cleanup_dist_env_and_memory()
-        time.sleep(15)
+        wait_for_tpu_release()
 
         spec_llm = LLM(
             model=model_name,
@@ -1031,7 +1055,7 @@ def test_structured_output_spec_decode_correctness_greedy(
         ref_llm.llm_engine.engine_core.shutdown()
         del ref_llm
         cleanup_dist_env_and_memory()
-        time.sleep(15)
+        wait_for_tpu_release()
 
         # 2. Speculative run with the same structured params.
         spec_llm = LLM(model=model_name,
@@ -1190,7 +1214,7 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
         ref_llm.llm_engine.engine_core.shutdown()
         del ref_llm
         cleanup_dist_env_and_memory()
-        time.sleep(15)
+        wait_for_tpu_release()
 
         # 2. eagle3 speculative run with the same structured params.
         spec_llm = LLM(model=model_name,
@@ -1401,7 +1425,7 @@ def test_eagle3_correctness_greedy_multi_chunk(
         ref_llm.llm_engine.engine_core.shutdown()
         del ref_llm
         cleanup_dist_env_and_memory()
-        time.sleep(15)
+        wait_for_tpu_release()
 
         # 2. Speculative run, forced multi-chunk.
         spec_llm = LLM(model=model_name,
@@ -1475,7 +1499,7 @@ def test_eagle3_sharded_draft(
         ref_llm.llm_engine.engine_core.shutdown()
         del ref_llm
         cleanup_dist_env_and_memory()
-        time.sleep(15)
+        wait_for_tpu_release()
 
         # 2. Sharded eagle3 draft (draft_tp == target tp).
         spec_llm = LLM(
@@ -1767,8 +1791,7 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
             server.kill()
             server.wait(timeout=60)
         log.close()
-        # Waiting for TPUs to be fully released before the next engine starts.
-        time.sleep(15)
+        wait_for_tpu_release()
 
 
 def _qwen35_dp_kwargs() -> dict:

@@ -35,6 +35,16 @@ import pytest
 import torch
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Record each phase's result on the item so fixtures can read it.
+
+    A teardown fixture otherwise cannot tell a passing test from a failing one.
+    """
+    outcome = yield
+    setattr(item, f"report_{call.when}", outcome.get_result())
+
+
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
 
