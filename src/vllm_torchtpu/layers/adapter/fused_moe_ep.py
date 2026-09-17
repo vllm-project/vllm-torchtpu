@@ -48,12 +48,12 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order,
                                                ep_token_replica_groups)
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v2.host import (PACK4, U32_SUBLANE_TILE,
                                                      token_gather_smem_bytes)
 from vllm_torchtpu.logger import init_logger
@@ -236,17 +236,19 @@ def _build_op(mesh,
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
-    # seven are sharded on axis 0. `sharded_jax_op` passes the spec tuple
-    # straight to shard_map, so a heterogeneous tuple is what it wants; the
-    # bias is NOT closed over as a constant because it differs per layer and
-    # `_OPS` would then key one exported program per MoE layer.
+    # seven are sharded on axis 0. The spec tuple goes straight to shard_map,
+    # so a heterogeneous tuple is what it wants; the bias is NOT closed over
+    # as a constant because it differs per layer and `_OPS` would then key one
+    # exported program per MoE layer.
     input_specs = (spec, ) * 7 + ((PartitionSpec(), ) if has_score_bias else
                                   ())
-    # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
-    # where a shard_map result is recorded as replicated, so this rank's 2048
-    # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
-    # with only that line replaced.
-    op = sharded_jax_op(
+    # Stock jax_op. It used to size its outputs from the export's avals, where
+    # a shard_map result is recorded as replicated, so this rank's 2048 rows
+    # came back claiming the mesh-wide 16384; a local copy of JaxCallable with
+    # that one line replaced was the way around it. Torchtpu takes
+    # output_partition_specs itself now, which is the same information without
+    # a copy of anyone's source.
+    op = jax_op(
         name,
         moe_with_score_bias if has_score_bias else moe,
         mesh=mesh,
@@ -256,10 +258,9 @@ def _build_op(mesh,
         output_partition_specs=spec,
     )
 
-    # Deliberately replaces the shard-aware fake `sharded_jax_op` installed,
-    # which resolves the output aval by running a real `jax.export` every time
-    # Dynamo traces the op. This kernel returns the rows it was given, so the
-    # answer is known without exporting for it.
+    # Replaces the fake jax_op installs, which resolves the output aval by
+    # running a real `jax.export` every time Dynamo traces the op. This kernel
+    # returns the rows it was given, so the answer is known without exporting.
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 

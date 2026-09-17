@@ -438,22 +438,6 @@ def test_ep_rank_order_does_not_depend_on_where_the_devices_sit():
     assert orders[0] == orders[1] == tuple(range(8))
 
 
-def test_sharded_jax_op_still_matches_the_line_it_replaces():
-    """`sharded_jax_op` finds its one line by string-matching torch_tpu's
-    installed source. On a miss it falls back to stock with only a warning,
-    and the fused op then sizes its outputs mesh-wide -- a device-time shape
-    error, long after load. Fail here instead, on a torch_tpu bump."""
-    import inspect
-
-    from torch_tpu._internal.pallas import pallas as pallas_impl
-
-    from vllm_torchtpu.distributed import sharded_jax_op as sjo
-
-    source = inspect.getsource(pallas_impl.JaxCallable.__call__)
-    assert sjo._STOCK_PLACEHOLDER_LINE in source
-    assert sjo._build_sharded_callable_cls() is not pallas_impl.JaxCallable
-
-
 def test_supports_internal_mk_tracks_both_owners():
     """`supports_internal_mk` claims vLLM's dispatch/combine. Either owner --
     chunk pipelining or the fused kernel -- has to claim it alone, and the
