@@ -187,7 +187,7 @@ def test_non_grouped_plain_path_matches_manual_topk():
 @pytest.mark.cpu_test
 def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
     """The runner owns the gate; DSv4 must forward tokens without a second GEMM."""
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.forward_context import set_forward_context
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import \
         MoERunner
@@ -220,7 +220,7 @@ def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
     torch.nn.Module.__init__(model)
     model.gate = Gate(2, 2, bias=False)
     model.gate.weight.data.copy_(torch.tensor([[2., 0.], [0., 3.]]))
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     moe_config = SimpleNamespace(hidden_dim=2,
                                  tp_size=1,
                                  dp_size=1,
