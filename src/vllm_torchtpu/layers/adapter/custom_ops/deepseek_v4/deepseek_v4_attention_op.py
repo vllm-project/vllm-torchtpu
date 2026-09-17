@@ -249,8 +249,15 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         dtype: torch.dtype,
         prefix: str,
         cache_config,
+        backend_cls: type[AttentionBackend] | None = None,
     ) -> None:
-        super().__init__(head_dim, window_size, dtype, prefix, cache_config)
+        super().__init__(head_dim,
+                         window_size,
+                         dtype,
+                         prefix,
+                         cache_config,
+                         backend_cls=backend_cls
+                         or VllmDeepseekSparseSWABackend)
         # Initialize with default block size at construction time;
         # get_kv_cache_spec recomputes self.block_size from finalized runtime config.
         self.block_size = self._swa_block_size(cache_config.block_size,
@@ -288,6 +295,3 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=None,
         )
-
-    def get_attn_backend(self) -> type[AttentionBackend]:
-        return VllmDeepseekSparseSWABackend
