@@ -32,11 +32,6 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
-from vllm_torchtpu.distributed.pcp_rank_order import (
-    pcp_topology_order,
-    resolve_pcp_topology_order,
-    verify_pcp_topology_order,
-)
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -415,25 +410,24 @@ class TPUWorker(WorkerBase):
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
             )
-        # Ring order is the PCP group's rank order, and the group is built
-        # below. topology_aware_mesh needs open chips and a live process
-        # group, so this is the first point it can be asked -- and the last
-        # point the answer can still be applied.
-        group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
-        with (
-            set_current_vllm_config(self.vllm_config),
-            pcp_topology_order(group_ranks_by_name),
-        ):
+        # The PCP group keeps its natural rank order. Reordering it used to be
+        # how the ring was chosen, on the understanding that the ring followed
+        # the group's own rank order. google-pytorch/torch_tpu#3522 binds
+        # partition index p to PyTorch rank p, so the ring follows the global
+        # rank order and a permuted group no longer reaches it. What a permuted
+        # group would still do is make rank_in_group differ from the rank the
+        # kernels index by, while the host splits tokens by rank_in_group --
+        # the mismatch this path exists to avoid. The ring stays good because
+        # the rank -> chip binding is already a Hamiltonian cycle: libtpu opens
+        # devices in ascending PCI order, and consecutive ranks land on
+        # ICI-adjacent chips.
+        with set_current_vllm_config(self.vllm_config):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.tensor_parallel_size,
                 pipeline_model_parallel_size=self.parallel_config.pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
                 decode_context_model_parallel_size=self.parallel_config.decode_context_parallel_size,
             )
-        # The patch above substitutes rank lists on the way in; this reads the
-        # built groups back, so a patch that silently stopped applying fails
-        # here rather than costing a few percent unnoticed.
-        verify_pcp_topology_order(group_ranks_by_name)
 
         pp_group = get_pp_group()
         is_first_rank = pp_group.is_first_rank
