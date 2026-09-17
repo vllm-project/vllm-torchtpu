@@ -63,10 +63,12 @@ def build_pcp_streaming_callable(
     replicated. Torchtpu now supports ``output_partition_specs``, which is
     the same information by a shorter route, so a subclass is not needed.
     The subclass had also overridden ``__call__`` outright, so it silently
-    missed every argument Torchtpu's own ``__call__`` acquired --
-    ``mesh_device_ids``, which decides whether the kernel's DeviceAssignment
-    follows the caller's mesh, among them. Using the base JaxCallable
-    unmodified is what keeps that from recurring.
+    missed whatever Torchtpu's own ``__call__`` did -- including, before
+    google-pytorch/torch_tpu#3522, the step that made the kernel's
+    DeviceAssignment follow the caller's mesh rather than PJRT enumeration
+    order. #3522 makes that assignment canonical, so there is no longer a
+    per-call argument to miss; using the base JaxCallable unmodified is what
+    keeps a future one from being missed the same way.
     """
     signature = inspect.signature(fn, follow_wrapped=False)
     pallas_impl._verify_signature(signature)
