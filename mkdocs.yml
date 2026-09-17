@@ -52,7 +52,6 @@ nav:
     - 'Docker': docker.md
   - 'Developers Guides':
     - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md
-    - 'Pre-Public Development Guide': developers_guide/pre_public_dev_guide.md
     - 'TPU Patch Mechanism': tpu_patch_mechanism.md
     - 'Profiling': developers_guide/profiling.md
 

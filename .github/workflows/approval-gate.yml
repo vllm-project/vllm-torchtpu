@@ -8,7 +8,7 @@ name: Approval Gate
 # an unmet gate is reported grey rather than red -- see
 # MISSING_APPROVAL_CONCLUSION below. Making it block is two changes once
 # rulesets land: that env, and marking the check required. See
-# docs/developers_guide/pre_public_dev_guide.md.
+# docs/PRE_PUBLIC_DEV_GUIDE.md.
 #
 # The verdict is a check run this workflow owns and updates in place, not the
 # job's own pass/fail. A job's check run belongs to the run that created it, so

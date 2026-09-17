@@ -34,11 +34,9 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 - :material-code-tags:{ .lg .middle } __I Want to Build__
 
-    Contribute code and follow the pre-public submission flow.
+    Contribute code and follow the submission flow.
 
     [:octicons-arrow-right-24: Contributing](developers_guide/contributing.md)
-
-    [:octicons-arrow-right-24: Pre-Public Development Guide](developers_guide/pre_public_dev_guide.md)
 
 </div>
 
