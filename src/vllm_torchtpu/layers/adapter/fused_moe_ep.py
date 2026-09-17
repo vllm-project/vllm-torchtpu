@@ -444,8 +444,8 @@ def prebuild_fused_moe_ep(layer,
             _SMEM_OVERHEAD_BYTES)
         return None
     global _RANK_BUFFER
-    # The kernel's index is this rank's position in the mesh, which is ordered
-    # by device id, not its EP rank.
+    # The kernel's index is this rank's position in the mesh, which since
+    # #3522 is ordered by rank, so the position is the EP rank.
     _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
                                 dtype=torch.int32,
                                 device=layer.w13_weight.device)
