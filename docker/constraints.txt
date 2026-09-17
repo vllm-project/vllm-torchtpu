@@ -1,0 +1,36 @@
+# Transitive-dependency version snapshot.
+#
+# These packages used to arrive preinstalled in torch-tpu-base, which compiles
+# torch-tpu's pyproject with `--resolution lowest-direct`. Nothing in our own
+# dependency set constrains them, so building on the upstream Python image let
+# all 21 float to latest-compatible at once. This file restores the versions the
+# image was last green on, so that a dependency bump is a deliberate, one-at-a-
+# time act rather than a side effect of an unrelated change.
+#
+# These are constraints, not requirements: a version here is only applied if
+# something in the dependency graph pulls the package in at all.
+#
+# This is a compatibility snapshot, not a considered set of pins -- the versions
+# are whatever torch-tpu's lowest-direct resolution happened to pick. Relaxing
+# entries is encouraged; do it a few at a time so a regression is attributable.
+absl-py==2.0.0
+datasets==4.8.0
+filelock==3.32.6
+frozendict==2.0.2
+fsspec==2026.2.0
+google-api-core==2.24.2
+google-cloud-core==2.6.0
+google-cloud-storage==2.14.0
+huggingface-hub==1.5.0
+immutabledict==4.0.0
+numpy==2.0.0
+pillow==11.3.0
+propcache==0.5.2
+protobuf==6.33.6
+pytest==9.0.0
+pyzmq==27.0.0
+scipy==1.16.1
+tensorboard==2.20.0
+tqdm==4.66.3
+urllib3==2.7.0
+yarl==1.24.5

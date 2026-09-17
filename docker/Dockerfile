@@ -2,20 +2,35 @@
 # This Dockerfile builds images for running vLLM on Google Cloud TPUs.
 # It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
-ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
-
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
-FROM $BASE_IMAGE AS base
+#
+# Python 3.12 is a hard constraint, not a preference: tpu-raiden-torch publishes
+# cp312 wheels only. Moving off it needs raiden to ship the newer ABI first.
+FROM python:3.12-slim-bookworm AS base
 
-# Install curl for health checks (minimal for base)
-RUN apt-get update && apt-get install -y curl git build-essential gcc g++ cmake ninja-build && rm -rf /var/lib/apt/lists/*
+# curl for health checks, git so uv can clone the vllm source dependency, the
+# toolchain for packages that build from source, and libgoogle-perftools4 for
+# the tcmalloc allocator enabled below. build-essential already pulls in gcc,
+# g++, make and libc6-dev.
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 && rm -rf /var/lib/apt/lists/*
+
+# tcmalloc for every derived image. Set after the install above, so that
+# intermediate steps do not fail preloading a library that is not there yet.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
+
+# The interpreter lives in /usr/local, so Debian's usual /usr/bin/python3 does
+# not exist. Nothing in this repo needs it, but third-party tooling run inside
+# the image may assume the Debian path.
+RUN ln -sf "$(command -v python)" /usr/bin/python3 && \
+    pip install --no-cache-dir uv
 
 WORKDIR /workspace/vllm-torchtpu
 
-# Copy pyproject.toml to extract dependencies and read settings
-COPY pyproject.toml .
+# Copy pyproject.toml to extract dependencies and read settings, and the
+# transitive-dependency snapshot that pins what torch-tpu-base used to supply.
+COPY pyproject.toml docker/constraints.txt ./
 
 # If VLLM_COMMIT_HASH is passed (e.g., testing upstream HEAD in CI),
 # dynamically update pyproject.toml inside the container before building.
@@ -43,6 +58,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
+      --constraint constraints.txt \
       -r pyproject.toml
 
 
@@ -62,7 +78,7 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
     apt-get update && apt-get install -y google-cloud-cli gcsfuse && \
     rm -rf /var/lib/apt/lists/*
 
-# Clear PYTHONPATH inherited from base image if any
+# Start from an empty PYTHONPATH; the dev and prod stages set their own.
 ENV PYTHONPATH=""
 
 WORKDIR /workspace/vllm-torchtpu
@@ -84,6 +100,7 @@ FROM ci AS dev
 # dependency installation layer cache.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
+      --constraint constraints.txt \
       -r pyproject.toml \
       --extra test \
       --extra benchmarking
