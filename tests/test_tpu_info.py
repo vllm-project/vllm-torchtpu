@@ -180,3 +180,67 @@ def test_get_num_chips(monkeypatch):
     with patch("glob.glob", return_value=[]), patch(
             "os.listdir", side_effect=PermissionError("access denied")):
         assert tpu_info.get_num_chips() == 0
+
+
+def test_get_tpu_metadata_none_or_empty():
+    with patch("requests.get") as mock_get:
+        assert tpu_info.get_tpu_metadata(None) is None
+        assert tpu_info.get_tpu_metadata("") is None
+        assert tpu_info.get_tpu_metadata("   ") is None
+        mock_get.assert_not_called()
+
+
+def test_get_tpu_metadata_none_text_response():
+    with patch("requests.get", return_value=MockResponse(200, None)):
+        assert tpu_info.get_tpu_metadata("accelerator-type") is None
+
+
+def test_get_chip_version_tpu_prefix():
+    from jax.experimental.pallas import tpu as pltpu
+
+    assert tpu_info.get_chip_version("tpu-v6e-8") == pltpu.ChipVersion.TPU_V6E
+    assert tpu_info.get_chip_version("tpu7x-8") == pltpu.ChipVersion.TPU_7X
+    assert tpu_info.get_chip_version("v5e-8") == pltpu.ChipVersion.TPU_V5E
+    assert tpu_info.get_chip_version("tpu-v5e-8") == pltpu.ChipVersion.TPU_V5E
+    assert tpu_info.get_chip_version("v6e-8") == pltpu.ChipVersion.TPU_V6E
+
+
+def test_get_node_worker_id_from_env_empty_string(monkeypatch, caplog):
+    monkeypatch.setattr("vllm_torchtpu.envs.TPU_WORKER_ID", "")
+    with patch("requests.get", return_value=MockResponse(404, "Not Found")):
+        with caplog.at_level("WARNING"):
+            assert tpu_info.get_node_worker_id() == 0
+            # Empty string should fall back cleanly to metadata without invalid ID warning
+            assert "Invalid TPU worker ID" not in caplog.text
+
+
+def test_get_node_worker_id_negative(monkeypatch, caplog):
+    monkeypatch.setattr("vllm_torchtpu.envs.TPU_WORKER_ID", "-1")
+    with caplog.at_level("WARNING"):
+        assert tpu_info.get_node_worker_id() == 0
+        assert "Invalid negative TPU worker ID '-1'" in caplog.text
+
+
+def test_get_tpu_type_from_env_empty_string(monkeypatch):
+    monkeypatch.setattr("vllm_torchtpu.envs.TPU_ACCELERATOR_TYPE", "")
+    with patch("requests.get", return_value=MockResponse(200, "v6e-8")):
+        assert tpu_info.get_tpu_type() == "v6e-8"
+
+
+def test_get_node_name_from_env_empty_string(monkeypatch):
+    monkeypatch.setattr("vllm_torchtpu.envs.TPU_NAME", "")
+    with patch("requests.get", return_value=MockResponse(200, "node-custom")):
+        assert tpu_info.get_node_name() == "node-custom"
+
+
+def test_get_num_cores_per_chip_variants(monkeypatch):
+    for variant in ["V6E-8", "v5e-8", "tpu-v6e-8", "tpu-v5e-8", "V5LITEPOD-8"]:
+        monkeypatch.setattr("vllm_torchtpu.tpu_info.get_tpu_type",
+                            lambda v=variant: v)
+        assert tpu_info.get_num_cores_per_chip() == 1, f"Failed for {variant}"
+
+    for variant in ["TPU7X-8", "tpu7x-8", "v4-8", None]:
+        monkeypatch.setattr("vllm_torchtpu.tpu_info.get_tpu_type",
+                            lambda v=variant: v)
+        assert tpu_info.get_num_cores_per_chip() == 2, f"Failed for {variant}"
+

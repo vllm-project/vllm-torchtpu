@@ -15,19 +15,21 @@ GCE_TPU_ACCELERATOR_ENDPOINT = (
 GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
 
 
-def get_tpu_metadata(key: str = "") -> str | None:
+def get_tpu_metadata(key: str | None = "") -> str | None:
+    if not key or not isinstance(key, str) or not key.strip():
+        return None
     try:
-        clean_key = key.lstrip("/")
-        url = os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, clean_key)
-        accelerator_type_request = requests.get(
+        clean_key = key.strip().lstrip("/")
+        url = f"{GCE_TPU_ACCELERATOR_ENDPOINT}{clean_key}"
+        response = requests.get(
             url,
             headers=GCE_TPU_HEADERS,
             timeout=5,
         )
-        if accelerator_type_request.status_code == 200:
-            text = accelerator_type_request.text.strip()
+        if response.status_code == 200:
+            text = (response.text or "").strip()
             return text if text else None
-        elif accelerator_type_request.status_code == 404:
+        elif response.status_code == 404:
             logger.debug(
                 "TPU GCE Metadata attribute %r not found (status code 404).",
                 key)
@@ -36,8 +38,8 @@ def get_tpu_metadata(key: str = "") -> str | None:
                 "Unable to poll TPU GCE Metadata for %r. Got "
                 "status code: %s and content: %s",
                 key,
-                accelerator_type_request.status_code,
-                accelerator_type_request.text,
+                response.status_code,
+                response.text,
             )
     except requests.RequestException as e:
         logger.error("Unable to poll the TPU GCE Metadata: %s", e)
@@ -46,7 +48,7 @@ def get_tpu_metadata(key: str = "") -> str | None:
 
 def get_tpu_type() -> str | None:
     tpu_type = envs.TPU_ACCELERATOR_TYPE
-    if tpu_type is None:
+    if not tpu_type or not tpu_type.strip():
         tpu_type = get_tpu_metadata(key="accelerator-type")
     if tpu_type:
         tpu_type = tpu_type.strip()
@@ -65,7 +67,12 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     accelerator_type = accelerator_type or get_tpu_type() or ""
     # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
     # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
-    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    raw = accelerator_type.strip().lower()
+    if raw.startswith("tpu-"):
+        raw = raw.removeprefix("tpu-")
+    elif raw.startswith("tpu"):
+        raw = raw.removeprefix("tpu")
+    name = raw.split("-")[0]
     # v5litepod and v7x are the only two that still differ after stripping.
     name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
     try:
@@ -79,7 +86,7 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
 
 def get_node_name() -> str | None:
     tpu_name = envs.TPU_NAME
-    if not tpu_name:
+    if not tpu_name or not tpu_name.strip():
         tpu_name = get_tpu_metadata(key="instance-id")
     if tpu_name:
         tpu_name = tpu_name.strip()
@@ -89,12 +96,19 @@ def get_node_name() -> str | None:
 def get_node_worker_id() -> int:
     """For multi-host TPU VM, this returns the worker id for the current node."""
     worker_id = envs.TPU_WORKER_ID
-    if worker_id is None:
+    if worker_id is None or (isinstance(worker_id, str) and not worker_id.strip()):
         worker_id = get_tpu_metadata(key="agent-worker-number")
-    if worker_id is None:
+    if worker_id is None or (isinstance(worker_id, str) and not worker_id.strip()):
         return 0
     try:
-        return int(worker_id)
+        val = int(worker_id)
+        if val < 0:
+            logger.warning(
+                "Invalid negative TPU worker ID %r; defaulting to worker ID 0.",
+                worker_id,
+            )
+            return 0
+        return val
     except (ValueError, TypeError):
         logger.warning(
             "Invalid TPU worker ID %r; defaulting to worker ID 0.",
@@ -105,8 +119,14 @@ def get_node_worker_id() -> int:
 
 def get_num_cores_per_chip() -> int:
     tpu_type = get_tpu_type()
-    if tpu_type and tpu_type.startswith(("v5litepod", "v6e")):
-        return 1
+    if tpu_type:
+        clean = tpu_type.strip().lower()
+        if clean.startswith("tpu-"):
+            clean = clean.removeprefix("tpu-")
+        elif clean.startswith("tpu"):
+            clean = clean.removeprefix("tpu")
+        if clean.startswith(("v5litepod", "v5e", "v6e")):
+            return 1
     return 2
 
 
