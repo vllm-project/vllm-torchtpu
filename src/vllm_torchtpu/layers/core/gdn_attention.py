@@ -30,10 +30,10 @@ from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
                                            pooled_gdn_conv_state_bytes,
                                            pooled_gdn_ssm_state_bytes)
 from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.kernels.gdn.head_geometry import (GdnHeadGeometry,
+                                                     derive_gdn_head_geometry)
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
-from vllm_torchtpu.layers.core.utils import \
-    reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 
@@ -229,6 +229,42 @@ def _select_replicated_shard_for_pcp_rank(
                                    concat_axis=axis,
                                    tiled=True)
     return jax.lax.dynamic_slice_in_dim(exchanged, 0, shard_size, axis=axis)
+
+
+def _reorder_gdn_qkv_for_pcp(
+    tensor: jnp.ndarray,
+    geometry: GdnHeadGeometry,
+    *,
+    d_k: int,
+    d_v: int,
+    axis: int,
+) -> jnp.ndarray:
+    """Pack Q/K/V as one rank-major shard per PCP rank.
+
+    Q/K shards repeat when their head count is smaller than the PCP size; V
+    shards remain unique. The packed axis therefore grows when Q/K is
+    replicated and can still be split evenly by the existing PCP exchange.
+    """
+    if axis < 0:
+        axis += tensor.ndim
+    key_dim = geometry.num_kq_heads * d_k
+    value_dim = geometry.num_v_heads * d_v
+    expected_dim = 2 * key_dim + value_dim
+    if tensor.shape[axis] != expected_dim:
+        raise ValueError(
+            f"Expected concatenated QKV width {expected_dim} on axis {axis}, "
+            f"got shape={tensor.shape}.")
+
+    q, k, v = jnp.split(tensor, (key_dim, 2 * key_dim), axis=axis)
+    q_shards = jnp.split(q, geometry.num_unique_kq_shards, axis=axis)
+    k_shards = jnp.split(k, geometry.num_unique_kq_shards, axis=axis)
+    v_shards = jnp.split(v, geometry.parallel_size, axis=axis)
+    rank_major = []
+    for rank in range(geometry.parallel_size):
+        kq_shard = geometry.kq_shard_index(rank)
+        rank_major.extend(
+            (q_shards[kq_shard], k_shards[kq_shard], v_shards[rank]))
+    return jnp.concatenate(rank_major, axis=axis)
 
 
 def _pcp_rank_token_count_before(x: jnp.ndarray, ranks: jnp.ndarray, *,
@@ -500,20 +536,10 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     if mesh.shape[pcp_axis] != pcp_size:
         raise ValueError(f"pcp_size={pcp_size} does not match mesh axis size "
                          f"{mesh.shape[pcp_axis]}.")
-    if n_kq % pcp_size != 0:
-        raise ValueError(
-            f"n_kq={n_kq} must be divisible by pcp_size={pcp_size}.")
-    if n_v % pcp_size != 0:
-        raise ValueError(
-            f"n_v={n_v} must be divisible by pcp_size={pcp_size}.")
-
-    local_n_kq = n_kq // pcp_size
-    local_n_v = n_v // pcp_size
-    local_key_dim = n_kq * d_k
-    local_value_dim = n_v * d_v
-    shard_key_dim = local_n_kq * d_k
-    shard_value_dim = local_n_v * d_v
-    local_conv_state_dim = 2 * shard_key_dim + shard_value_dim
+    geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
+    local_n_kq = geometry.local_num_kq_heads
+    local_n_v = geometry.local_num_v_heads
+    local_conv_state_dim = geometry.local_conv_dim(d_k, d_v)
 
     token_spec = P(pcp_axis, None)
     replicated_spec = P()
@@ -552,11 +578,12 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         distribution_,
         seq_lens_,
     ):
-        interleaved_qkv = reorder_concatenated_tensor_for_sharding(
+        interleaved_qkv = _reorder_gdn_qkv_for_pcp(
             local_qkv,
-            [local_key_dim, local_key_dim, local_value_dim],
-            pcp_size,
-            -1,
+            geometry,
+            d_k=d_k,
+            d_v=d_v,
+            axis=-1,
         )
         local_ba = jnp.stack((local_b, local_a),
                              axis=-1).reshape(local_b.shape[0], -1)
@@ -606,22 +633,24 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         b_shard = ba_shard[:, :, 0]
         a_shard = ba_shard[:, :, 1]
 
-        conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
+        conv_weight_interleaved = _reorder_gdn_qkv_for_pcp(
             conv_weight_,
-            [local_key_dim, local_key_dim, local_value_dim],
-            pcp_size,
-            0,
+            geometry,
+            d_k=d_k,
+            d_v=d_v,
+            axis=0,
         )
         weight_shard = _select_replicated_shard_for_pcp_rank(
             conv_weight_interleaved, pcp_axis, pcp_size, axis=0)
         if conv_bias_ is None:
             bias_shard = None
         else:
-            conv_bias_interleaved = reorder_concatenated_tensor_for_sharding(
+            conv_bias_interleaved = _reorder_gdn_qkv_for_pcp(
                 conv_bias_,
-                [local_key_dim, local_key_dim, local_value_dim],
-                pcp_size,
-                0,
+                geometry,
+                d_k=d_k,
+                d_v=d_v,
+                axis=0,
             )
             bias_shard = _select_replicated_shard_for_pcp_rank(
                 conv_bias_interleaved, pcp_axis, pcp_size, axis=0)
@@ -1034,18 +1063,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     if mesh.shape[pcp_axis] != pcp_size:
         raise ValueError(f"pcp_size={pcp_size} does not match mesh axis size "
                          f"{mesh.shape[pcp_axis]}.")
-    if n_kq % pcp_size != 0:
-        raise ValueError(
-            f"n_kq={n_kq} must be divisible by pcp_size={pcp_size}.")
-    if n_v % pcp_size != 0:
-        raise ValueError(
-            f"n_v={n_v} must be divisible by pcp_size={pcp_size}.")
-
-    local_n_kq = n_kq // pcp_size
-    local_n_v = n_v // pcp_size
-    key_dim = n_kq * d_k
-    value_dim = n_v * d_v
-    local_conv_dim = 2 * local_n_kq * d_k + local_n_v * d_v
+    geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
+    local_n_v = geometry.local_num_v_heads
+    local_conv_dim = geometry.local_conv_dim(d_k, d_v)
 
     token_spec = P(pcp_axis, None)
     replicated_spec = P()
@@ -1110,22 +1130,24 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         b_shard = ba_shard[:, :, 0]
         a_shard = ba_shard[:, :, 1]
 
-        conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
+        conv_weight_interleaved = _reorder_gdn_qkv_for_pcp(
             conv_weight_,
-            [key_dim, key_dim, value_dim],
-            pcp_size,
-            0,
+            geometry,
+            d_k=d_k,
+            d_v=d_v,
+            axis=0,
         )
         weight_shard = _select_replicated_shard_for_pcp_rank(
             conv_weight_interleaved, pcp_axis, pcp_size, axis=0)
         if conv_bias_ is None:
             bias_shard = None
         else:
-            conv_bias_interleaved = reorder_concatenated_tensor_for_sharding(
+            conv_bias_interleaved = _reorder_gdn_qkv_for_pcp(
                 conv_bias_,
-                [key_dim, key_dim, value_dim],
-                pcp_size,
-                0,
+                geometry,
+                d_k=d_k,
+                d_v=d_v,
+                axis=0,
             )
             bias_shard = _select_replicated_shard_for_pcp_rank(
                 conv_bias_interleaved, pcp_axis, pcp_size, axis=0)
@@ -1242,17 +1264,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     if mesh.shape[pcp_axis] != pcp_size:
         raise ValueError(f"pcp_size={pcp_size} does not match mesh axis size "
                          f"{mesh.shape[pcp_axis]}.")
-    if n_kq % pcp_size != 0:
-        raise ValueError(
-            f"n_kq={n_kq} must be divisible by pcp_size={pcp_size}.")
-    if n_v % pcp_size != 0:
-        raise ValueError(
-            f"n_v={n_v} must be divisible by pcp_size={pcp_size}.")
-
-    local_n_kq = n_kq // pcp_size
-    local_n_v = n_v // pcp_size
-    local_key_dim = n_kq * d_k
-    local_value_dim = n_v * d_v
+    geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
+    local_n_kq = geometry.local_num_kq_heads
+    local_n_v = geometry.local_num_v_heads
 
     token_spec = P(pcp_axis, None)
     replicated_spec = P()
@@ -1291,11 +1305,12 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         distribution_,
         seq_lens_,
     ):
-        interleaved_qkv = reorder_concatenated_tensor_for_sharding(
+        interleaved_qkv = _reorder_gdn_qkv_for_pcp(
             local_qkv,
-            [local_key_dim, local_key_dim, local_value_dim],
-            pcp_size,
-            -1,
+            geometry,
+            d_k=d_k,
+            d_v=d_v,
+            axis=-1,
         )
         local_ba = jnp.stack((local_b, local_a),
                              axis=-1).reshape(local_b.shape[0], -1)
@@ -1345,22 +1360,24 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         b_shard = ba_shard[:, :, 0]
         a_shard = ba_shard[:, :, 1]
 
-        conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
+        conv_weight_interleaved = _reorder_gdn_qkv_for_pcp(
             conv_weight_,
-            [local_key_dim, local_key_dim, local_value_dim],
-            pcp_size,
-            0,
+            geometry,
+            d_k=d_k,
+            d_v=d_v,
+            axis=0,
         )
         weight_shard = _select_replicated_shard_for_pcp_rank(
             conv_weight_interleaved, pcp_axis, pcp_size, axis=0)
         if conv_bias_ is None:
             bias_shard = None
         else:
-            conv_bias_interleaved = reorder_concatenated_tensor_for_sharding(
+            conv_bias_interleaved = _reorder_gdn_qkv_for_pcp(
                 conv_bias_,
-                [local_key_dim, local_key_dim, local_value_dim],
-                pcp_size,
-                0,
+                geometry,
+                d_k=d_k,
+                d_v=d_v,
+                axis=0,
             )
             bias_shard = _select_replicated_shard_for_pcp_rank(
                 conv_bias_interleaved, pcp_axis, pcp_size, axis=0)
