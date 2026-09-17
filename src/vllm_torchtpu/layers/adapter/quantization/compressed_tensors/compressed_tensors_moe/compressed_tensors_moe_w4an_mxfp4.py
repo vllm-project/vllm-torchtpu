@@ -1,3 +1,6 @@
+import math
+import zlib
+
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -56,16 +59,12 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
     def _initialize_dummy_quantized_weights(self,
                                             layer: RoutedExperts) -> None:
-        """Initialize integer checkpoint containers for dummy model loading.
+        """Use finite, nonzero random FP4 weights for meaningful dummy runs.
 
-        vLLM's dummy loader randomizes floating-point parameters but leaves
-        integer parameters untouched. MXFP4 packed weights and E8M0 scales are
-        uint8 tensors allocated with ``torch.empty``, so leaving them untouched
-        can produce invalid scales and NaNs after the first MoE layer. Besides
-        making dummy output unstable, NaN router logits make top-k routing
-        collapse onto a fixed set of experts and invalidate performance
-        measurements. Zero is a finite, deterministic encoding for both the
-        packed FP4 values and E8M0 scale containers.
+        The upstream dummy loader skips integer checkpoint containers. Encode
+        independent +/-0.5 values and a power-of-two fan-in scale instead of
+        zero experts, which erase token-dependent routed computation. Generate
+        on CPU to avoid an extra full-size random tensor in TPU HBM.
         """
         vllm_config = get_current_vllm_config_or_none()
         if vllm_config is None:
@@ -74,9 +73,26 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         load_format = getattr(load_format, "value", load_format)
         if str(load_format).lower() != "dummy":
             return
-        for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,
-                          layer.w2_weight_packed, layer.w2_weight_scale):
-            self._loaded_data(parameter).zero_()
+        seed = zlib.crc32(
+            str(getattr(layer, "layer_name", "experts")).encode())
+        seed += 1234 + int(self.moe.ep_rank) * 104729 + int(self.moe.tp_rank)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        for packed_param, scale_param in (
+            (layer.w13_weight_packed, layer.w13_weight_scale),
+            (layer.w2_weight_packed, layer.w2_weight_scale),
+        ):
+            packed = self._loaded_data(packed_param)
+            value = torch.randint(0,
+                                  256,
+                                  packed.shape,
+                                  dtype=torch.uint8,
+                                  device="cpu",
+                                  generator=generator)
+            value.bitwise_and_(0x88).bitwise_or_(0x11)
+            packed.copy_(value)
+            fan_in = packed.shape[-1] * 2
+            scale_code = 127 - round(0.5 * math.log2(fan_in))
+            self._loaded_data(scale_param).fill_(scale_code)
 
     def create_weights(
         self,
@@ -230,23 +246,41 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = self._tpu_activation_str
-        assert activation_str is not None, (
-            "[moe] process_weights_after_loading did not run for this layer")
-
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
+        return self.apply_with_routing(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            pipelined=enable_pipelined_collective_and_compute())
+
+    def apply_with_routing(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        pipelined: bool = False,
+    ) -> torch.Tensor:
+        """Run experts from preselected routes, including padding masking.
+
+        SP callers gather the small top-k tensors instead of full logits.
+        Rows here are in the same global token order as ``x``.
+        """
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer")
         # Ensure correct type for routing inputs
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
 
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids,
-            topk_weights,
-            is_local_tensor=enable_pipelined_collective_and_compute())
+            topk_ids, topk_weights, is_local_tensor=pipelined)
 
         kwargs = {
             "hidden_states": x,
@@ -264,7 +298,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             "rhs_quant_dtype": None,
             "skip_padded_tokens": True,
         }
-        if enable_pipelined_collective_and_compute():
+        if pipelined:
             return pipelined_fused_moe_gmm(**kwargs)
 
         # Execute GMM Kernel with native fp4 weights and scales

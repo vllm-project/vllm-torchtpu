@@ -333,6 +333,70 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
     rhs_quant_dtype = jnp.float4_e2m1fn
 
+    @property
+    def supports_internal_mk(self) -> bool:
+        # An armed layer owns its own dispatch and combine, so vLLM must not
+        # bracket it with an all-gather/reduce-scatter of its own.
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import \
+            fused_moe_ep_supported
+        return (enable_pipelined_collective_and_compute()
+                or fused_moe_ep_supported(self))
+
+    def _prebuild_w4a8(self, layer: RoutedExperts, activation: str,
+                       w13_weight_padded: torch.Tensor,
+                       w2_weight_padded: torch.Tensor,
+                       orig_intermediate_size: int) -> Any | None:
+        """Admit the fused EP layout before the weights are quantized to it.
+
+        Runs on the padded but still-dequantized tensors: the requantized
+        layout is a function of their shapes and the block size, so admission
+        needs nothing lossy to have happened yet, and the meta tensors below
+        describe exactly what `_requantize_native_fp4` goes on to produce.
+        Shapes are read off those tensors rather than recomputed so the two
+        cannot drift apart. Returns the op, or None to leave this layer on GMM.
+        """
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import \
+            prebuild_fused_moe_ep
+
+        if not (envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
+                and layer.moe_config.moe_parallel_config.use_ep):
+            return None
+        block = REQUANTIZED_BLOCK_SIZE
+        if min(block, orig_intermediate_size) != block:
+            # w2 would be quantized at a smaller block than w13, and the op
+            # closes over one `rhs_qb` that both matmuls read.
+            logger.info_once(
+                "DeepSeek-V4 MXFP4 fused EP not engaged: w2's block is "
+                "min(%d, intermediate=%d), which differs from w13's %d.",
+                block, orig_intermediate_size, block)
+            return None
+        experts, hidden, w13_channels = w13_weight_padded.shape
+        inter = w2_weight_padded.shape[1]
+        # Torch stores two FP4 values per element of a `float4_e2m1fn_x2`
+        # tensor, so every shape here has its LAST axis halved against the
+        # logical one; the scales are unpacked f32 and keep theirs.
+        weights = (
+            torch.empty((experts, hidden, w13_channels // 2),
+                        dtype=torch.float4_e2m1fn_x2,
+                        device="meta"),
+            torch.empty((experts, inter, hidden // 2),
+                        dtype=torch.float4_e2m1fn_x2,
+                        device="meta"),
+            torch.empty((experts, hidden // block, 1, w13_channels),
+                        dtype=torch.float32,
+                        device="meta"),
+            torch.empty((experts, inter // block, 1, hidden),
+                        dtype=torch.float32,
+                        device="meta"),
+        )
+        return prebuild_fused_moe_ep(layer,
+                                     topk=layer.moe_config.experts_per_token,
+                                     renormalize=layer.renormalize,
+                                     activation=activation,
+                                     weight_format="fp4",
+                                     rhs_qb=block,
+                                     weights=weights)
+
     def _resolve_tpu_activation(self, layer) -> str:
         # This variant runs the clamped kernel, so the string is not
         # recoverable from layer.activation alone -- resolving it at apply
@@ -444,15 +508,21 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         w2_weight_padded: torch.Tensor,
         orig_intermediate_size: int,
         device: torch.device,
+        pack: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize padded tensors to native FP4 K-major layout on TPU."""
+        """Quantize padded tensors to native FP4 K-major layout on TPU.
+
+        `pack=False` leaves the fp4 pairs unpacked as `float4_e2m1fn_x2`,
+        which is what the fused EP kernel reads; the GMM path wants the uint8
+        packing its `should_unpack` step undoes. Same values either way.
+        """
         w13_block_size = REQUANTIZED_BLOCK_SIZE
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
 
         w13_weight_processed, w13_weight_scale = quantize_native_fp4_kmajor(
-            w13_weight_padded.to(device), block=w13_block_size)
+            w13_weight_padded.to(device), block=w13_block_size, pack=pack)
         w2_weight_processed, w2_weight_scale = quantize_native_fp4_kmajor(
-            w2_weight_padded.to(device), block=w2_block_size)
+            w2_weight_padded.to(device), block=w2_block_size, pack=pack)
 
         return (w13_weight_processed, w2_weight_processed, w13_weight_scale,
                 w2_weight_scale)
@@ -471,11 +541,23 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         activation_str = self._set_tpu_activation(layer)
 
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason,
+            register_score_bias_buffer)
+
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)
+        # Decided before the quantization, not after: the two paths differ
+        # only in whether the fp4 pairs cross the bridge packed, and that is
+        # an argument to the quantizer.
+        op = self._prebuild_w4a8(layer, activation_str, w13_weight_padded,
+                                 w2_weight_padded, orig_intermediate)
         (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-         w2_weight_scale) = self._requantize_native_fp4(
-             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+         w2_weight_scale) = self._requantize_native_fp4(w13_weight_padded,
+                                                        w2_weight_padded,
+                                                        orig_intermediate,
+                                                        device,
+                                                        pack=op is None)
         self._release_source_weights(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
@@ -511,3 +593,52 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
         )
+
+        setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        if op is not None:
+            reason = fused_moe_ep_unsupported_reason(
+                layer, (layer.w13_weight, layer.w2_weight,
+                        layer.w13_weight_scale, layer.w2_weight_scale),
+                activation_str,
+                weight_format="fp4",
+                rhs_qb=REQUANTIZED_BLOCK_SIZE)
+            # Admission already accepted this exact layout on meta tensors, so
+            # a mismatch here is a preparation bug rather than a fallback case.
+            assert reason is None, (
+                "DeepSeek-V4 MXFP4 fused EP prepared weights violate the "
+                f"admitted layout: {reason}")
+            register_score_bias_buffer(layer)
+            # The kernel takes [E, K/block, N]; do the squeeze once here
+            # rather than per layer per step inside the compiled forward.
+            layer.register_buffer(
+                "_tpu_fused_w13_scale",
+                layer.w13_weight_scale.squeeze(2).contiguous(),
+                persistent=False)
+            layer.register_buffer(
+                "_tpu_fused_w2_scale",
+                layer.w2_weight_scale.squeeze(2).contiguous(),
+                persistent=False)
+            logger.info_once(
+                "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d",
+                REQUANTIZED_BLOCK_SIZE)
+
+    def _forward_monolithic_tpu(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            fused_moe_ep, fused_moe_ep_supported, score_bias_operand)
+        if fused_moe_ep_supported(self):
+            # This rank's own tokens in and out: the kernel scores, selects,
+            # dispatches, runs both matmuls and combines inside one program,
+            # so `input_ids` has no reader here -- hash-routed layers are
+            # refused at admission and take the branch below instead.
+            return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
+                                layer._tpu_fused_w13_scale,
+                                layer._tpu_fused_w2_scale, router_logits,
+                                score_bias_operand(layer))
+        return super()._forward_monolithic_tpu(layer, x, router_logits,
+                                               input_ids)

@@ -110,7 +110,7 @@ class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             num_kv_heads=1,
             head_size=align_to(128 + 1, 128),
             dtype=torch.uint8,
-            compress_ratio=min(self.compress_ratio, block_size),
+            tokens_per_state=min(self.compress_ratio, block_size),
             alignment=None,
         )
 

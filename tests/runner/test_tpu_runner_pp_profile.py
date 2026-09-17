@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from vllm.config import CacheConfig
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
@@ -272,7 +273,8 @@ def _capacity_runner():
     runner._attention_kv_cache_group_id = 0
     runner.input_batch = SimpleNamespace(
         block_table=[SimpleNamespace(max_num_blocks_per_req=2079)])
-    runner.cache_config = SimpleNamespace(block_size=4224)
+    runner.cache_config = CacheConfig(block_size=4224)
+    runner.cache_config.kv_cache_layout = "LBHNC"
     runner.model_config = SimpleNamespace(
         dtype=torch.bfloat16, get_num_attention_heads=lambda _config: 32)
     runner.kv_cache_dtype = torch.float8_e4m3fn
@@ -299,8 +301,6 @@ def _attention_layers(monkeypatch, batched, capacity=None):
     monkeypatch.setattr(
         "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
         lambda _config, _layer_type: layers)
-    monkeypatch.setattr("vllm_torchtpu.runner.tpu_runner.get_kv_cache_layout",
-                        lambda: "HND")
     sized = []
 
     def schedule_capacity(*, mode, **kwargs):

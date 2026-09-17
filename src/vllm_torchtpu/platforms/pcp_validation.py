@@ -87,7 +87,6 @@ class PcpStaticSupportValidator:
     def validate_platform_config(
         vllm_config: Any,
         *,
-        multihost_backend: str | None,
         kv_cache_layout: str,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
@@ -128,9 +127,6 @@ class PcpStaticSupportValidator:
                 raise NotImplementedError(
                     "PCP MTP currently requires kv_role=kv_producer, got "
                     f"{config.kv_role!r}.")
-        if multihost_backend:
-            raise NotImplementedError(
-                "PCP runner path does not support TPU multihost yet.")
         if config.interleave_size <= 0:
             raise ValueError(
                 "PCP runner path requires cp_kv_cache_interleave_size > 0.")

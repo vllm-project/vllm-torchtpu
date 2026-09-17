@@ -1039,10 +1039,11 @@ def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
         for eqn in dots)
 
 
-def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
-    # With skip_padded_tokens, gmm output rows past the valid prefix are
-    # uninitialized (NaN here); the one-hot combine must zero them before the
-    # matmul or they would spread to every token in the batch.
+def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
+    # gmm output rows past the valid prefix (non-local experts under EP, or
+    # skipped padded tokens) are never written and may hold NaN; the one-hot
+    # combine must zero them before the matmul, without any flag, or they
+    # would spread to every token in the batch.
     kwargs = _small_moe_gmm_kwargs()
     rows = kwargs["argsort_revert_indices"].size
     valid_rows = rows - 2
@@ -1059,11 +1060,9 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
     kwargs["valid_mask_flat"] = revert < valid_rows
     kwargs["group_sizes"] = jnp.array([valid_rows], dtype=jnp.int32)
 
-    out = fused_moe_gmm.moe_gmm(
-        **{
-            **kwargs,
-            "onehot_moe_permute_threshold": rows,
-            "skip_padded_tokens": True,
-        })
+    out = fused_moe_gmm.moe_gmm(**{
+        **kwargs,
+        "onehot_moe_permute_threshold": rows,
+    })
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))

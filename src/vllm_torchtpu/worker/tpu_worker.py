@@ -21,6 +21,7 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              get_pp_group,
                                              get_tensor_model_parallel_rank,
                                              init_distributed_environment)
+from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -132,6 +133,18 @@ class TPUWorker(WorkerBase):
             self.profile_dir = torch_profiler_dir
             logger.info("Profiling enabled. Traces will be saved to: %s",
                         self.profile_dir)
+
+    def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
+        # TPU resolves before model load because layout determines its page
+        # geometry. Check the actual loaded backends when engine core publishes
+        # that choice; its pre-resolved-config path does not validate them.
+        supported = self.get_supported_kv_cache_layouts()
+        if kv_cache_layout not in supported:
+            raise ValueError(
+                f"TPU KV cache layout {kv_cache_layout} is incompatible with "
+                f"the loaded attention backends; supported layouts: {supported}"
+            )
+        super().set_kv_cache_layout(kv_cache_layout)
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -296,10 +309,19 @@ class TPUWorker(WorkerBase):
         else:
             dist_init_method = self.distributed_init_method
             parsed = urlparse(dist_init_method)
-            if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
+            if parsed.scheme == "tcp" and parsed.hostname and parsed.port:
+                os.environ.setdefault("MASTER_ADDR", parsed.hostname)
+                os.environ.setdefault("MASTER_PORT", str(parsed.port))
+            elif parsed.scheme == "file" and parsed.path:
+                # vLLM 0.29's local executors rendezvous through FileStore.
+                # Keep that store for torch.distributed. Multi-rank PjRt also
+                # requires MASTER_PORT, chosen once by the parent's shared
+                # slice preparation and inherited by all local workers.
+                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            else:
                 raise ValueError(
-                    "Expected tcp://<host>:<port> distributed_init_method, "
-                    f"got: {dist_init_method!r}")
+                    "Expected tcp://<host>:<port> or file://<path> "
+                    f"distributed_init_method, got: {dist_init_method!r}")
             if pcp_size > 1:
                 logger.info(
                     "PCP native-rank TPU binding | rank=%d "
@@ -351,8 +373,6 @@ class TPUWorker(WorkerBase):
                     binding.local_rank,
                     binding.local_world_size,
                 )
-            os.environ.setdefault("MASTER_ADDR", parsed.hostname)
-            os.environ.setdefault("MASTER_PORT", str(parsed.port))
 
         if not self.devices:
             self.devices = [torch.device("tpu")]
@@ -617,6 +637,7 @@ class TPUWorker(WorkerBase):
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
+        set_torch_threads_for_runtime()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

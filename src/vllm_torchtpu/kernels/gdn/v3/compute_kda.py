@@ -356,58 +356,72 @@ def chunked_kda(
         out_list.append(out.swapaxes(0, 1))
         state_list.append(state)
     out = jnp.stack(out_list, axis=0)
-    # The caller expects one state per window position. KDA rejects
-    # speculative decoding, so `window_size` is always 1 and the only
-    # checkpoint is the end-of-tile state.
+    # Chunked KDA is only selected for a one-checkpoint window; speculative
+    # verify uses the recurrent scan below.
     state = jnp.stack(state_list, axis=0)[:, jnp.newaxis]
     return out, state
 
 
 def recurrent_kda_per_seq(
-    q_curr: jax.Array,  # (num_kq_heads, kq_head_dim)
-    k_curr: jax.Array,  # (num_kq_heads, kq_head_dim)
-    v_curr: jax.Array,  # (num_v_heads, v_head_dim)
-    gating_curr: jax.Array,  # (num_v_heads, kq_head_dim)
-    beta_curr: jax.Array,  # (num_v_heads, 1)
+    q: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
+    k: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
+    v: jax.Array,  # (num_v_heads, chunk, v_head_dim)
+    gating_decay: jax.Array,  # (num_v_heads, chunk, kq_head_dim)
+    beta: jax.Array,  # (num_v_heads, chunk, 1)
     state: jax.Array,  # (num_v_heads, kq_head_dim, v_head_dim)
     cfgs: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    # Repeat Q and K for GQA
-    q_heads = jnp.repeat(q_curr, cfgs.v_per_kq_head,
-                         axis=0)[:, None, :]  # (num_v_heads, 1, kq_head_dim)
-    k_heads = jnp.repeat(k_curr, cfgs.v_per_kq_head,
-                         axis=0)[:, None, :]  # (num_v_heads, 1, kq_head_dim)
-    k_heads_t = compute_gdn.fused_transpose_broadcast(
-        k_heads, src_dim=2, dst_dim=1)  # (num_v_heads, kq_head_dim, 1)
+    """Run the token recurrence and retain one state per verify position.
 
-    v_heads = v_curr[:, None, :]  # (num_v_heads, 1, v_head_dim)
-    beta_heads = beta_curr[:, None]  # (num_v_heads, 1, 1)
-    gating_decay = gating_curr[..., None]  # (num_v_heads, kq_head_dim, 1)
-
-    state_updated = state * gating_decay
-
+    BATCHED speculative decode sets ``chunk_size == window_size`` so every
+    post-token state is retained.  The ordinary decode case is the degenerate
+    one-token window.  Invalid ragged tail rows have q/k/v/beta zeroed and a
+    unit decay, therefore their output is zero and their state is unchanged;
+    memory_ref only writes checkpoints belonging to real rows.
+    """
+    out_list = []
+    state_list = []
     contract_dk = (((2, ), (1, )), ((0, ), (0, )))
-    v_updated = jax.lax.dot(
-        k_heads,
-        state_updated,
-        dimension_numbers=contract_dk,
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
 
-    v_diff = v_heads - v_updated
-    v_new = beta_heads * v_diff
+    for c_idx in range(cfgs.chunk_size):
+        # Repeat Q and K for GQA.  K3 currently has one V head per QK head,
+        # but keeping this here preserves the generic KDA ABI.
+        q_heads = jnp.repeat(q[:, c_idx], cfgs.v_per_kq_head,
+                             axis=0)[:,
+                                     None, :]  # (num_v_heads, 1, kq_head_dim)
+        k_heads = jnp.repeat(k[:, c_idx], cfgs.v_per_kq_head,
+                             axis=0)[:,
+                                     None, :]  # (num_v_heads, 1, kq_head_dim)
+        k_heads_t = compute_gdn.fused_transpose_broadcast(
+            k_heads, src_dim=2, dst_dim=1)  # (num_v_heads, kq_head_dim, 1)
 
-    state_new = k_heads_t * v_new
-    state = state_updated + state_new
+        v_heads = v[:, c_idx:c_idx + 1]
+        beta_heads = beta[:, c_idx:c_idx + 1]
+        decay = gating_decay[:, c_idx, :, None]
 
-    out = jax.lax.dot(
-        q_heads,
-        state,
-        dimension_numbers=contract_dk,
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
+        state_updated = state * decay
+        v_updated = jax.lax.dot(
+            k_heads,
+            state_updated,
+            dimension_numbers=contract_dk,
+            preferred_element_type=jnp.float32,
+        ).astype(cfgs.dtypes.compute)
 
-    return out[:, 0, :], state
+        v_new = beta_heads * (v_heads - v_updated)
+        state = state_updated + k_heads_t * v_new
+
+        out = jax.lax.dot(
+            q_heads,
+            state,
+            dimension_numbers=contract_dk,
+            preferred_element_type=jnp.float32,
+        ).astype(cfgs.dtypes.compute)
+        out_list.append(out[:, 0, :])
+
+        if c_idx >= cfgs.chunk_size - cfgs.window_size:
+            state_list.append(state)
+
+    return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
 def recurrent_kda(
@@ -422,35 +436,41 @@ def recurrent_kda(
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
-
     mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
-    valid_seq_mask = (real_sizes[:, None, None] > 0).astype(mask_dtype)
+    iota = jax.lax.broadcasted_iota(
+        mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2)
+    mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
 
-    # squeeze unnecessary axis
-    q = q_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    k = k_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    v = v_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    a = a_compact[:, :, 0, 0, :].astype(jnp.float32)
-
-    # Beta: [seqs, num_v_heads, 1]
-    b = b_compact[:, 0, 0, 0, :cfg.num_v_heads, None].astype(jnp.float32)
-
-    q = jnp.where(valid_seq_mask, q, 0.0)
-    k = jnp.where(valid_seq_mask, k, 0.0)
-    v = jnp.where(valid_seq_mask, v, 0.0)
+    q = jnp.where(mask, q_compact.astype(cfg.dtypes.compute), 0.0)
+    k = jnp.where(mask, k_compact.astype(cfg.dtypes.compute), 0.0)
+    v = jnp.where(mask, v_compact.astype(cfg.dtypes.compute), 0.0)
 
     q = _l2_norm_f32(q) * (cfg.kq_head_dim**-0.5)
     k = _l2_norm_f32(k)
 
     # Delta rule step-size beta in [0, 1]
-    beta = jnp.where(valid_seq_mask, jax.nn.sigmoid(b), 0.0)
+    beta = jnp.where(mask, jax.nn.sigmoid(b_compact.astype(jnp.float32)), 0.0)
+    if cfg.window_size > 1:
+        # Match `_activate_beta` feeding the one-token K3 decode kernel: its
+        # sigmoid result is rounded to the model activation dtype before the
+        # recurrent update. Return to fp32 here so the fused scan itself keeps
+        # its existing compute dtype and layout.
+        beta = beta.astype(cfg.dtypes.act_out).astype(jnp.float32)
+    beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
+    beta = beta[:, :cfg.num_v_heads, :, 0, :]
 
-    a_log_kda = a_log.reshape(1, cfg.num_v_heads, 1).astype(jnp.float32)
-    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads,
+    a_log_kda = a_log.reshape(1, cfg.num_v_heads, 1, 1, 1).astype(jnp.float32)
+    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads, 1, 1,
                                   cfg.kq_head_dim).astype(jnp.float32)
-    gating_log = activate_gate(a, a_log_kda, dt_bias_kda, cfg)
-    gating_log = jnp.where(valid_seq_mask, gating_log, 0.0)
-    gating_decay = jnp.exp(gating_log)  # [seqs, num_v_heads, kq_head_dim]
+    gating_log = activate_gate(a_compact, a_log_kda, dt_bias_kda, cfg)
+    # Invalid ragged tail tokens must leave the state untouched.
+    gating_log = jnp.where(mask, gating_log, 0.0)
+    gating_decay = jnp.exp(gating_log)[:, :, :, 0, :]
+
+    # Drop the compact layout's singleton dimension before the token scan.
+    q = q[:, :, :, 0, :]
+    k = k[:, :, :, 0, :]
+    v = v[:, :, :, 0, :]
 
     out_list = []
     new_state_list = []
@@ -464,10 +484,9 @@ def recurrent_kda(
             state_prev[idx],
             cfg,
         )
-        out_list.append(out[None, :])
+        out_list.append(out)
         new_state_list.append(state)
 
     out = jnp.stack(out_list, axis=0)
-    # One state per window position; see `chunked_kda`.
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)[:, jnp.newaxis]
+    new_recurrent_state = jnp.stack(new_state_list, axis=0)
     return out, new_recurrent_state

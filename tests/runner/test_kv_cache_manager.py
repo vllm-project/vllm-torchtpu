@@ -23,7 +23,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig, VllmConfig)
+                         SchedulerConfig, VllmConfig,
+                         get_current_vllm_config_or_none)
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
@@ -43,6 +44,7 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.runner.kv_cache_manager import (
     KVCacheManager, check_kv_caches_cover_block_ids)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 
 def _attention_layer_mock():
@@ -102,21 +104,25 @@ def test_check_kv_caches_cover_block_ids_rejects_short_cache(allocated_blocks):
         dtype=torch.bfloat16,
         page_size_padded=16384,
     )
-    tensor = KVCacheTensor(size=16384 * 4, shared_by=["attn.0", "attn.1"])
+    tensor = KVCacheTensor(size=16384 * 8,
+                           layers=["attn.0", "attn.1"],
+                           layer_stride=16384 * 4,
+                           block_stride=16384)
 
     with pytest.raises(ValueError,
                        match="scheduler can issue block IDs") as exc:
         check_kv_caches_cover_block_ids(
             {
                 name: torch.empty((allocated_blocks, 1))
-                for name in tensor.shared_by
+                for name in tensor.layers
             },
             [tensor],
             4,
             lambda _: spec,
         )
     assert f"attn.0 holds {allocated_blocks} blocks" in str(exc.value)
-    assert "2 layer(s) share this 65536-byte allocation" in str(exc.value)
+    assert "2 layer(s) in this 131072-byte backing allocation" in str(
+        exc.value)
 
 
 def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
@@ -124,8 +130,10 @@ def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
                              num_kv_heads=2,
                              head_size=128,
                              dtype=torch.bfloat16)
-    tensor = KVCacheTensor(size=spec.page_size_bytes * 4,
-                           shared_by=["attn.0", "attn.1"])
+    tensor = KVCacheTensor(size=spec.page_size_bytes * 8,
+                           layers=["attn.0", "attn.1"],
+                           layer_stride=spec.page_size_bytes * 4,
+                           block_stride=spec.page_size_bytes)
     with pytest.raises(ValueError, match="Missing KV cache.*attn.1"):
         check_kv_caches_cover_block_ids({"attn.0": torch.empty((4, 1))},
                                         [tensor], 4, lambda _: spec)
@@ -349,7 +357,10 @@ class TestKVCacheManager:
         ]
 
         kv_cache_tensors = [
-            KVCacheTensor(size=tensor_size, shared_by=layer_names)
+            KVCacheTensor(size=tensor_size,
+                          layers=[name],
+                          layer_stride=tensor_size,
+                          block_stride=uniform_size) for name in layer_names
         ]
         kv_cache_config = KVCacheConfig(num_blocks=num_blocks,
                                         kv_cache_tensors=kv_cache_tensors,
@@ -441,7 +452,10 @@ class TestKVCacheManager:
                                         kv_cache_tensors=[
                                             KVCacheTensor(
                                                 size=tensor_size,
-                                                shared_by=layer_names)
+                                                layers=[name],
+                                                layer_stride=tensor_size,
+                                                block_stride=uniform_size)
+                                            for name in layer_names
                                         ],
                                         kv_cache_groups=kv_cache_groups)
 
@@ -470,6 +484,28 @@ class TestKVCacheManager:
         # Slot pool sized to the compact mamba block count.
         self.runner._init_mamba_slot_pool.assert_called_once_with(
             mamba_num_blocks)
+
+    @patch('vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config')
+    def test_batched_kv_spec_rpc_establishes_config_context(
+            self, mock_get_layers):
+        self.runner.cache_config.kv_cache_layout = "LBNHC"
+        layer = _attention_layer_mock()
+        layer.get_attn_backend.return_value = PallasBatchedRPAAttentionBackend
+        layer.attn_type = AttentionType.DECODER
+        layer.num_kv_heads = 2
+        layer.head_size = 128
+        layer.kv_sharing_target_layer_name = None
+        layer.sliding_window = None
+        mock_get_layers.return_value = {"attn.0": layer}
+        worker = SimpleNamespace(model_runner=self.runner)
+
+        assert get_current_vllm_config_or_none() is None
+        with patch.object(TpuPlatform,
+                          '_find_non_ssm_backend',
+                          return_value=PallasBatchedRPAAttentionBackend):
+            specs = TPUWorker.get_kv_cache_spec(worker)
+        assert specs["attn.0"].page_size_bytes == 16384
+        assert get_current_vllm_config_or_none() is None
 
     @patch('vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config')
     @patch(
@@ -738,7 +774,10 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=100,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 100, shared_by=["layer.0"])
+                KVCacheTensor(size=16384 * 100,
+                              layers=["layer.0"],
+                              layer_stride=16384 * 100,
+                              block_stride=16384)
             ],
             kv_cache_groups=[
                 KVCacheGroupSpec(layer_names=["layer.0"],
@@ -783,7 +822,10 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["layer.0"])
+                KVCacheTensor(size=16384,
+                              layers=["layer.0"],
+                              layer_stride=16384,
+                              block_stride=16384)
             ],
             kv_cache_groups=[
                 KVCacheGroupSpec(layer_names=["layer.0"],
@@ -808,8 +850,14 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["layer.0"]),
-                KVCacheTensor(size=16384, shared_by=["layer.1"]),
+                KVCacheTensor(size=16384,
+                              layers=["layer.0"],
+                              layer_stride=16384,
+                              block_stride=16384),
+                KVCacheTensor(size=16384,
+                              layers=["layer.1"],
+                              layer_stride=16384,
+                              block_stride=16384),
             ],
             kv_cache_groups=[
                 KVCacheGroupSpec(layer_names=["layer.0"],
@@ -837,8 +885,7 @@ class TestKVCacheManager:
                                       num_kv_heads=2,
                                       head_size=128,
                                       dtype=torch.bfloat16,
-                                      page_size_padded=per_layer_bytes,
-                                      indexes_kv_by_block_stride=True)
+                                      page_size_padded=per_layer_bytes)
         layer_names = ["attn.0", "attn.1", "attn.2"]
         # Uniform KV cache group representing all layers of a dense model.
         kv_cache_groups = [
@@ -847,8 +894,10 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=num_blocks,
             kv_cache_tensors=[
-                KVCacheTensor(size=per_layer_size, shared_by=[n])
-                for n in layer_names
+                KVCacheTensor(size=per_layer_size * len(layer_names),
+                              layers=layer_names,
+                              layer_stride=per_layer_bytes,
+                              block_stride=per_layer_bytes * len(layer_names))
             ],
             kv_cache_groups=kv_cache_groups,
         )
@@ -940,8 +989,14 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["attn.0"]),
-                KVCacheTensor(size=16384, shared_by=["mamba.0"]),
+                KVCacheTensor(size=16384,
+                              layers=["attn.0"],
+                              layer_stride=16384,
+                              block_stride=16384),
+                KVCacheTensor(size=16384,
+                              layers=["mamba.0"],
+                              layer_stride=16384,
+                              block_stride=16384),
             ],
             kv_cache_groups=kv_cache_groups,
         )
@@ -976,6 +1031,139 @@ class TestKVCacheManager:
         assert self.runner._kv_cache_bundle is None
         assert self.runner._kv_cache_bundle_layer_index == {}
 
+    @pytest.mark.parametrize("alias_head_size", [128, 256])
+    def test_default_attention_hma_preserves_native_pool_budget(
+            self, alias_head_size):
+        """Full/SWA overlays share storage while retaining the last block ID."""
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        def spec(cls, head_size=128, **kwargs):
+            return PallasAttentionBackend.customize_spec(
+                cls(block_size=16,
+                    num_kv_heads=256 // head_size,
+                    head_size=head_size,
+                    dtype=torch.bfloat16,
+                    **kwargs))
+
+        full = spec(FullAttentionSpec)
+        groups = [
+            KVCacheGroupSpec(layer_names=["full.0", "full.1"],
+                             kv_cache_spec=full),
+            KVCacheGroupSpec(layer_names=["swa.0", "swa.1"],
+                             kv_cache_spec=spec(SlidingWindowSpec,
+                                                head_size=alias_head_size,
+                                                sliding_window=32)),
+        ]
+        num_blocks = 4
+        budget = 2 * num_blocks * full.page_size_bytes
+        config = get_kv_cache_config_from_groups(self.runner.vllm_config,
+                                                 groups, budget)
+        assert config.num_blocks == num_blocks
+        assert all(tensor.size == budget for tensor in config.kv_cache_tensors)
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        tables = []
+        for _ in groups:
+            table = MagicMock()
+            table.get_cpu_tensor.return_value = self.runner.block_table_cpu
+            tables.append(table)
+        self.runner.input_batch = SimpleNamespace(block_table=tables)
+
+        with patch('vllm_torchtpu.utils.tpu_bind_kv_cache') as bind, patch(
+                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
+                return_value=False):
+            self.runner.initialize_kv_cache(config)
+        caches = bind.call_args.args[0]
+        unique = {id(cache): cache for cache in caches.values()}
+        assert sum(cache.nbytes for cache in unique.values()) == budget
+        assert len(unique) == 2
+        for index in range(2):
+            assert caches[f"full.{index}"] is caches[f"swa.{index}"]
+            assert caches[f"full.{index}"].shape[0] == num_blocks
+        caches["full.0"][num_blocks - 1].fill_(7)
+        assert torch.all(caches["swa.0"][num_blocks - 1] == 7)
+        assert torch.count_nonzero(caches["full.0"][:num_blocks - 1]) == 0
+        assert torch.count_nonzero(caches["full.1"]) == 0
+
+    @pytest.mark.parametrize("sliding_heads, sliding_page_bytes, shared", [
+        (4, 524288, True),
+        (8, 1048576, True),
+        (6, 786432, False),
+    ])
+    def test_gemma_hma_native_geometries_fit_scheduler_budget(
+            self, sliding_heads, sliding_page_bytes, shared):
+        """Compatible shapes share regions; other shapes retain native arrays."""
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_config_from_groups, get_kv_cache_groups)
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        self.runner.block_size = 256
+        self.runner.cache_config.block_size = 256
+        self.runner.cache_config.kv_cache_layout = "LBNHC"
+        self.runner.kv_cache_dtype = torch.float8_e4m3fn
+        self.runner.scheduler_config.disable_hybrid_kv_cache_manager = False
+        layers = {}
+        for prefix, count, heads, head_size, window in [
+            ("full", 2, 1, 512, None),
+            ("swa", 6, sliding_heads, 256, 1024),
+        ]:
+            for index in range(count):
+                layer = _attention_layer_mock()
+                layer.attn_type = AttentionType.DECODER
+                layer.num_kv_heads = heads
+                layer.head_size = head_size
+                layer.sliding_window = window
+                layer.kv_sharing_target_layer_name = None
+                layers[f"{prefix}.{index}"] = layer
+        with patch(
+                'vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config',
+                return_value=layers):
+            specs = self.runner.get_kv_cache_spec()
+        groups = get_kv_cache_groups(self.runner.vllm_config, specs)
+        assert len(groups) == 4
+        assert sum(
+            isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            for group in groups) == 3
+        num_blocks = 4
+        page_bytes = (max(524288, sliding_page_bytes) if shared else 524288 +
+                      sliding_page_bytes)
+        budget = num_blocks * 2 * page_bytes
+        config = get_kv_cache_config_from_groups(self.runner.vllm_config,
+                                                 groups, budget)
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.input_batch = SimpleNamespace(block_table=[
+            SimpleNamespace(max_num_blocks_per_req=4,
+                            get_cpu_tensor=lambda: self.runner.block_table_cpu)
+            for _ in groups
+        ])
+        with patch('vllm_torchtpu.utils.tpu_bind_kv_cache') as bind, patch(
+                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
+                return_value=False):
+            self.runner.initialize_kv_cache(config)
+        caches = bind.call_args.args[0]
+        unique = {id(cache): cache for cache in caches.values()}
+        assert config.num_blocks == num_blocks
+        assert len(unique) == (2 if shared else 4)
+        assert sum(cache.nbytes for cache in unique.values()) == budget
+        if shared:
+            assert caches["full.0"] is caches["swa.0"]
+            assert caches["full.0"].shape == (4, 256, 4, page_bytes // 1024)
+        else:
+            assert caches["full.0"].shape == (4, 256, 1, 4, 512)
+            assert caches["swa.0"].shape == (4, 256, sliding_heads // 2, 4,
+                                             256)
+            assert caches["full.0"] is not caches["swa.0"]
+        assert caches["swa.0"] is caches["swa.1"] is caches["swa.2"]
+        assert caches["swa.3"] is caches["swa.4"] is caches["swa.5"]
+        caches["swa.0"][-1].fill_(7)
+        assert torch.all(caches["swa.2"][-1].float() == 7)
+        assert torch.count_nonzero(caches["swa.0"][:-1].float()) == 0
+        assert torch.count_nonzero(caches["swa.3"].float()) == 0
+        if not shared:
+            assert torch.count_nonzero(caches["full.0"].float()) == 0
+
     @pytest.mark.usefixtures("vllm_config_context")
     @pytest.mark.parametrize("full_heads,full_head_size,dtype,backend", [
         (2, 128, torch.bfloat16, PallasAttentionBackend),
@@ -1008,7 +1196,13 @@ class TestKVCacheManager:
             num_blocks=4,
             kv_cache_tensors=[
                 KVCacheTensor(size=page_bytes * 4,
-                              shared_by=["attn.0", "attn.1"]),
+                              layers=["attn.0"],
+                              layer_stride=page_bytes * 4,
+                              block_stride=page_bytes),
+                KVCacheTensor(size=page_bytes * 4,
+                              layers=["attn.1"],
+                              layer_stride=page_bytes * 4,
+                              block_stride=page_bytes),
             ],
             kv_cache_groups=kv_cache_groups,
         )
@@ -1087,7 +1281,10 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["attn.0"]),
+                KVCacheTensor(size=16384,
+                              layers=["attn.0"],
+                              layer_stride=16384,
+                              block_stride=16384),
             ],
             kv_cache_groups=kv_cache_groups,
         )
@@ -1133,7 +1330,10 @@ class TestKVCacheManager:
         kv_cache_config_explicit = KVCacheConfig(
             num_blocks=10,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 10 + 123, shared_by=["attn.0"]),
+                KVCacheTensor(size=16384 * 10 + 123,
+                              layers=["attn.0"],
+                              layer_stride=16384 * 10 + 123,
+                              block_stride=16384),
             ],
             kv_cache_groups=kv_cache_groups,
         )
@@ -1182,7 +1382,10 @@ class TestKVCacheManager:
         kv_cache_config = KVCacheConfig(
             num_blocks=None,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 5, shared_by=["attn.0"]),
+                KVCacheTensor(size=16384 * 5,
+                              layers=["attn.0"],
+                              layer_stride=16384 * 5,
+                              block_stride=16384),
             ],
             kv_cache_groups=[
                 KVCacheGroupSpec(layer_names=["attn.0"],
@@ -1211,7 +1414,7 @@ def test_dsv4_layer_classification():
                                 num_kv_heads=1,
                                 head_size=head_size,
                                 dtype=torch.uint8,
-                                compress_ratio=compress_ratio,
+                                tokens_per_state=compress_ratio,
                                 alignment=None)
 
     def swa():
@@ -1335,7 +1538,7 @@ def test_dsv4_specs_are_exempt_from_tpu_normalization():
         num_kv_heads=1,
         head_size=640,
         dtype=torch.uint8,
-        compress_ratio=4,
+        tokens_per_state=4,
         alignment=None,
     )
     ds_v4_swa_spec = SlidingWindowMLASpec(
@@ -1372,7 +1575,7 @@ def test_dsv4_specs_are_exempt_from_tpu_normalization():
     # A page sized from the logical block, not from the compressed rows: this
     # is exactly the over-allocation the exemption avoids.
     assert (unexempt["model.layers.0.attn"].page_size_padded
-            > ds_v4_spec.block_size // ds_v4_spec.compress_ratio * 640)
+            > ds_v4_spec.block_size // ds_v4_spec.tokens_per_state * 640)
 
 
 def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
@@ -1382,7 +1585,7 @@ def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
     spec must be unwrapped before any `isinstance` type test, and block size is
     not uniform across groups, so it cannot be asserted equal.
     """
-    from vllm.v1.core.kv_cache_utils import group_and_unify_kv_cache_specs
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
     from vllm.v1.kv_cache_interface import (AttentionSpec, MambaSpec,
                                             SlidingWindowMLASpec,
                                             UniformTypeKVCacheSpecs)
@@ -1397,7 +1600,7 @@ def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
             num_kv_heads=1,
             head_size=640,
             dtype=torch.uint8,
-            compress_ratio=4,
+            tokens_per_state=4,
             cache_dtype_str="fp8_ds_mla",
             model_version="deepseek_v4",
             alignment=None)
@@ -1412,7 +1615,14 @@ def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
                                      model_version="deepseek_v4",
                                      alignment=None))
 
-    grouped = group_and_unify_kv_cache_specs(specs)
+    config = SimpleNamespace(cache_config=CacheConfig(),
+                             speculative_config=None,
+                             scheduler_config=SimpleNamespace(
+                                 disable_hybrid_kv_cache_manager=False))
+    config.cache_config.kv_cache_layout = "BLHNC"
+    grouped = [
+        group.kv_cache_spec for group in get_kv_cache_groups(config, specs)
+    ]
     assert grouped is not None, (
         "vLLM did not take its DeepseekV4 grouping path for DSv4-shaped specs")
     assert all(

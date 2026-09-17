@@ -196,9 +196,10 @@ def test_real_bf16_checkpoint_loading(tmp_path, kind, keep_layout):
     for name, tensor in load_file(tmp_path / "model.safetensors").items():
         param = dict(model.named_parameters())[name]
         param.weight_loader(param, tensor)
-    process_weights_after_loading(
-        model, SimpleNamespace(dtype=torch.bfloat16, quantization=None),
-        torch.device("cpu"))
+    model_config = SimpleNamespace(dtype=torch.bfloat16,
+                                   quantization=None,
+                                   word_embeddings_untied_by_checkpoint=False)
+    process_weights_after_loading(model, model_config, torch.device("cpu"))
     validate_online_fp8(model, config)
     weight = layer.weight.float() if keep_layout else layer.weight.float().t()
     scales = layer.weight_scale
@@ -211,9 +212,7 @@ def test_real_bf16_checkpoint_loading(tmp_path, kind, keep_layout):
     assert relative_error < 0.04
     old_weight = layer.weight
     old_scale = layer.weight_scale
-    process_weights_after_loading(
-        model, SimpleNamespace(dtype=torch.bfloat16, quantization=None),
-        torch.device("cpu"))
+    process_weights_after_loading(model, model_config, torch.device("cpu"))
     assert layer.weight is old_weight
     assert layer.weight_scale is old_scale
 
