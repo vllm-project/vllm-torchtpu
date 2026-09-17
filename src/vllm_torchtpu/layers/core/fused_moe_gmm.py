@@ -200,7 +200,7 @@ def _counting_sort_positions(
     m = sort_keys.shape[0]
     block = min(_COUNTING_SORT_BLOCK, m)
     if num_buckets > block:
-        # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
+        # XLA miscompiles the rank matmul here on jaxlib 0.10.2/0.11.0 + libtpu
         # 0.0.44.1: under jit the positions come back not a permutation. Only
         # num_buckets > block is affected, so that is the excluded region.
         return None, None
