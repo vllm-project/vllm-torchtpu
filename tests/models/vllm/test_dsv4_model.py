@@ -184,9 +184,16 @@ def dist_ctx():
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
-def test_attention_constructs_tpu_swa_cache(dist_ctx, monkeypatch,
+def test_attention_constructs_tpu_swa_cache(monkeypatch, request,
                                             compress_ratio):
     """Exercise upstream construction, including its SWA backend argument."""
+    from vllm.platforms import current_platform
+
+    # CPU CI has no TPU device registered with PyTorch. Keep both the Gloo
+    # group and the compressor's parameter allocations on CPU.
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")
     # Only skip Pallas op registration, which needs the worker's TPU mesh.
     monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op",
                         lambda self: None)
