@@ -34,13 +34,13 @@ from absl.testing import parameterized
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
     SparseMLAKVCacheSpec,
 )
-from vllm_torchtpu.kernels.mla.masked_dense import routing as masked_dense_routing
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.core import attention_interface
 
@@ -104,7 +104,7 @@ def _masked_dense_limits(*limits: int):
     setting `os.environ`.
     """
     assert len(limits) == len(_LIMIT_NAMES)
-    module = masked_dense_routing
+    module = mla_dispatch
     saved = [getattr(module, n) for n in _LIMIT_NAMES]
     for name, value in zip(_LIMIT_NAMES, limits):
         setattr(module, name, value)
@@ -690,7 +690,7 @@ class MaskedDenseTierTest(parameterized.TestCase):
         starts[1 : len(q_lens) + 1] = np.cumsum(q_lens)
         starts[len(q_lens) + 1 :] = sum(q_lens)
         return int(
-            masked_dense_routing.select_tier(
+            mla_dispatch.select_tier(
                 jnp.asarray(seq_lens, jnp.int32),
                 jnp.asarray(distribution, jnp.int32),
                 jnp.asarray(starts, jnp.int32),
@@ -749,12 +749,12 @@ class MaskedDenseTierTest(parameterized.TestCase):
 
     def test_split_point(self):
         seq_lens = jnp.asarray([80, 100, 40, 100000], jnp.int32)
-        split_seq, contiguous = masked_dense_routing.split_point(
+        split_seq, contiguous = mla_dispatch.split_point(
             seq_lens, jnp.asarray([1, 1, 3], jnp.int32), 64
         )
         self.assertEqual(int(split_seq), 2)
         self.assertTrue(bool(contiguous))
-        split_seq, contiguous = masked_dense_routing.split_point(
+        split_seq, contiguous = mla_dispatch.split_point(
             jnp.asarray([40, 100, 40], jnp.int32), jnp.asarray([0, 0, 3], jnp.int32), 64
         )
         self.assertEqual(int(split_seq), 1)
@@ -906,21 +906,17 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
             if routed:
                 stack.enter_context(_masked_dense_limits(*limits))
                 stack.enter_context(
-                    mock.patch.object(
-                        masked_dense_routing, "MASKED_DENSE_MIN_TOKEN_BUCKET", 0
-                    )
+                    mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_TOKEN_BUCKET", 0)
                 )
                 stack.enter_context(
                     mock.patch.object(
-                        masked_dense_routing,
-                        "matches_glm52_tpu7x_profile",
-                        return_value=True,
+                        mla_dispatch, "matches_glm52_tpu7x_profile", return_value=True
                     )
                 )
             if min_suffix_tokens is not None:
                 stack.enter_context(
                     mock.patch.object(
-                        masked_dense_routing,
+                        mla_dispatch,
                         "MASKED_DENSE_MIN_SUFFIX_TOKENS",
                         min_suffix_tokens,
                     )
@@ -1046,7 +1042,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         """
         offset = (tier - seq_lens[0]) % 3
         with mock.patch.object(
-            masked_dense_routing,
+            mla_dispatch,
             "select_tier",
             side_effect=lambda lengths, *a, **k: (lengths[0] + offset) % 3,
         ):
@@ -1079,7 +1075,7 @@ class MaskedDenseDispatchSetupTest(parameterized.TestCase):
         case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
         mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
         with mock.patch.object(
-            masked_dense_routing,
+            mla_dispatch,
             "attention_from_parts",
             side_effect=lambda ql_nope, q_pe, *args, **kwargs: ql_nope,
         ):
@@ -1108,8 +1104,14 @@ class MaskedDenseDispatchSetupTest(parameterized.TestCase):
 class SparseMlaLayerBranchTest(parameterized.TestCase):
     """The layer calls the sparse kernel directly unless routing applies."""
 
-    @parameterized.parameters(False, True)
-    def test_layer_branch(self, applies):
+    K_SCALE = 1.5
+    SM_SCALE = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+    # (flag, applies) for flag off, ineligible flag on and eligible flag on.
+    # The flag-off case mocks `applies` true to check the layer's own guard.
+    CASES = ((False, True), (True, False), (True, True))
+
+    def setUp(self):
+        super().setUp()
         if jax.devices()[0].platform == "cpu":
             self.enter_context(
                 mock.patch.object(
@@ -1119,42 +1121,93 @@ class SparseMlaLayerBranchTest(parameterized.TestCase):
                     side_effect=kv_cache_utils.update_sparse_mla_kv_cache_jax,
                 )
             )
+
+    def _run_layer(self, flag, applies):
+        """One layer step with both kernels stubbed.
+
+        The sparse stub returns ones in the latent part and sevens in the rope
+        tail, so the layer's crop is visible; the routed stub returns threes.
+        """
         case = MaskedDenseDispatchTest()
-        case.k_scale = 1.5
-        case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+        case.k_scale = self.K_SCALE
+        case.sm_scale = self.SM_SCALE
         mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
+
+        def sparse_kernel(q, *args, **kwargs):
+            del args, kwargs
+            return jnp.concatenate(
+                [jnp.ones_like(q[..., :LKV_DIM]), jnp.full_like(q[..., LKV_DIM:], 7)],
+                axis=-1,
+            )
+
         with (
             mock.patch.object(
-                attention_interface.sparse_mla_kernel,
-                "sparse_ragged_paged_attention",
-                side_effect=lambda q, *a, **k: q,
+                attention_interface,
+                "sparse_mla_ragged_paged_attention",
+                side_effect=sparse_kernel,
             ) as sparse,
             mock.patch.object(
-                masked_dense_routing,
+                mla_dispatch,
                 "attention_from_parts",
-                side_effect=lambda ql_nope, *a, **k: ql_nope,
+                side_effect=lambda ql_nope, *a, **k: jnp.full_like(ql_nope, 3),
             ) as routed,
-            mock.patch.object(masked_dense_routing, "applies", return_value=applies),
+            mock.patch.object(mla_dispatch, "applies", return_value=applies),
         ):
-            _, output = case._step(
+            caches, output = case._step(
                 _empty_pair(),
                 [8],
                 [8],
                 0,
-                GATHER_ONLY,
+                GATHER_ONLY if flag else ORIGINAL_SPARSE,
                 np.random.default_rng(99),
                 jnp.arange(PAGES_PER_SEQ, dtype=jnp.int32),
                 mesh,
                 1,
                 1,
             )
+        return caches, output, sparse, routed
+
+    @parameterized.named_parameters(
+        ("flag_off", *CASES[0]),
+        ("flag_on_ineligible", *CASES[1]),
+        ("flag_on_eligible", *CASES[2]),
+    )
+    def test_layer_branch(self, flag, applies):
+        _, output, sparse, routed = self._run_layer(flag, applies)
+        takes_route = flag and applies
         self.assertEqual(output.shape, (8, NUM_HEADS, LKV_DIM))
-        self.assertEqual(routed.call_count, int(applies))
-        self.assertEqual(sparse.call_count, int(not applies))
-        if applies:
-            self.assertNotIn("q_concat", routed.call_args.kwargs)
-            self.assertEqual(routed.call_args.args[0].shape[-1], LKV_DIM)
-            self.assertEqual(routed.call_args.args[1].shape[-1], ROPE_DIM)
+        self.assertEqual(routed.call_count, int(takes_route))
+        self.assertEqual(sparse.call_count, int(not takes_route))
+        if takes_route:
+            args, kwargs = routed.call_args
+            self.assertEqual(args[0].shape[-1], LKV_DIM)
+            self.assertEqual(args[1].shape[-1], ROPE_DIM)
+            self.assertEqual(kwargs, dict(sm_scale=self.SM_SCALE, k_scale=self.K_SCALE))
+            np.testing.assert_array_equal(output, 3)
+        else:
+            args, kwargs = sparse.call_args
+            # q, caches, topk, block tables, query starts, distribution.
+            self.assertLen(args, 7)
+            self.assertEqual(args[0].shape[-1], LKV_DIM + ROPE_DIM)
+            self.assertEqual(
+                kwargs,
+                dict(
+                    sm_scale=self.SM_SCALE,
+                    k_scale=self.K_SCALE,
+                    cache_layout=NOPE_SPEC.layout.value,
+                ),
+            )
+            # The rope tail is cropped from the sparse output.
+            np.testing.assert_array_equal(output, 1)
+
+    def test_every_branch_returns_the_updated_caches(self):
+        results = [self._run_layer(*case)[0] for case in self.CASES]
+        first_nope, first_rope = map(np.asarray, results[0])
+        self.assertTrue(np.any(first_nope))
+        self.assertTrue(np.any(first_rope))
+        for nope, rope in results[1:]:
+            np.testing.assert_array_equal(np.asarray(nope), first_nope)
+            np.testing.assert_array_equal(np.asarray(rope), first_rope)
 
 
 def _cond_boundaries(jaxpr, depth=0):
@@ -1267,21 +1320,17 @@ class MaskedDenseRouteCompositionTest(parameterized.TestCase):
                     ),
                 ),
                 mock.patch.object(
-                    masked_dense_routing,
+                    mla_dispatch,
                     "masked_dense_ragged_paged_attention",
                     side_effect=self._fake_masked_dense,
                 ),
-                mock.patch.object(
-                    masked_dense_routing, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0
-                ),
+                mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0),
                 _masked_dense_limits(*self.LIMITS),
                 mock.patch.object(
-                    masked_dense_routing,
-                    "select_tier",
-                    side_effect=lambda *a, **k: forced,
+                    mla_dispatch, "select_tier", side_effect=lambda *a, **k: forced
                 ),
             ):
-                return masked_dense_routing.attention_from_parts(
+                return mla_dispatch.attention_from_parts(
                     *operands, sm_scale=1.0, k_scale=1.0
                 )
 
@@ -1363,14 +1412,10 @@ class SparsePrefixTest(parameterized.TestCase):
                 preserve_suffix=True,
             )
 
-        with mock.patch.object(
-            masked_dense_routing, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0
-        ):
+        with mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0):
             out = np.asarray(
                 jax.jit(
-                    lambda q, split: masked_dense_routing._sparse_prefix(
-                        q, split, run_chunk
-                    )
+                    lambda q, split: mla_dispatch._sparse_prefix(q, split, run_chunk)
                 )(q, jnp.asarray(split_token, jnp.int32))
             )
         expected = np.asarray(q).copy()
@@ -1380,9 +1425,7 @@ class SparsePrefixTest(parameterized.TestCase):
     def test_chunks_in_the_minimum_suffix_are_not_emitted(self):
         q = jnp.zeros((1024, 2, 8), jnp.float32)
         jaxpr = jax.make_jaxpr(
-            lambda q, split: masked_dense_routing._sparse_prefix(
-                q, split, lambda q, **k: q
-            )
+            lambda q, split: mla_dispatch._sparse_prefix(q, split, lambda q, **k: q)
         )(q, jnp.asarray(1, jnp.int32))
         conds = [e for e in jaxpr.jaxpr.eqns if e.primitive.name == "cond"]
         self.assertLen(conds, (1024 - 512) // 64)
@@ -1464,7 +1507,7 @@ class MaskedDenseLimitResolutionTest(parameterized.TestCase):
     ENV = "TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN"
 
     def _resolve(self, default=6144):
-        return masked_dense_routing._resolve_masked_dense_limit(self.ENV, default)
+        return mla_dispatch._resolve_masked_dense_limit(self.ENV, default)
 
     def test_masked_dense_routing_is_opt_in(self):
         getter = envs.environment_variables["TPU_MLA_MASKED_DENSE_ENABLED"]
@@ -1508,16 +1551,12 @@ class MaskedDenseProfileTest(parameterized.TestCase):
         )
 
     def test_exact_glm52_profile_is_enabled(self):
-        self.assertTrue(
-            masked_dense_routing.matches_glm52_tpu7x_profile(*self._operands())
-        )
+        self.assertTrue(mla_dispatch.matches_glm52_tpu7x_profile(*self._operands()))
 
     @parameterized.parameters(dict(heads=16), dict(topk=1024), dict(page_size=512))
     def test_other_sparse_mla_profiles_fall_back(self, **overrides):
         self.assertFalse(
-            masked_dense_routing.matches_glm52_tpu7x_profile(
-                *self._operands(**overrides)
-            )
+            mla_dispatch.matches_glm52_tpu7x_profile(*self._operands(**overrides))
         )
 
     def _applies(
@@ -1534,7 +1573,7 @@ class MaskedDenseProfileTest(parameterized.TestCase):
         ql_nope = jax.ShapeDtypeStruct((tokens, heads, 512), q.dtype)
         q_pe = jax.ShapeDtypeStruct((tokens, heads, 64), q.dtype)
         with mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", enabled):
-            return masked_dense_routing.applies(
+            return mla_dispatch.applies(
                 ql_nope,
                 q_pe,
                 nope or default_nope,
@@ -1580,9 +1619,7 @@ class MaskedDenseRequestGroupingTest(parameterized.TestCase):
         )
         attrs.update(layer)
         specs = (mock.Mock(layout=layout), mock.Mock(layout=layout))
-        return masked_dense_routing.groups_requests(
-            mock.Mock(**attrs), specs, page_size, dcp
-        )
+        return mla_dispatch.groups_requests(mock.Mock(**attrs), specs, page_size, dcp)
 
     def test_glm52_layer_groups_requests(self):
         self.assertTrue(self._groups())

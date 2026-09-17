@@ -34,7 +34,6 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
 )
-from vllm_torchtpu.kernels.mla.masked_dense import routing as masked_dense_routing
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
@@ -943,10 +942,10 @@ def sparse_mla_attention(
         )
 
         # Opt-in masked-dense routing builds Q inside each device branch.
-        if envs.TPU_MLA_MASKED_DENSE_ENABLED and masked_dense_routing.applies(
+        if envs.TPU_MLA_MASKED_DENSE_ENABLED and mla_dispatch.applies(
             ql_nope, q_pe, kv_cache_nope, kv_cache_rope, topk_idx, cache_layout
         ):
-            output = masked_dense_routing.attention_from_parts(
+            output = mla_dispatch.attention_from_parts(
                 ql_nope,
                 q_pe,
                 kv_cache_nope,
@@ -962,12 +961,11 @@ def sparse_mla_attention(
             return output, kv_cache_nope, kv_cache_rope
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        output = mla_dispatch.ragged_paged_attention(
+        output = sparse_mla_ragged_paged_attention(
             q,
             kv_cache_nope,
             kv_cache_rope,
             topk_idx,
-            seq_lens_,
             block_tables_,
             query_start_loc_,
             request_distribution_,

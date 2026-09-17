@@ -55,12 +55,10 @@ from jax.sharding import PartitionSpec as P
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_cache
 from vllm_torchtpu.kernels.mla.masked_dense import csa_mask
 from vllm_torchtpu.kernels.mla.masked_dense import kernel as masked_dense
-from vllm_torchtpu.kernels.mla.masked_dense import (
-    routing as masked_dense_routing,
-)
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse
 
 # GLM-5.2-FP8, read off the checkpoint config.
@@ -263,7 +261,7 @@ def _build_wrapper(enable_dispatch: bool):
         # masked-dense routing applies to this token bucket.
         if not (
             enable_dispatch
-            and ql_nope.shape[0] >= masked_dense_routing.MASKED_DENSE_MIN_TOKEN_BUCKET
+            and ql_nope.shape[0] >= mla_dispatch.MASKED_DENSE_MIN_TOKEN_BUCKET
         ):
             q = jnp.concatenate((ql_nope, q_pe), axis=-1)
             output = sparse.sparse_ragged_paged_attention(
@@ -278,7 +276,7 @@ def _build_wrapper(enable_dispatch: bool):
                 k_scale=1.0,
             )
             return output[..., :LKV_DIM], nope, rope
-        output = masked_dense_routing.attention_from_parts(
+        output = mla_dispatch.attention_from_parts(
             ql_nope,
             q_pe,
             nope,
@@ -395,10 +393,8 @@ def _run_point(
             k_scale=1.0,
         )
 
-    analytic_bound = min(
-        masked_dense_routing.MASKED_DENSE_ANALYTIC_LIMIT, MAX_MODEL_LEN
-    )
-    bitmap_bound = min(masked_dense_routing.MASKED_DENSE_LIMIT, MAX_MODEL_LEN)
+    analytic_bound = min(mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT, MAX_MODEL_LEN)
+    bitmap_bound = min(mla_dispatch.MASKED_DENSE_LIMIT, MAX_MODEL_LEN)
 
     def mask_fn():
         return csa_mask.generate_mask_sc(c["topk_indices"], bitmap_bound)
