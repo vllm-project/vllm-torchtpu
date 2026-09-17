@@ -38,7 +38,7 @@ HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
 def _layout_env(monkeypatch, value):
     """Resolve legacy env aliases through the native config API."""
     from vllm import envs as vllm_envs
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.config.attention import AttentionConfig
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
@@ -49,8 +49,9 @@ def _layout_env(monkeypatch, value):
         monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     else:
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", value)
-    config = VllmConfig(attention_config=AttentionConfig(
-        backend=AttentionBackendEnum.CUSTOM))
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM))
     resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     try:
         with set_current_vllm_config(config):

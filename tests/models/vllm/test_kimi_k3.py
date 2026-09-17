@@ -45,10 +45,13 @@ def _cpu_model_tests(monkeypatch):
     # These model tests use CPU tensors and stubbed custom ops. Dynamo still
     # queries registered devices; keep it from opening a distributed TPU
     # client merely to inspect the current device while tracing CPU code.
-    monkeypatch.setattr(torch.tpu, "is_available", lambda: False)
-    monkeypatch.setattr(torch.tpu, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.tpu, "device_count", lambda: 0)
-    monkeypatch.setattr(torch.tpu, "manual_seed_all", lambda seed: None)
+    tpu = getattr(torch, "tpu", None)
+    if tpu is None:
+        return
+    monkeypatch.setattr(tpu, "is_available", lambda: False)
+    monkeypatch.setattr(tpu, "current_device", lambda: 0)
+    monkeypatch.setattr(tpu, "device_count", lambda: 0)
+    monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
 
 
 def test_kimi_architectures_are_registered() -> None:
