@@ -160,6 +160,15 @@ curl http://localhost:8000/v1/completions \
     }'
 ```
 
+### Compile sizes
+
+`--compilation-config '{"compile_sizes": [...]}'` sets the token padding buckets: every step is
+padded up to the smallest listed size that holds it, and only the listed sizes are compiled. Without
+the flag the buckets are the powers of two from 16 up to `--max-num-batched-tokens`, plus any sizes
+in `TPU_TOKEN_BUCKET_EXTRA`. An engine that decodes needs small sizes in the list, for example
+`[16, 32, 64, 128, 256, 4096]`; with `[256, 4096]` every decode step runs as a 256-token forward,
+and under expert parallelism the data-parallel ranks gather those padded tokens together.
+
 ### 📉 Running Offline Inference
 
 You can also run a simple offline inference script to verify the setup without starting a full server.

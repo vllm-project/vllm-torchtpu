@@ -363,6 +363,41 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
+        ("compile_sizes", "kv_role", "expect_warning"),
+        [
+            # A decode step of a few tokens runs as a 256-token forward.
+            ([256, 4096], None, True),
+            ([16, 256], None, False),
+            # A pure KV producer never decodes.
+            ([256, 4096], "kv_producer", False),
+            ([256, 4096], "kv_consumer", True),
+        ],
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_warns_on_coarse_compile_sizes(
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
+            compile_sizes, kv_role, expect_warning):
+        vllm_config.compilation_config.compile_sizes = list(compile_sizes)
+        if kv_role is not None:
+            vllm_config.kv_transfer_config = MagicMock()
+            vllm_config.kv_transfer_config.kv_connector = "TPURaidenConnector"
+            vllm_config.kv_transfer_config.kv_role = kv_role
+
+        with patch("vllm_torchtpu.platforms.tpu_platform.logger") as logger:
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.compile_sizes == sorted(
+            compile_sizes)
+        warned = [
+            call for call in logger.warning.call_args_list if
+            "compile_sizes replaces the token padding buckets" in call.args[0]
+        ]
+        assert bool(warned) == expect_warning
+
+    @pytest.mark.parametrize(
         ("compile_sizes", "shapes_type", "expected_type"),
         [
             # Size 1 under backed shapes would crash in PiecewiseBackend.

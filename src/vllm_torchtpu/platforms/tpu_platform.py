@@ -631,7 +631,8 @@ class TpuPlatform(Platform):
         # Set compile_sizes to match the token padding buckets used by
         # TPUModelRunner. These are the exact shapes PiecewiseBackend
         # will compile for.
-        if compilation_config.compile_sizes is None:
+        explicit_compile_sizes = compilation_config.compile_sizes is not None
+        if not explicit_compile_sizes:
             scheduler_config = vllm_config.scheduler_config
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
@@ -641,6 +642,24 @@ class TpuPlatform(Platform):
         else:
             compilation_config.compile_sizes = sorted(
                 compilation_config.compile_sizes)
+        logger.info("Token padding buckets (compile_sizes): %s",
+                    compilation_config.compile_sizes)
+        # Every step is padded up to the smallest bucket that holds it, so a
+        # list that starts far above a decode step's token count turns each
+        # decode step into a forward of that size. An engine that only
+        # produces KV never decodes and is left alone.
+        transfer_config = vllm_config.kv_transfer_config
+        produces_only = (transfer_config is not None
+                         and transfer_config.kv_role == "kv_producer")
+        smallest_bucket = compilation_config.compile_sizes[0]
+        if explicit_compile_sizes and smallest_bucket > 16 and not produces_only:
+            logger.warning(
+                "compile_sizes replaces the token padding buckets and its "
+                "smallest entry is %d: every decode step with fewer tokens "
+                "runs as a %d-token forward (multiplied by the data-parallel "
+                "size under expert parallelism). Add 16, 32, 64 and 128 to "
+                "compile_sizes, or leave it unset, on engines that decode.",
+                smallest_bucket, smallest_bucket)
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
