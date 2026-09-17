@@ -51,7 +51,8 @@ from jax.sharding import PartitionSpec
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index, ep_rank_order)
+                                               ep_mesh_index, ep_rank_order,
+                                               ep_token_replica_groups)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v2.host import (PACK4, U32_SUBLANE_TILE,
                                                      token_gather_smem_bytes)
@@ -162,14 +163,16 @@ def _build_op(mesh,
               rhs_qb=None,
               scoring_fn="softmax",
               has_score_bias=False,
-              routed_scaling_factor=1.0):
+              routed_scaling_factor=1.0,
+              *,
+              token_replica_groups=None):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
     key = (topk, renormalize, activation, mesh_expert_order, sharded_plan,
            weight_format, rhs_qb, scoring_fn, has_score_bias,
-           routed_scaling_factor)
+           routed_scaling_factor, token_replica_groups)
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -206,6 +209,7 @@ def _build_op(mesh,
                                act_fn=activation,
                                mesh_ep_ranks=mesh_expert_order,
                                sharded_plan=sharded_plan,
+                               token_replica_groups=token_replica_groups,
                                **bias_kw,
                                **routing_kw)
 
@@ -414,8 +418,8 @@ def prebuild_fused_moe_ep(layer,
 
     # The token-gather table remains in HBM and is streamed through two fixed
     # SMEM windows, so TP and a 4K bucket do not exceed the compile-time SMEM
-    # limit. TP ranks present replicated token rows, which the fused EP program
-    # consumes directly on the flattened EP mesh. The TPU MoERunner
+    # limit. The fused EP program assigns disjoint slices of replicated TP
+    # inputs and restores their outputs using native TP groups. The TPU MoERunner
     # patch suppresses its explicit PCP all-gather/reduce-scatter only for a
     # layer this function actually arms; refused layers keep the old fallback.
     # Consequently the kernel is the sole dispatch/combine owner under PCP,
@@ -500,16 +504,29 @@ def prebuild_fused_moe_ep(layer,
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    token_replica_groups = ep_token_replica_groups(
+        is_sequence_parallel=layer.moe_config.moe_parallel_config.
+        is_sequence_parallel)
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
-    op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
-                   sharded_plan, weight_format, rhs_qb, scoring_fn,
-                   has_score_bias, routed_scale)
+    op = _build_op(mesh,
+                   topk,
+                   renormalize,
+                   activation,
+                   mesh_expert_order,
+                   sharded_plan,
+                   weight_format,
+                   rhs_qb,
+                   scoring_fn,
+                   has_score_bias,
+                   routed_scale,
+                   token_replica_groups=token_replica_groups)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
-        "act=%s scoring=%s score_bias=%s routed_scale=%s", hidden, inter,
-        local_experts, ep, pcp, topk, _TILE_M, sharded_plan, weight_format,
-        rhs_qb, activation, scoring_fn, has_score_bias, routed_scale)
+        "act=%s scoring=%s score_bias=%s routed_scale=%s token_replica_groups=%s",
+        hidden, inter, local_experts, ep, pcp, topk, _TILE_M, sharded_plan,
+        weight_format, rhs_qb, activation, scoring_fn, has_score_bias,
+        routed_scale, token_replica_groups)
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either
     # the padding mask or the chunked path. Padding costs expert work and
