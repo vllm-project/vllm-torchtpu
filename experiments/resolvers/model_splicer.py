@@ -1,9 +1,10 @@
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import torch
 from core.models import ModelArchitectureSpec
@@ -116,19 +117,25 @@ class ModelSplicer:
                 if f.endswith(".safetensors")
             ])
 
-        # Pre-open all sparse shards for fast random access
-        sparse_handles = {}
-        for sparse_file in set(sparse_weight_map.values()):
-            sparse_file_path = os.path.join(fully_sparse_model_dir,
-                                            sparse_file)
-            sparse_handles[sparse_file] = safe_open(sparse_file_path,
-                                                    framework="pt",
-                                                    device="cpu")
-
         replaced_count = 0
         kept_dense_count = 0
 
-        try:
+        # Open sparse shard handles lazily on-demand and guarantee clean release via ExitStack.
+        # This prevents holding open descriptors for unreferenced shards while avoiding
+        # the performance penalty of re-opening and parsing headers per tensor.
+        with contextlib.ExitStack() as stack:
+            sparse_handles: Dict[str, Any] = {}
+
+            def get_sparse_handle(file_name: str):
+                if file_name not in sparse_handles:
+                    sparse_file_path = os.path.join(fully_sparse_model_dir,
+                                                    file_name)
+                    sparse_handles[file_name] = stack.enter_context(
+                        safe_open(sparse_file_path,
+                                  framework="pt",
+                                  device="cpu"))
+                return sparse_handles[file_name]
+
             for shard_name in dense_safetensors:
                 dense_shard_path = os.path.join(dense_model_dir, shard_name)
                 output_shard_path = os.path.join(output_dir, shard_name)
@@ -141,8 +148,8 @@ class ModelSplicer:
                         layer_idx = cls.extract_layer_idx(k)
                         if layer_idx is not None and layer_idx in sparse_layer_indices and k in sparse_weight_map:
                             sparse_shard_name = sparse_weight_map[k]
-                            merged_shard[k] = sparse_handles[
-                                sparse_shard_name].get_tensor(k)
+                            merged_shard[k] = get_sparse_handle(
+                                sparse_shard_name).get_tensor(k)
                             replaced_count += 1
                         else:
                             merged_shard[k] = dense_handle.get_tensor(k)
@@ -152,9 +159,6 @@ class ModelSplicer:
                 print(
                     f">>> [SPLICER] Wrote merged shard {shard_name} ({len(merged_shard)} tensors)"
                 )
-        finally:
-            # Handles are closed on exit
-            del sparse_handles
 
         print(
             f">>> [SPLICER] Splicing complete: {replaced_count} tensors from sparse, {kept_dense_count} tensors from dense."
