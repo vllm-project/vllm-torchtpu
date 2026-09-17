@@ -33,3 +33,20 @@ upload_with_priority() {
     cat "$yaml_file";
   } | buildkite-agent pipeline upload
 }
+
+get_vllm_commit_hash() {
+  # Extract the pinned vLLM commit directly from pyproject.toml; fail loud if missing
+  local config_dir repo_root pyproject_path commit_hash=""
+  config_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  repo_root="$(cd "${config_dir}/../../.." && pwd)"
+
+  pyproject_path="${repo_root}/pyproject.toml"
+
+  commit_hash="$(sed -nE 's/.*vllm @ git\+https:\/\/github\.com\/vllm-project\/vllm\.git@([a-zA-Z0-9.-]+).*/\1/p' "${pyproject_path}" | head -n 1)"
+
+  if [ -z "${commit_hash:-}" ]; then
+    echo "ERROR: vLLM commit hash is missing from pyproject.toml. Cannot proceed without a pinned hash." >&2
+    exit 1
+  fi
+  echo "$commit_hash"
+}

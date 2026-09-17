@@ -55,13 +55,20 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    configs as rpa_configs
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    wrapper as rpa_batched
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import (
-    TPU_STR_DTYPE_TO_TORCH_DTYPE, PallasAttentionBackend)
+    KV_LAYOUT_BY_VLLM_LAYOUT, TPU_STR_DTYPE_TO_TORCH_DTYPE,
+    PallasAttentionBackend, PallasAttentionBackendImpl)
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.adapter.quantization import \
     get_tpu_quantization_config
+from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
+    validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import \
     RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
@@ -76,7 +83,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import \
@@ -708,6 +714,8 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
+        # Maximum query length to be considered a decode.
+        self.reorder_batch_threshold = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
         self.structured_decoding_manager = StructuredDecodingManager(self)
@@ -733,12 +741,19 @@ class TPUModelRunner(GPUModelRunner):
         # extra buckets once the KV block size is final.
         self._pp_chunk_granularity: int | None = None
         # (pairs, bq, bkv) per kernel mode for the batched attention
-        # kernel, None for other backends; computed once the KV block
-        # size is final.
-        self._attention_capacity: dict[str, tuple[int, int, int]] | None = None
-        self._attention_capacity_known = False
+        # kernel, per (sequences, pages per sequence) it is called with;
+        # computed once the KV block size is final.
+        self._attention_capacity: dict[tuple[int, int],
+                                       dict[str, tuple[int, int, int]]] = {}
+        # Whether an attention layer runs the batched kernel; None until
+        # asked.
+        self._attention_runs_batched_kernel: bool | None = None
         # The page size the attention kernel sees, set with the KV cache.
         self._attention_kernel_block_size: int | None = None
+        # The KV cache group of the full-attention layers, set with the KV
+        # cache: its block table width is the page count per sequence the
+        # kernel is called with, which sizes the kernel's schedule table.
+        self._attention_kv_cache_group_id: int | None = None
         # Random host inputs for profile runs, one buffer per shape.
         self._profile_inputs: dict[str, torch.Tensor] = {}
         # Per-key (trailing shape, dtype) of the tensors a stage receives.
@@ -1264,10 +1279,12 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        return self.kv_cache_manager.get_kv_cache_spec()
+        with set_current_vllm_config(self.vllm_config):
+            return self.kv_cache_manager.get_kv_cache_spec()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        with set_current_vllm_config(self.vllm_config):
+            self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -1370,11 +1387,11 @@ class TPUModelRunner(GPUModelRunner):
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
             return
-        layer_to_raw: dict[str, torch.Tensor] = {}
-        for raw, kv_cache_tensor in zip(raw_tensors,
-                                        kv_cache_config.kv_cache_tensors):
-            for layer_name in kv_cache_tensor.shared_by:
-                layer_to_raw[layer_name] = raw
+        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+        layer_to_raw = {
+            name: raw_tensors[index]
+            for name, index in layer_to_pool_index(kv_cache_config).items()
+        }
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
         manager_page_bytes: int | None = None
@@ -2086,6 +2103,9 @@ class TPUModelRunner(GPUModelRunner):
                         num_windowed_reqs: int | None = None):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
+        rpa_num_decode_reqs = (num_windowed_reqs
+                               if self.reorder_batch_threshold > 1 else
+                               num_decode_reqs)
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -2209,7 +2229,8 @@ class TPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_per_req)
         self._check_attention_schedule(
             num_reqs, num_scheduled_tokens_per_req,
-            max(0, min(num_decode_reqs - start_index, num_reqs)))
+            max(0, min(rpa_num_decode_reqs - start_index, num_reqs)),
+            use_max_model_len)
 
         request_major_input_ids_cpu: torch.Tensor
         if self._pcp_mtp_k1_enabled:
@@ -2386,7 +2407,7 @@ class TPUModelRunner(GPUModelRunner):
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
             # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
             chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
+                0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
@@ -2411,13 +2432,13 @@ class TPUModelRunner(GPUModelRunner):
         # Spec decode with mamba layers: the GDN kernel's windowed segment
         # covers 1-token decodes AND speculative verify windows (the batch is
         # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa),
-        # while RPA keeps its 1-token-decode-only front segment.
+        # while RPA includes verify only when its decode tile supports it.
         mamba_request_distribution = None
         if self.mamba_slot_read_offsets is not None:
             chunk_num_windowed = max(
                 0, min(num_windowed_reqs - start_index, num_reqs))
             chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
+                0, min(rpa_num_decode_reqs - start_index, num_reqs))
             # One H2D copy, two views (see the staging tensor's comment for
             # why these must not be independent device tensors). Overrides
             # the RPA tensor built above so both fields always come from the
@@ -3744,6 +3765,7 @@ class TPUModelRunner(GPUModelRunner):
              set_current_vllm_config(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
+        validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
@@ -3802,6 +3824,7 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config,
                                              AttentionLayerBase)
         initialized_count = 0
+        decode_query_sizes = []
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                             vllm_config=self.vllm_config):
             for name, attn_layer in layers.items():
@@ -3817,11 +3840,14 @@ class TPUModelRunner(GPUModelRunner):
                         attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
                         attn_layer.impl._kernel_op_prefix = (
                             "pallas::rpa_kernel_local")
+                        attn_layer.impl.decode_query_size = 1
                         logger.info(
                             "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
                             " | DRAFT_KV_BLOCK_CAP=%d", name,
                             _DRAFT_KV_BLOCK_CAP)
                     attn_layer.impl.initialize_kernel(attn_layer)
+                    decode_query_sizes.append(
+                        attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
             # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
@@ -3846,6 +3872,7 @@ class TPUModelRunner(GPUModelRunner):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
+        self.reorder_batch_threshold = min(decode_query_sizes, default=1)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)
@@ -3871,28 +3898,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # A profile batch carries random values so every token row routes
         # on its own, as real tokens do; a warmup batch traces shapes only.
-        if self.supports_mm_inputs:
-            input_ids = None
-            if profiling:
-                inputs_embeds = self._profile_input(
-                    "embeds", (self.max_num_tokens, self.inputs_embeds_size),
-                    self.dtype)[:num_tokens].to(self.device)
-            else:
-                inputs_embeds = torch.zeros(
-                    (num_tokens, self.inputs_embeds_size),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-        else:
-            if profiling:
-                input_ids = self._profile_input("ids", (self.max_num_tokens, ),
-                                                torch.int32)[:num_tokens].to(
-                                                    self.device)
-            else:
-                input_ids = torch.zeros((num_tokens),
-                                        dtype=torch.int32).to(self.device)
-            inputs_embeds = None
         if profiling:
+            input_ids = self._profile_input("ids", (self.max_num_tokens, ),
+                                            torch.int32)[:num_tokens].to(
+                                                self.device)
             # One prefill request, or several of at most the model length
             # when a bucket exceeds it.
             profile_query_lens = []
@@ -3905,7 +3914,10 @@ class TPUModelRunner(GPUModelRunner):
                 f"profiling {num_tokens} tokens needs {actual_num_reqs} "
                 f"requests, the batch holds {num_reqs}")
         else:
+            input_ids = torch.zeros((num_tokens),
+                                    dtype=torch.int32).to(self.device)
             actual_num_reqs = min(num_tokens, num_reqs)
+        inputs_embeds = None
         if self.uses_mrope:
             position_ids = torch.zeros((3, num_tokens),
                                        dtype=torch.int32).to(self.device)
@@ -4022,12 +4034,6 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
                 num_tokens, zeros=not profiling, random=profiling)
-        if profiling:
-            # The inputs reach the device before the clock starts.
-            inputs = [t for t in (input_ids, inputs_embeds) if t is not None]
-            if intermediate_tensors is not None:
-                inputs += list(intermediate_tensors.tensors.values())
-            synchronize_tensors(inputs)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -4043,6 +4049,17 @@ class TPUModelRunner(GPUModelRunner):
                     kv_cache_bundle=self._kv_cache_bundle,
                 ),
         ):
+            if self.supports_mm_inputs and self._pp_is_first:
+                input_ids, inputs_embeds = self._get_model_inputs(
+                    input_ids, None)
+            if profiling:
+                # The inputs reach the device before the clock starts.
+                inputs = [
+                    t for t in (input_ids, inputs_embeds) if t is not None
+                ]
+                if intermediate_tensors is not None:
+                    inputs += list(intermediate_tensors.tensors.values())
+                synchronize_tensors(inputs)
             started = time.perf_counter()
             out, _ = self.forward_model(
                 input_ids=input_ids,
@@ -4085,37 +4102,35 @@ class TPUModelRunner(GPUModelRunner):
         return cached
 
     def _attention_schedule_capacity(
-            self) -> dict[str, tuple[int, int, int]] | None:
+        self,
+        use_max_model_len: bool = True
+    ) -> dict[str, tuple[int, int, int]] | None:
         """(pairs, bq, bkv) the batched attention kernel can schedule in
-        one step, per kernel mode ("decode", "mixed"); None when the model
-        runs another attention kernel."""
-        if self._attention_capacity_known:
-            return self._attention_capacity
-        from vllm_torchtpu.layers.adapter.attention import \
-            PallasBatchedRPAAttentionBackend
-        backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
-        capacity = None
-        if (backend is not None
-                and issubclass(backend, PallasBatchedRPAAttentionBackend)
-                and not envs.USE_BATCHED_RPA_LONGCTX and self.head_size != 64):
-            from vllm.v1.attention.backends.utils import get_kv_cache_layout
-
-            from vllm_torchtpu.kernels.experimental.batched_rpa import \
-                configs as rpa_configs
-            from vllm_torchtpu.kernels.experimental.batched_rpa import \
-                wrapper as rpa_batched
-            from vllm_torchtpu.layers.adapter.attention import \
-                KV_LAYOUT_BY_VLLM_LAYOUT
-            layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
-            page_size = (self._attention_kernel_block_size
-                         or self.cache_config.block_size)
+        one step, per kernel mode ("decode", "mixed"), for the sequence and
+        page counts the kernel is called with in the context bucket; None
+        when no attention layer runs that kernel."""
+        if self._attention_runs_batched_kernel is None:
+            layers = get_layers_from_vllm_config(self.vllm_config,
+                                                 AttentionLayerBase)
+            impls = [getattr(layer, "impl", None) for layer in layers.values()]
+            self._attention_runs_batched_kernel = any(
+                impl.runs_batched_rpa_schedule() for impl in impls
+                if isinstance(impl, PallasAttentionBackendImpl))
+        if not self._attention_runs_batched_kernel:
+            return None
+        num_seqs, pages_per_seq, page_size = self._attention_kernel_shapes(
+            use_max_model_len)
+        capacity = self._attention_capacity.get((num_seqs, pages_per_seq))
+        if capacity is None:
+            layout = KV_LAYOUT_BY_VLLM_LAYOUT[
+                self.cache_config.get_resolved_kv_cache_layout()]
             shared = dict(
                 num_q_heads=self.model_config.get_num_attention_heads(
                     self.parallel_config),
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_size,
-                num_seqs=self.max_num_reqs,
-                pages_per_seq=cdiv(self.max_model_len, page_size),
+                num_seqs=num_seqs,
+                pages_per_seq=pages_per_seq,
                 page_size=page_size,
                 dtype_q=jax.numpy.dtype(
                     str(self.model_config.dtype).removeprefix("torch.")),
@@ -4134,31 +4149,54 @@ class TPUModelRunner(GPUModelRunner):
                 "Batched attention schedule capacity per step: decode %s, "
                 "mixed %s (pairs, query tile, KV tile) for %d seqs x %d "
                 "pages of %d tokens, %d q heads, %d kv heads, head dim %d",
-                capacity["decode"], capacity["mixed"], shared["num_seqs"],
-                shared["pages_per_seq"], page_size, shared["num_q_heads"],
-                shared["num_kv_heads"], shared["head_dim"])
-        self._attention_capacity = capacity
-        self._attention_capacity_known = True
+                capacity["decode"], capacity["mixed"], num_seqs, pages_per_seq,
+                page_size, shared["num_q_heads"], shared["num_kv_heads"],
+                shared["head_dim"])
+            self._attention_capacity[(num_seqs, pages_per_seq)] = capacity
         return capacity
 
-    def _check_attention_schedule(self, num_reqs: int, q_lens: np.ndarray,
-                                  num_decode: int) -> None:
+    def _attention_kernel_shapes(
+            self, use_max_model_len: bool) -> tuple[int, int, int]:
+        """(sequences, pages per sequence, page size) the batched attention
+        kernel is called with in the max- or most-model-len bucket: the
+        sequence count the bucket pads to and the block table width it
+        slices."""
+        page_size = (self._attention_kernel_block_size
+                     or self.cache_config.block_size)
+        if use_max_model_len or self.most_model_len is None:
+            num_seqs = self.num_reqs_max_model_len
+            group_id = self._attention_kv_cache_group_id
+            if group_id is not None:
+                pages_per_seq = self.input_batch.block_table[
+                    group_id].max_num_blocks_per_req
+            else:
+                pages_per_seq = cdiv(self.max_model_len, page_size)
+        else:
+            assert self.num_reqs_most_model_len is not None
+            num_seqs = self.num_reqs_most_model_len
+            pages_per_seq = cdiv(self.most_model_len, page_size)
+        return num_seqs, pages_per_seq, page_size
+
+    def _check_attention_schedule(self,
+                                  num_reqs: int,
+                                  q_lens: np.ndarray,
+                                  num_decode: int,
+                                  use_max_model_len: bool = True) -> None:
         """Refuse a step whose attention schedule would overrun the
         batched kernel's SMEM, which halts the TPU core. The first
         ``num_decode`` requests run in the decode kernel, the rest in the
         mixed kernel; each has its own capacity."""
-        capacity = self._attention_schedule_capacity()
+        capacity = self._attention_schedule_capacity(use_max_model_len)
         if capacity is None or num_reqs <= 0:
             return
-        from vllm_torchtpu.kernels.experimental.batched_rpa.wrapper import \
-            schedule_pairs
         kv_lens = self.seq_lens_np[:num_reqs]
         for mode, lo, hi in (("decode", 0, num_decode), ("mixed", num_decode,
                                                          num_reqs)):
             if hi <= lo:
                 continue
             pairs, bq, bkv = capacity[mode]
-            need = schedule_pairs(q_lens[lo:hi], kv_lens[lo:hi], bq, bkv)
+            need = rpa_batched.schedule_pairs(q_lens[lo:hi], kv_lens[lo:hi],
+                                              bq, bkv)
             if need > pairs:
                 raise RuntimeError(
                     f"This step's {mode} attention needs {need} (query "

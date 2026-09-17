@@ -24,8 +24,7 @@ import vllm.envs as envs
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.platforms import current_platform
-from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
-                                      get_open_port)
+from vllm.utils.network_utils import get_ip, get_open_port
 from vllm.v1.executor.multiproc_executor import FutureWrapper
 from vllm.v1.executor.ray_env_utils import get_driver_env_vars
 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerHandle
@@ -241,16 +240,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
             placement_group, bundle_to_node_id)
         driver_node = ray.get_runtime_context().get_node_id()
 
-        # Step 3: Resolve the IP for torch.distributed TCPStore.
-        # The TCPStore server runs on rank 0's node, so all workers
-        # must be able to reach this address.
-        dist_ip = bundle_assignments[0]["node_ip"]
-        port = self._select_tcpstore_port(
-            self.parallel_config.data_parallel_rank_local,
-            self.parallel_config.data_parallel_master_port,
-        )
-        distributed_init_method = get_distributed_init_method(dist_ip, port)
-
         # Step 4: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
@@ -304,7 +293,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
             ).remote(
                 vllm_config=self.vllm_config,
                 rank=bundle["rank"],
-                distributed_init_method=distributed_init_method,
                 input_shm_handle=scheduler_output_handle,
                 is_driver_worker=is_driver_worker,
                 is_driver_node=is_driver_node,
@@ -457,6 +445,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
                     "groups. Free the slice and retry so Ray can hand each "
                     "engine a contiguous, aligned set of chips.")
 
+        # Let rank 0 reserve its TCPStore on its own host, matching vLLM's
+        # two-phase RayWorkerProc startup and avoiding a free-port race.
+        distributed_init_method = ray.get(
+            self.ray_worker_handles[0].actor.create_dist_init_method.remote())
+
         # Initialize workers with correct environment variables and local_rank.
         init_worker_refs = []
         for i, (node_id,
@@ -512,6 +505,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
                     engine_local_rank,
                     worker_env_vars,
+                    distributed_init_method,
                     self.driver_env_vars,
                     assigned_physical_gpu_ids=assigned_physical_tpu_ids,
                 ))

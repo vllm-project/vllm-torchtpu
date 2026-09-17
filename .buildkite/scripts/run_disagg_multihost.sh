@@ -32,10 +32,28 @@ if [ -f /etc/environment ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${VLLM_TORCHTPU_IMAGE_TAG:-${IMAGE_REPO}:${COMMIT_HASH}}"
+# Point Test Steps to the Metadata-Driven Image Tag
+IMAGE_TAG=""
+if command -v buildkite-agent &> /dev/null; then
+  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" 2>/dev/null || true)"
+fi
+
+# Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
+if [ -z "${IMAGE_TAG:-}" ]; then
+  if [ "${BUILDKITE:-false}" == "true" ]; then
+    echo "ERROR: CI_IMAGE_TAG metadata is missing in Buildkite CI environment." >&2
+    exit 1
+  fi
+  VLLM_REF="$(sed -nE 's/.*vllm @ git\+https:\/\/github\.com\/vllm-project\/vllm\.git@([a-zA-Z0-9.-]+).*/\1/p' "${REPO_ROOT}/pyproject.toml" | head -n 1)"
+  if [ -z "${VLLM_REF}" ]; then
+    echo "ERROR: Could not parse the vLLM pin from ${REPO_ROOT}/pyproject.toml" >&2
+    exit 1
+  fi
+  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}"
+fi
 
 # ---------------------------------------------------------------------------
 # SSH Setup

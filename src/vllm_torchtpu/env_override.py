@@ -3,13 +3,17 @@
 
 import os
 
+# envs.py imports nothing from this package, so it is safe to load here,
+# while the package's own __init__ is still running.
+from vllm_torchtpu import envs
+
 # Configure TorchTPU compilation cache environment variables directly
-if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
+if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
     # Enable Tier-2 cache in memory (required by Tier-3)
     os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
-                          os.environ["TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"])
+                          envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT)
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
 
@@ -130,27 +134,11 @@ def _fetch_tpu_type_from_metadata() -> str | None:
 
 
 def _resolve_sc_offload_threshold_bytes() -> int | None:
-    # SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:
-    #   "auto" (default): look up per-family constant
-    #   "<integer>":      use that byte value
-    #   "0":              disable the flag (fall through to libtpu default)
-    override = os.getenv("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", "auto")
-    if override != "auto":
-        try:
-            value = int(override)
-        except ValueError:
-            # Log-and-fall-through on bad values so a typo doesn't silently
-            # no-op. (No vllm logger here; env_override runs before it's
-            # importable.)
-            import sys
-            print(
-                "vllm_torchtpu.env_override: invalid "
-                f"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES={override!r}; "
-                "ignoring (SC-offload flag not set).",
-                file=sys.stderr,
-            )
-            return None
-        return value if value > 0 else None
+    # An explicit value wins, with 0 meaning no flag. None (the variable
+    # was unset or "auto") falls through to the chip-family table below.
+    override = envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES
+    if override is not None:
+        return override if override > 0 else None
 
     tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
     if not tpu_type:

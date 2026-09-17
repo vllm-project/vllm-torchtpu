@@ -50,8 +50,10 @@ def _vllm_config(*,
             mamba_block_size=4096,
             mamba_page_size_padded=mamba_page_size_padded,
             mamba_cache_mode=None,
+            use_kda_recoverssm=False,
         ),
         speculative_config=None,
+        num_speculative_tokens=0,
     )
 
 

@@ -957,8 +957,10 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
                 kv_event_group_spec=MagicMock(),
                 sliding_window_size_in_chunks=None), ),
             blocks_per_chunk=1,
+            tokens_per_hash=self.TPC,
             num_workers=2,
-            offload_prompt_only=False)
+            offload_prompt_only=False,
+            supports_partial_tail=False)
         sched.manager = manager
         sched._raiden_manager = manager
         sched._fence_pending = {}

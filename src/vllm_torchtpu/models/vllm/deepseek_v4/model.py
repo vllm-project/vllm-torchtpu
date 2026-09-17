@@ -656,9 +656,10 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         import safetensors.torch  # pyrefly: ignore
         safetensors.torch._TYPES["F8_E8M0"] = torch.uint8
 
-        loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        loaded_params = loader.load_weights(weights,
-                                            mapper=self.hf_to_vllm_mapper)
+        loader = AutoWeightsLoader(self)
+        loaded_params = loader.load_weights(
+            self.hf_to_vllm_mapper.apply(weights),
+            mapper=WeightsMapper(orig_to_new_substr={"mtp.": None}))
 
         # Post-load weight surgery goes here.
         # `fused_wkv_wgate` is built with `quant_config=None`, so it never

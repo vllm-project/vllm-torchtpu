@@ -85,6 +85,10 @@ fi
 
 mkdir -p "${RUN_ROOT}" "${RUN_DIR}/logs"
 
+# Dynamically extract the exact vLLM version installed in the container
+EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-$(python3 -c 'import importlib.metadata as m; print(m.version("vllm"))')}"
+export EXPECTED_VLLM_VERSION
+
 export MODEL_PATH
 export SERVED_MODEL_NAME
 export RUN_ROOT

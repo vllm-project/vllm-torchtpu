@@ -49,32 +49,3 @@ def load_large_to_compact(vmem_ref,
             unpacked_list.append(vmem_ref[row_start:row_end])
 
     return jnp.stack(unpacked_list, axis=0)
-
-
-def store_compact_to_large(vmem_ref, vreg: jax.Array):
-    row_size = vmem_ref.shape[0]
-    src_dtype = vreg.dtype
-    dst_dtype = vmem_ref.dtype
-    should_pack = src_dtype != dst_dtype
-    src_packing = 4 // src_dtype.itemsize
-    dst_packing = 4 // dst_dtype.itemsize
-
-    assert vreg.ndim == 3
-    assert vreg.shape[-2] == src_packing
-    assert vmem_ref.ndim == 2
-    assert vmem_ref.shape[-1] == vreg.shape[-1]
-
-    for row_start in range(0, row_size, dst_packing):
-        row_end = row_start + dst_packing
-        packed_row = row_start // dst_packing
-        if should_pack:
-            assert src_dtype.itemsize == 4
-            assert dst_dtype.itemsize == 2
-
-            unpacked_list = [vreg[i] for i in range(row_start, row_end)]
-            packed = pltpu.pack_elementwise(unpacked_list,
-                                            packed_dtype=dst_dtype)
-            u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
-            u32_vmem_ref[packed_row:packed_row + 1] = packed
-        else:
-            vmem_ref[row_start:row_end] = vreg[packed_row]

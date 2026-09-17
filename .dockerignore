@@ -47,4 +47,6 @@ docs/
 mkdocs.yml
 .readthedocs.yaml
 .pre-commit-config.yaml
-.coveragerc
+# .coveragerc stays in the image: the coverage pipeline runs pytest --cov
+# inside the container and needs it for branch, parallel and subprocess
+# measurement.

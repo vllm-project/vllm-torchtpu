@@ -322,13 +322,12 @@ class TestTpuRayDistributedExecutorV2:
         return_value={})
     @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_open_port",
            return_value=9000)
-    @patch(
-        "vllm_torchtpu.executors.ray_distributed_executor_v2.get_distributed_init_method",
-        return_value="tcp://127.0.0.1:9000")
     @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.MessageQueue")
-    def test_init_executor_env_vars_propagation(
-            self, mock_mq, mock_init_method, mock_port, mock_driver_env,
-            mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray):
+    def test_init_executor_env_vars_propagation(self, mock_mq, mock_port,
+                                                mock_driver_env,
+                                                mock_wait_until_pg_ready,
+                                                mock_get_ip, mock_platform,
+                                                mock_ray):
         # This test verifies that _init_executor correctly computes and propagates all
         # TPU-specific multi-host environment variables to the remote workers.
 
@@ -390,6 +389,7 @@ class TestTpuRayDistributedExecutorV2:
             mock_ray.get.side_effect = [
                 # Discover GPU/TPU IDs (Step 6)
                 [("node_1", [0]), ("node_2", [0])],
+                "tcp://10.0.0.1:9000",  # rank 0 reserves the TCPStore
                 # Initialize workers (Step 7)
                 [None, None],
                 # Collect response MQ handles (Step 8)
@@ -580,14 +580,10 @@ class TestTpuRayDistributedExecutorV2:
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
         return_value={})
-    @patch(
-        "vllm_torchtpu.executors.ray_distributed_executor_v2.get_distributed_init_method",
-        return_value="tcp://10.0.0.1:9000")
     @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.MessageQueue")
     def test_init_executor_data_parallel_slice_binding(
-            self, mock_mq, mock_init_method, mock_driver_env,
-            mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray,
-            monkeypatch):
+            self, mock_mq, mock_driver_env, mock_wait_until_pg_ready,
+            mock_get_ip, mock_platform, mock_ray, monkeypatch):
         # TP=2 x DP=4 over two 4-chip hosts. This engine is DP rank 1 and Ray
         # gave it chips 2 and 3 of the first host, so its slice position comes
         # from those chip ids rather than from any cross-engine agreement.
@@ -639,6 +635,7 @@ class TestTpuRayDistributedExecutorV2:
 
             mock_ray.get.side_effect = [
                 [("node_1", [2]), ("node_1", [3])],
+                "tcp://10.0.0.1:9000",
                 [None, None],
                 [{
                     "status": "READY",
@@ -698,14 +695,10 @@ class TestTpuRayDistributedExecutorV2:
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
         return_value={})
-    @patch(
-        "vllm_torchtpu.executors.ray_distributed_executor_v2.get_distributed_init_method",
-        return_value="tcp://10.0.0.1:9000")
     @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.MessageQueue")
     def test_data_parallel_rejects_misaligned_chip_block(
-            self, mock_mq, mock_init_method, mock_driver_env,
-            mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray,
-            monkeypatch):
+            self, mock_mq, mock_driver_env, mock_wait_until_pg_ready,
+            mock_get_ip, mock_platform, mock_ray, monkeypatch):
         # Same geometry as above, but Ray hands this engine chips 1 and 2.
         # They are contiguous, so nothing downstream would look wrong, yet
         # vLLM reads the DP*TP world as `reshape(-1, dp, pp, pcp, tp)` and

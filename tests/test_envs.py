@@ -7,7 +7,7 @@ already recorded.
 from unittest.mock import MagicMock, patch
 
 import pytest
-from vllm.config import VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -20,7 +20,7 @@ def vllm_config():
     config = MagicMock(spec=VllmConfig)
     config.additional_config = {}
     config.model_config.is_hybrid = False
-    config.cache_config.enable_prefix_caching = False
+    config.cache_config = CacheConfig(enable_prefix_caching=False)
     config.compilation_config.compile_sizes = [16, 32]
     config.speculative_config = None
     config.parallel_config.nnodes = 1

@@ -347,9 +347,10 @@ class TpuPlatform(Platform):
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
-        "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",
-        "REQUANTIZE_WEIGHT_DTYPE", "MOE_REQUANTIZE_BLOCK_SIZE",
-        "MOE_REQUANTIZE_WEIGHT_DTYPE",
+        "MIXED_Q_SPLIT", "MIXED_NUM_QUERIES_PER_BLOCK",
+        "MIXED_NUM_KV_PAGES_PER_BLOCK", "ENABLE_QUANTIZED_MATMUL_KERNEL",
+        "REQUANTIZE_BLOCK_SIZE", "REQUANTIZE_WEIGHT_DTYPE",
+        "MOE_REQUANTIZE_BLOCK_SIZE", "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
@@ -429,6 +430,13 @@ class TpuPlatform(Platform):
         if world_size == 1:
             os.environ.pop("WORLD_SIZE", None)
             return
+
+        # PjRt's distributed bootstrap requires a native endpoint even when
+        # vLLM uses a c10d FileStore. Select it once before spawning workers,
+        # alongside the shared slice topology, so every rank inherits it.
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(portpicker.pick_unused_port())
 
         sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
         sb_count = len(sb_addresses.split(",")) if sb_addresses else 0
@@ -571,15 +579,29 @@ class TpuPlatform(Platform):
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-        kv_cache_layout = "NHD"
-        if parallel_config.prefill_context_parallel_size > 1:
-            from vllm.config import set_current_vllm_config
-            from vllm.v1.attention.backends.utils import get_kv_cache_layout
-            with set_current_vllm_config(vllm_config):
-                kv_cache_layout = get_kv_cache_layout()
+        # TPU's page geometry and block-size selection depend on layout while
+        # loading the model, before engine-core's post-load resolution. Resolve
+        # explicitly here through vLLM's API and publish the same CacheConfig
+        # value to workers, rather than maintaining a process-global getter.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm.v1.attention.backends.utils import (
+            get_flashinfer_layout_string, resolve_kv_cache_layout)
+
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
+        backend = (PallasBatchedRPAAttentionBackend
+                   if vllm_config.attention_config.backend
+                   == AttentionBackendEnum.CUSTOM else PallasAttentionBackend)
+        supported = [
+            layout.name for layout in backend.supported_kv_cache_layouts()
+        ]
+        if (vllm_config.model_config is not None and "DeepseekV4ForCausalLM"
+                in vllm_config.model_config.architectures):
+            supported = ["BLHNC"]
+        layout = resolve_kv_cache_layout(vllm_config, [supported])
+        kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
-            multihost_backend=envs.TPU_MULTIHOST_BACKEND,
             kv_cache_layout=kv_cache_layout,
         )
         pcp_size = pcp_config.pcp_size

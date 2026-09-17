@@ -1083,7 +1083,7 @@ def _resolve_multi_shapes_kv_geometry(
     per_block_shapes: set[tuple[int, ...]] = set()
     kv_dtypes: set[object] = set()
     for leaf in mla_leaves:
-        shape = (leaf.storage_block_size, leaf.num_kv_heads, leaf.head_size)
+        shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
         per_block_shapes.add(shape)
         kv_dtypes.add(leaf.dtype)
     return block_size, per_block_shapes, kv_dtypes, block_size

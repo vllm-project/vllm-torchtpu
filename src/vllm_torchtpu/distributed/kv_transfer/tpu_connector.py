@@ -720,7 +720,8 @@ class TPUConnectorScheduler:
                   because TPU pulls KV cache in a blocking way.
 
         """
-        if self.is_producer or not request.kv_transfer_params:
+        if (self.is_producer or not request.kv_transfer_params
+                or request.kv_transfer_params.get("_remote_kv_processed")):
             return 0, False
 
         assert num_computed_tokens % self.block_size == 0
@@ -767,6 +768,7 @@ class TPUConnectorScheduler:
                 remote_side_channel_port=params["remote_side_channel_port"]
                 if "remote_side_channel_port" in params else None,
             )
+        params["_remote_kv_processed"] = True
         logger.info(
             "TPUConnectorScheduler update_state_after_alloc --> reqs_to_load=%s",
             self.reqs_to_load)
@@ -996,7 +998,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     ) -> tuple[int, bool]:
         if self.is_producer:
             return 0, False
-        if not request.kv_transfer_params:
+        if (not request.kv_transfer_params
+                or request.kv_transfer_params.get("_remote_kv_processed")):
             return 0, False
 
         assert num_computed_tokens % self.block_size == 0
@@ -1055,6 +1058,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     remote_host=params["remote_host"],
                     remote_port=params["remote_port"],
                 )
+                params["_remote_kv_processed"] = True
                 logger.info(
                     "TPURaidenConnectorScheduler prefix hit req_id=%s "
                     "releases remote send uuid=%s", request.request_id,
@@ -1100,6 +1104,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             logger.info(
                 "TPURaidenConnectorScheduler no-load release req_id=%s "
                 "uuid=%s", request.request_id, params["uuid"])
+        params["_remote_kv_processed"] = True
         logger.info(
             "TPURaidenConnectorScheduler update_state_after_alloc --> "
             "reqs_to_load=%s", self.reqs_to_load)
@@ -1120,6 +1125,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if (self._stage3_prefix_aware_load_enabled
                     and int(request.num_computed_tokens) == 0):
                 self._enqueue_stage3_release(request)
+                if request.kv_transfer_params is not None:
+                    request.kv_transfer_params["_remote_kv_processed"] = True
             return
         params = request.kv_transfer_params
         assert params is not None
@@ -1226,6 +1233,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             mamba_state_block_ids=mamba_state_block_ids,
             skip_tokens=skip_tokens,
         )
+        params["_remote_kv_processed"] = True
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 load req_id=%s "
             "source_req_id=%s uuid=%d num_tokens=%d skip_tokens=%d "
@@ -3456,6 +3464,16 @@ class TPURaidenConnectorWorker:
         get_finished polls the local manager.
         """
         start_submit = time.perf_counter()
+        if (task.pending.destination_req_id
+                in self._stage3_finished_loads_pending_cleanup):
+            return _Stage3SubmitOutcome(
+                task=task,
+                error=RuntimeError(
+                    "Missing producer block registration (aborted before submit)"
+                ),
+                submit_ms=0.0,
+                attempted_at=start_submit,
+            )
         error: Optional[BaseException] = None
         try:
             if task.retry_inline:
@@ -3631,8 +3649,10 @@ class TPURaidenConnectorWorker:
             self, finished_req_ids: set[str] | None) -> None:
         """Re-attempts parked Stage-3 loads once per scheduler step, paced
         by the re-attempt interval."""
-        if finished_req_ids:
-            for req_id in finished_req_ids:
+        aborted_req_ids = (set(finished_req_ids or ())
+                           | self._stage3_finished_loads_pending_cleanup)
+        if aborted_req_ids:
+            for req_id in aborted_req_ids:
                 pending = self._stage3_pending_submits.pop(req_id, None)
                 if pending is None:
                     continue
@@ -3658,6 +3678,19 @@ class TPURaidenConnectorWorker:
             finished_req_ids: set[str] | None = None
     ) -> tuple[set[str], set[str]]:
         engine = self._ensure_raiden_transfer_engine()
+        # A request aborted in WAITING_FOR_REMOTE_KVS is scheduler-finished,
+        # but vLLM deliberately delays freeing its blocks until this connector
+        # reports a receive terminal. Record finished_req_ids upfront so
+        # _drain_stage3_pending_submits and _poll_finished immediately see the
+        # abort in the same pass.
+        cleanup_req_ids: set[str] = set()
+        if finished_req_ids:
+            for req_id in finished_req_ids:
+                if (req_id in self._stage3_submitted_loads
+                        and req_id not in self._stage3_terminal_loads):
+                    self._stage3_finished_loads_pending_cleanup.add(req_id)
+                else:
+                    cleanup_req_ids.add(req_id)
         # Deferred Stage-3 submits are re-driven here, once per step, before
         # terminals are read so a deadline failure surfaces in this pass.
         if self._stage3_pending_submits:
@@ -3680,22 +3713,13 @@ class TPURaidenConnectorWorker:
             logger.debug(
                 "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
                 self.tp_rank, done_recving)
-        # A request aborted in WAITING_FOR_REMOTE_KVS is scheduler-finished,
-        # but vLLM deliberately delays freeing its blocks until this connector
-        # reports a receive terminal. Retain accepted Stage-3 state across that
-        # abort so a later manager success/failure is not filtered as stale.
-        cleanup_req_ids: set[str] = set()
-        if finished_req_ids:
-            for req_id in finished_req_ids:
-                if (req_id in self._stage3_submitted_loads
-                        and req_id not in self._stage3_terminal_loads):
-                    self._stage3_finished_loads_pending_cleanup.add(req_id)
-                else:
-                    cleanup_req_ids.add(req_id)
         cleanup_req_ids.update(
             self._stage3_finished_loads_pending_cleanup.intersection(
                 self._stage3_terminal_loads))
         for req_id in cleanup_req_ids:
+            if (not self.is_producer and req_id in self._load_block_ids
+                    and req_id not in self._reported_recving):
+                done_recving.add(req_id)
             source_req_id = self._stage3_source_req_ids.pop(req_id, None)
             if (source_req_id is not None
                     and self._stage3_destination_req_ids.get(source_req_id)
