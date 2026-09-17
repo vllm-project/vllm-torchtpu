@@ -43,13 +43,11 @@ dependencies = [
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
     "tpu-raiden-torch==0.0.1.dev20260827124357",
-    # vLLM asks only for transformers>=5.5.3, with no upper bound. 5.17.0 turns
-    # head_dim into a per-layer attribute, so vLLM 0.27.0's get_head_size raises
-    # AmbiguousGlobalPerLayerAttributeError on any heterogeneous config; that is
-    # the gemma-4-26b multimodal Perf/Eval suite. 5.8.0 is the newest version CI
-    # has actually been green on. The true upper bound is somewhere in between -
-    # find it and widen this to a range rather than bumping the pin blind.
-    "transformers==5.8.0",
+    # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
+    # declared here rather than leaned on as a vLLM transitive. Left unpinned:
+    # vLLM owns the floor (>=5.10.4 as of 0.29.0) and pinning against it is how
+    # we last broke the image build.
+    "transformers",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing

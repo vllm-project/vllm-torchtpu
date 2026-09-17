@@ -28,9 +28,8 @@ RUN ln -sf "$(command -v python)" /usr/bin/python3 && \
 
 WORKDIR /workspace/vllm-torchtpu
 
-# Copy pyproject.toml to extract dependencies and read settings, and the
-# transitive-dependency snapshot that pins what torch-tpu-base used to supply.
-COPY pyproject.toml docker/constraints.txt ./
+# Copy pyproject.toml to extract dependencies and read settings
+COPY pyproject.toml .
 
 # If VLLM_COMMIT_HASH is passed (e.g., testing upstream HEAD in CI),
 # dynamically update pyproject.toml inside the container before building.
@@ -58,7 +57,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
-      --constraint constraints.txt \
       -r pyproject.toml
 
 
@@ -100,7 +98,6 @@ FROM ci AS dev
 # dependency installation layer cache.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
-      --constraint constraints.txt \
       -r pyproject.toml \
       --extra test \
       --extra benchmarking
