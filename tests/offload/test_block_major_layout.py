@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.v1.kv_cache_interface import KVCacheTensor
 
 # Synthetic test geometry: 1 kernel row = (16, 2, 2, 4) bf16 = 512 bytes.
 # Fixed to factor == 1 (device_block_size == kernel_block_size) as required by the contract.
@@ -43,8 +44,11 @@ _GEOMETRY = (_KERNEL_BLOCK_SIZE, _PER_BLOCK_SHAPE, torch.bfloat16,
 def _kv_cache_config(num_tensors=3, num_blocks=4, page_bytes=None):
     page_bytes = page_bytes or _FACTOR * _ROW_BYTES
     tensors = [
-        SimpleNamespace(size=num_blocks * page_bytes,
-                        shared_by=[f"layers.{i}"]) for i in range(num_tensors)
+        KVCacheTensor(size=num_blocks * page_bytes * num_tensors,
+                      layers=[f"layers.{i}"],
+                      layer_stride=page_bytes,
+                      block_stride=page_bytes * num_tensors,
+                      offset=i * page_bytes) for i in range(num_tensors)
     ]
     return SimpleNamespace(kv_cache_tensors=tensors,
                            num_blocks=num_blocks,

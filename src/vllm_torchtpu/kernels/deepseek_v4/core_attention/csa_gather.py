@@ -27,6 +27,7 @@ def main_kernel(
     nope_in_hbm_ref: Any,
     rope_in_hbm_ref: Any,
     indices_hbm_ref: Any,
+    valid_indices_ref: Any,
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
     nope_sem: Any,
@@ -94,7 +95,8 @@ def main_kernel(
                     packed, jnp.left_shift(bf16_bits(k), pk * rope_out_bits))
             out_ref[pl.ds(out_row_base + t, 1), pl.ds(0, half)] = packed
 
-    def outer_pipeline(idx_ref):
+    def outer_pipeline(idx_ref, valid_ref):
+        valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
         b = pl.program_id(0)
         out_row_base = (b * num_cores + core_index) * num_row_subchunks
 
@@ -173,25 +175,35 @@ def main_kernel(
             (num_streams * rope_rows_per_stream, rope_out_cols),
             lambda r: (out_row_base // num_streams + r, 0),
         )
-        pltpu.emit_pipeline(
-            _body,
-            grid=(num_row_subchunks // num_streams, ),
-            in_specs=nope_in_specs + rope_in_specs,
-            out_specs=(rope_out_spec, ),
-        )(
-            *([nope_in_i32] * num_streams),
-            *([rope_in_i32] * num_streams),
-            rope_out_i32,
-        )
+        core_start_idx = out_row_base * row_subchunk_size
+
+        @pl.when(core_start_idx < valid_indices)
+        def _run_gather():
+            pltpu.emit_pipeline(
+                _body,
+                grid=(num_row_subchunks // num_streams, ),
+                in_specs=nope_in_specs + rope_in_specs,
+                out_specs=(rope_out_spec, ),
+            )(
+                *([nope_in_i32] * num_streams),
+                *([rope_in_i32] * num_streams),
+                rope_out_i32,
+            )
 
     pltpu.emit_pipeline(
         outer_pipeline,
         grid=(num_blocks, ),
-        in_specs=pl.BlockSpec(
-            (row_chunk_size, ),
-            lambda b: (b * num_cores + core_index, ),
+        in_specs=(
+            pl.BlockSpec(
+                (row_chunk_size, ),
+                lambda b: (b * num_cores + core_index, ),
+            ),
+            pl.BlockSpec(
+                (row_subchunk_size, ),
+                lambda b: (0, ),
+            ),
         ),
-    )(indices_hbm_ref)
+    )(indices_hbm_ref, valid_indices_ref)
 
 
 @functools.partial(jax.jit)
@@ -199,6 +211,7 @@ def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
+    num_valid_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -208,6 +221,8 @@ def csa_gather(
     rope_cache: (total_pages, page_size // 4, 4, 128) uint8. Each (1, 128) uint8
       is token's rope. It encodes 64 bf16.
     indices: (N,) int32. Token indices into the caches.
+    num_valid_indices: Optional (1,) or scalar int32. Number of valid indices
+      to gather. Subcores assigned to indices beyond this count skip gathering.
 
   Returns:
     nope_out: (N, 4, 128) uint8.
@@ -233,6 +248,16 @@ def csa_gather(
     rope_out_cols = 64
     num_simd_lanes = sc_info.num_lanes
     num_cores = sc_info.num_cores * sc_info.num_subcores
+    row_subchunk_size = num_simd_lanes
+
+    if num_valid_indices is None:
+        valid_indices = jnp.full((row_subchunk_size, ),
+                                 out_size,
+                                 dtype=jnp.int32)
+    else:
+        valid_indices = jnp.full((row_subchunk_size, ),
+                                 num_valid_indices,
+                                 dtype=jnp.int32)
 
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
@@ -242,7 +267,6 @@ def csa_gather(
     assert (
         num_row_subchunks %
         num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."
-    row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = (
@@ -280,7 +304,7 @@ def csa_gather(
         ),
         mesh=vector_mesh,
         name="sc_csa_gather",
-    )(nope_cache, rope_cache, indices)
+    )(nope_cache, rope_cache, indices, valid_indices)
     return (
         nope_out.reshape(-1, nope_subrows, nope_out_cols)[:out_size],
         rope_out[:out_size],

@@ -47,6 +47,103 @@ def test_fp8_config_rejects_store_dtype():
         })
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("block_size,shard_size,deepseek_v4",
+                         [([128, 128], 256, False), ([128, 128], 192, False),
+                          (None, 256, False), ([128, 128], 256, True)])
+def test_fp8_routed_experts_checkpoint_allocation(monkeypatch, block_size,
+                                                  shard_size, deepseek_v4):
+    """Exercise upstream construction and loading with TPU checkpoint geometry."""
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig, FusedMoEParallelConfig, MoEActivation,
+        RoutingMethodType)
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import \
+        ExpertMapManager
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import \
+        VllmFp8MoEMethodTPU
+
+    parallel = FusedMoEParallelConfig(
+        tp_size=2,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=1,
+        tp_rank=1,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=0,
+        sp_size=1,
+        use_ep=False,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False)
+    config = FusedMoEConfig(num_experts=2,
+                            experts_per_token=1,
+                            hidden_dim=256,
+                            intermediate_size=2 * shard_size,
+                            num_local_experts=2,
+                            num_logical_experts=2,
+                            activation=MoEActivation.SILU,
+                            device=torch.device("cpu"),
+                            routing_method=RoutingMethodType.Renormalize,
+                            moe_parallel_config=parallel,
+                            in_dtype=torch.bfloat16)
+    expert_map = ExpertMapManager(max_num_batched_tokens=16,
+                                  top_k=1,
+                                  global_num_experts=2,
+                                  num_redundant_experts=0,
+                                  num_expert_group=None,
+                                  moe_parallel_config=parallel,
+                                  placement_strategy="linear",
+                                  enable_eplb=False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size", lambda: 2)
+    quant_cls = VllmFp8Config
+    if deepseek_v4:
+        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import \
+            VllmDeepseekV4Fp8Config
+        quant_cls = VllmDeepseekV4Fp8Config
+    quant = quant_cls(is_checkpoint_fp8_serialized=True,
+                      activation_scheme="dynamic",
+                      weight_block_size=block_size)
+    quant.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            expert_dtype="fp8")))
+    with set_current_vllm_config(quant.vllm_config):
+        layer = RoutedExperts(layer_name="model.layers.0.mlp.experts",
+                              params_dtype=torch.bfloat16,
+                              moe_config=config,
+                              quant_config=quant,
+                              expert_map_manager=expert_map)
+
+    assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
+    padded = ((shard_size + 127) // 128 * 128 if block_size else shard_size)
+    assert layer.w13_weight.shape == (2, 2 * padded, 256)
+    assert layer.w2_weight.shape == (2, 256, padded)
+    assert layer.w13_weight.dtype == layer.w2_weight.dtype == torch.float8_e4m3fn
+    suffix = "weight_scale_inv" if block_size else "weight_scale"
+    w13_scale = getattr(layer, f"w13_{suffix}")
+    w2_scale = getattr(layer, f"w2_{suffix}")
+    assert w13_scale.shape == ((2, 2 * padded // 128, 2) if block_size else
+                               (2, 2))
+    assert w2_scale.shape == ((2, 2, padded // 128) if block_size else (2, ))
+    assert w13_scale.dtype == w2_scale.dtype == torch.float32
+    assert layer.w13_weight.weight_loader == layer.weight_loader
+    assert w13_scale.weight_loader == layer.weight_loader
+    assert layer.w13_input_scale is None and layer.w2_input_scale is None
+    if block_size and shard_size == padded:
+        # The second TP rank loads the original checkpoint block grid without
+        # native GPU scale refinement. Distinct columns expose wrong slicing.
+        scales = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        layer.weight_loader(w2_scale, scales, "w2_weight_scale_inv", "w2", 0)
+        torch.testing.assert_close(w2_scale[0], scales[:, 2:])
+
+
 class FakeQuant:
     """Minimal quant config for testing."""
 

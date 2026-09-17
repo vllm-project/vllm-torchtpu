@@ -22,6 +22,7 @@ import weakref
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.exceptions import VLLMValidationError
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
@@ -78,7 +79,9 @@ def test_multiple_sampling_params(llm: LLM):
     assert len(PROMPTS) == len(outputs)
 
     # Exception raised, if the size of params does not match the size of prompts
-    with pytest.raises(ValueError):
+    with pytest.raises(
+            VLLMValidationError,
+            match=r"lengths of prompts .* and params .* must be the same"):
         outputs = llm.generate(PROMPTS, sampling_params=sampling_params[:3])
 
     # Single SamplingParams should be applied to every prompt
@@ -111,13 +114,17 @@ def test_multiple_priority(llm: LLM):
     assert len(PROMPTS) == len(outputs)
 
     # Exception raised, if the length of priority does not match the length of prompts
-    with pytest.raises(ValueError):
+    with pytest.raises(
+            VLLMValidationError,
+            match=r"lengths of prompts .* and priority .* must be the same"):
         outputs = llm.generate(PROMPTS,
                                sampling_params=GREEDY_SAMPLING_PARAMS,
                                priority=[0] * (len(PROMPTS) - 1))
 
     # Exception raised, if the priority list is empty
-    with pytest.raises(ValueError):
+    with pytest.raises(
+            VLLMValidationError,
+            match=r"lengths of prompts .* and priority .* must be the same"):
         outputs = llm.generate(PROMPTS,
                                sampling_params=GREEDY_SAMPLING_PARAMS,
                                priority=[])

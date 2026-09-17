@@ -10,7 +10,7 @@ import contextlib
 
 import pytest
 import torch
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.config import get_current_vllm_config
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
@@ -34,16 +34,12 @@ HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
 
 @contextlib.contextmanager
 def _layout_env(monkeypatch, value):
-    """Select a layout for the duration of one test.
-
-    Three caches sit between the env var and `get_kv_cache_layout()`: the
-    `vllm.envs` freeze an earlier `tests/entrypoints/` run leaves behind, the
-    accessor's own `lru_cache`, and -- with the env unset -- the KV connector
-    it falls through to, which needs an active config and resolves to "NHD".
-    """
+    """Resolve legacy env aliases through the native config API."""
     from vllm import envs as vllm_envs
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.v1.attention.backends.utils import set_kv_cache_layout
+    from vllm.config.attention import AttentionConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
@@ -51,13 +47,14 @@ def _layout_env(monkeypatch, value):
         monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     else:
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", value)
-    set_kv_cache_layout(None)
+    config = VllmConfig(attention_config=AttentionConfig(
+        backend=AttentionBackendEnum.CUSTOM))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     try:
-        with set_current_vllm_config(VllmConfig()):
+        with set_current_vllm_config(config):
             yield
     finally:
         monkeypatch.undo()
-        set_kv_cache_layout(None)
         if was_cached:
             vllm_envs.enable_envs_cache()
 
@@ -102,7 +99,8 @@ def page_bytes(backend, num_kv_heads, head_size, dtype, block_size=128):
 ])
 def test_env_selects_layout(monkeypatch, value, expected):
     with _layout_env(monkeypatch, value):
-        assert KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()] is expected
+        assert KV_LAYOUT_BY_VLLM_LAYOUT[get_current_vllm_config(
+        ).cache_config.get_resolved_kv_cache_layout()] is expected
 
 
 # The default must not move: this backend is behaviour-neutral without opt-in
@@ -216,7 +214,7 @@ def test_head_dim_64_delegates_whatever_the_layout(monkeypatch, layout):
     HEAD_ALONG_SUBLANE pages, so the shape comes from the base class.
 
     HND + head_dim 64 is refused at config time instead (#825): the pages are
-    fine for the hd64 kernel, but `get_kv_cache_layout()` still answers "HND"
+    fine for the hd64 kernel, but `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()` still answers "HND"
     process-wide, so `forward` reads a head width of 2 for a 64-wide head and
     skips the padding it owes."""
     with _layout_env(monkeypatch, layout):
@@ -253,14 +251,17 @@ def longctx(monkeypatch):
     `enable_envs_cache()`, which has no way back.
     """
     from vllm_torchtpu import envs
-    monkeypatch.setattr(envs, "USE_BATCHED_RPA_LONGCTX", True, raising=False)
+
+    # Restore the absence of the attribute so __getattr__ remains dynamic.
+    monkeypatch.setitem(envs.__dict__, "USE_BATCHED_RPA_LONGCTX", True)
     yield
 
 
 def test_hnd_selects_seq_along_lane_under_longctx(hnd, longctx):
     """HND drives both forks. Previously refused, because the longctx fork
     took its layout from a separate flag."""
-    assert (KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+    assert (KV_LAYOUT_BY_VLLM_LAYOUT[
+        get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()]
             is KVLayout.SEQ_ALONG_LANE)
 
 
@@ -270,7 +271,8 @@ def test_longctx_wrapper_reads_the_same_layout_env(hnd, longctx):
     name, not identity."""
     from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
         configs as longctx_configs
-    assert (KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+    assert (KV_LAYOUT_BY_VLLM_LAYOUT[
+        get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()]
             is KVLayout.SEQ_ALONG_LANE)
     assert (longctx_configs.KVLayout.SEQ_ALONG_LANE.name ==
             KVLayout.SEQ_ALONG_LANE.name)
@@ -304,7 +306,6 @@ def _normalized_page_bytes(backend, num_kv_heads, head_size, dtype):
         head_size=head_size,
         dtype=dtype,
         page_size_padded=page_bytes(backend, num_kv_heads, head_size, dtype),
-        indexes_kv_by_block_stride=True,
     )
     normalized = normalize_kv_cache_specs_for_tpu({"l": spec},
                                                   dtype,
@@ -384,7 +385,7 @@ def test_longctx_hnd_page_is_shaped_like_mainline(hnd, longctx):
 
 
 def test_no_layout_lookup_on_the_compiled_forward_path():
-    """Nothing on the forward path may call `get_kv_cache_layout()`.
+    """Nothing on the forward path may call `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()`.
 
     It asks the KV connector, which needs a current vLLM config; a compiled
     forward has none, and Dynamo traces into the accessor so its `lru_cache`
@@ -405,7 +406,7 @@ def test_no_layout_lookup_on_the_compiled_forward_path():
     ]
     offenders = [
         fn.__qualname__ for fn in on_forward_path
-        if "get_kv_cache_layout" in inspect.getsource(fn)
+        if "get_resolved_kv_cache_layout" in inspect.getsource(fn)
     ]
     assert not offenders, f"{offenders} resolve the KV layout at forward time"
 
@@ -467,3 +468,30 @@ def test_default_layout_shape_needs_no_tpu_client(nhd, monkeypatch,
                                       dtype) == BASE.get_kv_cache_shape(
                                           4, 128, num_kv_heads, head_size,
                                           dtype)
+
+
+def test_shape_needs_no_config_for_the_probe_and_hd64(monkeypatch):
+    """Two calls must answer without reading the KV layout at all.
+
+    The resolved layout lives in the current vLLM config. vLLM's
+    `OffloadingConnectorWorker.register_kv_caches` probes this
+    method with no dtype and no config, and head_dim 64 routes to the hd64
+    kernel, which ignores the layout. Resolving the layout before those two
+    early returns made both raise `Current vLLM config is not set`.
+
+    Deliberately no config fixture: the other tests here wrap the body in
+    `set_current_vllm_config`, which is exactly what hides this.
+    """
+
+    def no_config():
+        raise AssertionError("get_kv_cache_shape read the current vLLM config")
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.attention.get_current_vllm_config",
+        no_config)
+    assert (BATCHED.get_kv_cache_shape(4, 128, 1, 256,
+                                       "auto") == BASE.get_kv_cache_shape(
+                                           4, 128, 1, 256, "auto"))
+    assert (BATCHED.get_kv_cache_shape(4, 128, 1, 64,
+                                       BF16) == BASE.get_kv_cache_shape(
+                                           4, 128, 1, 64, BF16))

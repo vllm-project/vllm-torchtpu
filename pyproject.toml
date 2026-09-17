@@ -7,7 +7,10 @@ name = "vllm_torchtpu"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
-requires-python = ">=3.12"
+# 3.12 only: every tpu-raiden-torch wheel is cp312-only, so any other interpreter
+# fails to resolve. Stating it here makes that an up-front error rather than an
+# unsatisfiable-requirements failure partway through a Docker build.
+requires-python = ">=3.12,<3.13"
 authors = [
     { name = "vllm_torchtpu Contributors" }
 ]
@@ -25,13 +28,14 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     # Note: we **intentionally** build vllm from source, see README.
-    # vllm==0.27.0 is required for Kimi K3 compatibility
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.27.0",
+    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
-    # time in their HF processors. We must explicitly pin torchvision statically
-    # matching our torch==2.13.0 constraint to prevent the CI Docker base image
-    # from leaking structurally incompatible pre-compiled nms operators!
+    # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
+    # are built against a specific torch ABI, so this stays pinned in lockstep with
+    # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
+    # not at install time.
     "torchvision==0.28.0",
     "torch-tpu==0.1.1.dev20260910000446",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
@@ -39,6 +43,11 @@ dependencies = [
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
     "tpu-raiden-torch==0.0.1.dev20260827124357",
+    # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
+    # declared here rather than leaned on as a vLLM transitive. Left unpinned:
+    # vLLM owns the floor (>=5.10.4 as of 0.29.0) and pinning against it is how
+    # we last broke the image build.
+    "transformers",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -61,6 +70,8 @@ dependencies = [
 [project.optional-dependencies]
 # Required for running tests
 test = [
+    # tests/kernels/ and tests/layers/ use absl.testing.
+    "absl-py",
     "pytest",
     "pytest-mock",
     "pytest-timeout",
@@ -114,6 +125,26 @@ markers = [
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
 ]
+
+[tool.ruff.lint]
+# E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
+# I import sorting. Line length (E501) is in E5 and is not selected.
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# isort and yapf still own these paths. The same list appears in `exclude`
+# under [tool.ruff.format] and in the isort and yapf excludes in
+# .pre-commit-config.yaml; all three move together, otherwise two tools format the
+# same file.
+"scripts/**" = ["I"]
+"src/**" = ["I"]
+"tests/**" = ["I"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
+exclude = ["scripts/**", "src/**", "tests/**"]
 
 [tool.pyrefly]
 project-includes = ["src"]

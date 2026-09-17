@@ -13,8 +13,10 @@
 # limitations under the License.
 """Unit tests for DeepSeek-V4-specific MoE routing."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -180,3 +182,60 @@ def test_non_grouped_plain_path_matches_manual_topk():
                                         dim=-1)
     assert torch.equal(ids, expected_i.to(torch.int32))
     torch.testing.assert_close(weights, expected_w.to(weights.dtype))
+
+
+@pytest.mark.cpu_test
+def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
+    """The runner owns the gate; DSv4 must forward tokens without a second GEMM."""
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import \
+        MoERunner
+
+    from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+
+    class Gate(torch.nn.Linear):
+        tid2eid = torch.tensor([[0], [1]])
+        calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            return super().forward(x), None
+
+    class CPUExperts:
+        # Replace only the accelerator expert kernel; the runner's gate,
+        # dispatch and output handling are the real upstream implementation.
+        quant_method = SimpleNamespace(is_monolithic=True,
+                                       skip_forward_padding=True,
+                                       has_unpadded_output=False,
+                                       moe_kernel=None)
+
+        def _ensure_moe_quant_config_init(self):
+            pass
+
+        def forward_monolithic(self, *, x, router_logits, input_ids=None):
+            return x * router_logits[:, :1] + input_ids[:, None]
+
+    model = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    torch.nn.Module.__init__(model)
+    model.gate = Gate(2, 2, bias=False)
+    model.gate.weight.data.copy_(torch.tensor([[2., 0.], [0., 3.]]))
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    moe_config = SimpleNamespace(hidden_dim=2,
+                                 tp_size=1,
+                                 dp_size=1,
+                                 ep_size=1,
+                                 pcp_size=1,
+                                 is_sequence_parallel=False,
+                                 skip_final_all_reduce=False)
+    with set_current_vllm_config(config):
+        model.experts = MoERunner(layer_name="model.layers.0.ffn.experts",
+                                  moe_config=moe_config,
+                                  router=None,
+                                  routed_experts=CPUExperts(),
+                                  gate=model.gate)
+    with set_forward_context(None, config):
+        output = model(torch.tensor([[1., 2.], [3., 4.]]),
+                       input_ids=torch.tensor([1, 0]))
+    torch.testing.assert_close(output, torch.tensor([[3., 5.], [18., 24.]]))
+    assert model.gate.calls == 1

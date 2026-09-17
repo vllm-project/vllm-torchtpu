@@ -5,7 +5,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import vllm.envs as vllm_envs
-from vllm.config import set_current_vllm_config
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.attention import AttentionConfig
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter as pcp_adapter
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
@@ -430,9 +432,18 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
     assert captured["op_args"][7] is metadata.request_distribution
 
 
-def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(monkeypatch):
+@pytest.fixture
+def hnd_vllm_config_context(monkeypatch):
     vllm_envs.disable_envs_cache()
     monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+    config = VllmConfig(attention_config=AttentionConfig(backend="CUSTOM"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield config
+
+
+def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(
+        monkeypatch, hnd_vllm_config_context):
     impl = _batched_impl(kv_cache_dtype="fp8_e4m3")
     fake_mesh = object()
     captured = {}
@@ -477,25 +488,20 @@ def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(monkeypatch):
 
 
 def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
-        monkeypatch):
-    vllm_envs.disable_envs_cache()
-    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        hnd_vllm_config_context):
     shape = PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
         8, 256, 1, 128, torch.float8_e4m3fn)
 
     assert shape == (8, 2, 32, 4, 256)
-    with set_current_vllm_config(_vllm_config(pcp_size=8,
-                                              interleave_size=256)):
-        assert (PallasBatchedRPAAttentionBackend.
-                get_supported_kernel_block_sizes() == [
-                    128, 256, 512, 1024, 2048, 4096
-                ])
+    parallel_config = hnd_vllm_config_context.parallel_config
+    parallel_config.prefill_context_parallel_size = 8
+    parallel_config.cp_kv_cache_interleave_size = 256
+    assert (PallasBatchedRPAAttentionBackend.get_supported_kernel_block_sizes(
+    ) == [128, 256, 512, 1024, 2048, 4096])
 
 
-def test_pcp_hnd_layout_requires_custom_backend_and_fp8(monkeypatch):
-    vllm_envs.disable_envs_cache()
-    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-
+def test_pcp_hnd_layout_requires_custom_backend_and_fp8(
+        hnd_vllm_config_context):
     with pytest.raises(NotImplementedError, match="non-CUSTOM"):
         _impl(kv_cache_dtype="fp8_e4m3")._validate_pcp_streaming_support(False)
     with pytest.raises(NotImplementedError, match="without an FP8"):

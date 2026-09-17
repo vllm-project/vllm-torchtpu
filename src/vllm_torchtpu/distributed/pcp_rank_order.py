@@ -65,7 +65,9 @@ def resolve_pcp_topology_order(
     if pcp_size <= 1:
         return None
 
-    # Not applicable: PCP runner path does not support TPU multihost yet.
+    # Multi-host workers already have a global rank order spanning the slice.
+    # topology_aware_mesh can currently inspect only a single host, so retain
+    # that global order instead of trying to derive a partial mesh locally.
     nnodes = int(parallel_config.nnodes)
     if nnodes > 1:
         logger.info(

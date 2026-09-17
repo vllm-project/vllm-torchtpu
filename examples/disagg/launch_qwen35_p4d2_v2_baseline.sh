@@ -84,7 +84,7 @@ VLLM_SRC="${VLLM_SRC:-/mnt/data/vllm}"
 TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
-EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-0.27.0}"
+EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-0.29.0}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-0}"
 
 SERVE_HOST="${P4D2_BIND_HOST:-127.0.0.1}"
@@ -287,6 +287,7 @@ common_args=(
   --no-disable-hybrid-kv-cache-manager
   --attention-backend "${ATTENTION_BACKEND}"
   --mamba-cache-mode "${MAMBA_CACHE_MODE}"
+  --prefix-cache-retention-interval "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}"
   --enable-prompt-tokens-details
   --no-enable-log-requests
 )

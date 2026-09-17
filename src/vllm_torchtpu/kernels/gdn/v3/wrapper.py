@@ -131,6 +131,14 @@ def inner_kernel(
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
+    if cfg.is_kda and cfg.window_size > 1:
+        # The one-token K3 decode kernel stores the post-SiLU activation in
+        # the model activation dtype before promoting it for the recurrent
+        # math. Preserve that numerical contract for a fused verify window;
+        # otherwise its target logits can drift solely because the KDA window
+        # keeps this intermediate in fp32.
+        qkv_out_compact = qkv_out_compact.astype(cfg.dtypes.act_out).astype(
+            jnp.float32)
 
     # Step 2: GDN.
 
@@ -316,6 +324,8 @@ def outer_kernel(
         "num_spec_tokens",
         "decode_tile_size",
         "mixed_tile_size",
+        "batched_only",
+        "prefill_only",
         "zero_initialize_out",
         "compute_precision",
         "state_plan",
@@ -350,6 +360,8 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
+    batched_only: bool = False,
+    prefill_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -418,6 +430,9 @@ def fused_conv1d_gdn(
             Must be set iff `state_source` is set.
         num_spec_tokens: Number of speculative draft tokens (0 gives the
             plain 1-token-per-sequence decode path).
+        batched_only: Run only the leading decode/verify segment.
+        prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
+            untouched. Mutually exclusive with batched_only.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -453,13 +468,6 @@ def fused_conv1d_gdn(
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
-    if is_kda and num_spec_tokens > 0:
-        # The KDA compute path returns a single end-of-tile state, not one
-        # checkpoint per window position, so it cannot roll back rejected
-        # draft tokens.
-        raise NotImplementedError(
-            "KDA does not support speculative decoding yet "
-            f"(num_spec_tokens={num_spec_tokens}).")
     if gate_lower_bound is not None:
         if not is_kda:
             raise ValueError("gate_lower_bound only applies to KDA; got "
@@ -516,18 +524,31 @@ def fused_conv1d_gdn(
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__[
             "num_buffers"].default
-        bytes_per_seq = window * (
+        recurrent_bytes_per_seq = window * n_v * d_k * d_v * 4
+        bytes_per_seq = (
             # Recurrent checkpoints (fp32) — the dominant term.
-            n_v * d_k * d_v * 4
+            recurrent_bytes_per_seq
             # Conv checkpoints (fp32).
-            + (kernel_size - 1) * dim * 4
+            + window * (kernel_size - 1) * dim * 4
             # qkv (fp32), b/a (fp32), out (act_out).
-            + dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2))
         vmem_budget = int(config.GDNConfig.WINDOWED_VMEM_FRACTION *
                           pltpu.get_tpu_info().vmem_capacity_bytes)
         spec_tile_budget = (vmem_budget // 2) // num_buffers
         decode_tile_size = max(
             1, min(decode_tile_size, spec_tile_budget // bytes_per_seq))
+
+        if is_kda:
+            # Keep exactly one KDA sequence in each window tile.  The state
+            # pipeline issues one async recurrent-state DMA per sequence but
+            # shares a semaphore and drains the tile with one aggregate wait.
+            # Bounding only the total bytes is insufficient: TP32's four
+            # 3-head sequences have the same 6 MiB footprint as one TP8
+            # 12-head sequence, but the former still has four independent DMA
+            # starts and corrupts recurrent checkpoints in long-running
+            # serving.  A one-sequence tile is the only schedule validated for
+            # repeated rollback and slot reuse on v7, independent of TP size.
+            decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
@@ -682,20 +703,31 @@ def fused_conv1d_gdn(
             weights,
         )
 
+    if batched_only and prefill_only:
+        raise ValueError(
+            "batched_only and prefill_only are mutually exclusive")
+
     if pooled:
-        out_act, out_source, _ = call_kernel(state_source, None, None,
-                                             config.GDNMode.BATCHED)
-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
-                                             config.GDNMode.PER_SEQ)
+        out_act, out_source = None, state_source
+        if not prefill_only:
+            out_act, out_source, _ = call_kernel(state_source, None, None,
+                                                 config.GDNMode.BATCHED)
+        if not batched_only:
+            out_act, out_source, _ = call_kernel(out_source, None, out_act,
+                                                 config.GDNMode.PER_SEQ)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
     # The first segment holds verify windows of up to `num_spec_tokens + 1`
     # tokens, or plain 1-token decodes without speculative decoding.
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, None, config.GDNMode.BATCHED)
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+    out_act, out_conv_state, out_recurrent_state = None, conv_state, recurrent_state
+    if not prefill_only:
+        out_act, out_conv_state, out_recurrent_state = call_kernel(
+            conv_state, recurrent_state, None, config.GDNMode.BATCHED)
+    if not batched_only:
+        out_act, out_conv_state, out_recurrent_state = call_kernel(
+            out_conv_state, out_recurrent_state, out_act,
+            config.GDNMode.PER_SEQ)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)

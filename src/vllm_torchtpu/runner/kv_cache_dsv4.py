@@ -124,7 +124,7 @@ class DsV4KVCacheAllocator:
 
         Every array is uint8 and shaped for the kernel that reads it, rather
         than by the generic `head_size` formula. With `T =
-        spec.storage_block_size` compressed tokens per page:
+        spec.num_states` compressed tokens per page:
 
             CSA `*.attn`      NoPE `(N, T, 4, 128)`     512B/token
                               RoPE `(N, T/4, 4, 128)`   128B/token, in a
@@ -168,13 +168,13 @@ class DsV4KVCacheAllocator:
 
         for layer_name in mla_layer_names:
             spec = per_layer_spec(layer_name)
-            page_size = spec.storage_block_size
+            page_size = spec.num_states
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
                 # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
                 # padded to a 256B record; 4 tokens per row.
                 shape = (num_blocks, page_size // packing, packing, 256)
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
-            elif spec.compress_ratio == self._DS_V4_CSA_COMPRESS_RATIO:
+            elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.
                 nope = _create_cache((num_blocks, page_size, packing, 128),
                                      layer_name)

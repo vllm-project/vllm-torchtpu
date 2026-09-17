@@ -29,6 +29,9 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
+
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
@@ -50,6 +53,13 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 logger = init_logger(__name__)
 
 _pallas_op_cache: dict[str, Any] = {}
+
+
+class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.BLHNC, )
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
@@ -215,9 +225,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         return num_heads
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        from vllm_torchtpu.layers.adapter.attention import \
-            PallasAttentionBackend
-        return PallasAttentionBackend
+        return DeepseekV4TPUAttentionBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         """Derive the main compressed-KV cache spec, or None for SWA-only layers."""
@@ -242,7 +250,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             num_kv_heads=1,
             head_size=head_size,
             dtype=torch.uint8,
-            compress_ratio=min(comp_ratio, block_size),
+            tokens_per_state=min(comp_ratio, block_size),
             alignment=None,
         )
 

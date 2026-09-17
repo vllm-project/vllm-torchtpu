@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import zlib
+
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
@@ -14,11 +16,15 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
+from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import \
     make_latent_projection
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
+from .collective_ops import FusedPrefillCollectives
 from .layers import KimiMLP
 
 
@@ -55,6 +61,7 @@ class KimiMoE(nn.Module):
         assert config.num_experts_per_token is not None
         assert config.moe_intermediate_size is not None
 
+        self.prefix = prefix
         hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         vllm_config = get_current_vllm_config_or_none()
@@ -101,6 +108,15 @@ class KimiMoE(nn.Module):
                                    if self.routed_expert_up_proj is not None
                                    else None)
 
+        self.prefill_group = None
+        self.shared_group = None
+        if envs.TPU_K3_SP_PREFILL:
+            self.prefill_group = FusedPrefillCollectives(prefix)
+            self.shared_group = get_intra_chip_group()
+            if self.shared_group is None or self.shared_group.world_size != 2:
+                raise ValueError(
+                    "K3 SP prefill needs a physical two-core chip group")
+
         self.shared_experts = (KimiMLP(
             hidden_size,
             config.moe_intermediate_size * config.num_shared_experts,
@@ -108,6 +124,7 @@ class KimiMoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.shared_experts",
             reduce_results=False,
+            tp_group=self.shared_group,
             situ_beta=config.activation_situ_beta,
             situ_linear_beta=config.activation_situ_linear_beta,
         ) if config.num_shared_experts > 0 else None)
@@ -153,6 +170,11 @@ class KimiMoE(nn.Module):
                 routed_input_transform=self.routed_expert_down_proj,
                 routed_output_transform=routed_output_transform,
             )
+        if self.shared_group is not None and not hasattr(
+                self.experts.routed_experts.quant_method,
+                "apply_with_routing"):
+            raise ValueError(
+                "K3 SP prefill requires the native MXFP4 MoE backend")
         if padded_intermediate_size != config.moe_intermediate_size:
             routed_experts = self.experts.routed_experts
             w13_weight = getattr(routed_experts, "w13_weight", None)
@@ -166,10 +188,70 @@ class KimiMoE(nn.Module):
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
                 config.moe_intermediate_size // moe_tp_size)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def initialize_dummy_router(self) -> None:
+        """Use fan-in random weights and fixed, distinct random layer biases.
+
+        The generic dummy loader's +/-0.001 weights make the correction bias
+        dominate sigmoid routing scores. Match the prototype's unit logit
+        variance for normalized inputs without imposing any route counts.
+        """
+        config = get_current_vllm_config_or_none()
+        if config is None or str(
+                config.load_config.load_format).lower() != "dummy":
+            return
+        generator = torch.Generator(
+            device="cpu").manual_seed(1234 + zlib.crc32(self.prefix.encode()))
+        bias = torch.randn(self.gate.e_score_correction_bias.shape,
+                           generator=generator,
+                           dtype=torch.float32) * 0.02
+        weight = torch.randn(self.gate.weight.shape,
+                             generator=generator,
+                             dtype=torch.float32)
+        # The TPU dense loader transposes weights to [input, output]. Use
+        # the logical fan-in rather than depending on the stored layout.
+        weight *= self.gate.input_size**-0.5
+        with torch.no_grad():
+            self.gate.e_score_correction_bias.copy_(bias)
+            self.gate.weight.copy_(weight)
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                sequence_parallel: bool = False) -> torch.Tensor:
+        if sequence_parallel or self.shared_group is not None:
+            return self._forward_expert_parallel(hidden_states,
+                                                 sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
         output = self.experts(hidden_states=hidden_states,
                               router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
+
+    def _forward_expert_parallel(self, hidden_states: torch.Tensor,
+                                 sequence_parallel: bool) -> torch.Tensor:
+        """Run EP experts with sharded or replicated tokens, then add shared experts."""
+        group = self.prefill_group
+        router_logits, _ = self.gate(hidden_states)
+        latent = hidden_states
+        if self.routed_expert_down_proj is not None:
+            latent, _ = self.routed_expert_down_proj(latent)
+        routed = self.experts.routed_experts
+        if sequence_parallel:
+            weights, ids = moe_routing.route(routed, latent, router_logits)
+            latent, weights, ids = group.gather_moe_inputs(
+                latent, weights, ids, num_experts=self.gate.output_size)
+            output = routed.quant_method.apply_with_routing(
+                routed, latent, weights, ids)
+        else:
+            output = routed.quant_method.apply_monolithic(
+                routed, latent, router_logits)
+        output = (group.reduce_scatter(output, dim=0)
+                  if sequence_parallel else group.all_reduce(output))
+        if self.routed_expert_norm is not None:
+            output = self.routed_expert_norm(output)
+        if self.routed_expert_up_proj is not None:
+            output, _ = self.routed_expert_up_proj(output)
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(
+                hidden_states, sequence_parallel=sequence_parallel)
+        return output

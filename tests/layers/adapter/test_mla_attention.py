@@ -579,13 +579,6 @@ def test_mla_requires_declared_g_proj():
         _gate_wrapper(modules, 2)
 
 
-def test_mla_requires_calculate_kv_scales():
-    attention = VllmMLAAttention.__new__(VllmMLAAttention)
-    torch.nn.Module.__init__(attention)
-    with pytest.raises(AttributeError, match="calculate_kv_scales"):
-        attention(None, None, None)
-
-
 @pytest.mark.parametrize("layout", ["flipped", "unflipped", "packed"])
 def test_mla_weight_layout_is_restored_on_error(layout):
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
@@ -637,12 +630,9 @@ def test_tpu_platform_keeps_the_selected_backend_without_mla(
     assert cls_name != AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
 
 
-@pytest.mark.parametrize("calculate_kv_scales", [False, True])
-def test_mla_forward_calculates_kv_scales_only_when_declared(
-        calculate_kv_scales):
+def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
-    attention.calculate_kv_scales = calculate_kv_scales
     attention.layer_name = "model.layers.0.attn"
     attention.impl = MagicMock()
     attention.impl.forward.return_value = "out"
@@ -653,10 +643,7 @@ def test_mla_forward_calculates_kv_scales_only_when_declared(
                           "mla_attention_op.get_attention_context",
                           return_value=("meta", None, "cache", None)):
         assert attention(q, kv_c_normed, k_pe) == "out"
-    assert calc_scales.call_count == int(calculate_kv_scales)
-    if calculate_kv_scales:
-        calc_scales.assert_called_once_with(q, kv_c_normed, k_pe,
-                                            "model.layers.0.attn")
+    calc_scales.assert_not_called()
     attention.impl.forward.assert_called_once()
     assert attention.impl.forward.call_args.kwargs["attn_metadata"] == "meta"
     assert attention.impl.forward.call_args.kwargs["kv_cache"] == "cache"

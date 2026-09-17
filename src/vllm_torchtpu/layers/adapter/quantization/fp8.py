@@ -695,6 +695,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self.block_quant = self.weight_block_size is not None
         self.weight_scale_name = ("weight_scale_inv"
                                   if self.block_quant else "weight_scale")
+        # Native allocation/loading reads these states in vLLM 0.29. TPU
+        # pads to the checkpoint block grid instead of refining GPU scales.
+        self.moe_block_shape = self.weight_block_size
+        self.weight_scale_refine = None
         self.fp8_backend = None
 
     @property
@@ -750,7 +754,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype,
                        **extra_weight_attrs):
-        self.moe = layer
         if not hasattr(layer, "has_bias") and hasattr(layer, "moe_config"):
             layer.has_bias = layer.moe_config.has_bias
         if self.quant_config.is_checkpoint_fp8_serialized:

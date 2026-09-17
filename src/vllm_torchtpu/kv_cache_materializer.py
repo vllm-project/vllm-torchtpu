@@ -123,6 +123,32 @@ def _pool_attention_geometry(
     return None
 
 
+def layer_to_pool_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:
+    """Map native layer-compact placements to independently donated TPU pools.
+
+    vLLM's descriptors all describe one backing allocation. The TPU runtime
+    owns one native attention tensor per disjoint layer region instead; equal
+    byte ranges across cache groups must remain the exact same pool object.
+    """
+    page_bytes = max(group.kv_cache_spec.page_size_bytes
+                     for group in kv_cache_config.kv_cache_groups)
+    pool_bytes = kv_cache_config.num_blocks * page_bytes
+    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+    assert len(sizes) == 1, "KV placements must share one backing allocation"
+    backing_bytes = sizes.pop()
+    assert backing_bytes % pool_bytes == 0, (backing_bytes, pool_bytes)
+    result = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        assert tensor.block_stride == page_bytes, (
+            "Unified TPU pools require layer-compact pages", tensor)
+        for index, name in enumerate(tensor.layers):
+            offset = tensor.offset + index * tensor.layer_stride
+            assert offset % pool_bytes == 0, (name, offset, pool_bytes)
+            assert 0 <= offset <= backing_bytes - pool_bytes, (name, tensor)
+            result[name] = offset // pool_bytes
+    return result
+
+
 def allocate_raw_kv_cache_tensors(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
@@ -133,7 +159,10 @@ def allocate_raw_kv_cache_tensors(
     raw_tensors: list[torch.Tensor] = []
     pool_page_bytes = max(group.kv_cache_spec.page_size_bytes
                           for group in kv_cache_config.kv_cache_groups)
-    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+    pool_indices = layer_to_pool_index(kv_cache_config)
+    pool_bytes = kv_cache_config.num_blocks * pool_page_bytes
+    num_pools = kv_cache_config.kv_cache_tensors[0].size // pool_bytes
+    for _ in range(num_pools):
         # The unified pool is born as the stock attention-shaped KV cache.
         # Attention consumes it natively; Mamba adapters address their byte
         # regions inside each manager page without creating typed aliases.
@@ -141,9 +170,7 @@ def allocate_raw_kv_cache_tensors(
         assert spec.block_size % kernel_block_size == 0, (spec.block_size,
                                                           kernel_block_size)
         split = spec.block_size // kernel_block_size
-        assert kv_cache_tensor.size % pool_page_bytes == 0, (
-            kv_cache_tensor.size, pool_page_bytes)
-        num_blocks = kv_cache_tensor.size // pool_page_bytes
+        num_blocks = kv_cache_config.num_blocks
         shape = attn_backend.get_kv_cache_shape(
             num_blocks * split,
             kernel_block_size,
@@ -169,8 +196,8 @@ def allocate_raw_kv_cache_tensors(
                 f"kernel_block_size={kernel_block_size} "
                 f"pool_shape={tuple(raw.shape)} group_pages={group_pages}")
         raw_tensors.append(raw)
-        for layer_name in kv_cache_tensor.shared_by:
-            layer_to_raw[layer_name] = raw
+    for layer_name, pool_index in pool_indices.items():
+        layer_to_raw[layer_name] = raw_tensors[pool_index]
     return layer_to_raw, raw_tensors
 
 
@@ -199,9 +226,7 @@ def _can_allocate_attention_cache_directly(
     kv_cache_config: KVCacheConfig, ) -> bool:
     return all(
         isinstance(group.kv_cache_spec, AttentionSpec)
-        for group in kv_cache_config.kv_cache_groups) and all(
-            len(kv_cache_tensor.shared_by) == 1
-            for kv_cache_tensor in kv_cache_config.kv_cache_tensors)
+        for group in kv_cache_config.kv_cache_groups)
 
 
 def _select_representative_kv_cache_spec(
@@ -259,10 +284,13 @@ def materialize_kv_cache_tensors(
         kernel_block_sizes=kernel_block_sizes,
     )
     if _can_allocate_attention_cache_directly(kv_cache_config):
-        layer_to_tensor_size = {
-            kv_cache_tensor.shared_by[0]: kv_cache_tensor.size
-            for kv_cache_tensor in kv_cache_config.kv_cache_tensors
+        placements = {
+            name:
+            (tensor.offset + index * tensor.layer_stride, tensor.block_stride)
+            for tensor in kv_cache_config.kv_cache_tensors
+            for index, name in enumerate(tensor.layers)
         }
+        region_caches: dict[tuple[int, int], torch.Tensor] = {}
         kv_caches: dict[str, LayerKVCache] = {}
         for group_list in attn_groups:
             for group in group_list:
@@ -273,17 +301,36 @@ def materialize_kv_cache_tensors(
                     continue
                 assert isinstance(spec, AttentionSpec)
                 for layer_name in group.layer_names:
-                    tensor_size = layer_to_tensor_size[layer_name]
-                    assert tensor_size % spec.page_size_bytes == 0
-                    num_blocks = tensor_size // spec.page_size_bytes
-                    kv_caches[layer_name] = make_attention_cache_tensor(
-                        spec=spec,
-                        attn_backend=group.backend,
-                        num_blocks=num_blocks,
-                        kernel_block_size=kernel_block_size,
-                        cache_dtype=cache_dtype,
-                        device=device,
-                    )
+                    num_blocks = kv_cache_config.num_blocks
+                    region = placements[layer_name]
+                    assert region[1] == spec.page_size_bytes, (
+                        "Direct TPU attention caches require compact pages",
+                        layer_name, region)
+                    if region in region_caches:
+                        cache = region_caches[region]
+                        expected_shape = group.backend.get_kv_cache_shape(
+                            num_blocks * spec.block_size // kernel_block_size,
+                            kernel_block_size,
+                            spec.num_kv_heads,
+                            spec.head_size,
+                            cache_dtype_str=cache_dtype)
+                        if (tuple(cache.shape) != tuple(expected_shape)
+                                or cache.dtype != spec.dtype):
+                            raise NotImplementedError(
+                                "Aliased TPU attention layers require identical "
+                                f"native cache geometry: {layer_name} expects "
+                                f"{expected_shape} {spec.dtype}, existing region "
+                                f"has {tuple(cache.shape)} {cache.dtype}")
+                    else:
+                        region_caches[region] = make_attention_cache_tensor(
+                            spec=spec,
+                            attn_backend=group.backend,
+                            num_blocks=num_blocks,
+                            kernel_block_size=kernel_block_size,
+                            cache_dtype=cache_dtype,
+                            device=device,
+                        )
+                    kv_caches[layer_name] = region_caches[region]
         return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=[])
 
     pool_geometry = _pool_attention_geometry(kv_cache_config, attn_groups,

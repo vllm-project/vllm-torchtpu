@@ -41,4 +41,4 @@ def test_indexer_cache_spec_is_raw_uint8(block_size, expected_ratio):
     assert spec.num_kv_heads == 1
     # 128 record bytes + 1 scale byte, rounded to the 128-byte lane.
     assert spec.head_size == 256
-    assert spec.compress_ratio == expected_ratio
+    assert spec.tokens_per_state == expected_ratio
