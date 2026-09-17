@@ -195,11 +195,21 @@ def _pallas_rpa_kernel_impl(
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     if kv_cache.ndim == 4:
-        backend = (PallasAttentionBackend
-                   if kv_layout is None else PallasBatchedRPAAttentionBackend)
-        native_shape = backend.get_kv_cache_shape(
-            1, pool_shape[1], key.shape[1], query.shape[2],
-            pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype])
+        if (kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+                and query.shape[2] != 64):
+            native_shape = rpa_batched_wrapper.get_kv_cache_shape(
+                total_num_pages=1,
+                page_size=pool_shape[1],
+                actual_num_kv_heads=key.shape[1],
+                actual_head_dim=query.shape[2],
+                kv_dtype=kv_cache.dtype,
+                kv_layout=kv_layout,
+                chip_version=get_chip_version(),
+            )
+        else:
+            native_shape = PallasAttentionBackend.get_kv_cache_shape(
+                1, pool_shape[1], key.shape[1], query.shape[2],
+                pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype])
         native_page_elements = math.prod(native_shape[1:])
         # A padded pool page can span several of this layer's native pages.
         page_stride = math.prod(pool_shape[1:]) // native_page_elements
