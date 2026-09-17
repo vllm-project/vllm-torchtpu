@@ -74,36 +74,34 @@ def test_from_vllm_config_records_kv_role():
 
 
 @pytest.mark.parametrize(
-    ("config", "multihost_backend", "error_type", "message"),
+    ("config", "error_type", "message"),
     [
-        (_vllm_config(kv_role="kv_consumer"), "", NotImplementedError,
+        (_vllm_config(kv_role="kv_consumer"), NotImplementedError,
          "KV consumer"),
-        (_vllm_config(dcp_size=2), "", NotImplementedError, "DCP"),
-        (_vllm_config(pipeline_parallel_size=2), "", NotImplementedError,
+        (_vllm_config(dcp_size=2), NotImplementedError, "DCP"),
+        (_vllm_config(pipeline_parallel_size=2), NotImplementedError,
          "pipeline parallelism"),
         (_vllm_config(
             speculative_method="eagle3",
             num_speculative_tokens=1,
-            kv_role="kv_producer"), "", NotImplementedError, "method=mtp"),
+            kv_role="kv_producer"), NotImplementedError, "method=mtp"),
         (_vllm_config(speculative_method="mtp",
                       num_speculative_tokens=2,
-                      kv_role="kv_producer"), "", NotImplementedError,
+                      kv_role="kv_producer"), NotImplementedError,
          "num_speculative_tokens=1"),
-        (_vllm_config(speculative_method="mtp", num_speculative_tokens=1), "",
+        (_vllm_config(speculative_method="mtp", num_speculative_tokens=1),
          NotImplementedError, "kv_role=kv_producer"),
-        (_vllm_config(), "ray", NotImplementedError, "multihost"),
-        (_vllm_config(interleave_size=0), "", ValueError,
+        (_vllm_config(interleave_size=0), ValueError,
          "cp_kv_cache_interleave_size > 0"),
-        (_vllm_config(is_moe_model=True), "", NotImplementedError,
+        (_vllm_config(is_moe_model=True), NotImplementedError,
          "requires --enable-expert-parallel"),
     ],
 )
 def test_static_validator_rejects_unsupported_platform_config(
-        config, multihost_backend, error_type, message):
+        config, error_type, message):
     with pytest.raises(error_type, match=message):
         PcpStaticSupportValidator.validate_platform_config(
             config,
-            multihost_backend=multihost_backend,
             kv_cache_layout="NHD",
         )
 
@@ -111,7 +109,6 @@ def test_static_validator_rejects_unsupported_platform_config(
 def test_static_validator_accepts_supported_pcp_platform_config():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(),
-        multihost_backend="",
         kv_cache_layout="NHD",
     )
 
@@ -122,7 +119,6 @@ def test_static_validator_accepts_supported_pcp_platform_config():
 def test_static_validator_accepts_moe_pcp_with_expert_parallel():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(is_moe_model=True, enable_expert_parallel=True),
-        multihost_backend="",
         kv_cache_layout="NHD",
     )
 
@@ -133,7 +129,6 @@ def test_static_validator_accepts_moe_pcp_with_expert_parallel():
 def test_static_validator_ignores_expert_parallel_without_pcp():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(pcp_size=1, is_moe_model=True),
-        multihost_backend="",
         kv_cache_layout="NHD",
     )
 
@@ -144,17 +139,28 @@ def test_static_validator_ignores_expert_parallel_without_pcp():
 def test_static_validator_accepts_pcp_when_model_is_not_moe(is_moe_model):
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(is_moe_model=is_moe_model),
-        multihost_backend="",
         kv_cache_layout="NHD",
     )
 
     assert config.is_moe is False
 
 
+@pytest.mark.parametrize("nnodes", [2, 4])
+def test_static_validator_accepts_multihost_pcp_platform_config(nnodes):
+    vllm_config = _vllm_config()
+    vllm_config.parallel_config.nnodes = nnodes
+    config = PcpStaticSupportValidator.validate_platform_config(
+        vllm_config,
+        kv_cache_layout="NHD",
+    )
+
+    assert config.enabled
+    assert config.pcp_size == 4
+
+
 def test_static_validator_accepts_pcp_async_non_speculative_config():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(async_scheduling=True),
-        multihost_backend="",
         kv_cache_layout="NHD",
     )
 
@@ -165,7 +171,6 @@ def test_static_validator_accepts_pcp_async_non_speculative_config():
 def test_pcp_hnd_accepts_aligned_pcp_config():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(pcp_size=8, interleave_size=128),
-        multihost_backend="",
         kv_cache_layout="HND",
     )
 
@@ -177,7 +182,6 @@ def test_pcp_hnd_rejects_unaligned_interleave():
     with pytest.raises(ValueError, match="multiple of 128"):
         PcpStaticSupportValidator.validate_platform_config(
             _vllm_config(pcp_size=8, interleave_size=64),
-            multihost_backend="",
             kv_cache_layout="HND",
         )
 
@@ -185,7 +189,6 @@ def test_pcp_hnd_rejects_unaligned_interleave():
 def test_hnd_without_pcp_remains_valid():
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(pcp_size=1, interleave_size=64),
-        multihost_backend="",
         kv_cache_layout="HND",
     )
 
@@ -201,7 +204,6 @@ def test_static_validator_accepts_pcp_mtp_k1_producer(async_scheduling):
             kv_role="kv_producer",
             async_scheduling=async_scheduling,
         ),
-        multihost_backend="",
         kv_cache_layout="NHD",
     )
 
@@ -226,7 +228,6 @@ def test_static_validator_rejects_pcp_mtp_k1_kv_both():
     with pytest.raises(NotImplementedError, match="kv_role=kv_producer"):
         PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
-            multihost_backend="",
             kv_cache_layout="NHD",
         )
 
@@ -239,7 +240,6 @@ def test_static_validator_does_not_restrict_non_pcp_mtp_k3_consumer():
             num_speculative_tokens=3,
             kv_role="kv_consumer",
         ),
-        multihost_backend="",
         kv_cache_layout="NHD",
     )
 

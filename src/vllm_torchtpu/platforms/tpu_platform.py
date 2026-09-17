@@ -580,7 +580,6 @@ class TpuPlatform(Platform):
                 kv_cache_layout = get_kv_cache_layout()
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
-            multihost_backend=envs.TPU_MULTIHOST_BACKEND,
             kv_cache_layout=kv_cache_layout,
         )
         pcp_size = pcp_config.pcp_size
