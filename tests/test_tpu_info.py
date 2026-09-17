@@ -187,6 +187,11 @@ def test_get_tpu_metadata_none_or_empty():
         assert tpu_info.get_tpu_metadata(None) is None
         assert tpu_info.get_tpu_metadata("") is None
         assert tpu_info.get_tpu_metadata("   ") is None
+        assert tpu_info.get_tpu_metadata("/") is None
+        assert tpu_info.get_tpu_metadata("///") is None
+        assert tpu_info.get_tpu_metadata("  /  ") is None
+        assert tpu_info.get_tpu_metadata("../token") is None
+        assert tpu_info.get_tpu_metadata("foo/bar") is None
         mock_get.assert_not_called()
 
 
@@ -199,19 +204,47 @@ def test_get_chip_version_tpu_prefix():
     from jax.experimental.pallas import tpu as pltpu
 
     assert tpu_info.get_chip_version("tpu-v6e-8") == pltpu.ChipVersion.TPU_V6E
+    assert tpu_info.get_chip_version("tpu_v6e-8") == pltpu.ChipVersion.TPU_V6E
+    assert tpu_info.get_chip_version("tpu_v6e_8") == pltpu.ChipVersion.TPU_V6E
+    assert tpu_info.get_chip_version("v6e_8") == pltpu.ChipVersion.TPU_V6E
     assert tpu_info.get_chip_version("tpu7x-8") == pltpu.ChipVersion.TPU_7X
+    assert tpu_info.get_chip_version("tpu_7x_8") == pltpu.ChipVersion.TPU_7X
     assert tpu_info.get_chip_version("v5e-8") == pltpu.ChipVersion.TPU_V5E
     assert tpu_info.get_chip_version("tpu-v5e-8") == pltpu.ChipVersion.TPU_V5E
     assert tpu_info.get_chip_version("v6e-8") == pltpu.ChipVersion.TPU_V6E
+    assert tpu_info.get_chip_version("v5p_8") == pltpu.ChipVersion.TPU_V5P
+    assert tpu_info.get_chip_version("tpu_v5p-8") == pltpu.ChipVersion.TPU_V5P
+    assert tpu_info.get_chip_version("v4_8") == pltpu.ChipVersion.TPU_V4
+    assert tpu_info.get_chip_version("v5lite-8") == pltpu.ChipVersion.TPU_V5E
 
 
 def test_get_node_worker_id_from_env_empty_string(monkeypatch, caplog):
     monkeypatch.setattr("vllm_torchtpu.envs.TPU_WORKER_ID", "")
+    monkeypatch.delenv("CLOUD_TPU_TASK_ID", raising=False)
+    monkeypatch.delenv("JOB_COMPLETION_INDEX", raising=False)
     with patch("requests.get", return_value=MockResponse(404, "Not Found")):
         with caplog.at_level("WARNING"):
             assert tpu_info.get_node_worker_id() == 0
             # Empty string should fall back cleanly to metadata without invalid ID warning
             assert "Invalid TPU worker ID" not in caplog.text
+
+
+def test_get_node_worker_id_from_cloud_tpu_task_id(monkeypatch):
+    monkeypatch.setattr("vllm_torchtpu.envs.TPU_WORKER_ID", None)
+    monkeypatch.setenv("CLOUD_TPU_TASK_ID", "3")
+    monkeypatch.delenv("JOB_COMPLETION_INDEX", raising=False)
+    with patch("requests.get") as mock_get:
+        assert tpu_info.get_node_worker_id() == 3
+        mock_get.assert_not_called()
+
+
+def test_get_node_worker_id_from_job_completion_index(monkeypatch):
+    monkeypatch.setattr("vllm_torchtpu.envs.TPU_WORKER_ID", None)
+    monkeypatch.delenv("CLOUD_TPU_TASK_ID", raising=False)
+    monkeypatch.setenv("JOB_COMPLETION_INDEX", "5")
+    with patch("requests.get") as mock_get:
+        assert tpu_info.get_node_worker_id() == 5
+        mock_get.assert_not_called()
 
 
 def test_get_node_worker_id_negative(monkeypatch, caplog):
@@ -234,13 +267,37 @@ def test_get_node_name_from_env_empty_string(monkeypatch):
 
 
 def test_get_num_cores_per_chip_variants(monkeypatch):
-    for variant in ["V6E-8", "v5e-8", "tpu-v6e-8", "tpu-v5e-8", "V5LITEPOD-8"]:
+    single_core_variants = [
+        "V6E-8",
+        "v5e-8",
+        "tpu-v6e-8",
+        "tpu_v6e-8",
+        "tpu_v6e_8",
+        "v6e_8",
+        "tpu-v5e-8",
+        "tpu_v5e-8",
+        "V5LITEPOD-8",
+        "tpu_v5litepod-8",
+        "v5lite-8",
+    ]
+    for variant in single_core_variants:
         monkeypatch.setattr("vllm_torchtpu.tpu_info.get_tpu_type",
                             lambda v=variant: v)
         assert tpu_info.get_num_cores_per_chip() == 1, f"Failed for {variant}"
 
-    for variant in ["TPU7X-8", "tpu7x-8", "v4-8", None]:
+    dual_core_variants = [
+        "TPU7X-8",
+        "tpu7x-8",
+        "tpu_7x_8",
+        "v4-8",
+        "v4_8",
+        "v5p-8",
+        "v5p_8",
+        None,
+    ]
+    for variant in dual_core_variants:
         monkeypatch.setattr("vllm_torchtpu.tpu_info.get_tpu_type",
                             lambda v=variant: v)
         assert tpu_info.get_num_cores_per_chip() == 2, f"Failed for {variant}"
+
 

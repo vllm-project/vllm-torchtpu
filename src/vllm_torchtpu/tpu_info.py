@@ -18,8 +18,10 @@ GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
 def get_tpu_metadata(key: str | None = "") -> str | None:
     if not key or not isinstance(key, str) or not key.strip():
         return None
+    clean_key = key.strip().strip("/")
+    if not clean_key or "/" in clean_key or ".." in clean_key:
+        return None
     try:
-        clean_key = key.strip().lstrip("/")
         url = f"{GCE_TPU_ACCELERATOR_ENDPOINT}{clean_key}"
         response = requests.get(
             url,
@@ -70,11 +72,13 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     raw = accelerator_type.strip().lower()
     if raw.startswith("tpu-"):
         raw = raw.removeprefix("tpu-")
+    elif raw.startswith("tpu_"):
+        raw = raw.removeprefix("tpu_")
     elif raw.startswith("tpu"):
         raw = raw.removeprefix("tpu")
-    name = raw.split("-")[0]
+    name = raw.replace("_", "-").split("-")[0]
     # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    name = {"v5litepod": "v5e", "v5lite": "v5e", "v7x": "7x"}.get(name, name)
     try:
         return pltpu.ChipVersion(name)
     except ValueError:
@@ -96,6 +100,10 @@ def get_node_name() -> str | None:
 def get_node_worker_id() -> int:
     """For multi-host TPU VM, this returns the worker id for the current node."""
     worker_id = envs.TPU_WORKER_ID
+    if worker_id is None or (isinstance(worker_id, str) and not worker_id.strip()):
+        worker_id = os.getenv("CLOUD_TPU_TASK_ID")
+    if worker_id is None or (isinstance(worker_id, str) and not worker_id.strip()):
+        worker_id = os.getenv("JOB_COMPLETION_INDEX")
     if worker_id is None or (isinstance(worker_id, str) and not worker_id.strip()):
         worker_id = get_tpu_metadata(key="agent-worker-number")
     if worker_id is None or (isinstance(worker_id, str) and not worker_id.strip()):
@@ -123,9 +131,11 @@ def get_num_cores_per_chip() -> int:
         clean = tpu_type.strip().lower()
         if clean.startswith("tpu-"):
             clean = clean.removeprefix("tpu-")
+        elif clean.startswith("tpu_"):
+            clean = clean.removeprefix("tpu_")
         elif clean.startswith("tpu"):
             clean = clean.removeprefix("tpu")
-        if clean.startswith(("v5litepod", "v5e", "v6e")):
+        if clean.startswith(("v5litepod", "v5lite", "v5e", "v6e")):
             return 1
     return 2
 
