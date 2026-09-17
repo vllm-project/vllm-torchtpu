@@ -101,7 +101,6 @@ Example build using the standard helper script:
 
 The Dockerfile also supports a few build arguments that may be useful in advanced workflows:
 
-* `BASE_IMAGE`: base runtime image
 * `VLLM_SOURCE`: when set, installs `vllm` from the copied local source tree
 
 Example using the helper script with build arguments:
