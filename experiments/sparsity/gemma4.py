@@ -166,6 +166,9 @@ def gemma4_sequential(model, dataloader, dev, args):
                     continue
                 gpts[name] = SparseGPT(subset[name])
 
+            # Hook layer input activations (inp[0].data is X in paper) to update Hessian.
+            # When layer(...) runs, this hook calls gpts[name].add_batch(), where
+            # gpts[name].H is updated via: H += (sqrt(2/nsamples) * X) @ (sqrt(2/nsamples) * X)^T
             def add_batch(name):
 
                 def tmp(_, inp, out):
@@ -178,7 +181,8 @@ def gemma4_sequential(model, dataloader, dev, args):
                 handles.append(subset[name].register_forward_hook(
                     add_batch(name)))
 
-            # Forward calibration activations through layer to compute Hessians
+            # Step 1: Forward calibration batches (inps[j] is X).
+            # The forward hooks fire during this loop, accumulating H = 2*X*X^T into gpts[name].H.
             for j in range(args.nsamples):
                 outs[j] = layer(
                     inps[j].unsqueeze(0),
@@ -191,7 +195,11 @@ def gemma4_sequential(model, dataloader, dev, args):
             for h in handles:
                 h.remove()
 
-            # Execute SparseGPT pruning and second-order weight compensation on each matrix
+            # Step 2: Algorithm 1 (fasterprune)
+            # Solves min ||W*X - W_sparse*X||^2 using the accumulated Hessian gpts[name].H.
+            # Inverts H to H^-1, selects 2-of-4 weights per row in subset[name].weight minimizing
+            # error_q = w_q^2 / (2 * [H^-1]_qq), and applies 2nd-order error compensation:
+            # Delta w_unpruned = - (w_q / [H^-1]_qq) * H^-1_:,q
             for name in subset:
                 if name in gpts:
                     mat_start = time.time()
@@ -210,7 +218,10 @@ def gemma4_sequential(model, dataloader, dev, args):
                     mat_duration = time.time() - mat_start
                     print(f" done in {mat_duration:.2f}s")
 
-        # Forward updated activations through the newly pruned layer for subsequent layers
+        # Step 3 (Sequential layer-by-layer propagation):
+        # Forward inps through the newly pruned layer to get outs (distorted X_{l+1}).
+        # Below, inps, outs = outs, inps feeds this into layer l+1 so downstream
+        # layers accumulate Hessians on the actual distorted activations.
         for j in range(args.nsamples):
             outs[j] = layer(
                 inps[j].unsqueeze(0),
