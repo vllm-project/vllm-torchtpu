@@ -149,7 +149,7 @@ def compute_batched_seq_metadata(
     compression_ratio: int = 1,
     static_q_len: int | None = None,
     seq_batch_size: int = 1,
-    chunk_token_start: int | None = None,
+    chunk_token_start: int | tuple[int | None, ...] | None = None,
     chunk_tokens: int | None = None,
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
@@ -157,6 +157,11 @@ def compute_batched_seq_metadata(
 ) -> MetadataRef:
     max_num_seqs = seq_lens.shape[0]
     max_seq_tiles = pl.cdiv(max_num_seqs, seq_batch_size)
+
+    chunk_starts = (chunk_token_start if isinstance(chunk_token_start, tuple)
+                    else (chunk_token_start, ))
+    num_chunks = len(chunk_starts)
+    chunked = chunk_tokens is not None and chunk_starts[0] is not None
 
     if static_q_len == 1:
         total_max_bq = max_seq_tiles
@@ -173,7 +178,20 @@ def compute_batched_seq_metadata(
                                   page_size) if bkv_sz >= page_size else 1)
     max_bkv = max(1, pl.cdiv(pages_per_seq, max_kv_pages_per_block))
 
-    req_max_steps = total_max_bq * max_bkv
+    if chunked:
+        # A chunk can cut across a sequence tile, in which case we compute the
+        # block holding the seam twice: once for the tail of the first sequence,
+        # once for the head of the next. That is one extra block per tile the
+        # chunk touches, and it touches at most max_seq_tiles tiles, or at most
+        # chunk_tokens of them since a touched tile owns at least one token.
+        per_chunk_bq = min(
+            total_max_bq,
+            pl.cdiv(chunk_tokens, seq_batch_size * bq_sz) +
+            min(max_seq_tiles, chunk_tokens),
+        )
+        req_max_steps = num_chunks * per_chunk_bq * max_bkv
+    else:
+        req_max_steps = total_max_bq * max_bkv
     req_max_steps = pl.cdiv(req_max_steps, 1024) * 1024
 
     max_steps = max(1024, req_max_steps)
@@ -182,7 +200,7 @@ def compute_batched_seq_metadata(
 
     def _empty_schedule():
         return MetadataRef.create(
-            num_steps=jnp.zeros((1, ), dtype=jnp.int32),
+            num_steps=jnp.zeros((num_chunks, ), dtype=jnp.int32),
             batch_tile_idx=jnp.zeros((max_steps, ), dtype=jnp.int32),
             bq_idx=jnp.zeros((max_steps, ), dtype=jnp.int32),
             bkv_idx=jnp.zeros((max_steps, ), dtype=jnp.int32),
@@ -242,42 +260,47 @@ def compute_batched_seq_metadata(
             s_num_bq = jnp.maximum(1, pl.cdiv(max_q_lens,
                                               bq_sz)).astype(jnp.int32)
 
-        # Chunked: a tile keeps only the tokens this chunk owns, [lo, hi), and
-        # lays its blocks out from lo.
-        if chunk_token_start is not None:
-            assert chunk_tokens is not None
+        if chunked:
             bq_span = seq_batch_size * bq_sz
             tile_first_seq = jnp.minimum(starting_seq_tile_idx, max_num_seqs)
             tile_last_seq = jnp.minimum(starting_seq_tile_idx + seq_batch_size,
                                         max_num_seqs)
-            tile_tok_start = cu_q_lens[tile_first_seq]
-            tile_tok_end = cu_q_lens[tile_last_seq]
-            chunk_end = chunk_token_start + chunk_tokens
-            lo = jnp.clip(chunk_token_start, tile_tok_start, tile_tok_end)
-            hi = jnp.clip(chunk_end, tile_tok_start, tile_tok_end)
-            s_num_bq = pl.cdiv(hi - lo, bq_span).astype(jnp.int32)
+            tile_tok_start = cu_q_lens[tile_first_seq][None, :]
+            tile_tok_end = cu_q_lens[tile_last_seq][None, :]
+            # A tile keeps only the tokens its chunk owns, [lo, hi), and lays its
+            # blocks out from lo.
+            chunk_start = jnp.asarray(chunk_starts, dtype=jnp.int32)[:, None]
+            lo = jnp.clip(chunk_start, tile_tok_start, tile_tok_end)
+            hi = jnp.clip(chunk_start + chunk_tokens, tile_tok_start,
+                          tile_tok_end)
+            num_bq = pl.cdiv(hi - lo, bq_span).astype(jnp.int32)
+        else:
+            num_bq = s_num_bq[None, :]
 
-        # Elementwise multiplication produces a 1D array of shape (max_seq_tiles,),
-        # where element i holds the number of pipeline steps required for sequence
-        # tile i.
-        s_idx_to_num_steps = s_num_bq * s_num_bkv
-        s_idx_to_start_step_id = jnp.cumulative_sum(s_idx_to_num_steps,
-                                                    include_initial=True)
+        # A segment is one (chunk, sequence tile) pair. Segments sit back to back
+        # on one flat axis, so chunk m owns the max_seq_tiles segments starting at
+        # m * max_seq_tiles, and everything below reads per segment exactly as it
+        # used to read per sequence tile.
+        seg_num_bkv = jnp.tile(s_num_bkv, num_chunks)
+        seg_seq_tiles = jnp.tile(all_seq_tiles, num_chunks)
+        seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
+        seg_start_step_id = jnp.cumulative_sum(seg_num_steps,
+                                               include_initial=True)
 
-        # 2D boolean ownership mask [max_seq_tiles, max_steps] where entry (s, t)
-        # is True if flat pipeline step t belongs to sequence tile s.
-        is_step_in_seq = (
-            all_steps[None, :] >= s_idx_to_start_step_id[:-1, None]) & (
-                all_steps[None, :] < s_idx_to_start_step_id[1:, None])
+        # 2D boolean ownership mask [num_chunks * max_seq_tiles, max_steps] where
+        # entry (j, t) is True if flat pipeline step t belongs to segment j.
+        is_step_in_seg = (all_steps[None, :]
+                          >= seg_start_step_id[:-1, None]) & (
+                              all_steps[None, :] < seg_start_step_id[1:, None])
 
         # Map each flat pipeline step t to its sequence tile index (0, 1, ...) and
         # convert it to the starting sequence index in the batch (batch_tile_idx).
-        repeat_seq_tiles = jnp.sum(all_seq_tiles[:, None] * is_step_in_seq,
+        repeat_seq_tiles = jnp.sum(seg_seq_tiles[:, None] * is_step_in_seg,
                                    axis=0)
         batch_tile_idx = repeat_seq_tiles * seq_batch_size
         # Holds the starting sequence index per flat pipeline step.
-        start_step_id_repeat = jnp.sum(s_idx_to_start_step_id[:-1, None] *
-                                       is_step_in_seq,
+        start_step_id_repeat = jnp.sum(seg_start_step_id[:-1, None] *
+                                       is_step_in_seg,
                                        axis=0)
         # Holds the local step index within the sequence tile.
         tile_step_id = all_steps - start_step_id_repeat
@@ -286,17 +309,20 @@ def compute_batched_seq_metadata(
         # col] where width is nbkv_per_step_id:
         # row = tile_step_id // width, col = tile_step_id % width.
         # jnp.maximum(1, ...) prevents division by zero on inactive steps.
-        nbkv_per_step_id = jnp.sum(s_num_bkv[:, None] * is_step_in_seq, axis=0)
+        nbkv_per_step_id = jnp.sum(seg_num_bkv[:, None] * is_step_in_seg,
+                                   axis=0)
 
         bq_idx = jnp.maximum(0,
                              tile_step_id // jnp.maximum(1, nbkv_per_step_id))
         bkv_idx = jnp.maximum(0,
                               tile_step_id % jnp.maximum(1, nbkv_per_step_id))
 
-        num_steps = jnp.reshape(s_idx_to_num_steps.sum(), (1, ))
+        chunk_num_steps = jnp.sum(seg_num_steps.reshape(
+            num_chunks, max_seq_tiles),
+                                  axis=1)
 
         return MetadataRef.create(
-            num_steps=num_steps,
+            num_steps=chunk_num_steps,
             batch_tile_idx=batch_tile_idx,
             bq_idx=bq_idx,
             bkv_idx=bkv_idx,
@@ -318,13 +344,17 @@ def compute_metadata(
     compression_ratio: int = 1,
     static_q_len: int | None = None,
     seq_batch_size: int = 1,
-    chunk_token_start: int | None = None,
+    chunk_token_start: int | tuple[int | None, ...] | None = None,
     chunk_tokens: int | None = None,
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
 ) -> MetadataRef:
-    """Unified metadata calculation for batch_tile_idx, bq_idx, and bkv_idx."""
+    """Unified metadata calculation for batch_tile_idx, bq_idx, and bkv_idx.
+
+  Passing a tuple of `chunk_token_start` values builds one schedule holding
+  every chunk back to back, with `num_steps[m]` steps for chunk `m`.
+  """
     return compute_batched_seq_metadata(
         seq_lens=seq_lens,
         cu_q_lens=cu_q_lens,

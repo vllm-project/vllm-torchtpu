@@ -15,6 +15,7 @@
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
@@ -307,6 +308,187 @@ class MetadataTest(parameterized.TestCase):
             )
 
         print("=" * 60 + "\n")
+
+
+@pytest.mark.cpu_test
+class ChunkedMetadataTest(parameterized.TestCase):
+    """`chunk_token_start` as a tuple of chunk starts.
+
+    A tuple builds ONE schedule holding every chunk back to back, and the
+    kernel runs chunk `m` by jumping to `sum(num_steps[:m])` and executing
+    `num_steps[m]` steps from there. Three things have to hold for that to
+    work, and each has a test below: the per-chunk step counts are right, the
+    steps sitting at that offset are the ones chunk `m` would have got on its
+    own, and the schedule arrays are long enough to hold every chunk.
+
+    None of this builds a kernel, so it is a CPU test.
+    """
+
+    # Four sequences of 256 query tokens each over a 1024-token flat axis. A
+    # 256-token chunk therefore owns exactly one whole sequence, and every
+    # chunk cut lands on a sequence boundary and a bq block boundary at once --
+    # which is what makes the "same work, just split up" assertion below exact.
+    CHUNK_SEQ_LENS = (512, 1024, 768, 256)  # kv lengths, nbkv = 4, 8, 6, 2
+    CHUNK_CU_Q_LENS = (0, 256, 512, 768, 1024)
+    CHUNK_BQ_SZ = 64  # 256 query tokens -> 4 bq blocks per sequence
+    CHUNK_BKV_SZ = 128
+    CHUNK_PAGE_SIZE = 64
+    CHUNK_PAGES_PER_SEQ = 16
+    CHUNK_MAX_NUM_TOKENS = 1024
+    # 4 bq blocks x (4 + 8 + 6 + 2) kv blocks.
+    CHUNK_UNCHUNKED_STEPS = 80
+
+    def _chunk_meta(self, chunk_token_start, chunk_tokens=256, **overrides):
+        """One prefill pass over the four-sequence config above."""
+        kwargs = dict(
+            seq_lens=jnp.array(self.CHUNK_SEQ_LENS, dtype=jnp.int32),
+            cu_q_lens=jnp.array(self.CHUNK_CU_Q_LENS, dtype=jnp.int32),
+            start_seq_idx=0,
+            end_seq_idx=len(self.CHUNK_SEQ_LENS),
+            bq_sz=self.CHUNK_BQ_SZ,
+            bkv_sz=self.CHUNK_BKV_SZ,
+            pages_per_seq=self.CHUNK_PAGES_PER_SEQ,
+            page_size=self.CHUNK_PAGE_SIZE,
+            max_num_tokens=self.CHUNK_MAX_NUM_TOKENS,
+            static_q_len=None,
+            seq_batch_size=1,
+            chunk_token_start=chunk_token_start,
+            chunk_tokens=chunk_tokens,
+        )
+        kwargs.update(overrides)
+        return metadata.compute_metadata(**kwargs)
+
+    def _expected_num_steps(self, starts, chunk_tokens, cu_q_lens=None):
+        """Steps per chunk, straight from the definition, in numpy.
+
+        Chunk `m` gives sequence `s` the tokens in
+        `[chunk_start, chunk_start + chunk_tokens) & [q_start, q_end)`, lays bq
+        blocks out from the low end of that intersection, and pairs each with
+        every kv block of the sequence.
+        """
+        cu_q_lens = np.array(
+            cu_q_lens if cu_q_lens is not None else self.CHUNK_CU_Q_LENS)
+        kv_lens = np.array(self.CHUNK_SEQ_LENS)
+        num_bkv = np.maximum(1, -(-kv_lens // self.CHUNK_BKV_SZ))
+        out = []
+        for start in starts:
+            steps = 0
+            for s in range(len(kv_lens)):
+                lo = np.clip(start, cu_q_lens[s], cu_q_lens[s + 1])
+                hi = np.clip(start + chunk_tokens, cu_q_lens[s],
+                             cu_q_lens[s + 1])
+                steps += -(-(hi - lo) // self.CHUNK_BQ_SZ) * num_bkv[s]
+            out.append(int(steps))
+        return out
+
+    def test_num_steps_holds_one_entry_per_chunk(self):
+        """Shape is the caller's contract: `num_steps[m]` is chunk `m`.
+
+        Unchunked keeps the pre-tuple shape of (1,) so callers indexing
+        `num_steps[0]` are unaffected.
+        """
+        self.assertEqual(
+            self._chunk_meta(None, chunk_tokens=None).num_steps.shape, (1, ))
+        self.assertEqual(self._chunk_meta(0).num_steps.shape, (1, ))
+        self.assertEqual(
+            self._chunk_meta((0, 256, 512, 768)).num_steps.shape, (4, ))
+
+    @parameterized.named_parameters(("first_chunk", 0), ("middle_chunk", 512))
+    def test_scalar_chunk_start_matches_the_one_tuple(self, start):
+        """A bare int and a 1-tuple of it are the same single-chunk schedule."""
+        scalar = self._chunk_meta(start)
+        tupled = self._chunk_meta((start, ))
+        for name in ("num_steps", "batch_tile_idx", "bq_idx", "bkv_idx"):
+            np.testing.assert_array_equal(np.array(getattr(scalar, name)),
+                                          np.array(getattr(tupled, name)),
+                                          err_msg=name)
+
+    def test_each_chunk_slice_matches_its_standalone_schedule(self):
+        """The property the kernel's `step_offset` rests on.
+
+        Chunk `m` starts at `sum(num_steps[:m])`, and the steps from there must
+        be exactly the schedule that chunk builds when it is the only one.
+        """
+        starts = (0, 256, 512, 768)
+        combined = self._chunk_meta(starts)
+
+        offset = 0
+        for m, start in enumerate(starts):
+            solo = self._chunk_meta(start)
+            n = int(solo.num_steps[0])
+            self.assertEqual(int(combined.num_steps[m]), n,
+                             f"chunk {m} step count")
+            for name in ("batch_tile_idx", "bq_idx", "bkv_idx"):
+                np.testing.assert_array_equal(
+                    np.array(getattr(combined, name))[offset:offset + n],
+                    np.array(getattr(solo, name))[:n],
+                    err_msg=f"chunk {m} at step offset {offset}: {name}")
+            offset += n
+
+    def test_aligned_chunks_are_the_unchunked_schedule_cut_up(self):
+        """Chunking that lands on block boundaries adds and drops no work."""
+        plain = self._chunk_meta(None, chunk_tokens=None)
+        combined = self._chunk_meta((0, 256, 512, 768))
+
+        total = int(np.sum(np.array(combined.num_steps)))
+        self.assertEqual(int(plain.num_steps[0]), self.CHUNK_UNCHUNKED_STEPS)
+        self.assertEqual(total, self.CHUNK_UNCHUNKED_STEPS)
+        for name in ("batch_tile_idx", "bq_idx", "bkv_idx"):
+            np.testing.assert_array_equal(np.array(getattr(combined,
+                                                           name))[:total],
+                                          np.array(getattr(plain,
+                                                           name))[:total],
+                                          err_msg=name)
+
+    @parameterized.named_parameters(
+        ("two_chunks", 512),
+        ("four_chunks", 256),
+        ("eight_chunks", 128),
+        ("sixteen_chunks", 64),
+    )
+    def test_whole_sweep_of_chunks_fits_and_keeps_every_step(
+            self, chunk_tokens):
+        """`max_steps` has to scale with the chunk count, not the chunk.
+
+        All the chunks live in one set of arrays now, so a bound sized for a
+        single chunk would silently truncate the last ones.
+        """
+        starts = tuple(range(0, self.CHUNK_MAX_NUM_TOKENS, chunk_tokens))
+        meta_ = self._chunk_meta(starts, chunk_tokens=chunk_tokens)
+
+        num_steps = np.array(meta_.num_steps)
+        self.assertEqual(num_steps.shape, (len(starts), ))
+        np.testing.assert_array_equal(
+            num_steps, self._expected_num_steps(starts, chunk_tokens))
+        # Cuts are aligned here, so the split is exact however fine it gets.
+        self.assertEqual(int(num_steps.sum()), self.CHUNK_UNCHUNKED_STEPS)
+        self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
+
+    def test_chunks_cutting_mid_sequence_recompute_only_the_seam_block(self):
+        """Ragged q lens: a cut inside a bq block costs that block twice.
+
+        Sequence boundaries at 100 and 512 put every 256-token cut inside a
+        sequence, which is the case the flat-axis layout has to keep straight.
+        """
+        cu_q_lens = (0, 100, 512, 1024, 1024)
+        starts = (0, 256, 512, 768)
+        meta_ = self._chunk_meta(starts,
+                                 cu_q_lens=jnp.array(cu_q_lens,
+                                                     dtype=jnp.int32))
+
+        num_steps = np.array(meta_.num_steps)
+        np.testing.assert_array_equal(
+            num_steps,
+            self._expected_num_steps(starts, 256, cu_q_lens=cu_q_lens))
+        # Seam duplication only ever adds work, and never more than the arrays
+        # can hold.
+        self.assertGreaterEqual(int(num_steps.sum()), 1)
+        self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
+
+    def test_empty_pass_returns_a_zero_per_chunk(self):
+        """The empty branch has to agree with the schedule branch on shape."""
+        meta_ = self._chunk_meta((0, 256, 512), start_seq_idx=0, end_seq_idx=0)
+        np.testing.assert_array_equal(np.array(meta_.num_steps), [0, 0, 0])
 
 
 if __name__ == "__main__":

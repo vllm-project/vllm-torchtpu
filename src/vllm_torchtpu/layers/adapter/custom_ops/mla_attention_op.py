@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
@@ -179,6 +180,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
+        # None means unchunked. The kernel falls back to a single unpipelined
+        # pass when `max_num_tokens` is not a multiple of the chunk.
+        chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
 
         def _streamidx_topk_jax(
                 q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -230,6 +234,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                chunk_tokens=chunk_tokens,
             )
             return cache_kv, topk_indices
 
