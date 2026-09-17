@@ -773,19 +773,20 @@ def _make_attention_capacity_runner(monkeypatch, pcp_size):
     from vllm.config import CacheConfig
 
     from vllm_torchtpu.layers.adapter.attention import \
-        PallasBatchedRPAAttentionBackend
-    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+        PallasAttentionBackendImpl
 
     # Run the real capacity arithmetic using JAX's static chip specification;
     # neither the runner nor this fixture initializes a TPU device.
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-    monkeypatch.setattr(TpuPlatform, "_find_non_ssm_backend",
-                        lambda _: PallasBatchedRPAAttentionBackend)
-    monkeypatch.setattr("vllm_torchtpu.envs.USE_BATCHED_RPA_LONGCTX", False)
+    impl = MagicMock(spec=PallasAttentionBackendImpl)
+    impl.runs_batched_rpa_schedule.return_value = pcp_size == 1
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+        lambda _config, _layer_type: {"layer.0": SimpleNamespace(impl=impl)})
     runner = object.__new__(TPUModelRunner)
-    runner._attention_capacity_known = False
-    runner._attention_capacity = None
+    runner._attention_runs_batched_kernel = None
+    runner._attention_capacity = {}
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size)
     runner.vllm_config = SimpleNamespace(
@@ -798,7 +799,11 @@ def _make_attention_capacity_runner(monkeypatch, pcp_size):
     runner.num_kv_heads = 2
     runner.head_size = 256
     runner.max_num_reqs = 64
+    runner.num_reqs_max_model_len = 64
     runner.max_model_len = 262144
+    runner.most_model_len = None
+    runner.num_reqs_most_model_len = None
+    runner._attention_kv_cache_group_id = None
     runner.kv_cache_dtype = torch.float8_e4m3fn
     return runner
 
@@ -820,7 +825,7 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
     # The backend also serves ordinary RPA, but PCP dispatches the distinct
     # compact streaming schedule for every request distribution.
     assert runner._attention_schedule_capacity() is None
-    assert runner._attention_capacity_known
+    assert runner._attention_runs_batched_kernel is False
 
 
 @pytest.mark.cpu_test

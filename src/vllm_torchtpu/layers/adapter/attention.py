@@ -626,9 +626,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                    and cache_dtype_str.lower().strip() == "auto")
         # Resolve the layout last: the dtype-less probe and hd64 callers
         # do not need a current vLLM config.
-        if (head_size == 64 or is_auto
-                or get_current_vllm_config().cache_config.
-                get_resolved_kv_cache_layout() is not VllmKVCacheLayout.LBHNC):
+        if (head_size == 64
+                or is_auto or KV_LAYOUT_BY_VLLM_LAYOUT[get_current_vllm_config(
+                ).cache_config.get_resolved_kv_cache_layout()]
+                is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
                 cache_dtype_str)
