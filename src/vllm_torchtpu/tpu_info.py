@@ -15,20 +15,25 @@ GCE_TPU_ACCELERATOR_ENDPOINT = (
 GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
 
 
-def get_tpu_metadata(key: str = "") -> str:
+def get_tpu_metadata(key: str = "") -> str | None:
     try:
         accelerator_type_request = requests.get(
             os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),
             headers=GCE_TPU_HEADERS,
+            timeout=5,
         )
         if (accelerator_type_request.status_code == 200
                 and accelerator_type_request.text):
             return accelerator_type_request.text
+        elif accelerator_type_request.status_code == 404:
+            logger.debug(
+                "TPU GCE Metadata attribute %r not found (status code 404).",
+                key)
         else:
             logger.error(
-                "Unable to poll TPU GCE Metadata. Got "
+                "Unable to poll TPU GCE Metadata for %r. Got "
                 f"status code: {accelerator_type_request.status_code} and "
-                f"content: {accelerator_type_request.text}")
+                f"content: {accelerator_type_request.text}", key)
     except requests.RequestException as e:
         logger.error("Unable to poll the TPU GCE Metadata: %s", e)
     return None
@@ -84,7 +89,7 @@ def get_node_worker_id() -> int:
 
 def get_num_cores_per_chip() -> int:
     tpu_type = get_tpu_type()
-    if tpu_type.startswith(("v5litepod", "v6e")):
+    if tpu_type and tpu_type.startswith(("v5litepod", "v6e")):
         return 1
     return 2
 
