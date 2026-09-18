@@ -1,4 +1,9 @@
-<h1 align="center">vLLM TPU</h1>
+<p align="center">
+   <!-- This image will ONLY show up in GitHub's dark mode -->
+  <img src="docs/assets/torch_tpu_dark_mode_short.png#gh-dark-mode-only" alt="vLLM TorchTPU" style="width: 86%;">
+    <!-- This image will ONLY show up in GitHub's light mode (and on other platforms) -->
+  <img src="docs/assets/torch_tpu_light_mode_short.png#gh-light-mode-only" alt="vLLM TorchTPU" style="width: 86%;">
+</p>
 
 This repository contains the integration of **TorchTPU** and **vLLM**. It is a vLLM platform plugin packaged as `vllm_torchtpu`, with TPU kernels and runtime code for TorchTPU.
 

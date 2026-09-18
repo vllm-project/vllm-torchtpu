@@ -803,6 +803,25 @@ def sparse_ragged_paged_attention(
         chunk_size = end_pos - start_pos
         indices = physical_indices[start_pos:end_pos]
 
+        # Batching
+        kernel_batch_size = _largest_divisor(chunk_size,
+                                             attention_kernel_batch_size)
+        assert chunk_size % kernel_batch_size == 0
+        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
+        # steps, so `batch_end - start_pos` MUST be a multiple of
+        # `kernel_batch_size`.
+        batch_end = start_pos + (cdiv(
+            jnp.maximum(
+                0,
+                jnp.minimum(
+                    cu_q_lens[distribution[2]],
+                    end_pos,
+                ) - start_pos,
+            ),
+            kernel_batch_size,
+        ) * kernel_batch_size)
+        num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
+
         # For prefilling of short sequences (or early in the sequence), there are
         # very few number of KVs in the sequence, so different qs' selected topk
         # would have large overlap. This causes gather read hotspotting. We've seen
@@ -832,6 +851,7 @@ def sparse_ragged_paged_attention(
                 cache_kv_nope,
                 cache_kv_rope,
                 indices.reshape(-1),
+                num_valid_indices=num_valid_indices,
             )
             gathered_nope_buffer = gathered_nope_buffer.reshape(
                 chunk_size,
@@ -843,20 +863,6 @@ def sparse_ragged_paged_attention(
         # We treat each query token as a one independent sequence, attend to their
         # respective gathered kv tokens in the `gathered_kv_buffer`.
         # -1 in topk_indices is padded elements at the end of each row.
-        # Batching
-        kernel_batch_size = _largest_divisor(chunk_size,
-                                             attention_kernel_batch_size)
-        assert chunk_size % kernel_batch_size == 0
-        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
-        # steps, so `batch_end - start_pos` MUST be a multiple of
-        # `kernel_batch_size`.
-        batch_end = start_pos + (cdiv(
-            jnp.minimum(
-                cu_q_lens[distribution[2]],
-                end_pos,
-            ) - start_pos,
-            kernel_batch_size,
-        ) * kernel_batch_size)
         result = run_mla_kernel(
             q,
             gathered_nope_buffer,

@@ -5,13 +5,15 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import vllm.envs as vllm_envs
-from vllm.config import set_current_vllm_config
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.attention import AttentionConfig
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter as pcp_adapter
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl, PallasBatchedRPAAttentionBackend,
-    PallasBatchedRPAAttentionBackendImpl)
+    PallasBatchedRPAAttentionBackendImpl, _pallas_rpa_kernel_local)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
@@ -257,6 +259,57 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
     assert calls == [(True, 4)]
 
 
+def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
+        monkeypatch, vllm_config_context):
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_build_rpa_kernel",
+                        lambda self, *args, **kwargs: MagicMock())
+    impl = _batched_impl()
+    assert impl.runs_batched_rpa_schedule()
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        impl.initialize_kernel(_layer())
+
+    assert not impl.runs_batched_rpa_schedule()
+
+
+def test_only_the_batched_kernel_keeps_a_schedule_in_smem(
+        monkeypatch, vllm_config_context):
+    monkeypatch.delenv("USE_BATCHED_RPA_LONGCTX", raising=False)
+    # The batched backend on a plain layer: the batched kernel runs.
+    assert _batched_impl().runs_batched_rpa_schedule()
+    # The default backend runs RPA v3.
+    assert not _impl().runs_batched_rpa_schedule()
+    # head_dim 64 selects the head-dim-64 kernel on either backend.
+    hd64 = PallasBatchedRPAAttentionBackendImpl(num_heads=2,
+                                                head_size=64,
+                                                scale=1.0,
+                                                num_kv_heads=1,
+                                                alibi_slopes=None,
+                                                sliding_window=None,
+                                                kv_cache_dtype="bfloat16")
+    assert not hd64.runs_batched_rpa_schedule()
+
+    # DCP runs the two-pass long-context kernels.
+    dcp = _batched_impl()
+    dcp.dcp_world_size = 2
+    assert not dcp.runs_batched_rpa_schedule()
+
+    # A block-major KV bundle runs the bundled kernel.
+    bundled = _batched_impl()
+    bundled.rpa_kernel_bundled = MagicMock()
+    assert not bundled.runs_batched_rpa_schedule()
+
+    # A tp=1 draft rebound to the local entry runs RPA v3.
+    draft = _batched_impl()
+    draft._kernel_entry = _pallas_rpa_kernel_local
+    assert not draft.runs_batched_rpa_schedule()
+
+    # The long-context fork replaces the batched kernel wholesale.
+    monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
+    assert not _batched_impl().runs_batched_rpa_schedule()
+
+
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
         monkeypatch, vllm_config_context):
     impl = _impl()
@@ -379,9 +432,18 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
     assert captured["op_args"][7] is metadata.request_distribution
 
 
-def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(monkeypatch):
+@pytest.fixture
+def hnd_vllm_config_context(monkeypatch):
     vllm_envs.disable_envs_cache()
     monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+    config = VllmConfig(attention_config=AttentionConfig(backend="CUSTOM"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield config
+
+
+def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(
+        monkeypatch, hnd_vllm_config_context):
     impl = _batched_impl(kv_cache_dtype="fp8_e4m3")
     fake_mesh = object()
     captured = {}
@@ -426,25 +488,20 @@ def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(monkeypatch):
 
 
 def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
-        monkeypatch):
-    vllm_envs.disable_envs_cache()
-    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        hnd_vllm_config_context):
     shape = PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
         8, 256, 1, 128, torch.float8_e4m3fn)
 
     assert shape == (8, 2, 32, 4, 256)
-    with set_current_vllm_config(_vllm_config(pcp_size=8,
-                                              interleave_size=256)):
-        assert (PallasBatchedRPAAttentionBackend.
-                get_supported_kernel_block_sizes() == [
-                    128, 256, 512, 1024, 2048, 4096
-                ])
+    parallel_config = hnd_vllm_config_context.parallel_config
+    parallel_config.prefill_context_parallel_size = 8
+    parallel_config.cp_kv_cache_interleave_size = 256
+    assert (PallasBatchedRPAAttentionBackend.get_supported_kernel_block_sizes(
+    ) == [128, 256, 512, 1024, 2048, 4096])
 
 
-def test_pcp_hnd_layout_requires_custom_backend_and_fp8(monkeypatch):
-    vllm_envs.disable_envs_cache()
-    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-
+def test_pcp_hnd_layout_requires_custom_backend_and_fp8(
+        hnd_vllm_config_context):
     with pytest.raises(NotImplementedError, match="non-CUSTOM"):
         _impl(kv_cache_dtype="fp8_e4m3")._validate_pcp_streaming_support(False)
     with pytest.raises(NotImplementedError, match="without an FP8"):

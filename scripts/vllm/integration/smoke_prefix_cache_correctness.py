@@ -14,35 +14,49 @@ SHORT_QA = [
     ("math_sub", "What is 20 minus 6? Answer only the number.", "14"),
     ("math_mul", "What is 9 times 4? Answer only the number.", "36"),
     ("math_div", "What is 81 divided by 9? Answer only the number.", "9"),
-    ("fact_capital_fr",
-     "What is the capital of France? Answer only the city name.", "Paris"),
-    ("fact_capital_jp",
-     "What is the capital of Japan? Answer only the city name.", "Tokyo"),
-    ("fact_planet",
-     "Which planet is known as the Red Planet? Answer only the planet name.",
-     "Mars"),
-    ("fact_ocean",
-     "What is the largest ocean on Earth? Answer only the ocean name.",
-     "Pacific Ocean"),
-    ("color_banana", "What color is a ripe banana usually? Answer one word.",
-     "Yellow"),
+    (
+        "fact_capital_fr",
+        "What is the capital of France? Answer only the city name.",
+        "Paris",
+    ),
+    (
+        "fact_capital_jp",
+        "What is the capital of Japan? Answer only the city name.",
+        "Tokyo",
+    ),
+    (
+        "fact_planet",
+        "Which planet is known as the Red Planet? Answer only the planet name.",
+        "Mars",
+    ),
+    (
+        "fact_ocean",
+        "What is the largest ocean on Earth? Answer only the ocean name.",
+        "Pacific Ocean",
+    ),
+    ("color_banana", "What color is a ripe banana usually? Answer one word.", "Yellow"),
     ("color_grass", "What color is grass usually? Answer one word.", "Green"),
-    ("translate_cn",
-     "Translate to Chinese: good morning. Answer only the translation.",
-     "早上好。"),
-    ("translate_en", "Translate to English: 你好. Answer only the translation.",
-     "Hello."),
+    (
+        "translate_cn",
+        "Translate to Chinese: good morning. Answer only the translation.",
+        "早上好。",
+    ),
+    (
+        "translate_en",
+        "Translate to English: 你好. Answer only the translation.",
+        "Hello.",
+    ),
     ("yes_no", "Is ice cold? Answer yes or no.", "Yes"),
     ("count", "Count from 1 to 5, separated by commas.", "1, 2, 3, 4, 5"),
     ("spell", "Spell the word cat in uppercase letters.", "CAT"),
-    ("compare", "Which is larger, 12 or 21? Answer only the larger number.",
-     "21"),
+    ("compare", "Which is larger, 12 or 21? Answer only the larger number.", "21"),
     ("weekday", "How many days are in a week? Answer only the number.", "7"),
-    ("season",
-     "In the Northern Hemisphere, which season comes after winter? Answer one word.",
-     "Spring"),
-    ("shape", "How many sides does a triangle have? Answer only the number.",
-     "3"),
+    (
+        "season",
+        "In the Northern Hemisphere, which season comes after winter? Answer one word.",
+        "Spring",
+    ),
+    ("shape", "How many sides does a triangle have? Answer only the number.", "3"),
 ]
 
 BAD_MARKERS = ["<think>", "Thinking Process", "====", "\ufffd"]
@@ -62,14 +76,12 @@ def normalize(text: str) -> str:
 
 def cached_tokens_from_usage(usage: dict) -> int:
     details = usage.get("prompt_tokens_details")
-    if isinstance(details, dict) and isinstance(details.get("cached_tokens"),
-                                                int):
+    if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
         return details["cached_tokens"]
     return 0
 
 
-def post_json(url: str, payload: dict,
-              timeout: int) -> tuple[int, dict, float]:
+def post_json(url: str, payload: dict, timeout: int) -> tuple[int, dict, float]:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
@@ -93,19 +105,13 @@ def post_json(url: str, payload: dict,
         return response.status, json.loads(body), elapsed
 
 
-def chat(url: str, model: str, prompt: str, max_tokens: int,
-         timeout: int) -> dict:
+def chat(url: str, model: str, prompt: str, max_tokens: int, timeout: int) -> dict:
     payload = {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": prompt
-        }],
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
-        "chat_template_kwargs": {
-            "enable_thinking": False
-        },
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     status, parsed, elapsed = post_json(url, payload, timeout)
     result = {
@@ -118,21 +124,27 @@ def chat(url: str, model: str, prompt: str, max_tokens: int,
         return result
     choice = parsed["choices"][0]
     usage = parsed.get("usage", {})
-    result.update({
-        "finish": choice.get("finish_reason"),
-        "text": choice.get("message", {}).get("content", "").strip(),
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
-        "cached_tokens": cached_tokens_from_usage(usage),
-    })
+    result.update(
+        {
+            "finish": choice.get("finish_reason"),
+            "text": choice.get("message", {}).get("content", "").strip(),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "cached_tokens": cached_tokens_from_usage(usage),
+        }
+    )
     return result
 
 
 def build_repeat_prompt(namespace: str, line_count: int, expected: str) -> str:
     lines = [f"Prefix cache namespace={namespace}."]
-    lines.extend((f"Prefix cache fixture row {i:03d}: color=blue, city=Paris, "
-                  f"route=alpha-delta, answer-code={expected}.")
-                 for i in range(line_count))
+    lines.extend(
+        (
+            f"Prefix cache fixture row {i:03d}: color=blue, city=Paris, "
+            f"route=alpha-delta, answer-code={expected}."
+        )
+        for i in range(line_count)
+    )
     lines.append(
         f"Using the fixture above, answer exactly {expected} and no other text."
     )
@@ -141,16 +153,16 @@ def build_repeat_prompt(namespace: str, line_count: int, expected: str) -> str:
 
 def run_quick_probe(url: str, model: str, timeout: int) -> int:
     print("=== QUICK PROBE ===", flush=True)
-    result = chat(url, model, "What is 2+2? Answer only the number.", 16,
-                  timeout)
-    ok = (result.get("status") == 200 and result.get("finish") == "stop"
-          and normalize(result.get("text", "")) == "4")
-    print(json.dumps({
-        k: v
-        for k, v in result.items() if k != "raw"
-    },
-                     ensure_ascii=False),
-          flush=True)
+    result = chat(url, model, "What is 2+2? Answer only the number.", 16, timeout)
+    ok = (
+        result.get("status") == 200
+        and result.get("finish") == "stop"
+        and normalize(result.get("text", "")) == "4"
+    )
+    print(
+        json.dumps({k: v for k, v in result.items() if k != "raw"}, ensure_ascii=False),
+        flush=True,
+    )
     print(f"QUICK_PROBE_OK {int(ok)}")
     return 0 if ok else 1
 
@@ -162,9 +174,12 @@ def run_short_qa(url: str, model: str, timeout: int) -> tuple[int, int]:
     for index, (qid, prompt, expected) in enumerate(SHORT_QA, 1):
         result = chat(url, model, prompt, 64, timeout)
         text = result.get("text", "")
-        ok = (result.get("status") == 200 and result.get("finish") == "stop"
-              and normalize(text) == normalize(expected)
-              and all(marker not in text for marker in BAD_MARKERS))
+        ok = (
+            result.get("status") == 200
+            and result.get("finish") == "stop"
+            and normalize(text) == normalize(expected)
+            and all(marker not in text for marker in BAD_MARKERS)
+        )
         requests += 1
         failures += int(not ok)
         print(
@@ -204,16 +219,21 @@ def run_repeat_consistency(
     cached_values = []
     prompt_values = []
     prompt = build_repeat_prompt(namespace, line_count, expected)
-    print(f"\n=== REPEAT CONSISTENCY lines={line_count} repeats={repeats} ===",
-          flush=True)
+    print(
+        f"\n=== REPEAT CONSISTENCY lines={line_count} repeats={repeats} ===", flush=True
+    )
     for index in range(1, repeats + 1):
         result = chat(url, model, prompt, max_tokens, timeout)
         text = result.get("text", "")
         cached = int(result.get("cached_tokens") or 0)
         # The first request populates the cache; only repeats can hit it.
-        ok = (result.get("status") == 200 and result.get("finish") == "stop"
-              and text == expected and (cached > 0 or index == 1)
-              and all(marker not in text for marker in BAD_MARKERS))
+        ok = (
+            result.get("status") == 200
+            and result.get("finish") == "stop"
+            and text == expected
+            and (cached > 0 or index == 1)
+            and all(marker not in text for marker in BAD_MARKERS)
+        )
         outputs.append(text)
         cached_values.append(cached)
         if isinstance(result.get("prompt_tokens"), int):
@@ -239,32 +259,26 @@ def run_repeat_consistency(
     unique_outputs = sorted(set(outputs))
     if unique_outputs != [expected]:
         failures += 1
-        print(
-            f"REPEAT_OUTPUT_DRIFT lines={line_count} unique={unique_outputs!r}"
-        )
+        print(f"REPEAT_OUTPUT_DRIFT lines={line_count} unique={unique_outputs!r}")
     print(f"REPEAT_LINES {line_count}")
     print(f"REPEAT_REQUESTS {repeats}")
-    print(
-        f"REPEAT_PROMPT_TOKENS_MIN {min(prompt_values) if prompt_values else 0}"
-    )
-    print(
-        f"REPEAT_PROMPT_TOKENS_MAX {max(prompt_values) if prompt_values else 0}"
-    )
-    print(
-        f"REPEAT_CACHED_TOKENS_MIN {min(cached_values) if cached_values else 0}"
-    )
-    print(
-        f"REPEAT_CACHED_TOKENS_MAX {max(cached_values) if cached_values else 0}"
-    )
+    print(f"REPEAT_PROMPT_TOKENS_MIN {min(prompt_values) if prompt_values else 0}")
+    print(f"REPEAT_PROMPT_TOKENS_MAX {max(prompt_values) if prompt_values else 0}")
+    print(f"REPEAT_CACHED_TOKENS_MIN {min(cached_values) if cached_values else 0}")
+    print(f"REPEAT_CACHED_TOKENS_MAX {max(cached_values) if cached_values else 0}")
     print(f"REPEAT_FAILURES {failures}")
     return repeats, failures
 
 
 def build_shared_prefix(namespace: str, line_count: int) -> str:
     lines = [f"Prefix cache namespace={namespace}."]
-    lines.extend((f"Prefix cache fixture row {i:03d}: alpha=ALPHA-314 "
-                  f"bravo=BRAVO-271 charlie=CHARLIE-159.")
-                 for i in range(line_count))
+    lines.extend(
+        (
+            f"Prefix cache fixture row {i:03d}: alpha=ALPHA-314 "
+            f"bravo=BRAVO-271 charlie=CHARLIE-159."
+        )
+        for i in range(line_count)
+    )
     return "\n".join(lines)
 
 
@@ -305,18 +319,21 @@ def run_long_shared_prefix_cross_query(
         for name, key in sequence:
             expected = answers[key]
             prompt = (
-                common_prefix +
-                f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} and no other text."
+                common_prefix
+                + f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} and no other text."
             )
             result = chat(url, model, prompt, max_tokens, timeout)
             text = result.get("text", "")
             cached = int(result.get("cached_tokens") or 0)
             # Round 1 writes the shared prefix into the cache; from round 2
             # every query should resume from it.
-            ok = (result.get("status") == 200
-                  and result.get("finish") == "stop" and text == expected
-                  and (cached > 0 or round_index == 1)
-                  and all(marker not in text for marker in BAD_MARKERS))
+            ok = (
+                result.get("status") == 200
+                and result.get("finish") == "stop"
+                and text == expected
+                and (cached > 0 or round_index == 1)
+                and all(marker not in text for marker in BAD_MARKERS)
+            )
             requests += 1
             failures += int(not ok)
             outputs_by_key[key].append(text)
@@ -348,30 +365,25 @@ def run_long_shared_prefix_cross_query(
         unique = sorted(set(outputs_by_key[key]))
         if unique != [expected]:
             failures += 1
-            print(f"LONG_SHARED_OUTPUT_DRIFT key={key} unique={unique!r} "
-                  f"expected={expected!r}")
+            print(
+                f"LONG_SHARED_OUTPUT_DRIFT key={key} unique={unique!r} "
+                f"expected={expected!r}"
+            )
 
     print(f"LONG_SHARED_REQUESTS {requests}")
     print(f"LONG_SHARED_FAILURES {failures}")
+    print(f"LONG_SHARED_PROMPT_TOKENS_MIN {min(prompt_values) if prompt_values else 0}")
+    print(f"LONG_SHARED_PROMPT_TOKENS_MAX {max(prompt_values) if prompt_values else 0}")
+    print(f"LONG_SHARED_CACHED_TOKENS_MIN {min(cached_values) if cached_values else 0}")
+    print(f"LONG_SHARED_CACHED_TOKENS_MAX {max(cached_values) if cached_values else 0}")
     print(
-        f"LONG_SHARED_PROMPT_TOKENS_MIN {min(prompt_values) if prompt_values else 0}"
+        "LONG_SHARED_UNIQUE_BY_KEY "
+        + json.dumps(
+            {k: sorted(set(v)) for k, v in outputs_by_key.items()},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
     )
-    print(
-        f"LONG_SHARED_PROMPT_TOKENS_MAX {max(prompt_values) if prompt_values else 0}"
-    )
-    print(
-        f"LONG_SHARED_CACHED_TOKENS_MIN {min(cached_values) if cached_values else 0}"
-    )
-    print(
-        f"LONG_SHARED_CACHED_TOKENS_MAX {max(cached_values) if cached_values else 0}"
-    )
-    print("LONG_SHARED_UNIQUE_BY_KEY " +
-          json.dumps({
-              k: sorted(set(v))
-              for k, v in outputs_by_key.items()
-          },
-                     ensure_ascii=False,
-                     sort_keys=True))
     print(f"LONG_SHARED_PREFIX_CROSS_QUERY_OK {int(failures == 0)}")
     return requests, failures
 
@@ -428,9 +440,10 @@ def run_mixed_query_correctness(
             if kind == "long":
                 key = prompt_or_key
                 prompt = (
-                    common_prefix +
-                    f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
-                    "and no other text.")
+                    common_prefix
+                    + f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
+                    "and no other text."
+                )
             else:
                 prompt = prompt_or_key
 
@@ -439,11 +452,13 @@ def run_mixed_query_correctness(
             cached = int(result.get("cached_tokens") or 0)
             # Long prompts share a prefix, so from round 2 they must hit;
             # the short ones interleaved between them never can.
-            ok = (result.get("status") == 200
-                  and result.get("finish") == "stop"
-                  and normalize(text) == normalize(expected)
-                  and (cached > 0 or kind != "long" or round_index == 1)
-                  and all(marker not in text for marker in BAD_MARKERS))
+            ok = (
+                result.get("status") == 200
+                and result.get("finish") == "stop"
+                and normalize(text) == normalize(expected)
+                and (cached > 0 or kind != "long" or round_index == 1)
+                and all(marker not in text for marker in BAD_MARKERS)
+            )
             requests += 1
             failures += int(not ok)
             outputs_by_case[name].append(text)
@@ -475,23 +490,29 @@ def run_mixed_query_correctness(
         unique = sorted({normalize(value) for value in outputs_by_case[name]})
         if unique != [normalize(expected)]:
             failures += 1
-            print(f"MIXED_OUTPUT_DRIFT case={name} "
-                  f"unique={unique!r} expected={expected!r}")
+            print(
+                f"MIXED_OUTPUT_DRIFT case={name} "
+                f"unique={unique!r} expected={expected!r}"
+            )
 
     print(f"MIXED_QUERY_REQUESTS {requests}")
     print(f"MIXED_QUERY_FAILURES {failures}")
-    print("MIXED_QUERY_LONG_CACHED_TOKENS_MIN "
-          f"{min(cached_values) if cached_values else 0}")
-    print("MIXED_QUERY_LONG_CACHED_TOKENS_MAX "
-          f"{max(cached_values) if cached_values else 0}")
-    print("MIXED_QUERY_UNIQUE_BY_CASE " + json.dumps(
-        {
-            k: sorted(set(v))
-            for k, v in outputs_by_case.items()
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    ))
+    print(
+        "MIXED_QUERY_LONG_CACHED_TOKENS_MIN "
+        f"{min(cached_values) if cached_values else 0}"
+    )
+    print(
+        "MIXED_QUERY_LONG_CACHED_TOKENS_MAX "
+        f"{max(cached_values) if cached_values else 0}"
+    )
+    print(
+        "MIXED_QUERY_UNIQUE_BY_CASE "
+        + json.dumps(
+            {k: sorted(set(v)) for k, v in outputs_by_case.items()},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     print(f"MIXED_QUERY_CORRECTNESS_OK {int(failures == 0)}")
     return requests, failures
 
@@ -531,11 +552,11 @@ def run_concurrent_mixed_query_correctness(
                 key = keys[index % len(keys)]
                 expected = answers[key]
                 prompt = (
-                    common_prefix +
-                    f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
-                    "and no other text.")
-                future = executor.submit(chat, url, model, prompt, max_tokens,
-                                         timeout)
+                    common_prefix
+                    + f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
+                    "and no other text."
+                )
+                future = executor.submit(chat, url, model, prompt, max_tokens, timeout)
                 future_to_case[future] = (round_index, key, expected)
             for future in as_completed(future_to_case):
                 round_index, key, expected = future_to_case[future]
@@ -550,10 +571,13 @@ def run_concurrent_mixed_query_correctness(
                     }
                 text = result.get("text", "")
                 cached = int(result.get("cached_tokens") or 0)
-                ok = (result.get("status") == 200
-                      and result.get("finish") == "stop" and text == expected
-                      and cached > 0 and all(marker not in text
-                                             for marker in BAD_MARKERS))
+                ok = (
+                    result.get("status") == 200
+                    and result.get("finish") == "stop"
+                    and text == expected
+                    and cached > 0
+                    and all(marker not in text for marker in BAD_MARKERS)
+                )
                 requests += 1
                 failures += int(not ok)
                 outputs_by_key[key].append(text)
@@ -569,8 +593,7 @@ def run_concurrent_mixed_query_correctness(
                             "elapsed_s": result.get("elapsed_s"),
                             "prompt_tokens": result.get("prompt_tokens"),
                             "cached_tokens": cached,
-                            "completion_tokens":
-                            result.get("completion_tokens"),
+                            "completion_tokens": result.get("completion_tokens"),
                             "text": text,
                             "ok": ok,
                         },
@@ -584,44 +607,49 @@ def run_concurrent_mixed_query_correctness(
         unique = sorted(set(values))
         if unique != [expected]:
             failures += 1
-            print(f"CONCURRENT_MIXED_OUTPUT_DRIFT key={key} "
-                  f"unique={unique!r} expected={expected!r}")
+            print(
+                f"CONCURRENT_MIXED_OUTPUT_DRIFT key={key} "
+                f"unique={unique!r} expected={expected!r}"
+            )
 
     print(f"CONCURRENT_MIXED_QUERY_REQUESTS {requests}")
     print(f"CONCURRENT_MIXED_QUERY_FAILURES {failures}")
-    print("CONCURRENT_MIXED_QUERY_CACHED_TOKENS_MIN "
-          f"{min(cached_values) if cached_values else 0}")
-    print("CONCURRENT_MIXED_QUERY_CACHED_TOKENS_MAX "
-          f"{max(cached_values) if cached_values else 0}")
-    print("CONCURRENT_MIXED_QUERY_UNIQUE_BY_KEY " + json.dumps(
-        {
-            k: sorted(set(v))
-            for k, v in outputs_by_key.items()
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    ))
+    print(
+        "CONCURRENT_MIXED_QUERY_CACHED_TOKENS_MIN "
+        f"{min(cached_values) if cached_values else 0}"
+    )
+    print(
+        "CONCURRENT_MIXED_QUERY_CACHED_TOKENS_MAX "
+        f"{max(cached_values) if cached_values else 0}"
+    )
+    print(
+        "CONCURRENT_MIXED_QUERY_UNIQUE_BY_KEY "
+        + json.dumps(
+            {k: sorted(set(v)) for k, v in outputs_by_key.items()},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     print(f"CONCURRENT_MIXED_QUERY_CORRECTNESS_OK {int(failures == 0)}")
     return requests, failures
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=
-        "End-to-end correctness smoke for disaggregated serving with prefix caching."
+        description="End-to-end correctness smoke for disaggregated serving with prefix caching."
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", default=os.environ.get("PROXY_PORT", "8000"))
-    parser.add_argument("--model",
-                        default=os.environ.get("SERVED_MODEL_NAME",
-                                               "Qwen3.5-35B-A3B-FP8"))
+    parser.add_argument(
+        "--model", default=os.environ.get("SERVED_MODEL_NAME", "Qwen3.5-35B-A3B-FP8")
+    )
     parser.add_argument(
         "--namespace",
         help="Stable prompt namespace for priming and measured invocations.",
     )
-    parser.add_argument("--timeout",
-                        type=int,
-                        default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600))
+    parser.add_argument(
+        "--timeout", type=int, default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600)
+    )
     parser.add_argument("--quick-probe-only", action="store_true")
     parser.add_argument(
         "--prefix-hit-probe-only",
@@ -629,34 +657,36 @@ def parse_args() -> argparse.Namespace:
         help="Run only the repeated long-prefix correctness probe.",
     )
     parser.add_argument("--skip-short-qa", action="store_true")
-    parser.add_argument("--short-repeat-lines",
-                        type=int,
-                        default=env_int("P4D2_SHORT_REPEAT_LINES", 48))
-    parser.add_argument("--short-repeat-count",
-                        type=int,
-                        default=env_int("P4D2_SHORT_REPEAT_COUNT", 5))
-    parser.add_argument("--long-repeat-lines",
-                        type=int,
-                        default=env_int("P4D2_LONG_REPEAT_LINES", 96))
-    parser.add_argument("--long-repeat-count",
-                        type=int,
-                        default=env_int("P4D2_LONG_REPEAT_COUNT", 4))
-    parser.add_argument("--long-shared-lines",
-                        type=int,
-                        default=env_int("P4D2_LONG_SHARED_LINES", 60))
-    parser.add_argument("--long-shared-rounds",
-                        type=int,
-                        default=env_int("P4D2_LONG_SHARED_ROUNDS", 3))
+    parser.add_argument(
+        "--short-repeat-lines", type=int, default=env_int("P4D2_SHORT_REPEAT_LINES", 48)
+    )
+    parser.add_argument(
+        "--short-repeat-count", type=int, default=env_int("P4D2_SHORT_REPEAT_COUNT", 5)
+    )
+    parser.add_argument(
+        "--long-repeat-lines", type=int, default=env_int("P4D2_LONG_REPEAT_LINES", 96)
+    )
+    parser.add_argument(
+        "--long-repeat-count", type=int, default=env_int("P4D2_LONG_REPEAT_COUNT", 4)
+    )
+    parser.add_argument(
+        "--long-shared-lines", type=int, default=env_int("P4D2_LONG_SHARED_LINES", 60)
+    )
+    parser.add_argument(
+        "--long-shared-rounds", type=int, default=env_int("P4D2_LONG_SHARED_ROUNDS", 3)
+    )
     parser.add_argument("--skip-mixed-query", action="store_true")
-    parser.add_argument("--mixed-lines",
-                        type=int,
-                        default=env_int("P4D2_MIXED_LINES", 60))
-    parser.add_argument("--mixed-rounds",
-                        type=int,
-                        default=env_int("P4D2_MIXED_ROUNDS", 2))
-    parser.add_argument("--concurrent-requests",
-                        type=int,
-                        default=env_int("P4D2_CONCURRENT_REQUESTS", 0))
+    parser.add_argument(
+        "--mixed-lines", type=int, default=env_int("P4D2_MIXED_LINES", 60)
+    )
+    parser.add_argument(
+        "--mixed-rounds", type=int, default=env_int("P4D2_MIXED_ROUNDS", 2)
+    )
+    parser.add_argument(
+        "--concurrent-requests",
+        type=int,
+        default=env_int("P4D2_CONCURRENT_REQUESTS", 0),
+    )
     return parser.parse_args()
 
 

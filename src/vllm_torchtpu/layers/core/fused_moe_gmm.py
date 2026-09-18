@@ -119,10 +119,18 @@ def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
                          -2), jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2))
 
 
-def quantize_to_native_fp4_kmajor(w: jax.Array,
-                                  block: int) -> tuple[jax.Array, jax.Array]:
+def quantize_to_native_fp4_kmajor(
+        w: jax.Array,
+        block: int,
+        pack: bool = True) -> tuple[jax.Array, jax.Array]:
     """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and per-block FP32 scale.
     Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2.
+
+    ``pack=False`` returns the same values as ``float4_e2m1fn`` [..., K, N]
+    instead -- what the fused EP MoE kernel's FP4 form reads, and what torch
+    receives as a native ``torch.float4_e2m1fn_x2`` tensor. Only the transport
+    differs: the quantization above is one cast either way, so the two forms
+    carry bit-identical weights and a caller may choose per layer.
 
     TODO: Make a more generic version of this function; possibly combine with quantize_tensor_to_fp4
     """
@@ -140,13 +148,16 @@ def quantize_to_native_fp4_kmajor(w: jax.Array,
     quantized = quantized.reshape(*w.shape[:-2], size_k,
                                   w.shape[-1])  # [..., K, N]
 
+    scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
+    if not pack:
+        return quantized, scale
+
     # Real e2m1 bit-packing (2 values/byte along K), matching gmm_v2's own
     # should_unpack/bitcast(quant_dtype) unpacking convention.
     pairs = quantized.reshape(*w.shape[:-2], size_k // 2, 2, w.shape[-1])
     pairs = jnp.swapaxes(pairs, -1, -2)  # [..., K/2, N, 2] -- pair axis last
     packed = jax.lax.bitcast_convert_type(pairs, jnp.uint8)  # [..., K/2, N]
 
-    scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
     return packed, scale
 
 
@@ -350,7 +361,6 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
-    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -451,15 +461,13 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
-            if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            # Rows past the computed prefix (non-local experts under EP,
+            # skipped padded tokens) are never written by the GMM; zero them
+            # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
+            computed = jnp.arange(
+                gmm2_res.shape[0],
+                dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
@@ -598,6 +606,5 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
     )
     return x[:num_tokens, :hidden_size]

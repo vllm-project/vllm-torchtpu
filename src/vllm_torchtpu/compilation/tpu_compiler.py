@@ -145,6 +145,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+    # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
+    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -179,6 +182,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # K3 custom-op registration, sharding, and Attention Residual bridges.
+    "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
 )
 
 

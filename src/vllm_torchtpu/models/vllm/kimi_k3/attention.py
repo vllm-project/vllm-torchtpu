@@ -8,7 +8,8 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+                              get_tensor_model_parallel_world_size,
+                              get_tp_group)
 from vllm.forward_context import (get_forward_context,
                                   is_forward_context_available)
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -29,12 +30,16 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op, build_kimi_pooled_kda_op)
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
+
+from .collective_ops import FusedPrefillCollectives
 
 logger = init_logger(__name__)
 
@@ -282,7 +287,10 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=False,
         )
+        self.prefill_group = (FusedPrefillCollectives(prefix)
+                              if envs.TPU_K3_SP_PREFILL else None)
         mla_modules = MLAModules(
             g_proj=self.g_proj,
             kv_a_layernorm=self.kv_a_layernorm,
@@ -314,12 +322,42 @@ class MultiHeadLatentAttention(nn.Module):
             gate_is_fused=self.mla_gate_is_fused,
         )
 
+    def prepare_sp_mla_gate(self):
+        """Refresh the TP2 MLA gate buffer after checkpoint loading or reload."""
+        group = self.prefill_group
+        projection = self.fused_qkv_a_proj
+        weight = getattr(projection, 'weight', None)
+        wrapper = self.mla_attn
+        wrapper.kimi_preprocess = None
+        wrapper.kimi_gate_weight = None
+        if not (isinstance(group, FusedPrefillCollectives)
+                and self.mla_gate_is_fused and weight is not None and
+                weight.dtype == torch.bfloat16 and weight.shape == (7168, 2496)
+                and getattr(projection, WEIGHT_FLIPPED_ATTR, False)):
+            return
+        eps = self.q_a_layernorm.variance_epsilon
+        if eps != self.kv_a_layernorm.variance_epsilon:
+            raise ValueError(
+                'K3 MLA preprocessing requires matching norm epsilons')
+        pack, wrapper.kimi_preprocess = group.mla_ops(eps)
+        with torch.no_grad():
+            wrapper.kimi_gate_weight = pack(weight)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states)
+        group = self.prefill_group if sequence_parallel else get_tp_group()
+        if (sequence_parallel
+                and getattr(self.mla_attn, 'kimi_preprocess', None) is None):
+            hidden_states = group.all_gather(hidden_states, dim=0)
+        if sequence_parallel and isinstance(group, FusedPrefillCollectives):
+            return self.mla_attn(positions, hidden_states, prefill_group=group)
+        output = self.mla_attn(positions, hidden_states)
+        return (group.reduce_scatter(output, dim=0)
+                if sequence_parallel else group.all_reduce(output))
 
 
 class CausalDepthwiseConv1d(nn.Module):
@@ -466,7 +504,11 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=False,
         )
+        self.prefill_group = (FusedPrefillCollectives(prefix)
+                              if envs.TPU_K3_SP_PREFILL else None)
+        self.register_buffer("packed_prefill_weight", None, persistent=False)
         self.kv_cache = None
         # The dispatched op owns the short convolution as well: the fused
         # kernel does the convolution itself, so it cannot be fed by a separate
@@ -545,27 +587,72 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         out = torch.empty_like(fused)
         out.copy_(fused)
         self.conv_weight_fused = out
+        self._pack_prefill_projection()
+
+    def _pack_prefill_projection(self):
+        """Cache BF16 KDA input weights after the normal checkpoint loaders."""
+        self.packed_prefill_weight = None
+        if not (isinstance(getattr(self, 'prefill_group', None),
+                           FusedPrefillCollectives) and self.use_full_rank_gate
+                and self.num_heads == 3 and self.head_dim == 128):
+            return
+        projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
+        expected = ((7168, 1155), (7168, 384), (7168, 128))
+        for projection, shape in zip(projections, expected):
+            weight = getattr(projection, 'weight', None)
+            if (weight is None or weight.dtype != torch.bfloat16
+                    or weight.shape != shape
+                    or not getattr(projection, WEIGHT_FLIPPED_ATTR, False)):
+                return
+        # q/k/v occupy 1152 columns; pad the 3 beta columns to an MXU tile.
+        qkvb, gate, fa = (p.weight for p in projections)
+        with torch.no_grad():
+            packed = torch.cat((qkvb, qkvb.new_zeros((7168, 125)), gate, fa),
+                               dim=-1)
+            # Materialize the layout once, avoiding a lazy cat at every call.
+            self.packed_prefill_weight = torch.empty_like(packed)
+            self.packed_prefill_weight.copy_(packed)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
         del positions
-        projected, _ = self.fused_qkvb_proj(hidden_states)
-        query, key, value, beta = projected.split(
-            [self.local_projection_size] * 3 + [self.num_heads], dim=-1)
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
-        if self.use_full_rank_gate:
-            assert self.f_a_proj is not None
-            f_a, _ = self.f_a_proj(hidden_states)
-            assert self.g_proj is not None
-            output_gate, _ = self.g_proj(hidden_states)
+        group = self.prefill_group if sequence_parallel else get_tp_group()
+        if self.packed_prefill_weight is not None:
+            # Every token bucket must capture the same parameter list: the
+            # serving compiler hands executables between traces by input ABI.
+            if sequence_parallel and isinstance(group,
+                                                FusedPrefillCollectives):
+                packed = group.gather_project(hidden_states,
+                                              self.packed_prefill_weight)
+            else:
+                if sequence_parallel:
+                    hidden_states = group.all_gather(hidden_states, dim=0)
+                packed = hidden_states @ self.packed_prefill_weight
+            mixed_qkv, beta_pad, output_gate, f_a = packed.split(
+                [1152, 128, 384, 128], dim=-1)
+            beta = beta_pad[:, :self.num_heads]
+            query = mixed_qkv[:, :self.local_projection_size]
         else:
-            assert self.fused_fa_ga_proj is not None
-            gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
-            f_a, gate_input = gate_inputs.split([self.head_dim, self.head_dim],
-                                                dim=-1)
+            if sequence_parallel:
+                hidden_states = group.all_gather(hidden_states, dim=0)
+            projected, _ = self.fused_qkvb_proj(hidden_states)
+            query, key, value, beta = projected.split(
+                [self.local_projection_size] * 3 + [self.num_heads], dim=-1)
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+            if self.use_full_rank_gate:
+                assert self.f_a_proj is not None
+                f_a, _ = self.f_a_proj(hidden_states)
+                assert self.g_proj is not None
+                output_gate, _ = self.g_proj(hidden_states)
+            else:
+                assert self.fused_fa_ga_proj is not None
+                gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
+                f_a, gate_input = gate_inputs.split(
+                    [self.head_dim, self.head_dim], dim=-1)
         raw_gate, _ = self.f_b_proj(f_a)
         if not self.use_full_rank_gate:
             assert self.g_b_proj is not None
@@ -605,8 +692,11 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.request_distribution,
             ).flatten(1)
 
+        if sequence_parallel and isinstance(group, FusedPrefillCollectives):
+            return group.project_reduce_scatter(output, self.o_proj)
         output, _ = self.o_proj(output)
-        return output
+        return (group.reduce_scatter(output, dim=0)
+                if sequence_parallel else group.all_reduce(output))
 
     def _core_attention_pooled(
         self,

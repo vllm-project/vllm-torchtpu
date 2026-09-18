@@ -33,6 +33,7 @@ import numpy as np
 from absl.testing import parameterized
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
@@ -474,6 +475,120 @@ class SparseMlaAttentionTest(parameterized.TestCase):
                                           list(range(num_seqs + 1)), kv_c_deq,
                                           k_pe_deq)
         self._check(output, expected, valid)
+
+
+class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):
+    """Argument checks in `sparse_mla_attention_dcp`, the decode-context-
+    parallel (DCP) variant where the KV cache is split across several chips.
+
+    The function checks that the caller's `dcp_size` agrees with the mesh
+    and with the shape of the top-k indices before it does anything else.
+    These checks run in plain Python at the top of the function, so each
+    test can pass `None` for every argument the check under test does not
+    read, and none of them need a full DCP-sized mesh or a kernel call.
+    """
+
+    def _mesh(self, axis_name, size):
+        """A one-axis mesh over the first `size` local devices, or skip if
+        the host does not have that many."""
+        devices = jax.local_devices()
+        if len(devices) < size:
+            self.skipTest(f"needs {size} local devices, got {len(devices)}")
+        return jax.sharding.Mesh(np.array(devices[:size]), (axis_name, ))
+
+    def test_dcp_size_must_exceed_one(self):
+        """`dcp_size=1` means no sharding, which is what the plain
+        `sparse_mla_attention` is for. The DCP variant refuses it, and does
+        so before reading `mesh`, so `mesh=None` is fine here."""
+        with self.assertRaisesRegex(ValueError, "dcp_size > 1"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=None,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=1,
+                                                         interleave_size=1)
+
+    def test_mesh_missing_dcp_axis_raises(self):
+        """The mesh must have an axis with the DCP axis name. A mesh whose
+        only axis is called something else is rejected."""
+        mesh = self._mesh("x", 1)
+        with self.assertRaisesRegex(ValueError, "requires a mesh with"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=mesh,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         interleave_size=1)
+
+    def test_mesh_axis_size_mismatch_raises(self):
+        """The DCP axis must have exactly `dcp_size` devices on it. Here the
+        axis has the right name but only one device while `dcp_size=2`."""
+        mesh = self._mesh(streamindex_topk.DCP_AXIS_NAME, 1)
+        with self.assertRaisesRegex(ValueError, "does not match mesh axis"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=mesh,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         interleave_size=1)
+
+    def test_local_topk_indices_row_count_mismatch_raises(self):
+        """`local_topk_indices` holds one row per (chip, token), so it must
+        have `dcp_size * num_tokens` rows. This passes a valid mesh so the
+        earlier checks succeed, then hands over a table one row short."""
+        mesh = self._mesh(streamindex_topk.DCP_AXIS_NAME, 2)
+        num_tokens = 4
+        ql_nope = jnp.zeros((num_tokens, 2, 8))
+        # One row short of the required dcp_size * num_tokens.
+        bad_topk = jnp.zeros((2 * num_tokens - 1, 8), jnp.int32)
+
+        with self.assertRaisesRegex(ValueError, "one row per"):
+            attention_interface.sparse_mla_attention_dcp(ql_nope,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         bad_topk,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=mesh,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         interleave_size=1)
 
 
 class MaskedDensePrefillTierTest(parameterized.TestCase):

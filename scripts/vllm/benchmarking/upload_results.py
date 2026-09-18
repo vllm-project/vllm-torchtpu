@@ -61,8 +61,9 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
 
     # 1. Parse LM-Eval results
     # Oldest-first so that if a task genuinely is re-run, the newer value wins.
-    eval_jsons = sorted(results_dir.rglob("results_*.json"),
-                        key=lambda p: p.stat().st_mtime)
+    eval_jsons = sorted(
+        results_dir.rglob("results_*.json"), key=lambda p: p.stat().st_mtime
+    )
     for path in eval_jsons:
         try:
             with open(path, "r") as fh:
@@ -73,12 +74,15 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
                 # Find the primary accuracy metric
                 for key in ACC_KEYS:
                     if key in task_metrics and isinstance(
-                            task_metrics[key], (int, float)):
+                        task_metrics[key], (int, float)
+                    ):
                         metrics[task] = float(task_metrics[key])
                         break
         except Exception as e:
-            print(f"Warning: Failed to parse lm-eval results from {path}: {e}",
-                  file=sys.stderr)
+            print(
+                f"Warning: Failed to parse lm-eval results from {path}: {e}",
+                file=sys.stderr,
+            )
 
     return metrics
 
@@ -86,42 +90,52 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
 def main():
     parser = argparse.ArgumentParser(
         description="Upload performance benchmark results to Spanner and "
-        "BigQuery (dual write during the migration to BigQuery).")
-    parser.add_argument("--results-dir",
-                        type=Path,
-                        required=True,
-                        help="Directory containing benchmark result files.")
+        "BigQuery (dual write during the migration to BigQuery)."
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        required=True,
+        help="Directory containing benchmark result files.",
+    )
     parser.add_argument(
         "--skip-db-upload",
         action="store_true",
-        help="If set, only print SQL query without executing upload.")
-    parser.add_argument("--project",
-                        default=os.getenv("GCP_PROJECT_ID",
-                                          DEFAULT_PROJECT_ID),
-                        help="GCP project ID.")
-    parser.add_argument("--instance",
-                        default=os.getenv("GCP_INSTANCE_ID",
-                                          DEFAULT_INSTANCE_ID),
-                        help="Spanner instance ID.")
-    parser.add_argument("--database",
-                        default=os.getenv("GCP_DATABASE_ID",
-                                          DEFAULT_DATABASE_ID),
-                        help="Spanner database ID.")
-    parser.add_argument("--bq-project",
-                        default=None,
-                        help="GCP project ID used to run BigQuery jobs "
-                        "(default: BQ_PROJECT_ID env or "
-                        f"{bq_utils.DEFAULT_BQ_PROJECT_ID}).")
-    parser.add_argument("--bq-table",
-                        default=None,
-                        help="Fully-qualified BigQuery table "
-                        "(default: BQ_TABLE env or "
-                        f"{bq_utils.DEFAULT_BQ_TABLE}).")
+        help="If set, only print SQL query without executing upload.",
+    )
+    parser.add_argument(
+        "--project",
+        default=os.getenv("GCP_PROJECT_ID", DEFAULT_PROJECT_ID),
+        help="GCP project ID.",
+    )
+    parser.add_argument(
+        "--instance",
+        default=os.getenv("GCP_INSTANCE_ID", DEFAULT_INSTANCE_ID),
+        help="Spanner instance ID.",
+    )
+    parser.add_argument(
+        "--database",
+        default=os.getenv("GCP_DATABASE_ID", DEFAULT_DATABASE_ID),
+        help="Spanner database ID.",
+    )
+    parser.add_argument(
+        "--bq-project",
+        default=None,
+        help="GCP project ID used to run BigQuery jobs "
+        "(default: BQ_PROJECT_ID env or "
+        f"{bq_utils.DEFAULT_BQ_PROJECT_ID}).",
+    )
+    parser.add_argument(
+        "--bq-table",
+        default=None,
+        help="Fully-qualified BigQuery table "
+        "(default: BQ_TABLE env or "
+        f"{bq_utils.DEFAULT_BQ_TABLE}).",
+    )
     args = parser.parse_args()
 
     if not args.results_dir.exists():
-        print(f"Error: results-dir does not exist: {args.results_dir}",
-              file=sys.stderr)
+        print(f"Error: results-dir does not exist: {args.results_dir}", file=sys.stderr)
         return 1
 
     config = load_config_json(args.results_dir)
@@ -130,15 +144,14 @@ def main():
     # Locate all result json files matching the pattern
     result_files = sorted(args.results_dir.glob("isl*_osl*_c*.json"))
     if not result_files:
-        print(
-            f"No perf result files (isl*_osl*_c*.json) found in {args.results_dir}."
-        )
+        print(f"No perf result files (isl*_osl*_c*.json) found in {args.results_dir}.")
         return 0
 
     code_hash = os.getenv("BUILDKITE_COMMIT")
     if not code_hash:
-        print("Error: BUILDKITE_COMMIT environment variable is not set.",
-              file=sys.stderr)
+        print(
+            "Error: BUILDKITE_COMMIT environment variable is not set.", file=sys.stderr
+        )
         return 1
 
     device = os.getenv("TPU_NAME")
@@ -158,8 +171,9 @@ def main():
     if not run_by:
         run_by = os.getenv("BUILDKITE_AGENT_NAME", "unknown-agent")
 
-    job_ref = os.getenv("BUILDKITE_BUILD_NUMBER",
-                        datetime.now().strftime("%Y%m%d_%H%M%S"))
+    job_ref = os.getenv(
+        "BUILDKITE_BUILD_NUMBER", datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
 
     success = True
 
@@ -189,15 +203,15 @@ def main():
         except KeyError as e:
             print(
                 f"Error: Missing required config parameter {e} in config.json",
-                file=sys.stderr)
+                file=sys.stderr,
+            )
             success = False
             continue
 
         try:
             dataset = res["backend"]
         except KeyError as e:
-            print(f"Error: Missing required metric {e} in {rf.name}",
-                  file=sys.stderr)
+            print(f"Error: Missing required metric {e} in {rf.name}", file=sys.stderr)
             success = False
             continue
 
@@ -215,8 +229,7 @@ def main():
             "TensorParallelSize": str(tensor_parallelism),
             "MaxModelLen": str(max_model_len),
             "Dataset": f"'{sql_escape(dataset)}'",
-            "CreatedBy":
-            f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'",
+            "CreatedBy": f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'",
             "InputLen": str(input_len),
             "OutputLen": str(output_len),
             "Device": f"'{sql_escape(device)}'",
@@ -265,8 +278,7 @@ def main():
 
         # Add accuracy metrics if any were parsed
         if accuracy_metrics:
-            columns[
-                "AccuracyMetrics"] = f"JSON '{json.dumps(accuracy_metrics)}'"
+            columns["AccuracyMetrics"] = f"JSON '{json.dumps(accuracy_metrics)}'"
 
         keys_str = ", ".join(columns.keys())
         vals_str = ", ".join(columns.values())
@@ -281,19 +293,24 @@ def main():
             )
         else:
             cmd = [
-                "gcloud", "spanner", "databases", "execute-sql", args.database,
-                f"--project={args.project}", f"--instance={args.instance}",
-                f"--sql={sql}"
+                "gcloud",
+                "spanner",
+                "databases",
+                "execute-sql",
+                args.database,
+                f"--project={args.project}",
+                f"--instance={args.instance}",
+                f"--sql={sql}",
             ]
 
             print(f"Executing: {' '.join(cmd)}")
-            res_proc = subprocess.run(cmd,
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE,
-                                      text=True)
+            res_proc = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
             if res_proc.returncode != 0:
-                print(f"Failed to update Spanner record for {rf.name}!",
-                      file=sys.stderr)
+                print(
+                    f"Failed to update Spanner record for {rf.name}!", file=sys.stderr
+                )
                 print(f"Stdout:\n{res_proc.stdout}", file=sys.stderr)
                 print(f"Stderr:\n{res_proc.stderr}", file=sys.stderr)
                 success = False
@@ -326,8 +343,7 @@ def main():
                 "max_model_len": max_model_len,
                 "enable_ep": bool(config.get("enable_ep")),
                 "quantization": config.get("quantization"),
-                "multihost_backend": os.getenv("TPU_MULTIHOST_BACKEND")
-                or None,
+                "multihost_backend": os.getenv("TPU_MULTIHOST_BACKEND") or None,
             },
             "workload": {
                 "input_len": input_len,
@@ -345,12 +361,15 @@ def main():
             model_id=model,
             metrics=bq_metrics,
             config=bq_config,
-            bq_table=args.bq_table)
-        if not bq_utils.run_insert(bq_sql,
-                                   project=args.bq_project,
-                                   label=rf.name,
-                                   record_id=record_id,
-                                   skip=args.skip_db_upload):
+            bq_table=args.bq_table,
+        )
+        if not bq_utils.run_insert(
+            bq_sql,
+            project=args.bq_project,
+            label=rf.name,
+            record_id=record_id,
+            skip=args.skip_db_upload,
+        ):
             success = False
 
     return 0 if success else 1

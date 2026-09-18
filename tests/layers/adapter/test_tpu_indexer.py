@@ -41,6 +41,7 @@ import vllm.model_executor.custom_op as custom_op_mod
 import vllm.model_executor.layers.linear as linear_mod
 import vllm.model_executor.models.deepseek_v2 as deepseek_v2
 import vllm.model_executor.parameter as parameter_mod
+from vllm.config import CacheConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.deepseek_v2 import (DeepseekV32IndexerCache,
@@ -148,7 +149,7 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
             hidden_size=HIDDEN_SIZE,
             q_lora_rank=Q_LORA_RANK,
             quant_config=None,
-            cache_config=None,
+            cache_config=CacheConfig(),
             topk_indices_buffer=topk_indices_buffer,
             prefix="model.layers.0.self_attn.indexer",
         )

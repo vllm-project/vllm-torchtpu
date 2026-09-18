@@ -9,14 +9,13 @@ Builds the vllm-torchtpu image from the repository root as the docker context.
 
 Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
-  -b, --base-image IMAGE   Base image to build from
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev or ci (default: prod)
   -h, --help               Show this help and exit
 
 Examples:
   ./docker/build_image.sh
-  ./docker/build_image.sh -t my-vllm-image -b my-base-image
+  ./docker/build_image.sh -t my-vllm-image
   ./docker/build_image.sh -s /path/to/vllm/source
 
 The Dockerfile copies <repo>/vllm into the image. The script stages that
@@ -28,8 +27,8 @@ USAGE
 
 # Default values
 IMAGE_TAG="vllm-torchtpu-local"
-BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
 VLLM_SOURCE=""
+VLLM_COMMIT_HASH=""
 TARGET="prod"
 
 # Parse arguments
@@ -39,12 +38,12 @@ while [[ $# -gt 0 ]]; do
       IMAGE_TAG="$2"
       shift 2
       ;;
-    -b|--base-image)
-      BASE_IMAGE="$2"
-      shift 2
-      ;;
     -s|--vllm-source)
       VLLM_SOURCE="$2"
+      shift 2
+      ;;
+    -c|--vllm-commit-hash)
+      VLLM_COMMIT_HASH="$2"
       shift 2
       ;;
     --target)
@@ -65,7 +64,6 @@ done
 
 echo "===> Building vllm-torchtpu image..."
 echo "Image Tag: $IMAGE_TAG"
-echo "Base Image: $BASE_IMAGE"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,6 +74,22 @@ if [ -n "$VLLM_SOURCE" ] && [ ! -d "$VLLM_SOURCE" ]; then
   echo "vllm source directory not found: $VLLM_SOURCE" >&2
   exit 1
 fi
+
+# Enforce VLLM_COMMIT_HASH to prevent silently building from unpinned main
+if [ -z "$VLLM_COMMIT_HASH" ]; then
+  # Extract the pinned vLLM commit directly from pyproject.toml
+  VLLM_COMMIT_HASH="$(sed -nE 's/.*vllm @ git\+https:\/\/github\.com\/vllm-project\/vllm\.git@([a-zA-Z0-9.-]+).*/\1/p' "${REPO_ROOT}/pyproject.toml" | head -n 1)"
+
+  if [ -n "$VLLM_COMMIT_HASH" ]; then
+    echo "-c/--vllm-commit-hash not provided. Defaulting to pyproject.toml pin: $VLLM_COMMIT_HASH"
+  else
+    echo "ERROR: VLLM_COMMIT_HASH could not be parsed from pyproject.toml." >&2
+    exit 1
+  fi
+fi
+
+
+echo "vLLM Commit Hash: $VLLM_COMMIT_HASH"
 
 if [ -z "${ACCESS_TOKEN:-}" ]; then
   if command -v gcloud >/dev/null 2>&1; then
@@ -143,8 +157,8 @@ DOCKER_ARGS=(
   -f "${SCRIPT_DIR}/Dockerfile" \
   -t "${IMAGE_TAG}" \
   --target "${TARGET}" \
-  --build-arg BASE_IMAGE="${BASE_IMAGE}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
+  --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
 
 if [ -n "${ACCESS_TOKEN:-}" ]; then

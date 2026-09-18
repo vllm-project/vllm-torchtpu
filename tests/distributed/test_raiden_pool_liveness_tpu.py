@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device byte-liveness test: bytes in the typed KV cache buffers must be
+"""Device byte-liveness test: bytes in the unified KV pool buffers must be
 readable through raiden's pool surface, and bytes written through raiden must
 land in those buffers.
+
+The materialization is the unified (aliased-raw) binding the runner uses for
+the pooled GDN architectures: one attention-shaped raw pool per layer, with
+the GDN conv/ssm state regions carved out of each GDN layer's pool. The
+private-typed hybrid materialization is no longer admissible: tpu-sync
+0.0.1.dev20260914 and later require every registered storage to hold the
+same number of blocks (the typed GDN state tensors and the paged FA cache
+do not).
 
 The oracle is the bytes themselves, because metadata oracles cannot
 distinguish live from dead storage:
@@ -28,6 +36,7 @@ from collections import Counter
 import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+from vllm_torchtpu.distributed.kv_transfer.raiden.tags import class_tag
 
 from .tpu_test_utils import run_in_isolated_process
 
@@ -89,6 +98,38 @@ def _extent_bytes(block: bytes, extents) -> bytes:
     return b"".join(block[off:off + size] for off, size in extents)
 
 
+def _dead_extents(entry, extents) -> list[tuple[int, int]]:
+    """The pitch intervals of one block that hold no declared live bytes."""
+    dead = []
+    cursor = 0
+    for off, size in extents:
+        if cursor < off:
+            dead.append((cursor, off - cursor))
+        cursor = off + size
+    if cursor < entry.block_stride_bytes:
+        dead.append((cursor, entry.block_stride_bytes - cursor))
+    return dead
+
+
+def _mirror_holds_full_pitch(entry, block_id: int) -> bool:
+    """Whether the host mirror backs the whole pitch of ``block_id``.
+
+    The mirror of a storage ends at the last block's live extent, so only
+    blocks before the last one are guaranteed a full stride of host bytes;
+    dead-interval probes stay within that."""
+    return block_id < entry.num_blocks - 1
+
+
+def _host_write(ref, block_bytes: bytes, intervals) -> None:
+    for off, size in intervals:
+        ctypes.memmove(ref["ptr"] + off, block_bytes[off:off + size], size)
+
+
+def _host_read(ref, intervals) -> bytes:
+    return b"".join(
+        ctypes.string_at(ref["ptr"] + off, size) for off, size in intervals)
+
+
 def _device_bytes(tensor) -> bytes:
     import torch
 
@@ -96,57 +137,62 @@ def _device_bytes(tensor) -> bytes:
         torch.uint8).numpy().tobytes()
 
 
-def _small_hybrid_materialization(device):
-    """Hybrid config materialized exactly the way the runner's alias-fallback
-    path does it: torch.zeros on device (torch.empty for fp8). The shapes are
-    the live TP2DP4 decode shapes with NUM_GPU_BLOCKS_OVERRIDE=16; the device
-    layout of these allocations is row-major (proven by stage-1 content
-    correctness on live traffic), which is what pool admission relies on.
-    Buffers created via CPU->TPU transfer can get transposed layouts and are
-    NOT admissible."""
+def _small_unified_materialization(device):
+    """Unified-pool hybrid config: one attention-shaped raw pool per layer,
+    allocated on device the way the runner does it (torch.empty for fp8).
+    GDN layers expose their pool as ``[pool]`` and derive conv/ssm views
+    from the pooled kernel geometry; the FA layer's cache is its pool."""
     import torch
 
-    def _gdn_layer():
-        return (
-            torch.zeros((16, 3, 6144), dtype=torch.bfloat16, device=device),
-            torch.zeros((16, 32, 128, 128), dtype=torch.float32,
-                        device=device),
-        )
+    num_blocks, block_size, num_kv_heads, head_size = 16, 128, 2, 256
+    manager_page_bytes = block_size * 2 * num_kv_heads * head_size  # 131072
 
+    def _pool():
+        return torch.empty((num_blocks, block_size, 1, 4, head_size),
+                           dtype=torch.float8_e4m3fn,
+                           device=device)
+
+    gdn0, gdn1, fa = _pool(), _pool(), _pool()
     named = {
-        "model.layers.0.linear_attn":
-        _gdn_layer(),
-        "model.layers.1.linear_attn":
-        _gdn_layer(),
-        "model.layers.3.self_attn.attn":
-        torch.empty((64, 256, 1, 4, 256),
-                    dtype=torch.float8_e4m3fn,
-                    device=device),
+        "model.layers.0.linear_attn": [gdn0],
+        "model.layers.1.linear_attn": [gdn1],
+        "model.layers.3.self_attn.attn": fa,
     }
+    geometry = rpm.GdnHeadGeometry(local_key_heads=4,
+                                   local_value_heads=8,
+                                   key_head_dim=64,
+                                   value_head_dim=32,
+                                   conv_kernel_size=3)
+    conv_shape = (geometry.conv_kernel_size - 1, geometry.conv_dim)
+    ssm_shape = (geometry.local_value_heads, geometry.key_head_dim,
+                 geometry.value_head_dim)
     groups = (
         type(
             "G", (), {
                 "layer_names": ("model.layers.3.self_attn.attn", ),
                 "kv_cache_spec":
-                type("S", (), {
-                    "block_size": 1024,
-                    "num_kv_heads": 1,
-                    "head_size": 256,
-                })(),
+                type(
+                    "S", (), {
+                        "block_size": block_size,
+                        "num_kv_heads": num_kv_heads,
+                        "head_size": head_size,
+                    })(),
             })(),
         type(
             "G", (), {
                 "layer_names":
                 ("model.layers.0.linear_attn", "model.layers.1.linear_attn"),
                 "kv_cache_spec":
-                type("S", (), {})(),
+                type(
+                    "S", (), {
+                        "shapes": (conv_shape, ssm_shape),
+                        "dtypes": ("torch.bfloat16", "torch.float32"),
+                        "page_size_bytes": manager_page_bytes,
+                    })(),
             })(),
     )
-    geometry = rpm.GdnHeadGeometry(local_key_heads=8,
-                                   local_value_heads=32,
-                                   key_head_dim=128,
-                                   value_head_dim=128)
-    return named, groups, geometry
+    raw_tensors = (gdn0, gdn1, fa)
+    return named, groups, geometry, raw_tensors, manager_page_bytes
 
 
 def _run_pool_bytes_live_in_both_directions():
@@ -155,20 +201,28 @@ def _run_pool_bytes_live_in_both_directions():
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
     device = torch.device("tpu")
-    named, groups, geometry = _small_hybrid_materialization(device)
+    (named, groups, geometry, raw_tensors,
+     page_bytes) = _small_unified_materialization(device)
 
     manifest = rpm.build_qwen35_pool_manifest(named_kv_caches=named,
                                               kv_cache_groups=groups,
-                                              raw_tensors=(),
-                                              gdn_geometry=geometry)
-    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
+                                              raw_tensors=raw_tensors,
+                                              gdn_geometry=geometry,
+                                              mamba_group_ordinal_by_layer={
+                                                  "model.layers.0.linear_attn":
+                                                  0,
+                                                  "model.layers.1.linear_attn":
+                                                  0,
+                                              })
+    assert manifest.binding == rpm.BINDING_ALIASED_RAW
     assert len(manifest.pools) == 5  # 2×(conv+ssm) + 1 fa
-    # Decode FA geometry: 16 blocks of 1024 tokens.
-    fa_entry = next(e for e in manifest.pools if e.tag == rpm.TAG_FA)
-    assert fa_entry.num_blocks == 16
-    assert fa_entry.block_stride_bytes == 1_048_576
-    assert fa_entry.live_bytes_per_block == 524_288
-    rpm.verify_storage_binding(manifest, named, raw_tensors=())
+    # Every pool is addressed in manager pages of the same geometry.
+    assert all(e.num_blocks == 16 for e in manifest.pools)
+    assert all(e.block_stride_bytes == page_bytes for e in manifest.pools)
+    fa_entry = next(e for e in manifest.pools
+                    if class_tag(e.tag) == rpm.TAG_FA)
+    assert fa_entry.live_bytes_per_block == page_bytes
+    rpm.verify_storage_binding(manifest, named, raw_tensors=raw_tensors)
     # fp8 caches are torch.empty-backed: force device-buffer materialization
     # (wrapping an unmaterialized tensor hangs the manager constructor).
     rpm.materialize_storages(manifest)
@@ -185,20 +239,16 @@ def _run_pool_bytes_live_in_both_directions():
     assert summary["admitted"] is True
     assert summary["pools"] == 5
 
-    # In-process storage identity: every pool's storage is one of the typed
-    # caches (python object identity through the manifest).
-    typed_ids = set()
-    for cache in named.values():
-        tensors = cache if isinstance(cache, tuple) else (cache, )
-        typed_ids.update(id(t) for t in tensors)
-    assert {id(s) for s in manifest.storages} == typed_ids
+    # In-process storage identity: every pool's storage is one of the raw
+    # pools (python object identity through the manifest).
+    assert {id(s) for s in manifest.storages} == {id(t) for t in raw_tensors}
 
     # --- Byte-liveness oracles, calibrated per physical layout --------------
-    # Empirical device layouts for these live shapes: gdn.ssm fp32 buffers are
-    # physically linear (byte-identical to the logical view); fa fp8 buffers
-    # are tiled but the permutation stays within each vLLM block; gdn.conv
-    # bf16 buffers are tiled ACROSS block boundaries. The liveness contract
-    # stage 2 proves:
+    # Every storage is an fp8 attention-shaped pool whose device tiling stays
+    # within each manager page, so per-page multisets are preserved for the
+    # fa pool; the conv/ssm regions are byte spans inside the tiled page, so
+    # only whole-storage multisets are asserted for them. The liveness
+    # contract stage 2 proves:
     #   1. raiden H2D lands in the buffers torch reads (same storage), and
     #   2. raiden D2H returns exactly the physical bytes written (round trip),
     # with strict logical-byte equality asserted where the layout permits.
@@ -230,7 +280,10 @@ def _run_pool_bytes_live_in_both_directions():
                 assert ref["block_stride_bytes"] == stride
                 assert ref["tag"] == entry.tag
                 chunk = pattern[block_id * stride:(block_id + 1) * stride]
-                ctypes.memmove(ref["ptr"], chunk, stride)
+                # Region era: the pool surface moves the declared live
+                # regions of a block, and the host mirror is only guaranteed
+                # to back those bytes, so write exactly them.
+                _host_write(ref, chunk, extents)
             manager.h2d_pool_blocks(pool_idx,
                                     list(range(entry.num_blocks))).wait()
             return _device_bytes(storage)
@@ -258,27 +311,18 @@ def _run_pool_bytes_live_in_both_directions():
         ), (f"pool {pool_idx} ({entry.tag}): the bytes that changed between "
             "H2D passes are not exactly the live-region pattern bytes — "
             "raiden wrote foreign bytes")
-        if entry.tag == rpm.TAG_GDN_SSM:
-            for block_id in range(entry.num_blocks):
-                blk = slice(block_id * stride, (block_id + 1) * stride)
-                assert (
-                    _extent_bytes(after_second[blk], extents) == _extent_bytes(
-                        pattern_second[blk], extents)
-                ), (f"pool {pool_idx} ({entry.tag}): fp32 state buffers are "
-                    "physically linear, live bytes must match exactly")
 
     # --- Per-block H2D granularity on the fa pool (block-contained tiling) --
     pool_idx = next(i for i, e in enumerate(manifest.pools)
-                    if e.tag == rpm.TAG_FA)
+                    if class_tag(e.tag) == rpm.TAG_FA)
     entry = manifest.pools[pool_idx]
     storage = manifest.storages[entry.storage_index]
     stride = entry.block_stride_bytes
     fa_extents = _live_extents(entry)
     before = _device_bytes(storage)
     pattern_b = _pattern_bytes(97, storage.nbytes)
-    ctypes.memmove(
-        manager.get_block_ref(pool_idx, 2)["ptr"],
-        pattern_b[2 * stride:3 * stride], stride)
+    _host_write(manager.get_block_ref(pool_idx, 2),
+                pattern_b[2 * stride:3 * stride], fa_extents)
     manager.h2d_pool_blocks(pool_idx, [2]).wait()
     after = _device_bytes(storage)
     assert after[:2 * stride] == before[:2 * stride], (
@@ -301,36 +345,33 @@ def _run_pool_bytes_live_in_both_directions():
     for pool_idx, entry in enumerate(manifest.pools):
         stride = entry.block_stride_bytes
         extents = _live_extents(entry)
-        dead = []
-        cursor = 0
-        for off, size in extents:
-            if cursor < off:
-                dead.append((cursor, off - cursor))
-            cursor = off + size
-        if cursor < stride:
-            dead.append((cursor, stride - cursor))
+        dead = _dead_extents(entry, extents)
         expected = bytearray(patterns[pool_idx])
-        if entry.tag == rpm.TAG_FA:
+        if class_tag(entry.tag) == rpm.TAG_FA:
             expected[2 * stride:3 * stride] = pattern_b[2 * stride:3 * stride]
-        # Clobber the host mirror so a stale read cannot pass.
+        # Clobber the host mirror so a stale read cannot pass: the live
+        # regions of every block, plus the dead pitch of the blocks whose
+        # full pitch the mirror backs.
+        zeros = bytes(stride)
         for block_id in range(entry.num_blocks):
             ref = manager.get_block_ref(pool_idx, block_id)
-            ctypes.memmove(ref["ptr"], bytes(stride), stride)
+            _host_write(ref, zeros, extents)
+            if _mirror_holds_full_pitch(entry, block_id):
+                _host_write(ref, zeros, dead)
         manager.d2h_pool_blocks(pool_idx, list(range(entry.num_blocks))).wait()
         for block_id in range(entry.num_blocks):
             ref = manager.get_block_ref(pool_idx, block_id)
-            host = ctypes.string_at(ref["ptr"], stride)
             want = bytes(expected[block_id * stride:(block_id + 1) * stride])
-            assert (
-                _extent_bytes(host, extents) == _extent_bytes(want, extents)
-            ), (f"pool {pool_idx} ({entry.tag}) block {block_id}: raiden D2H "
+            assert _host_read(ref, extents) == _extent_bytes(want, extents), (
+                f"pool {pool_idx} ({entry.tag}) block {block_id}: raiden D2H "
                 "bytes do not round-trip the live bytes written through the "
                 "pool surface")
-            assert _extent_bytes(host, dead) == bytes(
-                sum(size for _, size in dead)
-            ), (f"pool {pool_idx} ({entry.tag}) block {block_id}: raiden D2H "
-                "wrote into dead pitch intervals — copies are not "
-                "region-granular")
+            if _mirror_holds_full_pitch(entry, block_id):
+                assert _host_read(ref, dead) == bytes(
+                    sum(size for _, size in dead)
+                ), (f"pool {pool_idx} ({entry.tag}) block {block_id}: raiden "
+                    "D2H wrote into dead pitch intervals — copies are not "
+                    "region-granular")
 
 
 def test_pool_bytes_live_in_both_directions():

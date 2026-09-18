@@ -1035,6 +1035,78 @@ class TestReorderBatchForRpa:
         assert runner.input_batch.req_ids[2] == "pf"
 
 
+class TestInitializeAttentionKernelsThreshold:
+    """`reorder_batch_threshold` is the smallest DECODE query width across the
+    kernels `_initialize_attention_kernels` builds, draft layers included."""
+
+    def _make_runner(self, widths, draft_names=(), draft_tp=2):
+        from vllm_torchtpu.layers.adapter.attention import \
+            PallasAttentionBackendImpl
+        runner = MagicMock(spec=TPUModelRunner)
+        runner._attention_kernels_initialized = False
+        runner.model = None
+        runner.mesh = MagicMock()
+        runner.vllm_config = MagicMock()
+        runner.reorder_batch_threshold = 1
+        runner.drafter = SimpleNamespace(
+            _draft_attn_layer_names=set(draft_names))
+        runner.speculative_config = SimpleNamespace(
+            draft_tensor_parallel_size=draft_tp)
+        runner._initialize_attention_kernels = (
+            TPUModelRunner._initialize_attention_kernels.__get__(runner))
+        layers = {}
+        for name, width in widths.items():
+            impl = MagicMock(spec=PallasAttentionBackendImpl)
+            impl.decode_query_size = width
+            layers[name] = SimpleNamespace(impl=impl)
+        return runner, layers
+
+    def _run(self, runner, layers):
+        with patch("vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+                   return_value=layers), \
+             patch("vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context"):
+            runner._initialize_attention_kernels()
+
+    def test_uniform_width(self):
+        runner, layers = self._make_runner({"a": 4, "b": 4})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 4
+        for layer in layers.values():
+            layer.impl.initialize_kernel.assert_called_once()
+
+    def test_min_across_layers(self):
+        runner, layers = self._make_runner({"a": 4, "b": 1})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 1
+
+    def test_relocated_draft_forces_one_token_decode(self):
+        runner, layers = self._make_runner({
+            "target": 4,
+            "draft": 4
+        },
+                                           draft_names=("draft", ),
+                                           draft_tp=1)
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 1
+        assert layers["target"].impl.decode_query_size == 4
+        assert runner.reorder_batch_threshold == 1
+
+    def test_sharded_draft_keeps_width(self):
+        runner, layers = self._make_runner({
+            "target": 4,
+            "draft": 4
+        },
+                                           draft_names=("draft", ),
+                                           draft_tp=2)
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 4
+
+    def test_no_pallas_layers(self):
+        runner, layers = self._make_runner({})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 1
+
+
 class TestMambaSlotReadOffsets:
     """Unit tests for the per-slot mamba read-offset scatter used to roll back
     rejected speculative tokens by *selection* (base_slot + offset)."""
@@ -1354,15 +1426,14 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     the layout against an ambient config and the gap stays hidden. Missing it
     both ways is what let this reach CI as an `AssertionError: Current vLLM
     config is not set` at server startup."""
+    from vllm.config import CacheConfig
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
     from vllm_torchtpu.layers.adapter.attention import \
         PallasBatchedRPAAttentionBackend
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            block_size=16,
-            user_specified_block_size=False,
-            block_size_unaligned=16,
-        ),
+        cache_config=CacheConfig(),
         model_config=SimpleNamespace(
             use_mla=False,
             is_hybrid=False,
@@ -1374,6 +1445,7 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         kv_transfer_config=None,
     )
+    resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
     with patch.object(TpuPlatform,
                       "_find_non_ssm_backend",
                       return_value=PallasBatchedRPAAttentionBackend):

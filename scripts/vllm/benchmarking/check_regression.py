@@ -32,10 +32,13 @@ GATED_METRICS = [
     # with --gate-ttft-max-concurrency to omit it for such cells.
     Metric("median_ttft_ms", "median_ttft_ms", "lower_is_better"),
     Metric("median_tpot_ms", "median_tpot_ms", "lower_is_better"),
-    Metric("total_token_throughput", "total_token_throughput",
-           "higher_is_better"),
-    Metric("output_throughput", "output_token_throughput", "higher_is_better",
-           ("output_throughput", )),
+    Metric("total_token_throughput", "total_token_throughput", "higher_is_better"),
+    Metric(
+        "output_throughput",
+        "output_token_throughput",
+        "higher_is_better",
+        ("output_throughput",),
+    ),
 ]
 
 COMPLETION_FLOOR_RATIO = 0.95
@@ -88,8 +91,9 @@ def get_baseline_metric(entry: dict, metric: Metric) -> float | None:
     return None
 
 
-def check_perf(results: dict[str, dict], baseline: dict[str, dict],
-               tolerance: float) -> int:
+def check_perf(
+    results: dict[str, dict], baseline: dict[str, dict], tolerance: float
+) -> int:
     rows: list[tuple[str, str, float, float, float, str]] = []
     failed = 0
 
@@ -108,20 +112,32 @@ def check_perf(results: dict[str, dict], baseline: dict[str, dict],
 
         baseline_completed = b.get("completed")
         completed = r.get("completed")
-        if (baseline_completed is not None and completed is not None
-                and baseline_completed > 0):
+        if (
+            baseline_completed is not None
+            and completed is not None
+            and baseline_completed > 0
+        ):
             ratio = completed / baseline_completed
             if ratio < COMPLETION_FLOOR_RATIO:
-                rows.append((key, "completed", completed, baseline_completed,
-                             ratio, "FAIL"))
+                rows.append(
+                    (key, "completed", completed, baseline_completed, ratio, "FAIL")
+                )
                 failed += 1
 
         for metric in GATED_METRICS:
             actual = r.get(metric.result_field)
             base = get_baseline_metric(b, metric)
             if actual is None or base is None or base == 0:
-                rows.append((key, metric.baseline_field, actual or 0.0, base
-                             or 0.0, 0.0, "SKIP"))
+                rows.append(
+                    (
+                        key,
+                        metric.baseline_field,
+                        actual or 0.0,
+                        base or 0.0,
+                        0.0,
+                        "SKIP",
+                    )
+                )
                 continue
             actual = float(actual)
             ratio = actual / base
@@ -134,10 +150,9 @@ def check_perf(results: dict[str, dict], baseline: dict[str, dict],
             status = "PASS" if ok else "FAIL"
             if not ok:
                 failed += 1
-            rows.append(
-                (key, metric.baseline_field, actual, base, ratio, status))
+            rows.append((key, metric.baseline_field, actual, base, ratio, status))
 
-    print(f"\n## Perf regression check (tolerance: {tolerance*100:.2f}%)\n")
+    print(f"\n## Perf regression check (tolerance: {tolerance * 100:.2f}%)\n")
     print("| key | metric | actual | baseline | actual/base | status |")
     print("|---|---|---:|---:|---:|---|")
     for key, metric, actual, base, ratio, status in rows:
@@ -149,8 +164,8 @@ def check_perf(results: dict[str, dict], baseline: dict[str, dict],
 
 
 def calibrate_perf(
-        results_dirs: list[Path],
-        gate_ttft_max_concurrency: int | None = None) -> dict[str, dict]:
+    results_dirs: list[Path], gate_ttft_max_concurrency: int | None = None
+) -> dict[str, dict]:
     collected: dict[str, dict[str, list[float]]] = {}
     num_prompts_by_key: dict[str, int] = {}
     completed_by_key: dict[str, list[int]] = {}
@@ -159,13 +174,13 @@ def calibrate_perf(
             slot = collected.setdefault(key, {})
             for metric in GATED_METRICS:
                 if metric.result_field in r:
-                    slot.setdefault(metric.baseline_field,
-                                    []).append(float(r[metric.result_field]))
+                    slot.setdefault(metric.baseline_field, []).append(
+                        float(r[metric.result_field])
+                    )
             if "num_prompts" in r:
                 num_prompts_by_key[key] = int(r["num_prompts"])
             if "completed" in r:
-                completed_by_key.setdefault(key,
-                                            []).append(int(r["completed"]))
+                completed_by_key.setdefault(key, []).append(int(r["completed"]))
 
     baseline = {}
     for key, metrics in collected.items():
@@ -224,8 +239,9 @@ def primary_metric(entry: dict) -> tuple[str, float] | None:
     return None
 
 
-def check_eval(results: dict[str, dict], baseline: dict[str, dict],
-               tolerance: float) -> int:
+def check_eval(
+    results: dict[str, dict], baseline: dict[str, dict], tolerance: float
+) -> int:
     rows: list[tuple[str, str, float, float, float, str]] = []
     failed = 0
 
@@ -252,12 +268,9 @@ def check_eval(results: dict[str, dict], baseline: dict[str, dict],
         status = "PASS" if delta >= -tolerance - 1e-9 else "FAIL"
         if status == "FAIL":
             failed += 1
-        rows.append(
-            (task, metric_name, actual_acc, baseline_acc, delta, status))
+        rows.append((task, metric_name, actual_acc, baseline_acc, delta, status))
 
-    print(
-        f"\n## MMLU/eval regression check (tolerance: -{tolerance*100:.2f}pp)\n"
-    )
+    print(f"\n## MMLU/eval regression check (tolerance: -{tolerance * 100:.2f}pp)\n")
     print("| task | metric | actual | baseline | delta | status |")
     print("|---|---|---:|---:|---:|---|")
     for task, metric, actual, baseline, delta, status in rows:
@@ -268,8 +281,9 @@ def check_eval(results: dict[str, dict], baseline: dict[str, dict],
     return failed
 
 
-def calibrate_eval(results_dirs: list[Path],
-                   task_filter: set[str] | None) -> dict[str, dict]:
+def calibrate_eval(
+    results_dirs: list[Path], task_filter: set[str] | None
+) -> dict[str, dict]:
     collected: dict[str, dict[str, list[float]]] = {}
     for d in results_dirs:
         for task, metrics in load_eval_results(d).items():
@@ -281,46 +295,51 @@ def calibrate_eval(results_dirs: list[Path],
 
     baseline = {}
     for task, metrics in collected.items():
-        baseline[task] = {
-            k: statistics.median(vs)
-            for k, vs in metrics.items()
-        }
+        baseline[task] = {k: statistics.median(vs) for k, vs in metrics.items()}
     return baseline
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode",
-                        choices=["perf", "eval"],
-                        required=True,
-                        help="Mode of operation: perf or eval.")
+    parser.add_argument(
+        "--mode",
+        choices=["perf", "eval"],
+        required=True,
+        help="Mode of operation: perf or eval.",
+    )
     parser.add_argument(
         "--results-dir",
         type=Path,
         action="append",
         required=True,
-        help="Directory containing result files. Repeat for calibrate.")
-    parser.add_argument("--baseline",
-                        type=Path,
-                        help="Baseline JSON to compare against.")
+        help="Directory containing result files. Repeat for calibrate.",
+    )
+    parser.add_argument(
+        "--baseline", type=Path, help="Baseline JSON to compare against."
+    )
     parser.add_argument(
         "--tolerance",
         type=float,
-        help="Allowed deviation (default 0.05 for perf, 0.015 for eval).")
+        help="Allowed deviation (default 0.05 for perf, 0.015 for eval).",
+    )
     parser.add_argument(
         "--calibrate",
         action="store_true",
-        help="Emit baseline JSON to stdout instead of checking.")
-    parser.add_argument("--task-filter",
-                        default="",
-                        help="Comma-separated allow-list of tasks/datasets.")
+        help="Emit baseline JSON to stdout instead of checking.",
+    )
+    parser.add_argument(
+        "--task-filter",
+        default="",
+        help="Comma-separated allow-list of tasks/datasets.",
+    )
     parser.add_argument(
         "--gate-ttft-max-concurrency",
         type=int,
         default=None,
         help="Calibrate (perf) only: omit median_ttft_ms from baseline "
         "entries whose concurrency exceeds this, so TTFT is ungated there. "
-        "0 ungates TTFT for every cell.")
+        "0 ungates TTFT for every cell.",
+    )
     args = parser.parse_args()
 
     tolerance = args.tolerance
@@ -329,15 +348,14 @@ def main() -> int:
 
     if args.calibrate:
         if args.mode == "perf":
-            baseline = calibrate_perf(args.results_dir,
-                                      args.gate_ttft_max_concurrency)
+            baseline = calibrate_perf(args.results_dir, args.gate_ttft_max_concurrency)
         elif args.mode == "eval":
             if args.task_filter == "all":
                 task_filter = None
             elif args.task_filter:
-                task_filter = set(s.strip()
-                                  for s in args.task_filter.split(",")
-                                  if s.strip())
+                task_filter = set(
+                    s.strip() for s in args.task_filter.split(",") if s.strip()
+                )
             else:
                 task_filter = {
                     "mmlu_llama",
@@ -364,14 +382,16 @@ def main() -> int:
         if not results:
             print(
                 f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
-                file=sys.stderr)
+                file=sys.stderr,
+            )
             return 2
     else:
         results = load_eval_results(args.results_dir[0])
         if not results:
             print(
                 f"ERROR: no results_*.json found under {args.results_dir[0]}",
-                file=sys.stderr)
+                file=sys.stderr,
+            )
             return 2
 
     with args.baseline.open() as fh:
@@ -382,16 +402,18 @@ def main() -> int:
         failed = check_perf(results, baseline, tolerance)
         if failed:
             print(
-                f"FAILED: {failed} metric(s) regressed beyond {tolerance*100:.2f}%",
-                file=sys.stderr)
+                f"FAILED: {failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
+                file=sys.stderr,
+            )
             return 1
         print("PASS: all gated metrics within tolerance.")
     else:
         failed = check_eval(results, baseline, tolerance)
         if failed:
             print(
-                f"FAILED: {failed} task(s) regressed beyond {tolerance*100:.2f}pp",
-                file=sys.stderr)
+                f"FAILED: {failed} task(s) regressed beyond {tolerance * 100:.2f}pp",
+                file=sys.stderr,
+            )
             return 1
         print("PASS: all evaluated tasks within tolerance.")
     return 0

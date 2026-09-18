@@ -133,6 +133,7 @@ class StepMetadata:
     """Metadata and scalars extracted for the current execution step."""
     causal_offset: list[jax.Array]
     bkv_sz_frm_cache: list[jax.Array]
+    bkv_sz_frm_new: list[jax.Array]
     new_kv_len_start: list[jax.Array]
     local_k_start: list[jax.Array] | None = None
     local_k_end: list[jax.Array] | None = None
@@ -151,6 +152,7 @@ def fetch_step_metadata(
     """Fetches metadata and handles scalar & mask interval values for the current step."""
     causal_offset_list = []
     bkv_sz_frm_cache_list = []
+    bkv_sz_frm_new_list = []
     new_kv_len_start_list = []
     local_k_start_list = ([] if cfgs.serve.attention_scope
                           == configs.AttentionScope.NEW_TOKENS_ONLY else None)
@@ -182,10 +184,13 @@ def fetch_step_metadata(
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
         new_kv_len_start = q_end - kv_left_frm_new
         bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
+        bkv_sz_frm_new_list.append(
+            jnp.minimum(kv_left, cfgs.bkv_sz) - bkv_sz_frm_cache)
         new_kv_len_start_list.append(new_kv_len_start)
     return StepMetadata(
         causal_offset=causal_offset_list,
         bkv_sz_frm_cache=bkv_sz_frm_cache_list,
+        bkv_sz_frm_new=bkv_sz_frm_new_list,
         new_kv_len_start=new_kv_len_start_list,
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
@@ -299,6 +304,7 @@ def rpa_body(
                 b_idx,
                 step_meta.bkv_sz_frm_cache[b_idx],
                 step_meta.new_kv_len_start[b_idx],
+                step_meta.bkv_sz_frm_new[b_idx],
                 cfgs=cfgs,
             )
             stitch_results.append(res)

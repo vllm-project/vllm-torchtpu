@@ -34,7 +34,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (FP4, FP8, FP8_MAX,
                                                      WEIGHT_PREFETCH_DISTANCE)
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
-from vllm_torchtpu.kernels.megablox.gmm_v2 import swigluoai
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (silu_and_mul_with_clamp,
+                                                   swigluoai)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -98,22 +99,23 @@ N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
 
 # The FFN activations this kernel can fuse. "silu" is the default and the
 # only one the kernel carried before the selector existed; "swigluoai" is
-# the clamped GPT-OSS form, whose math is the grouped-matmul kernel's
-# function imported above rather than a second copy.
-ACT_FNS = ("silu", "swigluoai")
+# the clamped GPT-OSS form and "silu_and_mul_with_clamp" from DeepSeek-V4
+ACT_FNS = ("silu", "swigluoai", "silu_and_mul_with_clamp")
 
 
 def _apply_act(gate, up, act_fn):
     """The FFN activation, on the POST-SCALE gate and up halves.
 
     Both weight forms reach here with the accumulator already multiplied
-    by its scales, which the clamped form requires: its clip is defined on
-    the true activation value, not on a raw accumulator.
+    by its scales, which the clamped forms require: their clip is defined
+    on the true activation value, not on a raw accumulator.
     """
     if act_fn == "silu":
         return jax.nn.silu(gate) * up
     if act_fn == "swigluoai":
         return swigluoai(gate, up)
+    if act_fn == "silu_and_mul_with_clamp":
+        return silu_and_mul_with_clamp(gate, up)
     raise NotImplementedError(
         f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
 

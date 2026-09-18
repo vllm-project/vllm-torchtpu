@@ -560,7 +560,9 @@ class TestMoEForwardPrecisionBranches:
         layer.w2_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
 
-        method = MagicMock(spec=VllmCompressedTensorsW4ANMxfp4MoEMethod)
+        # Exercise the real apply_with_routing helper, not a MagicMock child.
+        method = VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
+            VllmCompressedTensorsW4ANMxfp4MoEMethod)
         method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)

@@ -18,12 +18,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
+from vllm_torchtpu.runner.speculative_decoding_manager import \
+    SpeculativeDecodingManager
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 _PCP_LAYOUT_RANK = (
@@ -48,7 +51,8 @@ def _make_runner(*,
                  scheduled_tokens,
                  token_paddings,
                  uses_mrope=False,
-                 pcp_mtp_k1_enabled=False):
+                 pcp_mtp_k1_enabled=False,
+                 pcp_size=2):
     num_reqs = len(scheduled_tokens)
     max_model_len = max(64, max(prompt_tokens) + 16)
     max_num_reqs = 8
@@ -70,10 +74,11 @@ def _make_runner(*,
     runner.supports_mm_inputs = False
     runner.lora_config = None
     runner.speculative_config = None
+    runner.reorder_batch_threshold = 1
     runner._pcp_mtp_k1_enabled = pcp_mtp_k1_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
-        prefill_context_parallel_size=2,
+        prefill_context_parallel_size=pcp_size,
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
         pipeline_parallel_size=1,
@@ -82,7 +87,8 @@ def _make_runner(*,
         parallel_config=runner.parallel_config,
         scheduler_config=runner.scheduler_config,
         speculative_config=None,
-        kv_transfer_config=None)
+        kv_transfer_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}))
     runner.sequence_layout_planner = create_sequence_layout_planner(
         runner.vllm_config)
     runner.cache_config = SimpleNamespace(num_gpu_blocks=8,
@@ -117,8 +123,14 @@ def _make_runner(*,
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True
     runner._pp_is_last = True
-    # The stub runs no attention kernel: nothing to bound.
-    runner._check_attention_schedule = lambda *args: None
+    # The real schedule check; the stub registers no attention layer, so no
+    # kernel bounds the step.
+    runner._attention_capacity = {}
+    runner._attention_runs_batched_kernel = None
+    runner._attention_schedule_capacity = types.MethodType(
+        TPUModelRunner._attention_schedule_capacity, runner)
+    runner._check_attention_schedule = types.MethodType(
+        TPUModelRunner._check_attention_schedule, runner)
     # Spec-decode mamba rollback is inactive in these PCP layout tests; the
     # runner leaves the read-offset buffer unset (None) unless speculative
     # decoding is enabled, so _prepare_inputs / dummy_run skip the windowed
@@ -237,6 +249,75 @@ def _scheduler_output(scheduled_tokens):
     )
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("bucket", [1, 4])
+@pytest.mark.parametrize("chunk_size", [1, 2, 8])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_prepare_inputs_routes_reordered_verify_per_chunk(
+        bucket, chunk_size, hybrid):
+    """Protect the real prepare-inputs boundary, not a hand-made distribution.
+
+    Both RPA routes must keep prefill in MIXED. Hybrid GDN always includes
+    verification, independently of whether the RPA bucket is widened.
+    """
+    scheduled = [16, 3, 1, 3, 1]
+    runner = _make_runner(num_computed_tokens=[0, 8, 8, 8, 8],
+                          prompt_tokens=[16, 8, 8, 8, 8],
+                          scheduled_tokens=scheduled,
+                          token_paddings=[256],
+                          pcp_size=1)
+    runner.reorder_batch_threshold = bucket
+    runner.num_reqs_max_model_len = chunk_size
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    runner.spec_decode_manager = SpeculativeDecodingManager(runner)
+    if hybrid:
+        runner.mamba_slot_read_offsets = torch.zeros(8, dtype=torch.int32)
+        runner._combined_request_distribution_cpu = torch.zeros(
+            6, dtype=torch.int32)
+    sched = _scheduler_output(scheduled)
+    sched.scheduled_spec_decode_tokens = {"req1": [1, 2], "req3": [3, 4]}
+    batch = runner.input_batch
+
+    def swap_states(i, j):
+        batch.req_ids[i], batch.req_ids[j] = batch.req_ids[j], batch.req_ids[i]
+        batch.req_id_to_index[batch.req_ids[i]] = i
+        batch.req_id_to_index[batch.req_ids[j]] = j
+        for array in (batch.num_computed_tokens_cpu, batch.num_prompt_tokens,
+                      batch.token_ids_cpu):
+            array[[i, j]] = array[[j, i]]
+        table = batch.block_table[0]._table
+        table[[i, j]] = table[[j, i]]
+
+    batch.swap_states = swap_states
+    num_decode, num_windowed = TPUModelRunner._reorder_batch_for_rpa(
+        runner, sched)
+    assert (num_decode, num_windowed) == (2, 4)
+    assert [sched.num_scheduled_tokens[r]
+            for r in batch.req_ids] == [1, 1, 3, 3, 16]
+    # Independent per-request expectations in the reordered batch.
+    rpa_membership = [True, True, bucket > 1, bucket > 1, False]
+    gdn_membership = [True, True, True, True, False]
+    start = 0
+    while start < 5:
+        prepared = TPUModelRunner._prepare_inputs(runner, sched, start,
+                                                  num_decode, num_windowed)
+        metadata = prepared[0]["layer.0"]
+        end = prepared[4]
+        expected_decode = sum(rpa_membership[start:end])
+        assert metadata.request_distribution.tolist() == [
+            expected_decode, expected_decode, end - start
+        ]
+        expected_lengths = [1, 1, 3, 3, 16][start:end]
+        assert torch.diff(
+            metadata.query_start_loc)[:end -
+                                      start].tolist() == expected_lengths
+        if hybrid:
+            expected_windowed = sum(gdn_membership[start:end])
+            assert runner._attn_metadata_builder_ctx.mamba_request_distribution.tolist(
+            ) == [expected_windowed, expected_windowed, end - start]
+        start = end
+
+
 def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
 
     def capture_forward_context(attn_metadata, *_args, **_kwargs):
@@ -304,6 +385,27 @@ def test_prepare_inputs_builds_rank_local_partial_layout(monkeypatch):
     torch.testing.assert_close(
         logits_indices.cpu(), torch.tensor([271] + [-1] * 7,
                                            dtype=torch.int32))
+
+
+def test_prepare_inputs_pcp_long_context_step_is_not_bounded(monkeypatch):
+    # One 64K-token step of one request: far past the batched kernel's SMEM
+    # schedule, which no layer here runs.
+    scheduled = [65536]
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=scheduled,
+                          scheduled_tokens=scheduled,
+                          token_paddings=[65536])
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    attn_metadata, *_ = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 0, 0)
+
+    assert runner._attention_schedule_capacity() is None
+    md = attn_metadata["layer.0"]
+    assert md.sequence_layout_protocol == "pcp_streaming"
+    assert runner.seq_lens_np[0] == 65536
 
 
 def test_prepare_inputs_pcp_mtp_snapshots_request_major_tokens_before_pack(
@@ -664,3 +766,92 @@ def test_prepare_inputs_batch_flat_owner_preserves_history_positions_and_logits(
                                torch.tensor([125, 223], dtype=torch.int32))
     assert not hasattr(runner._attn_metadata_builder_ctx,
                        "token_owner_start_offsets")
+
+
+def _make_attention_capacity_runner(monkeypatch, pcp_size):
+    from jax.experimental.pallas import tpu as pltpu
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.layers.adapter.attention import \
+        PallasAttentionBackendImpl
+
+    # Run the real capacity arithmetic using JAX's static chip specification;
+    # neither the runner nor this fixture initializes a TPU device.
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    impl = MagicMock(spec=PallasAttentionBackendImpl)
+    impl.runs_batched_rpa_schedule.return_value = pcp_size == 1
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+        lambda _config, _layer_type: {"layer.0": SimpleNamespace(impl=impl)})
+    runner = object.__new__(TPUModelRunner)
+    runner._attention_runs_batched_kernel = None
+    runner._attention_capacity = {}
+    runner.parallel_config = SimpleNamespace(
+        prefill_context_parallel_size=pcp_size)
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=runner.parallel_config)
+    runner.cache_config = CacheConfig(block_size=256)
+    runner.cache_config.kv_cache_layout = "LBNHC"
+    runner._attention_kernel_block_size = 256
+    runner.model_config = SimpleNamespace(dtype=torch.bfloat16,
+                                          get_num_attention_heads=lambda _: 32)
+    runner.num_kv_heads = 2
+    runner.head_size = 256
+    runner.max_num_reqs = 64
+    runner.num_reqs_max_model_len = 64
+    runner.max_model_len = 262144
+    runner.most_model_len = None
+    runner.num_reqs_most_model_len = None
+    runner._attention_kv_cache_group_id = None
+    runner.kv_cache_dtype = torch.float8_e4m3fn
+    return runner
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("q_lens,kv_lens,num_decode", [
+    ([32768], [32768], 0),
+    ([32768], [65536], 0),
+    ([1, 32768], [262144, 65536], 1),
+    ([1] * 64, [262144] * 64, 64),
+],
+                         ids=["prefill", "history", "mixed", "decode"])
+def test_pcp_streaming_does_not_use_batched_smem_capacity(
+        monkeypatch, q_lens, kv_lens, num_decode):
+    runner = _make_attention_capacity_runner(monkeypatch, pcp_size=8)
+    runner.seq_lens_np = np.asarray(kv_lens, dtype=np.int32)
+    runner._check_attention_schedule(len(q_lens), np.asarray(q_lens),
+                                     num_decode)
+    # The backend also serves ordinary RPA, but PCP dispatches the distinct
+    # compact streaming schedule for every request distribution.
+    assert runner._attention_schedule_capacity() is None
+    assert runner._attention_runs_batched_kernel is False
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("extra_pairs", [0, 1])
+def test_non_pcp_batched_smem_capacity_boundary(monkeypatch, extra_pairs):
+    from vllm_torchtpu.kernels.experimental.batched_rpa.wrapper import \
+        schedule_pairs
+
+    runner = _make_attention_capacity_runner(monkeypatch, pcp_size=1)
+    assert runner._attention_schedule_capacity()["mixed"] == (13436, 256, 256)
+    # Fourteen valid requests, all below max_model_len: exactly the last
+    # schedulable pair, followed by one more KV block on the final request.
+    q_lens = np.full(14, 256)
+    runner.seq_lens_np = np.array([262144] * 13 + [(124 + extra_pairs) * 256])
+    assert schedule_pairs(q_lens, runner.seq_lens_np, 256,
+                          256) == 13436 + extra_pairs
+    if extra_pairs:
+        with pytest.raises(RuntimeError, match="needs 13437 .* holds 13436"):
+            runner._check_attention_schedule(14, q_lens, 0)
+    else:
+        runner._check_attention_schedule(14, q_lens, 0)
+
+
+@pytest.mark.cpu_test
+def test_non_pcp_still_rejects_long_history_chunk(monkeypatch):
+    runner = _make_attention_capacity_runner(monkeypatch, pcp_size=1)
+    runner.seq_lens_np = np.array([65536])
+    with pytest.raises(RuntimeError, match="needs 24640 .* holds 13436"):
+        runner._check_attention_schedule(1, np.array([32768]), 0)

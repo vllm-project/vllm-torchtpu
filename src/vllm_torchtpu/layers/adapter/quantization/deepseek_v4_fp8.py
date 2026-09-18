@@ -99,6 +99,6 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                 moe_config = self.get_moe_config(layer)
                 return VllmDeepseekV4Mxfp4MoEMethod(moe_config)
             else:
-                return VllmFp8MoEMethodTPU(self, layer)
+                return VllmFp8MoEMethodTPU(self, self.get_moe_config(layer))
 
         return None

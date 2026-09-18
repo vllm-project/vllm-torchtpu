@@ -109,10 +109,10 @@ def compile_pattern(pattern: str) -> re.Pattern:
     while i < n:
         c = p[i]
         if c == "*":
-            if p[i:i + 3] == "**/":
+            if p[i : i + 3] == "**/":
                 out.append("(?:.*/)?")
                 i += 3
-            elif p[i:i + 2] == "**":
+            elif p[i : i + 2] == "**":
                 out.append(".*")
                 i += 2
             else:
@@ -136,8 +136,7 @@ def compile_pattern(pattern: str) -> re.Pattern:
     return re.compile("^" + prefix + "".join(out) + subtree + "$")
 
 
-def load_rules(root: str,
-               override: str | None = None) -> tuple[list[Rule], str]:
+def load_rules(root: str, override: str | None = None) -> tuple[list[Rule], str]:
     if override:
         with open(override, encoding="utf-8") as f:
             return parse_codeowners(f.read()), override
@@ -146,8 +145,7 @@ def load_rules(root: str,
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 return parse_codeowners(f.read()), rel
-    die(f"no CODEOWNERS file found (looked in {', '.join(CODEOWNERS_CANDIDATES)})"
-        )
+    die(f"no CODEOWNERS file found (looked in {', '.join(CODEOWNERS_CANDIDATES)})")
 
 
 def parse_codeowners(content: str) -> list[Rule]:
@@ -181,8 +179,7 @@ def resolve_base(root: str, base: str | None) -> str:
     if base:
         return base
     for candidate in ("origin/main", "upstream/main", "main"):
-        if run(["git", "rev-parse", "--verify", "--quiet", candidate],
-               cwd=root):
+        if run(["git", "rev-parse", "--verify", "--quiet", candidate], cwd=root):
             return candidate
     die("could not find a base branch; pass --base <ref>")
 
@@ -199,8 +196,7 @@ def changed_files(root: str, base: str) -> tuple[list[str], str]:
     if diff:
         files.update(diff.splitlines())
 
-    untracked = run(["git", "ls-files", "--others", "--exclude-standard"],
-                    cwd=root)
+    untracked = run(["git", "ls-files", "--others", "--exclude-standard"], cwd=root)
     if untracked:
         files.update(untracked.splitlines())
 
@@ -245,10 +241,7 @@ def resolve_author(pr: str | None, repo: str | None) -> str | None:
     not excluded from the suggestions.
     """
     if pr:
-        cmd = [
-            "gh", "pr", "view",
-            str(pr), "--json", "author", "--jq", ".author.login"
-        ]
+        cmd = ["gh", "pr", "view", str(pr), "--json", "author", "--jq", ".author.login"]
         if repo:
             cmd += ["--repo", repo]
     else:
@@ -266,8 +259,10 @@ def resolve_pr(pr: str | None, repo: str | None) -> str:
         cmd += ["--repo", repo]
     ok, out = run_checked(cmd)
     if not ok or not out:
-        die("no PR found for the current branch; open one first or pass "
-            "--pr <PR_NUMBER>")
+        die(
+            "no PR found for the current branch; open one first or pass "
+            "--pr <PR_NUMBER>"
+        )
     return out
 
 
@@ -299,8 +294,7 @@ def request_reviewers(
 # --------------------------------------------------------------------------
 # grouping and reporting
 # --------------------------------------------------------------------------
-def group_by_rule(files: list[str],
-                  rules: list[Rule]) -> tuple[dict, list[str]]:
+def group_by_rule(files: list[str], rules: list[Rule]) -> tuple[dict, list[str]]:
     groups: dict[str, dict] = {}
     unowned: list[str] = []
     for path in files:
@@ -308,10 +302,7 @@ def group_by_rule(files: list[str],
         if rule is None or not rule.owners:
             unowned.append(path)
             continue
-        group = groups.setdefault(rule.pattern, {
-            "owners": rule.owners,
-            "files": []
-        })
+        group = groups.setdefault(rule.pattern, {"owners": rule.owners, "files": []})
         group["files"].append(path)
     return groups, unowned
 
@@ -325,8 +316,11 @@ def eligible_owners(owners: list[str], author: str | None) -> list[str]:
 
 def self_owned_areas(groups: dict, author: str | None) -> list[str]:
     """Patterns whose only owner is the author, so nobody else can be asked."""
-    return sorted(pat for pat, g in groups.items()
-                  if g["owners"] and not eligible_owners(g["owners"], author))
+    return sorted(
+        pat
+        for pat, g in groups.items()
+        if g["owners"] and not eligible_owners(g["owners"], author)
+    )
 
 
 def minimal_cover(groups: dict, author: str | None = None) -> list[str]:
@@ -339,20 +333,14 @@ def minimal_cover(groups: dict, author: str | None = None) -> list[str]:
     The author is never chosen. GitHub refuses to register a self-review
     request, and asking for one drops the rest of the request along with it.
     """
-    eligible = {
-        pat: eligible_owners(g["owners"], author)
-        for pat, g in groups.items()
-    }
+    eligible = {pat: eligible_owners(g["owners"], author) for pat, g in groups.items()}
     # Areas the author owns outright have nobody left to ask; they are
     # reported separately rather than silently covered.
     remaining = {pat for pat, owners in eligible.items() if owners}
     chosen: list[str] = []
     while remaining:
         best, best_cover = None, set()
-        for owner in sorted(
-            {o
-             for owners in eligible.values()
-             for o in owners}):
+        for owner in sorted({o for owners in eligible.values() for o in owners}):
             covered = {pat for pat in remaining if owner in eligible[pat]}
             if len(covered) > len(best_cover):
                 best, best_cover = owner, covered
@@ -364,7 +352,6 @@ def minimal_cover(groups: dict, author: str | None = None) -> list[str]:
 
 
 class Style:
-
     def __init__(self, enabled: bool):
         self.enabled = enabled
 
@@ -411,8 +398,10 @@ def report(
             owners = " ".join(group["owners"])
             count = len(group["files"])
             plural = "" if count == 1 else "s"
-            print(f"  {pattern.ljust(width)}  {style.green(owners)}"
-                  f"  {style.dim(f'({count} file{plural})')}")
+            print(
+                f"  {pattern.ljust(width)}  {style.green(owners)}"
+                f"  {style.dim(f'({count} file{plural})')}"
+            )
             if show_files:
                 for path in group["files"]:
                     print(style.dim(f"      {path}"))
@@ -424,8 +413,11 @@ def report(
             print(style.bold("Ping these reviewers"))
             print(f"  {style.green(' '.join(cover))}")
             print(
-                style.dim("  (smallest set covering every area above; "
-                          "one approval per area is required)"))
+                style.dim(
+                    "  (smallest set covering every area above; "
+                    "one approval per area is required)"
+                )
+            )
             handles = ",".join(o.lstrip("@") for o in cover)
             print()
             print(style.dim("  gh pr edit --add-reviewer ") + handles)
@@ -437,8 +429,11 @@ def report(
         if mine:
             print()
             print(
-                style.yellow(f"You are the only owner of {len(mine)} area(s); "
-                             "ask anyone for a second pair of eyes:"))
+                style.yellow(
+                    f"You are the only owner of {len(mine)} area(s); "
+                    "ask anyone for a second pair of eyes:"
+                )
+            )
             for pattern in mine:
                 print(f"  {pattern}")
 
@@ -454,21 +449,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Find the CODEOWNERS reviewers for your changes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("Typical use, from anywhere inside the repo:")
-        [-1],
+        epilog=__doc__.split("Typical use, from anywhere inside the repo:")[-1],
     )
     parser.add_argument(
         "paths",
         nargs="*",
-        help=
-        "files or directories to look up (default: files changed on this branch)",
+        help="files or directories to look up (default: files changed on this branch)",
     )
-    parser.add_argument("--pr",
-                        help="look up the files of an existing PR number")
+    parser.add_argument("--pr", help="look up the files of an existing PR number")
     parser.add_argument(
-        "--repo", help="owner/name to use with --pr (default: current repo)")
-    parser.add_argument("--base",
-                        help="base ref to diff against (default: origin/main)")
+        "--repo", help="owner/name to use with --pr (default: current repo)"
+    )
+    parser.add_argument(
+        "--base", help="base ref to diff against (default: origin/main)"
+    )
     parser.add_argument(
         "--codeowners",
         help="read ownership from this file instead of the checked-out one",
@@ -489,12 +483,8 @@ def main() -> None:
         help="request review from the owners on the PR "
         "(--pr, else the current branch's PR)",
     )
-    parser.add_argument("--json",
-                        action="store_true",
-                        help="print JSON output")
-    parser.add_argument("--no-color",
-                        action="store_true",
-                        help="disable color")
+    parser.add_argument("--json", action="store_true", help="print JSON output")
+    parser.add_argument("--no-color", action="store_true", help="disable color")
     args = parser.parse_args()
 
     root = repo_root()
@@ -519,32 +509,28 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "source":
-                    source,
-                    "codeowners":
-                    codeowners_path,
-                    "files":
-                    files,
-                    "groups": [{
-                        "pattern": pattern,
-                        "owners": groups[pattern]["owners"],
-                        "files": groups[pattern]["files"],
-                    } for pattern in sorted(groups)],
-                    "reviewers":
-                    minimal_cover(groups, author),
-                    "author":
-                    author,
-                    "self_owned":
-                    self_owned_areas(groups, author),
-                    "unowned":
-                    unowned,
+                    "source": source,
+                    "codeowners": codeowners_path,
+                    "files": files,
+                    "groups": [
+                        {
+                            "pattern": pattern,
+                            "owners": groups[pattern]["owners"],
+                            "files": groups[pattern]["files"],
+                        }
+                        for pattern in sorted(groups)
+                    ],
+                    "reviewers": minimal_cover(groups, author),
+                    "author": author,
+                    "self_owned": self_owned_areas(groups, author),
+                    "unowned": unowned,
                 },
                 indent=2,
-            ))
+            )
+        )
         return
 
-    color = sys.stdout.isatty(
-    ) and not args.no_color and not os.environ.get("NO_COLOR")
+    color = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
     style = Style(color)
     report(
         source,
@@ -558,8 +544,7 @@ def main() -> None:
     )
 
     if args.request:
-        request_reviewers(minimal_cover(groups, author), args.pr, args.repo,
-                          style)
+        request_reviewers(minimal_cover(groups, author), args.pr, args.repo, style)
 
 
 if __name__ == "__main__":

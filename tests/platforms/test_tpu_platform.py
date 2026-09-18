@@ -15,12 +15,15 @@
 import copy
 import math
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
-from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
+from vllm.config import (CacheConfig, KVTransferConfig, ModelConfig,
+                         ParallelConfig, VllmConfig)
 from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -69,6 +72,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         block_size=16,
         use_eagle=False,
         mamba_partial_cache_hit=False,
+        mamba_has_prefill_checkpoint_blocks=False,
         hash_block_size=16,
     )
     request = SimpleNamespace(
@@ -131,6 +135,63 @@ def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(
     assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
 
 
+@pytest.mark.parametrize("inherited_endpoint", [False, True])
+def test_singlehost_workers_share_native_endpoint_with_filestore(
+        monkeypatch, tmp_path, inherited_endpoint):
+    """Native bootstrap needs one shared endpoint even with a c10d FileStore."""
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    if inherited_endpoint:
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setenv("MASTER_PORT", "29457")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES",
+                       "localhost:10001,localhost:10002")
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "1,1,1,2")
+    with patch.object(tpu_platform.portpicker,
+                      "pick_unused_port",
+                      wraps=tpu_platform.portpicker.pick_unused_port) as pick:
+        TpuPlatform._prepare_singlehost_tpu_env(2)
+        # Config copies re-enter preparation before worker initialization.
+        TpuPlatform._prepare_singlehost_tpu_env(2)
+    assert pick.call_count == (0 if inherited_endpoint else 1)
+    endpoint = (os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"])
+    if inherited_endpoint:
+        assert endpoint == ("127.0.0.1", "29457")
+
+    script = """
+import os
+import sys
+from datetime import timedelta
+import torch.distributed as dist
+endpoint = (os.environ['MASTER_ADDR'], os.environ['MASTER_PORT'])
+assert 0 < int(endpoint[1]) < 65536
+dist.init_process_group('gloo', init_method=sys.argv[1], rank=int(sys.argv[2]),
+                        world_size=2, timeout=timedelta(seconds=30))
+peers = [None, None]
+dist.all_gather_object(peers, endpoint)
+assert peers == [endpoint, endpoint], peers
+dist.destroy_process_group()
+"""
+    processes = [
+        subprocess.Popen([
+            sys.executable, "-c", script, (tmp_path / "rendezvous").as_uri(),
+            str(rank)
+        ],
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE,
+                         text=True) for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=45)
+            assert process.returncode == 0, (stdout, stderr)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
 def set_mock_attn_to_vllm_config(vllm_config, page_size, min_page_size):
     new_vllm_config = copy.copy(vllm_config)
 
@@ -155,7 +216,7 @@ class TestTpuPlatform:
         vllm_config.model_config.dtype = torch.bfloat16
         vllm_config.model_config.is_hybrid = False
         vllm_config.model_config.hf_config = None
-        vllm_config.cache_config = MagicMock(spec=CacheConfig)
+        vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False
         vllm_config.cache_config.mamba_cache_mode = None
@@ -337,8 +398,8 @@ class TestTpuPlatform:
         vllm_config.model_config.is_hybrid = True
         vllm_config.model_config.architecture = "KimiK3ForConditionalGeneration"
         vllm_config.cache_config.enable_prefix_caching = True
-        vllm_config.kv_transfer_config = MagicMock(
-            kv_connector="DecodeBenchConnector")
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="DecodeBenchConnector", kv_role="kv_both")
 
         TpuPlatform.check_and_update_config(vllm_config)
 
@@ -356,8 +417,18 @@ class TestTpuPlatform:
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
             self, mock_prepare_env, mock_apply_patches, vllm_config,
             connector_name):
-        vllm_config.kv_transfer_config = MagicMock()
-        vllm_config.kv_transfer_config.kv_connector = connector_name
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector=connector_name, kv_role="kv_both")
+        if connector_name == "TPUConnector":
+            vllm_config.kv_transfer_config.kv_connector_module_path = (
+                "vllm_torchtpu.distributed.kv_transfer.tpu_connector")
+        elif connector_name == "TPUMultiConnector":
+            vllm_config.kv_transfer_config.kv_connector_extra_config = {
+                "connectors": [{
+                    "kv_connector": "DecodeBenchConnector",
+                    "kv_role": "kv_both",
+                }]
+            }
         vllm_config.cache_config.block_size = 16
 
         TpuPlatform.check_and_update_config(vllm_config)
@@ -414,9 +485,8 @@ class TestTpuPlatform:
             # Prefix caching stays off: hybrid APC without the pool is
             # rejected earlier, by its own gate, and would mask this one.
             vllm_config.cache_config.mamba_cache_mode = "align"
-        vllm_config.kv_transfer_config = MagicMock()
-        vllm_config.kv_transfer_config.kv_connector = (
-            "TPURaidenOffloadingConnector")
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="TPURaidenOffloadingConnector", kv_role="kv_both")
 
         if pool_env:
             monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
@@ -685,8 +755,11 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     originals = [getattr(target, name) for target, name in targets]
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
-    other_model = SimpleNamespace(hf_config=None, model="llama")
-    qwen_model = SimpleNamespace(hf_config=None, model="Qwen/Qwen3-VL-4B")
+    other_model = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="llama"), model="llama")
+    qwen_model = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        model="Qwen/Qwen3-VL-4B")
     reg.apply("platform_activation", model_config=other_model)
     assert [getattr(target, name) for target, name in targets] == originals
     reg.apply("platform_activation", model_config=qwen_model)
