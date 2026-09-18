@@ -281,23 +281,31 @@ class TestResolversEndToEnd(unittest.TestCase):
 
     def test_sparsegpt_resolver_resolve(self):
         """
-        Arrange-Act-Assert: Verify SparseGptResolver resolution with last_to_first strategy.
+        Arrange-Act-Assert: Verify SparseGptResolver resolution with prefix (first_to_last) strategy,
+        and verify that invalid non-prefix (last_to_first) splicing raises ValueError per scientific validity.
         """
         resolver = SparseGptResolver()
         current_config = {"num_sparse_layers": 2}
         resolver_config = {
             "base_model": self.dense_dir,
             "reference_sparse_model": self.sparse_dir,
-            "strategy": "last_to_first",
+            "strategy": "first_to_last",
             "checkpoint_base_dir": self.work_dir
         }
 
+        # Valid prefix splice
         model_path, consumed_keys = resolver.resolve(current_config,
                                                      resolver_config)
         self.assertIn("num_sparse_layers", consumed_keys)
         self.assertTrue(
             os.path.exists(
                 os.path.join(model_path, "model.safetensors.index.json")))
+
+        # Invalid non-prefix splice raises ValueError
+        invalid_config = dict(resolver_config)
+        invalid_config["strategy"] = "last_to_first"
+        with self.assertRaises(ValueError):
+            resolver.resolve(current_config, invalid_config)
 
     def test_weight_scaler_resolver_resolve(self):
         """
