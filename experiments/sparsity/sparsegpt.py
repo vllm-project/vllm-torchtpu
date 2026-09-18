@@ -75,10 +75,15 @@ class SparseGPT:
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        # Factorize dampened Hessian: H = L @ L^T
+        L = torch.linalg.cholesky(H)
+        # Fast multi-threaded inversion: solve L @ Linv = I, then H^-1 = Linv^T @ Linv
+        Linv = torch.linalg.solve_triangular(
+            L, torch.eye(self.columns, device=self.dev, dtype=L.dtype), upper=False
+        )
+        Hinv = Linv.t().matmul(Linv)
+        # Obtain upper Cholesky factor for OBS block updates
+        Hinv = torch.linalg.cholesky(Hinv, upper=True)
 
         mask = None
 
@@ -127,8 +132,8 @@ class SparseGPT:
                 Losses1[:, i] = (w - q)**2 / d**2
 
                 err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i,
-                                                            i:].unsqueeze(0))
+                # In-place rank-1 update: W1[:, i:] -= err1 @ Hinv1[i, i:]
+                W1[:, i:].addr_(err1, Hinv1[i, i:], alpha=-1.0)
                 Err1[:, i] = err1
 
             W[:, i1:i2] = Q1
