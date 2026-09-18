@@ -53,7 +53,7 @@ dependencies = [
     # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
     # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
     # bumping.
-    "libtpu==0.0.44.1",
+    "libtpu==0.0.47",
     "ray[default]",
     "ray[data]",
 ]
