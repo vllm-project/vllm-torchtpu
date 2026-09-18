@@ -92,7 +92,8 @@ class BaseSparsityResolver(BaseResolver):
 
     def prune_in_memory(self, base_model: str, save_path: str, min_layer: int,
                         max_layer: int, prunen: int, prunem: int,
-                        resolver_config: Dict[str, Any]) -> str:
+                        resolver_config: Dict[str, Any],
+                        sparse_layer_indices: Optional[Set[int]] = None) -> str:
         """Hook to be implemented by specific pruning algorithm subclasses."""
         raise NotImplementedError(
             "Subclasses must implement prune_in_memory fallback.")
@@ -125,6 +126,14 @@ class BaseSparsityResolver(BaseResolver):
 
         arch = self.splicer.detect_architecture(base_model)
         total_layers = arch.num_layers
+
+        if explicit_layer_indices is not None:
+            for layer_idx in sorted(explicit_layer_indices):
+                if not (0 <= layer_idx < total_layers):
+                    raise ValueError(
+                        f"Layer index {layer_idx} out of bounds for model with "
+                        f"{total_layers} layers (must satisfy 0 <= layer_idx < {total_layers})."
+                    )
 
         strategy = resolver_config.get("strategy", "first_to_last")
         prunen = resolver_config.get("prunen", 2)
@@ -189,14 +198,19 @@ class BaseSparsityResolver(BaseResolver):
             sparse_indices = set(range(min_layer, max_layer))
         can_splice = bool(reference_sparse_model) and os.path.exists(
             reference_sparse_model)
+        is_prefix = bool(sparse_indices) and sorted(sparse_indices) == list(range(len(sparse_indices)))
+        splice_from_reference = can_splice and (
+            is_prefix or resolver_config.get("allow_nonprefix_splice", False))
 
         # Validate the layer set BEFORE the cache lookup and before
         # _cleanup_old_spliced_dirs so an invalid config can never delete
-        # valid cached splices on its way to raising.
-        if can_splice:
+        # valid cached splices on its way to raising. Explicit non-prefix
+        # layer sets bypass the reference splice (in-memory calibration)
+        # and are therefore not subject to the splice guard.
+        if can_splice and (splice_from_reference
+                           or explicit_layer_indices is None):
             self._assert_spliceable(sparse_indices, strategy, resolver_config)
 
-        is_prefix = bool(sparse_indices) and sorted(sparse_indices) == list(range(len(sparse_indices)))
         if explicit_layer_indices is not None and not is_prefix:
             import hashlib
             calib_tag = f"_{resolver_config.get('nsamples')}c4" if "nsamples" in resolver_config else ""
@@ -230,15 +244,22 @@ class BaseSparsityResolver(BaseResolver):
 
         # 2. Fast cross-shard layer splicing from 100% sparse reference model (prefix only)
         if can_splice:
-            print(
-                f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
-            )
-            self.splicer.splice_checkpoint(
-                dense_model_dir=base_model,
-                fully_sparse_model_dir=reference_sparse_model,
-                sparse_layer_indices=sparse_indices,
-                output_dir=ckpt_path)
-            return ckpt_path, self.CONSUMED_KEYS
+            if splice_from_reference:
+                print(
+                    f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
+                )
+                self.splicer.splice_checkpoint(
+                    dense_model_dir=base_model,
+                    fully_sparse_model_dir=reference_sparse_model,
+                    sparse_layer_indices=sparse_indices,
+                    output_dir=ckpt_path)
+                return ckpt_path, self.CONSUMED_KEYS
+            elif explicit_layer_indices is not None:
+                print(
+                    f">>> [RESOLVER] Non-prefix layer set {sorted(sparse_indices)} requested. "
+                    f"Bypassing reference splice and falling through to in-memory calibration..."
+                )
+
 
         # 3. In-memory algorithmic pruning fallback
         print("\n=======================================================")

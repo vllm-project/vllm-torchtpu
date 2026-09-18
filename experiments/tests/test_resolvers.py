@@ -420,6 +420,81 @@ class TestResolversEndToEnd(unittest.TestCase):
             os.path.exists(
                 os.path.join(out_target, "model.safetensors.index.json")))
 
+    def test_base_sparsity_resolver_layer_bounds_validation(self):
+        """
+        Arrange-Act-Assert: Verify strict layer bounds validation (0 <= layer_idx < total_layers).
+        Prevents silent layer-dropping or out-of-bounds corruption.
+        """
+        resolver = BaseSparsityResolver()
+        resolver_config = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": self.sparse_dir,
+            "strategy": "first_to_last",
+            "checkpoint_base_dir": self.work_dir
+        }
+
+        # Negative layer index must raise ValueError
+        with self.assertRaises(ValueError):
+            resolver.resolve({"layers": [-1, 1]}, resolver_config)
+
+        # Out-of-bounds layer index (>= total_layers=4) must raise ValueError
+        with self.assertRaises(ValueError):
+            resolver.resolve({"layers": [0, 4]}, resolver_config)
+
+        with self.assertRaises(ValueError):
+            resolver.resolve({"layers": [48]}, resolver_config)
+
+        # Invalid layers type (not list/set/tuple) must raise ValueError
+        with self.assertRaises(ValueError):
+            resolver.resolve({"layers": "invalid_string"}, resolver_config)
+
+        # Missing base_model in resolver_config must raise ValueError
+        with self.assertRaises(ValueError):
+            resolver.resolve({"layers": [1, 2]}, {})
+
+    def test_base_sparsity_resolver_nonprefix_layers_bypass_splicing(self):
+        """
+        Arrange-Act-Assert: Verify that an arbitrary non-prefix layer set bypasses
+        reference splicing and falls through to in-memory algorithmic pruning.
+        """
+        resolver = NaiveMagnitudeResolver()
+        current_config = {"layers": [1, 2]}
+        resolver_config = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": self.sparse_dir,
+            "strategy": "first_to_last",
+            "checkpoint_base_dir": self.work_dir
+        }
+
+        # Should NOT raise ValueError from _assert_spliceable; falls through to prune_in_memory
+        model_path, consumed_keys = resolver.resolve(current_config,
+                                                     resolver_config)
+        self.assertIn("layers", consumed_keys)
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(model_path, "model.safetensors.index.json")))
+
+    def test_base_sparsity_resolver_nonprefix_layers_allow_splice(self):
+        """
+        Arrange-Act-Assert: Verify that allow_nonprefix_splice permits splicing non-prefix layer sets.
+        """
+        resolver = NaiveMagnitudeResolver()
+        current_config = {"layers": [1, 2]}
+        resolver_config = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": self.sparse_dir,
+            "strategy": "first_to_last",
+            "allow_nonprefix_splice": True,
+            "checkpoint_base_dir": self.work_dir
+        }
+
+        model_path, consumed_keys = resolver.resolve(current_config,
+                                                     resolver_config)
+        self.assertIn("layers", consumed_keys)
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(model_path, "model.safetensors.index.json")))
+
 
 class TestWeightScalerResolver(unittest.TestCase):
     """Tests constant scalar weight multiplier (W <- c * W) transformation."""
