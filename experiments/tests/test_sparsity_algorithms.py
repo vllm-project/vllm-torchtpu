@@ -184,6 +184,123 @@ class TestSparseGPT(unittest.TestCase):
         # Clean up
         sparsegpt.free()
 
+    def test_sparsegpt_lrc_prune_tall_matrix(self):
+        """
+        Arrange-Act-Assert: Verify LRC alternating minimization with Gram-matrix eigh on tall matrix (d_out >= d_in).
+        Verifies:
+        1. Dimension constraints: rows=32 >= cols=16 triggers G = R_tilde.T @ R_tilde (16x16 Gram matrix).
+        2. Execution of lrc_prune(k=4, T=3) with 2:4 structured sparsity.
+        3. Whitened Frobenius error monotonically non-increasing: error_lrc <= error_sparsegpt.
+        4. Reconstructed weights are finite and memory references are released on free().
+        """
+        torch.manual_seed(42)
+        linear = nn.Linear(16, 32, bias=False)
+        linear.weight.data = torch.randn(32, 16)
+        sparsegpt = SparseGPT(linear)
+
+        for _ in range(8):
+            inp = torch.randn(32, 16)
+            out = linear(inp)
+            sparsegpt.add_batch(inp, out)
+
+        U, V = sparsegpt.lrc_prune(
+            sparsity=0,
+            prunen=2,
+            prunem=4,
+            percdamp=0.01,
+            blocksize=16,
+            T=3,
+            k=4,
+        )
+
+        self.assertEqual(U.shape, (32, 4))
+        self.assertEqual(V.shape, (4, 16))
+        self.assertIsNotNone(sparsegpt.error_sparsegpt)
+        self.assertIsNotNone(sparsegpt.error_lrc)
+        self.assertLessEqual(sparsegpt.error_lrc, sparsegpt.error_sparsegpt + 1e-5)
+        self.assertFalse(torch.isnan(linear.weight.data).any())
+        self.assertFalse(torch.isinf(linear.weight.data).any())
+
+        sparsegpt.free()
+        self.assertIsNone(sparsegpt.H)
+        self.assertIsNone(sparsegpt.L)
+        self.assertIsNone(sparsegpt.U)
+        self.assertIsNone(sparsegpt.V)
+        self.assertIsNone(sparsegpt.S)
+
+    def test_sparsegpt_lrc_prune_wide_matrix(self):
+        """
+        Arrange-Act-Assert: Verify LRC alternating minimization with Gram-matrix eigh on wide matrix (d_out < d_in).
+        Verifies:
+        1. Dimension constraints: rows=16 < cols=32 triggers G = R_tilde @ R_tilde.T (16x16 Gram matrix).
+        2. Execution of lrc_prune(k=4, T=3) with 2:4 structured sparsity.
+        3. Whitened Frobenius error monotonically non-increasing: error_lrc <= error_sparsegpt.
+        4. Reconstructed weights are finite and memory references are released on free().
+        """
+        torch.manual_seed(42)
+        linear = nn.Linear(32, 16, bias=False)
+        linear.weight.data = torch.randn(16, 32)
+        sparsegpt = SparseGPT(linear)
+
+        for _ in range(8):
+            inp = torch.randn(32, 32)
+            out = linear(inp)
+            sparsegpt.add_batch(inp, out)
+
+        U, V = sparsegpt.lrc_prune(
+            sparsity=0,
+            prunen=2,
+            prunem=4,
+            percdamp=0.01,
+            blocksize=16,
+            T=3,
+            k=4,
+        )
+
+        self.assertEqual(U.shape, (16, 4))
+        self.assertEqual(V.shape, (4, 32))
+        self.assertIsNotNone(sparsegpt.error_sparsegpt)
+        self.assertIsNotNone(sparsegpt.error_lrc)
+        self.assertLessEqual(sparsegpt.error_lrc, sparsegpt.error_sparsegpt + 1e-5)
+        self.assertFalse(torch.isnan(linear.weight.data).any())
+        self.assertFalse(torch.isinf(linear.weight.data).any())
+
+        sparsegpt.free()
+        self.assertIsNone(sparsegpt.H)
+        self.assertIsNone(sparsegpt.L)
+        self.assertIsNone(sparsegpt.U)
+        self.assertIsNone(sparsegpt.V)
+        self.assertIsNone(sparsegpt.S)
+
+    def test_sparsegpt_lrc_prune_zero_rank(self):
+        """
+        Arrange-Act-Assert: Boundary condition with rank k=0.
+        Verifies:
+        1. When k=0, error_lrc matches error_sparsegpt.
+        2. Returns zero adapter shapes and valid finite weights.
+        """
+        linear = nn.Linear(16, 16, bias=False)
+        linear.weight.data = torch.randn(16, 16)
+        sparsegpt = SparseGPT(linear)
+
+        for _ in range(4):
+            inp = torch.randn(16, 16)
+            sparsegpt.add_batch(inp, linear(inp))
+
+        U, V = sparsegpt.lrc_prune(
+            sparsity=0,
+            prunen=2,
+            prunem=4,
+            percdamp=0.01,
+            blocksize=16,
+            T=2,
+            k=0,
+        )
+        self.assertEqual(U.shape, (16, 0))
+        self.assertEqual(V.shape, (0, 16))
+        self.assertAlmostEqual(sparsegpt.error_lrc, sparsegpt.error_sparsegpt, places=5)
+        sparsegpt.free()
+
 
 class TestQuantizer(unittest.TestCase):
     """Tests uniform quantizer configuration and forward quantization."""
