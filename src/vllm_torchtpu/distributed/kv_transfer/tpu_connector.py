@@ -1266,9 +1266,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         default_job = "prefill" if self.is_producer else "decode"
         return f"{default_job}-engine"
 
-    def _enqueue_stage3_release(
-        self, request: "Request", *, report_completion: bool = False
-    ) -> None:
+    def _enqueue_stage3_release(self,
+                                request: "Request",
+                                *,
+                                report_completion: bool = False) -> None:
         """Full local hit or pre-pull abort: nothing to pull; ask the worker
         to promptly release the producer's request-block registration instead
         of leaving until p2p_wait_pull_timeout. Best-effort: the TTL remains
