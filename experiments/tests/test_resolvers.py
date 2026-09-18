@@ -774,6 +774,128 @@ class TestWeightScalerResolver(unittest.TestCase):
                                     f"Norm {k} should NOT be scaled")
 
 
+class TestCheckpointIntegrityGate(unittest.TestCase):
+    """Contract & Integrity Guard tests: validates checkpoint safetensors key parity and substitution."""
+
+    def test_checkpoint_integrity_gate_pass_and_failures(self):
+        """
+        Contract & Integrity Guard Test: Validates that assert_checkpoint_integrity
+        passes when safetensors keys match 1:1, and fails loudly naming missing
+        or extra keys on any mismatch.
+        """
+        import tempfile
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "base")
+            valid_ckpt_dir = os.path.join(tmpdir, "valid_ckpt")
+            missing_key_dir = os.path.join(tmpdir, "missing_key_ckpt")
+            extra_key_dir = os.path.join(tmpdir, "extra_key_ckpt")
+
+            os.makedirs(base_dir)
+            os.makedirs(valid_ckpt_dir)
+            os.makedirs(missing_key_dir)
+            os.makedirs(extra_key_dir)
+
+            base_tensors = {
+                "model.language_model.layers.0.self_attn.q_proj.weight": torch.randn(8, 8),
+                "model.language_model.layers.1.self_attn.q_proj.weight": torch.randn(8, 8),
+                "model.vision_embedder.patch_dense.weight": torch.randn(4, 4),
+                "model.language_model.embed_tokens.weight": torch.randn(16, 8),
+            }
+            save_file(base_tensors, os.path.join(base_dir, "model.safetensors"))
+
+            # 1. Valid checkpoint: exact matching keys
+            valid_tensors = dict(base_tensors)
+            valid_tensors["model.language_model.layers.1.self_attn.q_proj.weight"] = torch.zeros(8, 8)
+            save_file(valid_tensors, os.path.join(valid_ckpt_dir, "model.safetensors"))
+
+            # Must pass without error
+            ModelSplicer.assert_checkpoint_integrity(base_dir, valid_ckpt_dir)
+
+            # 2. Missing key: omitted vision_embedder (reproducing the reported defect)
+            missing_tensors = dict(base_tensors)
+            del missing_tensors["model.vision_embedder.patch_dense.weight"]
+            save_file(missing_tensors, os.path.join(missing_key_dir, "model.safetensors"))
+
+            with self.assertRaises(ValueError) as ctx_missing:
+                ModelSplicer.assert_checkpoint_integrity(base_dir, missing_key_dir)
+            self.assertIn("Missing keys (1)", str(ctx_missing.exception))
+            self.assertIn("model.vision_embedder.patch_dense.weight", str(ctx_missing.exception))
+
+            # 3. Extra key: unexpected multimodal/tower key
+            extra_tensors = dict(base_tensors)
+            extra_tensors["model.audio_tower.extra.weight"] = torch.randn(4, 4)
+            save_file(extra_tensors, os.path.join(extra_key_dir, "model.safetensors"))
+
+            with self.assertRaises(ValueError) as ctx_extra:
+                ModelSplicer.assert_checkpoint_integrity(base_dir, extra_key_dir)
+            self.assertIn("Extra keys (1)", str(ctx_extra.exception))
+            self.assertIn("model.audio_tower.extra.weight", str(ctx_extra.exception))
+
+    def test_save_substituted_checkpoint_preserves_multimodal_keys(self):
+        """
+        Arrange-Act-Assert: Verifies that ModelSplicer.save_substituted_checkpoint
+        correctly updates target layer weights while preserving non-layer multimodal
+        weights (such as model.vision_embedder.*) and config files from base_model.
+        """
+        import json
+        import tempfile
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "base")
+            save_dir = os.path.join(tmpdir, "saved")
+            os.makedirs(base_dir)
+
+            base_w0 = torch.ones(8, 8)
+            base_w1 = torch.ones(8, 8)
+            vision_w = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+            embed_w = torch.ones(16, 8) * 5.0
+
+            base_tensors = {
+                "model.language_model.layers.0.self_attn.q_proj.weight": base_w0,
+                "model.language_model.layers.1.self_attn.q_proj.weight": base_w1,
+                "model.vision_embedder.patch_dense.weight": vision_w,
+                "model.language_model.embed_tokens.weight": embed_w,
+            }
+            save_file(base_tensors, os.path.join(base_dir, "model.safetensors"))
+            with open(os.path.join(base_dir, "config.json"), "w") as f:
+                json.dump({"architectures": ["Gemma4ForConditionalGeneration"]}, f)
+
+            # Replacement state dict modifies layer 1 only, plus a phantom key that must not leak
+            calibrated_w1 = torch.zeros(8, 8)
+            replacements = {
+                "model.language_model.layers.1.self_attn.q_proj.weight": calibrated_w1,
+                "model.phantom_audio_tower.ignored": torch.randn(4, 4),
+            }
+
+            ModelSplicer.save_substituted_checkpoint(
+                base_model_dir=base_dir,
+                output_dir=save_dir,
+                replacement_state_dict=replacements,
+                target_layer_indices={1},
+            )
+
+            # Assert checkpoint integrity passes
+            ModelSplicer.assert_checkpoint_integrity(base_dir, save_dir)
+
+            # Verify tensor contents
+            with safe_open(os.path.join(save_dir, "model.safetensors"), framework="pt", device="cpu") as sf:
+                self.assertEqual(set(sf.keys()), set(base_tensors.keys()))
+                # Layer 0 remained base_w0
+                self.assertTrue(torch.equal(sf.get_tensor("model.language_model.layers.0.self_attn.q_proj.weight"), base_w0))
+                # Layer 1 updated to calibrated_w1
+                self.assertTrue(torch.equal(sf.get_tensor("model.language_model.layers.1.self_attn.q_proj.weight"), calibrated_w1))
+                # Vision embedder preserved exactly
+                self.assertTrue(torch.equal(sf.get_tensor("model.vision_embedder.patch_dense.weight"), vision_w))
+                # Embed tokens preserved exactly
+                self.assertTrue(torch.equal(sf.get_tensor("model.language_model.embed_tokens.weight"), embed_w))
+
+            # Verify config.json was copied
+            self.assertTrue(os.path.exists(os.path.join(save_dir, "config.json")))
+
+
 class TestResolverRegistry(unittest.TestCase):
     """Tests ResolverRegistry factory and resolver lifecycle."""
 

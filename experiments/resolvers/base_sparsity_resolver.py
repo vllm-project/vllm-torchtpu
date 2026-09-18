@@ -42,6 +42,12 @@ class BaseSparsityResolver(BaseResolver):
                 shutil.rmtree(existing_dir, ignore_errors=True)
 
     @staticmethod
+    def assert_checkpoint_integrity(base_model_dir: str,
+                                    checkpoint_dir: str) -> None:
+        """Forwarding gate to ModelSplicer.assert_checkpoint_integrity."""
+        ModelSplicer.assert_checkpoint_integrity(base_model_dir, checkpoint_dir)
+
+    @staticmethod
     def _assert_spliceable(sparse_indices: Set[int], strategy: str,
                            resolver_config: Dict[str, Any]) -> None:
         """Refuse to splice a layer set that SparseGPT calibration cannot support."""
@@ -251,10 +257,17 @@ class BaseSparsityResolver(BaseResolver):
                     f.endswith(".safetensors") for f in os.listdir(ckpt_path)))
 
         if has_weights:
-            print(
-                f">>> [RESOLVER] Found cached checkpoint ({num_sparse_layers} layers, {strategy}): {ckpt_path}"
-            )
-            return ckpt_path, self.CONSUMED_KEYS
+            try:
+                self.assert_checkpoint_integrity(base_model, ckpt_path)
+                print(
+                    f">>> [RESOLVER] Found cached checkpoint ({num_sparse_layers} layers, {strategy}): {ckpt_path}"
+                )
+                return ckpt_path, self.CONSUMED_KEYS
+            except ValueError as e:
+                print(
+                    f">>> [RESOLVER] Cached checkpoint at {ckpt_path} failed integrity check: {e}. "
+                    f"Regenerating checkpoint..."
+                )
 
         # Clean older temporary spliced checkpoints before creating new one
         self._cleanup_old_spliced_dirs(base_sparse_dir, ckpt_path)
@@ -271,6 +284,7 @@ class BaseSparsityResolver(BaseResolver):
                     fully_sparse_model_dir=reference_sparse_model,
                     sparse_layer_indices=sparse_indices,
                     output_dir=ckpt_path)
+                self.assert_checkpoint_integrity(base_model, ckpt_path)
                 return ckpt_path, self.CONSUMED_KEYS
             elif explicit_layer_indices is not None:
                 print(
@@ -294,4 +308,5 @@ class BaseSparsityResolver(BaseResolver):
                              prunem=prunem,
                              resolver_config=resolver_config,
                              sparse_layer_indices=sparse_indices)
+        self.assert_checkpoint_integrity(base_model, ckpt_path)
         return ckpt_path, self.CONSUMED_KEYS

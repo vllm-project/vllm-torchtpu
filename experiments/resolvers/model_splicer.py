@@ -167,6 +167,110 @@ class ModelSplicer:
         return output_dir
 
 
+    @classmethod
+    def save_substituted_checkpoint(
+            cls,
+            base_model_dir: str,
+            output_dir: str,
+            replacement_state_dict: Dict[str, torch.Tensor],
+            target_layer_indices: Optional[Set[int]] = None) -> str:
+        """
+        Serializes a checkpoint by streaming safetensors shards from base_model_dir,
+        substituting tensors present in replacement_state_dict (filtered to target_layer_indices if provided),
+        and keeping all other weights (including non-layer multimodal tensors like model.vision_embedder.*)
+        bit-identical to base_model_dir.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. Copy non-safetensors metadata, tokenizer, and config files
+        for fname in os.listdir(base_model_dir):
+            if not fname.endswith(".safetensors") and not fname.endswith(
+                    ".bin"):
+                src_path = os.path.join(base_model_dir, fname)
+                dst_path = os.path.join(output_dir, fname)
+                if os.path.isfile(src_path):
+                    shutil.copy2(src_path, dst_path)
+
+        # 2. Identify all safetensors shards from base model
+        dense_weight_map = cls.get_weight_map(base_model_dir)
+        dense_safetensors = sorted(list(set(dense_weight_map.values())))
+        if not dense_safetensors:
+            dense_safetensors = sorted([
+                f for f in os.listdir(base_model_dir)
+                if f.endswith(".safetensors")
+            ])
+
+        replaced_count = 0
+        kept_dense_count = 0
+
+        # 3. Stream each shard, substitute calibrated weights, preserve non-layer and unpruned weights
+        for shard_name in dense_safetensors:
+            dense_shard_path = os.path.join(base_model_dir, shard_name)
+            output_shard_path = os.path.join(output_dir, shard_name)
+
+            merged_shard: Dict[str, torch.Tensor] = {}
+
+            with safe_open(dense_shard_path, framework="pt",
+                           device="cpu") as dense_handle:
+                for k in dense_handle.keys():
+                    layer_idx = cls.extract_layer_idx(k)
+                    should_substitute = (
+                        k in replacement_state_dict and (
+                            target_layer_indices is None or
+                            (layer_idx is not None and layer_idx in target_layer_indices)
+                        )
+                    )
+                    if should_substitute:
+                        merged_shard[k] = replacement_state_dict[k].detach().cpu().contiguous()
+                        replaced_count += 1
+                    else:
+                        merged_shard[k] = dense_handle.get_tensor(k)
+                        kept_dense_count += 1
+
+            save_file(merged_shard, output_shard_path)
+            print(
+                f">>> [SPLICER] Wrote merged shard {shard_name} ({len(merged_shard)} tensors)"
+            )
+
+        print(
+            f">>> [SPLICER] Calibrated checkpoint saved: {replaced_count} substituted, {kept_dense_count} preserved from base."
+        )
+        print(f">>> [SPLICER] Saved into {output_dir}\n")
+        return output_dir
+
+    @classmethod
+    def assert_checkpoint_integrity(cls, base_model_dir: str,
+                                    checkpoint_dir: str) -> None:
+        """
+        Asserts that checkpoint_dir has an identical set of safetensors keys to base_model_dir.
+        Fails loudly naming all missing and extra keys before evaluation launches.
+        """
+        base_map = cls.get_weight_map(base_model_dir)
+        ckpt_map = cls.get_weight_map(checkpoint_dir)
+
+        base_keys = set(base_map.keys())
+        ckpt_keys = set(ckpt_map.keys())
+
+        missing_keys = sorted(base_keys - ckpt_keys)
+        extra_keys = sorted(ckpt_keys - base_keys)
+
+        if missing_keys or extra_keys:
+            error_lines = [
+                f"Checkpoint integrity assertion failed for '{checkpoint_dir}' against base '{base_model_dir}':"
+            ]
+            if missing_keys:
+                error_lines.append(
+                    f"  Missing keys ({len(missing_keys)}): {missing_keys}")
+            if extra_keys:
+                error_lines.append(
+                    f"  Extra keys ({len(extra_keys)}): {extra_keys}")
+            raise ValueError("\n".join(error_lines))
+
+        print(
+            f">>> [INTEGRITY GATE] Verified {len(ckpt_keys)} safetensors keys match base model exactly."
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Standalone Zero-Recompute Model Layer Splicer")

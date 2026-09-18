@@ -112,28 +112,43 @@ def prune_gemma4(model_path: str,
         print(
             f">>> [SPARSITY ENGINE] Saving pruned checkpoint to {save_path}..."
         )
-        model.save_pretrained(save_path)
-        # Ensure multimodal processor and tokenizer configs are saved alongside sparse weights.
-        # Gemma 4 uses AutoProcessor (multimodal) which serializes processor_config.json,
-        # fallback to AutoTokenizer for text-only backends.
-        try:
-            from transformers import AutoProcessor
-            AutoProcessor.from_pretrained(model_path).save_pretrained(
-                save_path)
-        except (OSError, ValueError):
-            # transformers raises OSError/ValueError when no processor
-            # config exists; text-only checkpoints only ship a tokenizer.
-            print(">>> [SPARSITY ENGINE] No AutoProcessor found, "
-                  "falling back to AutoTokenizer")
-            AutoTokenizer.from_pretrained(model_path).save_pretrained(
-                save_path)
-        # Preserve original base model config.json and processor_config.json to retain
-        # exact architecture specifications (e.g. Gemma4ForConditionalGeneration) that
-        # AutoModel.save_pretrained might otherwise overwrite or omit.
-        for cfg_name in ["config.json", "processor_config.json"]:
-            src_cfg = os.path.join(model_path, cfg_name)
-            if os.path.exists(src_cfg):
-                shutil.copy2(src_cfg, os.path.join(save_path, cfg_name))
+        has_safetensors = os.path.exists(model_path) and (
+            os.path.exists(os.path.join(model_path, "model.safetensors.index.json")) or
+            any(f.endswith(".safetensors") for f in os.listdir(model_path))
+        )
+        if has_safetensors:
+            from resolvers.model_splicer import ModelSplicer
+            sparse_indices = sparse_layer_indices if sparse_layer_indices is not None else set(range(minlayer, maxlayer))
+            ModelSplicer.save_substituted_checkpoint(
+                base_model_dir=model_path,
+                output_dir=save_path,
+                replacement_state_dict=model.state_dict(),
+                target_layer_indices=sparse_indices,
+            )
+            ModelSplicer.assert_checkpoint_integrity(model_path, save_path)
+        else:
+            model.save_pretrained(save_path)
+            # Ensure multimodal processor and tokenizer configs are saved alongside sparse weights.
+            # Gemma 4 uses AutoProcessor (multimodal) which serializes processor_config.json,
+            # fallback to AutoTokenizer for text-only backends.
+            try:
+                from transformers import AutoProcessor
+                AutoProcessor.from_pretrained(model_path).save_pretrained(
+                    save_path)
+            except (OSError, ValueError):
+                # transformers raises OSError/ValueError when no processor
+                # config exists; text-only checkpoints only ship a tokenizer.
+                print(">>> [SPARSITY ENGINE] No AutoProcessor found, "
+                      "falling back to AutoTokenizer")
+                AutoTokenizer.from_pretrained(model_path).save_pretrained(
+                    save_path)
+            # Preserve original base model config.json and processor_config.json to retain
+            # exact architecture specifications (e.g. Gemma4ForConditionalGeneration) that
+            # AutoModel.save_pretrained might otherwise overwrite or omit.
+            for cfg_name in ["config.json", "processor_config.json"]:
+                src_cfg = os.path.join(model_path, cfg_name)
+                if os.path.exists(src_cfg):
+                    shutil.copy2(src_cfg, os.path.join(save_path, cfg_name))
         print(">>> [SPARSITY ENGINE] Checkpoint successfully saved.")
 
     return save_path
