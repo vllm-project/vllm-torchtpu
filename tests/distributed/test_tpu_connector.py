@@ -45,6 +45,7 @@ _MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
 _BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
 _CFG = "vllm_torchtpu.distributed.kv_transfer.raiden_config"
 _SCHED = "vllm_torchtpu.distributed.kv_transfer.connector_scheduler"
+_CONSUMER = "vllm_torchtpu.distributed.kv_transfer.stage3_consumer"
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -2800,8 +2801,9 @@ class TestTPURaidenConnectorWorker:
             assert worker.get_block_ids_with_load_errors() == set()
             # Re-attempts are paced by the interval; once it has elapsed the
             # next step re-dispatches the prepared call to a submit worker.
-            with patch(f"{_MOD}._STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S",
-                       0.0):
+            with patch(
+                    f"{_CONSUMER}._STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S",
+                    0.0):
                 assert worker.get_finished() == (set(), set())
             assert "dst-late" not in worker._stage3_pending_submits
             assert "dst-late" in worker._stage3_inflight_submits
