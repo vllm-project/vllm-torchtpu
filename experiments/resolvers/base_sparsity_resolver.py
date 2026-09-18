@@ -34,15 +34,43 @@ class BaseSparsityResolver(BaseResolver):
 
     def _cleanup_old_spliced_dirs(self, base_sparse_dir: str,
                                   current_target_path: str) -> None:
-        """Removes any older temporary spliced layer checkpoints to maintain ample disk headroom."""
-        pattern = os.path.join(base_sparse_dir, "*_layers_*_to_*")
-        for existing_dir in glob.glob(pattern):
-            if existing_dir != current_target_path and os.path.isdir(
-                    existing_dir):
-                print(
-                    f">>> [RESOLVER] Removing temporary spliced checkpoint to save disk space: {existing_dir}"
-                )
-                shutil.rmtree(existing_dir, ignore_errors=True)
+        """Removes older temporary spliced/calibrated layer checkpoints to maintain ample disk headroom.
+
+        Scans naming patterns constructed across resolver strategies:
+          - Spliced prefix/range: *_layers_*_to_*
+          - Calibrated non-prefix (indexed): *_layers_*l_*
+          - Custom order (hashed): *_*layers_*
+          - Custom order (unhashed): *_*layers
+
+        Guarantees:
+          1. Current active target path is strictly preserved.
+          2. Canonical reference checkpoints (*_canonical_*, *_full) are never reaped.
+        """
+        patterns = [
+            os.path.join(base_sparse_dir, "*_layers_*_to_*"),
+            os.path.join(base_sparse_dir, "*_layers_*l_*"),
+            os.path.join(base_sparse_dir, "*_*layers_*"),
+            os.path.join(base_sparse_dir, "*_*layers"),
+        ]
+        norm_target = os.path.normpath(current_target_path)
+        seen: Set[str] = set()
+        for pattern in patterns:
+            for existing_dir in glob.glob(pattern):
+                norm_existing = os.path.normpath(existing_dir)
+                if norm_existing in seen:
+                    continue
+                seen.add(norm_existing)
+                basename = os.path.basename(norm_existing)
+                # Never reap canonical reference models or full checkpoints
+                if "_canonical_" in basename or basename.endswith(
+                        "_full") or "_full_" in basename:
+                    continue
+                if norm_existing != norm_target and os.path.isdir(
+                        existing_dir):
+                    print(
+                        f">>> [RESOLVER] Removing temporary spliced checkpoint to save disk space: {existing_dir}"
+                    )
+                    shutil.rmtree(existing_dir, ignore_errors=True)
 
     @staticmethod
     def assert_checkpoint_integrity(base_model_dir: str,
