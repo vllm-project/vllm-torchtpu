@@ -242,7 +242,7 @@ def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
     assert _prebuild(_layer(),
                      ep_order=tuple(range(_STUB_EP)),
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-2] is None
+    assert seen and seen[0][_MESH_ORDER_ARG] is None
 
 
 def test_ep_rank_order_is_the_identity():
