@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, schedule
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
 
 
 @jax.tree_util.register_dataclass

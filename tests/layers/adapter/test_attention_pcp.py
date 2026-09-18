@@ -268,7 +268,6 @@ def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
         lambda self, *args, **kwargs: MagicMock(),
     )
     impl = _batched_impl()
-    assert impl.runs_batched_rpa_schedule()
 
     with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
         impl.initialize_kernel(_layer())
@@ -276,44 +275,11 @@ def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
     assert not impl.runs_batched_rpa_schedule()
 
 
-def test_only_the_batched_kernel_keeps_a_schedule_in_smem(
-    monkeypatch, vllm_config_context
-):
-    monkeypatch.delenv("USE_BATCHED_RPA_LONGCTX", raising=False)
-    # The batched backend on a plain layer: the batched kernel runs.
-    assert _batched_impl().runs_batched_rpa_schedule()
-    # The default backend runs RPA v3.
-    assert not _impl().runs_batched_rpa_schedule()
-    # head_dim 64 selects the head-dim-64 kernel on either backend.
-    hd64 = PallasBatchedRPAAttentionBackendImpl(
-        num_heads=2,
-        head_size=64,
-        scale=1.0,
-        num_kv_heads=1,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="bfloat16",
-    )
-    assert not hd64.runs_batched_rpa_schedule()
-
-    # DCP runs the two-pass long-context kernels.
-    dcp = _batched_impl()
-    dcp.dcp_world_size = 2
-    assert not dcp.runs_batched_rpa_schedule()
-
-    # A block-major KV bundle runs the bundled kernel.
-    bundled = _batched_impl()
-    bundled.rpa_kernel_bundled = MagicMock()
-    assert not bundled.runs_batched_rpa_schedule()
-
-    # A tp=1 draft rebound to the local entry runs RPA v3.
-    draft = _batched_impl()
-    draft._kernel_entry = _pallas_rpa_kernel_local
-    assert not draft.runs_batched_rpa_schedule()
-
-    # The long-context fork replaces the batched kernel wholesale.
-    monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
+def test_no_kernel_reports_a_schedule_bound(vllm_config_context):
+    """The batched kernel streams its schedule from an HBM table and exposes
+    no capacity, so no layer asks the runner to bound its schedule."""
     assert not _batched_impl().runs_batched_rpa_schedule()
+    assert not _impl().runs_batched_rpa_schedule()
 
 
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
@@ -793,7 +759,6 @@ def test_kv_layout_kwarg_follows_the_bound_kernel_entry(
     """
     from vllm_torchtpu.layers.adapter.attention import (
         PallasBatchedRPAAttentionBackendImpl,
-        _pallas_rpa_kernel_local,
     )
 
     impl = PallasBatchedRPAAttentionBackendImpl(

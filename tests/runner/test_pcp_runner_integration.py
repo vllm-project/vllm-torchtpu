@@ -963,30 +963,3 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
     # compact streaming schedule for every request distribution.
     assert runner._attention_schedule_capacity() is None
     assert runner._attention_runs_batched_kernel is False
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("extra_pairs", [0, 1])
-def test_non_pcp_batched_smem_capacity_boundary(monkeypatch, extra_pairs):
-    from vllm_torchtpu.kernels.experimental.batched_rpa.wrapper import schedule_pairs
-
-    runner = _make_attention_capacity_runner(monkeypatch, pcp_size=1)
-    assert runner._attention_schedule_capacity()["mixed"] == (13436, 256, 256)
-    # Fourteen valid requests, all below max_model_len: exactly the last
-    # schedulable pair, followed by one more KV block on the final request.
-    q_lens = np.full(14, 256)
-    runner.seq_lens_np = np.array([262144] * 13 + [(124 + extra_pairs) * 256])
-    assert schedule_pairs(q_lens, runner.seq_lens_np, 256, 256) == 13436 + extra_pairs
-    if extra_pairs:
-        with pytest.raises(RuntimeError, match="needs 13437 .* holds 13436"):
-            runner._check_attention_schedule(14, q_lens, 0)
-    else:
-        runner._check_attention_schedule(14, q_lens, 0)
-
-
-@pytest.mark.cpu_test
-def test_non_pcp_still_rejects_long_history_chunk(monkeypatch):
-    runner = _make_attention_capacity_runner(monkeypatch, pcp_size=1)
-    runner.seq_lens_np = np.array([65536])
-    with pytest.raises(RuntimeError, match="needs 24640 .* holds 13436"):
-        runner._check_attention_schedule(1, np.array([32768]), 0)

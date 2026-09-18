@@ -2,7 +2,7 @@ import pytest
 
 from vllm_torchtpu.core.pp_chunks import (StepCostModel, chunk_buckets,
                                           chunk_granularity, chunk_pairs,
-                                          profile_points)
+                                          profile_points, schedule_pairs)
 
 BUCKETS = [16, 4096, 8192, 12288, 16384]
 ATTN = 1.5e-7  # ms per token of chunk per token of context
@@ -65,6 +65,18 @@ def test_profile_points_cover_every_bucket_and_prefixes_for_large_ones():
     assert max(t + p for t, p in points) <= 65536 - 16384
     clipped = profile_points(BUCKETS, 16384, 40960)
     assert (16384, 8192) in clipped and (16384, 16384) not in clipped
+
+
+def test_schedule_pairs_sums_chunk_pairs_over_sequences():
+    # One sequence of q new tokens behind a prefix is exactly chunk_pairs.
+    schedule = (0, 256, 256)
+    assert schedule_pairs([16384], [32768 + 16384], 256,
+                          256) == chunk_pairs(schedule, 16384, 32768)
+    # Sequences add up; empty ones contribute nothing.
+    assert schedule_pairs([4096, 0, 1], [4096, 100, 8193], 256,
+                          256) == (chunk_pairs(schedule, 4096, 0) +
+                                   chunk_pairs(schedule, 1, 8192))
+    assert schedule_pairs([], [], 256, 256) == 0
 
 
 def test_profile_points_skip_prefixes_beyond_the_schedule_capacity():

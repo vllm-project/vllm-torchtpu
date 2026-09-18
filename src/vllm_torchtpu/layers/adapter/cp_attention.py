@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """DCP (Decode Context Parallelism) attention: kernel building and forward
-orchestration, on top of batched_rpa_longctx's schedule_cp.CPMetadataComputer.
+orchestration, on top of batched_rpa's schedule_cp.CPMetadataComputer.
 Process-group access lives in distributed/dcp.py.
 
 Each DCP rank stores a shard of the KV cache (interleaved by page_size).
@@ -37,11 +37,11 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
-    configs as _rpa_longctx_configs,
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as _batched_rpa_configs,
 )
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
-    wrapper as _rpa_longctx_wrapper,
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    wrapper as _batched_rpa_wrapper,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -133,8 +133,8 @@ def _pallas_rpa_kernel_dcp(
     soft_cap: float | None = None,
     cp_group_size: int,
     cp_rank_val: int,
-    attention_scope: _rpa_longctx_configs.AttentionScope,
-    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    attention_scope: _batched_rpa_configs.AttentionScope,
+    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
     output, lse). cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
@@ -146,7 +146,7 @@ def _pallas_rpa_kernel_dcp(
     import jax.numpy as jnp
 
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
-    output, new_kv_cache, lse = _rpa_longctx_wrapper.ragged_paged_attention(
+    output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
         queries=query,
         keys=key,
         values=value,
@@ -227,7 +227,7 @@ def build_dcp_kernels(
     v_scale: float | None,
     cp_group_size: int,
     cp_rank: int,
-    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -239,7 +239,7 @@ def build_dcp_kernels(
     """
     # The adapter uses batched_rpa's equivalent enum. Normalize here so both
     # entry points bind LONGCTX's enum and share ops for the same layout.
-    kv_layout = _rpa_longctx_configs.KVLayout(kv_layout)
+    kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
     base_key = (
         sliding_window,
         sm_scale,
@@ -267,7 +267,7 @@ def build_dcp_kernels(
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
-            attention_scope=_rpa_longctx_configs.AttentionScope.CACHE_ONLY,
+            attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
@@ -282,7 +282,7 @@ def build_dcp_kernels(
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
-            attention_scope=_rpa_longctx_configs.AttentionScope.NEW_TOKENS_ONLY,
+            attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
@@ -311,7 +311,7 @@ def forward_with_dcp(
     kv_cache_quantized_dtype,
     dcp_world_size: int,
     dcp_rank: int,
-    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
 ) -> torch.Tensor:
     """Orchestrate the two-pass DCP attention forward.
 

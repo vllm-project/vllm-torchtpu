@@ -718,7 +718,6 @@ class TestPooledCallerV3:
     def test_caller_matches_dense_with_native_seq_along_lane_pool(
         self, monkeypatch, page_size
     ):
-        monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")
         n = 4

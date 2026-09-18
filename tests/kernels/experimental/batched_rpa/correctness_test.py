@@ -10,7 +10,7 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     utils,
     wrapper,

@@ -134,8 +134,7 @@ def test_default_shape_matches_inherited(
     ) == BASE.get_kv_cache_shape(7, block_size, num_kv_heads, head_size, dtype)
 
 
-def test_default_block_size_unchanged(nhd):
-    assert BATCHED.get_supported_kernel_block_sizes() == [256]
+KERNEL_BLOCK_SIZES = [128, 256]
 
 
 @pytest.mark.cpu_test
@@ -196,9 +195,12 @@ def test_shared_pool_traces_without_vllm_config(monkeypatch, layout, dtype, head
     assert output.shape == query_shape
 
 
-def test_seq_along_lane_requires_page_size_128(hnd):
-    # `validate_inputs` in batched_rpa/configs.py rejects any other page size.
-    assert BATCHED.get_supported_kernel_block_sizes() == [128]
+def test_batched_kernel_pages_under_nhd(nhd):
+    assert BATCHED.get_supported_kernel_block_sizes() == KERNEL_BLOCK_SIZES
+
+
+def test_batched_kernel_pages_under_hnd_without_pcp(hnd):
+    assert BATCHED.get_supported_kernel_block_sizes() == KERNEL_BLOCK_SIZES
 
 
 # The fix itself
@@ -303,13 +305,6 @@ def test_head_dim_64_delegates_whatever_the_layout(monkeypatch, layout):
         ) == BASE.get_kv_cache_shape(7, 128, 2, 64, BF16)
 
 
-def test_head_dim_64_delegates_on_longctx_too(hnd, longctx):
-    """The longctx fork takes the same escape."""
-    assert BATCHED.get_kv_cache_shape(7, 128, 2, 64, BF16) == BASE.get_kv_cache_shape(
-        7, 128, 2, 64, BF16
-    )
-
-
 # Unified block pool
 
 
@@ -320,64 +315,6 @@ def test_unified_pool_accepts_seq_along_lane(hnd):
     from vllm_torchtpu.platforms import tpu_block_size_utils
 
     assert not hasattr(tpu_block_size_utils, "validate_kv_layout_supports_unified_pool")
-
-
-# Coexistence with the longctx fork
-
-
-@pytest.fixture
-def longctx(monkeypatch):
-    """Turn on the longctx fork for one test.
-
-    Patched as a module attribute, not via `os.environ`: that survives
-    `enable_envs_cache()`, which has no way back.
-    """
-    from vllm_torchtpu import envs
-
-    # Restore the absence of the attribute so __getattr__ remains dynamic.
-    monkeypatch.setitem(envs.__dict__, "USE_BATCHED_RPA_LONGCTX", True)
-    yield
-
-
-def test_hnd_selects_seq_along_lane_under_longctx(hnd, longctx):
-    """HND drives both forks. Previously refused, because the longctx fork
-    took its layout from a separate flag."""
-    assert (
-        KV_LAYOUT_BY_VLLM_LAYOUT[
-            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
-        ]
-        is KVLayout.SEQ_ALONG_LANE
-    )
-
-
-def test_longctx_wrapper_reads_the_same_layout_env(hnd, longctx):
-    """The longctx fork resolves HND onto its own `KVLayout` enum, which is a
-    distinct class from the mainline one -- so the two must be compared by
-    name, not identity."""
-    from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
-        configs as longctx_configs,
-    )
-
-    assert (
-        KV_LAYOUT_BY_VLLM_LAYOUT[
-            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
-        ]
-        is KVLayout.SEQ_ALONG_LANE
-    )
-    assert longctx_configs.KVLayout.SEQ_ALONG_LANE.name == KVLayout.SEQ_ALONG_LANE.name
-    assert longctx_configs.KVLayout is not KVLayout
-
-
-def test_longctx_block_sizes_are_untouched(nhd, longctx):
-    """The mainline `[128]` must not leak into the longctx fork's list."""
-    assert BATCHED.get_supported_kernel_block_sizes() == [
-        128,
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-    ]
 
 
 def test_page_size_bytes_is_not_overridden():
@@ -462,18 +399,6 @@ def test_page_carries_head_width_where_forward_reads_it(monkeypatch, layout, hea
         assert shape[-1] == 128
     else:
         assert shape[-1] >= head_size
-
-
-def test_longctx_hnd_page_is_shaped_like_mainline(hnd, longctx):
-    """Both forks put the head width in dims 2-3 under HND, so the single
-    layout-keyed branch in `forward` covers both.
-
-    Regression guard for the rebase onto #608, which keyed that branch on
-    `USE_BATCHED_RPA_SEQ_ON_LANE`."""
-    _require_tpu()
-    shape = BATCHED.get_kv_cache_shape(4, 128, 2, 256, BF16)
-    assert shape[2] * shape[3] == 256
-    assert shape[-1] == 128
 
 
 def test_no_layout_lookup_on_the_compiled_forward_path():

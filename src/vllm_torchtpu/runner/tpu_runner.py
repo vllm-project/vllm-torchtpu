@@ -4735,6 +4735,7 @@ class TPUModelRunner(GPUModelRunner):
         capacity = self._attention_schedule_capacity(use_max_model_len)
         if capacity is None or num_reqs <= 0:
             return
+        from vllm_torchtpu.core.pp_chunks import schedule_pairs
         kv_lens = self.seq_lens_np[:num_reqs]
         for mode, lo, hi in (
             ("decode", 0, num_decode),
@@ -4743,7 +4744,7 @@ class TPUModelRunner(GPUModelRunner):
             if hi <= lo:
                 continue
             pairs, bq, bkv = capacity[mode]
-            need = rpa_batched.schedule_pairs(q_lens[lo:hi], kv_lens[lo:hi], bq, bkv)
+            need = schedule_pairs(q_lens[lo:hi], kv_lens[lo:hi], bq, bkv)
             if need > pairs:
                 raise RuntimeError(
                     f"This step's {mode} attention needs {need} (query "

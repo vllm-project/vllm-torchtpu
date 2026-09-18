@@ -29,7 +29,7 @@ NUM_DEVICES = 4
 HEAD_DIM = 128
 NUM_KV_HEADS = 4
 NUM_Q_HEADS = 8
-PAGE_SIZE = 128  # SEQ_ALONG_LANE accepts no other page size
+PAGE_SIZE = 128  # SEQ_ALONG_LANE needs a multiple of 128
 TOTAL_PAGES = 4
 SEQ_LEN = 64
 

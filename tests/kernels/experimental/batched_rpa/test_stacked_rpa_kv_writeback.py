@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV-cache writeback correctness for the batched_rpa_longctx kernel."""
+"""KV-cache writeback correctness for the batched_rpa kernel."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
 NUM_KV_HEADS = 2
 NUM_Q_HEADS = 4
