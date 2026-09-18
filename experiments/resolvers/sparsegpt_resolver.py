@@ -1,4 +1,4 @@
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from resolvers.base_sparsity_resolver import BaseSparsityResolver
 from sparsity import prune_gemma4
@@ -7,13 +7,20 @@ from sparsity import prune_gemma4
 class SparseGptResolver(BaseSparsityResolver):
     """
     Dedicated resolver for SparseGPT Hessian-based N:M structured sparsity.
-    Inherits caching and cross-shard zero-recompute splicing from BaseSparsityResolver.
+    Inherits caching and cross-shard zero-recompute splicing from BaseSparsityResolver,
+    
     """
     METHOD_NAME: str = "sparsegpt"
 
-    def prune_in_memory(self, base_model: str, save_path: str, min_layer: int,
-                        max_layer: int, prunen: int, prunem: int,
-                        resolver_config: Dict[str, Any]) -> str:
+    def prune_in_memory(self,
+                        base_model: str,
+                        save_path: str,
+                        min_layer: int,
+                        max_layer: int,
+                        prunen: int,
+                        prunem: int,
+                        resolver_config: Dict[str, Any],
+                        sparse_layer_indices: Optional[Set[int]] = None) -> str:
         prune_gemma4(model_path=base_model,
                      dataset=resolver_config.get("dataset", "c4"),
                      minlayer=min_layer,
@@ -21,7 +28,15 @@ class SparseGptResolver(BaseSparsityResolver):
                      prunen=prunen,
                      prunem=prunem,
                      nsamples=resolver_config.get("nsamples", 64),
-                     save_path=save_path)
+                     seed=resolver_config.get("seed", 0),
+                     percdamp=resolver_config.get("percdamp", 0.01),
+                     blocksize=resolver_config.get("blocksize", 128),
+                     save_path=save_path,
+                     sparse_layer_indices=sparse_layer_indices,
+                     use_lrc=resolver_config.get("use_lrc", False) or resolver_config.get("is_lrc", False) or resolver_config.get("lrc", False),
+                     lrc_rank=resolver_config.get("lrc_rank", resolver_config.get("lrc_k", 128)),
+                     lrc_iters=resolver_config.get("lrc_iters", resolver_config.get("lrc_T", 3)),
+                     save_prefix24_path=resolver_config.get("save_prefix24_path", None))
         return save_path
 
 
