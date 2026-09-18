@@ -22,13 +22,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.attention.backends.utils import set_kv_cache_layout
+from vllm.config import get_current_vllm_config
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.configs import (
     AttentionScope, KVLayout)
 from vllm_torchtpu.layers.adapter import attention, cp_attention
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+
+pytestmark = pytest.mark.cpu_test
 
 
 def _impl(cls=attention.PallasBatchedRPAAttentionBackendImpl, head_size=256):
@@ -51,7 +53,7 @@ def _config():
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
-        monkeypatch, rank, compiled):
+        monkeypatch, rank, compiled, vllm_config_context):
     built, calls = [], []
 
     def build_op(_name, fn):
@@ -78,8 +80,8 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
     implementations = []
     # The third layer must reuse NHD's ops after HND has populated the registry.
-    for layout in ("NHD", "HND", "NHD"):
-        set_kv_cache_layout(layout)
+    for layout in ("LBNHC", "LBHNC", "LBNHC"):
+        get_current_vllm_config().cache_config.kv_cache_layout = layout
         impl = _impl()
         with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
             impl.initialize_kernel(layer)
@@ -111,8 +113,8 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
             implementations,
         (KVLayout.HEAD_ALONG_SUBLANE, KVLayout.SEQ_ALONG_LANE,
          KVLayout.HEAD_ALONG_SUBLANE)):
-        # The per-layer layout must survive even if the global setting changes.
-        set_kv_cache_layout("HND")
+        # The per-layer layout must survive even if the current config changes.
+        get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
         forward = impl._run_dcp_forward
         if compiled:
             forward = torch.compile(forward, backend="eager", fullgraph=True)
@@ -151,8 +153,9 @@ def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
     (attention.PallasAttentionBackendImpl, 256),
     (attention.PallasBatchedRPAAttentionBackendImpl, 64),
 ])
-def test_dcp_hnd_rejects_backends_that_allocate_nhd(cls, head_size):
-    set_kv_cache_layout("HND")
+def test_dcp_hnd_rejects_backends_that_allocate_nhd(cls, head_size,
+                                                    vllm_config_context):
+    get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
     impl = _impl(cls, head_size)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
     with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):

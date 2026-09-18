@@ -40,7 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from vllm.v1.attention.backends.utils import set_kv_cache_layout
+from vllm.config import get_current_vllm_config
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     wrapper)
@@ -255,11 +255,12 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
                          ids=lambda scope: scope.name)
 def test_dcp_fp8_pass_matches_reference(entry, layout, global_q_heads,
                                         global_kv_heads, dcp_size, rank, scope,
-                                        monkeypatch):
+                                        monkeypatch, vllm_config_context):
     assert global_q_heads % _TP_SIZE == 0
     assert global_kv_heads * dcp_size == _TP_SIZE
     own_q_heads = global_q_heads // _TP_SIZE
-    set_kv_cache_layout(layout)
+    get_current_vllm_config().cache_config.kv_cache_layout = (
+        "LBHNC" if layout == "HND" else "LBNHC")
     args, expected_out, expected_lse, expected_cache = _make_case(
         layout, rank, scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
     if entry == "adapter":
