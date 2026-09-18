@@ -40,6 +40,26 @@ class BaseSparsityResolver(BaseResolver):
                 )
                 shutil.rmtree(existing_dir, ignore_errors=True)
 
+    @staticmethod
+    def _assert_spliceable(sparse_indices: Set[int], strategy: str,
+                           resolver_config: Dict[str, Any]) -> None:
+        """Refuse to splice a layer set that SparseGPT calibration cannot support."""
+        if not sparse_indices:
+            return
+        if sparse_indices == set(range(len(sparse_indices))):
+            return
+
+        ordered = sorted(sparse_indices)
+        if resolver_config.get("allow_nonprefix_splice"):
+            print(">>> [RESOLVER] Proceeding because allow_nonprefix_splice is set.")
+            return
+
+        raise ValueError(
+            f"Refusing to splice non-prefix layer set {ordered} with strategy {strategy}. "
+            "SparseGPT calibration requires sequential prefix layers. "
+            "Non-prefix layer sets must be sequentially re-pruned rather than spliced."
+        )
+
     def compute_layer_range(
             self, num_sparse_layers: int, strategy: str,
             total_layers: int) -> Tuple[Optional[int], Optional[int]]:
@@ -178,10 +198,11 @@ class BaseSparsityResolver(BaseResolver):
 
         # 2. Fast cross-shard layer splicing from 100% sparse reference model
         if reference_sparse_model and os.path.exists(reference_sparse_model):
+            sparse_indices = set(range(min_layer, max_layer))
+            BaseSparsityResolver._assert_spliceable(sparse_indices, strategy, resolver_config)
             print(
                 f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
             )
-            sparse_indices = set(range(min_layer, max_layer))
             self.splicer.splice_checkpoint(
                 dense_model_dir=base_model,
                 fully_sparse_model_dir=reference_sparse_model,
