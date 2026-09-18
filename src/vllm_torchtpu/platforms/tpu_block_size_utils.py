@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
-    PooledGDNStateLayout, derive_pooled_gdn_state_layout,
-    pooled_gdn_state_dtypes, pooled_gdn_state_itemsize,
-    unified_kv_layout_enabled_for_architecture)
+    QWEN_GDN_ARCHITECTURES, PooledGDNStateLayout,
+    derive_pooled_gdn_state_layout, pooled_gdn_state_dtypes,
+    pooled_gdn_state_itemsize, unified_kv_layout_enabled_for_architecture)
+from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -122,6 +123,45 @@ def _pool_row_tokens(vllm_config: VllmConfig, backend_cls) -> int:
     return p
 
 
+def _localize_gdn_state_shapes_for_pcp(
+    vllm_config: VllmConfig,
+    tp_local_shapes: tuple[tuple[int, ...], ...],
+    pcp_size: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Apply GDN's Q/K replication and V sharding to TP-local shapes."""
+    if len(tp_local_shapes) != 2:
+        raise ValueError(
+            "TPU unified hybrid KV pool requires two GDN state regions "
+            f"(conv, SSM), got shapes={tp_local_shapes}")
+
+    model_config = vllm_config.model_config
+    hf_config = model_config.hf_text_config
+    parallel_config = vllm_config.parallel_config
+    tp_size = int(parallel_config.tensor_parallel_size)
+    num_kq_heads = int(hf_config.linear_num_key_heads)
+    num_v_heads = int(hf_config.linear_num_value_heads)
+    tp_geometry = derive_gdn_head_geometry(num_kq_heads, num_v_heads, tp_size)
+    tp_local_kq_heads = tp_geometry.local_num_kq_heads
+    tp_local_v_heads = tp_geometry.local_num_v_heads
+    d_k = int(hf_config.linear_key_head_dim)
+    d_v = int(hf_config.linear_value_head_dim)
+    geometry = derive_gdn_head_geometry(tp_local_kq_heads, tp_local_v_heads,
+                                        pcp_size)
+
+    conv_shape, recurrent_shape = tp_local_shapes
+    expected_conv_dim = (2 * tp_local_kq_heads * d_k + tp_local_v_heads * d_v)
+    if not conv_shape or conv_shape[-1] != expected_conv_dim:
+        raise ValueError(
+            "GDN state conv width does not match its TP-local heads: "
+            f"shape={conv_shape}, expected_width={expected_conv_dim}.")
+    if not recurrent_shape or recurrent_shape[0] != tp_local_v_heads:
+        raise ValueError("GDN recurrent state does not match its TP-local V "
+                         f"heads: shape={recurrent_shape}, "
+                         f"expected_heads={tp_local_v_heads}.")
+
+    return geometry.local_state_shapes(tp_local_shapes, d_k, d_v)
+
+
 def _hybrid_mamba_state_layout(
     vllm_config: VllmConfig,
     fa_physical_bytes_per_token: int,
@@ -136,23 +176,43 @@ def _hybrid_mamba_state_layout(
         model_config.architecture,
         model_config=model_config,
     )
-    full_shapes = tuple(
+    tp_local_shapes = tuple(
         model_cls.get_mamba_state_shape_from_config(vllm_config))
     parallel_config = vllm_config.parallel_config
+    if model_config.architecture in QWEN_GDN_ARCHITECTURES:
+        # mamba_utils imports current_platform, which loads this module while
+        # selecting TpuPlatform. Defer until platform registration is complete.
+        from vllm.model_executor.layers.mamba.mamba_utils import \
+            is_conv_state_dim_first
+
+        # Model-level sizing precedes layer construction. Use the same
+        # whole-head TP geometry as the TPU GDN layer, including replicas.
+        hf_config = model_config.hf_text_config
+        geometry = derive_gdn_head_geometry(
+            hf_config.linear_num_key_heads, hf_config.linear_num_value_heads,
+            parallel_config.tensor_parallel_size)
+        tp_local_shapes = geometry.local_state_shapes(
+            tp_local_shapes,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            conv_dim_axis=0 if is_conv_state_dim_first() else -1)
     pcp_size = parallel_config.prefill_context_parallel_size
     if pcp_size > 1:
-        # PCP-local GDN state is equivalent to adding PCP to the model's
-        # head-sharding factor. Shape calculators used here must therefore
-        # derive their sharded state dimensions from tensor_parallel_size.
-        orig_tp = parallel_config.tensor_parallel_size
-        try:
-            parallel_config.tensor_parallel_size = orig_tp * pcp_size
-            shapes = tuple(
-                model_cls.get_mamba_state_shape_from_config(vllm_config))
-        finally:
-            parallel_config.tensor_parallel_size = orig_tp
+        if model_config.architecture in QWEN_GDN_ARCHITECTURES:
+            shapes = _localize_gdn_state_shapes_for_pcp(
+                vllm_config, tp_local_shapes, pcp_size)
+        else:
+            # Other hybrid families retain their existing effective-TP state
+            # sharding until they define a distinct PCP group layout.
+            orig_tp = parallel_config.tensor_parallel_size
+            try:
+                parallel_config.tensor_parallel_size = orig_tp * pcp_size
+                shapes = tuple(
+                    model_cls.get_mamba_state_shape_from_config(vllm_config))
+            finally:
+                parallel_config.tensor_parallel_size = orig_tp
     else:
-        shapes = full_shapes
+        shapes = tp_local_shapes
 
     if len(shapes) != 2:
         raise ValueError(
@@ -184,11 +244,12 @@ def _hybrid_mamba_state_layout(
     conv_bytes = math.prod(shapes[0]) * conv_itemsize
     ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
 
-    if pcp_size > 1:
+    if (pcp_size > 1
+            and model_config.architecture not in QWEN_GDN_ARCHITECTURES):
         # Same item sizes on both sides of the ratio, so the check compares
         # sharding rather than dtype bookkeeping.
-        full_conv_bytes = math.prod(full_shapes[0]) * conv_itemsize
-        full_ssm_bytes = math.prod(full_shapes[1]) * ssm_itemsize
+        full_conv_bytes = math.prod(tp_local_shapes[0]) * conv_itemsize
+        full_ssm_bytes = math.prod(tp_local_shapes[1]) * ssm_itemsize
         if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes +
                                                    full_ssm_bytes):
             raise ValueError(

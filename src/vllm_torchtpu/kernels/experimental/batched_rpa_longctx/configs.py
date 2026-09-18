@@ -372,10 +372,14 @@ class RpaConfigs:
     @property
     def lse_vmem_shape(self):
         num_lanes = pltpu.get_tpu_info().num_lanes
+        q_per_kv_packing = (self.aligned_num_q_heads_per_kv_head //
+                            self.serve.packing_q)
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
-            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+            self.block.bq_sz,
+            q_per_kv_packing,
+            self.serve.packing_q,
             num_lanes,
         )
 

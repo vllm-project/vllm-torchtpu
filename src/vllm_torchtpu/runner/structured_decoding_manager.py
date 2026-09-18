@@ -104,8 +104,6 @@ class StructuredDecodingManager:
                 local_indices.append(batch_index - cur_start_idx)
                 mask_rows.append(mask_row)
 
-        num_reqs = cur_end_idx - cur_start_idx
-
         # Fast path 1: No structured requests in this chunk.
         # Bypass both requirement and bitmask host transfers completely by
         # returning pre-allocated device-resident zero tensors.
@@ -118,32 +116,7 @@ class StructuredDecodingManager:
 
         num_local = len(local_indices)
 
-        # Fast path 2: All real requests in this chunk are contiguous structured requests (0..num_reqs-1).
-        # Direct contiguous slice copy to pinned host buffer ensures fast block memory transfer.
-        if (num_local == num_reqs and local_indices[0] == 0
-                and local_indices[-1] == num_reqs - 1
-                and mask_rows[-1] - mask_rows[0] == num_reqs - 1):
-            mask_start = mask_rows[0]
-            self.grammar_bitmask_cpu[:num_reqs].copy_(
-                torch.from_numpy(bitmask[mask_start:mask_start + num_reqs]))
-            if num_reqs < padded_num_reqs:
-                self.grammar_bitmask_cpu[num_reqs:padded_num_reqs].zero_()
-                self.require_structured_out_cpu[:padded_num_reqs].zero_()
-                self.require_structured_out_cpu[:num_reqs] = True
-                require_tensor = self.require_structured_out_cpu[:
-                                                                 padded_num_reqs].to(
-                                                                     logits.
-                                                                     device)
-            else:
-                require_tensor = self.device_all_true_require[:padded_num_reqs]
-
-            return (
-                require_tensor,
-                self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
-                self.structured_decode_arange,
-            )
-
-        # Standard path: Mixed batch (some structured, some non-structured).
+        # Standard path: handles all structured batches (all-structured, mixed, or permuted).
         self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
         self.require_structured_out_cpu[:padded_num_reqs].zero_()
 

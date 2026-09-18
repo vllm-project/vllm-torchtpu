@@ -384,3 +384,46 @@ def test_multi_chunk_row_alignment(llm: LLM):
         assert outputs[1].outputs[0].text, "unconstrained request went silent"
     finally:
         llm.llm_engine.collective_rpc(_restore_chunk_cap, args=(saved[0], ))
+
+
+def test_more_requests_than_max_num_seqs(llm: LLM):
+    """Regression for the bitmask row order under batch turnover.
+
+    Every other test in this file submits at most `max_num_seqs` requests, so
+    each request keeps the `InputBatch` slot it was admitted into for its
+    whole life and the scheduler's request order happens to coincide with the
+    runner's batch order. Bitmask rows are emitted in scheduler order and
+    consumed by batch index, so that coincidence hides any mix-up between the
+    two.
+
+    Submitting more requests than the batch can hold removes it:
+    `InputBatch.condense()` backfills a finished request's slot with the last
+    request in the batch, after which bitmask row i no longer belongs to
+    batch row i.
+
+    The four constraints are interleaved so that requests finish at staggered
+    steps -- which is what drives the backfill -- and so that a row landing on
+    the wrong request carries not just a different grammar position but a
+    different grammar, making the violation unmissable.
+    """
+    kinds = [
+        (CHOICE_PROMPT, CHOICE_PARAMS, _assert_choice),
+        (REGEX_PROMPT, REGEX_PARAMS, _assert_regex),
+        (JSON_PROMPT, JSON_PARAMS, _assert_json),
+        (COMPLEX_AST_PROMPT, COMPLEX_AST_PARAMS, _assert_complex_ast_json),
+    ]
+    # 4x the fixture's max_num_seqs, so the batch turns over several times.
+    selected = [kinds[i % len(kinds)] for i in range(16)]
+
+    outputs = llm.generate([prompt for prompt, _, _ in selected],
+                           [params for _, params, _ in selected])
+
+    assert len(outputs) == len(selected)
+    for i, (output, (_, _, check)) in enumerate(zip(outputs, selected)):
+        completion = output.outputs[0]
+        # A mask from the wrong request lets through a token the grammar
+        # cannot accept; vLLM then fails to advance the FSM and terminates
+        # the request with finish_reason "error".
+        assert completion.finish_reason != "error", (
+            f"request {i} was terminated mid-generation: {completion.text!r}")
+        check(completion.text)

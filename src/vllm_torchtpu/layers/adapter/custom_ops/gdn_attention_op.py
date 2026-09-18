@@ -23,10 +23,13 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
+from vllm.model_executor.layers.quantization.base_config import \
+    QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
@@ -36,6 +39,9 @@ from vllm_torchtpu.gdn_pool_layout import (
     unified_kv_layout_enabled_for_architecture)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
+from vllm_torchtpu.kernels.gdn.head_geometry import (GdnHeadGeometry,
+                                                     derive_gdn_head_geometry)
+from vllm_torchtpu.layers.adapter.gdn_linear import GdnColumnParallelLinear
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention, run_jax_gdn_attention_pcp_tp_prefill,
@@ -249,6 +255,11 @@ def _get_pcp_size(vllm_config: VllmConfig) -> int:
 def _localize_gdn_mamba_spec_for_pcp(
     spec: MambaSpec,
     pcp_size: int,
+    *,
+    num_kq_heads: int,
+    num_v_heads: int,
+    d_k: int,
+    d_v: int,
 ) -> MambaSpec:
     if pcp_size <= 1 or len(spec.shapes) != 2:
         return spec
@@ -260,13 +271,17 @@ def _localize_gdn_mamba_spec_for_pcp(
     recurrent_shape = tuple(spec.shapes[1])
     if not conv_shape or not recurrent_shape:
         return spec
-    if conv_shape[-1] % pcp_size != 0:
-        raise ValueError("GDN conv state width must be divisible by PCP size: "
-                         f"shape={conv_shape}, pcp_size={pcp_size}")
-    if recurrent_shape[0] % pcp_size != 0:
+
+    geometry = derive_gdn_head_geometry(num_kq_heads, num_v_heads, pcp_size)
+    expected_conv_dim = 2 * num_kq_heads * d_k + num_v_heads * d_v
+    if conv_shape[-1] != expected_conv_dim:
         raise ValueError(
-            "GDN recurrent state head count must be divisible by PCP size: "
-            f"shape={recurrent_shape}, pcp_size={pcp_size}")
+            "GDN MambaSpec conv width does not match its TP-local heads: "
+            f"shape={conv_shape}, expected_width={expected_conv_dim}.")
+    if recurrent_shape[0] != num_v_heads:
+        raise ValueError("GDN MambaSpec recurrent heads do not match its "
+                         f"TP-local V heads: shape={recurrent_shape}, "
+                         f"expected_heads={num_v_heads}.")
 
     unpadded_page_size = dataclasses.replace(
         spec, page_size_padded=None).page_size_bytes
@@ -276,10 +291,7 @@ def _localize_gdn_mamba_spec_for_pcp(
 
     return dataclasses.replace(
         spec,
-        shapes=(
-            (*conv_shape[:-1], conv_shape[-1] // pcp_size),
-            (recurrent_shape[0] // pcp_size, *recurrent_shape[1:]),
-        ),
+        shapes=geometry.local_state_shapes(spec.shapes, d_k, d_v),
         page_size_padded=page_size_padded,
     )
 
@@ -289,6 +301,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
         if hasattr(self, "in_proj_qkvz"):
@@ -305,13 +318,64 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_pcp_op = (self._build_pooled_pcp_gdn_op()
                                   if pcp_enabled else None)
 
+    @property
+    def tp_head_geometry(self) -> GdnHeadGeometry:
+        return derive_gdn_head_geometry(self.num_k_heads, self.num_v_heads,
+                                        self.tp_size)
+
+    def create_qkvz_proj(self, hidden_size: int, key_dim: int, value_dim: int,
+                         quant_config: QuantizationConfig | None,
+                         prefix: str) -> MergedColumnParallelLinear:
+        if self.gqa_interleaved_layout:
+            # Qwen3-Next has a different checkpoint layout. Its existing
+            # interleaved loader requires complete Q/K groups per TP rank.
+            if self.tp_head_geometry.kq_replication_factor != 1:
+                raise NotImplementedError(
+                    "TP Q/K replication requires the Qwen3.5 QKVZ layout")
+            return super().create_qkvz_proj(hidden_size, key_dim, value_dim,
+                                            quant_config, prefix)
+        return GdnColumnParallelLinear(
+            input_size=hidden_size,
+            geometry=self.tp_head_geometry,
+            d_k=self.head_k_dim,
+            d_v=self.head_v_dim,
+            include_z=True,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def _create_conv1d(self) -> None:
+        if self.gqa_interleaved_layout:
+            # Keep Qwen3-Next's existing checkpoint loader with its matching
+            # interleaved projection. TP replication here targets Qwen3.5.
+            return
+        # Upstream constructs conv1d directly and installs its Mamba loader
+        # after create_qkvz_proj. Replace it before checkpoint loading, using
+        # the same Q/K/V partitioning as the input projection.
+        self.conv1d = GdnColumnParallelLinear(
+            input_size=self.conv_kernel_size,
+            geometry=self.tp_head_geometry,
+            d_k=self.head_k_dim,
+            d_v=self.head_v_dim,
+            include_z=False,
+            params_dtype=self.conv1d.weight.dtype,
+            prefix=f"{self.prefix}.conv1d",
+        )
+        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
         if spec is None:
             return None
         assert isinstance(spec, MambaSpec)
-        return _localize_gdn_mamba_spec_for_pcp(spec,
-                                                _get_pcp_size(vllm_config))
+        return _localize_gdn_mamba_spec_for_pcp(
+            spec,
+            _get_pcp_size(vllm_config),
+            num_kq_heads=self.tp_head_geometry.local_num_kq_heads,
+            num_v_heads=self.tp_head_geometry.local_num_v_heads,
+            d_k=self.head_k_dim,
+            d_v=self.head_v_dim,
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
@@ -354,7 +418,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                               device=w.device).copy_(w)
 
     def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        conv_state_shape, temporal_state_shape = super().get_state_shape()
+        geometry = self.tp_head_geometry
+        conv_state_shape, temporal_state_shape = (geometry.local_state_shapes(
+            super().get_state_shape(),
+            self.head_k_dim,
+            self.head_v_dim,
+            conv_dim_axis=0 if is_conv_state_dim_first() else -1))
         conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
         return conv_state_shape, temporal_state_shape
 
@@ -368,7 +437,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def _build_gdn_op(self, *, pcp_streaming: bool = False):
         local_num_v_heads = self.num_v_heads // self.tp_size
-        local_num_kq_heads = self.num_k_heads // self.tp_size
+        local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
         vllm_context = get_vllm_model_wrapper_context()
         # The non-PCP op uses num_spec_tokens for verify/rollback. PCP is a
@@ -397,14 +466,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 raise ValueError(
                     f"PCP world size {pcp_size} does not match mesh shape "
                     f"{pcp_mesh.shape['pcp']}.")
-            if local_num_kq_heads % pcp_size != 0:
-                raise ValueError("local GDN K/Q heads "
-                                 f"{local_num_kq_heads} must be divisible by "
-                                 f"pcp_size={pcp_size}.")
-            if local_num_v_heads % pcp_size != 0:
-                raise ValueError(
-                    f"local GDN V heads {local_num_v_heads} must be divisible "
-                    f"by pcp_size={pcp_size}.")
+            derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
+                                     pcp_size)
             op_name = ("pallas::gdn_attention_pcp_"
                        f"{self.prefix.replace('.', '_')}")
             wrapped_fn = functools.partial(
@@ -500,7 +563,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = vllm_context.vllm_config
         mesh = vllm_context.mesh
-        n_kq = self.num_k_heads // self.tp_size
+        n_kq = self.tp_head_geometry.local_num_kq_heads
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
@@ -612,7 +675,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _build_pooled_pcp_gdn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
-        local_num_kq_heads = self.num_k_heads // self.tp_size
+        local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
         parallel_config = vllm_context.vllm_config.parallel_config
         interleave_size = parallel_config.cp_kv_cache_interleave_size
@@ -625,14 +688,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             raise ValueError(
                 f"PCP world size {pcp_size} does not match mesh shape "
                 f"{pcp_mesh.shape['pcp']}.")
-        if local_num_kq_heads % pcp_size != 0:
-            raise ValueError("local GDN K/Q heads "
-                             f"{local_num_kq_heads} must be divisible by "
-                             f"pcp_size={pcp_size}.")
-        if local_num_v_heads % pcp_size != 0:
-            raise ValueError(
-                f"local GDN V heads {local_num_v_heads} must be divisible "
-                f"by pcp_size={pcp_size}.")
+        derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
+                                 pcp_size)
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim
@@ -882,7 +939,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 mixed_qkv = torch.cat((query, key, value), dim=-1)
             else:
                 # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
-                qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+                qkv_size = self.tp_head_geometry.local_conv_dim(
+                    self.head_k_dim, self.head_v_dim)
                 z_size = self.value_dim // self.tp_size
                 mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)

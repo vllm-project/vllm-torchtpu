@@ -568,7 +568,9 @@ def ragged_paged_attention(
         lse_hbm_init = jnp.full(
             [
                 num_kv_heads,
-                max_tokens * aligned_num_q_heads_per_kv_head,
+                max_tokens,
+                aligned_num_q_heads_per_kv_head // q_packing,
+                q_packing,
                 num_lanes,
             ],
             -jnp.inf,
@@ -674,7 +676,7 @@ def ragged_paged_attention(
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
     if not return_lse:
         return o_hbm, kv_cache
-    # Reshape LSE from [num_kv_heads, max_tokens * aligned_num_q_heads_per_kv_head, num_lanes] to
+    # Reshape LSE from [KV heads, tokens, Q groups, packing, lanes] to
     # [max_tokens, num_q_heads].
     max_tokens = queries.shape[0]
     # Extract first lane (scalar LSE value per token-head pair).

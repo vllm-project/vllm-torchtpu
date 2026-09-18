@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     pcp_local_token_counts as _pcp_local_token_counts
+from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.quantized_matmul import \
     util as quantized_matmul_util
@@ -73,16 +74,48 @@ _GDN_PCP_DESCRIPTOR_CASES = (
 )
 
 _GDN_PCP_FUSED_PROJECTION_CASES = (
-    pytest.param((64, 64), (0, 64), None, jnp.float32, id="batch-flat-fresh"),
+    pytest.param(8,
+                 4,
+                 32,
+                 2048, (64, 64), (0, 64),
+                 None,
+                 jnp.float32,
+                 1024,
+                 id="qwen38-kq-replication-pcp8-spmd"),
+    pytest.param(2,
+                 4,
+                 4,
+                 2048, (1024, 1024), (0, 1024),
+                 None,
+                 jnp.float32,
+                 1024,
+                 id="multi-stage-fresh"),
+    pytest.param(2,
+                 4,
+                 4,
+                 2048, (64, 64), (0, 64),
+                 None,
+                 jnp.float32,
+                 512,
+                 id="batch-flat-fresh"),
     pytest.param(
+        2,
+        4,
+        4,
+        2048,
         (17, 15, 32),
         (0, 17, 32),
         (5, 41, 9),
         jnp.float32,
+        512,
         id="batch-flat-owner-with-history",
     ),
-    pytest.param((17, 15, 32), (0, 17, 32), (5, 41, 9),
+    pytest.param(2,
+                 4,
+                 4,
+                 2048, (17, 15, 32), (0, 17, 32), (5, 41, 9),
                  jnp.bfloat16,
+                 512,
                  id="batch-flat-owner-with-history-bf16-ssm-cache"),
 )
 
@@ -606,15 +639,15 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     pytest.param(jnp.float8_e4m3fn, "block_nk", id="fp8-block-n512-k128"),
 ])
 @pytest.mark.parametrize(
-    ("lengths", "token_owner_starts", "request_absolute_starts",
-     "recurrent_state_dtype"),
+    ("pcp_size", "n_kq", "n_v", "hidden_size", "lengths", "token_owner_starts",
+     "request_absolute_starts", "recurrent_state_dtype", "pool_block_tokens"),
     _GDN_PCP_FUSED_PROJECTION_CASES,
 )
 def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
-        lengths, token_owner_starts, request_absolute_starts,
-        recurrent_state_dtype, projection_dtype, weight_scheme):
+        pcp_size, n_kq, n_v, hidden_size, lengths, token_owner_starts,
+        request_absolute_starts, recurrent_state_dtype, pool_block_tokens,
+        projection_dtype, weight_scheme):
     """Cover PCP stage metadata, native BF16/FP8 projection, and pooled GDN."""
-    pcp_size = 2
     lengths = np.asarray(lengths, dtype=np.int32)
     token_owner_starts = (np.zeros_like(lengths) if token_owner_starts is None
                           else np.asarray(token_owner_starts, dtype=np.int32))
@@ -635,8 +668,6 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         f"GDN PCP numerical test requires {pcp_size} TPU devices.",
     )
 
-    n_kq = 2 * pcp_size
-    n_v = 2 * pcp_size
     d_k = 128
     d_v = 128
     kernel_size = 4
@@ -644,7 +675,6 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     num_blocks = len(lengths) + 1
     qkv_dim = 2 * n_kq * d_k + n_v * d_v
     qkvz_dim = qkv_dim + n_v * d_v
-    hidden_size = qkvz_dim
 
     keys = jax.random.split(jax.random.key(0), 9)
     hidden = jax.random.normal(keys[0], (num_tokens, hidden_size),
@@ -778,9 +808,8 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         return jax.device_put(tensor, NamedSharding(mesh, P()))
 
     pool_kernel_block_tokens = 256
-    pool_block_tokens = 512
     pool_split = pool_block_tokens // pool_kernel_block_tokens
-    # The Qwen3.8 K=8/V=32 shape needs four local recurrent heads. Match its
+    # The Qwen3.8 K=4/V=32 shape needs four local recurrent heads. Match its
     # production pool capacity while keeping the smaller PCP2 cases unchanged.
     pool_tail_lanes = max(4, 2 * (n_v // pcp_size))
     local_pool_shape = (
@@ -845,8 +874,10 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         rtol=tolerance,
         atol=tolerance,
     )
-    local_n_kq, local_n_v = n_kq // pcp_size, n_v // pcp_size
-    local_conv_dim = 2 * local_n_kq * d_k + local_n_v * d_v
+    geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
+    local_n_kq = geometry.local_num_kq_heads
+    local_n_v = geometry.local_num_v_heads
+    local_conv_dim = geometry.local_conv_dim(d_k, d_v)
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=local_n_v * d_k * d_v *
         jnp.dtype(recurrent_state_dtype).itemsize,
@@ -881,17 +912,38 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
                                             check_vma=False)(new_pool)
     q, k, v = np.split(
         np.asarray(ref_conv)[1:], [n_kq * d_k, 2 * n_kq * d_k], -1)
-    expected_conv = np.concatenate([
-        np.concatenate(
-            [np.split(part, pcp_size, axis=-1)[rank]
-             for part in (q, k, v)], -1) for rank in range(pcp_size)
-    ])
+    local_key_dim = local_n_kq * d_k
+    local_value_dim = local_n_v * d_v
+    expected_conv_by_rank = []
+    for rank in range(pcp_size):
+        kq_start = geometry.kq_shard_index(rank) * local_key_dim
+        v_start = rank * local_value_dim
+        expected_conv_by_rank.append(
+            np.concatenate((
+                q[..., kq_start:kq_start + local_key_dim],
+                k[..., kq_start:kq_start + local_key_dim],
+                v[..., v_start:v_start + local_value_dim],
+            ),
+                           axis=-1))
+    expected_conv = np.concatenate(expected_conv_by_rank)
     expected_recurrent = np.concatenate(
         np.split(np.asarray(ref_recurrent)[1:], pcp_size, axis=1))
     np.testing.assert_allclose(np.asarray(pcp_conv),
                                expected_conv,
                                rtol=tolerance,
                                atol=tolerance)
+    if geometry.kq_replication_factor > 1:
+        actual_conv_by_rank = np.asarray(pcp_conv).reshape(
+            pcp_size, len(lengths), kernel_size - 1, local_conv_dim)
+        for rank in range(0, pcp_size, geometry.kq_replication_factor):
+            replicas = actual_conv_by_rank[rank:rank +
+                                           geometry.kq_replication_factor,
+                                           ..., :2 * local_key_dim]
+            for replica in replicas[1:]:
+                np.testing.assert_allclose(replica,
+                                           replicas[0],
+                                           rtol=tolerance,
+                                           atol=tolerance)
     np.testing.assert_allclose(np.asarray(pcp_recurrent),
                                expected_recurrent,
                                rtol=tolerance,
