@@ -29,9 +29,11 @@ class TestSweepOrchestrator(unittest.TestCase):
         self.test_dir = tempfile.TemporaryDirectory()
         self.config_path = os.path.join(self.test_dir.name, "test_config.yaml")
         self.results_dir = os.path.join(self.test_dir.name, "results")
+        os.environ["EXPERIMENTS_NO_UPLOAD_GCS"] = "1"
 
     def tearDown(self):
         self.test_dir.cleanup()
+        os.environ.pop("EXPERIMENTS_NO_UPLOAD_GCS", None)
 
     def _write_yaml(self, data):
         with open(self.config_path, "w") as f:
@@ -72,7 +74,10 @@ class TestSweepOrchestrator(unittest.TestCase):
         with patch("runners.registry.RunnerRegistry.get",
                    return_value=mock_runner):
             orchestrator = run_sweep.SweepOrchestrator(
-                config_path=self.config_path, result_dir=self.results_dir)
+                config_path=self.config_path,
+                result_dir=self.results_dir,
+                upload_gcs=False,
+            )
             orchestrator.run()
 
             # Assert: Runner was invoked 4 times and CSV has 4 rows
@@ -131,7 +136,9 @@ class TestSweepOrchestrator(unittest.TestCase):
             orchestrator = run_sweep.SweepOrchestrator(
                 config_path=self.config_path,
                 result_dir=self.results_dir,
-                experiment_id="test_resume_exp")
+                experiment_id="test_resume_exp",
+                upload_gcs=False,
+            )
             orchestrator.run()
 
             # Assert: Runner only invoked 1 time (for model_B)
@@ -203,7 +210,9 @@ class TestSweepOrchestrator(unittest.TestCase):
             orchestrator = run_sweep.SweepOrchestrator(
                 config_path=self.config_path,
                 result_dir=self.results_dir,
-                experiment_id="test_resume_json_exp")
+                experiment_id="test_resume_json_exp",
+                upload_gcs=False,
+            )
             orchestrator.run()
 
             # Assert: Runner only invoked 1 time (for model_B) because model_A was in sweep.json
@@ -232,7 +241,9 @@ class TestSweepOrchestrator(unittest.TestCase):
         orchestrator = run_sweep.SweepOrchestrator(
             config_path=self.config_path,
             result_dir=self.results_dir,
-            message="Evaluating Gemma 4 throughput")
+            message="Evaluating Gemma 4 throughput",
+            upload_gcs=False,
+        )
 
         metadata_path = orchestrator.metadata_file
         self.assertTrue(os.path.exists(metadata_path),
@@ -269,7 +280,8 @@ class TestSweepOrchestrator(unittest.TestCase):
         _ = run_sweep.SweepOrchestrator(config_path=self.config_path,
                                         result_dir=self.results_dir,
                                         experiment_id="existing_exp",
-                                        message="New ignored description")
+                                        message="New ignored description",
+                                        upload_gcs=False)
 
         with open(metadata_file, "r") as f:
             persisted = yaml.safe_load(f)
@@ -304,7 +316,8 @@ class TestSweepOrchestrator(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             run_sweep.SweepOrchestrator(config_path=self.config_path,
                                         result_dir=self.results_dir,
-                                        experiment_id="exp_to_fail")
+                                        experiment_id="exp_to_fail",
+                                        upload_gcs=False)
         self.assertIn("provided config does not match the config saved",
                       str(ctx.exception))
 
@@ -323,7 +336,8 @@ class TestSweepOrchestrator(unittest.TestCase):
             run_sweep.SweepOrchestrator(config_path=self.config_path,
                                         result_dir=self.results_dir,
                                         experiment_id="non_existent_exp",
-                                        resume=True)
+                                        resume=True,
+                                        upload_gcs=False)
         self.assertIn("metadata file not found", str(ctx.exception))
 
     def test_runner_exception_marks_sweep_failed(self):
@@ -378,7 +392,8 @@ class TestSweepOrchestrator(unittest.TestCase):
             config_path=self.config_path,
             result_dir=self.results_dir,
             experiment_id="custom_named_exp",
-            resume=False)
+            resume=False,
+            upload_gcs=False)
         self.assertEqual(orchestrator.exp_id, "custom_named_exp")
         self.assertTrue(os.path.exists(orchestrator.metadata_file))
 
