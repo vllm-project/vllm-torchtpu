@@ -61,6 +61,7 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
     attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
     attn.prefix = prefix
     attn.num_k_heads = 64
+    attn.gqa_interleaved_layout = False
     attn.num_v_heads = 64
     attn.tp_size = 1
     attn.head_k_dim = 128
@@ -162,6 +163,7 @@ class TestVllmGatedDeltaNetAttention:
         np.testing.assert_array_equal(np.asarray(returned_output),
                                       np.asarray(output))
 
+    @pytest.mark.parametrize("interleaved", [False, True])
     @pytest.mark.parametrize(
         ("ssm_cache_dtype", "expected_dtype"),
         [
@@ -179,8 +181,10 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
-            expected_dtype, projection_dtype, vllm_config_context):
+            expected_dtype, projection_dtype, interleaved,
+            vllm_config_context):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
+        attn.gqa_interleaved_layout = interleaved
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
         pool = torch.zeros((4, 8), dtype=torch.float32)
@@ -238,6 +242,8 @@ class TestVllmGatedDeltaNetAttention:
             fake_jax_op.register_fake.call_args.args[0](*op_args))
         assert fake_pool.shape == pool.shape
         assert fake_output.shape == fake_z.shape == output.shape
+        assert mock_run.call_args.kwargs[
+            "gqa_interleaved_layout"] is interleaved
         assert pool.untyped_storage().data_ptr() == original_storage
         assert torch.all(pool_alias == 7)
         assert torch.all(output == 1)
@@ -1076,18 +1082,22 @@ class TestVllmGatedDeltaNetAttention:
 
     @pytest.mark.parametrize("projection_dtype",
                              [torch.bfloat16, torch.float8_e4m3fn])
+    @pytest.mark.parametrize("projection_bias", [False, True])
+    @pytest.mark.parametrize("interleaved", [False, True])
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_uses_fused_projection_for_pooled_pcp_prefill(
-            self, mock_get_forward_context, projection_dtype):
+            self, mock_get_forward_context, projection_dtype, interleaved,
+            projection_bias):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 1
         attn.head_v_dim = 16
         attn.num_v_heads = 4
+        attn.num_k_heads = 2
         attn.tp_size = 1
         attn.prefix = "test_layer"
-        attn.gqa_interleaved_layout = False
+        attn.gqa_interleaved_layout = interleaved
         attn._pcp_streaming_configured = True
 
         attn.conv1d = MagicMock()
@@ -1106,7 +1116,7 @@ class TestVllmGatedDeltaNetAttention:
         attn.in_proj_qkvz = SimpleNamespace(
             weight=qkvz_weight,
             weight_scale=qkvz_weight_scale,
-            bias=None,
+            bias=torch.zeros(192) if projection_bias else None,
         )
         attn.in_proj_ba = MagicMock()
         attn.norm = MagicMock()
@@ -1114,10 +1124,15 @@ class TestVllmGatedDeltaNetAttention:
 
         num_tokens = 2
         hidden_states = torch.randn(num_tokens, 64)
-        b_local = torch.full((num_tokens, 16), -2.0)
-        a_local = torch.full((num_tokens, 16), -3.0)
-        attn.in_proj_ba.return_value = (torch.cat((b_local, a_local),
-                                                  dim=-1), None)
+        b_local = torch.arange(num_tokens * 4).reshape(num_tokens, 4).float()
+        a_local = b_local + 100
+        if interleaved:
+            ba = torch.cat((b_local.reshape(
+                num_tokens, 2, 2), a_local.reshape(num_tokens, 2, 2)),
+                           dim=-1)
+        else:
+            ba = torch.cat((b_local, a_local), dim=-1)
+        attn.in_proj_ba.return_value = (ba.reshape(num_tokens, -1), None)
 
         fused_output = torch.arange(
             num_tokens * 4 * 16,
@@ -1141,6 +1156,14 @@ class TestVllmGatedDeltaNetAttention:
         with set_vllm_model_wrapper_context(
                 mesh=_mesh(),
                 vllm_config=_vllm_config(pcp_size=2, interleave_size=1)):
+            if projection_bias:
+                with pytest.raises(RuntimeError, match="bias-free"):
+                    attn.forward(hidden_states)
+                attn.in_proj_ba.assert_not_called()
+                attn.gdn_op.assert_not_called()
+                attn.gdn_pooled_op.assert_not_called()
+                attn.gdn_pooled_pcp_op.assert_not_called()
+                return
             output = attn.forward(hidden_states)
 
         attn.gdn_op.assert_not_called()

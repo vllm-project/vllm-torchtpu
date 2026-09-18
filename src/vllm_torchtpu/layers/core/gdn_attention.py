@@ -1054,6 +1054,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     interleave_size: int,
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
+    gqa_interleaved_layout: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
     pcp_axis = "pcp"
@@ -1201,6 +1202,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=pcp_axis,
             state_plan=state_plan,
+            gqa_interleaved_layout=gqa_interleaved_layout,
         )
 
     mapped_fn = jax.shard_map(
