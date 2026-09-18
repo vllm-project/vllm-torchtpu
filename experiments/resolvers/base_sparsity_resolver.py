@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import re
 import shutil
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -22,7 +23,7 @@ class BaseSparsityResolver(BaseResolver):
       disk space.
     """
 
-    CONSUMED_KEYS: Set[str] = {"num_sparse_layers", "layers"}
+    CONSUMED_KEYS: Set[str] = {"num_sparse_layers", "layers", "prunen", "prunem"}
     METHOD_NAME: str = "sparsity"
 
     def __init__(self, splicer: Optional[ModelSplicer] = None):
@@ -61,6 +62,20 @@ class BaseSparsityResolver(BaseResolver):
             "SparseGPT calibration requires sequential prefix layers. "
             "Non-prefix layer sets must be sequentially re-pruned rather than spliced."
         )
+
+    @staticmethod
+    def _assert_reference_ratio(reference_sparse_model: str, prunen: int,
+                                prunem: int) -> None:
+        """Asserts that reference_sparse_model matches the requested prunen/prunem ratio."""
+        ref_basename = os.path.basename(os.path.normpath(reference_sparse_model))
+        match = re.search(r"(\d+)(?:of|:)(\d+)", ref_basename)
+        if match:
+            ref_n, ref_m = int(match.group(1)), int(match.group(2))
+            if (ref_n, ref_m) != (prunen, prunem):
+                raise ValueError(
+                    f"Reference sparse model ratio mismatch: reference at '{reference_sparse_model}' "
+                    f"has ratio {ref_n}:{ref_m} ({ref_n}of{ref_m}), but sweep requested {prunen}:{prunem} ({prunen}of{prunem})."
+                )
 
     def compute_layer_range(
             self, num_sparse_layers: int, strategy: str,
@@ -136,8 +151,8 @@ class BaseSparsityResolver(BaseResolver):
                     )
 
         strategy = resolver_config.get("strategy", "first_to_last")
-        prunen = resolver_config.get("prunen", 2)
-        prunem = resolver_config.get("prunem", 4)
+        prunen = int(current_config.get("prunen", resolver_config.get("prunen", 2)))
+        prunem = int(current_config.get("prunem", resolver_config.get("prunem", 4)))
 
         # Check if the full reference sparse model exists on disk.
         # If absent, invoke SparseGPT in memory once across all layers to generate and cache it,
@@ -162,6 +177,7 @@ class BaseSparsityResolver(BaseResolver):
         # to ModelSplicer to construct a complete checkpoint using the dense base model as template.
         if num_sparse_layers >= total_layers and reference_sparse_model and os.path.exists(
                 reference_sparse_model):
+            BaseSparsityResolver._assert_reference_ratio(reference_sparse_model, prunen, prunem)
             dense_map = self.splicer.get_weight_map(base_model)
             sparse_map = self.splicer.get_weight_map(reference_sparse_model)
             # Ensure every non-layer weight (vision embeddings, embed_tokens, norm) is present in sparse model
@@ -214,7 +230,8 @@ class BaseSparsityResolver(BaseResolver):
         if explicit_layer_indices is not None and not is_prefix:
             import hashlib
             calib_tag = f"_{resolver_config.get('nsamples')}c4" if "nsamples" in resolver_config else ""
-            layer_sig = hashlib.sha1(",".join(str(x) for x in sorted(sparse_indices)).encode()).hexdigest()[:8]
+            cache_payload = f"{prunen}of{prunem}:" + ",".join(str(x) for x in sorted(sparse_indices))
+            layer_sig = hashlib.sha1(cache_payload.encode()).hexdigest()[:8]
             ckpt_name = f"{arch.model_type}_{self.METHOD_NAME}_{prunen}of{prunem}{calib_tag}_layers_{num_sparse_layers}l_{layer_sig}"
         else:
             ckpt_name = self.generate_checkpoint_name(
@@ -244,6 +261,7 @@ class BaseSparsityResolver(BaseResolver):
 
         # 2. Fast cross-shard layer splicing from 100% sparse reference model (prefix only)
         if can_splice:
+            BaseSparsityResolver._assert_reference_ratio(reference_sparse_model, prunen, prunem)
             if splice_from_reference:
                 print(
                     f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."

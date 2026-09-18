@@ -11,6 +11,7 @@ Comprehensive unit and edge-case test suite for model resolvers:
 """
 
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -494,6 +495,56 @@ class TestResolversEndToEnd(unittest.TestCase):
         self.assertTrue(
             os.path.exists(
                 os.path.join(model_path, "model.safetensors.index.json")))
+
+
+
+    def test_base_sparsity_resolver_ratio_in_cache_key(self):
+        """
+        Arrange-Act-Assert: Verify that prunen and prunem from current_config are respected,
+        added to CONSUMED_KEYS, and embedded into the non-prefix SHA1 cache key and checkpoint name.
+        """
+        resolver = NaiveMagnitudeResolver()
+        resolver_config = {
+            "base_model": self.dense_dir,
+            "strategy": "first_to_last",
+            "checkpoint_base_dir": self.work_dir
+        }
+
+        cur_1of4 = {"prunen": 1, "prunem": 4, "layers": [1, 2]}
+        model_path_1of4, consumed_1of4 = resolver.resolve(cur_1of4, resolver_config)
+        self.assertIn("prunen", consumed_1of4)
+        self.assertIn("prunem", consumed_1of4)
+        self.assertIn("_1of4_", model_path_1of4)
+
+        cur_3of4 = {"prunen": 3, "prunem": 4, "layers": [1, 2]}
+        model_path_3of4, consumed_3of4 = resolver.resolve(cur_3of4, resolver_config)
+        self.assertIn("_3of4_", model_path_3of4)
+
+        self.assertNotEqual(model_path_1of4, model_path_3of4)
+
+    def test_base_sparsity_resolver_reference_ratio_assertion(self):
+        """
+        Arrange-Act-Assert: Verify that reference_sparse_model ratio mismatch
+        (e.g., 2:4 reference for 1:4 sweep) is strictly rejected with ValueError.
+        """
+        resolver = BaseSparsityResolver()
+        ref_2of4_dir = os.path.join(self.work_dir, "model_2of4_canonical_full")
+        os.makedirs(ref_2of4_dir, exist_ok=True)
+        shutil.copytree(self.sparse_dir, ref_2of4_dir, dirs_exist_ok=True)
+
+        resolver_config = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": ref_2of4_dir,
+            "strategy": "first_to_last",
+            "checkpoint_base_dir": self.work_dir
+        }
+
+        with self.assertRaises(ValueError) as ctx:
+            resolver.resolve({"prunen": 1, "prunem": 4, "num_sparse_layers": 2}, resolver_config)
+        self.assertIn("Reference sparse model ratio mismatch", str(ctx.exception))
+
+        path, consumed = resolver.resolve({"prunen": 2, "prunem": 4, "num_sparse_layers": 2}, resolver_config)
+        self.assertIn("_2of4_", path)
 
 
 class TestWeightScalerResolver(unittest.TestCase):
