@@ -49,7 +49,7 @@ Routing always uses the sharded plan. The experimental API has no
 `sharded_plan` argument and does not read `MOE_FUSED_EP_V2_SHARDED_PLAN`.
 Unsupported shapes, dtypes, scale layouts or memory requirements raise errors.
 
-### Strict adapter for subsequent serving integration
+### Serving integration
 
 `vllm_adapter.prebuild_adaptive_fused_moe` accepts a layer and its prepared
 K-major Torch weights, automatically chooses FP8/FP4 from their dtype, and
@@ -59,10 +59,23 @@ weight/routing contracts, insufficient SMEM/VMEM, or a deployment below
 on the quantization-method owner under `vllm_adapter.FUSED_MOE_EP_OP_ATTR`, then
 use `vllm_adapter.run_adaptive_fused_moe`; a missing op is an error.
 
-The adapter is for an explicitly selected experimental path. It does not read
-the old fused-kernel enable flag or the W4A8/routing-plan gates. Production
-quantization methods and checkpoint loading have not been wired to this adapter
-yet; production serving continues to use the unchanged v2 integration.
+Select the experimental FP8/NVFP4 serving path with one variable:
+
+```bash
+MOE_FUSED_EP_KERNEL_IMPL=adaptive
+```
+
+No additional fused-enable, W4A8 or sharded-plan flag is required. The selection
+is forwarded to workers and bound during weight loading; forward uses the bound
+op. NVFP4 reuses the existing scale fusion and K-major requantization, choosing
+runtime block 64 when no block override is supplied. The adapter validates the
+proposed layout before converting checkpoint weights. vLLM recognizes the
+experimental op as the owner of EP/TP/PCP communication and final reduction.
+
+When this variable is unset, the legacy `USE_MOE_FUSED_EP_KERNEL` behavior is
+unchanged. Explicit `v2` enables the original implementation and retains its
+existing W4A8/routing-plan controls. Invalid implementation names raise errors.
+The original v2 kernel and adapter remain unchanged.
 
 ## TP-replicated inputs
 

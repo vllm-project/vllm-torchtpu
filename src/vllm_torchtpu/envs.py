@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
@@ -406,6 +407,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Specify requantization block size for MoE weights. When unset, NVFP4
     # expert-parallel layers admitted with USE_MOE_FUSED_EP_KERNEL and
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
+    # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
     # Other MoE paths retain their default, including explicit requantization.
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
@@ -584,7 +586,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL":
-    env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    lambda: (environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]
+             () is not None or env_bool("USE_MOE_FUSED_EP_KERNEL")()),
+    # Explicit implementation selection also enables fused EP. When unset,
+    # preserve the legacy enable flag and v2 behavior. Adaptive owns its
+    # admission, automatically supports FP4 and never falls back to GMM.
+    "MOE_FUSED_EP_KERNEL_IMPL":
+    env_with_choices("MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8":

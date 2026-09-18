@@ -13,8 +13,9 @@
 # limitations under the License.
 """Strict Torch/JAX bridge for an explicitly selected experimental kernel.
 
-This module is not wired into the production quantization methods yet. Callers
-provide prepared K-major weights. Native FP4 selects W4A8 automatically; the
+The FP8/NVFP4 quantization methods select this bridge at weight-load time with
+MOE_FUSED_EP_KERNEL_IMPL=adaptive. Callers provide prepared K-major weights.
+Native FP4 selects W4A8 automatically; the
 experimental path always builds sharded routing and never returns a GMM fallback.
 """
 
@@ -181,6 +182,52 @@ def prebuild_adaptive_fused_moe(
         plan.vmem_bytes,
     )
     return op
+
+
+def adaptive_fused_moe_supported(owner: Any) -> bool:
+    """Only a successfully prebuilt op owns vLLM's dispatch/combine."""
+    return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
+
+
+def prebuild_adaptive_nvfp4(
+    layer: RoutedExperts,
+    activation: str,
+    configured_block: int | None = None,
+) -> tuple[torch.library.CustomOpDef, int]:
+    """Validate checkpoint geometry before committing runtime requantization."""
+    block = U32_SUBLANE_TILE * PACK4 if configured_block is None else configured_block
+    hidden = layer.w13_weight.shape[-1] * 2
+    inter = layer.w2_weight.shape[-1] * 2
+    if not isinstance(block, int) or block <= 0 or hidden % block:
+        raise ValueError(
+            f"adaptive NVFP4 block-{block} must be positive and divide hidden={hidden}"
+        )
+    inter = host.align_up(inter, block)
+    experts = layer.w13_weight.shape[0]
+    # Meta tensors describe the prepared packed K-major layout without
+    # allocating another copy of the checkpoint. Strict prebuild also checks
+    # routing, EP placement, alignment and memory before weights are replaced.
+    weights = (
+        torch.empty((experts, hidden, inter),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="meta"),
+        torch.empty((experts, inter, hidden // 2),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="meta"),
+        torch.empty((experts, hidden // block, 1, 2 * inter),
+                    dtype=torch.float32,
+                    device="meta"),
+        torch.empty((experts, inter // block, 1, hidden),
+                    dtype=torch.float32,
+                    device="meta"),
+    )
+    op = prebuild_adaptive_fused_moe(layer,
+                                     topk=layer.moe_config.experts_per_token,
+                                     renormalize=layer.renormalize,
+                                     activation=activation,
+                                     weights=weights,
+                                     rhs_qb=block)
+    return op, block
 
 
 def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
