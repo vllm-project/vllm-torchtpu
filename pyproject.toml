@@ -37,17 +37,27 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260910000446",
+    "torch-tpu==0.1.1.dev20260912075415",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
-    # raiden KV connector (disaggregated serving) and host KV offload. The
-    # wheel bundles one extension per supported torch ABI and dispatches to
-    # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260827124357",
+    # raiden KV connector (disaggregated serving) and host KV offload; the
+    # import name is `tpu_sync`. The wheel bundles one extension per
+    # supported torch ABI and dispatches to the variant matching the
+    # installed torch at import time.
+    "tpu-sync-torch==0.0.1.dev20260917080754",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
-    # declared here rather than leaned on as a vLLM transitive. Left unpinned:
-    # vLLM owns the floor (>=5.10.4 as of 0.29.0) and pinning against it is how
-    # we last broke the image build.
-    "transformers",
+    # declared here rather than leaned on as a vLLM transitive.
+    #
+    # Capped below 5.11. vLLM 0.29.0 only sets a floor (>=5.10.4), and letting
+    # transformers float to 5.17.0 fails
+    # test_structured_output_spec_decode_correctness_greedy[single_chunk] with
+    # assert 1 == 0 -- a wrong answer under grammar-constrained decoding, not an
+    # import or API error, so nothing catches it before the test.
+    #
+    # 5.10.4 is vLLM's floor and the closest available release to 5.8.0, which
+    # was the last version this suite was green on. It is NOT a bisected ceiling:
+    # the break is somewhere in 5.11.0-5.17.0 and could be much later than 5.11.
+    # Widen it by bisecting against that test, not by bumping and hoping.
+    "transformers>=5.10.4,<5.11",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -58,11 +68,12 @@ dependencies = [
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
     "jax==0.10.2",
     "jaxlib==0.10.2",
-    # This libtpu pin needs the workarounds in src/vllm_torchtpu/env_override.py
-    # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
-    # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
-    # bumping.
-    "libtpu==0.0.44.1",
+    # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
+    # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
+    # per-config LIBTPU_INIT_ARGS additions under
+    # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
+    # re-verify those runs when bumping.
+    "libtpu==0.0.47",
     "ray[default]",
     "ray[data]",
 ]
@@ -126,6 +137,12 @@ markers = [
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
 ]
 
+[tool.ruff]
+# Without this, ruff ignores its `exclude` lists for any path named directly
+# on the command line, which is exactly how pre-commit invokes it. Setting it
+# makes `exclude` hold for both `ruff format .` and the hook.
+force-exclude = true
+
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
 # I import sorting. Line length (E501) is in E5 and is not selected.
@@ -136,7 +153,6 @@ select = ["E4", "E7", "E9", "F", "I"]
 # under [tool.ruff.format] and in the isort and yapf excludes in
 # .pre-commit-config.yaml; all three move together, otherwise two tools format the
 # same file.
-"scripts/**" = ["I"]
 "src/**" = ["I"]
 "tests/**" = ["I"]
 
@@ -144,7 +160,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 docstring-code-format = true
 
 # Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
-exclude = ["scripts/**", "src/**", "tests/**"]
+exclude = ["src/**", "tests/**"]
 
 [tool.pyrefly]
 project-includes = ["src"]
@@ -210,4 +226,4 @@ explicit = true
 
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
-tpu-raiden-torch = { index = "torch-tpu-registry" }
+tpu-sync-torch = { index = "torch-tpu-registry" }

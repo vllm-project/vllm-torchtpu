@@ -24,6 +24,7 @@ model replies with prose + a fenced code block rather than a raw
 continuation; these filters extract the code block, standing in for
 evalplus's response sanitizer.
 """
+
 import re
 from typing import Union
 
@@ -36,8 +37,9 @@ code_eval = hf_evaluate.load("code_eval")
 CODE_EVAL_TIMEOUT_S = 15.0
 
 
-def pass_at_1(references: Union[str, list[str]],
-              predictions: Union[list[str], list[list[str]]]) -> list[float]:
+def pass_at_1(
+    references: Union[str, list[str]], predictions: Union[list[str], list[list[str]]]
+) -> list[float]:
     if isinstance(references, str):
         references = [references]
     if predictions and isinstance(predictions[0], str):
@@ -58,8 +60,7 @@ def _extract_code(text: str) -> str:
     missing closing fence (max_gen_toks truncation). Falls back to the raw
     text when there is no fence at all.
     """
-    blocks = re.findall(r"```[a-zA-Z0-9_+-]*\n(.*?)(?:\n```|$)", text,
-                        re.DOTALL)
+    blocks = re.findall(r"```[a-zA-Z0-9_+-]*\n(.*?)(?:\n```|$)", text, re.DOTALL)
     if not blocks:
         return text
     for block in blocks:
@@ -72,8 +73,7 @@ def extract_code(resps: list[list[str]], docs: list[dict]) -> list[list[str]]:
     return [[_extract_code(r) for r in resp] for resp in resps]
 
 
-def extract_code_instruct(resps: list[list[str]],
-                          docs: list[dict]) -> list[list[str]]:
+def extract_code_instruct(resps: list[list[str]], docs: list[dict]) -> list[list[str]]:
     """humaneval variant: the tests call doc["entry_point"], so if the model
     answered with a bare body (continuation-style) instead of restating the
     full function, prepend the original prompt to complete it."""

@@ -1,0 +1,224 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The 1P1D benchmark as a Kueue workload. Both engines ask for the same shape,
+# because a workload is admitted against one queue and a queue is one shape;
+# the client asks for no accelerator and rides along.
+#
+# ${WORKLOAD_NAME} and ${IMAGE} are substituted before submission, so a literal
+# dollar is $$. Every container is named `workload`: the launcher forwards step
+# environment into that name and reads its logs.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    # The fleet's pod setup - caches, tolerations, retries. See
+    # manifests/README.md.
+    tpu-ci.google.com/defaults: standard
+spec:
+  # Each pod gets a DNS name of its own - <jobset>-<role>-<job>-<pod> under a
+  # headless service named for the JobSet - which is how the client finds the
+  # engines. A Service selector would be shared with any overlapping run.
+  network:
+    enableDNSHostnames: true
+  # The engines serve until told to stop, so the client finishing is what
+  # finishes the run; JobSet then tears the engines down.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - benchmark
+  replicatedJobs:
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Over the fleet's three-hour default: a cold compile of this model
+          # takes hours before the client sweep starts. The launcher bounds it
+          # by the step's whole budget.
+          activeDeadlineSeconds: 36000
+          # Indexed because enableDNSHostnames requires it.
+          completionMode: Indexed
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: ["/bin/bash", "/root/torchtpu-vllm/.buildkite/kubernetes/disagg_engine.sh", "prefill"]
+                env:
+                # The downward API, so these cannot come from the script.
+                - name: POD_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                # What the benchmark's dependsOn waits on: ready means the server
+                # answers, not that the container started.
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  periodSeconds: 10
+                ports:
+                - containerPort: 8000
+                # Only the chips: this pod holds every chip on the node, memory
+                # comes from the shape's profile, and a cpu request here can
+                # stop the pool scaling up at all. See manifests/README.md.
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                  requests:
+                    google.com/tpu: "4"
+                volumeMounts:
+                # Shadows one subtree of the inherited jax cache: profile_cache
+                # must not persist, or a later run loads the kv=0 graph instead
+                # of compiling it and the free-HBM probe measures nothing.
+                - name: vllm-profile-cache
+                  mountPath: /cache/jax/vllm/profile_cache
+              volumes:
+              - name: vllm-profile-cache
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 16Gi
+
+    - name: decode
+      # Both engines write the same HF cache, so they race while a model is
+      # still downloading and the first run of a new one needs a re-run.
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          activeDeadlineSeconds: 36000
+          completionMode: Indexed
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: ["/bin/bash", "/root/torchtpu-vllm/.buildkite/kubernetes/disagg_engine.sh", "decode"]
+                env:
+                # The downward API, so these cannot come from the script.
+                - name: POD_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                # What the benchmark's dependsOn waits on: ready means the server
+                # answers, not that the container started.
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  periodSeconds: 10
+                ports:
+                - containerPort: 8000
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                  requests:
+                    google.com/tpu: "4"
+                volumeMounts:
+                - name: vllm-profile-cache
+                  mountPath: /cache/jax/vllm/profile_cache
+              volumes:
+              - name: vllm-profile-cache
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 16Gi
+
+    - name: benchmark
+      # Both engines, not just decode: this role needs both to answer /health.
+      dependsOn:
+        - name: prefill
+          status: Ready
+        - name: decode
+          status: Ready
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          activeDeadlineSeconds: 36000
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              # This role holds no chips - it is an HTTP client driving the two
+              # engines - so it runs on a compute-class node sized to the
+              # requests below.
+              nodeSelector:
+                cloud.google.com/compute-class: worker-cpu
+              # Holds the grant on the benchmark table; the BigQuery insert
+              # below authenticates as it through the metadata server.
+              serviceAccountName: tpu-workload
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                env:
+                # JobSet builds each engine's DNS name from this.
+                - name: WORKLOAD_NAME
+                  value: ${WORKLOAD_NAME}
+                # What the BigQuery row is tagged with; the parser's other
+                # fields are the step's and arrive by --env.
+                - name: RUN_TYPE
+                  value: "KUBE_DISAGG"
+                - name: REPOSITORY
+                  value: "vllm-torchtpu"
+                # The digest the launcher resolved, so the row names the exact
+                # bytes that were measured rather than a tag that has moved.
+                - name: DOCKER_IMAGE
+                  value: ${IMAGE}
+                # Off unless the step says otherwise; see pipeline_disagg_kube.yml.
+                - name: BQ_UPLOAD
+                  value: "0"
+                # Loading the torchtpu platform plugin on this CPU client makes
+                # vLLM's CLI call torch.device("tpu"), which fails without
+                # import torch_tpu.
+                - name: VLLM_PLUGINS
+                  value: ""
+                # PyTorch auto-imports torch_tpu at `import torch` via the
+                # torch.backends entry point, and without libtpu its native
+                # init fatally aborts.
+                - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+                  value: "0"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                command: ["/bin/bash", "/root/torchtpu-vllm/.buildkite/kubernetes/disagg_benchmark.sh"]
+                # Request equals limit, so this is Guaranteed: it holds no
+                # chips and shares a worker-cpu node, so the bound is real.
+                resources:
+                  requests:
+                    cpu: "6"
+                    memory: "16Gi"
+                    ephemeral-storage: "20Gi"
+                  limits:
+                    cpu: "6"
+                    memory: "16Gi"
+                    ephemeral-storage: "20Gi"

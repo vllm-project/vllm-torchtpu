@@ -2058,17 +2058,8 @@ class TPURaidenConnectorWorker:
             return
         if self._local_raiden_transfer_rank() != 0:
             return
-        from tpu_sync.api.torch import reshard_store as _reshard_store
-
-        ReshardStore = _reshard_store.ReshardStore
-        # Backward compatible: newer tpu-sync wheels export RaidenId from
-        # reshard_store; older ones only from kv_cache_store.
-        # TODO(yiweiw): remove the kv_cache_store fallback once the pin moves
-        # to a tpu-sync-torch wheel (>= 0.0.1.dev20260913224657).
-        _StoreRaidenId = getattr(_reshard_store, "RaidenId", None)
-        if _StoreRaidenId is None:
-            from tpu_sync.api.torch.kv_cache_store import \
-                RaidenId as _StoreRaidenId
+        from tpu_sync.api.torch.reshard_store import RaidenId as _StoreRaidenId
+        from tpu_sync.api.torch.reshard_store import ReshardStore
 
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job

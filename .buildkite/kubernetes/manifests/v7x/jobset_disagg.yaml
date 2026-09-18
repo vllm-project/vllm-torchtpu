@@ -23,7 +23,7 @@
 # sweep c8-256, TTFT 8K-64K (128K/252K need max-model-len beyond the
 # shared 66560), decode rounds C8/P8192/D1024 and C256/P65536/D1024.
 #
-# Requires an image whose torch-tpu and tpu-raiden-torch were built
+# Requires an image whose torch-tpu and tpu-sync-torch were built
 # against the same XLA revision: a mismatched pair segfaults in
 # tpu_sync's KVCacheManager at startup. Use a DOCKER_IMAGE override if
 # the default prod:latest carries a mismatch.
