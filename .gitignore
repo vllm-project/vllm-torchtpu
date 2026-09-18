@@ -209,3 +209,4 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 # Benchmark results
 benchmark_runs/
+experiments/run_sweep.py
