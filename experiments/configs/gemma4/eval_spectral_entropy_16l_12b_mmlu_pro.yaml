@@ -1,0 +1,18 @@
+description: 'Single-Arm Evaluation: Gemma 4 12B with 16 sparse layers ordered by ascending weighted_rel_distortion'
+mode: eval
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+evaluation:
+  tasks: mmlu_pro
+  batch_size: auto
+sweep_matrix:
+  model:
+  - /mnt/pd/sparse_checkpoints/gemma4_12b_2of4_spectral_entropy_16l

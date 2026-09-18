@@ -1,0 +1,40 @@
+description: 'Splice validity control, PREFIX arm. Identical to
+  splice_validity_midstack_12b.yaml except that the layer list is the prefix
+  0,1,2,... A prefix set is exactly what SparseGPT sequential calibration
+  assumes, so this arm should track the known first_to_last baseline (77.03 at
+  0 layers, 75.22 at 8, n=12,032). If the prefix arm holds and the mid-stack arm
+  collapses, the splice shortcut is only valid for prefixes and every ordering
+  hypothesis needs a fresh SparseGPT run rather than a splice.'
+mode: eval
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+evaluation:
+  tasks: mmlu_pro
+  batch_size: auto
+  limit: 0.01
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: google/gemma-4-12B-it
+    reference_sparse_model: gemma4_12b_2of4_canonical_256c4_full
+    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    strategy: custom_order
+    # Expressed as a custom order rather than first_to_last so that both arms
+    # travel the identical code path and the only variable is the layer list.
+    custom_order_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    prunen: 2
+    prunem: 4
+    nsamples: 256
+sweep_matrix:
+  num_sparse_layers:
+  - 4
+  - 8
