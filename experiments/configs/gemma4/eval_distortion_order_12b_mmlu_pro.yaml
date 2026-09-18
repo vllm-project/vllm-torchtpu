@@ -1,0 +1,30 @@
+description: 'Single-Arm Evaluation: Gemma 4 12B with 16 sparse layers ordered by
+  ascending weighted_rel_distortion constraint'
+dtype: bfloat16
+engine_args:
+  disable_chunked_mm_input: true
+  enable_prefix_caching: false
+  gpu_memory_utilization: 0.85
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+evaluation:
+  batch_size: auto
+  tasks: mmlu_pro
+max_model_len: 8192
+mode: eval
+model_resolver:
+  config:
+    base_model: google/gemma-4-12B-it
+    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    nsamples: 256
+    prunem: 4
+    prunen: 2
+    reference_sparse_model: gemma4_12b_2of4_canonical_256c4_full
+    strategy: custom_order
+  function: resolve_model
+  module: resolvers.sparsegpt_resolver
+sweep_matrix:
+  num_sparse_layers:
+  - 16
+tensor_parallel_size: 4

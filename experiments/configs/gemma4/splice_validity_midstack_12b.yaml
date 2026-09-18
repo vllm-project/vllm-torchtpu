@@ -1,0 +1,44 @@
+description: 'Splice validity control, MID-STACK arm. Tests whether a non-prefix
+  layer set spliced from a sequentially calibrated SparseGPT checkpoint yields a
+  valid model. SparseGPT fits layer i assuming layers 0..i-1 are already sparse,
+  which first_to_last preserves and a mid-stack window violates. Paired with
+  splice_validity_prefix_12b.yaml, which is identical except for the layer list.
+  Both arms use custom_order so the only difference is which layers are chosen.'
+mode: eval
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+evaluation:
+  tasks: mmlu_pro
+  batch_size: auto
+  limit: 0.01
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: google/gemma-4-12B-it
+    reference_sparse_model: gemma4_12b_2of4_canonical_256c4_full
+    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    strategy: custom_order
+    # Deep mid-stack block, ascending. Layer 35 is absent from the canonical's
+    # sparse set, so it is skipped here too. All indices are < 48, the real
+    # layer count of Gemma-4 12B.
+    custom_order_layers: [23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 36, 37, 38]
+    # This arm deliberately measures what a non-prefix splice does, so it
+    # opts out of the guard. Its numbers are diagnostic and are NOT
+    # comparable to any first_to_last baseline.
+    allow_nonprefix_splice: true
+    prunen: 2
+    prunem: 4
+    nsamples: 256
+sweep_matrix:
+  num_sparse_layers:
+  - 4
+  - 8
