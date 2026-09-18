@@ -23,7 +23,10 @@ class BaseSparsityResolver(BaseResolver):
       disk space.
     """
 
-    CONSUMED_KEYS: Set[str] = {"num_sparse_layers", "layers", "prunen", "prunem"}
+    CONSUMED_KEYS: Set[str] = {
+        "num_sparse_layers", "layers", "prunen", "prunem", "use_lrc", "is_lrc",
+        "lrc_rank", "lrc_iters", "lrc_k", "lrc_T"
+    }
     METHOD_NAME: str = "sparsity"
 
     def __init__(self, splicer: Optional[ModelSplicer] = None):
@@ -109,7 +112,12 @@ class BaseSparsityResolver(BaseResolver):
                                  max_layer: int,
                                  resolver_config: Dict[str, Any]) -> str:
         calib_tag = f"_{resolver_config.get('nsamples')}c4" if "nsamples" in resolver_config else ""
-        return f"{arch_type}_{self.METHOD_NAME}_{prunen}of{prunem}{calib_tag}_{strategy}_layers_{min_layer}_to_{max_layer}"
+        name = f"{arch_type}_{self.METHOD_NAME}_{prunen}of{prunem}{calib_tag}_{strategy}_layers_{min_layer}_to_{max_layer}"
+        if resolver_config.get("use_lrc") or resolver_config.get("is_lrc"):
+            rank = resolver_config.get("lrc_rank", resolver_config.get("lrc_k", 128))
+            iters = resolver_config.get("lrc_iters", resolver_config.get("lrc_T", 3))
+            name += f"_lrc_k{rank}_T{iters}"
+        return name
 
     def prune_in_memory(self, base_model: str, save_path: str, min_layer: int,
                         max_layer: int, prunen: int, prunem: int,
@@ -159,11 +167,13 @@ class BaseSparsityResolver(BaseResolver):
         strategy = resolver_config.get("strategy", "first_to_last")
         prunen = int(current_config.get("prunen", resolver_config.get("prunen", 2)))
         prunem = int(current_config.get("prunem", resolver_config.get("prunem", 4)))
+        is_lrc = bool(resolver_config.get("use_lrc") or resolver_config.get("is_lrc") or current_config.get("use_lrc") or current_config.get("is_lrc"))
+        is_ref_lrc = bool(reference_sparse_model and ("lrc" in os.path.basename(reference_sparse_model).lower() or resolver_config.get("reference_is_lrc", False)))
 
         # Check if the full reference sparse model exists on disk.
         # If absent, invoke SparseGPT in memory once across all layers to generate and cache it,
         # ensuring downstream partial-layer splices have a complete sparse source.
-        if reference_sparse_model and not os.path.exists(
+        if reference_sparse_model and (not is_lrc or is_ref_lrc) and not os.path.exists(
                 reference_sparse_model):
             print(
                 f">>> [RESOLVER] Reference sparse model not found at {reference_sparse_model}."
@@ -181,7 +191,7 @@ class BaseSparsityResolver(BaseResolver):
         # with the base model architecture and has all non-transformer multimodal weights
         # (e.g. model.vision_embedder.*). If compatible, reuse it directly; otherwise fall through
         # to ModelSplicer to construct a complete checkpoint using the dense base model as template.
-        if num_sparse_layers >= total_layers and reference_sparse_model and os.path.exists(
+        if num_sparse_layers >= total_layers and reference_sparse_model and (not is_lrc or is_ref_lrc) and os.path.exists(
                 reference_sparse_model):
             BaseSparsityResolver._assert_reference_ratio(reference_sparse_model, prunen, prunem)
             dense_map = self.splicer.get_weight_map(base_model)
@@ -218,8 +228,8 @@ class BaseSparsityResolver(BaseResolver):
                 strategy=strategy,
                 total_layers=total_layers)
             sparse_indices = set(range(min_layer, max_layer))
-        can_splice = bool(reference_sparse_model) and os.path.exists(
-            reference_sparse_model)
+        can_splice = bool(reference_sparse_model) and (
+            not is_lrc or is_ref_lrc) and os.path.exists(reference_sparse_model)
         is_prefix = bool(sparse_indices) and sorted(sparse_indices) == list(range(len(sparse_indices)))
         splice_from_reference = can_splice and (
             is_prefix or resolver_config.get("allow_nonprefix_splice", False))
@@ -237,8 +247,14 @@ class BaseSparsityResolver(BaseResolver):
             import hashlib
             calib_tag = f"_{resolver_config.get('nsamples')}c4" if "nsamples" in resolver_config else ""
             cache_payload = f"{prunen}of{prunem}:" + ",".join(str(x) for x in sorted(sparse_indices))
+            if is_lrc:
+                rank = resolver_config.get("lrc_rank", resolver_config.get("lrc_k", current_config.get("lrc_rank", current_config.get("lrc_k", 128))))
+                iters = resolver_config.get("lrc_iters", resolver_config.get("lrc_T", current_config.get("lrc_iters", current_config.get("lrc_T", 3))))
+                cache_payload += f"_lrc_k{rank}_T{iters}"
             layer_sig = hashlib.sha1(cache_payload.encode()).hexdigest()[:8]
             ckpt_name = f"{arch.model_type}_{self.METHOD_NAME}_{prunen}of{prunem}{calib_tag}_layers_{num_sparse_layers}l_{layer_sig}"
+            if is_lrc:
+                ckpt_name += f"_lrc_k{rank}_T{iters}"
         else:
             ckpt_name = self.generate_checkpoint_name(
                 arch_type=arch.model_type,
@@ -291,6 +307,11 @@ class BaseSparsityResolver(BaseResolver):
                     f">>> [RESOLVER] Non-prefix layer set {sorted(sparse_indices)} requested. "
                     f"Bypassing reference splice and falling through to in-memory calibration..."
                 )
+        elif is_lrc and reference_sparse_model and not is_ref_lrc:
+            print(
+                f">>> [RESOLVER] Reference sparse model '{reference_sparse_model}' is not tagged as an LRC checkpoint. "
+                "Bypassing reference model reuse and splicing, falling through directly to prune_in_memory."
+            )
 
 
         # 3. In-memory algorithmic pruning fallback

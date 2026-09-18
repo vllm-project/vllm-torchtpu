@@ -930,5 +930,152 @@ class TestResolverRegistry(unittest.TestCase):
         self.assertIsInstance(resolved, DummyResolver)
 
 
+
+
+class TestLrcSparsityResolution(unittest.TestCase):
+    """Tests Low-Rank Compensated (LRC: W = S + UV) sparsity resolution, naming, and verification."""
+
+    def setUp(self):
+        self.resolver = BaseSparsityResolver()
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.dense_dir = os.path.join(self.test_dir.name, "dense_model")
+        self.sparse_dir = os.path.join(self.test_dir.name, "sparse_model")
+        self.work_dir = os.path.join(self.test_dir.name, "workspace")
+        os.makedirs(self.work_dir, exist_ok=True)
+
+        create_synthetic_model(self.dense_dir,
+                               num_layers=4,
+                               num_shards=2,
+                               sparsity_ratio=0.0)
+        create_synthetic_model(self.sparse_dir,
+                               num_layers=4,
+                               num_shards=2,
+                               sparsity_ratio=0.5)
+
+    def tearDown(self):
+        self.test_dir.cleanup()
+
+    def test_checkpoint_naming_with_lrc(self):
+        """
+        Arrange-Act-Assert: Verify checkpoint naming with use_lrc enabled.
+        Ensures Arm B does not collide with Arm A's cached directory.
+        """
+        name_arm_a = self.resolver.generate_checkpoint_name(
+            arch_type="gemma4",
+            prunen=2,
+            prunem=4,
+            strategy="first_to_last",
+            min_layer=0,
+            max_layer=24,
+            resolver_config={"use_lrc": False},
+        )
+        name_arm_b = self.resolver.generate_checkpoint_name(
+            arch_type="gemma4",
+            prunen=2,
+            prunem=4,
+            strategy="first_to_last",
+            min_layer=0,
+            max_layer=24,
+            resolver_config={"use_lrc": True, "lrc_rank": 128, "lrc_iters": 3},
+        )
+        name_arm_b_custom = self.resolver.generate_checkpoint_name(
+            arch_type="gemma4",
+            prunen=2,
+            prunem=4,
+            strategy="first_to_last",
+            min_layer=0,
+            max_layer=24,
+            resolver_config={"use_lrc": True, "lrc_rank": 64, "lrc_iters": 5},
+        )
+        name_is_lrc = self.resolver.generate_checkpoint_name(
+            arch_type="gemma4",
+            prunen=2,
+            prunem=4,
+            strategy="first_to_last",
+            min_layer=0,
+            max_layer=24,
+            resolver_config={"is_lrc": True, "lrc_k": 32, "lrc_T": 2},
+        )
+
+        self.assertNotIn("_lrc", name_arm_a)
+        self.assertIn("_lrc_k128_T3", name_arm_b)
+        self.assertIn("_lrc_k64_T5", name_arm_b_custom)
+        self.assertIn("_lrc_k32_T2", name_is_lrc)
+        self.assertNotEqual(name_arm_a, name_arm_b)
+        self.assertNotEqual(name_arm_b, name_arm_b_custom)
+
+    def test_nonprefix_cache_payload_and_naming_with_lrc(self):
+        """
+        Arrange-Act-Assert: Verify non-prefix layer resolution embeds LRC parameters into
+        cache_payload and checkpoint naming, preventing collision between standard SparseGPT and LRC.
+        """
+        resolver = NaiveMagnitudeResolver()
+        resolver_config = {
+            "base_model": self.dense_dir,
+            "strategy": "first_to_last",
+            "checkpoint_base_dir": self.work_dir,
+        }
+
+        # Standard non-prefix (no LRC)
+        path_std, consumed_std = resolver.resolve(
+            {"layers": [1, 2]},
+            resolver_config,
+        )
+
+        # Non-prefix with LRC
+        lrc_config = dict(resolver_config)
+        lrc_config["use_lrc"] = True
+        lrc_config["lrc_rank"] = 128
+        lrc_config["lrc_iters"] = 3
+        path_lrc, consumed_lrc = resolver.resolve(
+            {"layers": [1, 2]},
+            lrc_config,
+        )
+
+        self.assertNotIn("_lrc", path_std)
+        self.assertIn("_lrc_k128_T3", path_lrc)
+        self.assertNotEqual(path_std, path_lrc)
+        self.assertIn("use_lrc", consumed_lrc)
+
+    def test_lrc_bypasses_non_lrc_reference_sparse_model(self):
+        """
+        Arrange-Act-Assert: Verify that when use_lrc is True, reference_sparse_model reuse
+        and splicing are bypassed unless the reference model is explicitly tagged as an LRC checkpoint.
+        """
+        resolver = NaiveMagnitudeResolver()
+
+        # Non-LRC reference model: must be bypassed, falling through to prune_in_memory
+        resolver_config_std_ref = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": self.sparse_dir,
+            "checkpoint_base_dir": self.work_dir,
+            "use_lrc": True,
+            "lrc_rank": 128,
+            "lrc_iters": 3,
+        }
+        path_bypassed, _ = resolver.resolve(
+            {"layers": [0]},
+            resolver_config_std_ref,
+        )
+        self.assertIn("_lrc_k128_T3", path_bypassed)
+
+        # LRC-tagged reference model: should NOT be bypassed for prefix splicing
+        ref_lrc_dir = os.path.join(self.work_dir, "gemma4_lrc_k128_T3_full")
+        shutil.copytree(self.sparse_dir, ref_lrc_dir, dirs_exist_ok=True)
+        resolver_config_lrc_ref = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": ref_lrc_dir,
+            "checkpoint_base_dir": self.work_dir,
+            "use_lrc": True,
+            "lrc_rank": 128,
+            "lrc_iters": 3,
+        }
+        path_spliced, _ = resolver.resolve(
+            {"layers": [0]},
+            resolver_config_lrc_ref,
+        )
+        self.assertIn("_lrc_k128_T3", path_spliced)
+
+
 if __name__ == "__main__":
     unittest.main()
