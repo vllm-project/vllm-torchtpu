@@ -1,0 +1,42 @@
+description: "Gemma-4 12B Low-Rank Compensated (LRC: k=128, T=3, 2:4 sparsity) Stage L1 screening evaluation: prefix layers [0, 8, 16, 24] against matched dense control (limit: 0.05, n=608, seed: 42)"
+mode: eval
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+
+evaluation:
+  tasks: mmlu_pro
+  limit: 0.05
+  batch_size: auto
+  seed: 42
+
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: /mnt/pd/huggingface_cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+    reference_sparse_model: /mnt/pd/sparse_checkpoints/gemma4_12b_lrc_k128_T3_256c4_full
+    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    strategy: first_to_last
+    prunen: 2
+    prunem: 4
+    nsamples: 256
+    use_lrc: true
+    lrc_rank: 128
+    lrc_iters: 3
+
+sweep_matrix:
+  num_sparse_layers:
+    - 0
+    - 8
+    - 16
+    - 24
