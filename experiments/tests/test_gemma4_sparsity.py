@@ -132,6 +132,80 @@ class TestGemma4Sparsity(unittest.TestCase):
                                    delta=0.05,
                                    msg="Layer weights must be 2:4 sparse")
 
+    def test_gemma4_sequential_lrc_execution(self):
+        """
+        Arrange-Act-Assert: Exercises gemma4_sequential with use_lrc=True to verify
+        the active gpts[name].lrc_prune alternating minimization path end-to-end.
+        """
+        class MockDecoderLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn_q = nn.Linear(32, 32, bias=False)
+                self.mlp_down = nn.Linear(32, 32, bias=False)
+                self.self_attn_q.weight.data = torch.randn(32, 32)
+                self.mlp_down.weight.data = torch.randn(32, 32)
+
+            def forward(self, hidden_states, *args, **kwargs):
+                return (self.mlp_down(self.self_attn_q(hidden_states)), )
+
+        class MockLanguageModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([MockDecoderLayer(), MockDecoderLayer()])
+                self.embed_tokens = nn.Embedding(100, 32)
+                self.embed_tokens.weight.data = torch.randn(100, 32)
+                self.unique_layer_types = ["full_attention"]
+                self.config = types.SimpleNamespace(
+                    layer_types=["full_attention", "full_attention"],
+                    text_config=types.SimpleNamespace(hidden_size=32))
+
+            def rotary_emb(self, *args, **kwargs):
+                return torch.zeros((1, 32, 32))
+
+        class MockInnerModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = MockLanguageModel()
+
+        class MockGemmaModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = MockInnerModel()
+                self.config = types.SimpleNamespace(
+                    text_config=types.SimpleNamespace(hidden_size=32))
+                self.seqlen = 32
+
+            def forward(self, input_ids):
+                x = self.model.language_model.embed_tokens(input_ids)
+                return self.model.language_model.layers[0](x)
+
+        model = MockGemmaModel()
+        dataloader = [[torch.arange(0, 32).unsqueeze(0)]]
+
+        args = types.SimpleNamespace(
+            prunen=2,
+            prunem=4,
+            sparsity=0,
+            minlayer=0,
+            maxlayer=2,
+            nsamples=1,
+            prune_only=None,
+            percdamp=0.01,
+            blocksize=32,
+            use_lrc=True,
+            lrc_rank=4,
+            lrc_iters=2,
+        )
+
+        with patch("transformers.models.gemma4.modeling_gemma4.create_causal_mask", return_value=None),              patch("transformers.models.gemma4.modeling_gemma4.create_sliding_window_causal_mask", return_value=None):
+            gemma4_sequential(model, dataloader, dev=torch.device("cpu"), args=args)
+
+        for layer in model.model.language_model.layers:
+            self.assertFalse(torch.isnan(layer.self_attn_q.weight.data).any())
+            self.assertFalse(torch.isinf(layer.self_attn_q.weight.data).any())
+            self.assertFalse(torch.isnan(layer.mlp_down.weight.data).any())
+            self.assertFalse(torch.isinf(layer.mlp_down.weight.data).any())
+
 
 if __name__ == "__main__":
     unittest.main()
