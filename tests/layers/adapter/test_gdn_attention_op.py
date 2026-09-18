@@ -273,7 +273,7 @@ class TestVllmGatedDeltaNetAttention:
                                             vllm_config=vllm_config), \
              patch(
                  "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "pcp_streaming_jax_op",
+                 "pallas.jax_op",
                  side_effect=fake_pcp_jax_op,
              ), \
              patch(

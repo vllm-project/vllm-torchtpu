@@ -7,10 +7,19 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,
-                                                  get_cp_group_layout,
-                                                  get_or_create_cp_mesh)
+                                                  get_cp_group_layout)
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 PcpGroupLayout = CpGroupLayout
+
+# PCP builds its own mesh rather than going through
+# ``mesh_utils.get_or_create_cp_mesh``, so it needs its own cache: the two
+# builders produce different objects for the same key -- abstract
+# ``_PallasDevice`` positions here, real TPU devices there -- and sharing one
+# dict between them would hand a caller whichever ran first.
+_MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
 
 
 def get_pcp_group() -> Any | None:
@@ -55,46 +64,6 @@ def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     return group.all_reduce(tensor)
-
-
-def _get_current_global_rank() -> int:
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return int(torch.distributed.get_rank())
-    return 0
-
-
-def _get_tpu_global_device_id() -> int:
-    try:
-        from torch_tpu._internal.distributed import tpu_distributed
-
-        return int(tpu_distributed.global_device_id())
-    except Exception:
-        # Single-process tests may exercise layout code before TorchTPU/PJRT is
-        # initialized. Use JAX's local device id when available, otherwise the
-        # only sensible single-device fallback is 0.
-        try:
-            import jax
-
-            local_devices = jax.local_devices()
-            if local_devices:
-                return int(getattr(local_devices[0], "id", 0))
-        except Exception:
-            pass
-        return 0
-
-
-def _collect_rank_to_device_id(group: Any, global_rank: int,
-                               device_id: int) -> dict[int, int]:
-    gathered: list[tuple[int, int] | None] = [None] * int(group.world_size)
-    torch.distributed.all_gather_object(gathered, (global_rank, device_id),
-                                        group=group.cpu_group)
-    rank_to_device_id: dict[int, int] = {}
-    for item in gathered:
-        if item is None:
-            raise RuntimeError("PCP device id gather returned an empty entry.")
-        rank, gathered_device_id = item
-        rank_to_device_id[int(rank)] = int(gathered_device_id)
-    return rank_to_device_id
 
 
 def get_pcp_group_layout() -> PcpGroupLayout:
