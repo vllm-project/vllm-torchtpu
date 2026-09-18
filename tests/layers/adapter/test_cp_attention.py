@@ -22,7 +22,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import get_current_vllm_config
+from vllm.config import (DeviceConfig, VllmConfig, get_current_vllm_config,
+                         set_current_vllm_config)
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.configs import (
     AttentionScope, KVLayout)
@@ -31,6 +33,16 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture
+def cpu_vllm_config_context():
+    # CPU CI does not register torch's TPU device type. These tests only
+    # exercise layout propagation with CPU tensors and mocked kernels.
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
 
 
 def _impl(cls=attention.PallasBatchedRPAAttentionBackendImpl, head_size=256):
@@ -53,7 +65,7 @@ def _config():
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
-        monkeypatch, rank, compiled, vllm_config_context):
+        monkeypatch, rank, compiled, cpu_vllm_config_context):
     built, calls = [], []
 
     def build_op(_name, fn):
@@ -154,7 +166,7 @@ def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
     (attention.PallasBatchedRPAAttentionBackendImpl, 64),
 ])
 def test_dcp_hnd_rejects_backends_that_allocate_nhd(cls, head_size,
-                                                    vllm_config_context):
+                                                    cpu_vllm_config_context):
     get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
     impl = _impl(cls, head_size)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
