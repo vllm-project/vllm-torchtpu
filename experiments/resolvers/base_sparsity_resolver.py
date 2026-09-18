@@ -92,7 +92,8 @@ class BaseSparsityResolver(BaseResolver):
 
     def prune_in_memory(self, base_model: str, save_path: str, min_layer: int,
                         max_layer: int, prunen: int, prunem: int,
-                        resolver_config: Dict[str, Any]) -> str:
+                        resolver_config: Dict[str, Any],
+                        sparse_layer_indices: Optional[Set[int]] = None) -> str:
         """Hook to be implemented by specific pruning algorithm subclasses."""
         raise NotImplementedError(
             "Subclasses must implement prune_in_memory fallback.")
@@ -125,6 +126,14 @@ class BaseSparsityResolver(BaseResolver):
 
         arch = self.splicer.detect_architecture(base_model)
         total_layers = arch.num_layers
+
+        if explicit_layer_indices is not None:
+            for layer_idx in sorted(explicit_layer_indices):
+                if not (0 <= layer_idx < total_layers):
+                    raise ValueError(
+                        f"Layer index {layer_idx} out of bounds for model with "
+                        f"{total_layers} layers (must satisfy 0 <= layer_idx < {total_layers})."
+                    )
 
         strategy = resolver_config.get("strategy", "first_to_last")
         prunen = resolver_config.get("prunen", 2)
@@ -222,17 +231,25 @@ class BaseSparsityResolver(BaseResolver):
 
         # 2. Fast cross-shard layer splicing from 100% sparse reference model (prefix only)
         if reference_sparse_model and os.path.exists(reference_sparse_model):
-            BaseSparsityResolver._assert_spliceable(sparse_indices, strategy,
-                                                    resolver_config)
-            print(
-                f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
-            )
-            self.splicer.splice_checkpoint(
-                dense_model_dir=base_model,
-                fully_sparse_model_dir=reference_sparse_model,
-                sparse_layer_indices=sparse_indices,
-                output_dir=ckpt_path)
-            return ckpt_path, self.CONSUMED_KEYS
+            if is_prefix or resolver_config.get("allow_nonprefix_splice", False):
+                BaseSparsityResolver._assert_spliceable(sparse_indices, strategy, resolver_config)
+                print(
+                    f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
+                )
+                self.splicer.splice_checkpoint(
+                    dense_model_dir=base_model,
+                    fully_sparse_model_dir=reference_sparse_model,
+                    sparse_layer_indices=sparse_indices,
+                    output_dir=ckpt_path)
+                return ckpt_path, self.CONSUMED_KEYS
+            elif explicit_layer_indices is not None:
+                print(
+                    f">>> [RESOLVER] Non-prefix layer set {sorted(sparse_indices)} requested. "
+                    f"Bypassing reference splice and falling through to in-memory calibration..."
+                )
+            else:
+                BaseSparsityResolver._assert_spliceable(sparse_indices, strategy, resolver_config)
+
 
         # 3. In-memory algorithmic pruning fallback
         print("\n=======================================================")

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from resolvers.base_sparsity_resolver import BaseSparsityResolver
 from sparsity.naive_magnitude_pruner import prune_model_magnitude
@@ -13,7 +13,8 @@ class NaiveMagnitudeResolver(BaseSparsityResolver):
 
     def prune_in_memory(self, base_model: str, save_path: str, min_layer: int,
                         max_layer: int, prunen: int, prunem: int,
-                        resolver_config: Dict[str, Any]) -> str:
+                        resolver_config: Dict[str, Any],
+                        sparse_layer_indices: Optional[Set[int]] = None) -> str:
         prune_model_magnitude(base_model_dir=base_model,
                               output_dir=save_path,
                               prunen=prunen,
