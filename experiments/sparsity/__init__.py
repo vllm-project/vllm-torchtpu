@@ -31,13 +31,35 @@ def prune_gemma4(model_path: str,
                  blocksize: int = 128,
                  save_path: str = "",
                  dev: str = "cpu",
-                 sparse_layer_indices: Optional[Set[int]] = None) -> str:
+                 sparse_layer_indices: Optional[Set[int]] = None,
+                 use_lrc: bool = False,
+                 lrc_rank: int = 128,
+                 lrc_iters: int = 3,
+                 save_prefix24_path: Optional[str] = None) -> str:
     """
     Main entry point for SparseGPT pruning on Gemma 4 architectures.
     Captures layer activations sequentially, calculates second-order Hessian matrices,
     and applies N:M structured sparsity on host CPU before serving on TPU.
+
+    Args:
+        model_path: Path to HuggingFace or checkpoint directory.
+        dataset: Calibration dataset name ('c4', 'wikitext2').
+        minlayer: Starting layer index for pruning range.
+        maxlayer: Ending layer index (exclusive) for pruning range.
+        prunen: N in N:M structured sparsity (e.g. 2).
+        prunem: M in N:M structured sparsity (e.g. 4).
+        nsamples: Number of calibration sequences.
+        seed: Random seed for sample extraction.
+        percdamp: Percentage dampening factor for Hessian regularization.
+        blocksize: Column blocksize for Lazy OBS updates.
+        save_path: Output directory to serialize sparsified weights and configs.
+        dev: Device string ('cpu' or 'cuda'/'tpu').
+        sparse_layer_indices: Optional explicit set of layer indices to prune.
+        use_lrc: Whether to apply Low-Rank Compression alternating minimization.
+        lrc_rank: Low-rank rank k for LRC approximation.
+        lrc_iters: Alternating minimization iterations T for LRC.
+        save_prefix24_path: Optional path to save prefix-24 intermediate checkpoint.
     """
-    from typing import Optional, Set
     from .gemma4 import gemma4_sequential, get_gemma4
 
     device = torch.device(dev)
@@ -64,6 +86,11 @@ def prune_gemma4(model_path: str,
     args.prunen = prunen
     args.prunem = prunem
     args.sparse_layer_indices = sparse_layer_indices
+    args.use_lrc = use_lrc
+    args.lrc_rank = lrc_rank
+    args.lrc_iters = lrc_iters
+    args.save_prefix24_path = save_prefix24_path
+    args.model_path = model_path
     args.wbits = 16
     args.percdamp = percdamp
     args.blocksize = blocksize

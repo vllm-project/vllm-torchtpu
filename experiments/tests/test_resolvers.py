@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 from resolvers.base_resolver import BaseResolver
@@ -331,6 +332,12 @@ class TestResolversEndToEnd(unittest.TestCase):
             os.path.exists(
                 os.path.join(model_path, "model.safetensors.index.json")))
 
+        # Verify module-level resolve_model entrypoint
+        from resolvers.sparsegpt_resolver import resolve_model
+        fn_path, fn_keys = resolve_model(current_config, resolver_config)
+        self.assertEqual(model_path, fn_path)
+        self.assertEqual(consumed_keys, fn_keys)
+
         # Invalid non-prefix splice raises ValueError ...
         invalid_config = dict(resolver_config)
         invalid_config["strategy"] = "last_to_first"
@@ -420,6 +427,165 @@ class TestResolversEndToEnd(unittest.TestCase):
         self.assertTrue(
             os.path.exists(
                 os.path.join(out_target, "model.safetensors.index.json")))
+
+    def test_sparsegpt_resolver_outbound_signature_guard(self):
+        """
+        Contract Guard Test: Validates that all outbound arguments dispatched by
+        SparseGptResolver.prune_in_memory bind cleanly against prune_gemma4's real
+        inspect.signature without parameter divergence or unexpected kwargs.
+        """
+        import inspect
+        from sparsity import prune_gemma4
+
+        sig = inspect.signature(prune_gemma4)
+        intercepted_calls = []
+
+        def signature_verifier_spy(*args, **kwargs):
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            intercepted_calls.append(bound)
+            return "/tmp/stub_output_dir"
+
+        with patch("resolvers.sparsegpt_resolver.prune_gemma4", side_effect=signature_verifier_spy):
+            resolver = SparseGptResolver()
+            resolver.prune_in_memory(
+                base_model="/mock/base",
+                save_path="/mock/save",
+                min_layer=0,
+                max_layer=4,
+                prunen=2,
+                prunem=4,
+                resolver_config={
+                    "dataset": "c4",
+                    "nsamples": 32,
+                    "seed": 42,
+                    "percdamp": 0.02,
+                    "blocksize": 64,
+                    "use_lrc": True,
+                    "lrc_rank": 64,
+                    "lrc_iters": 5,
+                    "save_prefix24_path": "/mock/prefix24",
+                },
+                sparse_layer_indices={1, 3},
+            )
+
+        self.assertEqual(len(intercepted_calls), 1)
+        bound = intercepted_calls[0]
+        self.assertEqual(bound.arguments["model_path"], "/mock/base")
+        self.assertEqual(bound.arguments["dataset"], "c4")
+        self.assertEqual(bound.arguments["minlayer"], 0)
+        self.assertEqual(bound.arguments["maxlayer"], 4)
+        self.assertEqual(bound.arguments["prunen"], 2)
+        self.assertEqual(bound.arguments["prunem"], 4)
+        self.assertEqual(bound.arguments["nsamples"], 32)
+        self.assertEqual(bound.arguments["seed"], 42)
+        self.assertEqual(bound.arguments["percdamp"], 0.02)
+        self.assertEqual(bound.arguments["blocksize"], 64)
+        self.assertEqual(bound.arguments["save_path"], "/mock/save")
+        self.assertEqual(bound.arguments["sparse_layer_indices"], {1, 3})
+        self.assertTrue(bound.arguments["use_lrc"])
+        self.assertEqual(bound.arguments["lrc_rank"], 64)
+        self.assertEqual(bound.arguments["lrc_iters"], 5)
+        self.assertEqual(bound.arguments["save_prefix24_path"], "/mock/prefix24")
+
+    def test_sparsegpt_resolver_prune_in_memory_nonprefix_unmocked_boundary(self):
+        """
+        Arrange-Act-Assert: Exercises SparseGptResolver.prune_in_memory for a non-prefix layer set
+        reaching prune_gemma4 with NO mock on the resolver->prune_gemma4 boundary.
+        Executes real sequential SparseGPT calibration on a synthetic module, asserting that
+        layer 1 is 2:4 pruned while layer 0 remains dense.
+        """
+        import types
+        import torch.nn as nn
+
+        class MockDecoderLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn_q = nn.Linear(32, 32, bias=False)
+                self.mlp_down = nn.Linear(32, 32, bias=False)
+                self.self_attn_q.weight.data = torch.randn(32, 32)
+                self.mlp_down.weight.data = torch.randn(32, 32)
+
+            def forward(self, hidden_states, *args, **kwargs):
+                return (self.mlp_down(self.self_attn_q(hidden_states)), )
+
+        class MockLanguageModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([MockDecoderLayer(), MockDecoderLayer()])
+                self.embed_tokens = nn.Embedding(100, 32)
+                self.embed_tokens.weight.data = torch.randn(100, 32)
+                self.unique_layer_types = ["full_attention"]
+                self.config = types.SimpleNamespace(
+                    layer_types=["full_attention", "full_attention"],
+                    text_config=types.SimpleNamespace(hidden_size=32))
+
+            def rotary_emb(self, *args, **kwargs):
+                return torch.zeros((1, 32, 32))
+
+        class MockInnerModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = MockLanguageModel()
+
+        class MockGemmaModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = MockInnerModel()
+                self.config = types.SimpleNamespace(
+                    text_config=types.SimpleNamespace(hidden_size=32))
+                self.seqlen = 32
+
+            def forward(self, input_ids):
+                x = self.model.language_model.embed_tokens(input_ids)
+                return self.model.language_model.layers[0](x)
+
+        mock_model = MockGemmaModel()
+        mock_dataloader = [[torch.arange(0, 32).unsqueeze(0)]]
+
+        # Verify initial state: both layers have 0% zeros
+        w0_init = mock_model.model.language_model.layers[0].self_attn_q.weight.data
+        w1_init = mock_model.model.language_model.layers[1].self_attn_q.weight.data
+        self.assertEqual((w0_init == 0).sum().item(), 0)
+        self.assertEqual((w1_init == 0).sum().item(), 0)
+
+        resolver = SparseGptResolver()
+        resolver_config = {
+            "dataset": "c4",
+            "nsamples": 1,
+            "seed": 42,
+            "percdamp": 0.01,
+            "blocksize": 32,
+            "use_lrc": False,
+        }
+
+        # IMPORTANT: prune_gemma4 is UNMOCKED. The resolver calls the real prune_gemma4 function.
+        # Only HuggingFace model loading, dataset streaming, and causal masks are patched to run fast on CPU.
+        with patch("sparsity.gemma4.get_gemma4", return_value=mock_model), \
+             patch("sparsity.get_loaders", return_value=(mock_dataloader, None)), \
+             patch("transformers.models.gemma4.modeling_gemma4.create_causal_mask", return_value=None), \
+             patch("transformers.models.gemma4.modeling_gemma4.create_sliding_window_causal_mask", return_value=None):
+            out = resolver.prune_in_memory(
+                base_model="mock_model_dir",
+                save_path="",
+                min_layer=0,
+                max_layer=2,
+                prunen=2,
+                prunem=4,
+                resolver_config=resolver_config,
+                sparse_layer_indices={1},
+            )
+            self.assertEqual(out, "")
+
+        # Layer 0: was not in sparse_layer_indices -> preserved 100% dense
+        w0_post = mock_model.model.language_model.layers[0].self_attn_q.weight.data
+        zero_ratio_0 = (w0_post == 0).sum().item() / w0_post.numel()
+        self.assertEqual(zero_ratio_0, 0.0, "Layer 0 must remain dense")
+
+        # Layer 1: was in sparse_layer_indices={1} -> 2:4 SparseGPT pruned
+        w1_post = mock_model.model.language_model.layers[1].self_attn_q.weight.data
+        zero_ratio_1 = (w1_post == 0).sum().item() / w1_post.numel()
+        self.assertAlmostEqual(zero_ratio_1, 0.5, delta=0.05, msg="Layer 1 must be 2:4 sparse")
 
     def test_base_sparsity_resolver_layer_bounds_validation(self):
         """
