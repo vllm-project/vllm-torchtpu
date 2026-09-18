@@ -22,7 +22,7 @@ class BaseSparsityResolver(BaseResolver):
       disk space.
     """
 
-    CONSUMED_KEYS: Set[str] = {"num_sparse_layers"}
+    CONSUMED_KEYS: Set[str] = {"num_sparse_layers", "layers"}
     METHOD_NAME: str = "sparsity"
 
     def __init__(self, splicer: Optional[ModelSplicer] = None):
@@ -99,7 +99,16 @@ class BaseSparsityResolver(BaseResolver):
 
     def resolve(self, current_config: Dict[str, Any],
                 resolver_config: Dict[str, Any]) -> Tuple[str, Set[str]]:
-        num_sparse_layers = int(current_config.get("num_sparse_layers", 0))
+        raw_layers = current_config.get("layers", None)
+        if raw_layers is not None:
+            if isinstance(raw_layers, (list, set, tuple)):
+                explicit_layer_indices: Optional[Set[int]] = set(int(x) for x in raw_layers)
+                num_sparse_layers = len(explicit_layer_indices)
+            else:
+                raise ValueError(f"Expected list/set of layer indices in 'layers', got {type(raw_layers)}")
+        else:
+            explicit_layer_indices = None
+            num_sparse_layers = int(current_config.get("num_sparse_layers", 0))
         base_sparse_dir = resolver_config.get("checkpoint_base_dir",
                                               SPARSE_CHECKPOINTS_DIR)
         base_model = resolve_model_path(resolver_config.get("base_model", ""))
@@ -168,11 +177,16 @@ class BaseSparsityResolver(BaseResolver):
                 f"base model non-layer weights or matching config. Splicing all {total_layers} layers..."
             )
 
-        min_layer, max_layer = self.compute_layer_range(
-            num_sparse_layers=num_sparse_layers,
-            strategy=strategy,
-            total_layers=total_layers)
-        sparse_indices = set(range(min_layer, max_layer))
+        if explicit_layer_indices is not None:
+            sparse_indices = explicit_layer_indices
+            min_layer = min(sparse_indices) if sparse_indices else 0
+            max_layer = (max(sparse_indices) + 1) if sparse_indices else 0
+        else:
+            min_layer, max_layer = self.compute_layer_range(
+                num_sparse_layers=num_sparse_layers,
+                strategy=strategy,
+                total_layers=total_layers)
+            sparse_indices = set(range(min_layer, max_layer))
         can_splice = bool(reference_sparse_model) and os.path.exists(
             reference_sparse_model)
 
@@ -182,14 +196,21 @@ class BaseSparsityResolver(BaseResolver):
         if can_splice:
             self._assert_spliceable(sparse_indices, strategy, resolver_config)
 
-        ckpt_name = self.generate_checkpoint_name(
-            arch_type=arch.model_type,
-            prunen=prunen,
-            prunem=prunem,
-            strategy=strategy,
-            min_layer=min_layer,
-            max_layer=max_layer,
-            resolver_config=resolver_config)
+        is_prefix = bool(sparse_indices) and sorted(sparse_indices) == list(range(len(sparse_indices)))
+        if explicit_layer_indices is not None and not is_prefix:
+            import hashlib
+            calib_tag = f"_{resolver_config.get('nsamples')}c4" if "nsamples" in resolver_config else ""
+            layer_sig = hashlib.sha1(",".join(str(x) for x in sorted(sparse_indices)).encode()).hexdigest()[:8]
+            ckpt_name = f"{arch.model_type}_{self.METHOD_NAME}_{prunen}of{prunem}{calib_tag}_layers_{num_sparse_layers}l_{layer_sig}"
+        else:
+            ckpt_name = self.generate_checkpoint_name(
+                arch_type=arch.model_type,
+                prunen=prunen,
+                prunem=prunem,
+                strategy=strategy,
+                min_layer=min_layer,
+                max_layer=max_layer,
+                resolver_config=resolver_config)
         ckpt_path = os.path.join(base_sparse_dir, ckpt_name)
 
         # 1. Cache hit on disk
@@ -207,7 +228,7 @@ class BaseSparsityResolver(BaseResolver):
         # Clean older temporary spliced checkpoints before creating new one
         self._cleanup_old_spliced_dirs(base_sparse_dir, ckpt_path)
 
-        # 2. Fast cross-shard layer splicing from 100% sparse reference model
+        # 2. Fast cross-shard layer splicing from 100% sparse reference model (prefix only)
         if can_splice:
             print(
                 f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
@@ -232,5 +253,6 @@ class BaseSparsityResolver(BaseResolver):
                              max_layer=max_layer,
                              prunen=prunen,
                              prunem=prunem,
-                             resolver_config=resolver_config)
+                             resolver_config=resolver_config,
+                             sparse_layer_indices=sparse_indices)
         return ckpt_path, self.CONSUMED_KEYS

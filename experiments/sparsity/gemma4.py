@@ -154,7 +154,8 @@ def gemma4_sequential(model, dataloader, dev, args):
         subset = find_layers(layer)
         gpts = {}
 
-        is_pruned = (args.minlayer <= i < args.maxlayer)
+        sparse_indices = getattr(args, "sparse_layer_indices", None)
+        is_pruned = (i in sparse_indices) if sparse_indices is not None else (args.minlayer <= i < args.maxlayer)
         status_tag = f"PRUNING ({sparsity_ratio} SparseGPT)" if is_pruned else "DENSE (Preserved)"
         print(
             f"\n>>> [Layer {i:02d}/{total_layers:02d} - {progress_pct:4.1f}%] Type: {layer_type:<18} | Status: {status_tag}"

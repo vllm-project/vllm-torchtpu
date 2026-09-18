@@ -1,3 +1,4 @@
+from typing import Optional, Set
 """
 sparsity package
 ----------------
@@ -29,12 +30,14 @@ def prune_gemma4(model_path: str,
                  percdamp: float = 0.01,
                  blocksize: int = 128,
                  save_path: str = "",
-                 dev: str = "cpu") -> str:
+                 dev: str = "cpu",
+                 sparse_layer_indices: Optional[Set[int]] = None) -> str:
     """
     Main entry point for SparseGPT pruning on Gemma 4 architectures.
     Captures layer activations sequentially, calculates second-order Hessian matrices,
     and applies N:M structured sparsity on host CPU before serving on TPU.
     """
+    from typing import Optional, Set
     from .gemma4 import gemma4_sequential, get_gemma4
 
     device = torch.device(dev)
@@ -60,6 +63,7 @@ def prune_gemma4(model_path: str,
     args.nsamples = nsamples
     args.prunen = prunen
     args.prunem = prunem
+    args.sparse_layer_indices = sparse_layer_indices
     args.wbits = 16
     args.percdamp = percdamp
     args.blocksize = blocksize
