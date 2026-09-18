@@ -167,6 +167,11 @@ class _Stage3LoadMeta:
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
     release_only: bool = False
+    # When True on a release_only entry (e.g. a consumer request aborted while
+    # queued in reqs_to_load before reaching the worker), also record the
+    # request in _done_recving so get_finished() surfaces it and the vLLM
+    # scheduler frees the request's delayed local KV blocks.
+    report_completion: bool = False
 
 
 @dataclass
@@ -1261,11 +1266,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         default_job = "prefill" if self.is_producer else "decode"
         return f"{default_job}-engine"
 
-    def _enqueue_stage3_release(self, request: "Request") -> None:
-        """Full local hit: nothing to pull; ask the worker to promptly
-        release the producer's request-block registration instead of leaving
-        until p2p_wait_pull_timeout. Best-effort: the TTL remains the
-        backstop, so malformed params degrade to a warning, not a failure."""
+    def _enqueue_stage3_release(
+        self, request: "Request", *, report_completion: bool = False
+    ) -> None:
+        """Full local hit or pre-pull abort: nothing to pull; ask the worker
+        to promptly release the producer's request-block registration instead
+        of leaving until p2p_wait_pull_timeout. Best-effort: the TTL remains
+        the backstop, so malformed params degrade to a warning, not a failure."""
         params = request.kv_transfer_params or {}
         source_req_id = params.get("req_id")
         uuid = int(params.get("uuid", 0) or 0)
@@ -1289,6 +1296,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_data_replica_idx=int(params.get("src_data_replica_idx", -1)),
             src_parallelism=int(params.get("src_parallelism", 0) or 0),
             release_only=True,
+            report_completion=report_completion,
         )
         logger.info(
             "TPURaidenConnectorScheduler full prefix hit req_id=%s "
@@ -1304,6 +1312,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
         if not self.is_producer:
+            if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+                params = request.kv_transfer_params
+                if isinstance(params, dict) and params.get("uuid"):
+                    in_flight_load = self.reqs_to_load.get(request.request_id)
+                    if in_flight_load is not None or not params.get(
+                            "_remote_kv_processed"):
+                        self._enqueue_stage3_release(
+                            request,
+                            report_completion=in_flight_load is not None)
+                        params["_remote_kv_processed"] = True
             return False, None
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
@@ -1525,6 +1543,7 @@ class TPURaidenConnectorWorker:
         self._stage3_reported_sends: set[str] = set()
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
+        self._stage3_submitted_load_metas: dict[str, _Stage3LoadMeta] = {}
         self._stage3_load_start_times: dict[str, float] = {}
         self._legacy_registered_sends: set[str] = set()
         self._legacy_submitted_loads: set[str] = set()
@@ -3239,6 +3258,8 @@ class TPURaidenConnectorWorker:
                 ),
             )
 
+        if req_meta.report_completion:
+            self._done_recving.add(destination_req_id)
         if synchronous:
             _release()
             return
@@ -3287,6 +3308,7 @@ class TPURaidenConnectorWorker:
                 continue
             self._stage3_submitted_loads[destination_req_id] = uuid
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
+            self._stage3_submitted_load_metas[destination_req_id] = req_meta
             self._stage3_load_start_times[
                 destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
@@ -3670,8 +3692,12 @@ class TPURaidenConnectorWorker:
                 if pending is None:
                     continue
                 # Scheduler-finished (aborted) before the producer
-                # registered: resolve to the pre-arm failure terminal so the
-                # delayed block-free path completes.
+                # registered: cancel producer's registration if it arrives and
+                # resolve to the pre-arm failure terminal so the delayed
+                # block-free path completes.
+                req_meta = self._stage3_submitted_load_metas.pop(
+                    req_id, pending.req_meta)
+                self._stage3_release_producer_registration(req_id, req_meta)
                 self._record_stage3_load_failure(req_id, pending.local_blocks)
                 logger.warning(
                     "Stage-3 deferred load aborted before producer "
@@ -3730,9 +3756,17 @@ class TPURaidenConnectorWorker:
             self._stage3_finished_loads_pending_cleanup.intersection(
                 self._stage3_terminal_loads))
         for req_id in cleanup_req_ids:
+            req_meta = self._stage3_submitted_load_metas.pop(req_id, None)
             if (not self.is_producer and req_id in self._load_block_ids
                     and req_id not in self._reported_recving):
                 done_recving.add(req_id)
+                if req_meta is not None:
+                    self._stage3_release_producer_registration(
+                        req_id, req_meta)
+            elif (not self.is_producer and req_meta is not None
+                  and (req_id in self._failed_recving
+                       or req_id not in self._stage3_controller_accepted)):
+                self._stage3_release_producer_registration(req_id, req_meta)
             source_req_id = self._stage3_source_req_ids.pop(req_id, None)
             if (source_req_id is not None
                     and self._stage3_destination_req_ids.get(source_req_id)
