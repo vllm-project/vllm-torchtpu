@@ -195,11 +195,15 @@ def gemma4_sequential(model, dataloader, dev, args):
             for h in handles:
                 h.remove()
 
-            # Step 2: Algorithm 1 (fasterprune)
+            # Step 2: Algorithm 1 (fasterprune) / LRC Alternating Minimization
             # Solves min ||W*X - W_sparse*X||^2 using the accumulated Hessian gpts[name].H.
-            # Inverts H to H^-1, selects 2-of-4 weights per row in subset[name].weight minimizing
-            # error_q = w_q^2 / (2 * [H^-1]_qq), and applies 2nd-order error compensation:
-            # Delta w_unpruned = - (w_q / [H^-1]_qq) * H^-1_:,q
+            # If use_lrc is set, applies Low-Rank Compression (Frantar & Alistarh):
+            #   argmin_{S, U, V} || (W - S - U @ V) X ||^2_2
+            # Otherwise runs canonical SparseGPT with 2nd-order OBS weight compensation.
+            is_lrc = getattr(args, "use_lrc", False) or getattr(args, "lrc", False)
+            lrc_rank = getattr(args, "lrc_rank", getattr(args, "lrc_k", 128))
+            lrc_iters = getattr(args, "lrc_iters", getattr(args, "lrc_T", 3))
+
             for name in subset:
                 if name in gpts:
                     mat_start = time.time()
@@ -207,13 +211,24 @@ def gemma4_sequential(model, dataloader, dev, args):
                     print(f"    ├─ [{name:<24}] shape {str(w_shape):<16} ...",
                           end="",
                           flush=True)
-                    gpts[name].fasterprune(
-                        args.sparsity,
-                        prunen=args.prunen,
-                        prunem=args.prunem,
-                        percdamp=args.percdamp,
-                        blocksize=args.blocksize,
-                    )
+                    if is_lrc:
+                        gpts[name].lrc_prune(
+                            sparsity=args.sparsity if hasattr(args, "sparsity") and args.sparsity > 0 else 0.5,
+                            prunen=args.prunen,
+                            prunem=args.prunem,
+                            percdamp=args.percdamp,
+                            blocksize=args.blocksize,
+                            T=lrc_iters,
+                            k=lrc_rank,
+                        )
+                    else:
+                        gpts[name].fasterprune(
+                            args.sparsity,
+                            prunen=args.prunen,
+                            prunem=args.prunem,
+                            percdamp=args.percdamp,
+                            blocksize=args.blocksize,
+                        )
                     gpts[name].free()
                     mat_duration = time.time() - mat_start
                     print(f" done in {mat_duration:.2f}s")
