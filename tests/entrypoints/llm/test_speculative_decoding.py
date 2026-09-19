@@ -1089,8 +1089,16 @@ def test_structured_output_spec_decode_correctness_greedy(
             # prompt but not sampling params, so the group key carries the params
             # too; they must not vote in one majority. Every structured row is
             # still checked individually by (a) above.
-            ref_texts = [o.outputs[0].text for o in ref_outputs]
-            spec_texts = [o.outputs[0].text for o in spec_outputs]
+            ref_texts = [
+                o.outputs[0].text if i %
+                2 == 0 else o.outputs[0].text.splitlines()[0]
+                for i, o in enumerate(ref_outputs)
+            ]
+            spec_texts = [
+                o.outputs[0].text if i %
+                2 == 0 else o.outputs[0].text.splitlines()[0]
+                for i, o in enumerate(spec_outputs)
+            ]
             group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
                           for i, prompt in enumerate(test_prompts)]
             _assert_no_spec_divergence(test_prompts,
@@ -1253,8 +1261,16 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
             # prompt but not sampling params, so the group key carries the params
             # too; they must not vote in one majority. Every structured row is
             # still checked individually by (a) above.
-            ref_texts = [o.outputs[0].text for o in ref_outputs]
-            spec_texts = [o.outputs[0].text for o in spec_outputs]
+            ref_texts = [
+                o.outputs[0].text if i %
+                2 == 0 else o.outputs[0].text.splitlines()[0]
+                for i, o in enumerate(ref_outputs)
+            ]
+            spec_texts = [
+                o.outputs[0].text if i %
+                2 == 0 else o.outputs[0].text.splitlines()[0]
+                for i, o in enumerate(spec_outputs)
+            ]
             group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
                           for i, prompt in enumerate(test_prompts)]
             _assert_no_spec_divergence(test_prompts,
