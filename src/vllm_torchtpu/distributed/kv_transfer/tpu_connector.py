@@ -3562,6 +3562,8 @@ class TPURaidenConnectorWorker:
             exc = outcome.error
             missing_registration = ("Missing producer block registration"
                                     in str(exc))
+            cancelled_registration = (
+                "Request block registration was cancelled" in str(exc))
             aborted = (destination_req_id
                        in self._stage3_finished_loads_pending_cleanup)
             if (missing_registration and pending.defer_deadline is not None
@@ -3582,7 +3584,7 @@ class TPURaidenConnectorWorker:
                         dist_utils.get_stage3_registration_wait_s())
                 self._stage3_pending_submits[destination_req_id] = pending
                 return
-            if missing_registration:
+            if missing_registration or cancelled_registration:
                 # The FA registration lookup fails before receiver arming,
                 # so no late H2D is possible. A request the scheduler already
                 # finished resolves here as well, so its delayed block-free
