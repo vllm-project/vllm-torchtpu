@@ -639,7 +639,7 @@ class TestVllmGatedDeltaNetAttention:
         with set_vllm_model_wrapper_context(
                 mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), patch(
                     "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                    "pcp_streaming_jax_op",
+                    "pallas.jax_op",
                     return_value=fake_jax_op,
                 ) as mock_pcp_jax_op:
             compact_op = attn._build_gdn_op(pcp_streaming=True)
