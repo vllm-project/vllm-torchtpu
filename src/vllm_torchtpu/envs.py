@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
+    VLLM_TPU_JUMP_DECODING: bool = False
 
 
 def env_with_choices(
@@ -821,6 +822,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # env_override.py resolves it from the chip family. 0 sets no flag.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES":
     env_nonnegative_int_or_auto("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"),
+    # Master switch for grammar-as-a-draft (GaaD) jump decoding.
+    "VLLM_TPU_JUMP_DECODING":
+    env_bool("VLLM_TPU_JUMP_DECODING", default=False),
 }
 
 

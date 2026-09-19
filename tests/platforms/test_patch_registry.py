@@ -201,6 +201,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_mamba_split_scheduler_block_size",
         "_patch_vllm_offloading_config_build",
         "_patch_vllm_hybrid_producer_prefix_hits",
+        "_patch_vllm_grammar_jump_decoding",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (stages["worker_init"] +

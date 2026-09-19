@@ -565,3 +565,100 @@ class TestMaskLogitsWithTrace:
             "SD:PrepareSpecInput#num_reqs=1,num_target_rows=0,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
             in name for name in events_none
         ), f"SD:PrepareSpecInput (target=None) not found in {events_none}"
+
+    def test_prepare_spec_skips_bitmask_for_grammar_and_empty_flags(self):
+        # req0 has 5 draft slots: [G, G, D, -1, -1] -> flags: [2, 2, 1, 0, 0]
+        # Only slot 2 (flag=1, MODEL) requires bitmask!
+        # Slot 0, 1 (flag=2, GRAMMAR) and slot 3, 4 (flag=0, EMPTY) must have require=False.
+        manager = make_manager(num_spec_tokens=5, req_id_to_index={"req0": 0})
+        grammar_output = make_grammar_output(
+            ["req0"],
+            # 5 draft rows + 1 bonus row
+            [row(10), row(11),
+             row(12), row(13),
+             row(14), row(20)],
+        )
+        scheduled_tokens = {"req0": [100, 101, 102, -1, -1]}
+        scheduled_flags = {"req0": [2, 2, 1, 0, 0]}
+        draft_lengths = np.array([5], dtype=np.int32)
+        target_logits = torch.zeros(5, VOCAB_SIZE)
+        bonus_logits = torch.zeros(1, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask,
+         _) = manager.prepare_spec_structured_decoding_input(
+             target_logits,
+             bonus_logits,
+             grammar_output,
+             scheduled_tokens,
+             draft_lengths,
+             0,
+             1,
+             scheduled_spec_decode_flags=scheduled_flags,
+         )
+
+        # Slot 0, 1: G (flag 2) -> False
+        # Slot 2: D (flag 1) -> True
+        # Slot 3, 4: -1 (flag 0) -> False
+        assert require_target[:, 0].tolist() == [
+            False, False, True, False, False
+        ]
+        # Only slot 2 needs the bitmask copied; other slots should remain 0
+        assert target_bitmask[2].tolist() == row(12)
+        assert target_bitmask[0].tolist() == [0, 0]
+        assert target_bitmask[1].tolist() == [0, 0]
+        assert target_bitmask[3].tolist() == [0, 0]
+        assert target_bitmask[4].tolist() == [0, 0]
+        # Bonus row is still active
+        assert require_bonus[:, 0].tolist() == [True]
+        assert bonus_bitmask[0].tolist() == row(20)
+
+    def test_prepare_spec_all_grammar_bypasses_target_transfer_and_kernel(
+            self):
+        """When all scheduled draft tokens are GRAMMAR (flag 2) or EMPTY (flag 0),
+        require_target and target_bitmask must be None to bypass H2D transfer
+        and TPU structured_decode execution.
+        """
+        manager = make_manager(num_spec_tokens=3, req_id_to_index={"req0": 0})
+        grammar_output = make_grammar_output(
+            ["req0"],
+            # 3 draft rows + 1 bonus row
+            [row(10), row(11), row(12), row(20)],
+        )
+        scheduled_tokens = {"req0": [100, 101, -1]}
+        # All slots are GRAMMAR (2) or EMPTY (0), no MODEL drafts (1)
+        scheduled_flags = {"req0": [2, 2, 0]}
+        draft_lengths = np.array([3], dtype=np.int32)
+        target_logits = torch.ones(3, VOCAB_SIZE)
+        bonus_logits = torch.zeros(1, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask,
+         _) = manager.prepare_spec_structured_decoding_input(
+             target_logits,
+             bonus_logits,
+             grammar_output,
+             scheduled_tokens,
+             draft_lengths,
+             0,
+             1,
+             scheduled_spec_decode_flags=scheduled_flags,
+         )
+
+        # Must completely bypass target transfer
+        assert require_target is None
+        assert target_bitmask is None
+        # Bonus row is still active
+        assert require_bonus is not None
+        assert bonus_bitmask is not None
+
+        # When mask_spec_logits is called, target_logits should be returned as-is
+        out_target, out_bonus = manager.mask_spec_logits(
+            target_logits,
+            bonus_logits,
+            grammar_output,
+            scheduled_tokens,
+            draft_lengths,
+            0,
+            1,
+            scheduled_spec_decode_flags=scheduled_flags,
+        )
+        assert out_target is target_logits

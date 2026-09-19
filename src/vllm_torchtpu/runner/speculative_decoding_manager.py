@@ -36,6 +36,11 @@ class SpecDecodeMetadata:
     segment_ids: torch.Tensor
     # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
+    # [padded_logits_length] optional per-slot draft flag (0=EMPTY, 1=MODEL, 2=GRAMMAR).
+    draft_flags: Optional[torch.Tensor] = None
+    # True if any draft token requires model verification (e.g. flag == 1).
+    # False if all valid draft tokens are GRAMMAR (flag == 2) and unconditionally accepted.
+    has_model_drafts: bool = True
 
 
 class SpeculativeDecodingManager:
@@ -188,11 +193,59 @@ class SpeculativeDecodingManager:
                 "Speculative decoding method "
                 f"'{self.runner.speculative_config.method}' is not supported.")
 
+    def _build_draft_flags_tensor(
+        self,
+        num_draft_tokens: np.ndarray,
+        padded_logits_length: int,
+        scheduled_spec_decode_flags: Optional[dict[str, list[int]]],
+        start_index: int = 0,
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        if not scheduled_spec_decode_flags:
+            return None, True
+        # ``num_draft_tokens`` is built from
+        # ``req_ids[start_index:start_index + num_reqs]``, so the flag lookup has
+        # to start at the same offset. Restarting from 0 would pair one
+        # request's draft lengths with another request's flags, which can plant
+        # a GRAMMAR flag on a model slot and force-accept a token the target
+        # model rejected.
+        num_reqs = num_draft_tokens.shape[0]
+        req_ids = self.runner.input_batch.req_ids[start_index:start_index +
+                                                  num_reqs]
+        flag_chunks = []
+        has_model_drafts = False
+        has_any_drafts = False
+        for req_id, n in zip(req_ids, num_draft_tokens):
+            n_int = int(n)
+            if n_int <= 0:
+                continue
+            has_any_drafts = True
+            flags = scheduled_spec_decode_flags.get(req_id)
+            if flags is not None:
+                f = list(flags[:n_int])
+                if len(f) < n_int:
+                    f.extend([1] * (n_int - len(f)))
+                if any(x == 1 for x in f):
+                    has_model_drafts = True
+                flag_chunks.append(np.array(f, dtype=np.int32))
+            else:
+                flag_chunks.append(np.ones(n_int, dtype=np.int32))
+                has_model_drafts = True
+        padded_draft_flags = np.zeros(padded_logits_length, dtype=np.int32)
+        if flag_chunks:
+            flat_flags = np.concatenate(flag_chunks)
+            padded_draft_flags[:flat_flags.shape[0]] = flat_flags
+        draft_flags_tensor = torch.from_numpy(padded_draft_flags).to(
+            self.runner.device, non_blocking=True)
+        return draft_flags_tensor, (has_model_drafts
+                                    if has_any_drafts else False)
+
     def get_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        scheduled_spec_decode_flags: Optional[dict[str, list[int]]] = None,
+        start_index: int = 0,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and rejection sampling.
 
@@ -200,6 +253,9 @@ class SpeculativeDecodingManager:
       num_draft_tokens: The number of draft tokens for each request.
       cu_num_scheduled_tokens: The cumulative number of scheduled tokens.
       padded_num_reqs: The padded number of requests.
+      scheduled_spec_decode_flags: Optional per-request draft flags list.
+      start_index: Offset of this chunk into ``input_batch.req_ids``. Only the
+        flag lookup needs it; every other input is already chunk-local.
 
     Returns:
       A SpecDecodeMetadata object containing the necessary indices for
@@ -220,6 +276,11 @@ class SpeculativeDecodingManager:
             padded_draft_token_ids = np.zeros(padded_logits_length,
                                               dtype=np.int32)
             padded_draft_token_ids[:draft_token_ids.shape[0]] = draft_token_ids
+            draft_flags_tensor, has_model_drafts = (
+                self._build_draft_flags_tensor(num_draft_tokens,
+                                               padded_logits_length,
+                                               scheduled_spec_decode_flags,
+                                               start_index))
             return SpecDecodeMetadata(
                 draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
                     self.runner.device, non_blocking=True),
@@ -230,6 +291,8 @@ class SpeculativeDecodingManager:
                 final_logits_indices=self._meta_cache.final_logits_indices,
                 segment_ids=self._meta_cache.segment_ids,
                 group_indices=self._meta_cache.group_indices,
+                draft_flags=draft_flags_tensor,
+                has_model_drafts=has_model_drafts,
             )
 
         # [num_reqs]
@@ -315,6 +378,9 @@ class SpeculativeDecodingManager:
 
         # CPU -> TPU copy.
         device = self.runner.device
+        draft_flags_tensor, has_model_drafts = (self._build_draft_flags_tensor(
+            num_draft_tokens, padded_logits_length,
+            scheduled_spec_decode_flags, start_index))
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
@@ -332,6 +398,8 @@ class SpeculativeDecodingManager:
                 device, non_blocking=True),
             group_indices=torch.from_numpy(padded_group_indices).to(
                 device, non_blocking=True),
+            draft_flags=draft_flags_tensor,
+            has_model_drafts=has_model_drafts,
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.

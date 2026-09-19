@@ -784,3 +784,54 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
                             dtype=torch.int32,
                             device=device)
     assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_target_logits_none_all_grammar(device):
+    sampler = RejectionSampler()
+    # 2 requests: req0 has 2 drafts [10, 20], req1 has 1 draft [30] and 1 padding [-1]
+    draft_token_ids = torch.tensor([10, 20, 30, -1],
+                                   dtype=torch.int32,
+                                   device=device)
+    num_draft_tokens = torch.tensor([2, 1], dtype=torch.int32, device=device)
+    bonus_token_ids = torch.tensor([40, 50], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 0, 1],
+                                 dtype=torch.int64,
+                                 device=device)
+    draft_flags = torch.tensor([2, 2, 2, 0], dtype=torch.int32, device=device)
+
+    output = sampler(draft_token_ids=draft_token_ids,
+                     num_draft_tokens=num_draft_tokens,
+                     target_logits=None,
+                     bonus_token_ids=bonus_token_ids,
+                     segment_ids=segment_ids,
+                     group_indices=group_indices,
+                     max_draft_tokens=2,
+                     draft_flags=draft_flags)
+
+    expected = torch.tensor([[10, 20, 40], [30, 50, -1]],
+                            dtype=torch.int32,
+                            device=device)
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_target_logits_none_raises_if_model_draft_present(
+        device):
+    import pytest
+    sampler = RejectionSampler()
+    draft_token_ids = torch.tensor([10], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
+    bonus_token_ids = torch.tensor([40], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0], dtype=torch.int64, device=device)
+    draft_flags = torch.tensor([1], dtype=torch.int32, device=device)
+
+    with pytest.raises(ValueError, match="target_logits"):
+        sampler(draft_token_ids=draft_token_ids,
+                num_draft_tokens=num_draft_tokens,
+                target_logits=None,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=segment_ids,
+                group_indices=group_indices,
+                max_draft_tokens=1,
+                draft_flags=draft_flags)

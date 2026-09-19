@@ -79,6 +79,13 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
 
+    # Structured output. The grammar FSM lives in the engine-core process
+    # alongside the scheduler, so this patch is engine-core only: worker
+    # processes never see a Scheduler.
+    Patch(
+        "vllm_torchtpu.spec_decode.grammar_jump:_patch_vllm_grammar_jump_decoding",
+        ("engine_core", )),
+
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
