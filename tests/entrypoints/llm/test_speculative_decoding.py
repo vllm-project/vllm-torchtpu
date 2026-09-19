@@ -1041,7 +1041,12 @@ def test_structured_output_spec_decode_correctness_greedy(
             # workers, which needs pickle fallback in vLLM's IPC encoder.
             mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-        test_prompts = get_structured_spec_prompts()
+        structured_prompts = get_structured_spec_prompts()
+        free_prompt = "Keep repeating: a a a a a a a a a a"
+        test_prompts = [
+            structured_prompts[i] if i % 2 == 0 else free_prompt
+            for i in range(len(structured_prompts))
+        ]
         params = [
             structured if i % 2 == 0 else unconstrained
             for i in range(len(test_prompts))
@@ -1084,26 +1089,9 @@ def test_structured_output_spec_decode_correctness_greedy(
                 if i % 2 == 0:
                     _assert_valid_structured_json(spec.outputs[0].text)
 
-            # (b) Speculation must not change greedy output. Compared per-group
-            # majority, not row-for-row. Once the structured rows finish after
-            # the JSON object (~12 tokens), only the unconstrained rows remain
-            # in the batch with different matmul M dimensions (1 token/req in
-            # ref_llm vs 1+K tokens/req in spec_llm), which can shift a bf16
-            # near-tie in post-JSON continuations across all free rows. Compare
-            # the full text on structured rows and the first line (the JSON
-            # object generated while the batch is mixed) on unconstrained rows.
-            ref_texts = [
-                o.outputs[0].text if i % 2 == 0 else
-                (o.outputs[0].text.splitlines()[0]
-                 if o.outputs[0].text.splitlines() else o.outputs[0].text)
-                for i, o in enumerate(ref_outputs)
-            ]
-            spec_texts = [
-                o.outputs[0].text if i % 2 == 0 else
-                (o.outputs[0].text.splitlines()[0]
-                 if o.outputs[0].text.splitlines() else o.outputs[0].text)
-                for i, o in enumerate(spec_outputs)
-            ]
+            # (b) Speculation must not change greedy output.
+            ref_texts = [o.outputs[0].text for o in ref_outputs]
+            spec_texts = [o.outputs[0].text for o in spec_outputs]
             group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
                           for i, prompt in enumerate(test_prompts)]
             _assert_no_spec_divergence(test_prompts,
@@ -1218,7 +1206,12 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
     unconstrained = SamplingParams(temperature=0, max_tokens=16)
 
     with monkeypatch.context():
-        test_prompts = get_structured_spec_prompts()
+        structured_prompts = get_structured_spec_prompts()
+        free_prompt = get_eagle3_test_prompts()[0]
+        test_prompts = [
+            structured_prompts[i] if i % 2 == 0 else free_prompt
+            for i in range(len(structured_prompts))
+        ]
         params = [
             structured if i % 2 == 0 else unconstrained
             for i in range(len(test_prompts))
@@ -1258,23 +1251,9 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
                 if i % 2 == 0:
                     _assert_valid_structured_json(spec.outputs[0].text)
 
-            # (b) Speculation must not change greedy output. Compare the full
-            # text on structured rows and the first line (the JSON object
-            # generated while the batch is mixed) on unconstrained rows so
-            # post-JSON bf16 matmul tile-size near-ties (after structured rows
-            # finish) do not cause false positives.
-            ref_texts = [
-                o.outputs[0].text if i % 2 == 0 else
-                (o.outputs[0].text.splitlines()[0]
-                 if o.outputs[0].text.splitlines() else o.outputs[0].text)
-                for i, o in enumerate(ref_outputs)
-            ]
-            spec_texts = [
-                o.outputs[0].text if i % 2 == 0 else
-                (o.outputs[0].text.splitlines()[0]
-                 if o.outputs[0].text.splitlines() else o.outputs[0].text)
-                for i, o in enumerate(spec_outputs)
-            ]
+            # (b) Speculation must not change greedy output.
+            ref_texts = [o.outputs[0].text for o in ref_outputs]
+            spec_texts = [o.outputs[0].text for o in spec_outputs]
             group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
                           for i, prompt in enumerate(test_prompts)]
             _assert_no_spec_divergence(test_prompts,
