@@ -102,6 +102,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     sliding_window: int,
     logical_page_size: int,
     unnormalized_output: bool,
+    non_causal_block: bool,
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
@@ -201,6 +202,14 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             # So we only need to check the upper bound.
             keep = (q_span - k_span).astype(
                 jnp.uint32) < jnp.uint32(sliding_window)
+            if non_causal_block:
+                # DSpark draft block mode: the last q_len positions
+                # of the sequence are one parallel-drafting block attending
+                # bidirectionally within itself. The upper bound is NOT free
+                # here: the causal uint32 trick excluded the final page's
+                # tail garbage (k_span >= kv_len), so the block clause must
+                # re-impose it.
+                keep = keep | ((k_span >= kv_len - q_len) & (k_span < kv_len))
 
             s = jnp.einsum("nd,md->nm",
                            qc,
@@ -603,15 +612,18 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             if single_bkv_block:
                 end_bkv_idx = 1
             else:
+                if non_causal_block:
+                    # Draft block mode: every query in the block may attend
+                    # to the whole block, which ends at kv_len, not at this
+                    # bq block's last query.
+                    q_pos_end = kv_len
+                else:
+                    # Causal: no query sees past its own position, so the
+                    # last query of this bq block bounds the keys needed.
+                    q_pos_end = jnp.minimum(
+                        kv_len - q_len + (bq_idx + 1) * bq_sz, kv_len)
                 end_bkv_idx = jnp.maximum(
-                    cdiv(
-                        jnp.minimum(kv_len - q_len +
-                                    (bq_idx + 1) * bq_sz, kv_len) -
-                        cur_start_offset,
-                        bkv_sz,
-                    ),
-                    1,
-                )
+                    cdiv(q_pos_end - cur_start_offset, bkv_sz), 1)
 
             def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx):
                 next_bkv_idx = bkv_idx + 1
@@ -1367,6 +1379,7 @@ def run_mla_batched_decode_kernel(
         "vmem_limit_bytes",
         "logical_page_size",
         "unnormalized_output",
+        "non_causal_block",
         "q_compute_block_size",
     ),
     donate_argnames=("cache_kv", ),
@@ -1394,6 +1407,10 @@ def mla_sliding_window_ragged_paged_attention(
     q_compute_block_size: int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     unnormalized_output: bool = False,
+    # Draft (DSpark/DFlash) block mode: the last q_len positions of each
+    # sequence attend bidirectionally within themselves (window still
+    # bounds context keys). Requires q_len <= sliding_window.
+    non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
 ) -> tuple[
         jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
@@ -1588,7 +1605,8 @@ def mla_sliding_window_ragged_paged_attention(
             jnp.full((6, ), -1, jnp.int32),
         )
 
-        scope_name = f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
+        scope_name = (f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
+                      f"{'-ncb' if non_causal_block else ''}")
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -1600,6 +1618,7 @@ def mla_sliding_window_ragged_paged_attention(
                     bkv_p=bkv_p,
                     logical_page_size=logical_page_size,
                     unnormalized_output=unnormalized_output,
+                    non_causal_block=non_causal_block,
                     q_compute_block_size=q_compute_block_size,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
