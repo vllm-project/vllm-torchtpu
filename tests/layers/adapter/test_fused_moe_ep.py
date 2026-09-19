@@ -158,7 +158,9 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         closures.append(fn)
         return Mock()
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", build)
+    # This branch builds the fused EP op with Torchtpu's native
+    # jax_op; the local shim it used to go through is gone.
+    monkeypatch.setattr(bridge, "jax_op", build)
     kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
     monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
     groups = ((0, 1),)
@@ -239,9 +241,10 @@ def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
     index i holds EP rank i's experts and the op must be handed nothing.
     """
     seen = []
-    assert _prebuild(_layer(),
-                     ep_order=tuple(range(_STUB_EP)),
-                     build_op=lambda *args: seen.append(args) or "op") == "op"
+    assert _prebuild(
+        _layer(),
+        ep_order=tuple(range(_STUB_EP)),
+        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
     assert seen and seen[0][_MESH_ORDER_ARG] is None
 
 
