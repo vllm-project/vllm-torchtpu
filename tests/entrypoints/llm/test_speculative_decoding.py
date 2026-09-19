@@ -1033,7 +1033,7 @@ def test_structured_output_spec_decode_correctness_greedy(
         max_tokens=64,
         structured_outputs=StructuredOutputsParams(json=schema),
     )
-    unconstrained = SamplingParams(temperature=0, max_tokens=16)
+    unconstrained = SamplingParams(temperature=0, max_tokens=64)
 
     with monkeypatch.context() as mp:
         if multi_chunk:
@@ -1041,12 +1041,7 @@ def test_structured_output_spec_decode_correctness_greedy(
             # workers, which needs pickle fallback in vLLM's IPC encoder.
             mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-        structured_prompts = get_structured_spec_prompts()
-        free_prompt = "Keep repeating: a a a a a a a a a a"
-        test_prompts = [
-            structured_prompts[i] if i % 2 == 0 else free_prompt
-            for i in range(len(structured_prompts))
-        ]
+        test_prompts = get_structured_spec_prompts()
         params = [
             structured if i % 2 == 0 else unconstrained
             for i in range(len(test_prompts))
@@ -1062,9 +1057,6 @@ def test_structured_output_spec_decode_correctness_greedy(
         # 1. Reference run: structured outputs, no speculation.
         ref_llm = LLM(model=model_name, **kwargs)
         try:
-            if multi_chunk:
-                ref_llm.llm_engine.collective_rpc(_force_multi_chunk_cap,
-                                                  args=(2, ))
             ref_outputs = ref_llm.generate(test_prompts, params)
         finally:
             ref_llm.llm_engine.engine_core.shutdown()
@@ -1089,7 +1081,14 @@ def test_structured_output_spec_decode_correctness_greedy(
                 if i % 2 == 0:
                     _assert_valid_structured_json(spec.outputs[0].text)
 
-            # (b) Speculation must not change greedy output.
+            # (b) Speculation must not change greedy output. Compared per-group
+            # majority, not row-for-row: the unconstrained rows run the full 64
+            # free tokens, and at this batch size either run can flip one row on
+            # a near-tie (see _assert_no_spec_divergence) -- both directions have
+            # been observed here. Structured and unconstrained rows share a
+            # prompt but not sampling params, so the group key carries the params
+            # too; they must not vote in one majority. Every structured row is
+            # still checked individually by (a) above.
             ref_texts = [o.outputs[0].text for o in ref_outputs]
             spec_texts = [o.outputs[0].text for o in spec_outputs]
             group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
@@ -1203,15 +1202,10 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
         max_tokens=64,
         structured_outputs=StructuredOutputsParams(json=schema),
     )
-    unconstrained = SamplingParams(temperature=0, max_tokens=16)
+    unconstrained = SamplingParams(temperature=0, max_tokens=64)
 
     with monkeypatch.context():
-        structured_prompts = get_structured_spec_prompts()
-        free_prompt = get_eagle3_test_prompts()[0]
-        test_prompts = [
-            structured_prompts[i] if i % 2 == 0 else free_prompt
-            for i in range(len(structured_prompts))
-        ]
+        test_prompts = get_structured_spec_prompts()
         params = [
             structured if i % 2 == 0 else unconstrained
             for i in range(len(test_prompts))
@@ -1251,7 +1245,14 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
                 if i % 2 == 0:
                     _assert_valid_structured_json(spec.outputs[0].text)
 
-            # (b) Speculation must not change greedy output.
+            # (b) Speculation must not change greedy output. Compared per-group
+            # majority, not row-for-row: the unconstrained rows run the full 64
+            # free tokens, and at this batch size either run can flip one row on
+            # a near-tie (see _assert_no_spec_divergence) -- both directions have
+            # been observed here. Structured and unconstrained rows share a
+            # prompt but not sampling params, so the group key carries the params
+            # too; they must not vote in one majority. Every structured row is
+            # still checked individually by (a) above.
             ref_texts = [o.outputs[0].text for o in ref_outputs]
             spec_texts = [o.outputs[0].text for o in spec_outputs]
             group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
