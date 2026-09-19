@@ -246,7 +246,8 @@ def test_build_kv_connector_output_supports_vllm_023():
     )
 
 
-def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
+def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery(
+):
     with patch.object(
             tpu_runner,
             "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",

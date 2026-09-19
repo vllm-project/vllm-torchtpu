@@ -75,8 +75,8 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     if Scheduler.__dict__.get("_tpu_hybrid_kv_load_failure_patch", False):
         return
 
-    original_update = getattr(Scheduler, "_update_requests_with_invalid_blocks",
-                              None)
+    original_update = getattr(Scheduler,
+                              "_update_requests_with_invalid_blocks", None)
     if original_update is None:
         return
 
@@ -106,9 +106,8 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
             req_id = request.request_id
             req_block_ids_per_group = self.kv_cache_manager.get_block_ids(
                 req_id)
-            req_num_computed_tokens = (
-                request.num_computed_tokens -
-                num_scheduled_tokens.get(req_id, 0))
+            req_num_computed_tokens = (request.num_computed_tokens -
+                                       num_scheduled_tokens.get(req_id, 0))
             request_invalid_block_ids = {
                 block_id
                 for req_block_ids in req_block_ids_per_group
@@ -121,11 +120,9 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
                 request.num_computed_tokens = 0
                 if evict_blocks:
                     for req_block_ids in req_block_ids_per_group:
-                        blocks_to_evict.update(
-                            block_id
-                            for block_id in req_block_ids
-                            if block_id != null_block_id
-                        )
+                        blocks_to_evict.update(block_id
+                                               for block_id in req_block_ids
+                                               if block_id != null_block_id)
                 affected_req_ids.add(req_id)
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
