@@ -1617,8 +1617,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             f"{config.cache.blocks_per_chunk}"
         )
         parallel = config.parallel
-        assert parallel.dcp_size == 1, (
-            "TPURaidenOffloadingConnector: does not support decode context parallelism"
+        assert not (parallel.pcp_size > 1 and parallel.dcp_size > 1), (
+            "TPURaidenOffloadingConnector: concurrent PCP and DCP is not "
+            f"supported: got pcp={parallel.pcp_size}, dcp={parallel.dcp_size}"
         )
         # Count all ranks in the distributed execution group (TP * PP * PCP)
         # for registration barriers, save fanout, and total host capacity sizing.
@@ -1659,25 +1660,26 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             vllm_config, kv_cache_config
         )
 
-        # Verify PCP scaling invariant: scheduler chunks at the logical all-PCP-rank
+        # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
-        # scales by pcp_size so OffloadKey spans match scheduler blocks.
+        # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
         for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
+                expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (
-                    group.kv_cache_spec.block_size * parallel.pcp_size
+                    group.kv_cache_spec.block_size * expected_cp_scale
                 ), (
                     "TPURaidenOffloadingConnector: offloading group tokens_per_block="
                     f"{group_config.tokens_per_block} != rank-local "
                     f"block_size={group.kv_cache_spec.block_size} x "
-                    f"pcp={parallel.pcp_size}; the PCP-aware "
+                    f"cp={expected_cp_scale}; the CP-aware "
                     "OffloadingConfig build patch did not run"
                 )
 
         # Include context parallelism dimensions in key namespace only when CP
         # is active, preserving namespace compatibility for standard pcp=1 runs.
         cp_geometry: tuple[int, ...] = ()
-        if parallel.pcp_size > 1:
+        if parallel.pcp_size > 1 or parallel.dcp_size > 1:
             cp_geometry = (
                 parallel.pcp_size,
                 parallel.dcp_size,
