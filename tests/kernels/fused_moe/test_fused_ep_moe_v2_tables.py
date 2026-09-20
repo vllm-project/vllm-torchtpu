@@ -130,7 +130,7 @@ def test_sharded_plan_produces_the_same_kernel_operands(
     for me in range(ep):
         seen = []
 
-        def all_gather_rows(row):
+        def all_gather_rows(row, seen=seen):
             seen.append(np.asarray(row))
             return jnp.asarray(counts)
 

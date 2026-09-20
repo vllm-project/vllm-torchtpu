@@ -85,7 +85,7 @@ def test_qkvz_checkpoint_load_preserves_whole_heads(make_gdn_attention,
             expected,
             rtol=0,
             atol=0,
-            msg=lambda detail:
+            msg=lambda detail, rank=rank:
             f"QKVZ checkpoint partition: TP={tp_size}, rank={rank}\n{detail}")
 
 
@@ -102,7 +102,7 @@ def test_conv_checkpoint_uses_same_head_ownership(make_gdn_attention, tp_size):
             expected,
             rtol=0,
             atol=0,
-            msg=lambda detail:
+            msg=lambda detail, rank=rank:
             f"Conv checkpoint partition: TP={tp_size}, rank={rank}\n{detail}")
 
 
@@ -138,7 +138,7 @@ def test_fp8_scales_follow_projection_partition(make_gdn_attention, tp_size,
             expected,
             rtol=0,
             atol=0,
-            msg=lambda detail:
+            msg=lambda detail, rank=rank:
             f"FP8 scale partition: TP={tp_size}, rank={rank}\n{detail}")
 
 

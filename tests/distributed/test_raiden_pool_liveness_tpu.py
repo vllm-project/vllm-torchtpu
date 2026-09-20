@@ -274,7 +274,9 @@ def _run_pool_bytes_live_in_both_directions():
                            *,
                            pool_idx=pool_idx,
                            entry=entry,
-                           stride=stride):
+                           stride=stride,
+                           extents=extents,
+                           storage=storage):
             for block_id in range(entry.num_blocks):
                 ref = manager.get_block_ref(pool_idx, block_id)
                 assert ref["block_stride_bytes"] == stride

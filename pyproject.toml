@@ -159,7 +159,6 @@ ignore = [
     # Firing today and not fixed yet. `ruff check --fix` does not clear any of
     # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
     # change. Delete the entry once its count reaches zero.
-    "B023",    # 164  closure captures a loop variable
     "G004",    #  39  f-string passed to a logging call
     "SIM108",  #  15  if/else that could be a conditional expression
     "SIM102",  #  13  nested if that could be one
@@ -185,6 +184,13 @@ ignore = [
 # same file.
 "src/**" = ["I"]
 "tests/**" = ["I"]
+
+# Pallas runs a kernel closure the moment it is defined: `pl.when` and
+# `pl.loop` trace the body during the decorator call, inside the iteration
+# that built it. B023 warns that a closure outliving its loop sees the last
+# value of the loop variable, which cannot happen to a body that never
+# outlives the iteration.
+"src/vllm_torchtpu/kernels/**" = ["B023"]
 
 [tool.ruff.format]
 docstring-code-format = true

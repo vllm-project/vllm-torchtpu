@@ -532,7 +532,8 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
-                mamba_block_ids=mamba_block_ids)  # type: ignore
+                mamba_block_ids=mamba_block_ids,  # type: ignore
+            )
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
             f"{len(block_ids)} groups")
