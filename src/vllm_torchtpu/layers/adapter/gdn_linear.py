@@ -8,6 +8,7 @@ from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 from vllm.model_executor.parameter import (BasevLLMParameter,
                                            BlockQuantScaleParameter,
+                                           ChannelQuantScaleParameter,
                                            PerTensorScaleParameter)
 
 from vllm_torchtpu.kernels.gdn.head_geometry import GdnHeadGeometry
@@ -100,4 +101,78 @@ class GdnColumnParallelLinear(MergedColumnParallelLinear):
 
     # vLLM selects the entry point by quantization method, but both entries
     # must apply precisely the same head ownership and checkpoint splitting.
+    weight_loader_v2 = weight_loader
+
+
+class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
+    """Shard checkpoint groups while keeping complete shared Q/K heads.
+
+    Each group contains Q/K and its associated V/Z channels, or B/A channels.
+    Only the latter channels split when several TP ranks share a Q/K head.
+    The resulting rank-local tensor retains the checkpoint's group ordering.
+    """
+
+    def __init__(self,
+                 *,
+                 geometry: GdnHeadGeometry,
+                 group_sizes: list[int],
+                 replicated_segments: list[bool],
+                 input_size: int,
+                 quant_config: QuantizationConfig | None = None,
+                 prefix: str = "") -> None:
+        self.geometry = geometry
+        self.group_sizes = group_sizes
+        self.replicated_segments = replicated_segments
+        self.local_group_sizes = [
+            size if replicated else size // geometry.kq_replication_factor
+            for size, replicated in zip(group_sizes, replicated_segments)
+        ]
+        super().__init__(
+            input_size=input_size,
+            output_sizes=[
+                sum(self.local_group_sizes) * geometry.local_num_kq_heads *
+                geometry.parallel_size
+            ],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix)
+
+    def weight_loader(
+            self,
+            param: BasevLLMParameter,
+            loaded_weight: torch.Tensor,
+            loaded_shard_id: tuple[int, ...] | int | None = None) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        if isinstance(param, PerTensorScaleParameter):
+            return super().weight_loader_v2(param, loaded_weight,
+                                            loaded_shard_id)
+        geometry = self.geometry
+        sizes = self.group_sizes
+        local_sizes = self.local_group_sizes
+        if isinstance(param, BlockQuantScaleParameter):
+            block = self.weight_block_size[0]
+            if any(size % block for size in sizes + local_sizes):
+                raise ValueError("GDN interleaved scale blocks must align "
+                                 "with rank-local head segments.")
+            sizes = [size // block for size in sizes]
+            local_sizes = [size // block for size in local_sizes]
+        if isinstance(param, ChannelQuantScaleParameter):
+            loaded_weight = loaded_weight.reshape(-1, *param.shape[1:])
+        source = loaded_weight.movedim(param.output_dim, 0)
+        groups = source.reshape(geometry.num_kq_heads, sum(sizes),
+                                *source.shape[1:])
+        first = geometry.kq_shard_index(
+            self.tp_rank) * geometry.local_num_kq_heads
+        groups = groups.narrow(0, first, geometry.local_num_kq_heads)
+        replica = self.tp_rank % geometry.kq_replication_factor
+        pieces = [
+            piece.narrow(1, 0 if shared else replica * width, width)
+            for piece, width, shared in zip(groups.split(
+                sizes, dim=1), local_sizes, self.replicated_segments)
+        ]
+        local = torch.cat(pieces,
+                          dim=1).flatten(0, 1).movedim(0, param.output_dim)
+        assert local.shape == param.shape
+        param.data.copy_(local)
+
     weight_loader_v2 = weight_loader
