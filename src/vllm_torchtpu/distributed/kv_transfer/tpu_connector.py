@@ -26,7 +26,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import torch
@@ -158,7 +158,7 @@ class _Stage3LoadMeta:
     # group ordinal: the block holding the recurrent state for the resumed
     # request (state follows each group's block table; None for FA-only
     # models).
-    mamba_state_block_ids: Optional[list[int]] = None
+    mamba_state_block_ids: list[int] | None = None
     # Prefix-aware load: tokens satisfied by the decode-local prefix cache
     # and excluded from the transfer. local_block_ids then holds only the
     # suffix pages; the source store clips its plan at
@@ -195,7 +195,7 @@ class _Stage3PendingSubmit:
     dst_controller_address: str
     dst_units: list
     # None = legacy inline-poll mode (the entry is then never parked).
-    defer_deadline: Optional[float]
+    defer_deadline: float | None
     first_attempt_s: float
     wait_logged: bool = False
     # RPC rate limiting for re-attempts.
@@ -230,7 +230,7 @@ class _Stage3SubmitOutcome:
     """Result of one coordination RPC, applied on the model-runner thread."""
 
     task: _Stage3SubmitTask
-    error: Optional[BaseException]
+    error: BaseException | None
     submit_ms: float
     # perf_counter() when the RPC was issued; paces re-attempts.
     attempted_at: float
@@ -411,7 +411,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                  kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
-        self._connector_metadata: Optional[TPUConnectorMetadata] = None
+        self._connector_metadata: TPUConnectorMetadata | None = None
         use_raiden = self.force_raiden_connector or _use_raiden_connector(
             vllm_config)
         self.use_raiden = use_raiden
@@ -498,7 +498,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         request: "Request",
         block_ids: list[int],
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
+    ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
@@ -506,7 +506,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         request: "Request",
         block_ids: tuple[list[int], ...],
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
+    ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
 
         if self.use_raiden and _use_raiden_stage3_transport():
@@ -795,7 +795,7 @@ class TPUConnectorScheduler:
         self,
         request: "Request",
         block_ids: list[int],
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
+    ) -> tuple[bool, dict[str, Any] | None]:
         if not self.is_producer:
             return False, None
 
@@ -902,7 +902,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
     def _try_fast_scatter(
             self, device_shards: list[torch.Tensor],
             kv_caches: list[torch.Tensor],
-            local_blocks: list[int]) -> Optional[list[torch.Tensor]]:
+            local_blocks: list[int]) -> list[torch.Tensor] | None:
         if not self._kv_scatter_enabled:
             return None
         dest_blocks_dev = torch.tensor(local_blocks,
@@ -1213,7 +1213,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                  f"suffix_pages={suffix_pages}, "
                                  f"expected_pages={expected_pages}")
             local_block_ids = local_block_ids[prefix_pages:]
-        mamba_state_block_ids: Optional[list[int]] = None
+        mamba_state_block_ids: list[int] | None = None
         if self._stage3_mamba_group_indices:
             mamba_block_ids: list[list[int]] = []
             for mamba_gid in self._stage3_mamba_group_indices:
@@ -1308,8 +1308,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self,
         request: "Request",
         block_ids: list[int],
-        mamba_block_ids: Optional[list[list[int]]] = None,
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        mamba_block_ids: list[list[int]] | None = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
         if not self.is_producer:
@@ -1441,7 +1441,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "Stage-3 in-flight finish dedup capacity exhausted: "
                 f"limit={_STAGE3_FINISH_DEDUP_LIMIT}")
 
-        mamba_state_block_ids: Optional[list[int]] = None
+        mamba_state_block_ids: list[int] | None = None
         if self._stage3_mamba_group_indices:
             if not mamba_block_ids:
                 raise ValueError("GDN state is present but the producer's "
@@ -1516,7 +1516,7 @@ class TPURaidenConnectorWorker:
         self.vllm_config = vllm_config
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
-        self.runner: Optional[TPUModelRunner] = None
+        self.runner: TPUModelRunner | None = None
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1524,8 +1524,8 @@ class TPURaidenConnectorWorker:
         self.host_ip = dist_utils.get_host_ip()
         self.kv_transfer_port = int(dist_utils.get_kv_transfer_port()) + (
             2 * self.dp_rank * self.tp_size)
-        self._raiden_transfer_engine: Optional["KVCacheManager"] = None
-        self.named_kv_caches: Optional[dict[str, Any]] = None
+        self._raiden_transfer_engine: KVCacheManager | None = None
+        self.named_kv_caches: dict[str, Any] | None = None
         self._raiden_admission_summary: dict[str, Any] | None = None
         self._raiden_manifest: Any | None = None
         self._raiden_layout_fingerprint: str | None = None
@@ -3207,8 +3207,7 @@ class TPURaidenConnectorWorker:
                 f"destination={destination_req_id!r}")
         return source_req_id
 
-    def _stage3_destination_request_id(self,
-                                       source_req_id: str) -> Optional[str]:
+    def _stage3_destination_request_id(self, source_req_id: str) -> str | None:
         # Native completion IDs are controller plan IDs. Never treat an
         # unknown ID as a decode-local ID: it may be a stale terminal record
         # that happens to collide with an active destination request.
@@ -3334,7 +3333,7 @@ class TPURaidenConnectorWorker:
 
     def _stage_stage3_submit_task(
             self, pending: _Stage3PendingSubmit,
-            synchronous: bool) -> Optional[_Stage3SubmitTask]:
+            synchronous: bool) -> _Stage3SubmitTask | None:
         """Prepares the coordination call for one staged load.
 
         Model-runner thread only. A failure here precedes any controller
@@ -3510,7 +3509,7 @@ class TPURaidenConnectorWorker:
                 submit_ms=0.0,
                 attempted_at=start_submit,
             )
-        error: Optional[BaseException] = None
+        error: BaseException | None = None
         try:
             if task.retry_inline:
                 accepted = self._start_stage3_transfer_with_d5_retry(

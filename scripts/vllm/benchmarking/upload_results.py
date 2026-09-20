@@ -49,7 +49,7 @@ def load_config_json(results_dir: Path) -> dict:
     config_path = results_dir / "config.json"
     if config_path.exists():
         try:
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 return json.load(f)
         except Exception as e:
             print(f"Warning: Failed to load config.json: {e}", file=sys.stderr)
@@ -66,7 +66,7 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
     )
     for path in eval_jsons:
         try:
-            with open(path, "r") as fh:
+            with open(path) as fh:
                 data = json.load(fh)
             for task, task_metrics in (data.get("results") or {}).items():
                 if not isinstance(task_metrics, dict):
@@ -187,7 +187,7 @@ def main():
         concurrency = int(m.group(3))
 
         try:
-            with open(rf, "r") as f:
+            with open(rf) as f:
                 res = json.load(f)
         except Exception as e:
             print(f"Error loading {rf}: {e}", file=sys.stderr)

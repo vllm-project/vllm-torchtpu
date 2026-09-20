@@ -17,7 +17,7 @@ import threading
 import time
 import weakref
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import ray
 import vllm.envs as envs
@@ -46,7 +46,7 @@ from vllm_torchtpu.worker.tpu_rank_binding import slice_binding_env
 def get_tpu_bundles_for_indices(
     placement_group,
     bundle_indices: list[int],
-    bundle_to_node_id: Optional[list[tuple[int, str, str]]] = None,
+    bundle_to_node_id: list[tuple[int, str, str]] | None = None,
 ) -> list[tuple[int, str, str]]:
     """Return bundle metadata for the specified bundle indices."""
     if bundle_to_node_id is None:
@@ -98,7 +98,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
         return dp_size, int(dp_rank), world_size * dp_size
 
     def _slice_host_layout(
-            self, device_str: str) -> tuple[list[str], Dict[str, int]]:
+            self, device_str: str) -> tuple[list[str], dict[str, int]]:
         """Return the slice's hosts in rank order and their device counts.
 
         Each DP engine owns a placement group covering only its own chips, so
@@ -577,7 +577,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 "support ray.")
 
         pp_size = self.parallel_config.pipeline_parallel_size
-        placement_group_specs: List[Dict[str, float]] = []
+        placement_group_specs: list[dict[str, float]] = []
 
         ray_nodes = ray.nodes()
         logger.info(f"RayDistributedExecutorV2 | ray_nodes={ray_nodes}")

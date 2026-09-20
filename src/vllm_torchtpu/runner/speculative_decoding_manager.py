@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -44,26 +44,24 @@ class SpeculativeDecodingManager:
     def __init__(self, runner: TPUModelRunner):
         self.runner = runner
         # Cached draft tokens.
-        self._draft_token_ids: Optional[list[list[int]]] = None
+        self._draft_token_ids: list[list[int]] | None = None
         # For async-scheduling: in-flight D2H copy of drafts on device,
         # as (cpu_tensor, ready_event, req_ids snapshot). See
         # stage_draft_token_ids_for_host.
-        self._staged_draft_copy: Optional[tuple[torch.Tensor,
-                                                Optional[torch.Event],
-                                                list[str]]] = None
+        self._staged_draft_copy: tuple[torch.Tensor, torch.Event | None,
+                                       list[str]] | None = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
         # tensors are pure functions of (num_draft_tokens,
         # cu_num_scheduled_tokens, padded_num_reqs), which repeat every decode
         # step at steady state. Only draft_token_ids carries per-step values.
-        self._meta_cache_key: Optional[tuple] = None
-        self._meta_cache: Optional[SpecDecodeMetadata] = None
+        self._meta_cache_key: tuple | None = None
+        self._meta_cache: SpecDecodeMetadata | None = None
         # (logits_indices, target_logits_indices, padded_logits_length) from
         # the cached build — needed to re-extract draft_token_ids on a hit.
-        self._meta_cache_np: Optional[tuple[np.ndarray, np.ndarray,
-                                            int]] = None
+        self._meta_cache_np: tuple[np.ndarray, np.ndarray, int] | None = None
 
-    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._staged_draft_copy is not None:
             # For async scheduling: the engine only asks when a step carries
             # structured-output requests, to swap real drafts into the

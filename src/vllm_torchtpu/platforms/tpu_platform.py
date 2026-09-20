@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Union
 
 import portpicker
 import torch
@@ -123,7 +123,7 @@ _TPU_8I_GENERATIONS = ("v8i", "tpu8i")
 
 def get_tpu_multihost_topology(
     world_size: int,
-    device_name: Optional[str] = None,
+    device_name: str | None = None,
 ) -> str:
     """Return the multi-host mesh topology string for a TPU cluster.
 
@@ -511,7 +511,7 @@ class TpuPlatform(Platform):
         return float(total - free)
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
+    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         return False
 
     @classmethod
@@ -519,7 +519,7 @@ class TpuPlatform(Platform):
         return "vllm_torchtpu.lora.torch_punica_tpu.PunicaWrapperTPU"
 
     @classmethod
-    def get_infinity_values(cls, dtype) -> Tuple[float, float]:
+    def get_infinity_values(cls, dtype) -> tuple[float, float]:
         return torch.finfo(dtype).min, torch.finfo(dtype).max
 
     @classmethod

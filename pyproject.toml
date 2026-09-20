@@ -145,8 +145,38 @@ force-exclude = true
 
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
-# I import sorting. Line length (E501) is in E5 and is not selected.
-select = ["E4", "E7", "E9", "F", "I"]
+# I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
+# G logging calls, ISC string concatenation.
+# Line length (E501) is in E5 and is not selected.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+
+ignore = [
+    # Off on purpose, matching upstream vllm.
+    "B905",   # zip() without an explicit strict=
+    "B007",   # loop control variable not used in the body
+    "UP032",  # .format() that could be an f-string
+
+    # Firing today and not fixed yet. `ruff check --fix` does not clear any of
+    # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
+    # change. Delete the entry once its count reaches zero.
+    "B023",    # 164  closure captures a loop variable
+    "G004",    #  39  f-string passed to a logging call
+    "SIM108",  #  15  if/else that could be a conditional expression
+    "SIM102",  #  13  nested if that could be one
+    "SIM117",  #  12  nested with statements
+    "SIM105",  #  12  try/except/pass that could be contextlib.suppress
+    "UP022",   #   4  subprocess stdout=PIPE, stderr=PIPE
+    "ISC002",  #   3  implicit string concatenation over several lines
+    "SIM401",  #   2  if/else that could be dict.get
+    "SIM103",  #   2  returning a condition through if/else
+    "B904",    #   2  raise inside except without from
+    "UP047",   #   1  generic function that could use PEP 695 syntax
+    "UP040",   #   1  TypeAlias that could be the type statement
+    "UP031",   #   1  printf-style string formatting
+    "SIM115",  #   1  open() outside a context manager
+    "B020",    #   1  loop variable shadows the iterable
+    "B011",    #   1  assert False
+]
 
 [tool.ruff.lint.per-file-ignores]
 # isort and yapf still own these paths. The same list appears in `exclude`

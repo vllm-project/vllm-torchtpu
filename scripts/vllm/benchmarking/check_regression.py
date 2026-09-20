@@ -212,7 +212,7 @@ def load_eval_results(results_dir: Path) -> dict[str, dict]:
     for path in sorted(jsons, key=lambda p: p.stat().st_mtime):
         try:
             with path.open() as fh:
-                data["results"].update((json.load(fh).get("results") or {}))
+                data["results"].update(json.load(fh).get("results") or {})
         except (OSError, json.JSONDecodeError) as e:
             print(f"Warning: failed to parse {path}: {e}", file=sys.stderr)
 

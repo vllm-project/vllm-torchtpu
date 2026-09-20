@@ -1593,7 +1593,7 @@ def _mla_ragged_paged_attention_kernel(
         old_bo_idx = bo_ids_ref[bo_sem_idx + 2]
 
         @pl.when(
-            jnp.logical_and(0 <= old_batch_start_seq_idx,
+            jnp.logical_and(old_batch_start_seq_idx >= 0,
                             old_batch_start_seq_idx <= batch_start_seq_idx))
         def _():
             _send_bo(old_batch_start_seq_idx,

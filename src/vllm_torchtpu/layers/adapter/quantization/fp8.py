@@ -40,7 +40,7 @@ the blockwise Pallas kernel path instead.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -424,7 +424,7 @@ def _quantize_and_format_moe_weights(
 def _process_fp8_moe_weights(
     layer: RoutedExperts,
     *,
-    weight_block_size: Optional[tuple[int, int]] = None,
+    weight_block_size: tuple[int, int] | None = None,
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
            | None]:
@@ -615,7 +615,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         return FP8
 
     @classmethod
-    def from_config(cls, config: dict) -> "VllmFp8Config":
+    def from_config(cls, config: dict) -> VllmFp8Config:
         weight_block_size = config.get("weight_block_size")
         activation_scheme = config.get("activation_scheme", "dynamic")
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
@@ -645,7 +645,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[QuantizeMethodBase]:
+    ) -> QuantizeMethodBase | None:
         if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
                     prefix=prefix,
@@ -1206,7 +1206,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+              bias: torch.Tensor | None = None) -> torch.Tensor:
         weight = layer.weight
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`

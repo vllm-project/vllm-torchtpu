@@ -175,4 +175,4 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert HASH_IGNORED_ADDITIONAL_CONFIG_KEYS == {KEY, PREFILL_KEY}
+    assert {KEY, PREFILL_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS

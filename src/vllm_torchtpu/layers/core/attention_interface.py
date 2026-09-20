@@ -1,6 +1,7 @@
 import functools
 import math
-from typing import Any, Callable, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -63,7 +64,7 @@ sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attent
 def sharded_flash_attention(
     mesh: Mesh,
     causal: bool = True,
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
     vmem_limit_bytes: int | None = None,
 ) -> Callable[..., Any]:
     in_specs = (
@@ -93,7 +94,7 @@ def sharded_flash_attention(
 
 def sharded_paged_attention(
     mesh: Mesh,
-    attn_logits_soft_cap: Optional[float] = None,
+    attn_logits_soft_cap: float | None = None,
 ) -> Callable[..., Any]:
     """Shards GQA PagedAttention along KV heads."""
     in_specs = (
@@ -198,7 +199,7 @@ def update_cache(
 
     B, K, T, H = operand.shape
     K_c, L, S, H = cache.shape
-    assert K == K_c
+    assert K_c == K
     # NOTE: The cache updating is pretty tricky:
     # 1. The random access updating cache is not as performant as the slice updating.
     #    If the random access is necessary, make sure the indexing count is as small as possible.
@@ -212,7 +213,7 @@ def update_cache(
     # We reshape the cache so that we can update the cache in token wise, which only requires the token indices (block_id + offset).
     if is_prefill:
         # In the case of sliding window, we should select sliding_window tokens from actual prompt, not from the padded tokens.
-        if sliding_window and T > sliding_window:
+        if sliding_window and sliding_window < T:
             assert B == 1
             start_index = jax.lax.max(0, prefill_seq_len - sliding_window)
             operand = jax.lax.dynamic_slice_in_dim(
@@ -254,7 +255,7 @@ def apply_splash(q, k, v, window_size, attn_logits_soft_cap,
         mask_lib.LocalMask((q_seq_len, kv_seq_len), (window_size, 0),
                            kv_seq_len - q_seq_len) for _ in range(num_heads)
     ]
-    mask = mask_lib.MultiHeadMask(tuple((m for m in masks)))
+    mask = mask_lib.MultiHeadMask(tuple(m for m in masks))
     block_sizes = splash.BlockSizes.get_default()
 
     if is_mqa:
@@ -275,8 +276,8 @@ def apply_splash(q, k, v, window_size, attn_logits_soft_cap,
 
 def sharded_splash_attention(
     mesh: Mesh,
-    window_size: Optional[int] = None,
-    attn_logits_soft_cap: Optional[float] = None,
+    window_size: int | None = None,
+    attn_logits_soft_cap: float | None = None,
     is_mqa: bool = False,
 ) -> Callable[..., Any]:
     in_specs = (
@@ -440,7 +441,7 @@ def attention_bundled(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     use_causal_mask: bool = True,
-) -> Tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     """Dispatches ragged paged attention over the bundled block-major KV cache across the TPU mesh.
 
     Args:
@@ -547,7 +548,7 @@ def attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
-) -> Tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
     # K: num_kv_heads
@@ -610,7 +611,7 @@ def mla_attention(q_TNA: jax.Array,
                   k_scale: float | None = None,
                   v_scale: float | None = None,
                   sm_scale: float | None = None,
-                  use_causal_mask: bool = True) -> Tuple[jax.Array, jax.Array]:
+                  use_causal_mask: bool = True) -> tuple[jax.Array, jax.Array]:
     """Main shared interface for Multi-Head Latent Attention (MLA).
 
     Computes sharded MLA paged attention and applies in-place KV cache updates across

@@ -999,7 +999,7 @@ def derive_offload_namespace(
         num_kv_cache_groups: int,
         num_kv_cache_tensors: int,
         cp_geometry: tuple[int, ...] = (),
-        block_major_contract: "BlockMajorContract | None" = None) -> bytes:
+        block_major_contract: BlockMajorContract | None = None) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and registry key.
 
     Ensures cache keys never collide across incompatible engine deployments by

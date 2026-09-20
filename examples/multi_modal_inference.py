@@ -16,7 +16,7 @@ python examples/multi_modal_inference.py \
 
 from contextlib import contextmanager
 from dataclasses import asdict
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.image import ImageAsset
@@ -27,7 +27,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 class ModelRequestData(NamedTuple):
     engine_args: EngineArgs
     prompts: list[str]
-    stop_token_ids: Optional[list[int]] = None
+    stop_token_ids: list[int] | None = None
 
 
 # Currently Qwen2.5-VL is the only supported multi-modal

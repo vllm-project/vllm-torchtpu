@@ -52,7 +52,6 @@ import functools
 import gc
 import os
 from collections.abc import Generator
-from typing import Optional
 
 import torch
 
@@ -80,7 +79,7 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
 
 
 def _should_skip_weight_tpu(name: str,
-                            local_expert_ids: Optional[set[int]]) -> bool:
+                            local_expert_ids: set[int] | None) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
@@ -93,7 +92,7 @@ def _should_skip_weight_tpu(name: str,
     return _should_skip(name, local_expert_ids)
 
 
-def _compute_local_expert_ids() -> Optional[set[int]]:
+def _compute_local_expert_ids() -> set[int] | None:
     """Local expert ids for this rank, or None when filtering is off.
 
     Mirrors ``DefaultModelLoader._init_ep_weight_filter`` (vLLM 0.26) so the
@@ -181,7 +180,7 @@ def _sharded_runai_weights_iterator(
         kept = skipped = 0
         kept_bytes = skipped_bytes = 0
 
-        run_start: Optional[int] = None
+        run_start: int | None = None
         run_sizes: list[int] = []
         run_tensors: list = []
 
@@ -285,8 +284,7 @@ def patch_runai_sharded_expert_streaming() -> None:
         return
     original_get_iterator = rsl.RunaiModelStreamerLoader._get_weights_iterator
 
-    def _get_weights_iterator(self, model_or_path: str,
-                              revision: Optional[str]):
+    def _get_weights_iterator(self, model_or_path: str, revision: str | None):
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:

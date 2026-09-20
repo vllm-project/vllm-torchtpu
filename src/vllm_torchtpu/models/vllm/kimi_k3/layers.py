@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from functools import lru_cache
+from functools import cache
 from unittest.mock import patch
 
 import jax
@@ -24,7 +24,7 @@ from vllm_torchtpu import envs
 from .collective_ops import TokenShardCollectives
 
 
-@lru_cache(maxsize=None)
+@cache
 def _build_attention_residual_op(eps: float):
     from torch_tpu._internal import pallas
 

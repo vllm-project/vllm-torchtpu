@@ -2095,10 +2095,10 @@ class TestTPURaidenConnectorWorker:
                         create=True), patch(
                             f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
                             "",
-                            create=True):
-            with pytest.raises(ValueError,
-                               match="TPU_RAIDEN_CONTROLLER_ADDRESS"):
-                worker.register_runner(runner)
+                            create=True), pytest.raises(
+                                ValueError,
+                                match="TPU_RAIDEN_CONTROLLER_ADDRESS"):
+            worker.register_runner(runner)
 
     def test_stage3_manager_owns_listener_and_uses_pcp_rank_endpoint(self):
         worker = _make_raiden_worker(tp_rank=0,

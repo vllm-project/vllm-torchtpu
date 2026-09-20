@@ -49,7 +49,7 @@ class DSparkProposer(DFlashProposer):
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
         block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and K != int(block):
+        if block is not None and int(block) != K:
             raise ValueError(
                 f"num_speculative_tokens={K} does not match the DSpark "
                 f"checkpoint's block size {block}; the block/Markov-head "

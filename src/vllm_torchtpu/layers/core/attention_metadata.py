@@ -39,7 +39,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
 @dataclass
-class AttentionMetadata(object):
+class AttentionMetadata:
     # (padded_total_num_scheduled_tokens,)
     input_positions: jax.Array
     # (max_num_seqs * max_num_blocks_per_req,)
@@ -233,7 +233,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             device="cpu")
 
     def _mamba_row_plan(
-        self, ctx: "AttentionMetadataBuilderContext", target_num_blocks: int
+        self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Row offsets into a mamba block table, cached and shared across groups.
 
@@ -277,7 +277,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         return plan
 
     def _block_table_geometry(
-            self, ctx: "AttentionMetadataBuilderContext") -> tuple[Any, int]:
+            self, ctx: AttentionMetadataBuilderContext) -> tuple[Any, int]:
         """The (block_table_obj, target_num_blocks) this group's build() uses.
 
         Shared with `stage_block_table_uploads`, which must pack each group's

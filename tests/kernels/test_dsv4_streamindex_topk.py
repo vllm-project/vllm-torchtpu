@@ -1050,7 +1050,7 @@ def _fragmented_pages(num_seqs, pages_per_seq=4):
         for i in range(num_seqs))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _chunk_inputs(T_list, block_table_list, page_size, H_I, D) -> _ChunkInputs:
     """Randomized fp8-packed cache and queries for one chunked geometry.
 

@@ -106,9 +106,8 @@ def test_force_draft_tp1_restores_on_exception():
     fake_tp = SimpleNamespace(world_size=4, rank_in_group=2)
     with mock.patch("vllm.distributed.parallel_state.get_tp_group",
                     return_value=fake_tp):
-        with pytest.raises(RuntimeError):
-            with _force_draft_tp1():
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError), _force_draft_tp1():
+            raise RuntimeError("boom")
         assert fake_tp.world_size == 4
         assert fake_tp.rank_in_group == 2
 

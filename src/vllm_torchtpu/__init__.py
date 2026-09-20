@@ -948,7 +948,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
         module = sys.modules.get(module_name)
         if module is not None:
-            setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
+            module.resolve_kv_cache_block_sizes = patched_resolve
 
     # Upstream _promote_local_kv_cache_specs asserts that all workers share a
     # uniform KV cache spec across groups, raising ValueError when encountering
@@ -975,7 +975,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             mod = sys.modules.get(module_name)
             if mod is not None and hasattr(mod,
                                            "_promote_local_kv_cache_specs"):
-                setattr(mod, "_promote_local_kv_cache_specs", patched_promote)
+                mod._promote_local_kv_cache_specs = patched_promote
 
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = (
@@ -1041,8 +1041,8 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     for mod_name, mod in list(sys.modules.items()):
         if mod_name.startswith("vllm.model_executor.models") and hasattr(
                 mod, "_merge_multimodal_embeddings"):
-            if getattr(mod, "_merge_multimodal_embeddings") is not patched_fn:
-                setattr(mod, "_merge_multimodal_embeddings", patched_fn)
+            if mod._merge_multimodal_embeddings is not patched_fn:
+                mod._merge_multimodal_embeddings = patched_fn
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:

@@ -658,7 +658,7 @@ class VllmTPUMLAAttention(MLAAttention):
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
-        for key in kv_b_proj_params.keys():
+        for key in kv_b_proj_params:
             if key in self.kv_b_proj._parameters:
                 self.kv_b_proj._parameters[key] = None
             elif hasattr(self.kv_b_proj, key):

@@ -28,8 +28,6 @@ its workers (multiproc and Ray multi-host); build 155 failed on the Ray
 path's own copy of this logic, which still demanded exact agreement.
 """
 
-from typing import Optional
-
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -39,8 +37,8 @@ _NUM_BLOCKS_OVERRIDE_REL_TOL = 0.005
 
 
 def reconcile_num_gpu_blocks_override(
-        worker_overrides: list[Optional[int]],
-        workers_per_stage: Optional[int] = None) -> Optional[int]:
+        worker_overrides: list[int | None],
+        workers_per_stage: int | None = None) -> int | None:
     """Return the agreed block-count override, or None if no worker set one.
 
     Raises ValueError when the spread across workers exceeds both the

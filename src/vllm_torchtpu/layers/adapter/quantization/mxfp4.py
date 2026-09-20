@@ -45,7 +45,7 @@ scaling.
    - Returns output tensor
 """
 
-from typing import Any, Optional
+from typing import Any
 
 import jax.numpy as jnp
 import torch
@@ -102,7 +102,7 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[QuantizeMethodBase]:
+    ) -> QuantizeMethodBase | None:
         """
         Return the appropriate quantization method for a layer.
 
@@ -269,7 +269,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     def get_fused_moe_quant_config(
         self,
         layer: torch.nn.Module,
-    ) -> Optional[FusedMoEQuantConfig]:
+    ) -> FusedMoEQuantConfig | None:
         return mxfp4_w4a16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
@@ -284,7 +284,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        input_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = self._tpu_activation_str
@@ -627,7 +627,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        input_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep, fused_moe_ep_supported, score_bias_operand)

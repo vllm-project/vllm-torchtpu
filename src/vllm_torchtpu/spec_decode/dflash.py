@@ -43,7 +43,7 @@ class DFlashProposer:
 
     def __init__(
         self,
-        runner: "TPUModelRunner",
+        runner: TPUModelRunner,
         vllm_config: VllmConfig,
     ):
         self.runner = runner
@@ -90,9 +90,8 @@ class DFlashProposer:
                                                          torch.Tensor]] = {}
         # Keyed by (num_tokens, num_reqs, num_blocks); one entry per replay
         # shape, see `_dummy_kv_update_inputs`.
-        self._dummy_kv_input_cache: dict[tuple,
-                                         tuple[list[torch.Tensor],
-                                               "AttentionMetadata"]] = {}
+        self._dummy_kv_input_cache: dict[tuple, tuple[list[torch.Tensor],
+                                                      AttentionMetadata]] = {}
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
@@ -375,8 +374,8 @@ class DFlashProposer:
 
     def _build_draft_layer_metadata(
         self,
-        attn_metadata: dict[str, "AttentionMetadata"],
-    ) -> tuple["AttentionMetadata", ...]:
+        attn_metadata: dict[str, AttentionMetadata],
+    ) -> tuple[AttentionMetadata, ...]:
         """Per-layer metadata for the draft's KV write, in layer order.
 
         `attn_metadata` is the *target's* full per-layer dict, so a draft layer
@@ -591,7 +590,7 @@ class DFlashProposer:
         num_tokens: int,
         num_reqs: int,
         num_blocks: int,
-    ) -> tuple[list[torch.Tensor], "AttentionMetadata"]:
+    ) -> tuple[list[torch.Tensor], AttentionMetadata]:
         """Cached `(aux hidden list, metadata)` for one KV-update shape;
         `(num_reqs, num_blocks)` is the target chunk's block-table geometry.
         """
@@ -797,7 +796,7 @@ class DFlashProposer:
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor]
         | torch.Tensor,
         positions: torch.Tensor,
-        draft_md_tuple: tuple["AttentionMetadata", ...],
+        draft_md_tuple: tuple[AttentionMetadata, ...],
     ) -> torch.Tensor:
         """
         Projects target model hidden states directly into the draft model's KV space.
