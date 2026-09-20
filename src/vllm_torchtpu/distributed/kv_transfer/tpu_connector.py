@@ -63,6 +63,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 # (TPUConnectorWorker), not by the Raiden connector.
 from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
     ZmqShmKvConnectorBase, _CoordRecvEntry, _CoordSendEntry)
+from vllm_torchtpu.kernels.gdn.head_geometry import (GdnHeadGeometry,
+                                                     derive_gdn_head_geometry)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import synchronize_tensors
@@ -350,6 +352,17 @@ def _raiden_dst_shards() -> int:
     if shards <= 0:
         raise ValueError("TPU_RAIDEN_DST_SHARDS must be positive")
     return shards
+
+
+def _raiden_dst_dcp_size(vllm_config: VllmConfig) -> int:
+    """Destination geometry needed before the producer publishes its spans."""
+    degree = int(
+        _get_extra_config(vllm_config).get(
+            "destination_decode_context_parallel_size", 1))
+    if degree <= 0 or _raiden_dst_shards() % degree:
+        raise ValueError(
+            "destination DCP size must divide destination TP size")
+    return degree
 
 
 def _reshard_advertise_host() -> str:
@@ -1207,6 +1220,18 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             raise ValueError(
                 "Stage-3 source transfer parallelism must be positive")
 
+        tp_size = int(self.vllm_config.parallel_config.tensor_parallel_size)
+        dcp_size = int(
+            self.vllm_config.parallel_config.decode_context_parallel_size)
+        if (int(params.get("dst_tp_size", 0)) != tp_size
+                or int(params.get("dst_dcp_size", 0)) != dcp_size):
+            raise ValueError(
+                "Stage-3 metadata requires explicit matching destination "
+                "TP/DCP geometry for the producer's registered spans")
+        # One scheduler block covers this many global tokens, although each
+        # worker allocates only block_size local token slots.
+        logical_block_tokens = self.block_size * dcp_size
+
         grouped_block_ids = blocks.get_block_ids()
         if self._stage3_fa_group_index >= len(grouped_block_ids):
             raise ValueError(
@@ -1214,8 +1239,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"index={self._stage3_fa_group_index}, "
                 f"groups={len(grouped_block_ids)}")
         local_block_ids = list(grouped_block_ids[self._stage3_fa_group_index])
-        expected_pages = ((num_tokens + self.block_size - 1) //
-                          self.block_size)
+        expected_pages = ((num_tokens + logical_block_tokens - 1) //
+                          logical_block_tokens)
         if len(local_block_ids) != expected_pages:
             raise ValueError(
                 "Stage-3 FA resharding requires the complete destination "
@@ -1233,14 +1258,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # Partial local prefix hit: pull only the suffix, and only into
             # the trailing (newly allocated) pages — the leading adopted
             # cache pages are shared and must never be transfer targets.
-            if skip_tokens % self.block_size != 0:
+            if skip_tokens % logical_block_tokens != 0:
                 raise ValueError(
                     "Prefix hits must be destination-page aligned: "
                     f"skip_tokens={skip_tokens}, "
                     f"page_tokens={self.block_size}")
-            prefix_pages = skip_tokens // self.block_size
-            suffix_pages = ((external_tokens + self.block_size - 1) //
-                            self.block_size)
+            prefix_pages = skip_tokens // logical_block_tokens
+            suffix_pages = ((external_tokens + logical_block_tokens - 1) //
+                            logical_block_tokens)
             if prefix_pages + suffix_pages != expected_pages:
                 raise ValueError("Suffix page arithmetic is inconsistent: "
                                  f"prefix_pages={prefix_pages}, "
@@ -1448,9 +1473,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     "Stage-3 pipeline producer transfer parallelism must "
                     f"equal PP size: parallelism={src_parallelism}, "
                     f"pp_size={pp_size}")
-        elif src_parallelism != pcp_size:
+        elif src_parallelism != pcp_size * int(
+                parallel_config.tensor_parallel_size):
             raise ValueError(
-                "Stage-3 producer transfer parallelism must equal PCP size: "
+                "Stage-3 producer transfer parallelism must equal PCP * TP size: "
                 f"parallelism={src_parallelism}, pcp_size={pcp_size}")
         if src_data_replica_idx < 0:
             raise ValueError(
@@ -1501,6 +1527,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "src_engine_id": src_engine_id,
             "src_data_replica_idx": src_data_replica_idx,
             "src_parallelism": src_parallelism,
+            "dst_tp_size": _raiden_dst_shards(),
+            "dst_dcp_size": _raiden_dst_dcp_size(self.vllm_config),
         }
         self._stage3_finished_sends[request.request_id] = (
             uuid,
@@ -1535,7 +1563,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return int(parallel_config.tensor_parallel_size or 1)
         if _engine_is_pipeline(self.vllm_config):
             return _pipeline_parallel_size(self.vllm_config)
-        return int(parallel_config.prefill_context_parallel_size or 1)
+        return (int(parallel_config.prefill_context_parallel_size or 1) *
+                int(parallel_config.tensor_parallel_size or 1))
 
 
 class TPURaidenConnectorWorker:
@@ -1755,6 +1784,12 @@ class TPURaidenConnectorWorker:
             return
 
         stage3_enabled = self._raiden_stage3_enabled()
+        topology = self._raiden_hybrid_admission_topology()
+        head_geometry = None if self._stage3_kimi else self._gdn_head_geometry(
+        )
+        if stage3_enabled and self.is_producer and head_geometry is not None:
+            self._validate_gdn_transfer_geometry(head_geometry)
+            _raiden_dst_dcp_size(self.vllm_config)
         controller_address = ""
         if stage3_enabled:
             self._maybe_host_reshard_store()
@@ -1768,7 +1803,6 @@ class TPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.kv_transfer.raiden import \
             pool_manifest as rpm
 
-        topology = self._raiden_hybrid_admission_topology()
         role = "kv_producer" if self.is_producer else "kv_consumer"
         named_kv_caches = self.named_kv_caches
         if not named_kv_caches:
@@ -1799,11 +1833,10 @@ class TPURaidenConnectorWorker:
         if self._stage3_kimi:
             manifest = rpm.build_kimi_k3_pool_manifest(**manifest_args)
         else:
+            assert head_geometry is not None
             gdn_geometry = rpm.GdnHeadGeometry(
-                local_key_heads=self._local_gdn_head_count(
-                    self._model_config_int("linear_num_key_heads", 0)),
-                local_value_heads=self._local_gdn_head_count(
-                    self._model_config_int("linear_num_value_heads", 0)),
+                local_key_heads=head_geometry.local_num_kq_heads,
+                local_value_heads=head_geometry.local_num_v_heads,
                 key_head_dim=self._model_config_int("linear_key_head_dim", 1),
                 value_head_dim=self._model_config_int(
                     "linear_value_head_dim",
@@ -2102,10 +2135,10 @@ class TPURaidenConnectorWorker:
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
             or 1)
-        if transfer_parallelism != pcp_size:
+        if transfer_parallelism != pcp_size * self.tp_size:
             raise ValueError(
                 "Producer transfer parallelism must equal the complete "
-                "PCP rank count: "
+                "PCP * TP rank count: "
                 f"parallelism={transfer_parallelism}, pcp_size={pcp_size}")
 
     @staticmethod
@@ -2146,9 +2179,16 @@ class TPURaidenConnectorWorker:
             return int(self.tp_rank)
         if _uses_tp_stage3_source(self.vllm_config):
             return int(self.tp_rank)
-        from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
+        from vllm_torchtpu.distributed.pcp import (get_pcp_cache_rank,
+                                                   get_pcp_rank)
 
-        return int(get_pcp_cache_rank())
+        if self.tp_size == 1:
+            return int(get_pcp_cache_rank())
+        # A work-unit identity enumerates workers, not GDN head shards. FA
+        # lowering consumes PCP and TP coordinates separately; GDN uses the
+        # transposed (TP, PCP) head order. Include both axes here so TP peers
+        # cannot overwrite each other's source registration.
+        return int(get_pcp_rank()) * self.tp_size + self.tp_rank
 
     def _raiden_engine_id(self) -> str:
         env_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
@@ -2402,6 +2442,14 @@ class TPURaidenConnectorWorker:
         tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
         pp_size = _pipeline_parallel_size(self.vllm_config)
+        if _raiden_seq_on_lane_layout() and dp_size == pp_size == 1:
+            dcp_size = int(parallel_config.decode_context_parallel_size)
+            if dcp_size <= 0 or tp_size % dcp_size:
+                raise ValueError("DCP size must divide TP size")
+            if self.is_producer and tp_size > 1 and dcp_size == 1:
+                return f"pcp{pcp_size}tp{tp_size}_prefill"
+            if not self.is_producer and pcp_size == 1 and tp_size > 1:
+                return f"tp{tp_size}dcp{dcp_size}_decode"
         if self.is_producer:
             if (tp_size == 1 and pcp_size == 1 and dp_size == 1
                     and pp_size in (2, 4, 8)):
@@ -2466,23 +2514,35 @@ class TPURaidenConnectorWorker:
                              f"tp_size={tp_size}")
         return total_heads // tp_size
 
-    def _local_gdn_head_count(self, total_heads: int) -> int:
-        """Return the GDN head count stored by this TP/PCP worker.
-
-        GDN cache specs are localized across PCP as well as TP.  Full-
-        attention head geometry is only TP-local, so keep this adjustment
-        specific to GDN admission.
-        """
-        tp_local_heads = self._local_head_count(total_heads)
-        if tp_local_heads <= 0:
-            return 0
+    def _gdn_head_geometry(self) -> GdnHeadGeometry:
+        """Use the compute path's QK replication and V-head ownership."""
         parallel_config = self.vllm_config.parallel_config
-        pcp_size = int(parallel_config.prefill_context_parallel_size)
-        if tp_local_heads % pcp_size:
+        degree = (int(parallel_config.prefill_context_parallel_size or 1) *
+                  int(parallel_config.tensor_parallel_size or self.tp_size))
+        return derive_gdn_head_geometry(
+            self._model_config_int("linear_num_key_heads", 0),
+            self._model_config_int("linear_num_value_heads", 0), degree)
+
+    def _validate_gdn_transfer_geometry(self, source: GdnHeadGeometry) -> None:
+        """Reject state mappings the byte-span lowering cannot represent."""
+        destination = derive_gdn_head_geometry(source.num_kq_heads,
+                                               source.num_v_heads,
+                                               _raiden_dst_shards())
+        # The current lowerer concatenates source regions for fan-in, or
+        # splits a full-width source for fan-out. Neither operation removes
+        # or creates Q/K replicas, unlike logical head-based resharding.
+        if source.kq_replication_factor != destination.kq_replication_factor:
             raise ValueError(
-                f"TP-local GDN heads={tp_local_heads} must be divisible by "
-                f"pcp_size={pcp_size}")
-        return tp_local_heads // pcp_size
+                "GDN state transfer cannot change Q/K replication: "
+                f"source={source.kq_replication_factor}, "
+                f"destination={destination.kq_replication_factor}")
+        if (source.parallel_size != 1
+                and source.parallel_size % destination.parallel_size):
+            raise ValueError(
+                "GDN destination shards must divide producer parallelism "
+                "unless the producer holds the full state: "
+                f"source={source.parallel_size}, "
+                f"destination={destination.parallel_size}")
 
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,
@@ -2601,8 +2661,8 @@ class TPURaidenConnectorWorker:
         # spans are lowered as a single contiguous owner, and the layer
         # subset is expressed through per-layer pool tags instead.
         pipeline = _engine_is_pipeline(self.vllm_config)
-        lowering_parallelism = 1 if pipeline else parallelism
-        lowering_rank = 0 if pipeline else transfer_rank
+        lowering_parallelism = 1 if pipeline else parallelism // self.tp_size
+        lowering_rank = 0 if pipeline else transfer_rank // self.tp_size
 
         now = time.perf_counter()
         expired_terminal_req_ids = [
@@ -2676,9 +2736,14 @@ class TPURaidenConnectorWorker:
                         self._raiden_manifest),
                     dst_shards=dst_shards,
                     block_ids=list(local_ids),
+                    producer_tp_size=self.tp_size,
+                    producer_tp_rank=self.tp_rank,
+                    total_kv_heads=self._model_config_int(
+                        "num_key_value_heads", 0),
+                    dst_dcp_size=_raiden_dst_dcp_size(self.vllm_config),
                 )
             else:
-                if dst_shards != 1:
+                if dst_shards != 1 or self.tp_size != 1:
                     raise ValueError(
                         "TPU_RAIDEN_DST_SHARDS > 1 requires the seq-along-lane "
                         "FA layout (head shards are not placement-exact on "
@@ -2768,7 +2833,7 @@ class TPURaidenConnectorWorker:
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
             )
-            if not local_ids:
+            if not any(reg.spans for reg in pool_spans):
                 # This PCP rank owns no physical page for the request. It has
                 # nevertheless published an empty D5 entry so controller
                 # lookup sees the complete source unit set, and is terminal
@@ -3145,12 +3210,15 @@ class TPURaidenConnectorWorker:
                 "GDN state registration group count disagrees with the "
                 f"manifest: blocks={len(mamba_state_block_ids)}, "
                 f"groups={self._stage3_state_group_count}")
-        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
-            lower_gdn_state_shard_spans, lower_kda_state_shard_spans)
+        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
+            lower_kda_state_shard_spans
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             EXPECTED_FA_MINOR_TO_MAJOR, EXPECTED_FA_TILES)
         from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
             BINDING_ALIASED_RAW
+        from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (
+            SOL_LAYOUT_TOKEN, lower_gdn_state_shard_spans_sol,
+            sol_fa_geometry_from_manifest)
 
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
         if aliased_raw and not self._stage3_kimi:
@@ -3177,6 +3245,14 @@ class TPURaidenConnectorWorker:
                     "aliased raw GDN lowering is unsupported for the "
                     "admitted physical layout")
 
+        physical_granule = 1024
+        if _raiden_seq_on_lane_layout() and not self._stage3_kimi:
+            if aliased_raw and payload.get("fa_kv_layout") != SOL_LAYOUT_TOKEN:
+                raise RuntimeError(
+                    "HND GDN spans require an HND layout fingerprint")
+            geometry = sol_fa_geometry_from_manifest(self._raiden_manifest)
+            physical_granule = geometry.packing * geometry.page_tokens
+
         registrations = []
         for exact_tag, ordinal in self._stage3_state_registration_tags():
             block_id = mamba_state_block_ids[ordinal]
@@ -3186,8 +3262,8 @@ class TPURaidenConnectorWorker:
                     if str(getattr(pool, "tag", "")) == exact_tag)
                 if any(
                         int(pool.base_offset_bytes) %
-                        1024 or int(pool.block_stride_bytes) % 1024
-                        for pool in matching_pools):
+                        physical_granule or int(pool.block_stride_bytes) %
+                        physical_granule for pool in matching_pools):
                     raise RuntimeError(
                         "aliased raw GDN pool base and block stride must "
                         f"be physical-token aligned ({exact_tag})")
@@ -3204,20 +3280,16 @@ class TPURaidenConnectorWorker:
                     regions=self._stage3_state_regions(exact_tag),
                 )
             else:
-                lowering = lower_gdn_state_shard_spans
-                shard_kwargs = {}
-                if _raiden_dst_shards() > 1:
-                    from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import \
-                        lower_gdn_state_shard_spans_sol
-                    lowering = lower_gdn_state_shard_spans_sol
-                    shard_kwargs["dst_shards"] = _raiden_dst_shards()
-                registration = lowering(
+                registration = lower_gdn_state_shard_spans_sol(
                     tag=exact_tag,
                     block_id=int(block_id),
                     transfer_rank=transfer_rank,
                     parallelism=parallelism,
                     regions=self._stage3_state_regions(exact_tag),
-                    **shard_kwargs,
+                    dst_shards=_raiden_dst_shards(),
+                    producer_tp_size=self.tp_size,
+                    producer_tp_rank=self.tp_rank,
+                    physical_granule_bytes=physical_granule,
                 )
             if registration.declared_bytes != admitted_live_bytes:
                 raise RuntimeError(
@@ -3466,7 +3538,8 @@ class TPURaidenConnectorWorker:
         if self._raiden_work_unit is None:
             raise RuntimeError(
                 "Stage-3 destination work unit is not registered")
-        tp_group = get_tp_group() if self._stage3_sharded_consumer() else None
+        tp_group = self._stage3_tp_group() if self._stage3_sharded_consumer(
+        ) else None
 
         for destination_req_id, req_meta in metadata.reqs_to_load.items():
             if not isinstance(req_meta, _Stage3LoadMeta):
@@ -4083,7 +4156,7 @@ class TPURaidenConnectorWorker:
         transfer units and keep per-worker submits."""
         if self._stage3_kimi:
             return int(self.tp_size) > 1 and not self.is_producer
-        return (int(self.tp_size) == 2 and not self.is_producer
+        return (int(self.tp_size) > 1 and not self.is_producer
                 and not _use_raiden_glm_admission())
 
     @staticmethod
@@ -4135,7 +4208,6 @@ class TPURaidenConnectorWorker:
             # dispatch). Actual byte completion is deliberately *not*
             # inferred from that acknowledgement; get_finished polls the
             # local manager.
-            controller_contacted = True
             # ONE transfer carries every replicated cache class; tag
             # order fixes the H2D order ranks executor-side (the first
             # tag = group 0 uploads first). Each tag replays over the
@@ -4171,11 +4243,19 @@ class TPURaidenConnectorWorker:
                 if _raiden_seq_on_lane_layout():
                     from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
                         sol_fa_geometry_from_manifest, sol_fa_skip_bytes)
+                    dcp_size = int(self.vllm_config.parallel_config.
+                                   decode_context_parallel_size)
+                    if skip_tokens % (
+                            int(self.vllm_config.cache_config.block_size) *
+                            dcp_size):
+                        raise ValueError(
+                            "DCP prefix must cover whole scheduler blocks")
                     fa_skip_bytes = sol_fa_skip_bytes(
-                        skip_tokens,
+                        skip_tokens // dcp_size,
                         geometry=sol_fa_geometry_from_manifest(
                             self._raiden_manifest),
-                        dst_shards=int(self.tp_size))
+                        # This manifest already describes local TP heads.
+                        dst_shards=1)
                 else:
                     token_bytes = self._stage3_fa_token_bytes(
                         int(self.vllm_config.cache_config.block_size))
@@ -4184,6 +4264,7 @@ class TPURaidenConnectorWorker:
                     [fa_skip_bytes] * fa_tag_count + [0] *
                     (len(transfer_tags) - fa_tag_count))
             start_submit = time.perf_counter()
+            controller_contacted = True
             accepted = self._start_stage3_transfer_with_d5_retry(
                 source_facade,
                 src_units=src_units,

@@ -285,6 +285,21 @@ def sol_fa_skip_bytes(skip_tokens: int, *, geometry: SolFaGeometry,
             geometry.page_tokens) * geometry.shard_bytes(dst_shards)
 
 
+def _tp_head_range(heads: int, degree: int, rank: int) -> tuple[int, int]:
+    """Global KV-head interval, including TP replication when heads < TP."""
+    if heads <= 0 or degree <= 0:
+        raise SeqOnLaneError("head count and TP degree must be positive")
+    if not 0 <= rank < degree:
+        raise SeqOnLaneError(f"TP rank {rank} is outside degree {degree}")
+    unique = min(heads, degree)
+    if heads % unique or degree % unique:
+        raise SeqOnLaneError(
+            f"KV heads and TP degree must divide evenly: {heads=}, {degree=}")
+    width = heads // unique
+    start = (rank // (degree // unique)) * width
+    return start, start + width
+
+
 def lower_fa_spans_sol(
     *,
     num_tokens: int,
@@ -295,21 +310,32 @@ def lower_fa_spans_sol(
     geometry: SolFaGeometry,
     dst_shards: int,
     block_ids: Sequence[int],
+    producer_tp_size: int = 1,
+    producer_tp_rank: int = 0,
+    total_kv_heads: int | None = None,
+    dst_dcp_size: int = 1,
 ) -> PoolSpanRegistration:
-    """Lower PCP ownership to seq-on-lane byte spans: one span per owned
-    kernel page per destination shard.
+    """Intersect source PCP/TP and destination TP/DCP ownership in HND.
 
     Source: the rank's owned chunks (``pcp_layout``) packed dense rank-major
-    at kernel-page granularity over a prefix of its manager blocks. Shard
-    ``d`` of a source kernel page is the contiguous ``shard_bytes`` run at
-    ``d * shard_bytes`` (KV heads ``[d*H/S, (d+1)*H/S)``). Destination: the
-    shard's request-global compact byte space (``dst_space_version=1``;
-    ``shard_bytes`` per kernel page), which the planner splits at the
-    destination's page live bytes. The last owned kernel page ships whole
+    at kernel-page granularity over a prefix of its manager blocks. The
+    intersection of source and destination heads is contiguous inside each
+    kernel page. Destination offsets address rank-local compact byte space
+    (``dst_space_version=1``), which the planner splits at the destination's
+    manager page boundaries. The last owned kernel page ships whole
     even when the request ends inside it (lanes past the request are never
     read before later tokens rewrite them).
 
     ``page_tokens`` is the manager block (a whole number of kernel pages).
+    ``dst_shards`` counts destination TP workers, including DCP lanes. DCP
+    groups are contiguous TP ranks holding identical KV heads. Global page
+    j goes to lane j % DCP at compact local page j // DCP. Replicated source
+    KV heads are sent by the first TP replica only; the other replicas still
+    register their local bytes and participate in GDN state transfer.
+
+    TP1/DCP1 use the same ownership intersection. total_kv_heads is required
+    for a TP producer because its local shape cannot distinguish sharding
+    from replication.
     """
     if num_tokens <= 0:
         raise SeqOnLaneError("num_tokens must be positive")
@@ -327,7 +353,26 @@ def lower_fa_spans_sol(
         raise SeqOnLaneError(
             "seq-on-lane manager page must be a whole number of kernel "
             f"pages: page_tokens={page_tokens}, kernel_page={kp_tokens}")
-    shard_bytes = geometry.shard_bytes(dst_shards)
+    heads = (geometry.num_kv_heads *
+             producer_tp_size if total_kv_heads is None else total_kv_heads)
+    src_start, src_end = _tp_head_range(heads, producer_tp_size,
+                                        producer_tp_rank)
+    if producer_tp_size > 1 and total_kv_heads is None:
+        raise SeqOnLaneError("total_kv_heads is required for a TP producer")
+    if src_end - src_start != geometry.num_kv_heads:
+        raise SeqOnLaneError(
+            "source head geometry disagrees with TP ownership")
+    if dst_dcp_size <= 0 or dst_shards <= 0 or dst_shards % dst_dcp_size:
+        raise SeqOnLaneError("DCP size must divide destination TP degree")
+    destinations = [
+        _tp_head_range(heads, dst_shards, rank) for rank in range(dst_shards)
+    ]
+    for base in range(0, dst_shards, dst_dcp_size):
+        if any(head_range != destinations[base]
+               for head_range in destinations[base:base + dst_dcp_size]):
+            raise SeqOnLaneError("DCP group ranks must own identical KV heads")
+    source_replicas = producer_tp_size // min(heads, producer_tp_size)
+    is_source_owner = producer_tp_rank % source_replicas == 0
     kps_per_block = page_tokens // kp_tokens
     ranges = owned_token_ranges(num_tokens=num_tokens,
                                 transfer_rank=transfer_rank,
@@ -344,16 +389,23 @@ def lower_fa_spans_sol(
         last_kp = (end + kp_tokens - 1) // kp_tokens  # exclusive; tail whole
         for global_kp in range(first_kp, last_kp):
             block_ordinal, in_block_kp = divmod(local_kp, kps_per_block)
-            for shard in range(dst_shards):
+            for shard, (dst_start, dst_end) in enumerate(destinations):
+                start, end = max(src_start, dst_start), min(src_end, dst_end)
+                if (not is_source_owner or start >= end
+                        or global_kp % dst_dcp_size != shard % dst_dcp_size):
+                    continue
+                dst_page_bytes = (dst_end - dst_start) * geometry.pair_bytes
                 spans.append(
                     PoolByteSpan(
                         src_block_ordinal=block_ordinal,
                         src_offset_bytes=(
                             in_block_kp * geometry.kernel_page_bytes +
-                            shard * shard_bytes),
+                            (start - src_start) * geometry.pair_bytes),
                         dst_block_index=0,
-                        dst_offset_bytes=global_kp * shard_bytes,
-                        size_bytes=shard_bytes,
+                        dst_offset_bytes=(
+                            (global_kp // dst_dcp_size) * dst_page_bytes +
+                            (start - dst_start) * geometry.pair_bytes),
+                        size_bytes=(end - start) * geometry.pair_bytes,
                         dst_unit_ordinal=(shard if dst_shards > 1 else None),
                     ))
             local_kp += 1
@@ -380,6 +432,9 @@ def lower_gdn_state_shard_spans_sol(
     parallelism: int,
     regions: Sequence[object],
     dst_shards: int,
+    producer_tp_size: int = 1,
+    producer_tp_rank: int = 0,
+    physical_granule_bytes: int = 1024,
 ) -> PoolSpanRegistration:
     """One rank's GDN head shard into its destination shard's full state.
 
@@ -392,31 +447,51 @@ def lower_gdn_state_shard_spans_sol(
     state instead: shard ``d`` takes head block ``d`` of every region
     (``_lower_gdn_state_split_spans``). Layout-independent: GDN state bytes
     are word-row separable under both FA layouts.
+
+    ``physical_granule_bytes`` is the measured state carrier's word-row
+    width, not the logical state's element size. The existing 256-lane
+    carrier uses 1024 bytes; a 128-lane HND carrier uses 512. Both source
+    and destination must have the same admitted carrier layout.
     """
+    # Worker enumeration is PCP-major, but GDN head ownership follows the
+    # (TP, PCP) state axis in gdn_attention._gdn_pcp_tp_state_axis. DCP only
+    # partitions FA history; it does not partition GDN recurrent states.
+    if (parallelism <= 0 or not 0 <= transfer_rank < parallelism
+            or producer_tp_size <= 0
+            or not 0 <= producer_tp_rank < producer_tp_size):
+        raise SeqOnLaneError("invalid producer PCP/TP rank or degree")
+    transfer_rank += producer_tp_rank * parallelism
+    parallelism *= producer_tp_size
     if dst_shards <= 0:
         raise SeqOnLaneError("destination shards must be positive")
     if parallelism == 1 and dst_shards > 1:
-        return _lower_gdn_state_split_spans(tag=tag,
-                                            block_id=block_id,
-                                            regions=regions,
-                                            dst_shards=dst_shards)
+        return _lower_gdn_state_split_spans(
+            tag=tag,
+            block_id=block_id,
+            regions=regions,
+            dst_shards=dst_shards,
+            physical_granule_bytes=physical_granule_bytes)
     if parallelism % dst_shards:
         raise SeqOnLaneError(
             "destination shards must divide the producer parallelism: "
             f"parallelism={parallelism}, dst_shards={dst_shards}")
     if dst_shards == 1:
-        return lower_gdn_state_shard_spans(tag=tag,
-                                           block_id=block_id,
-                                           transfer_rank=transfer_rank,
-                                           parallelism=parallelism,
-                                           regions=regions)
+        return lower_gdn_state_shard_spans(
+            tag=tag,
+            block_id=block_id,
+            transfer_rank=transfer_rank,
+            parallelism=parallelism,
+            regions=regions,
+            physical_granule_bytes=physical_granule_bytes)
     fan_in = parallelism // dst_shards
     shard, rank_in_shard = divmod(int(transfer_rank), fan_in)
-    registration = lower_gdn_state_shard_spans(tag=tag,
-                                               block_id=block_id,
-                                               transfer_rank=rank_in_shard,
-                                               parallelism=fan_in,
-                                               regions=regions)
+    registration = lower_gdn_state_shard_spans(
+        tag=tag,
+        block_id=block_id,
+        transfer_rank=rank_in_shard,
+        parallelism=fan_in,
+        regions=regions,
+        physical_granule_bytes=physical_granule_bytes)
     return dataclasses.replace(
         registration,
         spans=tuple(
@@ -431,17 +506,20 @@ def _lower_gdn_state_split_spans(
     block_id: int,
     regions: Sequence[object],
     dst_shards: int,
+    physical_granule_bytes: int = 1024,
 ) -> PoolSpanRegistration:
     """Full-width producer state -> ``dst_shards`` head-sharded destination
     states (the converse of the fan-in lowering): every region (QK block, V
     block, SSM) is split into ``dst_shards`` equal contiguous head blocks;
     shard ``d`` receives block ``d`` at offset 0 of its own (narrower) region.
     """
-    full = lower_gdn_state_shard_spans(tag=tag,
-                                       block_id=block_id,
-                                       transfer_rank=0,
-                                       parallelism=1,
-                                       regions=regions)
+    full = lower_gdn_state_shard_spans(
+        tag=tag,
+        block_id=block_id,
+        transfer_rank=0,
+        parallelism=1,
+        regions=regions,
+        physical_granule_bytes=physical_granule_bytes)
     spans: list[PoolByteSpan] = []
     segments = list(full.spans)  # conv: [QK, V] strided x taps; ssm: [one]
     if not segments:

@@ -135,6 +135,7 @@ def _make_vllm_config(*,
     cfg.parallel_config.data_parallel_size = dp_size
     cfg.parallel_config.tensor_parallel_size = tp_size
     cfg.parallel_config.prefill_context_parallel_size = pcp_size
+    cfg.parallel_config.decode_context_parallel_size = 1
     cfg.parallel_config.cp_kv_cache_interleave_size = interleave_size
     cfg.parallel_config.pipeline_parallel_size = pp_size
     return cfg
@@ -952,6 +953,8 @@ class TestTPURaidenConnectorScheduler:
             "src_engine_id": "producer-engine-9",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         assert "remote_block_ids" not in params
         assert first_meta.reqs_to_send[req.request_id].local_block_ids == (
@@ -1178,6 +1181,18 @@ class TestTPURaidenConnectorScheduler:
             assert producer.get_finished_count() == 8
             assert consumer.get_finished_count() == 1
 
+    @pytest.mark.parametrize("pcp,tp", [(4, 2), (16, 2), (8, 1), (1, 1)])
+    def test_pcp_tp_completion_requires_every_producer_worker(self, pcp, tp):
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          pcp_size=pcp,
+                                          tp_size=tp)
+        consumer = _make_raiden_scheduler(is_producer=False,
+                                          pcp_size=1,
+                                          tp_size=pcp * tp)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"):
+            assert producer.get_finished_count() == pcp * tp
+            assert consumer.get_finished_count() == pcp * tp
+
     def test_v4_stage3_consumer_uses_declared_transfer_extent(self):
         consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
         req = MagicMock()
@@ -1192,6 +1207,8 @@ class TestTPURaidenConnectorScheduler:
             "src_engine_id": "producer-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = (list(range(200, 264)), )
@@ -1229,6 +1246,8 @@ class TestTPURaidenConnectorScheduler:
             "src_engine_id": "producer-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 1,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = ([200], [10, 11, 12, 13, 14])
@@ -1255,6 +1274,8 @@ class TestTPURaidenConnectorScheduler:
             "src_engine_id": "producer-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = ([50, 51, 52, 53], )
@@ -1301,6 +1322,8 @@ class TestTPURaidenConnectorScheduler:
             "src_engine_id": "producer-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = ([50, 51, 52, 53], )
@@ -1345,6 +1368,8 @@ class TestTPURaidenConnectorScheduler:
             "src_engine_id": "producer-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         return req
 
@@ -1444,6 +1469,8 @@ class TestTPURaidenConnectorScheduler:
             "src_engine_id": "producer-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = ([200, 201], )
@@ -1734,6 +1761,39 @@ def _synthetic_qwen35_unified_pool_materialization(*,
 
 
 class TestTPURaidenConnectorWorker:
+
+    @pytest.mark.parametrize("pcp,tp,k,v", [(4, 2, 4, 32), (16, 2, 16, 128),
+                                            (1, 8, 4, 32), (1, 32, 16, 128),
+                                            (8, 1, 8, 32)])
+    def test_pd_gdn_admission_uses_compute_head_geometry(self, pcp, tp, k, v):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=tp, pcp_size=pcp)
+        worker.vllm_config.model_config.hf_config.linear_num_key_heads = k
+        worker.vllm_config.model_config.hf_config.linear_num_value_heads = v
+        geometry = worker._gdn_head_geometry()
+        assert geometry.parallel_size == pcp * tp
+        assert geometry.local_num_kq_heads == 1
+        assert geometry.local_num_v_heads == 4
+        assert geometry.kq_replication_factor == pcp * tp // k
+
+    @pytest.mark.parametrize("pcp,tp", [(4, 2), (16, 2), (8, 1)])
+    def test_pcp_tp_source_work_units_are_unique(self, pcp, tp):
+        ranks, units = [], []
+        for pcp_rank in range(pcp):
+            for tp_rank in range(tp):
+                worker = _make_raiden_worker(tp_rank=tp_rank,
+                                             tp_size=tp,
+                                             pcp_size=pcp)
+                with patch(
+                        "vllm_torchtpu.distributed.pcp.get_pcp_rank",
+                        return_value=pcp_rank), patch(
+                            "vllm_torchtpu.distributed.pcp.get_pcp_cache_rank",
+                            return_value=pcp_rank):
+                    rank = worker._local_raiden_transfer_rank()
+                ranks.append(rank)
+                fields = worker._raiden_work_unit_fields(rank)
+                units.append(tuple(sorted(fields.items())))
+        assert ranks == list(range(pcp * tp))
+        assert len(set(units)) == pcp * tp
 
     @pytest.fixture(autouse=True)
     def _byte_lowering_defaults(self):
@@ -2837,7 +2897,10 @@ class TestTPURaidenConnectorWorker:
         return meta
 
     def test_stage3_async_submit_defers_native_terminal_until_outcome(self):
-        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker = _make_raiden_worker(is_producer=False,
+                                     tp_rank=0,
+                                     tp_size=1,
+                                     block_size=1024)
         worker._raiden_work_unit = MagicMock()
         engine = _FakeRaidenEngine()
         # The armed receiver completes while the coordination RPC is still
@@ -2880,7 +2943,10 @@ class TestTPURaidenConnectorWorker:
         assert worker.get_block_ids_with_load_errors() == set()
 
     def test_stage3_async_submit_abandons_overdue_rpc(self):
-        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker = _make_raiden_worker(is_producer=False,
+                                     tp_rank=0,
+                                     tp_size=1,
+                                     block_size=1024)
         worker._raiden_work_unit = MagicMock()
         engine = _FakeRaidenEngine()
         engine.poll_results = []
@@ -2957,7 +3023,10 @@ class TestTPURaidenConnectorWorker:
         return engine, facade
 
     def test_stage3_async_submit_parks_missing_registration_then_retries(self):
-        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker = _make_raiden_worker(is_producer=False,
+                                     tp_rank=0,
+                                     tp_size=1,
+                                     block_size=1024)
         engine, facade = self._park_missing_registration_load(
             worker, [
                 RuntimeError("Missing producer block registration for rank 3"),
@@ -2988,7 +3057,10 @@ class TestTPURaidenConnectorWorker:
         assert worker.get_block_ids_with_load_errors() == set()
 
     def test_stage3_async_submit_parked_load_aborted_by_scheduler(self):
-        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker = _make_raiden_worker(is_producer=False,
+                                     tp_rank=0,
+                                     tp_size=1,
+                                     block_size=1024)
         _, facade = self._park_missing_registration_load(
             worker,
             [RuntimeError("Missing producer block registration for rank 3")],
@@ -3007,7 +3079,10 @@ class TestTPURaidenConnectorWorker:
         assert facade.start_transfer.call_count == 1
 
     def test_stage3_async_submit_registration_wait_deadline_fails(self):
-        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker = _make_raiden_worker(is_producer=False,
+                                     tp_rank=0,
+                                     tp_size=1,
+                                     block_size=1024)
         _, facade = self._park_missing_registration_load(
             worker,
             [RuntimeError("Missing producer block registration for rank 3")],
@@ -3221,6 +3296,8 @@ class TestTPURaidenConnectorWorker:
             "src_engine_id": "producer-engine-9",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = (list(range(300, 364)), )
@@ -3341,6 +3418,8 @@ class TestTPURaidenConnectorWorker:
             "src_engine_id": "source-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = ([41, 43], )
@@ -3409,6 +3488,8 @@ class TestTPURaidenConnectorWorker:
             "src_engine_id": "source-engine",
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = ([41, 43], )
@@ -3631,10 +3712,12 @@ class TestTPURaidenConnectorWorker:
             fields = worker._raiden_work_unit_fields(0)
             assert fields["job_replica_id"] == "decode-engine"
 
+    @pytest.mark.parametrize("tp_size", [2, 8, 32])
     @pytest.mark.parametrize("tp_rank", [0, 1])
-    def test_tp2_load_leader_submits_once_and_broadcasts(self, tp_rank):
+    def test_tp_load_leader_submits_once_and_broadcasts(
+            self, tp_rank, tp_size):
         worker = _make_raiden_worker(tp_rank=tp_rank,
-                                     tp_size=2,
+                                     tp_size=tp_size,
                                      is_producer=False,
                                      dp_size=4)
         worker._raiden_work_unit = MagicMock()
@@ -3650,7 +3733,7 @@ class TestTPURaidenConnectorWorker:
             worker._submit_stage3_loads(meta, MagicMock())
         assert submit.call_count == (1 if tp_rank == 0 else 0)
         if tp_rank == 0:
-            assert len(submit.call_args.kwargs["dst_units"]) == 2
+            assert len(submit.call_args.kwargs["dst_units"]) == tp_size
         group.broadcast_object.assert_called_once_with(
             outcome if tp_rank == 0 else None, src=0)
         assert "dst-tp2" in worker._stage3_controller_accepted
