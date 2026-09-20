@@ -7,6 +7,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 import bisect
 import contextlib
 import copy
+import dataclasses
 import math
 import os
 import time
@@ -1712,6 +1713,42 @@ class TPUModelRunner(GPUModelRunner):
             copy_mamba_state_blocks(raws, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
 
+    def _apply_kv_cache_block_copies(self, copies) -> None:
+        """Copy CoW blocks within each unified pool buffer page-locally.
+
+        Scheduler pairs name manager blocks. A manager block can span several
+        kernel-granular rows, so each pair fans out by ``_pool_block_split``.
+        """
+        assert copies, "page-local KV block copy requires at least one pair"
+        assert self.kv_cache_raw_tensors, (
+            "page-local KV block copy requires the unified KV pool")
+
+        if getattr(self, "mamba_slot_read_offsets", None) is not None:
+            mgr_pairs = [(block_copy.src_block_id, block_copy.dst_block_id)
+                         for block_copy in copies]
+            mgr_pairs = self._pad_to_bucket(mgr_pairs, pad=(0, 0))
+            mgr_src_t = torch.tensor([s for s, _ in mgr_pairs],
+                                     dtype=torch.long).to(self.device,
+                                                          non_blocking=True)
+            mgr_dst_t = torch.tensor([d for _, d in mgr_pairs],
+                                     dtype=torch.long).to(self.device,
+                                                          non_blocking=True)
+            _rollback_offsets_migrate(self.mamba_slot_read_offsets, mgr_src_t,
+                                      mgr_dst_t)
+
+        split = self._pool_block_split
+        pairs = [(block_copy.src_block_id * split + j,
+                  block_copy.dst_block_id * split + j) for block_copy in copies
+                 for j in range(split)]
+        pairs = self._pad_to_bucket(pairs, pad=(0, 0))
+        src_t = torch.tensor([src for src, _ in pairs],
+                             dtype=torch.int32).to(self.device,
+                                                   non_blocking=True)
+        dst_t = torch.tensor([dst for _, dst in pairs],
+                             dtype=torch.int32).to(self.device,
+                                                   non_blocking=True)
+        copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int,
         num_scheduled_tokens_per_req: np.ndarray
@@ -1887,7 +1924,18 @@ class TPUModelRunner(GPUModelRunner):
         for req_state in self.requests.values():
             req_state.prev_num_draft_len = 0
         self._install_spec_token_room_guard()
-        return super()._update_states(scheduler_output)
+        copies = scheduler_output.kv_cache_block_copies
+        use_page_local_copy = bool(copies and self.kv_cache_raw_tensors)
+        # The base implementation uses an advanced-index assignment which
+        # TorchTPU functionalizes into a full raw-storage result. Hide only
+        # the copy field from it; block zeroing and state updates stay intact.
+        base_output = (dataclasses.replace(scheduler_output,
+                                           kv_cache_block_copies=None)
+                       if use_page_local_copy else scheduler_output)
+        result = super()._update_states(base_output)
+        if use_page_local_copy:
+            self._apply_kv_cache_block_copies(copies)
+        return result
 
     def _modify_prev_results(self):
         if self._pre_async_results is None:
@@ -4782,18 +4830,28 @@ class TPUModelRunner(GPUModelRunner):
         itself; src and dst are distinct tensors (dynamo specializes on
         src-is-dst otherwise).
         """
-        if not self._mamba_copy_plan:
+        if not self._mamba_copy_plan and not self.kv_cache_raw_tensors:
             return
         raw_sets: dict[tuple[int, ...], list[torch.Tensor]] = {}
         for _, raws in self._mamba_copy_plan:
             raw_sets.setdefault(tuple(id(r) for r in raws), raws)
+        if self.kv_cache_raw_tensors:
+            raw_sets.setdefault(
+                tuple(id(r) for r in self.kv_cache_raw_tensors),
+                self.kv_cache_raw_tensors,
+            )
         # Serving calls the program under execute_model's no_grad, and dynamo
         # guards on grad mode: compile it the same way.
         with self._precompile_timed(
                 "mamba state seed copies"), torch.no_grad():
-            limit = self._bucket_len(
-                len(self._mamba_copy_plan) * self.max_num_reqs *
-                self._pool_block_split)
+            num_groups = max(
+                1,
+                len(self._mamba_copy_plan),
+                len(self.kv_cache_config.kv_cache_groups)
+                if self.kv_cache_config is not None else 0,
+            )
+            limit = self._bucket_len(num_groups * self.max_num_reqs *
+                                     self._pool_block_split)
             n = 8
             while n <= limit:
                 src = torch.zeros(n, dtype=torch.int32).to(self.device)
@@ -4821,7 +4879,12 @@ class TPUModelRunner(GPUModelRunner):
         if offsets is None:
             return
         with self._precompile_timed("mamba rollback helpers"):
-            num_groups = max(1, len(self._mamba_copy_plan))
+            num_groups = max(
+                1,
+                len(self._mamba_copy_plan),
+                len(self.kv_cache_config.kv_cache_groups)
+                if self.kv_cache_config is not None else 0,
+            )
             limit = self._bucket_len(num_groups * self.max_num_reqs)
             n = 8
             while n <= limit:
