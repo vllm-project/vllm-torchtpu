@@ -2345,13 +2345,17 @@ class TPURaidenConnectorWorker:
         return self._raiden_qwen35_admission_topology()
 
     def _raiden_kimi_k3_admission_topology(self) -> str:
+        dst_shards = tpu_envs.TPU_RAIDEN_DST_SHARDS
+        if dst_shards is None:
+            raise ValueError(
+                "TPU_RAIDEN_DST_SHARDS must be explicitly set to the decode "
+                "TP size on both prefill and decode workers for Kimi Stage-3")
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
         pp_size = _pipeline_parallel_size(self.vllm_config)
         source_parallelism = self._raiden_transfer_parallelism()
-        dst_shards = int(tpu_envs.TPU_RAIDEN_DST_SHARDS)
         expected_tp = source_parallelism if self.is_producer else dst_shards
         if (dst_shards <= 0 or pcp_size != 1 or tp_size != expected_tp
                 or pp_size != 1 or (self.is_producer and dp_size != 1)
@@ -3152,12 +3156,14 @@ class TPURaidenConnectorWorker:
                         f"be physical-token aligned ({exact_tag})")
             admitted_live_bytes = self._stage3_state_live_bytes(exact_tag)
             if self._stage3_kimi:
+                dst_shards = tpu_envs.TPU_RAIDEN_DST_SHARDS
+                assert dst_shards is not None
                 registration = lower_kda_state_shard_spans(
                     tag=exact_tag,
                     block_id=int(block_id),
                     transfer_rank=transfer_rank,
                     parallelism=parallelism,
-                    dst_shards=int(tpu_envs.TPU_RAIDEN_DST_SHARDS),
+                    dst_shards=dst_shards,
                     regions=self._stage3_state_regions(exact_tag),
                 )
             else:
@@ -3426,6 +3432,8 @@ class TPURaidenConnectorWorker:
                 if tp_group is None or self.tp_rank == 0:
                     self._stage3_release_producer_registration(
                         destination_req_id, req_meta, synchronous=synchronous)
+                elif req_meta.report_completion:
+                    self._done_recving.add(destination_req_id)
                 continue
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens)

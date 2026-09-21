@@ -1942,6 +1942,19 @@ class TestTPURaidenConnectorWorker:
         with pytest.raises(ValueError, match="POOL_TAGS_PER_LAYER"):
             worker.register_runner(SimpleNamespace())
 
+    @pytest.mark.parametrize("is_producer", [True, False])
+    def test_kimi_stage3_requires_destination_shards(self, monkeypatch,
+                                                     is_producer):
+        monkeypatch.delenv("TPU_RAIDEN_DST_SHARDS", raising=False)
+        worker = _make_raiden_worker(
+            tp_size=8,
+            is_producer=is_producer,
+            architecture="KimiK3ForConditionalGeneration")
+        with pytest.raises(
+                ValueError,
+                match="TPU_RAIDEN_DST_SHARDS must be explicitly set"):
+            worker._raiden_hybrid_admission_topology()
+
     def test_kimi_stage3_topologies_and_work_units(self):
         req_meta = _Stage3LoadMeta(uuid=1,
                                    source_req_id="prefill-request",
@@ -1956,6 +1969,7 @@ class TestTPURaidenConnectorWorker:
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION", True), \
              patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"), \
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 32), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", 32), \
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME", "decode-job"), \
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", "decode-engine"):
             producer = _make_raiden_worker(
@@ -2756,8 +2770,17 @@ class TestTPURaidenConnectorWorker:
         assert "dst_skip_bytes" not in unclipped
         assert unclipped["dst_device_block_ids"] == [50, 51, 52, 53]
 
-    def test_stage3_release_only_meta_cancels_producer_registration(self):
-        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+    @pytest.mark.parametrize(("tp_rank", "tp_size"), [(0, 1), (0, 2), (1, 2)])
+    @pytest.mark.parametrize("report_completion", [False, True])
+    def test_stage3_release_only_meta_cancels_producer_registration(
+            self, tp_rank, tp_size, report_completion):
+        worker = _make_raiden_worker(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            is_producer=False,
+            block_size=1024,
+            architecture="KimiK3ForConditionalGeneration"
+            if tp_size > 1 else None)
         worker._raiden_work_unit = MagicMock()
         facade = MagicMock()
         facade.cancel_request_blocks_if_unclaimed.return_value = True
@@ -2774,17 +2797,24 @@ class TestTPURaidenConnectorWorker:
             src_data_replica_idx=0,
             src_parallelism=8,
             release_only=True,
+            report_completion=report_completion,
         )
 
         with patch.object(worker,
                           "_require_stage3_controller",
-                          return_value=(MagicMock(), "10.0.0.2:28000")):
+                          return_value=(MagicMock(), "10.0.0.2:28000")), \
+             patch(f"{_MOD}.get_tp_group", return_value=MagicMock()):
             worker._submit_stage3_loads(meta, MagicMock())
             _flush_stage3_submits(worker)
 
-        facade.cancel_request_blocks_if_unclaimed.assert_called_once_with(
-            req_id="src-hit", uuid=999)
+        if tp_rank == 0:
+            facade.cancel_request_blocks_if_unclaimed.assert_called_once_with(
+                req_id="src-hit", uuid=999)
+        else:
+            facade.cancel_request_blocks_if_unclaimed.assert_not_called()
         facade.start_transfer.assert_not_called()
+        assert worker._done_recving == ({"dst-hit"}
+                                        if report_completion else set())
         assert worker._stage3_submitted_loads == {}
         assert "dst-hit" not in worker._load_block_ids
 

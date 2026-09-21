@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
-    TPU_RAIDEN_DST_SHARDS: int = 1
+    TPU_RAIDEN_DST_SHARDS: int | None = None
     TPU_RAIDEN_POOL_TAGS_PER_LAYER: bool = False
     TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
     TPU_RAIDEN_RESHARD_IMPL: str = "controller"
@@ -453,7 +453,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TP shards in one decode engine, not its DP replica count. Configure
     # both roles alike; the producer uses this to route head-sharded state.
     "TPU_RAIDEN_DST_SHARDS":
-    lambda: int(os.getenv("TPU_RAIDEN_DST_SHARDS") or "1"),
+    env_optional_int("TPU_RAIDEN_DST_SHARDS"),
     "TPU_RAIDEN_MAX_TRANSFER_TOKENS":
     env_optional_int("TPU_RAIDEN_MAX_TRANSFER_TOKENS"),
     # Reshard control-plane hosting (zero sidecar processes): "store" hosts the
