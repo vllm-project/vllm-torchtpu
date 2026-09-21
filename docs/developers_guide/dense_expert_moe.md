@@ -68,7 +68,9 @@ activation quantization 和 BF16 中间舍入，最终专家加权累加使用 F
 若本 rank 命中 32 个专家，一次完整权重读取约 384.75 MiB。
 这只是权重字节量，不是整层 MoE 的实测 HBM 流量，也不能直接据此给出 MBU。
 `[256,4096]` FP32 accumulator 为 4 MiB，显式 VMEM scratch 合计约 34.6 MiB，
-包含双缓冲权重；kernel 配置上限为 60 MiB，入口要求硬件至少有 64 MiB VMEM。
+包含双缓冲权重。这是已测形状的占用，不作为其他形状的准入上限。
+后续放宽尺寸限制时移除了原有 60 MiB 编译预算和 64 MiB 硬件门槛，
+资源是否足够由编译器判断。
 
 第一版 activation scale 使用 `[tokens, Kblocks, 128]`。
 LLO 与源码对应分析发现，读取固定 K block 的非连续平面产生大量
@@ -89,6 +91,8 @@ VRF 与 VMEM 间的 spill/fill 也不能算作 HBM 权重流量。
 
 ## 开关、支持范围与回退
 
+这是进程级显式 opt-in，默认关闭。由用户仅在 decode 服务进程开启，
+prefill 服务保持 `standard`；kernel 不自行判断请求阶段。
 在服务进程启动前设置，重启后生效：
 
 ```bash
@@ -99,16 +103,25 @@ export TPU_MOE_DECODE_IMPL=dense_expert
 入口和输出 shape/dtype 不变。静态条件不满足时保留原 GMM 路径：
 
 - BF16 hidden、原生 `float8_e4m3fn` 权重、每输出通道 FP32 scale。
-- SiLU、无 expert bias、无 packed quantization，`skip_padded_tokens=False`。
-- token 数为 16 的倍数，范围 16–256；本地专家 1–64。
-- hidden 为 512/1024/2048/4096，expert intermediate 为 512/1024。
-- 每 core VMEM 至少 64 MiB。
+- SiLU、无 expert bias、无 packed quantization；`rhs_quant_dtype` 可为
+  `None` 或与权重相同的 `float8_e4m3fn`。
+- M/H/I/E 均为正；`M % 16 == 0`、`H % 512 == 0`、`I % 512 == 0`。
+- 不限制 M/E 上限，不保留 H/I 白名单或固定 VMEM 门槛。
+- 路由系数的专家维度向上补齐到 128 的倍数，可跨越 128 专家边界。
+- `skip_padded_tokens` 两种取值均支持：零权重路由已经被屏蔽。
 
-长 prefill 继续走原路径。应从日志确认
+未启用开关或功能/对齐条件不符时保留原 GMM。新 kernel 一旦选中，
+资源不足的编译错误直接传播，不捕获错误重试其他实现。
+去掉 M 上限后，大 prefill 不再自动回退；混合 prefill/decode 服务
+不能依赖旧的尺寸上限来选择阶段。能编译不等于所有大形状都有性能优势。
+应从日志确认
 `Selected experimental dense-expert decode MoE`，不能仅根据环境变量判断生效。
 新旧实现应使用独立编译缓存；配套 benchmark 启动脚本已经隔离。
 
 ## 正确性验证
+
+下列 TPU 测试及端到端结果来自放宽形状限制前的提交 `3477a1f`，
+不代表扩大支持范围后所有形状都已经在硬件上验证。
 
 - 集成后 203 项 TPU 测试通过，含 13 项新 kernel 测试和 190 项原 MoE core 回归。
 - 覆盖同入口切换、EP 屏蔽、单专家、空 rank、零权重、重复专家和长 prefill 回退。
@@ -123,6 +136,17 @@ export TPU_MOE_DECODE_IMPL=dense_expert
   原实现无缓存基线在追加问答检查前已完成。
 
 简单问答和算子 UT 不等于完整模型精度评测，也不保证任意 prompt 输出完全一致。
+
+放宽限制新增 CPU 验证覆盖 M=272、H/I=1536、E=129，以及非法对齐和
+显式实现选择。Pallas 解释模式执行真实 kernel 的路由、双缓冲 DMA 索引和
+算术，与独立参考对照，包含专家 127/128、重复 ID、无效 ID 和零权重行。
+解释模式只在测试中注入，不进入生产 kernel；不验证 TPU 编译资源或性能。
+通过模拟资源异常验证新实现错误传播，不进入原 GMM。
+
+```bash
+JAX_PLATFORMS=cpu python -m pytest -q \
+  tests/kernels/test_moe_dense_expert_shapes.py
+```
 
 ## 端到端压测
 

@@ -18,8 +18,15 @@ from jax.experimental.pallas import tpu as pltpu
 
 def can_use_dense_expert(hidden, w1, w2, s1, s2, b1, b2, *, activation,
                          rhs_quant_dtype, skip_padded_tokens):
-    """Conservative, static eligibility check; other calls keep standard GMM."""
-    if activation != 'silu' or rhs_quant_dtype is not None or skip_padded_tokens:
+    """Check arithmetic/layout support; the compiler owns resource limits.
+
+    Zero routing coefficients already suppress padded tokens, so either
+    skip_padded_tokens setting is supported. There is no prefill/decode
+    inference here: callers opt in only on their decode service.
+    """
+    if activation != 'silu':
+        return False
+    if rhs_quant_dtype not in (None, jnp.float8_e4m3fn):
         return False
     if b1 is not None or b2 is not None or s1 is None or s2 is None:
         return False
@@ -27,9 +34,11 @@ def can_use_dense_expert(hidden, w1, w2, s1, s2, b1, b2, *, activation,
         return False
     m, h = hidden.shape
     e, i, out = w2.shape
-    if not (0 < m <= 256 and m % 16 == 0 and 0 < e <= 64
-            and h in (512, 1024, 2048, 4096) and i in (512, 1024) and out == h
-            and w1.shape == (e, h, 2 * i)):
+    if min(m, h, i, e) <= 0:
+        return False
+    if m % 16 or h % 512 or i % 512:
+        return False
+    if out != h or w1.shape != (e, h, 2 * i):
         return False
     if (hidden.dtype != jnp.bfloat16 or w1.dtype != jnp.float8_e4m3fn
             or w2.dtype != jnp.float8_e4m3fn):
@@ -37,10 +46,7 @@ def can_use_dense_expert(hidden, w1, w2, s1, s2, b1, b2, *, activation,
     if (s1.shape != (e, 1, 1, 2 * i) or s2.shape != (e, 1, 1, h)
             or s1.dtype != jnp.float32 or s2.dtype != jnp.float32):
         return False
-    try:
-        return pltpu.get_tpu_info().vmem_capacity_bytes >= 64 * 1024 * 1024
-    except ValueError:
-        return False
+    return True
 
 
 def _quantize(x, q_ref, scale_ref):
@@ -148,7 +154,7 @@ def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
             return None
 
         # Double-buffered weights overlap the next expert DMA with compute.
-        # Compacting the 64-element active bitmap uses only scalar SMEM ops.
+        # Compacting the local-expert active bitmap uses only scalar SMEM ops.
         lax.fori_loop(0, count, expert_body, None)
 
     out_ref[...] = owner_ref[...].astype(jnp.bfloat16)
@@ -170,7 +176,7 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
     coeff = jnp.sum(selector * topk_weights.astype(jnp.float32)[..., None],
                     axis=1)
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
-    coeff = jnp.pad(coeff, ((0, 0), (0, 128 - experts)))
+    coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
     return pl.pallas_call(
         functools.partial(_kernel, m=m, h=h, i=i, experts=experts),
         out_shape=jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
@@ -196,7 +202,5 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
                 pltpu.SMEM((experts, ), jnp.int32),
                 pltpu.SemaphoreType.DMA((2, 4)),
             ]),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 * 1024 *
-                                             1024),
         name=f'dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}',
     )(active, hidden, coeff, w1, w2, s1, s2)

@@ -497,7 +497,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
                      "off", ["off", "on"],
                      case_sensitive=False),
-    # Experimental small-batch FP8 decode path; unsupported inputs retain GMM.
+    # Explicit FP8 MoE opt-in for decode services; no phase/size heuristic.
+    # Unsupported arithmetic/layouts retain GMM. Resource failures propagate.
     "TPU_MOE_DECODE_IMPL":
     env_with_choices("TPU_MOE_DECODE_IMPL", "standard",
                      ["standard", "dense_expert"]),
