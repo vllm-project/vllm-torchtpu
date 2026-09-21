@@ -40,7 +40,8 @@ from vllm_torchtpu.layers.core.attention_metadata import \
     AttentionMetadataBuilder
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
-from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
+from vllm_torchtpu.runner.kv_cache_manager import (
+    KVCacheManager, check_kv_caches_cover_block_ids)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
@@ -91,6 +92,50 @@ class _FakeReserveSpec:
     @classmethod
     def estimate_hbm_reserve_bytes(cls, vllm_config):
         return cls.RESERVE_BYTES
+
+
+@pytest.mark.parametrize("allocated_blocks", [0, 2, 3])
+def test_check_kv_caches_cover_block_ids_rejects_short_cache(allocated_blocks):
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=16384,
+    )
+    tensor = KVCacheTensor(size=16384 * 8,
+                           layers=["attn.0", "attn.1"],
+                           layer_stride=16384 * 4,
+                           block_stride=16384)
+
+    with pytest.raises(ValueError,
+                       match="scheduler can issue block IDs") as exc:
+        check_kv_caches_cover_block_ids(
+            {
+                name: torch.empty((allocated_blocks, 1))
+                for name in tensor.layers
+            },
+            [tensor],
+            4,
+            lambda _: spec,
+        )
+    assert f"attn.0 holds {allocated_blocks} blocks" in str(exc.value)
+    assert "2 layer(s) in this 131072-byte backing allocation" in str(
+        exc.value)
+
+
+def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
+    spec = FullAttentionSpec(block_size=16,
+                             num_kv_heads=2,
+                             head_size=128,
+                             dtype=torch.bfloat16)
+    tensor = KVCacheTensor(size=spec.page_size_bytes * 8,
+                           layers=["attn.0", "attn.1"],
+                           layer_stride=spec.page_size_bytes * 4,
+                           block_stride=spec.page_size_bytes)
+    with pytest.raises(ValueError, match="Missing KV cache.*attn.1"):
+        check_kv_caches_cover_block_ids({"attn.0": torch.empty((4, 1))},
+                                        [tensor], 4, lambda _: spec)
 
 
 class TestKVCacheManager:
@@ -1244,8 +1289,9 @@ class TestKVCacheManager:
         assert "attn.0" in created_caches
         assert created_caches["attn.0"].shape == (1, 16, 2, 1, 128)
 
-    def test_initialize_kv_cache_num_blocks_override(self):
-        """Verify explicit num_blocks override on kv_cache_config."""
+    @pytest.mark.parametrize("allocated_blocks", [9, 10, 11])
+    def test_initialize_kv_cache_num_blocks_override(self, allocated_blocks):
+        """Validate the scheduler's explicit block count before binding."""
         attn_spec = FullAttentionSpec(block_size=16,
                                       num_kv_heads=2,
                                       head_size=128,
@@ -1281,12 +1327,20 @@ class TestKVCacheManager:
 
         with patch(
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(10, 16, 2, 1, 128)
+                return_value=(allocated_blocks, 16, 2, 1, 128)
         ) as mock_get_shape, patch(
                 'vllm_torchtpu.utils.tpu_bind_kv_cache'
-        ), patch('vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
-                 return_value=False):
+        ) as mock_bind, patch(
+                'vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group',
+                return_value=False):
+            if allocated_blocks < kv_cache_config_explicit.num_blocks:
+                with pytest.raises(ValueError,
+                                   match="scheduler can issue block IDs"):
+                    self.runner.initialize_kv_cache(kv_cache_config_explicit)
+                mock_bind.assert_not_called()
+                return
             self.runner.initialize_kv_cache(kv_cache_config_explicit)
+            mock_bind.assert_called_once()
             mock_get_shape.assert_called_once_with(10, attn_spec.block_size,
                                                    attn_spec.num_kv_heads,
                                                    attn_spec.head_size,
