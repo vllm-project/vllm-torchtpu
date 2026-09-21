@@ -21,6 +21,8 @@ import pytest
 import torch
 import vllm.envs as vllm_envs
 from jax.sharding import PartitionSpec
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
@@ -28,6 +30,18 @@ from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+
+pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture
+def cpu_vllm_config_context():
+    # These adapter tests use CPU tensors and mocked kernels. They must not
+    # require registration of torch's TPU device type just to resolve layout.
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
 
 
 def _mesh():
@@ -182,7 +196,7 @@ class TestVllmGatedDeltaNetAttention:
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
             expected_dtype, projection_dtype, interleaved,
-            vllm_config_context):
+            cpu_vllm_config_context):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
         attn.gqa_interleaved_layout = interleaved
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
@@ -430,7 +444,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pooled_op_reads_block_size_at_call_time(self, ssm_cache_dtype,
                                                      expected_dtype,
-                                                     vllm_config_context):
+                                                     cpu_vllm_config_context):
         """The pooled op must not freeze cache_config.block_size at build.
 
         Hybrid models construct GDN layers during load_model(), but the
@@ -476,7 +490,7 @@ class TestVllmGatedDeltaNetAttention:
             "recurrent_state_dtype"] == jnp.dtype(expected_dtype)
 
     def test_pooled_impl_forwards_every_operand_the_forward_passes(
-            self, vllm_config_context):
+            self, cpu_vllm_config_context):
         """`gdn_impl` must accept exactly what `forward` calls it with.
 
         The pooled operand list is threaded through four layers (forward ->
@@ -611,7 +625,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pcp_compact_and_unified_ops_construct_with_mtp_k1(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
-            vllm_config_context):
+            cpu_vllm_config_context):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
         attn.num_spec = 1
