@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -60,7 +60,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
         # Create dummy input templates for every budget size and path directly
         # from self.path_token_budgets prepared by EncoderCudaGraphManager.
-        self.budget_templates: Dict[str, Dict[int, Dict[
+        self.budget_templates: dict[str, dict[int, dict[
             str, torch.Tensor]]] = {
                 path: {
                     budget:
@@ -91,13 +91,13 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
     def _pad_to_template(
         self,
-        replay_values: Dict[str, torch.Tensor],
+        replay_values: dict[str, torch.Tensor],
         budget: int,
         path: str = "default",
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Zero-pads dynamic multimodal inputs up to the static budget template."""
         template = self.budget_templates[path][budget]
-        padded: Dict[str, torch.Tensor] = {}
+        padded: dict[str, torch.Tensor] = {}
 
         for key, tmpl in template.items():
             src = replay_values.get(key)
@@ -143,7 +143,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
     @torch.no_grad()
     def _run_budget_graph(
         self,
-        mm_kwargs: Dict[str, Any],
+        mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
     ) -> torch.Tensor | None:

@@ -1,0 +1,70 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The P/D disaggregated benchmark on the managed kube fleet.
+
+# Named by build number so the tag is immutable: submission can be hours after
+# the push, and a second build sharing a tag would decide what the first
+# measures.
+env:
+  WORKLOAD_IMAGE: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:kube-disagg-${BUILDKITE_BUILD_NUMBER}"
+
+steps:
+  # TODO: drop this step and point WORKLOAD_IMAGE at :latest once a nightly is
+  # published from a Dockerfile carrying buildkite-agent; until then the pod
+  # cannot publish its own results.
+  - label: ":docker: Build the benchmark image"
+    key: "build_kube_disagg_image"
+    agents:
+      queue: cpu_64_core
+    commands:
+      # dev, not ci: a pod has nothing to bind-mount, so it needs the package
+      # installed as well as the CI tooling.
+      - ./docker/build_image.sh --target dev -t "$$WORKLOAD_IMAGE"
+      - docker push "$$WORKLOAD_IMAGE"
+
+  - label: ":kubernetes: :tpu: Kube P/D Disaggregated Benchmark"
+    depends_on: "build_kube_disagg_image"
+    # Covers queueing as well as running, so that the launcher's own limits are
+    # what stop a step and not this.
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          # Carries the launcher and the service account that may submit a
+          # workload.
+          podTemplate: tpu-launcher
+    env:
+      CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
+      # The same parse_gke_results.py the GKE lane uses, so rows land in the
+      # same table. CI_RUNNER tags them runner=kube in the config JSON, which
+      # tells the two lanes apart - but does not stop a reader that expects one
+      # row a night from seeing two while pipeline_disagg_gke.yml also runs.
+      # Retire that lane, or teach the readers to filter, before relying on it.
+      #
+      # BigQuery only: Spanner is written by upload_results.py, which this lane
+      # does not use.
+      BQ_UPLOAD: "1"
+      CI_RUNNER: "kube"
+    commands:
+      # --env forwards by name into every container called `workload`. The
+      # BUILDKITE_* the agent CLI needs to attach an artifact are swept by the
+      # launcher itself, so only what it cannot infer is named here.
+      - >-
+        /opt/launcher/launch
+        --manifest .buildkite/kubernetes/manifests/workloads/qwen3.5-397b-1p1d.yaml
+        --env BQ_UPLOAD
+        --env CI_RUNNER
+        --env CREATED_BY

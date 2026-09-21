@@ -311,11 +311,20 @@ class TestTpuPlatform:
         vllm_config.model_config.architecture = unpooled_arch
         assert not unified_kv_layout_enabled(vllm_config)
 
-        # A pooled GDN architecture selects the pool with no env set.
-        vllm_config.model_config.architecture = pooled_arch
-        assert unified_kv_layout_enabled(vllm_config)
+        # Both direct text-only and multimodal-wrapper Qwen3.5 classes use
+        # the same pooled GDN layer implementation.
+        for pooled_arch in (
+                "Qwen3_5ForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5MoeForConditionalGeneration",
+        ):
+            vllm_config.model_config.architecture = pooled_arch
+            assert unified_kv_layout_enabled(vllm_config)
 
         # An explicit setting wins in either direction.
+        vllm_config.model_config.architecture = (
+            "Qwen3_5ForConditionalGeneration")
         with patch.dict("os.environ",
                         {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"}):
             assert not unified_kv_layout_enabled(vllm_config)

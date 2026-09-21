@@ -32,8 +32,8 @@ mismatch rather than silently.
 """
 
 import inspect
-from collections.abc import Sequence
-from typing import Any, Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import jax
 import torch

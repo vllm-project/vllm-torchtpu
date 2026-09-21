@@ -52,7 +52,7 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
         )
 
     success = True
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         for line in f:
             if not line.strip():
                 continue

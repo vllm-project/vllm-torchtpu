@@ -14,7 +14,6 @@
 """Tests for Compressed Tensors quantization integration on TPU."""
 
 import ctypes
-from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,8 +29,8 @@ def _reference_moe(x: torch.Tensor,
                    router_logits: torch.Tensor,
                    w1: torch.Tensor,
                    w2: torch.Tensor,
-                   w1_bias: Optional[torch.Tensor],
-                   w2_bias: Optional[torch.Tensor],
+                   w1_bias: torch.Tensor | None,
+                   w2_bias: torch.Tensor | None,
                    top_k: int,
                    renormalize: bool,
                    activation: str,

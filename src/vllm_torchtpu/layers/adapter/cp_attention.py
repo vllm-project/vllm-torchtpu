@@ -130,6 +130,8 @@ def _pallas_rpa_kernel_dcp(
     cp_group_size: int,
     cp_rank_val: int,
     attention_scope: _rpa_longctx_configs.AttentionScope,
+    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.
+    HEAD_ALONG_SUBLANE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
     output, lse). cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
@@ -159,6 +161,7 @@ def _pallas_rpa_kernel_dcp(
         cp_rank=cp_rank_arr,
         attention_scope=attention_scope,
         return_lse=True,
+        kv_layout=kv_layout,
     )
     return new_kv_cache, output, lse
 
@@ -223,6 +226,8 @@ def build_dcp_kernels(
     v_scale: float | None,
     cp_group_size: int,
     cp_rank: int,
+    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.
+    HEAD_ALONG_SUBLANE,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -232,8 +237,11 @@ def build_dcp_kernels(
                  query_start_loc, request_distribution, q_scale, k_scale,
                  v_scale) -> (output [T,H,D], lse [T,H])``
     """
+    # The adapter uses batched_rpa's equivalent enum. Normalize here so both
+    # entry points bind LONGCTX's enum and share ops for the same layout.
+    kv_layout = _rpa_longctx_configs.KVLayout(kv_layout)
     base_key = (sliding_window, sm_scale, logits_soft_cap, q_scale, k_scale,
-                v_scale, cp_group_size, cp_rank)
+                v_scale, cp_group_size, cp_rank, kv_layout)
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
 
@@ -251,6 +259,7 @@ def build_dcp_kernels(
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
             attention_scope=_rpa_longctx_configs.AttentionScope.CACHE_ONLY,
+            kv_layout=kv_layout,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn)
@@ -265,6 +274,7 @@ def build_dcp_kernels(
             cp_rank_val=cp_rank,
             attention_scope=_rpa_longctx_configs.AttentionScope.
             NEW_TOKENS_ONLY,
+            kv_layout=kv_layout,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn)
@@ -291,6 +301,8 @@ def forward_with_dcp(
     kv_cache_quantized_dtype,
     dcp_world_size: int,
     dcp_rank: int,
+    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.
+    HEAD_ALONG_SUBLANE,
 ) -> torch.Tensor:
     """Orchestrate the two-pass DCP attention forward.
 
@@ -318,6 +330,7 @@ def forward_with_dcp(
         v_scale=v_scale,
         cp_group_size=dcp_world_size,
         cp_rank=dcp_rank,
+        kv_layout=kv_layout,
     )
 
     own_num_heads = query.shape[1]

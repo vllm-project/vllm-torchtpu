@@ -64,9 +64,19 @@ def main_kernel(
 
     nope_in_cols = nope_in_i32.shape[1]
     rope_in_cols = rope_in_i32.shape[1]
-    rope_out_cols = rope_out_hbm_ref.shape[1]
+    # A `bf16[n, 64]` output is tiled T(8,128), so XLA pads it to 128 lanes and
+    # it costs twice its own bytes -- on this kernel's write and on the
+    # consumer's read. The output is 128 lanes wide instead, pairing entry `i`
+    # of each `rope_period` with entry `i + rope_period // 2`, which the
+    # consumer splits apart with a lane slice and a row concatenate.
+    rope_out_cols = rope_out_hbm_ref.shape[1] // 2
+    half_streams = num_streams // 2
 
-    def process_rope(gather_ref, out_ref, idx_sub, out_row_base=0):
+    def process_rope(gather_ref,
+                     out_ref,
+                     idx_sub,
+                     out_row_base=0,
+                     out_col_base=0):
         # one (1, 128) uint8 is one token's rope data, which encodes 64 bf16
         # values. (0, 64) are the high bits for bf16 data, (64, 128) are the low.
         half = rope_out_cols
@@ -93,7 +103,8 @@ def main_kernel(
                 k = t * rope_out_packing + pk
                 packed = jnp.bitwise_or(
                     packed, jnp.left_shift(bf16_bits(k), pk * rope_out_bits))
-            out_ref[pl.ds(out_row_base + t, 1), pl.ds(0, half)] = packed
+            out_ref[pl.ds(out_row_base + t, 1),
+                    pl.ds(out_col_base, half)] = packed
 
     def outer_pipeline(idx_ref, valid_ref):
         valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
@@ -102,9 +113,12 @@ def main_kernel(
 
         # Subchunk handled by stream `s` at inner step `r`. `num_streams`
         # independent `pl.Indirect` gathers run concurrently per step, keeping
-        # several gather DMAs in flight to raise effective read bandwidth.
+        # several gather DMAs in flight to raise effective read bandwidth;
+        # the first half of the streams serves the low half of the period and
+        # the second half the high half.
         def subchunk(r, s):
-            return r * num_streams + s
+            return ((s // half_streams) * (num_row_subchunks // 2) +
+                    r * half_streams + s % half_streams)
 
         def idx_window(r, s):
             return idx_ref[pl.ds(
@@ -142,7 +156,8 @@ def main_kernel(
                     gather_ref=rope_g[s],
                     out_ref=rope_o,
                     idx_sub=idx_window(r, s),
-                    out_row_base=s * rope_rows_per_stream,
+                    out_row_base=(s % half_streams) * rope_rows_per_stream,
+                    out_col_base=(s // half_streams) * rope_out_cols,
                 )
 
             # Wait for all nope DMAs to complete.
@@ -166,13 +181,12 @@ def main_kernel(
                 lambda r, s=s: (lax.div(idx_window(r, s), in_packing), 0),
             ) for s in range(num_streams))
 
-        # One merged rope output block, covering all `num_streams` subchunks.
-        #
-        # nope has no pipeline output block -- `_body` DMAs it to HBM directly (
-        # this approach has better performance based on measured performance in
-        # microbenchmarks).
+        # One merged rope output block, covering all `num_streams` subchunks:
+        # `half_streams` subchunks of the low half of the period in lanes
+        # [0, rope_out_cols) and the matching high-half ones in
+        # [rope_out_cols, 2 * rope_out_cols).
         rope_out_spec = pl.BlockSpec(
-            (num_streams * rope_rows_per_stream, rope_out_cols),
+            (half_streams * rope_rows_per_stream, 2 * rope_out_cols),
             lambda r: (out_row_base // num_streams + r, 0),
         )
         core_start_idx = out_row_base * row_subchunk_size
@@ -206,12 +220,14 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit)
+@functools.partial(jax.jit, static_argnames=("rope_period", ))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
     num_valid_indices: jax.Array | None = None,
+    *,
+    rope_period: int = 1024,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -221,15 +237,21 @@ def csa_gather(
     rope_cache: (total_pages, page_size // 4, 4, 128) uint8. Each (1, 128) uint8
       is token's rope. It encodes 64 bf16.
     indices: (N,) int32. Token indices into the caches.
-    num_valid_indices: Optional (1,) or scalar int32. Number of valid indices
-      to gather. Subcores assigned to indices beyond this count skip gathering.
+    num_valid_indices: Optional (1,) or scalar int32. Number of valid indices to
+      gather. Subcores assigned to indices beyond this count skip gathering.
+    rope_period: the consumer's row block (the attention kernel's top-k).
+      `rope_out` pairs entry i of a period with entry i + rope_period // 2.
 
   Returns:
     nope_out: (N, 4, 128) uint8.
       Each (4, 128) uint8 is token's nope. It will be flattened to (1, 512)
       downstream.
-    rope_out: (N, 64) bf16.
-      Each (64) bf16 is token's rope.
+    rope_out: (N // 2, 128) bf16.
+      Row `period * (rope_period // 2) + i` holds entry i of that period in
+      lanes 0:64 and entry i + rope_period // 2 in lanes 64:128 -- 128 lanes
+      so XLA does not pad the buffer to twice its size. The consumer restores
+      (rope_period, 64) with
+      `jnp.concatenate([row[:, :64], row[:, 64:]], axis=0)`.
   """
     assert indices.ndim == 1, "Indices must be 1D."
     assert nope_cache.dtype == rope_cache.dtype, "Caches must share a dtype."
@@ -263,7 +285,9 @@ def csa_gather(
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
-    num_row_subchunks = 32
+    assert (rope_period % row_subchunk_size == 0
+            ), f"{rope_period=} must be a multiple of {row_subchunk_size=}."
+    num_row_subchunks = rope_period // row_subchunk_size
     assert (
         num_row_subchunks %
         num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."
@@ -271,7 +295,12 @@ def csa_gather(
     block_size = row_chunk_size * num_cores
     out_pad_size = (
         (out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size:
+        # spread the padding to avoid hotspots
+        num_tokens = nope_cache.shape[0] // nope_subrows
+        pad = (jnp.arange(out_pad_size, dtype=indices.dtype) *
+               104729) % num_tokens
+        indices = jnp.concatenate([indices, pad])
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -291,8 +320,9 @@ def csa_gather(
                 ((out_size + out_pad_size) * nope_subrows, nope_out_cols),
                 jnp.uint8,
             ),
-            jax.ShapeDtypeStruct((out_size + out_pad_size, rope_out_cols),
-                                 jnp.bfloat16),
+            jax.ShapeDtypeStruct(
+                ((out_size + out_pad_size) // 2, 2 * rope_out_cols),
+                jnp.bfloat16),
         ),
         # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
         # copies issued in `main_kernel`.
@@ -307,5 +337,5 @@ def csa_gather(
     )(nope_cache, rope_cache, indices, valid_indices)
     return (
         nope_out.reshape(-1, nope_subrows, nope_out_cols)[:out_size],
-        rope_out[:out_size],
+        rope_out[:out_size // 2],
     )

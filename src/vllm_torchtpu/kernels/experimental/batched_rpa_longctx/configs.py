@@ -53,10 +53,11 @@ class ModelConfigs:
 
 class AttentionScope(enum.StrEnum):
     """Which KV positions to attend to.
-  FULL:            attend all positions (default).
-  CACHE_ONLY:      attend only cached tokens, skip new tokens.
-  NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
-  """
+    FULL:            attend all positions (default).
+    CACHE_ONLY:      attend only cached tokens, skip new tokens.
+    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
+    """
+
     FULL = enum.auto()
     CACHE_ONLY = enum.auto()
     NEW_TOKENS_ONLY = enum.auto()
@@ -75,10 +76,10 @@ class KVLayout(enum.StrEnum):
     @property
     def symbol(self):
         match self:
-            case KVLayout.HEAD_ALONG_SUBLANE:
-                return "nhs"
             case KVLayout.SEQ_ALONG_LANE:
                 return "snh"
+            case KVLayout.HEAD_ALONG_SUBLANE:
+                return "nhs"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -213,8 +214,7 @@ class RpaConfigs:
         fixed_bytes = 0
         fixed_bytes += self.serve.num_seqs  # kv_lens
         fixed_bytes += self.serve.num_seqs + 1  # cu_q_lens
-        fixed_bytes += (self.serve.num_seqs * self.serve.pages_per_seq
-                        )  # page_indices
+        fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq  # page_indices
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
         fixed_bytes += 1  # actual_steps
@@ -359,8 +359,7 @@ class RpaConfigs:
 
     @property
     def q_vmem_shape(self):
-        q_per_kv_packing = (self.aligned_num_q_heads_per_kv_head //
-                            self.serve.packing_q)
+        q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
@@ -409,10 +408,14 @@ class RpaConfigs:
     @property
     def lse_vmem_shape(self):
         num_lanes = pltpu.get_tpu_info().num_lanes
+        q_per_kv_packing = (self.aligned_num_q_heads_per_kv_head //
+                            self.serve.packing_q)
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
-            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+            self.block.bq_sz,
+            q_per_kv_packing,
+            self.serve.packing_q,
             num_lanes,
         )
 
@@ -484,8 +487,9 @@ class RpaConfigs:
             )
 
         if kv_cache.shape != expected_kv_cache_shape:
-            raise ValueError(f"Expected {kv_cache.shape=} to be equal to"
-                             f" {expected_kv_cache_shape=}")
+            raise ValueError(
+                f"Expected {kv_cache.shape=} to be equal to {expected_kv_cache_shape=}"
+            )
 
         # If we are using per-token quantization, we expect the kv-cache scale to be
         # in VMEM, and so it will not be in the configs.
@@ -530,4 +534,12 @@ class RpaConfigs:
             if self.model.sliding_window is not None:
                 raise ValueError(
                     "Context Parallel does not support sliding window right now"
+                )
+
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            bkv_sz = self.block.bkv_sz
+            page_size = self.serve.page_size
+            if bkv_sz % page_size != 0:
+                raise NotImplementedError(
+                    f"SEQ_ALONG_LANE expects {bkv_sz=} to be aligned to {page_size=}."
                 )

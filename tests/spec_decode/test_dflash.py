@@ -158,7 +158,8 @@ def test_precompile_skips_sub_block_draft_forward():
     ] == [8, 16, 512]
 
 
-def test_tpu_precompute_context_kv(device):
+@pytest.mark.parametrize("has_upstream_hook", [False, True])
+def test_tpu_precompute_context_kv(device, has_upstream_hook):
     # Setup dimension sizes
     L = 2  # layers
     nkv = 2  # KV heads
@@ -175,9 +176,6 @@ def test_tpu_precompute_context_kv(device):
     positions = torch.tensor([10, 11, 12], dtype=torch.int32, device=device)
 
     # Create draft model mock
-    draft_model = mock.MagicMock()
-    del draft_model.combine_hidden_states
-    del draft_model.fc
     self_model = mock.MagicMock()
 
     # Initialize fused weight matrix
@@ -200,6 +198,7 @@ def test_tpu_precompute_context_kv(device):
         layer = mock.MagicMock()
         layer.self_attn.head_dim = hd
         layer.self_attn.num_kv_heads = nkv
+        layer.self_attn.num_heads = nkv
         del layer.self_attn.k_norm
 
         # Extract individual weights for assertion comparison
@@ -229,8 +228,11 @@ def test_tpu_precompute_context_kv(device):
 
     self_model.layers[0].self_attn.rotary_emb = mock_rotary_emb
 
-    draft_model.model = self_model
-    proposer.draft_model = draft_model
+    proposer.draft_model = SimpleNamespace(model=self_model)
+    upstream_hook = mock.Mock(side_effect=AssertionError(
+        "The upstream context-KV hook must not run on TPU"))
+    if has_upstream_hook:
+        proposer.draft_model.precompute_and_store_context_kv = upstream_hook
 
     # Initialize mock forward implementations on the layers to record outputs
     for layer in layers:
@@ -243,6 +245,7 @@ def test_tpu_precompute_context_kv(device):
         DFlashProposer._tpu_precompute_and_update_kv_cache)
     dummy_md = mock.MagicMock()
     fn_eager(proposer, hidden_states, positions, tuple([dummy_md] * L))
+    upstream_hook.assert_not_called()
 
     # Extract roped keys and values from the mocked layer forward calls
     roped_k_list = []
@@ -279,6 +282,30 @@ def test_tpu_precompute_context_kv(device):
     # 3. Assert exact equality
     assert torch.allclose(roped_k_all, expected_k_all, atol=1e-5)
     assert torch.allclose(all_v, expected_v_all, atol=1e-5)
+
+
+def test_tpu_precompute_context_kv_uses_explicit_tpu_hook(device):
+    proposer = _make_proposer(draft_tp=1)
+    hidden_states = torch.randn(3, 32, device=device)
+    positions = torch.arange(3, device=device)
+    metadata = (SimpleNamespace(), )
+    expected = torch.randn(3, 16, device=device)
+    tpu_hook = mock.Mock(return_value=expected)
+    upstream_hook = mock.Mock(side_effect=AssertionError(
+        "The upstream context-KV hook must not run on TPU"))
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(),
+        tpu_precompute_and_store_context_kv=tpu_hook,
+        precompute_and_store_context_kv=upstream_hook,
+    )
+
+    fn_eager = torch._dynamo.disable(
+        DFlashProposer._tpu_precompute_and_update_kv_cache)
+    result = fn_eager(proposer, hidden_states, positions, metadata)
+
+    assert result is expected
+    tpu_hook.assert_called_once_with(hidden_states, positions, metadata)
+    upstream_hook.assert_not_called()
 
 
 def _make_chunk(num_reqs,
@@ -473,8 +500,8 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     named.self_attn.attn.layer_name = "dummy_layer"
     unnamed = mock.MagicMock()
     unnamed.self_attn.attn.layer_name = "not_in_the_metadata"
-    draft_model = mock.MagicMock()
-    draft_model.model.layers = [named, unnamed]
+    draft_model = SimpleNamespace(model=SimpleNamespace(
+        layers=[named, unnamed]))
     proposer.draft_model = draft_model
 
     md = {"dummy_layer": SimpleNamespace(block_tables=None)}

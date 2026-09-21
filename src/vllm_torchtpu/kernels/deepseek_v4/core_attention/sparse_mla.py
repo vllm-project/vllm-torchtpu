@@ -136,34 +136,26 @@ def gather_page_ids(
     return out[:num_tokens]
 
 
-# DSV4 FP8 nope layout: 448 e4m3 values plus 7 e8m0 scales, one scale per
-# 64-wide block of the 448.
-def _make_dsv4_fp8_scale_expand_matrix():
-    """One-hot [7, 448] matrix mapping each e8m0 scale onto its 64-lane block."""
-    scale_id = lax.broadcasted_iota(jnp.int32, (7, 448), 0)
-    block_id = lax.broadcasted_iota(jnp.int32, (7, 448), 1) // 64
-    return (scale_id == block_id).astype(jnp.bfloat16)
+# DSV4 FP8 nope layout: 448 e4m3 values, then one e8m0 scale per lane of a
+# 64-lane period -- 64 quantization groups of 7 dims, group j holding the dims
+# {j, j + 64, ... j + 384}. The 64 scale bytes fill the row's padding, so the
+# record is still 448 + 64 = 512 bytes.
+NOPE_DIM = 448
+NOPE_SCALE_PERIOD = 64
 
 
-def _dequant_dsv4_fp8(bkv_nope: jax.Array,
-                      dsv4_fp8_scale_expand_matrix: jax.Array):
+def _dequant_dsv4_fp8(bkv_nope: jax.Array):
     """Dequantize FP8 values to BF16."""
-    nope_fp8 = pltpu.bitcast(bkv_nope[:, :448],
+    nope_fp8 = pltpu.bitcast(bkv_nope[:, :NOPE_DIM],
                              jnp.float8_e4m3fn).astype(jnp.bfloat16)
-    nope_scales = pltpu.bitcast(
-        bkv_nope[:, 448:448 + 7],
-        jnp.float8_e8m0fnu,
-    ).astype(jnp.bfloat16)
-    # Using on-hot matrix to broadcast each scale across its 64-lane block is
-    # more efficient than using
-    # `nope_scales = jnp.repeat(nope_scales.T, 64, axis=0).T`
-    nope_scales = jnp.dot(
-        nope_scales,
-        dsv4_fp8_scale_expand_matrix,
-        preferred_element_type=jnp.float32,
-    ).astype(jnp.bfloat16)
-    nope = (nope_fp8 * nope_scales).astype(jnp.bfloat16)
-    return nope
+    # scales[d] = scales[d % 64]
+    tail = pltpu.bitcast(bkv_nope[:, -128:],
+                         jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+    lane = lax.broadcasted_iota(jnp.int32, tail.shape, 1)
+    tile = jnp.where(lane < NOPE_SCALE_PERIOD,
+                     pltpu.roll(tail, NOPE_SCALE_PERIOD, 1), tail)
+    nope_scales = jnp.concatenate([tile] * 4, axis=1)[:, :NOPE_DIM]
+    return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
 
 
 def _attention_kernel(
@@ -199,7 +191,8 @@ def _attention_kernel(
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     assert kv_lens_ref.shape[0] == num_tokens
-    bkv_sz = cache_kv_rope_hbm_ref.shape[1]
+    # The gathered rope buffer carries two top-k entries per row (csa_gather).
+    bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -245,9 +238,9 @@ def _attention_kernel(
         l_prev = swa_l
         l_curr = exp_m_diff * l_prev + p_rowsum
         exp_attention_sinks = jnp.exp(attention_sinks - m_curr)
-        l = l_curr + exp_attention_sinks  # noqa: E741
+        l_total = l_curr + exp_attention_sinks
 
-        return p, exp_m_diff, l
+        return p, exp_m_diff, l_total
 
     def flash_attention_step2_pv(
         p,
@@ -401,13 +394,21 @@ def _attention_kernel(
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
         return q
 
-    def load_bkv(bkv_sem_idx, batch_idx, dsv4_fp8_scale_expand_matrix):
+    def load_bkv(bkv_sem_idx, batch_idx):
         bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         # The gather nope is (4, 128) u8, reshape it to (1, 512) u8.
         bkv_nope = bkv_nope.reshape(bkv_sz, -1)
-        bkv_nope = _dequant_dsv4_fp8(bkv_nope, dsv4_fp8_scale_expand_matrix)
+        bkv_nope = _dequant_dsv4_fp8(bkv_nope)
 
+        # The gathered rope block is [bkv_sz // 2, 2 * rope_dim]: entry i in
+        # lanes 0:rope_dim, entry i + bkv_sz // 2 in the upper half (see
+        # csa_gather). Mosaic has no [m, 2n] -> [2m, n] shape cast, but the
+        # lane slice + row concatenate below is one lane rotate per vreg.
         bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
+        bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
+        rope_dim = bkv_rope.shape[-1] // 2
+        bkv_rope = jnp.concatenate(
+            [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
         # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
@@ -449,7 +450,6 @@ def _attention_kernel(
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
         attention_sinks = attention_sinks_ref[...][..., None]
-        dsv4_fp8_scale_expand_matrix = _make_dsv4_fp8_scale_expand_matrix()
 
         prev_p = None
         prev_bkv = None
@@ -468,7 +468,7 @@ def _attention_kernel(
             wait_send_bo_batch(bo_sem_idx)
 
         for batch_idx in range(batch_size):
-            bkv = load_bkv(bi_sem_idx, batch_idx, dsv4_fp8_scale_expand_matrix)
+            bkv = load_bkv(bi_sem_idx, batch_idx)
             bq = load_bq(bi_sem_idx, batch_idx)
 
             if prev_out is not None:
@@ -479,7 +479,7 @@ def _attention_kernel(
 
             swa_acc, swa_l, swa_m = load_swa_output(bi_sem_idx, batch_idx)
 
-            p, exp_m_diff, l = flash_attention_step1_qk_softmax(  # noqa: E741
+            p, exp_m_diff, l_total = flash_attention_step1_qk_softmax(
                 bq,
                 bkv,
                 kv_lens_ref[batch_start_seq_idx + batch_idx],
@@ -507,7 +507,7 @@ def _attention_kernel(
             prev_p = p
             prev_bkv = bkv
             prev_exp_m_diff = exp_m_diff
-            prev_l = l
+            prev_l = l_total
             prev_swa_acc = swa_acc
 
         # end of pipelining loop
@@ -630,7 +630,7 @@ def sparse_ragged_paged_attention(
     *,
     sm_scale: float = 1.0,
     # Kernel optimization params.
-    gather_and_attention_chunk_size: int = 64,
+    gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> jax.Array:
@@ -761,7 +761,8 @@ def sparse_ragged_paged_attention(
             jnp.full((2, ), -1, jnp.int32),
         )
 
-        scope_name = f"SparseMLA-p_{cache_kv_rope.shape[1]}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
+        gathered_topk = cache_kv_rope.shape[1] * 2
+        scope_name = f"SparseMLA-p_{gathered_topk}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -803,7 +804,6 @@ def sparse_ragged_paged_attention(
                                  tokens_per_seq,
                                  total_repeat_length=q.shape[0])
     assert topk_indices is not None
-    # TODO: skip gather for padding tokens in topk_indices.
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
 
     seq_page_ids = topk_indices // page_size
@@ -829,14 +829,14 @@ def sparse_ragged_paged_attention(
     )
 
     assert page_ids.shape == (q.shape[0], topk)
+    gather_indices = (page_ids * page_size + token_offset).reshape(-1)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
-        indices = (page_ids[start_pos:end_pos, ...] * page_size +
-                   token_offset[start_pos:end_pos, ...]).reshape(-1)
+        indices = gather_indices[start_pos * topk:end_pos * topk]
 
         # Batching
         kernel_batch_size = _largest_divisor(chunk_size,
@@ -871,14 +871,13 @@ def sparse_ragged_paged_attention(
             cache_kv_rope,
             indices,
             num_valid_indices=num_valid_indices,
+            rope_period=topk,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size, -1, 128)
         gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk, -1)
-        # We treat each query token as a one independent sequence, attend to their
-        # respective gathered kv tokens in the `gathered_kv_buffer`.
-        # -1 in topk_indices is padded elements at the end of each row.
+            chunk_size, topk // 2, -1)
+
         q = run_mla_kernel(
             q,
             gathered_nope_buffer,

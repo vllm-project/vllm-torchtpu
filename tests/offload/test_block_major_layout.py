@@ -111,9 +111,8 @@ class TestContractResolution(unittest.TestCase):
         with patch.object(bml.tpu_envs, "VLLM_TPU_BLOCK_MAJOR_KV", True), \
              patch(
                  "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
-                 return_value=geometry):
-            with self.assertRaisesRegex(ValueError, "factor"):
-                bml.resolve_block_major_contract(MagicMock(), config)
+                 return_value=geometry), self.assertRaisesRegex(ValueError, "factor"):
+            bml.resolve_block_major_contract(MagicMock(), config)
 
 
 class TestNamespaceIsolation(unittest.TestCase):

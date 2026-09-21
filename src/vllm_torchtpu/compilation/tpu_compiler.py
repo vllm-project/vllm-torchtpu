@@ -13,9 +13,10 @@ import importlib.util
 import json
 import os
 import pickle
+from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch._guards

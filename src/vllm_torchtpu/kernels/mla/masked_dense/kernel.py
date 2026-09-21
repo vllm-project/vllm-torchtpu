@@ -371,7 +371,7 @@ def _mla_ragged_paged_attention_kernel(
         old_seq_idx = bo_ids_ref[bo_sem_idx]
         old_bo_idx = bo_ids_ref[bo_sem_idx + 2]
 
-        @pl.when(jnp.logical_and(0 <= old_seq_idx, old_seq_idx <= seq_idx))
+        @pl.when(jnp.logical_and(old_seq_idx >= 0, old_seq_idx <= seq_idx))
         def _():
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 

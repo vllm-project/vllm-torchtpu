@@ -8,6 +8,8 @@
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
 import math
+from collections.abc import Callable
+from typing import TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +24,18 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+_VerifyWindowResult = TypeVar("_VerifyWindowResult")
+
+
+def _guard_kda_verify_window(
+    num_window_reqs: jax.Array,
+    run_verify_window: Callable[[], _VerifyWindowResult],
+    skip_verify_window: Callable[[], _VerifyWindowResult],
+) -> _VerifyWindowResult:
+    """Skip KDA verification when the device-side window is empty."""
+    return jax.lax.cond(num_window_reqs > 0, run_verify_window,
+                        skip_verify_window)
 
 
 def _token_sequence_ids(
@@ -276,14 +290,16 @@ def _check_kda_abi(
     return num_tokens, num_sequences, num_heads, head_dim
 
 
-def _build_fused_core(lower_bound: float | None, eps: float):
+def _build_fused_core(lower_bound: float | None,
+                      eps: float,
+                      num_spec_tokens: int = 0):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
-    One Pallas call replaces the four-stage manual pipeline: the fused kernel
+    The fused kernel replaces the four-stage manual pipeline and
     owns the convolution, silu, q/k L2-norm, the gate activation, beta's
-    sigmoid, both recurrences and the state write-back, and it dispatches
-    decode against prefill/mixed off `distribution` inside the kernel rather
-    than by emitting both paths and selecting per token.
+    sigmoid, both recurrences and the state write-back. Speculative decoding
+    invokes its batched and per-sequence programs separately so empty verify
+    windows and empty prefill segments do not touch state.
 
     Only `_gated_output_norm` stays outside, since the fused kernel has no
     notion of the output gate.
@@ -304,11 +320,15 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
         distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+        window_distribution: jax.Array | None = None,
+        slot_read_offsets: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         num_tokens, _, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
             dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
         kernel_size = conv_weight.shape[0]
+        if window_distribution is None:
+            window_distribution = distribution
 
         # `mixed_qkv`, `conv_state` and `conv_weight` all lay their channels
         # out as (3, H, D) in row-major order, which is exactly the flat
@@ -316,33 +336,73 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         # kernel wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+        if num_spec_tokens > 0 and slot_read_offsets is None:
+            raise ValueError("slot_read_offsets are required for KDA verify")
+        read_offsets = (slot_read_offsets[state_indices]
+                        if num_spec_tokens > 0 else None)
 
-        (new_conv_state, new_pool), out = gdn_wrapper.fused_conv1d_gdn(
-            qkv=mixed_qkv,
-            # Raw: the kernel applies sigmoid to `b` and the gate activation
-            # to `a` itself.
-            b=beta,
-            a=raw_gate,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
-            conv_weight=conv_weight_flat,
-            # Kimi's short convolution is bias-free.
-            conv_bias=None,
-            a_log=a_log,
-            # Per-channel under KDA, and Mosaic rejects the flat form.
-            dt_bias=dt_bias.reshape(num_heads, head_dim),
-            query_start_loc=query_start_loc,
-            state_indices=state_indices,
-            distribution=distribution,
-            seq_lens=seq_lens,
-            n_kq=num_heads,
-            n_v=num_heads,
-            d_k=head_dim,
-            d_v=head_dim,
-            kernel_size=kernel_size,
-            attention_mode=gdn_config.AttentionMode.KDA,
-            gate_lower_bound=lower_bound,
-        )
+        def run_kernel(conv_in,
+                       rec_in,
+                       *,
+                       batched_only=False,
+                       prefill_only=False):
+            return gdn_wrapper.fused_conv1d_gdn(
+                qkv=mixed_qkv,
+                # Raw: the kernel applies sigmoid to `b` and the gate activation
+                # to `a` itself.
+                b=beta,
+                a=raw_gate,
+                conv_state=conv_in,
+                recurrent_state=rec_in,
+                conv_weight=conv_weight_flat,
+                # Kimi's short convolution is bias-free.
+                conv_bias=None,
+                a_log=a_log,
+                # Per-channel under KDA, and Mosaic rejects the flat form.
+                dt_bias=dt_bias.reshape(num_heads, head_dim),
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                # The batched segment contains both ordinary one-token decodes and
+                # K+1 target-verify windows.  Ragged query lengths distinguish the
+                # two while the recurrent kernel uses one static window shape.
+                distribution=window_distribution,
+                seq_lens=seq_lens,
+                read_offsets=read_offsets,
+                n_kq=num_heads,
+                n_v=num_heads,
+                d_k=head_dim,
+                d_v=head_dim,
+                kernel_size=kernel_size,
+                attention_mode=gdn_config.AttentionMode.KDA,
+                gate_lower_bound=lower_bound,
+                num_spec_tokens=num_spec_tokens,
+                batched_only=batched_only,
+                prefill_only=prefill_only,
+            )
+
+        if num_spec_tokens > 0:
+            window_end = window_distribution[0]
+            empty_out = jnp.zeros((num_tokens, num_heads * head_dim),
+                                  mixed_qkv.dtype)
+            (verify_states, verify_out) = _guard_kda_verify_window(
+                window_end,
+                lambda: run_kernel(
+                    conv_state, recurrent_state, batched_only=True),
+                lambda: ((conv_state, recurrent_state), empty_out),
+            )
+            first_prefill_token = query_start_loc[window_end]
+            total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
+            ((new_conv_state, new_pool), prefill_out) = jax.lax.cond(
+                first_prefill_token < total_tokens,
+                lambda: run_kernel(*verify_states, prefill_only=True),
+                lambda: (verify_states, empty_out),
+            )
+            out = jnp.where((jnp.arange(num_tokens)
+                             < first_prefill_token)[:, None], verify_out,
+                            prefill_out)
+        else:
+            (new_conv_state,
+             new_pool), out = run_kernel(conv_state, recurrent_state)
 
         output = out.reshape(num_tokens, num_heads, head_dim)
         output = _gated_output_norm(output, output_gate, norm_weight, eps,
@@ -358,22 +418,13 @@ def build_kimi_dispatched_kda_op(
     lower_bound: float | None,
     eps: float,
     state_dim_first: bool,
+    num_spec_tokens: int = 0,
 ):
-    """Build the KDA op on the fused conv1d + GDN v3 kernel.
-
-    Takes the *pre-convolution* projection output and owns both caches: the
-    fused kernel owns the convolution, silu, q/k L2-norm, the gate activations,
-    both recurrences and the state write-back, and dispatches decode against
-    prefill/mixed off ``distribution`` inside the kernel.
-    """
-    core = _build_fused_core(lower_bound, eps)
-
-    # vLLM's compile cache is keyed on the model config, so the variant goes in
-    # the op name. If this line disagrees with the kernels in a profile, the
-    # run came from cache.
-    logger.info("KDA op %s: using the fused conv1d + GDN v3 path.", prefix)
-
-    op_name = f"pallas::kimi_dispatched_kda_fused_{prefix.replace('.', '_')}"
+    """Build fused KDA with separately guarded speculative and prefill segments."""
+    core = _build_fused_core(lower_bound, eps, num_spec_tokens)
+    variant = "fused_window" if num_spec_tokens else "fused"
+    logger.info("KDA op %s: using the %s GDN v3 path.", prefix, variant)
+    op_name = f"pallas::kimi_dispatched_kda_{variant}_{prefix.replace('.', '_')}"
     dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
 
     def _fake_dispatched(mixed_qkv, _raw_gate, _beta, _output_gate, conv_state,
@@ -402,6 +453,8 @@ def build_kimi_dispatched_kda_op(
         state_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         distribution: torch.Tensor,
+        window_distribution: torch.Tensor,
+        slot_read_offsets: torch.Tensor,
     ) -> torch.Tensor:
         output, new_conv_state, new_pool = dispatched_op(
             mixed_qkv,
@@ -418,6 +471,8 @@ def build_kimi_dispatched_kda_op(
             state_indices,
             seq_lens,
             distribution,
+            window_distribution,
+            slot_read_offsets,
         )
         conv_state.copy_(new_conv_state)
         recurrent_state.copy_(new_pool)

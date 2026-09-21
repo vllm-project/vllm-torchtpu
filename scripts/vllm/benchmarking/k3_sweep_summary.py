@@ -51,8 +51,7 @@ _SCORE_KEYS = (
 
 # (column title, dotted path into the InferenceX aggregate JSON)
 AGENTX_COLUMNS = (
-    ("out tok/s per chip",
-     "request_metrics.throughput.per_gpu.output_tput_tps"),
+    ("out tok/s per chip", "request_metrics.throughput.per_gpu.output_tput_tps"),
     ("out tok/s total", "request_metrics.throughput.output.tokens_per_second"),
     ("requests ok", "num_requests_successful"),
     ("TTFT p50 s", "request_metrics.latency.ttft.p50"),
@@ -72,13 +71,11 @@ def dotted_get(d: Any, path: str) -> float | None:
         if not isinstance(d, dict) or key not in d:
             return None
         d = d[key]
-    return d if isinstance(d,
-                           (int, float)) and not isinstance(d, bool) else None
+    return d if isinstance(d, (int, float)) and not isinstance(d, bool) else None
 
 
 def newest_results_file(output_dir: str) -> str | None:
-    files = glob.glob(os.path.join(output_dir, "**", "results_*.json"),
-                      recursive=True)
+    files = glob.glob(os.path.join(output_dir, "**", "results_*.json"), recursive=True)
     return max(files, key=os.path.getmtime) if files else None
 
 
@@ -94,15 +91,16 @@ def lm_eval_score(output_dir: str, task: str) -> tuple[str, float, float]:
     r = results[task]
     for key in _SCORE_KEYS:
         if key in r:
-            stderr = r.get(key.replace("exact_match", "exact_match_stderr"),
-                           float("nan"))
+            stderr = r.get(
+                key.replace("exact_match", "exact_match_stderr"), float("nan")
+            )
             return key, float(r[key]), float(stderr)
-    raise KeyError(
-        f"no exact_match metric for {task!r} in {path}: {sorted(r)}")
+    raise KeyError(f"no exact_match metric for {task!r} in {path}: {sorted(r)}")
 
 
-def question_limit(task: str, conc: int, gsm8k_limit: int,
-                   mmlu_limit: int) -> tuple[int, int]:
+def question_limit(
+    task: str, conc: int, gsm8k_limit: int, mmlu_limit: int
+) -> tuple[int, int]:
     """(lm_eval --limit, total questions) so that 2*conc questions exist.
 
     gsm8k's --limit is a question count; mmlu_pro's is per subject, and it
@@ -124,19 +122,22 @@ def gsm8k_row(output_dir: str, conc: int) -> str:
     with open(path) as f:
         results = json.load(f)["results"]
     r = next(iter(results.values()), {})
-    return (f"| {conc} | {r.get('exact_match,strict-match')} | "
-            f"{r.get('exact_match,flexible-extract')} |")
+    return (
+        f"| {conc} | {r.get('exact_match,strict-match')} | "
+        f"{r.get('exact_match,flexible-extract')} |"
+    )
 
 
 def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
     lines = [
         "| conc | " + " | ".join(t for t, _ in AGENTX_COLUMNS) + " |",
-        "|" + "---|" * (len(AGENTX_COLUMNS) + 1)
+        "|" + "---|" * (len(AGENTX_COLUMNS) + 1),
     ]
     for c in concs:
         path = os.path.join(results_dir, f"{base}_c{c}.json")
         timed_out = os.path.exists(
-            os.path.join(results_dir, f"conc_{c}", "HARD_TIMEOUT"))
+            os.path.join(results_dir, f"conc_{c}", "HARD_TIMEOUT")
+        )
         if not os.path.exists(path):
             why = "hard timeout, " if timed_out else ""
             lines.append(
@@ -155,8 +156,8 @@ def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("lm-eval-score")
     s.add_argument("--output-dir", required=True)
@@ -182,13 +183,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"[k3-sweep-summary] ERROR: cannot score {a.task} from "
                 f"{a.output_dir}: {e}",
-                file=sys.stderr)
+                file=sys.stderr,
+            )
             print("none nan nan")
             return 0
         print(f"{metric} {score} {stderr}")
     elif a.cmd == "question-limit":
-        limit, total = question_limit(a.task, a.conc, a.gsm8k_limit,
-                                      a.mmlu_limit)
+        limit, total = question_limit(a.task, a.conc, a.gsm8k_limit, a.mmlu_limit)
         print(f"{limit} {total}")
     elif a.cmd == "gsm8k-row":
         print(gsm8k_row(a.output_dir, a.conc))

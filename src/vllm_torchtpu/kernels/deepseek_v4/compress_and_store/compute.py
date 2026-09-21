@@ -132,6 +132,48 @@ def quantize_fp8_tiled(x, block_size):
     return q, scale_f8
 
 
+def quantize_fp8_lane_periodic(x, period, nope_dim):
+    """Quantize with one e8m0 scale per lane of a `period`-lane cycle.
+
+    Group j is ``{d < nope_dim : d % period == j}``, so the scale a stored
+    value needs is a function of its lane alone. The attention kernel then
+    reads the scales as a tile it can rotate into place instead of expanding
+    them with a one-hot matmul (see sparse_mla._dequant_dsv4_fp8).
+
+    x: (tile_n, S, 128) f32, of which the first `nope_dim` flattened dims are
+    the ones the record keeps.
+    Returns (tile_n, S, 128) fp8 values and (tile_n, 1, period) e8m0 scales.
+    """
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    _, _, width = x.shape
+    assert width == 2 * period, (width, period)
+
+    dim = (jax.lax.broadcasted_iota(jnp.int32, x.shape, 1) * width +
+           jax.lax.broadcasted_iota(jnp.int32, x.shape, 2))
+    # Dims past the record's end are dropped by the packer; keeping them out
+    # of the amax stops them widening a group they are not stored in.
+    a = jnp.where(dim < nope_dim, jnp.abs(x), 0.0)
+    folded = jnp.maximum(a[:, :, :period], a[:, :, period:])
+    amax = jnp.clip(jnp.max(folded, axis=1, keepdims=True), 1e-4, None)
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))  # (tile_n, 1, period)
+
+    q = (x * (1.0 / jnp.concatenate([scale, scale], axis=-1))).astype(
+        jnp.float8_e4m3fn)
+    scale_u8 = (pltpu.bitcast(scale, jnp.uint32) >> 23).astype(jnp.uint8)
+    return q, pltpu.bitcast(scale_u8, jnp.float8_e8m0fnu)
+
+
+def pack_nope_lane_periodic(q, scale, nope_dim, nope_width_bytes,
+                            last_dim_size):
+    """Pack `nope_dim` fp8 values followed by the e8m0 scales."""
+    tile_n = q.shape[0]
+    q_nope = pltpu.bitcast(q, jnp.uint8).reshape(tile_n, -1)[:, :nope_dim]
+    scale_bytes = pltpu.bitcast(scale, jnp.uint8).reshape(tile_n, -1)
+    record = jnp.concatenate([q_nope, scale_bytes], axis=1)
+    assert record.shape[1] == nope_width_bytes, record.shape
+    return record.reshape(tile_n, -1, last_dim_size)
+
+
 def pack_nope_tiled(q,
                     scale,
                     nope_dim,

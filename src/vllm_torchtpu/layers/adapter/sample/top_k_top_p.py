@@ -17,7 +17,7 @@ Includes fast algorithms for top-k masking and top-p masking on probability
 distributions.
 """
 
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 

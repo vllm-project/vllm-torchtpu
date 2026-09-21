@@ -86,6 +86,7 @@ def kernel(
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     cp_size: int = 1,
     interleave_c: int = 1,
+    chunk_idx: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -122,22 +123,30 @@ def kernel(
     num_sublanes_bkv = bkv_sz // 128
     shift_comp = (compression_ratio - 1).bit_length()
 
+    # The schedule holds every chunk's steps back to back, so this chunk starts
+    # where the chunks before it end and runs `num_steps[chunk_idx]` steps.
+    step_offset = sum(metadata_ref.num_steps[m] for m in range(chunk_idx))
+
+    def seq_tile(p_id):
+        """Sequence tile scheduled at pipeline step `p_id`."""
+        return metadata_ref.batch_tile_idx[step_offset + p_id]
+
+    def bq_block(p_id):
+        """Query block scheduled at pipeline step `p_id`."""
+        return metadata_ref.bq_idx[step_offset + p_id]
+
+    def bkv_block(p_id):
+        """KV block scheduled at pipeline step `p_id`."""
+        return metadata_ref.bkv_idx[step_offset + p_id]
+
     q_spec = pl.BlockSpec(
         (pl.BoundedSlice(seq_batch_size * bq_sz), num_q_heads, head_dim),
-        lambda p_id: (
-            metadata_ref.batch_tile_idx[p_id] * seq_batch_size * bq_sz,
-            metadata_ref.bq_idx[p_id],
-            0,
-        ),
+        lambda p_id: (seq_tile(p_id), bq_block(p_id), 0),
         pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
     )
     weights_spec = pl.BlockSpec(
         (pl.BoundedSlice(seq_batch_size * bq_sz), num_q_heads),
-        lambda p_id: (
-            metadata_ref.batch_tile_idx[p_id] * seq_batch_size * bq_sz,
-            metadata_ref.bq_idx[p_id],
-            0,
-        ),
+        lambda p_id: (seq_tile(p_id), bq_block(p_id), 0),
         pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
     )
     if seq_along_lane:
@@ -148,12 +157,7 @@ def kernel(
                 kv_packing,
                 bkv_sz,
             ),
-            lambda p_id: (
-                metadata_ref.batch_tile_idx[p_id],
-                0,
-                0,
-                metadata_ref.bkv_idx[p_id],
-            ),
+            lambda p_id: (seq_tile(p_id), 0, 0, bkv_block(p_id)),
             pipeline_mode=pl.Buffered(buffer_count=buffer_cnt,
                                       use_lookahead=True),
         )
@@ -165,23 +169,13 @@ def kernel(
                 kv_packing,
                 cache_kv_hbm_ref.shape[-1],
             ),
-            lambda p_id: (
-                metadata_ref.batch_tile_idx[p_id],
-                0,
-                metadata_ref.bkv_idx[p_id],
-                0,
-            ),
+            lambda p_id: (seq_tile(p_id), 0, bkv_block(p_id), 0),
             pipeline_mode=pl.Buffered(buffer_count=buffer_cnt,
                                       use_lookahead=True),
         )
     out_spec = pl.BlockSpec(
         (pl.BoundedSlice(seq_batch_size * bq_sz), num_sublanes_bkv, 128),
-        lambda p_id: (
-            metadata_ref.batch_tile_idx[p_id] * seq_batch_size * bq_sz,
-            metadata_ref.bq_idx[p_id],
-            metadata_ref.bkv_idx[p_id],
-            0,
-        ),
+        lambda p_id: (seq_tile(p_id), bq_block(p_id), bkv_block(p_id), 0),
         pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
     )
 
@@ -193,6 +187,7 @@ def kernel(
         bq_sz=bq_sz,
         seq_batch_size=seq_batch_size,
         chunk_tokens=scores_hbm_ref.shape[0],
+        chunk_idx=chunk_idx,
     )
     weights_alloc = bref_override.StreamIndexQBufferedRef.input(
         spec=weights_spec,
@@ -202,6 +197,7 @@ def kernel(
         bq_sz=bq_sz,
         seq_batch_size=seq_batch_size,
         chunk_tokens=scores_hbm_ref.shape[0],
+        chunk_idx=chunk_idx,
     )
     if seq_along_lane:
         kv_alloc = bref_override.StreamIndexKVSeqAlongLaneBufferedRef.input(
@@ -213,6 +209,7 @@ def kernel(
             page_size=page_size,
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
+            chunk_idx=chunk_idx,
         )
     else:
         kv_alloc = bref_override.StreamIndexKVBufferedRef.input(
@@ -225,6 +222,7 @@ def kernel(
             kv_packing=kv_packing,
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
+            chunk_idx=chunk_idx,
         )
     o_alloc = bref_override.StreamIndexOBufferedRef.output(
         spec=out_spec,
@@ -234,6 +232,7 @@ def kernel(
         bq_sz=bq_sz,
         num_sublanes=num_sublanes_bkv,
         seq_batch_size=seq_batch_size,
+        chunk_idx=chunk_idx,
     )
 
     def transpose_to_head_major(bq_rows, n_tok):
@@ -332,9 +331,9 @@ def kernel(
 
     def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
         p_id = pl.program_id(0)
-        batch_start_seq_idx = metadata_ref.batch_tile_idx[p_id]
-        bq_idx = metadata_ref.bq_idx[p_id]
-        bkv_idx = metadata_ref.bkv_idx[p_id]
+        batch_start_seq_idx = seq_tile(p_id)
+        bq_idx = bq_block(p_id)
+        bkv_idx = bkv_block(p_id)
         cp_rank = cp_rank_ref[0]
 
         if q_hm_ref is not None:
@@ -419,7 +418,7 @@ def kernel(
             q_buf, weights_buf, kv_buf, o_buf = final_allocs
             pipeline_fn = pltpu.emit_pipeline(
                 functools.partial(step_body, q_hm_ref=q_hm_ref),
-                grid=(metadata_ref.num_steps[0], ),
+                grid=(metadata_ref.num_steps[chunk_idx], ),
                 in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
                 out_specs=o_buf.spec,
             )
@@ -815,6 +814,15 @@ def streamindex_topk(
         align_to(pages_per_seq, bkv_p) * page_size // 128
         for bkv_p in num_kv_pages_per_blocks)
 
+    def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
+        """Query and KV block sizes a pass runs with."""
+        if static_q_len is not None:
+            bq_sz = min(num_queries_per_block, static_q_len)
+        else:
+            bq_sz = num_queries_per_block
+        bkv_sz = page_size * bkv_p
+        return bq_sz, bkv_sz
+
     def run_scores_kernel(
         q,
         prepared_indexer_weights,
@@ -831,10 +839,12 @@ def streamindex_topk(
         buffer_count,
         seq_batch_size,
         out_dtype,
+        pass_meta,
         case=MlaCase.MIXED,
         chunk_token_start=None,
         chunk_tokens=None,
         scheduling_group_id=None,
+        chunk_idx=0,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
         # Only support batching for decode sequences.
@@ -848,31 +858,8 @@ def streamindex_topk(
             chunk_tokens = max_num_tokens
 
         bkv_p = num_kv_pages_per_block
-        if static_q_len is not None:
-            bq_sz = min(num_queries_per_block, static_q_len)
-        else:
-            bq_sz = num_queries_per_block
-        bkv_sz = page_size * bkv_p
-
-        meta = metadata.compute_metadata(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            start_seq_idx=start_seq_idx,
-            end_seq_idx=end_seq_idx,
-            bq_sz=bq_sz,
-            bkv_sz=bkv_sz,
-            pages_per_seq=pages_per_seq,
-            compression_ratio=compression_ratio,
-            static_q_len=static_q_len,
-            seq_batch_size=seq_batch_size,
-            page_size=page_size,
-            max_num_tokens=max_num_tokens,
-            chunk_token_start=chunk_token_start,
-            chunk_tokens=chunk_tokens,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
+        bq_sz, bkv_sz = _block_sizes(num_queries_per_block, bkv_p,
+                                     static_q_len)
 
         hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
         # Passes 2 and 3 donate the previous pass's HBM buffer so its rows survive
@@ -896,7 +883,7 @@ def streamindex_topk(
             page_indices,
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32),
-            meta,
+            pass_meta,
             jnp.asarray([cp_rank], jnp.int32),
         )
 
@@ -925,6 +912,7 @@ def streamindex_topk(
                 kv_layout=kv_layout,
                 cp_size=cp_size,
                 interleave_c=interleave_c,
+                chunk_idx=chunk_idx,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=num_scalar_prefetch,
@@ -957,78 +945,99 @@ def streamindex_topk(
                 scores, _scheduling_group_id=scheduling_group_id)
         return scores
 
+    def _pass_specs(decode_batch_end):
+        """`run_scores_kernel` kwargs for the three passes over the batch."""
+        decode_cfg = dict(
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            buffer_count=buffer_counts[0],
+            static_q_len=1,
+            case=MlaCase.DECODE,
+        )
+        return (
+            dict(
+                start_seq_idx=jnp.array(0),
+                end_seq_idx=decode_batch_end,
+                seq_batch_size=decode_req_batch_size,
+                **decode_cfg,
+            ),
+            # Handle num_decode_seqs % decode_req_batch_size != 0 case.
+            dict(
+                start_seq_idx=decode_batch_end,
+                end_seq_idx=distribution[1],
+                seq_batch_size=1,
+                **decode_cfg,
+            ),
+            dict(
+                num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+                num_queries_per_block=num_queries_per_blocks[2],
+                buffer_count=buffer_counts[2],
+                start_seq_idx=distribution[1],
+                end_seq_idx=distribution[2],
+                static_q_len=None,
+                seq_batch_size=1,
+                case=MlaCase.MIXED,
+            ),
+        )
+
+    def _pass_metadata(spec, chunk_starts, chunk_tokens):
+        """One schedule per pass, holding every chunk's steps back to back."""
+        bq_sz, bkv_sz = _block_sizes(
+            spec["num_queries_per_block"],
+            spec["num_kv_pages_per_block"],
+            spec["static_q_len"],
+        )
+        return metadata.compute_metadata(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            start_seq_idx=spec["start_seq_idx"],
+            end_seq_idx=spec["end_seq_idx"],
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            pages_per_seq=pages_per_seq,
+            compression_ratio=compression_ratio,
+            static_q_len=spec["static_q_len"],
+            seq_batch_size=spec["seq_batch_size"],
+            page_size=page_size,
+            max_num_tokens=q.shape[0],
+            chunk_token_start=chunk_starts,
+            chunk_tokens=chunk_tokens,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
+        )
+
     def _scores_for_chunk(
+        passes,
+        chunk_idx,
         chunk_token_start,
         chunk_tokens,
         out_dtype,
-        decode_batch_end,
         scheduling_group_id,
     ):
         """Scores for one window of the flat token axis, in a private buffer."""
-        chunk = dict(
-            chunk_token_start=chunk_token_start,
-            chunk_tokens=chunk_tokens,
-            out_dtype=out_dtype,
-            scheduling_group_id=scheduling_group_id,
-        )
         # `scores=None`: no -inf pre-fill. It would write all of HBM scores, and
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
-        scores = run_scores_kernel(
-            q,
-            prepared_indexer_weights,
-            cache_kv,
-            None,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-            num_queries_per_block=num_queries_per_blocks[0],
-            buffer_count=buffer_counts[0],
-            start_seq_idx=jnp.array(0),
-            end_seq_idx=decode_batch_end,
-            static_q_len=1,
-            seq_batch_size=decode_req_batch_size,
-            case=MlaCase.DECODE,
-            **chunk,
-        )
-        # Handle num_decode_seqs % decode_req_batch_size != 0 case.
-        scores = run_scores_kernel(
-            q,
-            prepared_indexer_weights,
-            cache_kv,
-            scores,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-            num_queries_per_block=num_queries_per_blocks[0],
-            buffer_count=buffer_counts[0],
-            start_seq_idx=decode_batch_end,
-            end_seq_idx=distribution[1],
-            static_q_len=1,
-            seq_batch_size=1,
-            case=MlaCase.DECODE,
-            **chunk,
-        )
-        return run_scores_kernel(
-            q,
-            prepared_indexer_weights,
-            cache_kv,
-            scores,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-            num_queries_per_block=num_queries_per_blocks[2],
-            buffer_count=buffer_counts[2],
-            start_seq_idx=distribution[1],
-            end_seq_idx=distribution[2],
-            static_q_len=None,
-            seq_batch_size=1,
-            case=MlaCase.MIXED,
-            **chunk,
-        )
+        scores = None
+        for spec, pass_meta in passes:
+            scores = run_scores_kernel(
+                q,
+                prepared_indexer_weights,
+                cache_kv,
+                scores,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                pass_meta=pass_meta,
+                chunk_idx=chunk_idx,
+                chunk_token_start=chunk_token_start,
+                chunk_tokens=chunk_tokens,
+                out_dtype=out_dtype,
+                scheduling_group_id=scheduling_group_id,
+                **spec,
+            )
+        return scores
 
     def _common_path(_):
         # Raw f32 bits, not f32. The SparseCore top-k compares bits, and this is
@@ -1068,6 +1077,11 @@ def streamindex_topk(
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         need_scores = cp_size > 1 or return_scores
+
+        chunk_starts = ((None, ) if num_chunks == 1 else tuple(
+            m * chunk_len for m in range(num_chunks)))
+        passes = tuple((spec, _pass_metadata(spec, chunk_starts, chunk_len))
+                       for spec in _pass_specs(decode_batch_end))
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
@@ -1076,15 +1090,17 @@ def streamindex_topk(
             # Chunk 0's scoring and the last top-k have no partner.
             tc_group = None if m == 0 else group_base + m - 1
             sc_group = None if m == num_chunks - 1 else group_base + m
+            # Stage 2 lands one group later than its own stage 1, so it overlaps
+            # chunk m + 2's scoring. The last two chunks have no later group.
+            sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
-            # `None` start means unchunked, which is what tells the kernel and the
-            # metadata not to clip anything.
             start = m * chunk_len
             scores = _scores_for_chunk(
-                None if num_chunks == 1 else start,
+                passes,
+                m,
+                chunk_starts[m],
                 chunk_len,
                 out_dtype,
-                decode_batch_end,
                 tc_group,
             )
             scores = scores.reshape(chunk_len, -1)
@@ -1101,6 +1117,7 @@ def streamindex_topk(
                 row_lengths=eff_row_lengths[start:start + chunk_len],
                 write_empty_rows=True,
                 scheduling_group_id=sc_group,
+                stage2_scheduling_group_id=sc2_group,
                 return_scores=True,
             )
             topk_idxs.append(chunk_topk_idxs)

@@ -68,6 +68,9 @@ FROM base AS ci
 # Copy bktec binary from Buildkite Test Engine client image
 COPY --from=buildkite/test-engine-client /usr/local/bin/bktec /usr/local/bin/bktec
 
+# The agent CLI, so a pod can upload its own results before it is deleted.
+COPY --from=buildkite/agent:3 /usr/local/bin/buildkite-agent /usr/local/bin/buildkite-agent
+
 # Install tools needed for CI (gcloud, lsof, fuser, compilers)
 RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg lsof psmisc lsb-release && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \

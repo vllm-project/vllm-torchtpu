@@ -261,7 +261,7 @@ def test_masking_is_below_the_flush_sentinel():
 
 def test_sentinel_is_below_every_real_score_but_above_the_reduce_identity():
     assert NEG < 0.0
-    assert NEG > torch.finfo(torch.float32).min
+    assert torch.finfo(torch.float32).min < NEG
 
 
 def test_k_equal_to_expert_count():

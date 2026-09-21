@@ -101,18 +101,9 @@ def ref_implementation(
     fp8_part = kv_c_cache[..., :448]
     bf16_part = kv_c_cache[..., 448:512]
 
-    fp8_blocked = fp8_part.reshape(total_num_pages, page_size, 7, 64)
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    x_amax = jnp.max(jnp.abs(fp8_blocked), axis=-1, keepdims=True)
-    x_amax = jnp.clip(x_amax, 1e-4, None)
-    sf = jnp.power(2.0, jnp.ceil(jnp.log2(x_amax / fp8_max)))
-
-    fp8_quant = (fp8_blocked * (1.0 / sf)).astype(jnp.float8_e4m3fn)
-    scales_quant = sf.reshape(total_num_pages, page_size,
-                              7).astype(jnp.float8_e8m0fnu)
-
+    fp8_quant, scales_quant = _quantize_lane_periodic(fp8_part)
     fp8_dequant = (fp8_quant.astype(jnp.bfloat16) *
-                   scales_quant[..., None].astype(jnp.bfloat16)).reshape(
+                   scales_quant[..., None, :].astype(jnp.bfloat16)).reshape(
                        total_num_pages, page_size, 448)
     kv_c_cache = jnp.concatenate([fp8_dequant, bf16_part], axis=-1)
 
@@ -194,6 +185,23 @@ def gen_random(rng, shape, dtype):
     return jnp.array(rng.random(size=shape, dtype=np.float32)).astype(dtype)
 
 
+# The nope record carries one e8m0 scale per lane of a 64-lane period, so
+# quantization group j is {d : d % 64 == j} (see sparse_mla._dequant_dsv4_fp8).
+NOPE_SCALE_PERIOD = 64
+
+
+def _quantize_lane_periodic(x):
+    """[..., 448] -> e4m3 [..., 7, 64] values and e8m0 [..., 64] scales."""
+    blocked = x.reshape(*x.shape[:-1], x.shape[-1] // NOPE_SCALE_PERIOD,
+                        NOPE_SCALE_PERIOD)
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-2, keepdims=True), 1e-4,
+                    None)
+    sf = jnp.power(2.0, jnp.ceil(jnp.log2(amax / fp8_max)))
+    q = (blocked * (1.0 / sf)).astype(jnp.float8_e4m3fn)
+    return q, jnp.squeeze(sf, -2).astype(jnp.float8_e8m0fnu)
+
+
 def gen_random_int(rng, shape, low, high):
     return jnp.array(rng.integers(low=low, high=high, size=shape))
 
@@ -210,15 +218,7 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
     fp8_part = kv_c_flat[..., :448]
     bf16_part = kv_c_flat[..., 448:512]
 
-    fp8_blocked = fp8_part.reshape(total_pages, page_size, 7, 64)
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    x_amax = jnp.max(jnp.abs(fp8_blocked), axis=-1, keepdims=True)
-    x_amax = jnp.clip(x_amax, 1e-4, None)
-    sf = jnp.power(2.0, jnp.ceil(jnp.log2(x_amax / fp8_max)))
-
-    fp8_quant = (fp8_blocked * (1.0 / sf)).astype(jnp.float8_e4m3fn)
-    scales_quant = sf.reshape(total_pages, page_size,
-                              7).astype(jnp.float8_e8m0fnu)
+    fp8_quant, scales_quant = _quantize_lane_periodic(fp8_part)
 
     fp8_uint8 = jax.lax.bitcast_convert_type(
         fp8_quant.reshape(total_pages, page_size, 448), jnp.uint8)
@@ -229,10 +229,9 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
     rope_uint8 = jnp.concatenate([hi, lo], axis=-1)
 
     scales_uint8 = jax.lax.bitcast_convert_type(scales_quant, jnp.uint8)
-    pad_uint8 = jnp.zeros((total_pages, page_size, 57), dtype=jnp.uint8)
 
-    # NOPE cache: fp8_uint8 (448) + scales_uint8 (7) + pad_uint8 (57) = 512
-    cache_kv_nope = jnp.concatenate([fp8_uint8, scales_uint8, pad_uint8],
+    # NOPE cache: fp8_uint8 (448) + scales_uint8 (64) = 512
+    cache_kv_nope = jnp.concatenate([fp8_uint8, scales_uint8],
                                     axis=-1).reshape(total_pages, page_size, 4,
                                                      128)
 

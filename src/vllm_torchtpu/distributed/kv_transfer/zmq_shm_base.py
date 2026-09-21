@@ -35,7 +35,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import zmq
@@ -67,13 +67,12 @@ def _get_default_ipc_key() -> bytes:
     machine_id = ""
     try:
         if os.path.exists("/etc/machine-id"):
-            with open("/etc/machine-id", "r") as f:
+            with open("/etc/machine-id") as f:
                 machine_id = f.read().strip()
     except Exception:
         pass
     user_id = str(os.getuid()) if hasattr(os, "getuid") else "0"
-    base_secret = f"vllm-torchtpu-ipc-auth-{machine_id}-{user_id}".encode(
-        "utf-8")
+    base_secret = f"vllm-torchtpu-ipc-auth-{machine_id}-{user_id}".encode()
     return hashlib.sha256(base_secret).digest()
 
 
@@ -173,7 +172,7 @@ class _CoordRecvEntry:
     remote_blocks: list[int]
     remote_host: str | list[str]
     remote_port: int | list[int]
-    remote_side_channel_port: Optional[int] = None
+    remote_side_channel_port: int | None = None
     # Set by the async pull thread once data has been written to shm.
     load_complete: threading.Event = field(default_factory=threading.Event)
     # Ranks that have sent COPY_DONE. Once |copied| == tp_size we can notify
@@ -262,13 +261,13 @@ class ZmqShmKvConnectorBase:
 
     def __init__(self, vllm_config: VllmConfig):
         self._coord_threads: list[threading.Thread] = []
-        self._coord_pool: Optional[HostKVShmPool] = None
+        self._coord_pool: HostKVShmPool | None = None
         self.vllm_config = vllm_config
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
 
-        self.runner: Optional[Any] = None
-        self.device: Optional[torch.device] = None
+        self.runner: Any | None = None
+        self.device: torch.device | None = None
         self.multi_host = envs.TPU_MULTIHOST_BACKEND == "ray"
         self.node_id: int = dist_utils.get_node_id()
         self.dp_rank: int = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
@@ -331,7 +330,7 @@ class ZmqShmKvConnectorBase:
         # smoke-test or compile failure.
         self._kv_scatter_enabled: bool = False
 
-        self._coord_ipc_sock: Optional[zmq.Socket] = None
+        self._coord_ipc_sock: zmq.Socket | None = None
         # Outbound IPC queue: the IPC loop owns the socket and drains this
         # queue each iteration, so send_multipart() is only ever called from
         # one thread (ZMQ sockets are not thread-safe).
@@ -403,8 +402,8 @@ class ZmqShmKvConnectorBase:
         self._worker_pending_stage_cv = threading.Condition()
         # uuid -> (slot_idx, num_blocks, local_blocks) -- consumer: after
         # coord has filled the slot, ranks scatter from shm on next step.
-        self._worker_pending_load: dict[int, Optional[tuple[int, int,
-                                                            list[int]]]] = {}
+        self._worker_pending_load: dict[int, tuple[int, int, list[int]]
+                                        | None] = {}
         self._worker_pending_load_cv = threading.Condition()
 
         # Lock around the rank-0 bookkeeping dicts above.
@@ -584,7 +583,7 @@ class ZmqShmKvConnectorBase:
         return self._coord_process_send_load(metadata)
 
     def _resolve_remote_host_port(
-            self, req_meta: LoadMeta) -> tuple[str, int, Optional[int]]:
+            self, req_meta: LoadMeta) -> tuple[str, int, int | None]:
         if isinstance(req_meta.remote_host, list):
             assert len(req_meta.remote_host) == len(req_meta.remote_port)
             host = req_meta.remote_host[self.node_id]
@@ -694,7 +693,7 @@ class ZmqShmKvConnectorBase:
         """Non-rank-0 ranks may race ahead of rank 0. Poll the shm name a
         few seconds before giving up."""
         deadline = time.perf_counter() + 30.0
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         while time.perf_counter() < deadline:
             try:
                 return self._pool_attach(spec, name)
@@ -769,7 +768,7 @@ class ZmqShmKvConnectorBase:
         sock = self.zmq_cxt.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 0)
         # Identity encodes rank so the coordinator can address us explicitly.
-        ident = f"tpu_rank_{self.local_tp_rank}".encode("utf-8")
+        ident = f"tpu_rank_{self.local_tp_rank}".encode()
         sock.setsockopt(zmq.IDENTITY, ident)
         sock.connect(ipc_path)
         self._coord_ipc_sock = sock
@@ -992,7 +991,7 @@ class ZmqShmKvConnectorBase:
             "STAGE_NOTIFY req_id=%s uuid=%s", self.node_id, self.tp_rank,
             req_id, uuid)
         deadline = time.perf_counter() + timeout
-        info: Optional[tuple[int, int, list[int]]] = None
+        info: tuple[int, int, list[int]] | None = None
         with self._worker_pending_stage_cv:
             while uuid not in self._worker_pending_stage:
                 rem = deadline - time.perf_counter()
@@ -1180,7 +1179,7 @@ class ZmqShmKvConnectorBase:
         if self._is_host_coordinator:
             fired_complete = False
             staged_count = 0
-            per_rank_event: Optional[threading.Event] = None
+            per_rank_event: threading.Event | None = None
             with self._coord_lock:
                 entry = self._coord_send.get(uuid)
                 if entry is None:
@@ -1192,7 +1191,7 @@ class ZmqShmKvConnectorBase:
                 if staged_count == self.ranks_per_host:
                     entry.stage_complete.set()
                     fired_complete = True
-                if 0 < len(entry.staged_events):  ## self.local_tp_rank?
+                if len(entry.staged_events) > 0:  ## self.local_tp_rank?
                     per_rank_event = entry.staged_events[
                         0]  ## self.local_tp_rank?
             # Set the per-rank event outside the lock; the wait side is
@@ -1402,7 +1401,7 @@ class ZmqShmKvConnectorBase:
                 # Per-rank block = (rank_idx, layer0, layer1, ..., layer_{L-1})
                 n_ranks = int(bytes(frames[2].buffer).decode("utf-8"))
                 idx = 3
-                header_frame: Optional[zmq.Frame] = None
+                header_frame: zmq.Frame | None = None
                 if ch == 0:
                     header_frame = frames[idx]
                     idx += 1
@@ -1447,8 +1446,8 @@ class ZmqShmKvConnectorBase:
             # Annotation was stale: _pull_channel returns 6 values
             # (h, ch, wire_ms, unpack_ms, ranks_handled, header_frame), not 5.
             results: list[tuple[int, int, float, float, list[int],
-                                Optional[zmq.Frame]]] = []
-            first_error: Optional[BaseException] = None
+                                zmq.Frame | None]] = []
+            first_error: BaseException | None = None
             for fut in futures:
                 try:
                     results.append(fut.result())
@@ -1465,7 +1464,7 @@ class ZmqShmKvConnectorBase:
 
             # Sanity-check all local ranks were delivered exactly once.
             seen: set[int] = set()
-            header_frame: Optional[zmq.Frame] = None
+            header_frame: zmq.Frame | None = None
             for _h, _ch, _w, _u, ranks, hdr in results:
                 if hdr is not None:
                     header_frame = hdr
@@ -1749,7 +1748,7 @@ class ZmqShmKvConnectorBase:
     def _coord_worker_wait_load(
             self,
             uuid: int,
-            timeout: float = 1.0) -> Optional[tuple[int, int, list[int]]]:
+            timeout: float = 1.0) -> tuple[int, int, list[int]] | None:
         """Block until LOAD_NOTIFY or LOAD_SKIP for uuid arrives, or timeout
         expires. Returns (slot_idx, num_blocks, local_blocks) for a scatter,
         or None for skip/timeout. The dict stores None as a sentinel set
@@ -1822,7 +1821,7 @@ class ZmqShmKvConnectorBase:
                 uuid, rank, failed = obj
                 fired_complete = False
                 staged_count = 0
-                per_rank_event: Optional[threading.Event] = None
+                per_rank_event: threading.Event | None = None
                 with self._coord_lock:
                     entry = self._coord_send.get(uuid)
                     if entry is None:
@@ -2084,7 +2083,7 @@ class ZmqShmKvConnectorBase:
 
     def _coord_rank0_build_pull_response(
             self, uuid: int, uuid_bytes: bytes, channel_idx: int,
-            ranks_on_channel: list[int]) -> Optional[list[bytes]]:
+            ranks_on_channel: list[int]) -> list[bytes] | None:
         # A PULL can arrive before the scheduler has routed reqs_to_send
         # through process_send_load (the D-side orchestrator may dispatch
         # the pull immediately after handing D the uuid, racing P's own
@@ -2339,7 +2338,7 @@ class ZmqShmKvConnectorBase:
     def _try_fast_scatter(
             self, device_shards: list[torch.Tensor],
             kv_caches: list[torch.Tensor],
-            local_blocks: list[int]) -> Optional[list[torch.Tensor]]:
+            local_blocks: list[int]) -> list[torch.Tensor] | None:
         raise NotImplementedError
 
     def get_kv_connector_stats(self) -> TpuKVConnectorStats | None:

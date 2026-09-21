@@ -37,6 +37,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.kernels.gdn.v3 import (config, memory_ref, pcp_metadata,
                                           wrapper)
 from vllm_torchtpu.kernels.gdn.v3.projection_scale import \
@@ -50,6 +51,8 @@ class _ProjectionConfig:
     token_block_size: int
     out_block_size: int
     qkv_dim: int
+    full_key_dim: int
+    kq_replication_factor: int
 
 
 _TPU_TILE_ROWS = 8
@@ -248,6 +251,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_weight_scale_vmem_ref: jax.Array | None,
     projection_out_ref: jax.Array,
     projection_z_out_ref: jax.Array,
+    projection_pending_out_ref: jax.Array,
     active_rows_smem_ref: jax.Array,
     active_rows_dma_sem: jax.Array,
     *,
@@ -261,6 +265,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
     del packed_out_hbm_ref
     is_fp8_projection = projection_weight_ref.dtype == jnp.float8_e4m3fn
+    projection_pending_out_ref[0] = -1
 
     rank = lax.axis_index(pcp_axis_name)
     active_rows_smem_ref[0] = stage_metadata_ref.rank_active_row_end[rank]
@@ -387,7 +392,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     num_qkv_out_blocks = pcp_size
     num_z_out_blocks = pcp_size
     num_projection_out_blocks = num_qkv_out_blocks + num_z_out_blocks
-    full_key_dim = pcp_size * shard_key_dim
+    full_key_dim = projection_cfg.full_key_dim
 
     def _projection_job(out_block):
         is_qkv = out_block < num_qkv_out_blocks
@@ -457,6 +462,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         ).start()
 
     def _start_qkv_stage(stage) -> None:
+        # The last overlapped projection can still be writing HBM even when
+        # no catch-up work remains. Publish it before remote DMA reads QKV.
+        _wait_projection_output()
         slot = lax.rem(stage, 2)
         for destination in range(pcp_size):
             _start_packed_qkv_copy(stage, slot, destination)
@@ -561,8 +569,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
         @pl.when(is_qkv)
         def _start_qkv() -> None:
-            q_col = destination * shard_key_dim
-            k_col = full_key_dim + destination * shard_key_dim
+            kq_destination = destination // projection_cfg.kq_replication_factor
+            q_col = kq_destination * shard_key_dim
+            k_col = full_key_dim + kq_destination * shard_key_dim
             v_col = 2 * full_key_dim + destination * shard_value_dim
             _start_weight_piece(q_col, 0, shard_key_dim)
             _start_weight_piece(k_col, shard_key_dim, shard_key_dim)
@@ -577,17 +586,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             z_col = projection_cfg.qkv_dim + z_group * shard_value_dim
             _start_weight_piece(z_col, 0, shard_value_dim)
 
-    def _previous_projection_out_block(out_block):
-        return lax.select(
-            out_block > 0,
-            out_block - 1,
-            num_projection_out_blocks - 1,
-        )
+    def _wait_projection_output() -> None:
+        pending = projection_pending_out_ref[0]
+        is_qkv, _, _ = _projection_job(pending)
 
-    def _wait_projection_output(out_block) -> None:
-        is_qkv, _, _ = _projection_job(out_block)
-
-        @pl.when(is_qkv)
+        @pl.when(jnp.logical_and(pending >= 0, is_qkv))
         def _wait_qkv() -> None:
             pltpu.make_async_copy(
                 src_ref=projection_out_ref,
@@ -595,13 +598,15 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 sem=projection_out_sem,
             ).wait()
 
-        @pl.when(jnp.logical_not(is_qkv))
+        @pl.when(jnp.logical_and(pending >= 0, jnp.logical_not(is_qkv)))
         def _wait_z() -> None:
             pltpu.make_async_copy(
                 src_ref=projection_z_out_ref,
                 dst_ref=projection_z_out_ref,
                 sem=projection_out_sem,
             ).wait()
+
+        projection_pending_out_ref[0] = -1
 
     def _finish_projection_tile(
         token_block,
@@ -613,8 +618,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
         @pl.when(wait_previous)
         def _wait_previous_projection_output() -> None:
-            _wait_projection_output(
-                _previous_projection_out_block(out_block), )
+            _wait_projection_output()
 
         @pl.when(out_block == 0)
         def _prepare_projection_x() -> None:
@@ -753,9 +757,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 sem=projection_out_sem,
             ).start()
 
+        projection_pending_out_ref[0] = out_block
+
         @pl.when(wait_final)
         def _wait_final_projection_output() -> None:
-            _wait_projection_output(out_block)
+            _wait_projection_output()
 
     def _project_first_token_block() -> None:
 
@@ -1326,8 +1332,7 @@ def fused_qkvz_projection_pcp_gdn(
         raise ValueError(
             "comm_chunk_size must align to the TPU VMEM row tile: "
             f"{comm_chunk_size=} {dma_row_alignment=}.")
-    if n_kq % pcp_size != 0 or n_v % pcp_size != 0:
-        raise ValueError("GDN head counts must be divisible by pcp_size.")
+    geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
     if b.shape != a.shape:
         raise ValueError(f"b and a shapes must match, got {b.shape} and "
                          f"{a.shape}.")
@@ -1348,8 +1353,8 @@ def fused_qkvz_projection_pcp_gdn(
 
     full_key_dim = n_kq * d_k
     full_value_dim = n_v * d_v
-    local_n_kq = n_kq // pcp_size
-    local_n_v = n_v // pcp_size
+    local_n_kq = geometry.local_num_kq_heads
+    local_n_v = geometry.local_num_v_heads
     shard_key_dim = local_n_kq * d_k
     shard_value_dim = local_n_v * d_v
     local_dim = 2 * shard_key_dim + shard_value_dim
@@ -1409,6 +1414,8 @@ def fused_qkvz_projection_pcp_gdn(
         token_block_size=projection_token_block_size,
         out_block_size=projection_out_block_size,
         qkv_dim=expected_local_qkv_dim,
+        full_key_dim=full_key_dim,
+        kq_replication_factor=geometry.kq_replication_factor,
     )
 
     if b.shape[1] != local_n_v:
@@ -1598,6 +1605,7 @@ def fused_qkvz_projection_pcp_gdn(
             ),
             act_out_dtype,
         ),
+        pltpu.SMEM((1, ), jnp.int32),
     )
     # Pallas aliases index flattened array leaves; a missing BF16 scale has
     # no leaf. Derive the output-buffer positions from the actual prefix.

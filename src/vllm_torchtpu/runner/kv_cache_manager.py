@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,7 +30,8 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
-                                        KVCacheConfig, KVCacheSpec, MambaSpec,
+                                        KVCacheConfig, KVCacheSpec,
+                                        KVCacheTensor, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.worker.utils import (AttentionGroup,
@@ -68,6 +70,34 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     return isinstance(attn_module,
                       (DeepseekV4Attention, DeepseekV4SWACache,
                        DeepseekV4IndexerCache, CompressorStateCache))
+
+
+def check_kv_caches_cover_block_ids(
+    kv_caches: dict[str, torch.Tensor],
+    kv_cache_tensors: Iterable[KVCacheTensor],
+    num_blocks: int,
+    spec_for_layer: Callable[[str], KVCacheSpec],
+) -> None:
+    """Check block coverage for dense caches in scheduler-page layout."""
+    for kv_cache_tensor in kv_cache_tensors:
+        for layer_name in kv_cache_tensor.layers:
+            spec = spec_for_layer(layer_name)
+            if (not isinstance(spec, AttentionSpec)
+                    or isinstance(spec, MLAAttentionSpec)):
+                continue
+            kv_cache = kv_caches.get(layer_name)
+            if kv_cache is None:
+                raise ValueError(f"Missing KV cache for attention layer "
+                                 f"{layer_name}")
+            if kv_cache.shape[0] < num_blocks:
+                raise ValueError(
+                    f"KV cache for {layer_name} holds {kv_cache.shape[0]} "
+                    f"blocks, but the scheduler can issue block IDs through "
+                    f"{num_blocks - 1} ({num_blocks} blocks; "
+                    f"{len(kv_cache_tensor.layers)} layer(s) in this "
+                    f"{kv_cache_tensor.size}-byte backing allocation). "
+                    "TPU kernels do not bounds-check these "
+                    "indices.")
 
 
 def _warn_if_kv_cache_is_padded(
@@ -1350,6 +1380,14 @@ class KVCacheManager:
 
         # Reset kv_caches list (tpu_bind_kv_cache expects empty list)
         self.runner.kv_caches = []
+
+        if not use_block_major and not _is_ds_v4:
+            check_kv_caches_cover_block_ids(
+                kv_caches,
+                kv_cache_config.kv_cache_tensors,
+                kv_cache_config.num_blocks,
+                _per_layer_spec,
+            )
 
         # Use tpu_bind_kv_cache to bind KV caches to attention layers using layer names
         # This is the native vLLM pattern and avoids the 'layer_id' attribute error

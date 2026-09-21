@@ -25,6 +25,7 @@ from vllm_torchtpu.distributed import ep_mesh as ep
 @pytest.fixture(autouse=True)
 def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
+    monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
 
 
 @pytest.mark.parametrize(
@@ -120,3 +121,53 @@ def test_mesh_rejects_invisible_device(monkeypatch):
 def test_missing_native_ep_symbol(monkeypatch):
     monkeypatch.delattr(parallel_state, "get_ep_group")
     assert ep.get_ep_group() is None
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_token_groups_use_native_membership_and_mesh_order(
+        monkeypatch, group, sequence_parallel):
+    group.cpu_group = object()
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
+    monkeypatch.setattr(parallel_state, "get_tp_group",
+                        lambda: SimpleNamespace(ranks=[6, 2]))
+    reports = ([(r, (r, ))
+                for r in group.ranks] if sequence_parallel else [(2, (6, 2)),
+                                                                 (4, (8, 4)),
+                                                                 (6, (6, 2)),
+                                                                 (8, (8, 4))])
+
+    def gather(output, value, *, group):
+        assert group is not None
+        assert value == (6, (6, ) if sequence_parallel else (6, 2))
+        output[:] = reports
+
+    collect = Mock(side_effect=gather)
+    monkeypatch.setattr(ep.torch.distributed, "all_gather_object", collect)
+    expected = ((0, ), (1, ), (2, ), (3, )) if sequence_parallel else ((0, 3),
+                                                                       (2, 1))
+    assert ep.ep_token_replica_groups(
+        is_sequence_parallel=sequence_parallel) == expected
+    assert ep.ep_token_replica_groups(
+        is_sequence_parallel=sequence_parallel) == expected
+    assert collect.call_count == 1
+
+
+@pytest.mark.parametrize("reports", [
+    [None] * 4,
+    [(2, (2, 6)), (4, (4, 8)), (6, (6, 2)), (8, (4, 8))],
+    [(2, (2, 6)), (4, (4, 8)), (6, (2, 6)), (8, (8, 10))],
+    [(2, (2, )), (4, (4, 8)), (6, (6, )), (8, (4, 8))],
+])
+def test_token_groups_reject_inconsistent_membership(monkeypatch, group,
+                                                     reports):
+    group.cpu_group = object()
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
+    monkeypatch.setattr(parallel_state, "get_tp_group",
+                        lambda: SimpleNamespace(ranks=[6, 2]))
+
+    def gather(output, value, *, group):
+        output[:] = reports
+
+    monkeypatch.setattr(ep.torch.distributed, "all_gather_object", gather)
+    with pytest.raises(RuntimeError, match="replica"):
+        ep.ep_token_replica_groups()

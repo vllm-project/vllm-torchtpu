@@ -33,8 +33,6 @@ Usage in MXFP4 MoE pipeline:
 5. Use in GMM kernel with rhs_scale
 """
 
-from typing import Tuple
-
 import jax.numpy as jnp
 import torch
 
@@ -220,7 +218,7 @@ def quantize_tensor(
     axis: int = -1,
     block_size: int | None = None,
     use_ue8m0: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor with block scaling.
 
     Args:
@@ -333,7 +331,7 @@ def quantize_tensor_to_fp4(
     tensor: torch.Tensor,
     axis: int = -1,
     block_size: int = REQUANTIZED_BLOCK_SIZE,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize float tensor to FP4 with block scaling.
 
     Computes per-block scale factors and quantizes each element to the

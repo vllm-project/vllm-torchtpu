@@ -326,6 +326,15 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                 f"{self.custom_prefix}: attention scale unavailable at "
                 "attention-op build time.")
 
+        # Draft (DSpark/DFlash) layers attend bidirectionally within their
+        # query block on the SWA path; set by the draft model at construction.
+        # TODO: MLA draft model classes to set
+        # `non_causal_multi_token_decode = True` on each of their attention
+        # layers -- DSparkDeepseekV4ForCausalLM (DSV4 DSpark). Absent the
+        # attribute a layer stays causal, so target layers are unaffected.
+        non_causal = bool(getattr(self, "non_causal_multi_token_decode",
+                                  False))
+
         wrapped_fn = functools.partial(
             _attention_csa if is_csa else _attention_hca,
             sm_scale=sm_scale,
@@ -333,13 +342,16 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             logical_page_size=logical_page_size,
             swa_only=swa_only,
             two_caches_same_buffer=two_caches_same_buffer,
+            non_causal_block=non_causal,
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
-        # Build unique cache key encoding geometry, overlay status, and profiling stage.
+        # Build unique cache key encoding geometry, overlay status, block
+        # causality, and profiling stage.
         op_name = (f"pallas::deepseek_v4_attention_{op_type}"
                    f"_p{logical_page_size}"
                    f"{'_aliased' if two_caches_same_buffer else ''}"
+                   f"{'_ncb' if non_causal else ''}"
                    f"{'' if built_from_real_caches else '_prof'}")
 
         if op_name in _pallas_op_cache:

@@ -35,6 +35,7 @@ Verification Gates:
      must produce zero external hits, verifying that the hit counter is not
      incrementing unconditionally.
 """
+
 import argparse
 import json
 import math
@@ -91,17 +92,17 @@ def main() -> int:
         required=True,
         help="Base URL (http://host:port) for Replica B (replayer).",
     )
-    parser.add_argument("--model",
-                        required=True,
-                        help="Served model name identifier.")
+    parser.add_argument("--model", required=True, help="Served model name identifier.")
     parser.add_argument(
         "--min-prompt-tokens",
         type=int,
         default=16385,
-        help=("Minimum token threshold exceeding one full offload span "
-              "(block_size * pcp + 1). Because prefix caching matches up to "
-              "num_tokens - 1, prompts must exceed the span boundary for the "
-              "lookup to reach the global registry at all."),
+        help=(
+            "Minimum token threshold exceeding one full offload span "
+            "(block_size * pcp + 1). Because prefix caching matches up to "
+            "num_tokens - 1, prompts must exceed the span boundary for the "
+            "lookup to reach the global registry at all."
+        ),
     )
     parser.add_argument("--publish-wait-s", type=float, default=15.0)
     parser.add_argument("--request-timeout-s", type=float, default=900.0)
@@ -114,13 +115,11 @@ def main() -> int:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req,
-                                        timeout=args.request_timeout_s) as r:
+            with urllib.request.urlopen(req, timeout=args.request_timeout_s) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as err:
             body = err.read().decode(errors="replace")
-            raise SystemExit(
-                f"{base}{path} returned HTTP {err.code}: {body}") from err
+            raise SystemExit(f"{base}{path} returned HTTP {err.code}: {body}") from err
 
     def ask(base: str, prompt: str) -> tuple[str, int]:
         resp = api(
@@ -128,10 +127,7 @@ def main() -> int:
             base,
             {
                 "model": args.model,
-                "messages": [{
-                    "role": "user",
-                    "content": prompt
-                }],
+                "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 16,
                 "temperature": 0.0,
                 "seed": 0,
@@ -178,12 +174,15 @@ def main() -> int:
     if target > sample["max_model_len"]:
         print(
             f"RESULT: FAIL (the probes need {target} tokens but max_model_len is"
-            f" only {sample['max_model_len']})")
+            f" only {sample['max_model_len']})"
+        )
         return 1
     lines = math.ceil(target / per_line)
-    print(f"sizing: {per_line:.1f} tokens/line,"
-          f" max_model_len={sample['max_model_len']}, {lines} lines targeting"
-          f" {target} tokens")
+    print(
+        f"sizing: {per_line:.1f} tokens/line,"
+        f" max_model_len={sample['max_model_len']}, {lines} lines targeting"
+        f" {target} tokens"
+    )
 
     failures = []
 
@@ -197,7 +196,8 @@ def main() -> int:
             print(
                 f"RESULT: FAIL (the {tag} document is {tokens} tokens, below the"
                 f" {args.min_prompt_tokens}-token offload span despite the"
-                " tokenizer-based sizing above)")
+                " tokenizer-based sizing above)"
+            )
             return 1
     # Allow sufficient time for asynchronous host DRAM transfer and global registry publication.
     time.sleep(2 * args.publish_wait_s)
@@ -215,21 +215,26 @@ def main() -> int:
         if rep["hit"] <= 0:
             failures.append(
                 f"the {tag} replay produced no external hits on server B; it"
-                " recomputed instead of pulling from the shared cache")
+                " recomputed instead of pulling from the shared cache"
+            )
     if matches < len(seeds):
         failures.append(
             f"only {matches}/{len(seeds)} replays continued the way A's cold"
             " computation did; corrupt restored KV diverges from the first tokens"
-            " on every document")
+            " on every document"
+        )
 
     print("=== fresh document through B (cold control) ===")
     ans_f, cold = measured(build_prompt(fresh_tag, fresh_code, lines))
-    print(f"cold: answer={ans_f!r} prefill={cold['prefill']:.3f}s"
-          f" ext_hit={int(cold['hit'])}/{int(cold['q'])}")
+    print(
+        f"cold: answer={ans_f!r} prefill={cold['prefill']:.3f}s"
+        f" ext_hit={int(cold['hit'])}/{int(cold['q'])}"
+    )
     if cold["hit"] > 0:
         failures.append(
             f"the fresh document produced {int(cold['hit'])} external hits: it is"
-            " not cold, so the replay gate proves nothing")
+            " not cold, so the replay gate proves nothing"
+        )
 
     if failures:
         print("RESULT: FAIL (" + "; ".join(failures) + ")")
@@ -237,7 +242,8 @@ def main() -> int:
     print(
         f"RESULT: PASS ({matches}/{len(seeds)} replays matched A's cold output"
         " on their first tokens with external hits on every replay; the fresh"
-        " document stayed cold)")
+        " document stayed cold)"
+    )
     return 0
 
 

@@ -63,8 +63,9 @@ def test_partial_last_block_does_not_leak(rows):
 
 def test_kernel_matches_torch_topk_on_real_routing_distribution():
     rng = np.random.default_rng(99)
-    logits = torch.from_numpy((rng.standard_normal(
-        (1024, EXPERTS), dtype=np.float32) * 2.0)).to(torch.bfloat16)
+    logits = torch.from_numpy(
+        rng.standard_normal(
+            (1024, EXPERTS), dtype=np.float32) * 2.0).to(torch.bfloat16)
     scores = logits.float().softmax(dim=-1)
     kw, ki = select(jnp.asarray(scores.numpy()), TOPK, interpret=True)
     ref_v, _ = torch.topk(scores, TOPK, dim=-1)
