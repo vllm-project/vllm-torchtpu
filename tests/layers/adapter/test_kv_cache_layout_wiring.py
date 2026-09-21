@@ -514,6 +514,91 @@ def test_shape_needs_no_config_for_the_probe_and_hd64(monkeypatch):
     )
 
 
+# The bound kernel must read the layout the layer allocated
+
+
+def _batched_impl():
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    return PallasBatchedRPAAttentionBackendImpl(
+        num_heads=2,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="bfloat16",
+    )
+
+
+def _build_rpa_kernel(impl, monkeypatch):
+    """Run `_build_rpa_kernel` without compiling; return the bound entry."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    captured = {}
+
+    class FakeOp:
+        def register_fake(self, _fake_impl):
+            pass
+
+    def fake_jax_op(_name, wrapped_fn, **_kwargs):
+        captured["fn"] = wrapped_fn
+        return FakeOp()
+
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl,
+        "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (object(), object(), None)),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.attention.pallas.jax_op", fake_jax_op
+    )
+    mesh = SimpleNamespace(shape={"attn_dp": 1, "expert": 1, "model": 1})
+    with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=None):
+        impl._build_rpa_kernel(None, None, None)
+    return captured["fn"]
+
+
+def test_hnd_refuses_a_kernel_entry_that_ignores_the_layout(hnd, monkeypatch):
+    """A tp=1 speculative draft allocates SEQ_ALONG_LANE pages, then
+    `tpu_runner._initialize_attention_kernels` rebinds `_kernel_entry` to the
+    layout-blind `_pallas_rpa_kernel_local`."""
+    from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
+
+    impl = _batched_impl()
+    impl._kernel_entry = _pallas_rpa_kernel_local
+    impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+    with pytest.raises(NotImplementedError, match="takes no kv_layout"):
+        _build_rpa_kernel(impl, monkeypatch)
+
+
+def test_hnd_binds_kv_layout_into_the_batched_kernel_entry(hnd, monkeypatch):
+    impl = _batched_impl()
+    assert impl._pool_is_seq_along_lane
+    bound = _build_rpa_kernel(impl, monkeypatch)
+    assert bound.keywords["kv_layout"] is KVLayout.SEQ_ALONG_LANE
+
+
+def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
+    """`_pallas_rpa_kernel_local` reads HEAD_ALONG_SUBLANE, so the tp=1 draft
+    rebind is legal under the default layout."""
+    from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
+
+    impl = _batched_impl()
+    impl._kernel_entry = _pallas_rpa_kernel_local
+    impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+    bound = _build_rpa_kernel(impl, monkeypatch)
+    assert "kv_layout" not in bound.keywords
+
+
 def test_both_vllm_spellings_map_to_one_kernel_layout():
     """Layer-major and block-major spell the same kernel layout, so callers
     must ask `is_seq_along_lane` rather than compare against one member."""
