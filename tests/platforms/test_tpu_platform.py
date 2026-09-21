@@ -399,6 +399,38 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_hnd_refuses_head_dim_64(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        head_size,
+        refused,
+    ):
+        """head_dim 64 routes to the hd64 kernel, which allocates
+        HEAD_ALONG_SUBLANE even on the batched-RPA backend.
+
+        `supported_kv_cache_layouts` cannot express it: it is a classmethod on
+        the backend with no head size, so it offers HND either way.
+        """
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
+        vllm_config.model_config.get_head_size = lambda: head_size
+
+        if refused:
+            with pytest.raises(NotImplementedError, match="head_dim==64"):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(

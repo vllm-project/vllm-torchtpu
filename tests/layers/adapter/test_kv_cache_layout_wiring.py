@@ -512,3 +512,16 @@ def test_shape_needs_no_config_for_the_probe_and_hd64(monkeypatch):
     assert BATCHED.get_kv_cache_shape(4, 128, 1, 64, BF16) == BASE.get_kv_cache_shape(
         4, 128, 1, 64, BF16
     )
+
+
+def test_both_vllm_spellings_map_to_one_kernel_layout():
+    """Layer-major and block-major spell the same kernel layout, so callers
+    must ask `is_seq_along_lane` rather than compare against one member."""
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    from vllm_torchtpu.layers.adapter.attention import is_seq_along_lane
+
+    assert is_seq_along_lane(KVCacheLayout.LBHNC)
+    assert is_seq_along_lane(KVCacheLayout.BLHNC)
+    assert not is_seq_along_lane(KVCacheLayout.LBNHC)
+    assert not is_seq_along_lane(KVCacheLayout.BLNHC)
