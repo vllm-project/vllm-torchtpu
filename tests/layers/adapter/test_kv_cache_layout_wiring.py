@@ -7,6 +7,8 @@ Only the second makes an fp8 page smaller than a bf16 page when a rank holds a
 single KV head (b/510425663).
 """
 import contextlib
+import functools
+import math
 
 import pytest
 import torch
@@ -36,7 +38,7 @@ HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
 def _layout_env(monkeypatch, value):
     """Resolve legacy env aliases through the native config API."""
     from vllm import envs as vllm_envs
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.config.attention import AttentionConfig
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
@@ -47,8 +49,9 @@ def _layout_env(monkeypatch, value):
         monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     else:
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", value)
-    config = VllmConfig(attention_config=AttentionConfig(
-        backend=AttentionBackendEnum.CUSTOM))
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM))
     resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     try:
         with set_current_vllm_config(config):
@@ -119,6 +122,65 @@ def test_default_shape_matches_inherited(nhd, num_kv_heads, head_size, dtype,
 
 def test_default_block_size_unchanged(nhd):
     assert BATCHED.get_supported_kernel_block_sizes() == [256]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [BF16, FP8])
+@pytest.mark.parametrize("head_dim", [64, 256, 512])
+def test_shared_pool_traces_without_vllm_config(monkeypatch, layout, dtype,
+                                                head_dim):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    with _layout_env(monkeypatch, layout):
+        native_shape = BATCHED.get_kv_cache_shape(8, 128, 2, head_dim, dtype)
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_current_vllm_config(
+        ).cache_config.get_resolved_kv_cache_layout()]
+    assert get_current_vllm_config_or_none() is None
+
+    packing = 4 // dtype.itemsize
+    pool_shape = (4, 128, packing,
+                  2 * math.prod(native_shape[1:]) // (128 * packing))
+
+    def attention(kv_cache, query, key, value, metadata, mesh, **kwargs):
+        assert kv_cache.shape == native_shape
+        assert kwargs["kv_layout"] == kv_layout
+        return kv_cache, query
+
+    monkeypatch.setattr(adapter, "attention", attention)
+    mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("model", ))
+    run = functools.partial(
+        adapter._pallas_rpa_kernel_batched,
+        sinks=None,
+        q_scale=None,
+        k_scale=1.0,
+        v_scale=1.0,
+        mesh=mesh,
+        sliding_window=None,
+        skip_kv_update=False,
+        kv_layout=kv_layout,
+    )
+    jax_dtype = {BF16: jnp.bfloat16, FP8: jnp.float8_e4m3fn}[dtype]
+    query_shape = (1, 4, head_dim)
+    cache, output = jax.eval_shape(
+        run,
+        jax.ShapeDtypeStruct(pool_shape, jax_dtype),
+        jax.ShapeDtypeStruct(query_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct((1, 2, head_dim), jax_dtype),
+        jax.ShapeDtypeStruct((1, 2, head_dim), jax_dtype),
+        jax.ShapeDtypeStruct((1, ), jnp.int32),
+        jax.ShapeDtypeStruct((1, ), jnp.int32),
+        jax.ShapeDtypeStruct((2, ), jnp.int32),
+        jax.ShapeDtypeStruct((3, ), jnp.int32),
+    )
+    assert cache.shape == pool_shape
+    assert cache.dtype == jnp.dtype(jax_dtype)
+    assert output.shape == query_shape
 
 
 def test_seq_along_lane_requires_page_size_128(hnd):
