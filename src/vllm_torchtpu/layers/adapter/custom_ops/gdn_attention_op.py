@@ -854,6 +854,22 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_v_heads = self.num_v_heads // self.tp_size
         core_attn_out = core_attn_out.view(num_tokens, local_num_v_heads,
                                            self.head_v_dim)
+        # TPU_GDN_FUSED_NORM_QUANT: the gated norm and the out-projection's fp8
+        # quantisation in one pass; the out-projection then runs on the
+        # pre-quantised rows.
+        from vllm_torchtpu.layers.adapter import gated_norm_quant_op
+        out_proj = self.out_proj
+        out_scale = getattr(out_proj, "weight_scale", None)
+        # The fused path runs the projection's matmul itself: only for a
+        # per-channel fp8 projection in the [in, out] layout, and only
+        # without tensor parallelism, whose all-reduce the projection's own
+        # forward would add.
+        if (gated_norm_quant_op.enabled() and self.tp_size == 1
+                and out_proj.weight.dtype == torch.float8_e4m3fn
+                and out_scale is not None and out_scale.ndim == 1
+                and not getattr(out_proj, KEEP_VLLM_LAYOUT_ATTR, False)):
+            return gated_norm_quant_op.output_projection(
+                core_attn_out, z, self.norm, out_proj)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
