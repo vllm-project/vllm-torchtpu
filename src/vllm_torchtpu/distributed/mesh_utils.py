@@ -20,6 +20,19 @@ asked -- a layout is just "this group's ranks, in order, and where they live"
 
 `ep_mesh.py` builds its own mesh but takes the rank/device helpers from here
 too, which is why this module is named for the job rather than for an axis.
+
+Under pipeline parallelism a context-parallel group is one pipeline stage, and
+a multi-device kernel of that group must run on the stage's devices alone: the
+other stages run other layers at other times, so a slice-wide launch would
+wait for devices that never join. torch_tpu compiles a program for a proper
+subgroup of the slice when every collective and kernel in it is tagged with
+that group (``collective_devices``), so the stage meshes here span the whole
+slice, shaped (stage, group), and every op built over one carries the stage's
+devices as its tag. torch_tpu numbers the slice's devices by world rank, and a
+collective a kernel bakes in names its peers by mesh position, so the two must
+coincide: stage s is the ranks s*K .. s*K+K-1 in that order
+(``stage_group_ranks`` builds the model-parallel groups to make it so), and
+the stage mesh is the slice's devices in rank order, shaped (stage, group).
 """
 
 from __future__ import annotations
@@ -58,6 +71,47 @@ class CpGroupLayout:
 
 _LAYOUT_CACHE: dict[tuple[int, tuple[int, ...], int, int], CpGroupLayout] = {}
 _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+
+# The mesh axis a pipeline stage's group mesh gets for the stage dimension.
+STAGE_AXIS_NAME = "stage"
+
+
+@dataclass(frozen=True)
+class StageDeviceTable:
+    """Where every rank of the slice sits: its pipeline stage, its position in
+    the stage's context-parallel group, and its TPU device id, by world rank.
+    torch_tpu numbers the slice's devices by world rank, so a rank is also the
+    logical id of its device."""
+
+    stages: tuple[int, ...]
+    columns: tuple[int, ...]
+    device_ids: tuple[int, ...]
+    stage: int
+    column: int
+
+    @property
+    def num_stages(self) -> int:
+        return max(self.stages) + 1
+
+    @property
+    def num_columns(self) -> int:
+        return max(self.columns) + 1
+
+    def rows(self) -> tuple[tuple[int, ...], ...]:
+        """World ranks of every stage's group, stage-major and in group order."""
+        table: dict[tuple[int, int], int] = {}
+        for rank, (stage, column) in enumerate(zip(self.stages, self.columns)):
+            table[(stage, column)] = rank
+        return tuple(
+            tuple(table[(stage, column)] for column in range(self.num_columns))
+            for stage in range(self.num_stages))
+
+    def stage_device_ids(self, stage: int) -> tuple[int, ...]:
+        """TPU device ids of one stage's group, in group order."""
+        return tuple(self.device_ids[rank] for rank in self.rows()[stage])
+
+
+_STAGE_TABLE: StageDeviceTable | None = None
 
 
 def _get_current_global_rank() -> int:
@@ -98,6 +152,125 @@ def _collect_rank_to_device_id(group: Any, global_rank: int,
         rank, gathered_device_id = item
         rank_to_device_id[int(rank)] = int(gathered_device_id)
     return rank_to_device_id
+
+
+def stage_group_ranks(stages: int,
+                      group_size: int) -> dict[str, list[list[int]]]:
+    """The model-parallel groups that put pipeline stage s on the world ranks
+    s*K .. s*K+K-1 in rank order: one ``pcp`` (and ``ep``) group per stage,
+    one ``pp`` group per column of the stages."""
+    from vllm.distributed.parallel_state import get_world_group
+    ranks = sorted(int(rank) for rank in get_world_group().ranks)
+    width = stages * group_size
+    if ranks != list(range(width)):
+        raise RuntimeError(
+            f"pipeline stages of {group_size} devices need the ranks "
+            f"0..{width - 1}, got {ranks}")
+    rows = [ranks[s * group_size:(s + 1) * group_size] for s in range(stages)]
+    columns = [[rows[s][k] for s in range(stages)] for k in range(group_size)]
+    return {"pcp": rows, "pp": columns, "ep": rows}
+
+
+def gather_stage_device_table() -> StageDeviceTable:
+    """Gather every rank's stage, group position and device id over the world
+    group. A collective: every rank calls it once the parallel groups exist
+    (the worker does, right after building them)."""
+    global _STAGE_TABLE
+    if _STAGE_TABLE is not None:
+        return _STAGE_TABLE
+    from vllm.distributed.parallel_state import (get_pcp_group, get_pp_group,
+                                                 get_world_group)
+    world = get_world_group()
+    mine = (int(get_pp_group().rank_in_group),
+            int(get_pcp_group().rank_in_group), _get_tpu_global_device_id())
+    gathered: list[tuple[int, int, int]
+                   | None] = [None] * int(world.world_size)
+    torch.distributed.all_gather_object(gathered, mine, group=world.cpu_group)
+    if any(entry is None for entry in gathered):
+        raise RuntimeError("stage device table gather returned an empty entry")
+    entries = [entry for entry in gathered if entry is not None]
+    _STAGE_TABLE = StageDeviceTable(
+        stages=tuple(entry[0] for entry in entries),
+        columns=tuple(entry[1] for entry in entries),
+        device_ids=tuple(entry[2] for entry in entries),
+        stage=mine[0],
+        column=mine[1],
+    )
+    logger.info(
+        "Stage device table | stage=%d column=%d | rows=%s | device ids=%s",
+        _STAGE_TABLE.stage, _STAGE_TABLE.column, _STAGE_TABLE.rows(),
+        _STAGE_TABLE.device_ids)
+    return _STAGE_TABLE
+
+
+def get_stage_device_table() -> StageDeviceTable | None:
+    """The gathered table, or None outside pipeline parallelism."""
+    if _STAGE_TABLE is not None:
+        return _STAGE_TABLE
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+        if int(get_pp_group().world_size) <= 1:
+            return None
+    except (AssertionError, ImportError):
+        return None
+    raise RuntimeError(
+        "the stage device table was not gathered; the worker gathers it "
+        "after the parallel groups are built")
+
+
+def stage_collective_devices() -> list[int] | None:
+    """World ranks of this rank's pipeline stage, in group order: the
+    ``collective_devices`` tag of every multi-device op the stage runs. None
+    outside pipeline parallelism."""
+    table = get_stage_device_table()
+    if table is None:
+        return None
+    return list(table.rows()[table.stage])
+
+
+def get_or_create_stage_mesh(axis_name: str) -> Any:
+    """A (stage, group) JAX mesh over the whole slice, row s being stage s's
+    ranks in group order. Kernels partition over ``axis_name`` only; the
+    stage axis exists so that a program tagged with one stage's devices is
+    compiled for that stage (see the module docstring)."""
+    table = get_stage_device_table()
+    assert table is not None
+    rows = table.rows()
+    cache_key = (axis_name, tuple(d for row in rows for d in row))
+    cached = _MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    width = len(rows[0])
+    expected = tuple(
+        tuple(range(s * width, (s + 1) * width)) for s in range(len(rows)))
+    if rows != expected:
+        raise RuntimeError(
+            "pipeline stages must be laid out on consecutive ranks in "
+            f"group order, got rows {rows} instead of {expected}; the "
+            "model-parallel groups were not built by stage_group_ranks")
+
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    devices_by_id = {
+        int(getattr(device, "id", idx)): device
+        for idx, device in enumerate(jax.devices())
+    }
+    missing = [d for row in rows for d in row if d not in devices_by_id]
+    if missing:
+        raise RuntimeError(
+            f"Cannot build the '{axis_name}' stage mesh because JAX does not "
+            f"expose a device per rank of the slice: missing={missing}, "
+            f"rows={rows}, jax_device_ids={sorted(devices_by_id)}")
+    mesh = Mesh(
+        np.asarray([[devices_by_id[d] for d in row] for row in rows]),
+        axis_names=(STAGE_AXIS_NAME, axis_name),
+    )
+    logger.info("Stage mesh | axis=%s | this stage %d column %d | rows=%s",
+                axis_name, table.stage, table.column, rows)
+    _MESH_CACHE[cache_key] = mesh
+    return mesh
 
 
 def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
@@ -155,8 +328,13 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
 
     The cache is keyed on `(axis_name, device_ids)`, so two axes coexist even
     when they cover the same devices -- which they do under `tp=N, dcp=N`.
+
+    Under pipeline parallelism the group is one stage and the mesh spans the
+    slice as (stage, group); see `get_or_create_stage_mesh`.
     """
 
+    if get_stage_device_table() is not None:
+        return get_or_create_stage_mesh(axis_name)
     layout = get_cp_group_layout(group)
     cache_key = (axis_name, layout.device_ids)
     cached = _MESH_CACHE.get(cache_key)

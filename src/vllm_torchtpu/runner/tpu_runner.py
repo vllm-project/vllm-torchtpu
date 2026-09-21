@@ -4246,7 +4246,13 @@ class TPUModelRunner(GPUModelRunner):
                     f"holds {schedule[0]}; running it would halt the TPU "
                     "core. Use a smaller --max-num-batched-tokens, or "
                     "fewer --max-num-seqs or a shorter --max-model-len.")
-        points = profile_points(self.num_tokens_paddings, self.max_num_tokens,
+        # A bucket counts this rank's rows; under prefill context parallelism
+        # a step of that many rows per rank is pcp times as long, and the
+        # scheduler sizes steps in tokens.
+        pcp = self.parallel_config.prefill_context_parallel_size
+        step = self.scheduler_config.max_num_batched_tokens
+        buckets = [b for b in self.num_tokens_paddings if b * pcp <= step]
+        points = profile_points(buckets, self.max_num_tokens,
                                 self.max_model_len, schedule)
         samples = []
         started = time.perf_counter()
@@ -4258,7 +4264,7 @@ class TPUModelRunner(GPUModelRunner):
                                 self.max_num_blocks_per_req,
                                 use_max_model_len=True,
                                 profile_prefix=prefix) for _ in range(2))
-            samples.append((int(tokens), int(prefix), float(ms)))
+            samples.append((int(tokens) * pcp, int(prefix), float(ms)))
         logger.info("Pipeline step profile (%d points, %.1f s): %s",
                     len(samples),
                     time.perf_counter() - started,

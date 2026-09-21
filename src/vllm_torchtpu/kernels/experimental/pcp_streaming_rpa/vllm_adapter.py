@@ -15,6 +15,8 @@ from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
+from vllm_torchtpu.distributed.sharded_jax_op import (make_jax_callable,
+                                                      stage_tag_for_mesh)
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import \
@@ -126,12 +128,16 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
             arg for i, arg in enumerate(args)
             if arg is not None and i not in self.static_argnums
         ]
+        call_kwargs = {}
+        if getattr(self, "collective_devices", None):
+            call_kwargs["collective_devices"] = self.collective_devices
         results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
             self.name,
             mlir_fingerprint,
             inputs=tensor_args,
             output_shapes=output_shapes,
             donate_argnums=self.donate_argnums,
+            **call_kwargs,
         )
 
         for in_idx, out_idx in self.input_output_aliases.items():
@@ -184,7 +190,9 @@ def build_pcp_streaming_callable(
             tuple(map(str, output_partition_specs_tuple)),
         },
     )
-    return _PcpStreamingJaxCallable(
+    return make_jax_callable(
+        _PcpStreamingJaxCallable,
+        collective_devices=stage_tag_for_mesh(mesh),
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,

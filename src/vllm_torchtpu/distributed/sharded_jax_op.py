@@ -40,9 +40,42 @@ import torch
 from jax.sharding import NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
+from vllm_torchtpu.distributed.mesh_utils import (STAGE_AXIS_NAME,
+                                                  get_stage_device_table,
+                                                  stage_collective_devices)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def stage_tag_for_mesh(mesh: jax.sharding.Mesh) -> list[int] | None:
+    """The ``collective_devices`` tag of an op over a stage mesh: the world
+    ranks of this rank's pipeline stage. None for any other mesh."""
+    if (get_stage_device_table() is None
+            or STAGE_AXIS_NAME not in mesh.axis_names):
+        return None
+    return stage_collective_devices()
+
+
+def make_jax_callable(cls, *, collective_devices: list[int] | None, **kwargs):
+    """Construct a JaxCallable, tagged with its device group when given."""
+    if collective_devices is None:
+        return cls(**kwargs)
+    try:
+        return cls(collective_devices=collective_devices, **kwargs)
+    except TypeError as exc:
+        raise NotImplementedError(
+            "a kernel restricted to a pipeline stage needs a torch_tpu whose "
+            "JaxCallable takes collective_devices (subgroup-collective "
+            "programs)") from exc
+
+
+def _takes_output_partition_specs() -> bool:
+    """Whether the installed ``JaxCallable`` sizes a sharded output from an
+    ``output_partition_specs`` argument of its own."""
+    return "output_partition_specs" in inspect.signature(
+        pallas_impl.JaxCallable.__init__).parameters
+
 
 _STOCK_PLACEHOLDER_LINE = """      output_shapes = [
           torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
@@ -133,6 +166,7 @@ def sharded_jax_op(
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
+    collective_devices: Sequence[int] | None = None,
 ):
     """A torch custom op for ``fn`` run as an SPMD program over ``mesh``.
 
@@ -142,15 +176,14 @@ def sharded_jax_op(
     ``output_partition_specs`` is required, not optional -- getting it wrong is
     how a sharded output silently becomes a replicated one -- and mirrors the
     shape of ``fn``'s result: one spec for one array.
+    ``collective_devices`` tags the op with the world ranks of the devices it
+    runs over; an op over a stage mesh is tagged with its pipeline stage.
 
     Prefer returning a single array from ``fn`` over a one-tuple. Both work
     here, but a one-tuple gives the op the schema ``-> ((Tensor))``, and torch
     ``guard_int``s every symbolic input dimension of an op with that schema, so
     a caller under ``torch.compile`` loses its dynamic batch dimension.
     """
-    global _SHARDED_CALLABLE_CLS
-    if _SHARDED_CALLABLE_CLS is None:
-        _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
     if "::" not in name or len(name.split("::")) != 2:
         raise ValueError(
             f"Op name {name} must be 'namespace::op', with one '::'.")
@@ -179,7 +212,28 @@ def sharded_jax_op(
             "donate_argnums": donate_argnums,
             "output_partition_specs": str(output_partition_specs),
         })
-    wrapped_fn = _SHARDED_CALLABLE_CLS(
+    if collective_devices is None:
+        collective_devices = stage_tag_for_mesh(mesh)
+    # One spec per output leaf, in the order of the export's out_avals. A
+    # torch_tpu that takes them sizes the placeholders itself; an older one
+    # gets the patched ``__call__`` that reads the export's out shardings.
+    global _SHARDED_CALLABLE_CLS
+    if _takes_output_partition_specs():
+        callable_cls = pallas_impl.JaxCallable
+        sizing = {
+            "output_partition_specs":
+            jax.tree.leaves(output_partition_specs,
+                            is_leaf=lambda s: isinstance(s, PartitionSpec))
+        }
+    else:
+        if _SHARDED_CALLABLE_CLS is None:
+            _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
+        callable_cls = _SHARDED_CALLABLE_CLS
+        sizing = {}
+    wrapped_fn = make_jax_callable(
+        callable_cls,
+        collective_devices=(None if collective_devices is None else
+                            [int(d) for d in collective_devices]),
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
@@ -187,6 +241,7 @@ def sharded_jax_op(
         input_partition_specs=input_partition_specs,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
+        **sizing,
     )
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())

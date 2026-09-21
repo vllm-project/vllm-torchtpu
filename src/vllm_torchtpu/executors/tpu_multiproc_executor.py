@@ -20,6 +20,29 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         from vllm_torchtpu import _patch_multiproc_worker_global_rank_env
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
+        # The workers build the pipeline stages of a context-parallel group
+        # themselves, so the output rank and the per-stage block
+        # reconciliation follow the workers' own positions rather than rank
+        # arithmetic here.
+        self._pipeline_positions: list[tuple[int, int]] | None = None
+        pc = self.vllm_config.parallel_config
+        if (pc.pipeline_parallel_size > 1
+                and pc.prefill_context_parallel_size > 1):
+            self._pipeline_positions = [
+                tuple(position)
+                for position in self.collective_rpc("pipeline_position")
+            ]
+            self.output_rank = self._pipeline_positions.index(
+                (pc.pipeline_parallel_size - 1, 0))
+
+    def _stage_major(self, values: list) -> list:
+        """``values`` (one per worker, in rank order) reordered so each
+        pipeline stage's workers are consecutive."""
+        positions = getattr(self, "_pipeline_positions", None)
+        if positions is None:
+            return values
+        order = sorted(range(len(values)), key=lambda rank: positions[rank])
+        return [values[rank] for rank in order]
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()
@@ -30,7 +53,8 @@ class TpuMultiprocExecutor(MultiprocExecutor):
             # copy it to the engine-side config here.
             pc = self.vllm_config.parallel_config
             agreed = reconcile_num_gpu_blocks_override(
-                self.collective_rpc("get_num_gpu_blocks_override"),
+                self._stage_major(
+                    self.collective_rpc("get_num_gpu_blocks_override")),
                 workers_per_stage=pc.world_size // pc.pipeline_parallel_size)
             if agreed is not None:
                 self.vllm_config.cache_config.num_gpu_blocks_override = agreed

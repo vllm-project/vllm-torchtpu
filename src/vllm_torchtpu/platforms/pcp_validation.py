@@ -106,9 +106,12 @@ class PcpStaticSupportValidator:
         if config.dcp_size > 1:
             raise NotImplementedError(
                 "PCP runner path does not support DCP yet.")
-        if config.pipeline_parallel_size != 1:
+        if config.pipeline_parallel_size != 1 and config.kv_role is not None:
+            # A pipeline stage may be a PCP group; the KV connectors pair a
+            # stage with its peer through one pool per device.
             raise NotImplementedError(
-                "PCP runner path does not support pipeline parallelism yet.")
+                "PCP inside pipeline stages does not support KV transfer "
+                "connectors yet.")
         if config.is_moe and not config.expert_parallel:
             raise NotImplementedError(
                 "PCP on an MoE model requires --enable-expert-parallel: "

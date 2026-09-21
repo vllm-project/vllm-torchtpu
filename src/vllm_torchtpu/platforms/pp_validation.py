@@ -46,11 +46,11 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     unsupported = None
     remedy = ""
     if parallel_config.tensor_parallel_size > 1:
-        # On torch_tpu (dev20260813) a stage's TP collectives stall on the
-        # first serving step, when the other stages are not launching the
-        # same collectives; warmup, where every stage runs them, passes.
+        # A stage spans devices only as a prefill context-parallel group,
+        # whose kernels and collectives are compiled for the stage alone.
         unsupported = "tensor parallelism inside a stage"
-        remedy = " Use --tensor-parallel-size 1."
+        remedy = (" Use --tensor-parallel-size 1 (a stage may span devices "
+                  "with --prefill-context-parallel-size).")
     elif vllm_config.scheduler_config.async_scheduling:
         # Stages before the last never see the sampled tokens the async
         # placeholder substitution reads from the device.

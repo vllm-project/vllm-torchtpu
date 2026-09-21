@@ -423,6 +423,48 @@ def test_sharded_jax_op_still_matches_the_line_it_replaces():
     assert sjo._build_sharded_callable_cls() is not pallas_impl.JaxCallable
 
 
+def test_sharded_jax_op_hands_the_output_specs_to_a_torch_tpu_that_takes_them(
+        monkeypatch):
+    """A torch_tpu whose `JaxCallable` takes `output_partition_specs` sizes
+    the shards itself: the op is built on the stock class with one spec per
+    output leaf, in the order of the outputs, and no patched `__call__`."""
+    import jax
+    from jax.sharding import PartitionSpec
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    from vllm_torchtpu.distributed import sharded_jax_op as sjo
+
+    class Takes:
+
+        def __init__(self, *, output_partition_specs=None, **kwargs):
+            self.kwargs = dict(kwargs,
+                               output_partition_specs=output_partition_specs)
+
+    built = []
+    monkeypatch.setattr(pallas_impl, "JaxCallable", Takes)
+    monkeypatch.setattr(sjo, "NamedSharding", lambda mesh, spec: spec)
+    monkeypatch.setattr(jax, "jit", lambda fn, **kwargs: fn)
+    monkeypatch.setattr(
+        torch.library, "custom_op", lambda name, fn, mutates_args: built.
+        append(fn) or SimpleNamespace(register_fake=lambda f: None))
+
+    def fn(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return x, x
+
+    sjo.sharded_jax_op("test::two",
+                       fn,
+                       mesh=SimpleNamespace(axis_names=("d", )),
+                       input_partition_specs=(PartitionSpec("d"), ),
+                       output_partition_specs=(PartitionSpec("d"),
+                                               PartitionSpec()))
+    assert sjo._takes_output_partition_specs()
+    assert type(built[0]) is Takes
+    assert built[0].kwargs["output_partition_specs"] == [
+        PartitionSpec("d"), PartitionSpec()
+    ]
+    assert "collective_devices" not in built[0].kwargs
+
+
 def test_supports_internal_mk_tracks_both_owners():
     """`supports_internal_mk` claims vLLM's dispatch/combine. Either owner --
     chunk pipelining or the fused kernel -- has to claim it alone, and the

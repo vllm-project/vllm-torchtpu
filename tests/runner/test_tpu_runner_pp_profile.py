@@ -137,6 +137,8 @@ def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(
 def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None):
     from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
     runner = MagicMock(spec=TPUModelRunner)
+    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=16384)
     runner.num_tokens_paddings = list(paddings)
     runner.max_num_tokens = paddings[-1]
     runner.max_model_len = 65536
@@ -186,8 +188,45 @@ def test_chunk_buckets_are_skipped_without_dynamic_chunks():
     assert runner.num_tokens_paddings == [16, 16384]
 
 
+def test_profile_pipeline_chunks_counts_context_parallel_rows_as_step_tokens():
+    """A rank of a two-way context-parallel stage runs half a step's tokens:
+    buckets above half the step are never a step, and a timed bucket is
+    recorded as the step it stands for."""
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=2)
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=16384)
+    runner.num_tokens_paddings = [16, 4096, 8192, 16384]
+    runner.max_num_tokens = 16384
+    runner.max_model_len = 65536
+    runner.num_reqs_max_model_len = 8
+    runner.max_num_blocks_per_req = 16
+    runner._pp_chunk_granularity = 2048
+    calls = []
+
+    def dummy_run(tokens, num_reqs, num_blocks, use_max_model_len,
+                  profile_prefix):
+        calls.append((tokens, profile_prefix))
+        return 100.0
+
+    runner._dummy_run = dummy_run
+    runner._attention_schedule_capacity = lambda: None
+    report = TPUModelRunner.profile_pipeline_chunks(runner)
+
+    assert sorted(set(calls)) == [(16, 0), (4096, 0), (4096, 16384),
+                                  (4096, 32768), (8192, 0), (8192, 16384),
+                                  (8192, 32768)]
+    assert [(t, p) for t, p, _ in report["samples"]] == [(32, 0), (8192, 0),
+                                                         (8192, 16384),
+                                                         (8192, 32768),
+                                                         (16384, 0),
+                                                         (16384, 16384),
+                                                         (16384, 32768)]
+
+
 def test_profile_pipeline_chunks_times_every_point_twice_and_keeps_faster():
     runner = MagicMock(spec=TPUModelRunner)
+    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=16384)
     runner.num_tokens_paddings = [16, 4096, 8192, 16384]
     runner.max_num_tokens = 16384
     runner.max_model_len = 65536
@@ -219,6 +258,9 @@ def test_profile_pipeline_chunks_times_every_point_twice_and_keeps_faster():
 
 def _profile_runner(paddings, max_tokens, capacity):
     runner = MagicMock(spec=TPUModelRunner)
+    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=max_tokens)
     runner.num_tokens_paddings = paddings
     runner.max_num_tokens = max_tokens
     runner.max_model_len = 262144
@@ -255,6 +297,8 @@ def _capacity_runner():
     heads, head_dim 256, fp8 KV, 4224-token blocks paged at 128 tokens.
     The kernel's sizing needs a TPU, so the tests stub it."""
     runner = MagicMock(spec=TPUModelRunner)
+    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=16384)
     runner._attention_capacity = {}
     runner._attention_runs_batched_kernel = None
     runner.parallel_config = SimpleNamespace()

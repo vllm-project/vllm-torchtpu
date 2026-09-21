@@ -27,6 +27,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.distributed.mesh_utils import gather_stage_device_table
 from vllm_torchtpu.distributed.pcp_rank_order import (
     pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
@@ -149,6 +150,14 @@ class TPUWorker(WorkerBase):
                          num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+
+    def pipeline_position(self) -> tuple[int, int]:
+        """This worker's pipeline stage and its rank in the stage's
+        context-parallel group, which the executor reads rather than derives
+        from the worker's index."""
+        from vllm.distributed.parallel_state import get_pcp_group
+        return (int(get_pp_group().rank_in_group),
+                int(get_pcp_group().rank_in_group))
 
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
@@ -408,6 +417,10 @@ class TPUWorker(WorkerBase):
         # built groups back, so a patch that silently stopped applying fails
         # here rather than costing a few percent unnoticed.
         verify_pcp_topology_order(group_ranks_by_name)
+        if self.parallel_config.pipeline_parallel_size > 1:
+            # Every rank joins this gather; the stage meshes and the hand-off
+            # read the table later, at points not every rank reaches together.
+            gather_stage_device_table()
 
         pp_group = get_pp_group()
         is_first_rank = pp_group.is_first_rank

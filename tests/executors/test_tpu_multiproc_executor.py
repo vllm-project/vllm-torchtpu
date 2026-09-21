@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -221,3 +222,35 @@ def test_ray_executor_raises_on_real_disagreement():
                       return_value=_SPECS):
         with pytest.raises(ValueError, match="workers disagree"):
             executor.get_kv_cache_specs()
+
+
+def test_output_rank_and_stage_order_follow_the_workers_positions():
+    """PP2 x PCP2 on ranks bound to devices (0, 1, 4, 5): stage 1 is
+    ranks 2 and 3 here, but with the (0, 1, 4, 5, 6, 7, 2, 3) binding of a
+    wider slice it need not be, so the executor asks."""
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2,
+                                        prefill_context_parallel_size=2,
+                                        world_size=4))
+    positions = [(0, 0), (1, 1), (1, 0), (0, 1)]
+    executor.collective_rpc = MagicMock(return_value=positions)
+    with patch.object(MultiprocExecutor, "_init_executor"), \
+            patch("vllm_torchtpu._patch_multiproc_worker_global_rank_env"):
+        executor._init_executor()
+    assert executor.output_rank == 2
+    assert executor._stage_major([10, 11, 12, 13]) == [10, 13, 12, 11]
+
+
+def test_stage_order_is_the_rank_order_without_context_parallel_stages():
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2,
+                                        prefill_context_parallel_size=1,
+                                        world_size=2))
+    executor.collective_rpc = MagicMock()
+    with patch.object(MultiprocExecutor, "_init_executor"), \
+            patch("vllm_torchtpu._patch_multiproc_worker_global_rank_env"):
+        executor._init_executor()
+    executor.collective_rpc.assert_not_called()
+    assert executor._stage_major([1, 2]) == [1, 2]

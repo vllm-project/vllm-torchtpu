@@ -49,10 +49,25 @@ def test_no_order_when_multiple_nodes():
 # --- resolve_pcp_topology_order: faults raise ------------------------------
 
 
-def test_raises_when_pipeline_parallelism_is_present():
-    """PcpStaticSupportValidator rejects this before workers spawn."""
-    with pytest.raises(RuntimeError, match="pipeline_parallel_size"):
-        order_mod.resolve_pcp_topology_order(_config(pp=2))
+def test_pipeline_stages_take_the_rank_block_layout(monkeypatch):
+    """Under pipeline parallelism the groups are the stage layout, and the
+    expert group only when the model has experts."""
+    from vllm_torchtpu.distributed import mesh_utils
+    groups = {
+        "pcp": [[0, 1], [3, 2]],
+        "pp": [[0, 3], [1, 2]],
+        "ep": [[0, 1], [3, 2]]
+    }
+    monkeypatch.setattr(mesh_utils, "stage_group_ranks",
+                        lambda stages, size: dict(groups))
+    config = _config(pp=2, pcp=2)
+    config.model_config = SimpleNamespace(is_moe=True)
+    assert order_mod.resolve_pcp_topology_order(config) == groups
+    config.model_config = SimpleNamespace(is_moe=False)
+    assert order_mod.resolve_pcp_topology_order(config) == {
+        "pcp": groups["pcp"],
+        "pp": groups["pp"]
+    }
 
 
 def test_raises_when_data_parallel_replicas_are_present():
@@ -391,7 +406,27 @@ def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
     _patch_groups(monkeypatch, rank=0, pcp=[0, 1])
 
     with pytest.raises(RuntimeError, match="No group accessor"):
-        order_mod.verify_pcp_topology_order({"ep": [[0, 1]]})
+        order_mod.verify_pcp_topology_order({"dp": [[0, 1]]})
+
+
+def test_verify_reads_back_the_pipeline_and_expert_groups(monkeypatch):
+    from vllm.distributed import parallel_state
+    _patch_groups(monkeypatch, rank=3, pcp=[3, 2])
+    monkeypatch.setattr(parallel_state,
+                        "get_pp_group",
+                        lambda: SimpleNamespace(ranks=[1, 3]),
+                        raising=False)
+    monkeypatch.setattr(parallel_state,
+                        "get_ep_group",
+                        lambda: SimpleNamespace(ranks=[3, 2]),
+                        raising=False)
+    order_mod.verify_pcp_topology_order({
+        "pcp": [[0, 1], [3, 2]],
+        "pp": [[0, 2], [1, 3]],
+        "ep": [[0, 1], [3, 2]]
+    })
+    with pytest.raises(RuntimeError, match="did not adopt"):
+        order_mod.verify_pcp_topology_order({"pp": [[0, 2], [3, 1]]})
 
 
 @pytest.mark.parametrize("field", [

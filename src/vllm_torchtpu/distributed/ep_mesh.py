@@ -36,7 +36,9 @@ from vllm.distributed import parallel_state
 
 from vllm_torchtpu.distributed.mesh_utils import (_collect_rank_to_device_id,
                                                   _get_current_global_rank,
-                                                  _get_tpu_global_device_id)
+                                                  _get_tpu_global_device_id,
+                                                  get_or_create_stage_mesh,
+                                                  get_stage_device_table)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -203,6 +205,10 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     unordered = ep_device_ids()
     if unordered is None:
         return None
+    if get_stage_device_table() is not None:
+        # The EP group is one pipeline stage; the stage mesh row lists its
+        # devices in group order and the stage tag numbers them the same way.
+        return get_or_create_stage_mesh(axis_name)
     device_ids = tuple(sorted(unordered))
 
     cache_key = (axis_name, device_ids)

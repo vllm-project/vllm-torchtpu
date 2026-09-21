@@ -79,15 +79,18 @@ def resolve_pcp_topology_order(
     tp_size = int(parallel_config.tensor_parallel_size)
     pp_size = int(parallel_config.pipeline_parallel_size)
 
-    # PcpStaticSupportValidator rejects PCP with pipeline parallelism before
-    # any worker spawns, so reaching here with pp > 1 means that gate moved or
-    # broke. Fail rather than build a layout whose pp axis we never modelled.
+    # A pipeline stage is one PCP group whose kernels run on the stage's
+    # devices alone, which needs each stage on a block of consecutive
+    # world ranks (mesh_utils), not on the ring order of the topology.
     if pp_size != 1:
-        raise RuntimeError(
-            f"Topology aware mesh assignment reached with "
-            f"pipeline_parallel_size={pp_size}. "
-            f"PcpStaticSupportValidator should have rejected PCP "
-            f"with pipeline parallelism before worker startup.")
+        from vllm_torchtpu.distributed.mesh_utils import stage_group_ranks
+        groups = stage_group_ranks(pp_size, pcp_size)
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is None or not getattr(model_config, "is_moe", False):
+            groups.pop("ep")
+        logger.info("Pipeline stage layout | pp=%d pcp=%d -> %s", pp_size,
+                    pcp_size, groups)
+        return groups
 
     # dp > 1 is only visible here under expert parallelism: TPUWorker
     # collapses data_parallel_size to 1 for dense DP, and preserves it only
@@ -160,11 +163,11 @@ def pcp_topology_order(
 
     Patches ``init_model_parallel_group`` for the duration rather than
     permanently, so nothing is left installed for later callers to trip over.
-    Only the axes present in ``group_ranks_by_name`` are replaced -- today
-    ``pcp`` and ``tp``. Every other group, including ``dp``, ``pp`` and
-    ``ep``, goes through the original function untouched; at the supported
-    scope those are singletons or the whole world, so they cannot conflict
-    with this layout.
+    Only the axes present in ``group_ranks_by_name`` are replaced: ``pcp``
+    and ``tp`` from the topology mesh, or ``pcp``, ``pp`` and ``ep`` under
+    pipeline parallelism. Every other group goes through the original
+    function untouched; at the supported scope those are singletons or the
+    whole world, so they cannot conflict with this layout.
 
     ``group_ranks_by_name`` is ``None`` only when topology aware mesh does
     not apply to this configuration. The patch is still installed in that
@@ -262,9 +265,15 @@ def verify_pcp_topology_order(
         return
 
     import torch.distributed as dist
-    from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
+    from vllm.distributed.parallel_state import (get_ep_group, get_pcp_group,
+                                                 get_pp_group, get_tp_group)
 
-    getters = {"pcp": get_pcp_group, "tp": get_tp_group}
+    getters = {
+        "pcp": get_pcp_group,
+        "tp": get_tp_group,
+        "pp": get_pp_group,
+        "ep": get_ep_group,
+    }
     my_rank = int(dist.get_rank())
 
     for axis, wanted in group_ranks_by_name.items():

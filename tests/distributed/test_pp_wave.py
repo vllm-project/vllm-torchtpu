@@ -48,6 +48,8 @@ def stages(monkeypatch):
     size = 8
     ring = _Ring(size)
     current = {}
+    from vllm_torchtpu.distributed import mesh_utils
+    monkeypatch.setattr(mesh_utils, "get_stage_device_table", lambda: None)
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(
         pp_wave, "pp_permute_op", lambda mesh:
@@ -188,6 +190,91 @@ def test_a_launch_count_off_by_one_is_caught(stages):
     w.forwards = 1
     with pytest.raises(RuntimeError, match="issued 3 launches, expected 2"):
         w._check_count()
+
+
+def test_warmup_tells_the_device_columns_apart(monkeypatch):
+    """Stage 2, column 1 of 2 expects stage 1's column 1 (index 4); a block
+    from column 0 (index 3) is a routing error."""
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed import mesh_utils, pcp
+    monkeypatch.setattr(mesh_utils, "get_stage_device_table", lambda: None)
+    monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
+    monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh: None)
+    monkeypatch.setattr(parallel_state, "get_pp_group",
+                        lambda: SimpleNamespace(rank_in_group=2, world_size=4))
+    monkeypatch.setattr(pcp, "get_pcp_rank", lambda: 1)
+    monkeypatch.setattr(pcp, "get_pcp_world_size", lambda: 2)
+    template = {
+        "hidden_states": ((HIDDEN, ), torch.float32),
+        "residual": ((HIDDEN, ), torch.float32),
+    }
+    sent = []
+
+    def from_index(index):
+        return lambda op, x: (sent.append(x[0, 0].item()) or torch.full_like(
+            x, float(index)))
+
+    monkeypatch.setattr(pp_wave, "_launch_now", from_index(4))
+    pp_wave.PPWave(torch.device("cpu"), MAX_ROWS, template).warmup()
+    assert sent == [6.0]
+    monkeypatch.setattr(pp_wave, "_launch_now", from_index(3))
+    with pytest.raises(RuntimeError, match="expected 4.0"):
+        pp_wave.PPWave(torch.device("cpu"), MAX_ROWS, template).warmup()
+
+
+def test_a_stage_over_two_chips_drains_before_every_hand_off(monkeypatch):
+    """Eight cores on four chips: a PP2 x PCP4 stage spans two chips and
+    waits for the slice before each hand-off; a PP8 stage is one core and
+    launches at once."""
+    import jax
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed import mesh_utils, pcp
+    devices = [SimpleNamespace(id=i, coords=(i // 2, 0, 0)) for i in range(8)]
+    monkeypatch.setattr(jax, "devices", lambda: devices)
+    monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
+    monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh: None)
+    monkeypatch.setattr(pcp, "get_pcp_rank", lambda: 0)
+    drains = []
+    monkeypatch.setattr(pp_wave, "_drain_slice", lambda: drains.append(1))
+    template = {
+        "hidden_states": ((HIDDEN, ), torch.float32),
+        "residual": ((HIDDEN, ), torch.float32),
+    }
+
+    def stage(table, rank, columns):
+        monkeypatch.setattr(mesh_utils, "get_stage_device_table",
+                            lambda: table)
+        monkeypatch.setattr(
+            parallel_state, "get_pp_group",
+            lambda: SimpleNamespace(rank_in_group=rank,
+                                    world_size=table.num_stages))
+        monkeypatch.setattr(pcp, "get_pcp_world_size", lambda: columns)
+        monkeypatch.setattr(
+            pp_wave, "_launch_now",
+            lambda op, x: torch.full_like(x, float((rank - 1) * columns + 1)))
+        wave = pp_wave.PPWave(torch.device("cpu"), MAX_ROWS, template)
+        wave.warmup()
+        return wave
+
+    two_chips = mesh_utils.StageDeviceTable(stages=(0, 0, 0, 0, 1, 1, 1, 1),
+                                            columns=(0, 1, 2, 3, 0, 1, 2, 3),
+                                            device_ids=tuple(range(8)),
+                                            stage=1,
+                                            column=0)
+    assert stage(two_chips, 1, 4).drain_before_handoff
+    assert drains == [1]
+
+    one_core = mesh_utils.StageDeviceTable(stages=tuple(range(8)),
+                                           columns=(0, ) * 8,
+                                           device_ids=tuple(range(8)),
+                                           stage=3,
+                                           column=0)
+    assert not stage(one_core, 3, 1).drain_before_handoff
+    monkeypatch.setattr(mesh_utils, "get_stage_device_table", lambda: None)
+    assert not stage(one_core, 3, 1).drain_before_handoff
+    assert drains == [1]
 
 
 def test_the_hand_off_carries_hidden_states_and_residual_only(monkeypatch):

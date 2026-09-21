@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hand one pipeline stage's activations to the next over ICI.
 
-The op is an XLA collective-permute over a mesh of the pipeline group's
-devices: every stage's block lands on the stage after it, and the last stage's
-block lands on the first stage, which ignores it, so the permutation is one
-closed cycle. Every stage must call it at the same point in its launch
+The op is an XLA collective-permute over a mesh of the slice's devices: every
+stage's block lands on the stage after it, and the last stage's block lands on
+the first stage, which ignores it, so the permutation is one closed cycle. A
+stage of several devices (a context-parallel group) forms one cycle per
+device column: each device hands its rows to the device holding the same rows
+in the next stage. Every device must call it at the same point in its launch
 sequence; ``pp_wave`` arranges that.
 """
 import jax
@@ -13,63 +15,60 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from vllm.logger import init_logger
 
-from vllm_torchtpu.distributed.mesh_utils import (_collect_rank_to_device_id,
-                                                  _get_current_global_rank,
-                                                  _get_tpu_global_device_id)
+from vllm_torchtpu.distributed.mesh_utils import (StageDeviceTable,
+                                                  gather_stage_device_table)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
 logger = init_logger(__name__)
 
 AXIS = "pp"
 _MESH: Mesh | None = None
-_POS_OF_RANK: tuple[int, ...] = ()
+_TABLE: StageDeviceTable | None = None
 _OPS: dict[tuple, object] = {}
 
 
 def get_or_create_pp_mesh() -> Mesh:
-    """A JAX mesh over the pipeline group's devices in device-id order.
+    """A JAX mesh over the slice's devices in world-rank order.
 
-    The runtime addresses collective peers by device order, so mesh positions
-    follow device ids; ``pp_positions()`` maps pipeline ranks onto them.
+    torch_tpu numbers the slice's devices by world rank, so mesh position r
+    is rank r; ``pipeline_permutation`` maps stages onto the positions.
     """
-    global _MESH, _POS_OF_RANK
+    global _MESH, _TABLE
     if _MESH is not None:
         return _MESH
-    from vllm.distributed.parallel_state import get_pp_group
-    group = get_pp_group()
-    ranks = tuple(int(rank) for rank in group.ranks)
-    rank_to_device = _collect_rank_to_device_id(group,
-                                                _get_current_global_rank(),
-                                                _get_tpu_global_device_id())
+    _TABLE = gather_stage_device_table()
     devices_by_id = {int(device.id): device for device in jax.devices()}
-    device_ids = sorted(rank_to_device[rank] for rank in ranks)
-    _MESH = Mesh(np.asarray([devices_by_id[d] for d in device_ids]),
+    _MESH = Mesh(np.asarray(
+        [devices_by_id[rank] for rank in range(len(_TABLE.stages))]),
                  axis_names=(AXIS, ))
-    _POS_OF_RANK = tuple(
-        device_ids.index(rank_to_device[rank]) for rank in ranks)
     logger.info(
-        "PP hand-off mesh (device order): %s",
-        ", ".join(f"rank{r}->pos{_POS_OF_RANK[i]}/dev{rank_to_device[r]}"
-                  for i, r in enumerate(ranks)))
+        "PP hand-off mesh (rank order): %s",
+        ", ".join(f"stage{s}/col{c}->rank{r}/dev{d}"
+                  for r, (s, c, d) in enumerate(
+                      zip(_TABLE.stages, _TABLE.columns, _TABLE.device_ids))))
     return _MESH
 
 
-def pp_positions() -> tuple[int, ...]:
-    """Mesh position of each pipeline rank, in rank order."""
-    get_or_create_pp_mesh()
-    return _POS_OF_RANK
+def pipeline_permutation(
+        rows: tuple[tuple[int, ...], ...]) -> tuple[tuple[int, int], ...]:
+    """Source/target rank pairs of the hand-off for stage-major ``rows`` of
+    ranks: stage s's column j sends to stage s+1's column j, the last stage
+    back to stage 0, one closed cycle per column."""
+    size = len(rows)
+    return tuple((rows[s][j], rows[(s + 1) % size][j])
+                 for j in range(len(rows[0])) for s in range(size))
 
 
 def pp_permute_op(mesh: Mesh):
     """Torch op ``x_out = pp_permute(x)``: one collective-permute carrying a
-    [tokens, hidden] tensor one stage forward around the cycle, routed by
-    mesh position."""
+    [tokens, hidden] tensor one stage forward around its column's cycle,
+    routed by mesh position."""
     key = ("permute", ) + tuple(int(d.id) for d in mesh.devices)
     op = _OPS.get(key)
     if op is not None:
         return op
-    pos = pp_positions()
-    perm = [(pos[r], pos[(r + 1) % len(pos)]) for r in range(len(pos))]
+    assert _TABLE is not None
+    perm = list(pipeline_permutation(_TABLE.rows()))
     spec = PartitionSpec(AXIS)
 
     def shift(x: jax.Array) -> jax.Array:
