@@ -171,6 +171,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    # A layer piece that changes the compiled graph when its switch is on.
+    "vllm_torchtpu/layers/adapter/norm_weight_hoist.py",
     "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` fixes the device ORDER
     # the kernel's remote DMAs resolve their peer coordinates against, so an
