@@ -26,7 +26,6 @@ Flow:
 """
 
 import copy
-from typing import Dict, Optional, Type
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import \
@@ -70,7 +69,7 @@ def get_tpu_quantization_config(
     model_config = copy.deepcopy(vllm_config.model_config)
 
     # Map from quant method name to TPU config class
-    method_to_config: Dict[Optional[str], Type[VllmQuantConfig]] = {
+    method_to_config: dict[str | None, type[VllmQuantConfig]] = {
         None: VllmUnquantizedConfig,
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions for quantized matmul kernel."""
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp

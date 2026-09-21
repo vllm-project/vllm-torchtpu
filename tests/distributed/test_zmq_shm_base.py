@@ -510,7 +510,7 @@ class TestIpcAuth:
                                 exists=lambda path: path == "/etc/machine-id")
         with patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)), \
              patch(f"{_BASE}.open", create=True,
-                   return_value=open(machine_id, "r")):
+                   return_value=open(machine_id)):
             key = zsb._get_default_ipc_key()
         assert key == _derived_key("abc123")
 

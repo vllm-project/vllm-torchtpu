@@ -484,8 +484,8 @@ class BatchingLSERef(pltpu.BufferedRef):
             dma_list.append((q_src, q_sz, b))
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            q_src = q_src * self.cfgs.aligned_num_q_heads_per_kv_head
-            q_sz = q_sz * self.cfgs.aligned_num_q_heads_per_kv_head
+            # Tokens are a leading dimension, outside the tiled head/lane
+            # axes. Copy whole token records, matching BatchingORef.
             pltpu.make_async_copy(
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 lse_hbm.at[:, pl.ds(q_src, q_sz)],
@@ -502,7 +502,7 @@ class BatchingLSERef(pltpu.BufferedRef):
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
         wait_lanes = schedule_ref.total_wait_lse_out[block_idx]
-        wait_lanes = pl.multiple_of(wait_lanes, 8)
+        # Packed token records can contribute fewer than eight u32 rows.
         ref_u32 = lse_hbm.bitcast(jnp.uint32)
         flat_ref = ref_u32.reshape((-1, 128))
         pltpu.make_async_copy(

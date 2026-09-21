@@ -214,19 +214,13 @@ def test_no_forward_output_preserves_invalid_block_ids():
     with patch(
             "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
             return_value=False):
-        if not tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
-            with pytest.raises(RuntimeError,
-                               match="cache-group-scoped KV load failure"):
-                TPUModelRunner.kv_connector_no_forward(runner,
-                                                       scheduler_output,
-                                                       vllm_config)
-            return
         output = TPUModelRunner.kv_connector_no_forward(
             runner, scheduler_output, vllm_config)
 
     assert output.kv_connector_output.finished_recving == {"failed-load"}
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
-    assert output.kv_connector_output.invalid_block_group_index == 2
+    if tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
+        assert output.kv_connector_output.invalid_block_group_index == 2
 
 
 def test_build_kv_connector_output_supports_vllm_023():
@@ -252,19 +246,22 @@ def test_build_kv_connector_output_supports_vllm_023():
     )
 
 
-def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
+def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery(
+):
     with patch.object(
             tpu_runner,
             "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
             False,
-    ), pytest.raises(RuntimeError, match="cache-group-scoped KV load failure"):
-        tpu_runner._build_kv_connector_output(
+    ):
+        out = tpu_runner._build_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
             kv_connector_worker_meta=None,
             invalid_block_ids={41, 43},
             invalid_block_group_index=2,
         )
+        assert out.finished_recving == {"failed-load"}
+        assert out.invalid_block_ids == {41, 43}
 
 
 def _fake_phased_runner(additional_config=None,

@@ -51,6 +51,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk as sc_module
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (LANES,
                                                                _align_to,
                                                                _pick_partition,
@@ -343,3 +344,127 @@ def test_return_scores(b: int, n: int, k: int):
                                            rtol=1e-5)
             else:
                 assert score_val == -np.inf
+
+
+# --------------------------------------------------------------------------- #
+# Scheduling groups.
+# --------------------------------------------------------------------------- #
+# `scheduling_group_id` puts stage 1 in an XLA scheduling group and
+# `stage2_scheduling_group_id` puts stage 2 in a *different* one, so a caller
+# pipelining several chunks can overlap each stage with a different chunk's
+# TensorCore work. Stage 2 only exists on the two-stage path.
+#
+# Both ids are scheduling hints, so there are exactly two ways they can be
+# wrong: the annotation lands on the wrong stage (or leaks onto a stage the
+# caller left unannotated, which would pin two stages into one group and
+# serialise the overlap it was added to create), or it perturbs the selection.
+# One test each. Which stage gets which id is decided before any kernel is
+# built, so that half is a `cpu_test` and only the other two need a TPU.
+
+# `b=16, n=N_128K` is the two-stage shape; `b=64, n=N_SHORT` is single-stage.
+TWO_STAGE = (16, N_128K, 2048)
+SINGLE_STAGE = (64, N_SHORT, 2048)
+
+
+def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
+    """The `scheduling_group_id` each `_sc_topk_direct` call receives, in order.
+
+    Calls `sparsecore_topk.__wrapped__` rather than the jitted wrapper so the
+    stub is guaranteed to be the function that runs: a cached trace from an
+    earlier test would otherwise re-run the real kernel and record nothing.
+    """
+    seen: list[int | None] = []
+
+    def _stub(scores,
+              k_,
+              row_lengths,
+              *,
+              write_empty=True,
+              scheduling_group_id=None):
+        seen.append(scheduling_group_id)
+        out = jnp.zeros((scores.shape[0], k_), jnp.int32)
+        return out, out
+
+    monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
+    sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k,
+                                          **kwargs)
+    return seen
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "shape,kwargs,expected",
+    [
+        # Each stage gets its own group, and stage 2 gets the stage-2 one.
+        (TWO_STAGE, dict(scheduling_group_id=3,
+                         stage2_scheduling_group_id=4), [3, 4]),
+        # Stage 2 unannotated: it must NOT inherit stage 1's group.
+        (TWO_STAGE, dict(scheduling_group_id=3), [3, None]),
+        # Stage 1 unannotated, stage 2 annotated: the two are independent.
+        (TWO_STAGE, dict(stage2_scheduling_group_id=4), [None, 4]),
+        (TWO_STAGE, {}, [None, None]),
+        # One stage exists, so the stage-2 id is accepted and unused.
+        (SINGLE_STAGE, dict(scheduling_group_id=3,
+                            stage2_scheduling_group_id=4), [3]),
+        (SINGLE_STAGE, dict(stage2_scheduling_group_id=4), [None]),
+    ],
+    ids=[
+        "both", "stage1_only", "stage2_only", "neither", "p1_both",
+        "p1_stage2_only"
+    ],
+)
+def test_each_stage_gets_the_group_id_it_was_given(monkeypatch, shape, kwargs,
+                                                   expected):
+    b, n, k = shape
+    assert _pick_partition(b, n, k) == (8 if len(expected) == 2 else 1)
+    assert _stage_group_ids(monkeypatch, b, n, k, **kwargs) == expected
+
+
+def test_scheduling_group_ids_reach_the_lowered_hlo():
+    """The stub test above proves the plumbing; this proves the plumbing does
+    something. Both ids have to survive as frontend attributes, or the stages
+    are annotated only in the source."""
+    b, n, k = TWO_STAGE
+    assert _pick_partition(b, n, k) == 8
+    scores = jnp.zeros((b, n), jnp.float32)
+    row_lengths = jnp.full((b, ), n, jnp.int32)
+
+    def _text(**kwargs):
+        return sparsecore_topk.lower(scores, k, row_lengths,
+                                     **kwargs).as_text()
+
+    both = _text(scheduling_group_id=3, stage2_scheduling_group_id=4)
+    assert '_scheduling_group_id = "3"' in both
+    assert '_scheduling_group_id = "4"' in both
+
+    # Nothing is annotated unless it was asked for.
+    stage1_only = _text(scheduling_group_id=3)
+    assert '_scheduling_group_id = "3"' in stage1_only
+    assert '_scheduling_group_id = "4"' not in stage1_only
+    assert "_scheduling_group_id" not in _text()
+
+
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+def test_scheduling_group_ids_do_not_change_the_selection(kind):
+    """A scheduling hint that changed the answer would be a correctness bug."""
+    b, n, k = TWO_STAGE
+    rng = np.random.default_rng(SEED)
+    scores = _scores(kind, b, n, rng)
+    row_lengths = np.full(b, n, np.int32)
+
+    plain = _run(scores, k, row_lengths)
+    grouped = np.asarray(
+        jax.block_until_ready(
+            sparsecore_topk(jnp.asarray(scores),
+                            k,
+                            jnp.asarray(row_lengths),
+                            scheduling_group_id=3,
+                            stage2_scheduling_group_id=4)))
+
+    assert _mismatch(scores, grouped, k, row_lengths) is None
+    # Indices may legitimately differ on ties, the selected scores may not.
+    np.testing.assert_array_equal(
+        np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1),
+                axis=1),
+        np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1),
+                axis=1))

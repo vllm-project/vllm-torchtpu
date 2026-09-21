@@ -41,7 +41,7 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -235,7 +235,7 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[QuantizeMethodBase]:
+    ) -> QuantizeMethodBase | None:
         if isinstance(layer, Attention):
             # NVFP4 attention/kv-cache quantization is not implemented on TPU.
             return None
@@ -265,7 +265,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
     with `maybe_quantize_lhs=False`; only admitted fused EP layers use W4A8.
     """
 
-    def __init__(self, quant_config: 'VllmNvfp4Config', moe_config):
+    def __init__(self, quant_config: VllmNvfp4Config, moe_config):
         # Skip ModelOptNvFp4FusedMoE.__init__ (it selects a GPU experts backend).
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
@@ -495,7 +495,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     `gmm_v2`.
     """
 
-    def __init__(self, quant_config: 'VllmNvfp4Config',
+    def __init__(self, quant_config: VllmNvfp4Config,
                  linear_config: VllmQuantLinearConfig):
         # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel
         # unavailable on TPU). create_weights only needs kernel.input_quant_key.
@@ -565,7 +565,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+              bias: torch.Tensor | None = None) -> torch.Tensor:
         out = quantized_matmul_fp4(x, layer.weight, layer.weight_scale)
         if bias is not None:
             out = out + bias

@@ -67,7 +67,9 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(
             experts_per_token=2,
-            moe_parallel_config=SimpleNamespace(use_ep=True, pcp_size=1),
+            moe_parallel_config=SimpleNamespace(use_ep=True,
+                                                pcp_size=1,
+                                                is_sequence_parallel=False),
         ),
     )
     for name, value in overrides.items():
@@ -81,6 +83,7 @@ def _prebuild(layer,
               node_tokens=4096,
               smem_bytes=1024 * 1024,
               ep_order=None,
+              replica_groups=((0, ), (1, )),
               build_op=None,
               **kwargs):
     """Call prebuild with the distributed lookups stubbed out.
@@ -92,10 +95,12 @@ def _prebuild(layer,
     """
     mesh = (SimpleNamespace(
         shape={bridge.EP_AXIS_NAME: _STUB_EP}) if has_mesh else None)
-    build_op = build_op or (lambda *_args: "op")
+    build_op = build_op or (lambda *_args, **_kwargs: "op")
     with patch.object(bridge, "build_ep_mesh", return_value=mesh), \
             patch.object(bridge, "ep_mesh_index", return_value=0), \
             patch.object(bridge, "ep_rank_order", return_value=ep_order), \
+            patch.object(bridge, "ep_token_replica_groups",
+                         return_value=replica_groups), \
             patch.object(bridge, "_max_node_tokens", return_value=node_tokens), \
             patch.object(bridge, "_smem_capacity_bytes",
                          return_value=smem_bytes), \
@@ -119,20 +124,91 @@ def test_arms_on_a_supported_layer():
     assert _prebuild(_layer()) == "op"
 
 
+def test_native_replica_groups_reach_prebuilt_op():
+    groups = ((0, 1), )
+    seen = []
+    assert _prebuild(
+        _layer(),
+        replica_groups=groups,
+        build_op=lambda *args, **kw: seen.append(kw) or "op") == "op"
+    assert seen[0]["token_replica_groups"] == groups
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True])
+@pytest.mark.parametrize("scoring_fn,has_bias,scale", [
+    ("softmax", False, 1.0),
+    ("sigmoid", True, 2.5),
+    ("sqrtsoftplus", True, 0.75),
+])
+def test_replica_groups_are_part_of_op_cache_and_kernel_call(
+        monkeypatch, sharded_plan, scoring_fn, has_bias, scale):
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build(name, fn, **kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "sharded_jax_op", build)
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    groups = ((0, 1), )
+    args = (None, 2, True, "silu", None, sharded_plan)
+    options = dict(scoring_fn=scoring_fn,
+                   has_score_bias=has_bias,
+                   routed_scaling_factor=scale,
+                   token_replica_groups=groups)
+    replicated = bridge._build_op(*args, **options)
+    assert bridge._build_op(*args, **options) is replicated
+    # Every independent routing setting and the TP membership separate caches.
+    for changed in (
+            dict(token_replica_groups=((0, ), (1, ))),
+            dict(scoring_fn="sigmoid" if scoring_fn ==
+                 "softmax" else "softmax"),
+            dict(has_score_bias=not has_bias),
+            dict(routed_scaling_factor=scale + 1.0),
+    ):
+        assert bridge._build_op(*args, **(options | changed)) is not replicated
+    assert len(closures) == 5
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    bias = jnp.arange(4, dtype=jnp.bfloat16)
+    operands = (x, None, None, None, None, jnp.zeros(
+        (8, 4)), jnp.zeros((1, 1), dtype=jnp.int32))
+    if has_bias:
+        operands += (bias, )
+    assert closures[0](*operands) is x
+    forwarded = kernel.call_args.kwargs
+    assert forwarded["token_replica_groups"] == groups
+    assert forwarded["scoring_fn"] == scoring_fn
+    assert forwarded["routed_scaling_factor"] == scale
+    assert forwarded["sharded_plan"] is sharded_plan
+    if has_bias:
+        np.testing.assert_array_equal(forwarded["score_bias"], bias)
+        assert forwarded["score_bias"].dtype == jnp.float32
+    else:
+        assert "score_bias" not in forwarded
+
+
 def test_sharded_plan_flag_reaches_the_built_op():
     seen = []
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
         assert _prebuild(
-            _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
+            _layer(),
+            build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
     assert seen and seen[0][_SHARDED_PLAN_ARG] is True
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
     order = (1, 0)
     seen = []
-    assert _prebuild(_layer(),
-                     ep_order=order,
-                     build_op=lambda *args: seen.append(args) or "op") == "op"
+    assert _prebuild(
+        _layer(),
+        ep_order=order,
+        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
     assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
@@ -501,10 +577,11 @@ def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
 @pytest.mark.parametrize("block", [64, 128, 256, 512, 1024])
 def test_nvfp4_aligned_block_arms_and_passes_format(block):
     seen = []
-    assert _prebuild(_fp4_layer(block, hidden=1024, inter=1024),
-                     weight_format="fp4",
-                     rhs_qb=block,
-                     build_op=lambda *args: seen.append(args) or "op") == "op"
+    assert _prebuild(
+        _fp4_layer(block, hidden=1024, inter=1024),
+        weight_format="fp4",
+        rhs_qb=block,
+        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
     assert seen[0][_WEIGHT_FORMAT_ARG:_WEIGHT_FORMAT_ARG + 2] == ("fp4", block)
 
 
@@ -592,7 +669,9 @@ def _nvfp4_checkpoint_layer(hidden=512, inter=512, use_ep=True):
     layer.global_num_experts = _STUB_EP
     layer.moe_config = SimpleNamespace(experts_per_token=2,
                                        moe_parallel_config=SimpleNamespace(
-                                           use_ep=use_ep, pcp_size=1))
+                                           use_ep=use_ep,
+                                           pcp_size=1,
+                                           is_sequence_parallel=False))
     return layer
 
 

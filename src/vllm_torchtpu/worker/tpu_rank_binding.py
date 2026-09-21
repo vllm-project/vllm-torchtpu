@@ -34,8 +34,8 @@ ordering is visible rather than silent; if one ever appears, the fix belongs in
 the PCP group's rank order, not here.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from vllm_torchtpu.logger import init_logger
 

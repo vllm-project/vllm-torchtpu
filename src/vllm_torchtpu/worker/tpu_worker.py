@@ -6,7 +6,6 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import Dict, Tuple
 from urllib.parse import urlparse
 
 import torch
@@ -701,8 +700,8 @@ class TPUWorker(WorkerBase):
 
     def sync_weights(self,
                      updated_weights,
-                     mappings: Dict[str, Tuple[str, Tuple[str]]],
-                     transpose_keys: Dict[str, Tuple[int]],
+                     mappings: dict[str, tuple[str, tuple[str]]],
+                     transpose_keys: dict[str, tuple[int]],
                      reshard_fn=None) -> None:
         return self.model_runner._sync_weights(
             updated_weights=updated_weights,

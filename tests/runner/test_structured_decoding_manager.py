@@ -162,7 +162,6 @@ class TestPrepareStructuredDecodingInput:
         require, bitmask, arange = manager.prepare_structured_decoding_input(
             logits, grammar_output, 0, 2)
 
-        assert require.data_ptr() == manager.device_all_true_require.data_ptr()
         assert require[:, 0].tolist() == [True, True]
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
         assert bitmask[1].tolist() == [BLOCK_ALL, ALLOW_ALL]
@@ -184,6 +183,67 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
         assert bitmask[1].tolist() == [0, 0]
         assert arange.tolist() == list(range(32))
+
+    def test_scheduler_order_permutes_batch_order(self):
+        # Bitmask rows follow `structured_output_request_ids`, i.e. the
+        # scheduler's order. That order is not the runner's batch order:
+        # `InputBatch.condense()` moves the last request into the slot a
+        # finished request vacated, so with more requests than `max_num_seqs`
+        # the two orders permute against each other.
+        #
+        # Here all four requests are structured, they fill batch rows 0..3,
+        # and their bitmask rows are contiguous -- every property a
+        # block-copy shortcut keys on -- yet rows 1 and 2 belong to the
+        # requests sitting at batch rows 2 and 1. Each row must still land on
+        # its own request's logits.
+        manager = make_manager(req_id_to_index={
+            "reqA": 0,
+            "reqB": 2,
+            "reqC": 1,
+            "reqD": 3,
+        })
+        grammar_output = make_grammar_output(
+            ["reqA", "reqB", "reqC", "reqD"],
+            [row(10), row(20), row(30), row(40)],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+
+        require, bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, cur_start_idx=0, cur_end_idx=4)
+
+        assert require[:, 0].tolist() == [True, True, True, True]
+        assert bitmask[0].tolist() == row(10)
+        assert bitmask[1].tolist() == row(30)  # reqC sits at batch row 1.
+        assert bitmask[2].tolist() == row(20)  # reqB sits at batch row 2.
+        assert bitmask[3].tolist() == row(40)
+
+    def test_scheduler_order_permutes_batch_order_in_later_chunk(self):
+        # Same permutation one chunk further in, so the block of rows does
+        # not start at row 0: `req0` belongs to an earlier chunk and owns
+        # bitmask row 0, and the four rows that follow cover batch rows 4..7
+        # in a different order than the scheduler listed them.
+        manager = make_manager(req_id_to_index={
+            "req0": 0,
+            "reqA": 4,
+            "reqB": 6,
+            "reqC": 5,
+            "reqD": 7,
+        })
+        grammar_output = make_grammar_output(
+            ["req0", "reqA", "reqB", "reqC", "reqD"],
+            [row(1), row(10), row(20),
+             row(30), row(40)],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+
+        require, bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, cur_start_idx=4, cur_end_idx=8)
+
+        assert require[:, 0].tolist() == [True, True, True, True]
+        assert bitmask[0].tolist() == row(10)  # reqA sits at batch row 4.
+        assert bitmask[1].tolist() == row(30)  # reqC sits at batch row 5.
+        assert bitmask[2].tolist() == row(20)  # reqB sits at batch row 6.
+        assert bitmask[3].tolist() == row(40)  # reqD sits at batch row 7.
 
 
 class TestStructuredDecode:

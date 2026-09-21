@@ -116,15 +116,28 @@ def inner_kernel(
 
     # --- pack + store ---
     if cfgs.dims.is_quantized:
-        q, scale = compute.quantize_fp8_tiled(normed, cfgs.dims.quant_block)
-        nope_val_padded = compute.pack_nope_tiled(
-            q,
-            scale,
-            cfgs.nope_store_dim,
-            cfgs.dims.quant_block,
-            nope_width_bytes=cfgs.record_bytes,
-            last_dim_size=cfgs.last_dim_size,
-        )
+        if cfgs.dims.mode == config.Mode.CSA:
+            # CSA's reader wants the scales per lane, not per block.
+            q, scale = compute.quantize_fp8_lane_periodic(
+                normed, cfgs.dims.quant_block, cfgs.nope_store_dim)
+            nope_val_padded = compute.pack_nope_lane_periodic(
+                q,
+                scale,
+                cfgs.nope_store_dim,
+                cfgs.record_bytes,
+                cfgs.last_dim_size,
+            )
+        else:
+            q, scale = compute.quantize_fp8_tiled(normed,
+                                                  cfgs.dims.quant_block)
+            nope_val_padded = compute.pack_nope_tiled(
+                q,
+                scale,
+                cfgs.nope_store_dim,
+                cfgs.dims.quant_block,
+                nope_width_bytes=cfgs.record_bytes,
+                last_dim_size=cfgs.last_dim_size,
+            )
         if cfgs.dims.mode == config.Mode.CSA_INDEXER:
             kv_slots = []
             for i in range(tile_n):

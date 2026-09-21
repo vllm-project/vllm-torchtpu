@@ -5,7 +5,7 @@ import datetime
 import json
 import os
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.profiler
@@ -158,11 +158,11 @@ class PhaseBasedProfiler:
         int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
         prefill_kv_len_threshold:
         int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
-        standard_opts: Optional[dict[str, Any]] = None,
-        advanced_opts: Optional[dict[str, Any]] = None,
+        standard_opts: dict[str, Any] | None = None,
+        advanced_opts: dict[str, Any] | None = None,
     ):
         self.profiling_n_steps_left: int = 0
-        self.profile_dir_with_phase_suffix: Optional[str] = None
+        self.profile_dir_with_phase_suffix: str | None = None
         self.num_steps_to_profile_for: int = num_steps_to_profile_for
         # Skip initial decode steps to avoid profiling XLA compilation and warmup overhead
         self.num_decode_steps_to_skip: int = num_decode_steps_to_skip
@@ -186,8 +186,8 @@ class PhaseBasedProfiler:
         self.current_phase: str = ""
         self.worker_rank = worker_rank
         self.world_size = world_size
-        self.profile_context: Optional[Any] = None
-        self._canonical_dst_ts: Optional[str] = None
+        self.profile_context: Any | None = None
+        self._canonical_dst_ts: str | None = None
 
         logger.info(
             "Phase-based profiler enabled. Traces will be saved to: %s",

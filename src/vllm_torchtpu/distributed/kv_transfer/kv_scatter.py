@@ -28,7 +28,6 @@ can take seconds for N=64; warmup amortizes it.
 from __future__ import annotations
 
 import functools
-from typing import Optional
 
 import torch
 
@@ -38,7 +37,7 @@ logger = init_logger(__name__)
 
 # Lazy JAX/Pallas import so this module is safe to import on hosts without
 # a working JAX install.
-_jax_import_error: Optional[BaseException] = None
+_jax_import_error: BaseException | None = None
 try:
     import jax  # noqa: F401
     from jax.experimental import pallas as pl
@@ -158,8 +157,8 @@ def multi_layer_scatter_into(
     dsts: list[torch.Tensor],
     local_blocks: torch.Tensor,
     *,
-    prebuilt_args: Optional[tuple[torch.Tensor, torch.Tensor,
-                                  torch.Tensor]] = None,
+    prebuilt_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None = None,
 ) -> list[torch.Tensor]:
     """Scatter ``srcs[l][i]`` into ``dsts[l][local_blocks[i]]`` for all
     layers ``l`` and blocks ``i``, in one kernel dispatch.

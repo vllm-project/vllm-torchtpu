@@ -206,7 +206,7 @@ def _gather_window(pool,
     window costs a little extra DMA but restores the single-window-per-
     request shape whose per-window setup dominates the region cost.
     """
-    assert 0 <= kb0 and kb0 + nblocks <= split, (kb0, nblocks, split)
+    assert kb0 >= 0 and kb0 + nblocks <= split, (kb0, nblocks, split)
     na = mgr_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(out_dtype)
@@ -255,7 +255,7 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
     manager block, so the non-region kernel blocks are copied through
     from the aliased input to satisfy the full-write rule.
     """
-    assert 0 <= kb0 and kb0 + nblocks <= split, (kb0, nblocks, split)
+    assert kb0 >= 0 and kb0 + nblocks <= split, (kb0, nblocks, split)
     na = mgr_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)

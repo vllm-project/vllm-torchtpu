@@ -23,7 +23,6 @@ import threading
 import time
 from dataclasses import dataclass
 from multiprocessing import shared_memory
-from typing import Optional
 
 try:
     import numpy as np
@@ -114,11 +113,11 @@ class HostKVShmPool:
         # munlock without re-deriving the (possibly already-closed) shm
         # base address. Each entry is (addr, size).
         self._mlocked_regions: list[tuple[int, int]] = []
-        self._mlock_thread: Optional[threading.Thread] = None
+        self._mlock_thread: threading.Thread | None = None
         self._mlock_done = threading.Event()
         # Only rank 0 uses the free list.
-        self._free: Optional[queue.Queue] = None
-        self._lock: Optional[threading.Lock] = None
+        self._free: queue.Queue | None = None
+        self._lock: threading.Lock | None = None
         if owner:
             self._free = queue.Queue(maxsize=spec.num_slots)
             for i in range(spec.num_slots):
@@ -126,7 +125,7 @@ class HostKVShmPool:
             self._lock = threading.Lock()
 
     # ---- mlock / munlock ----------------------------------------------
-    def mlock_async(self, my_rank: Optional[int] = None) -> threading.Thread:
+    def mlock_async(self, my_rank: int | None = None) -> threading.Thread:
         """Run mlock(2) on a daemon thread so init isn't blocked.
 
         With pool=128 GB and ~1 µs/page, locking on the calling thread
@@ -153,13 +152,13 @@ class HostKVShmPool:
         self._mlock_thread = t
         return t
 
-    def wait_mlock(self, timeout: Optional[float] = None) -> bool:
+    def wait_mlock(self, timeout: float | None = None) -> bool:
         """Block until the async mlock completes (or until timeout). Mainly
         useful for tests / benchmarks that need pages pinned before the
         first request hits."""
         return self._mlock_done.wait(timeout=timeout)
 
-    def _mlock_blocking(self, my_rank: Optional[int]) -> None:
+    def _mlock_blocking(self, my_rank: int | None) -> None:
         if _libc_for_mlock is None:
             logger.warning("HostKVShmPool: libc.mlock unavailable")
             self._mlock_done.set()
@@ -247,7 +246,7 @@ class HostKVShmPool:
         return cls(spec, shm, owner=False)
 
     # ---- Free-list (rank 0 only) ---------------------------------------
-    def acquire_slot(self, timeout: Optional[float] = None) -> int:
+    def acquire_slot(self, timeout: float | None = None) -> int:
         assert self._owner, "acquire_slot: only rank 0 manages the free list"
         return self._free.get(timeout=timeout)
 

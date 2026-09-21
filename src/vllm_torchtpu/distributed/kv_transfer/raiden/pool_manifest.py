@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,

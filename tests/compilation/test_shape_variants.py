@@ -464,9 +464,8 @@ def test_a_refused_bucket_nobody_retraced_raises(tmp_path):
 
 def test_warmup_scope_survives_a_failure():
     """A failed warmup must not leave the session pinned for the next one."""
-    with pytest.raises(RuntimeError):
-        with shape_variants.warmup():
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), shape_variants.warmup():
+        raise RuntimeError("boom")
     assert shape_variants._session is None
 
 

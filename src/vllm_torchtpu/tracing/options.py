@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Any, Dict, Tuple
+from typing import Any
 
 _STANDARD_KEYS = frozenset({
     "host_tracer_level",
@@ -28,7 +28,7 @@ def _parse_option_value(key: str, val: str) -> Any:
 
 
 def parse_profile_options(
-        profile_prefix: str | None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        profile_prefix: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
     if not profile_prefix or not profile_prefix.strip():
         return {}, {}
 
@@ -76,7 +76,7 @@ _DEFAULT_ADVANCED_OPTS = {
 
 def resolve_profile_dir_and_opts(
         base_dir: str, profile_prefix: str | None
-) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """
     Resolves the target profiling directory and parses dynamic tracing options.
 

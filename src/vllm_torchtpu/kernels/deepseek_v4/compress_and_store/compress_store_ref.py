@@ -29,6 +29,23 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     return q, scale
 
 
+def quantize_fp8_lane_periodic(x: jax.Array, period: int, nope_dim: int):
+    """Block fp8 quantization with one UE8M0 scale per lane of `period`.
+
+    Group j is ``{d < nope_dim : d % period == j}``; see
+    ``compute.quantize_fp8_lane_periodic``.
+    """
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    dim = x.shape[-1]
+    kept = jnp.where(jnp.arange(dim) < nope_dim, jnp.abs(x), 0.0)
+    amax = jnp.clip(
+        jnp.max(kept.reshape(*x.shape[:-1], dim // period, period), axis=-2),
+        1e-4, None)
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+    q = (x / jnp.tile(scale, dim // period)).astype(jnp.float8_e4m3fn)
+    return q, scale.astype(jnp.float8_e8m0fnu)
+
+
 def interleaved_rope(
     x: jax.Array,  # [..., head_dim] fp32
     cos_sin: jax.Array,  # [..., rope_head_dim] fp32 ([cos | sin])
@@ -281,7 +298,11 @@ def ref_compress_norm_rope_store(
     nope_store_dim = head_dim - rope_head_dim if has_rope_cache else head_dim
     if is_quantized:
         # Quantized (CSA / Indexer)
-        q_full, scale_full = quantize_fp8_ue8m0(compressed, quant_block)
+        if is_indexer_mode:
+            q_full, scale_full = quantize_fp8_ue8m0(compressed, quant_block)
+        else:
+            q_full, scale_full = quantize_fp8_lane_periodic(
+                compressed, quant_block, nope_store_dim)
         q_bytes = jax.lax.bitcast_convert_type(q_full, jnp.uint8)
         scale_bytes = jax.lax.bitcast_convert_type(scale_full, jnp.uint8)
 
@@ -289,8 +310,11 @@ def ref_compress_norm_rope_store(
         scale_bytes_flat = scale_bytes.reshape(scale_bytes.shape[0], -1)
 
         q_nope = q_bytes_flat[..., :nope_store_dim]
-        nope_blocks = (nope_store_dim + quant_block - 1) // quant_block
-        scale_nope = scale_bytes_flat[..., :nope_blocks]
+        if is_indexer_mode:
+            nope_blocks = (nope_store_dim + quant_block - 1) // quant_block
+            scale_nope = scale_bytes_flat[..., :nope_blocks]
+        else:
+            scale_nope = scale_bytes_flat
 
         nope_record = jnp.concatenate([q_nope, scale_nope], axis=-1)
     else:

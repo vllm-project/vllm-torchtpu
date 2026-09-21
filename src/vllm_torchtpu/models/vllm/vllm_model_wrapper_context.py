@@ -14,7 +14,6 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 import torch
 from jax.sharding import Mesh
@@ -25,16 +24,16 @@ class VllmModelWrapperContext:
     # TODO need discussion, ullm use this context to manager kv_caches
     # while vllm binds the KV cache to the attention layer
     mesh: Mesh
-    kv_caches: Optional[List[torch.Tensor]] = None
-    layer_name_to_kvcache_index: Optional[Dict[str, int]] = None
-    vllm_config: Optional[object] = None
+    kv_caches: list[torch.Tensor] | None = None
+    layer_name_to_kvcache_index: dict[str, int] | None = None
+    vllm_config: object | None = None
     # Full-model block-major KV cache bundle shared across layers. When set,
     # attention forward execution routes through the bundled RPA custom op with
     # in-place buffer donation, bypassing the per-layer tensor views bound by vLLM.
-    kv_cache_bundle: Optional[torch.Tensor] = None
+    kv_cache_bundle: torch.Tensor | None = None
 
 
-_vllm_model_wrapper_context: Optional[VllmModelWrapperContext] = None
+_vllm_model_wrapper_context: VllmModelWrapperContext | None = None
 
 
 def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
@@ -48,11 +47,11 @@ def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
 @contextmanager
 def set_vllm_model_wrapper_context(
     *,
-    kv_caches: Optional[List[torch.Tensor]] = None,
+    kv_caches: list[torch.Tensor] | None = None,
     mesh: Mesh,
-    layer_name_to_kvcache_index: Optional[Dict[str, int]] = None,
-    vllm_config: Optional[object] = None,
-    kv_cache_bundle: Optional[torch.Tensor] = None,
+    layer_name_to_kvcache_index: dict[str, int] | None = None,
+    vllm_config: object | None = None,
+    kv_cache_bundle: torch.Tensor | None = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context

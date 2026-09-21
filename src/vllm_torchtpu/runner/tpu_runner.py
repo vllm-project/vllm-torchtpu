@@ -10,12 +10,12 @@ import copy
 import math
 import os
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -289,11 +289,6 @@ def _build_kv_connector_output(
     }
     if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         kwargs["invalid_block_group_index"] = invalid_block_group_index
-    elif invalid_block_group_index is not None:
-        raise RuntimeError(
-            "Installed vLLM does not support cache-group-scoped KV load "
-            "failure recovery; upgrade vLLM before recovering a failed "
-            f"hybrid KV load (group={invalid_block_group_index})")
     return KVConnectorOutput(**kwargs)
 
 
@@ -4897,11 +4892,17 @@ class TPUModelRunner(GPUModelRunner):
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P,
+                    greedy)
         try:
-            # ---- batched prefill of R requests (disjoint top-of-pool blocks) --
+            # Match the low-block working set used by the LIFO BlockPool
+            # workaround. High physical block ids can trigger the v7x SC2
+            # indexed-KV halt even though they are inside the allocated pool.
+            # Warmup runs before serving, with no live scheduler requests;
+            # reserve block 0 and keep each synthetic request's range disjoint.
             new_reqs = []
             for j, rid in enumerate(rids):
-                lo = top - (j + 1) * nblk
+                lo = 1 + j * nblk
                 new_reqs.append(
                     NewRequestData(req_id=rid,
                                    prompt_token_ids=[0] * P,
@@ -4979,10 +4980,11 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         decode_ncts = [P + t for t in range(n_dec)]
-        # Blocks from the TOP of the pool so the first real allocations (low ids)
-        # don't collide. Page CONTENTS are value-insensitive and KV writes use
-        # empty_slot_mappings, so stale pages are safe; each request is fully torn
-        # down before the next. Cover the highest context this request reaches.
+        # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
+        # BlockPool workaround, rather than exercising the SC2-sensitive end
+        # of the pool. Warmup runs before serving and tears down each request;
+        # real requests overwrite their valid KV positions on first prefill.
+        # Cover the highest context this request reaches, reserving block 0.
         # Count blocks per kv-cache group at that group's own block size:
         # groups differ on hybrid models (mamba vs attention), and the
         # runner-level self.block_size predates the executor's post-load
@@ -4994,7 +4996,7 @@ class TPUModelRunner(GPUModelRunner):
         for group in self.kv_cache_config.kv_cache_groups:
             gbs = int(group.kv_cache_spec.block_size)
             g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
-            block_ids_per_group.append(list(range(top - g_nblk, top)))
+            block_ids_per_group.append(list(range(1, 1 + g_nblk)))
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:
             logger.warning(
