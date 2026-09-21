@@ -69,7 +69,10 @@ def test_kimi_architectures_are_registered() -> None:
         architecture: ModelRegistry.models.get(architecture)
         for architecture in architectures
     }
-    previous_config = MODELS_CONFIG_MAP.get("KimiK3ForConditionalGeneration")
+    previous_configs = {
+        architecture: MODELS_CONFIG_MAP.get(architecture)
+        for architecture in architectures
+    }
     try:
         register_layers()
         for architecture, expected in architectures.items():
@@ -98,11 +101,11 @@ def test_kimi_architectures_are_registered() -> None:
                 model_config.model_arch_config,
             ))
     finally:
-        if previous_config is None:
-            MODELS_CONFIG_MAP.pop("KimiK3ForConditionalGeneration", None)
-        else:
-            MODELS_CONFIG_MAP[
-                "KimiK3ForConditionalGeneration"] = previous_config
+        for architecture, config_handler in previous_configs.items():
+            if config_handler is None:
+                MODELS_CONFIG_MAP.pop(architecture, None)
+            else:
+                MODELS_CONFIG_MAP[architecture] = config_handler
         for architecture, registered in previous.items():
             if registered is None:
                 ModelRegistry.models.pop(architecture, None)
