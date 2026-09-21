@@ -13,8 +13,7 @@
 # limitations under the License.
 """PCP projection/communication fused with the GDN v3 compute pipeline.
 
-The BF16/FP8 entry consumes canonical QKVZ weights normalized during loading.
-It projects QKVZ in-kernel and interleaves all but the first
+The Qwen3.5 BF16/FP8 entry projects QKVZ in-kernel and interleaves all but the first
 projection block with GDN tiles. BA exchange, gated normalization, and the
 final output projection remain outside. GDN state streams directly to and from
 the unified KV pool through a StateSourcePlan. QKV is written directly into a
