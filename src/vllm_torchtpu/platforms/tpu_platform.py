@@ -358,6 +358,13 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN", "MOE_FUSED_EP_ENABLE_W4A8"
     ]
 
+    def is_tpu(self) -> bool:
+        return True
+
+    @classmethod
+    def use_custom_op_collectives(cls) -> bool:
+        return True
+
     # The "Platform" base class has import_kernels() that tries to import
     # vllm._C, which is not available in the TPU Platform setup.
     # Override it to do nothing so we won't cause confusing warning logs.

@@ -948,6 +948,11 @@ def sparse_mla_attention_dcp(
         raise ValueError(
             f"dcp_size={dcp_size} does not match mesh axis "
             f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
+    if nope_spec.layout is not rope_spec.layout:
+        raise ValueError(
+            "sparse MLA attention requires matching NoPE and RoPE layouts; "
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}")
+    cache_layout = nope_spec.layout.value
     num_tokens = ql_nope.shape[0]
     if local_topk_indices.shape[0] != dcp_size * num_tokens:
         raise ValueError(
@@ -1030,6 +1035,7 @@ def sparse_mla_attention_dcp(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             return_lse=True,
+            cache_layout=cache_layout,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
