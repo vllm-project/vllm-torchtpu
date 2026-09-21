@@ -118,9 +118,9 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
             source dtype.
         region: The region's copy-plan (typed view parameters).
         shape: Logical state shape; its element count must equal
-            ``region.rows_used`` times the typed view's lane count. The FP32
-            path narrows the ref to the logical minor dimension; BF16 keeps
-            the full carrier width and reshapes the loaded array here.
+            ``region.rows_used`` times the typed view's lane count. The
+            ref is narrowed to the logical minor dimension; a 16-bit view of
+            a byte-typed pool goes through ``typed_ldst``'s packed route.
 
     Returns:
         The logical state of ``shape`` in ``region.view_dtype``.

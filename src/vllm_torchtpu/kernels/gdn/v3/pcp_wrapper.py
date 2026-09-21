@@ -1459,7 +1459,7 @@ def fused_qkvz_projection_pcp_gdn(
             act_in=jnp.float32.dtype,
             act_out=act_out_dtype,
             compute=compute_precision,
-            recurrent_state=jnp.float32.dtype,
+            recurrent_state=state_plan.recurrent.view_dtype,
             conv_state=jnp.float32.dtype,
         ),
         batch_size=global_batch_size,

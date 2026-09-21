@@ -575,9 +575,12 @@ class TestPooledCallerV3:
         pool = jnp.zeros((NUM_MGR * SPLIT, KBS, 1, 4, LANES),
                          dtype=jnp.float8_e4m3fn)
         ssm_ntok = N_V * D_K * D_V * 2 // (4 * LANES)
+        # A bf16 state is exchanged through the d_v-wide packed view on both
+        # sides of the seam (typed_ldst's 16-bit view of a byte block), the
+        # same view the kernel loads and stores it with; a full-width view
+        # would read the pair-interleaved words in the wrong order.
         pool = pool_adapters.scatter_region(pool,
-                                            recurrent_bf16.reshape(
-                                                n, -1, LANES),
+                                            recurrent_bf16.reshape(n, -1, D_V),
                                             pool_idx,
                                             tok0=0,
                                             ntok=ssm_ntok,
@@ -620,7 +623,7 @@ class TestPooledCallerV3:
                                                  ntok=ssm_ntok,
                                                  split=SPLIT,
                                                  out_dtype=jnp.bfloat16,
-                                                 out_lanes=LANES).reshape(
+                                                 out_lanes=D_V).reshape(
                                                      n, N_V, D_K, D_V)
 
         np.testing.assert_allclose(np.asarray(pooled_out),

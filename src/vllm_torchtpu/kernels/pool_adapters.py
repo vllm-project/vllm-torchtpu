@@ -481,8 +481,9 @@ def v3_state_source(
 
     The SSM region is the whole kernel blocks at the start of the manager
     window (one contiguous DMA per slot), viewed in the configured storage
-    dtype. FP32 uses a ``d_v``-wide typed view; BF16 preserves the raw pool
-    ref's full minormost width. The Conv region is ``conv_ntok`` token rows
+    dtype, through a ``d_v``-wide typed view (a 16-bit view of a byte-typed
+    pool goes through ``typed_ldst``'s packed route). The Conv region is
+    ``conv_ntok`` token rows
     inside a single kernel block, viewed as BF16 with the tail rows
     zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
@@ -516,21 +517,21 @@ def v3_state_source(
     else:
         assert ssm_ntok < block_size, (ssm_ntok, block_size)
         ssm_nblocks, ssm_nrows = 1, ssm_ntok
-    # Mosaic requires a BF16 typed ref to preserve the raw pool ref's minormost
-    # dimension, so load full-width and reshape the resulting array. FP32
-    # supports the d_v-wide ref view, avoiding a post-load lane-crossing
-    # relayout.
-    if recurrent_state_dtype.itemsize == 2:
+    # The d_v-wide view: the 16-bit view of a byte block goes through
+    # typed_ldst's packed view (see `_packed_view_on_byte_block` there), so a
+    # bf16 state on the fp8 pool needs no full-width carrier rows and no
+    # lane-crossing relayout after the load. A pool whose element width equals
+    # the state's keeps the full-width view, where a narrower view would split
+    # lanes after the load.
+    assert lanes % d_v == 0, (lanes, d_v)
+    pool_itemsize = jnp.dtype(pool.dtype).itemsize
+    if recurrent_state_dtype.itemsize == pool_itemsize and pool_itemsize > 1:
         ssm_lane_split = 1
     else:
-        assert lanes % d_v == 0, (lanes, d_v)
         ssm_lane_split = lanes // d_v
     ssm_out_lanes = lanes // ssm_lane_split
     # load_state_region treats these rows as one contiguous element stream and
     # reshapes it to (n_v, d_k, d_v); store_state_region reverses that reshape.
-    # FP32 uses d_v-wide rows, while BF16 may pack multiple logical rows into
-    # one full-width carrier row. The logical state must contain a whole number
-    # of carrier rows.
     assert ssm_elements % ssm_out_lanes == 0, (ssm_elements, ssm_out_lanes)
     ssm = gdn_v3_config.StateRegion(
         kb0=0,
