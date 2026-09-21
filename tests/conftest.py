@@ -34,6 +34,15 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 import pytest
 import torch
 
+# Test files that need no chip. A session of nothing but these (or tests
+# marked cpu_test) runs with JAX pinned to the CPU.
+HOST_ONLY_TEST_FILES = ("tests/layers/adapter/test_sharded_lm_head.py", )
+
+
+def _needs_no_chip(item):
+    return (item.get_closest_marker("cpu_test") is not None
+            or str(item.path).endswith(HOST_ONLY_TEST_FILES))
+
 
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
@@ -48,6 +57,17 @@ def pytest_collection_modifyitems(items):
     """
     items.sort(key=lambda item: 0
                if item.get_closest_marker("spawns_tpu_workers") else 1)
+    # A session of tests that need no chip runs with JAX pinned to the CPU,
+    # unless JAX_PLATFORMS is set already. JAX does not fall back to the CPU
+    # when the chips are busy (it raises), and the pin must not leak into a
+    # session with device tests, which would then skip; so it is decided
+    # here, over the whole collection, and applied to the loaded jax config
+    # as well (jax reads JAX_PLATFORMS once, at import).
+    if (items and not os.environ.get("JAX_PLATFORMS")
+            and all(_needs_no_chip(item) for item in items)):
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        if "jax" in sys.modules:
+            sys.modules["jax"].config.update("jax_platforms", "cpu")
 
 
 def pytest_addoption(parser):

@@ -660,7 +660,6 @@ class TPUModelRunner(GPUModelRunner):
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
-
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (min(
             PallasAttentionBackend.get_max_num_seqs(
@@ -2239,8 +2238,8 @@ class TPUModelRunner(GPUModelRunner):
         else:
             assert self.num_reqs_most_model_len is not None
             target_num_reqs = self.num_reqs_most_model_len
-        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs)
+        padded_num_reqs = _get_padded_token_len(self.num_reqs_paddings,
+                                                num_reqs)
 
         layout_plan = sequence_layout_planner.prepare_real(
             runner=self,
@@ -3762,6 +3761,13 @@ class TPUModelRunner(GPUModelRunner):
                                             model_config=self.model_config)
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        # Select a fixed request bucket only after the head is installed.
+        # Unsupported models keep the normal request buckets.
+        from vllm_torchtpu.layers.adapter import sharded_lm_head
+        if sharded_lm_head.install_if_enabled(model, [self.max_num_reqs]):
+            self.num_reqs_paddings = [self.max_num_reqs]
+            logger.info("TPU_SHARDED_LM_HEAD: one request bucket, %d rows",
+                        self.max_num_reqs)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
