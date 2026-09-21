@@ -190,6 +190,10 @@ ignore = [
 # that built it. B023 warns that a closure outliving its loop sees the last
 # value of the loop variable, which cannot happen to a body that never
 # outlives the iteration.
+#
+# Switching the rule off here would also hide a capture that does escape, so
+# tools/check_b023_baseline.py counts the findings per file and fails when a
+# file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
 
 [tool.ruff.format]

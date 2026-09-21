@@ -97,6 +97,20 @@ repos:
     language: script
     always_run: true
     pass_filenames: false
+  - id: check-b023-baseline
+    name: Kernels must not gain closures over loop variables
+    # Ratchet against tools/b023_baseline.txt. B023 is switched off for
+    # src/vllm_torchtpu/kernels in pyproject.toml because pl.when and pl.loop
+    # bodies run inside the iteration that defined them; this keeps a new
+    # capture there from arriving unnoticed.
+    # `python`, not `script`: the entry shells out to ruff, so it needs an
+    # environment that has it. Keep this pin equal to the ruff-pre-commit rev
+    # above, or the two disagree about what B023 finds.
+    entry: tools/check_b023_baseline.py
+    language: python
+    additional_dependencies: [ruff==0.14.0]
+    always_run: true
+    pass_filenames: false
   - id: check-filenames
     name: Check for spaces in all filenames
     entry: bash
