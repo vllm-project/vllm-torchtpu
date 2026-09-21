@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
         *)
             echo "Unknown argument: $1"
             echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT]"
-            echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
+            echo "  --results-dir defaults to \$ARTIFACTS_DIR/\$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_\$CONFIG_NAME"
             exit 1
             ;;
     esac
