@@ -59,6 +59,81 @@ def _patch_vllm_hybrid_producer_prefix_hits() -> None:
     logger.info("Applied TPU patch: reconcile hybrid producer prefix hits.")
 
 
+def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
+    """Backport hybrid KV cache load failure recovery from vLLM #50388.
+
+    In vLLM <= 0.29.0 (prior to vLLM #50388),
+    ``Scheduler._update_requests_with_invalid_blocks`` unpacks
+    ``(req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)``, which
+    raises ``ValueError: too many values to unpack (expected 1)`` whenever a
+    hybrid model (multiple KV cache groups) encounters a failed KV load.
+    """
+    from functools import wraps
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if Scheduler.__dict__.get("_tpu_hybrid_kv_load_failure_patch", False):
+        return
+
+    original_update = getattr(Scheduler,
+                              "_update_requests_with_invalid_blocks", None)
+    if original_update is None:
+        return
+
+    @wraps(original_update)
+    def _hybrid_update_requests_with_invalid_blocks(
+        self,
+        requests,
+        invalid_block_ids: set[int],
+        num_scheduled_tokens: dict[str, int],
+        evict_blocks: bool = True,
+    ) -> tuple[set[str], int, set[int]]:
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
+            return original_update(
+                self,
+                requests,
+                invalid_block_ids,
+                num_scheduled_tokens,
+                evict_blocks=evict_blocks,
+            )
+
+        affected_req_ids: set[str] = set()
+        total_affected_tokens = 0
+        blocks_to_evict: set[int] = set()
+        marked_invalid_block_ids: set[int] = set()
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        for request in requests:
+            req_id = request.request_id
+            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(
+                req_id)
+            req_num_computed_tokens = (request.num_computed_tokens -
+                                       num_scheduled_tokens.get(req_id, 0))
+            request_invalid_block_ids = {
+                block_id
+                for req_block_ids in req_block_ids_per_group
+                for block_id in req_block_ids
+                if block_id != null_block_id and block_id in invalid_block_ids
+            }
+            if request_invalid_block_ids:
+                marked_invalid_block_ids |= request_invalid_block_ids
+                total_affected_tokens += req_num_computed_tokens
+                request.num_computed_tokens = 0
+                if evict_blocks:
+                    for req_block_ids in req_block_ids_per_group:
+                        blocks_to_evict.update(block_id
+                                               for block_id in req_block_ids
+                                               if block_id != null_block_id)
+                affected_req_ids.add(req_id)
+        return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    Scheduler._update_requests_with_invalid_blocks = (
+        _hybrid_update_requests_with_invalid_blocks)
+    Scheduler._tpu_hybrid_kv_load_failure_patch = True
+    logger.info(
+        "Applied TPU patch: hybrid KV cache load failure recovery (vLLM #50388)."
+    )
+
+
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     """Align Mamba prefill splits to the scheduler block size.
 

@@ -386,11 +386,7 @@ class DFlashProposer:
         the draft's KV through it would corrupt the cache silently instead of
         failing.
         """
-        # TODO: MLA draft model classes to set `owns_context_kv = True`
-        # to take this path -- DSparkDeepseekV4ForCausalLM (DSV4 DSpark) and
-        # K3DSparkForCausalLM (K3 DSpark). Without it they fall back to the
-        # dense _fused_kv_weight path, which doesn't work for latent-KV MLA drafts.
-        if getattr(type(self.draft_model), "owns_context_kv", False):
+        if hasattr(self.draft_model, "get_draft_kv_cache_layer_names"):
             layer_names = self.draft_model.get_draft_kv_cache_layer_names()
         else:
             layer_names = [
@@ -578,13 +574,8 @@ class DFlashProposer:
                         sync=True,
                     )
 
-                # The draft model only runs speculation on decode steps, so it never processes
-                # more tokens than the max batch size * speculation block size.
-                if num_tokens < block_size or num_tokens > max_draft_tokens:
-                    if num_tokens < block_size:
-                        logger.info(
-                            "Skipping DFlash draft-forward bucket %d: "
-                            "query block size is %d.", num_tokens, block_size)
+                # Context-KV updates allow short chunks; draft forward needs a full block.
+                if not block_size <= num_tokens <= max_draft_tokens:
                     continue
 
                 self._dummy_draft_forward(num_tokens=num_tokens,
@@ -823,11 +814,12 @@ class DFlashProposer:
         else:
             target_hidden = hidden_states
 
-        # MLA-native drafts (K3/DSV4) own their latent-KV projection and
-        # paged cache insert.
-        # TODO: set `owns_context_kv = True` on the MLA draft model classes
-        # (DSparkDeepseekV4ForCausalLM, K3DSparkForCausalLM); see the matching
-        # gate in _build_draft_layer_metadata.
+        # Only opt into TPU-specific hooks; upstream methods with a similar
+        # name may call GPU custom ops. Other drafts use the TPU path below.
+        tpu_precompute = getattr(self.draft_model,
+                                 "tpu_precompute_and_store_context_kv", None)
+        if callable(tpu_precompute):
+            return tpu_precompute(target_hidden, positions, draft_md_tuple)
         if getattr(type(self.draft_model), "owns_context_kv", False):
             return self.draft_model.precompute_and_store_context_kv(
                 target_hidden, positions, draft_md_tuple)

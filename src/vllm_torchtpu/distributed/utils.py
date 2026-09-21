@@ -81,6 +81,19 @@ def get_p2p_wait_pull_timeout() -> int:
     return envs.TPU_P2P_WAIT_PULL_TIMEOUT
 
 
+# Min delta added on top of the producer lease when computing the reshard store's
+# request-block registry TTL.
+_RAIDEN_REGISTRY_TTL_MIN_DELTA_S = 60.0
+
+
+def get_raiden_registry_ttl_s() -> float:
+    """TTL, in seconds, for the raiden reshard store's request-block
+    registry: the prefill lease (TPU_P2P_WAIT_PULL_TIMEOUT) plus a delta
+    of max(60s, 10%). The registry must outlive the lease."""
+    lease = float(get_p2p_wait_pull_timeout())
+    return lease + max(_RAIDEN_REGISTRY_TTL_MIN_DELTA_S, 0.1 * lease)
+
+
 def get_stage3_status_probe_s() -> float:
     """Interval, in seconds, at which a Stage-3 producer worker probes the
     source store's request-block registry for its registrations that have

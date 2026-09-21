@@ -8,6 +8,7 @@ used here.  Heavy dependencies (ZMQ sockets, shared-memory pool, TPU device
 queries) are mocked at construction time so that all tests run without a real
 TPU.
 """
+import sys
 import threading
 import time
 import unittest
@@ -4457,3 +4458,88 @@ class TestPipelineParallelConsumer:
                    create=True):
             scheduler = TPURaidenConnectorScheduler(cfg)
             assert scheduler.get_finished_count() == 8
+
+
+class _FakeReshardStoreModule:
+
+    def __init__(self, supports_ttl: bool):
+        self.SUPPORTS_REQUEST_REGISTRY_TTL = supports_ttl
+        self.calls: list[dict] = []
+        module = self
+
+        class RaidenId:
+
+            def __init__(self, **fields):
+                self.fields = fields
+
+        class ReshardStore:
+
+            def __init__(self, **kwargs):
+                if ("request_registry_ttl_s" in kwargs
+                        and not module.SUPPORTS_REQUEST_REGISTRY_TTL):
+                    raise TypeError("unexpected keyword argument "
+                                    "'request_registry_ttl_s'")
+                module.calls.append(dict(kwargs))
+                self.request_registry_ttl_s = kwargs.get(
+                    "request_registry_ttl_s", 600.0)
+                self.reshard_service_port = kwargs["reshard_service_port"]
+
+        self.RaidenId = RaidenId
+        self.ReshardStore = ReshardStore
+
+
+def _host_reshard_store(supports_ttl: bool, pull_timeout: int):
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=1,
+                                 is_producer=True,
+                                 dp_size=1,
+                                 pcp_size=8,
+                                 block_size=4096)
+    worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+    fake = _FakeReshardStoreModule(supports_ttl)
+    # `from tpu_sync.api.torch import reshard_store` resolves the attribute
+    # on the package object, so the fake must hang off it as well.
+    torch_pkg = MagicMock()
+    torch_pkg.reshard_store = fake
+    modules = {
+        "tpu_sync": MagicMock(),
+        "tpu_sync.api": MagicMock(),
+        "tpu_sync.api.torch": torch_pkg,
+        "tpu_sync.api.torch.reshard_store": fake,
+    }
+    with patch.dict(sys.modules, modules), \
+         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "store",
+               create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ADVERTISE_HOST", "10.0.0.1",
+               create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_PORT_BASE", 27000,
+               create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE", 27100,
+               create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME", "prefill",
+               create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", "prefill-engine",
+               create=True), \
+         patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+               return_value=pull_timeout):
+        worker._maybe_host_reshard_store()
+    return worker, fake
+
+
+def test_maybe_host_reshard_store_passes_registry_ttl_from_lease():
+    """Store mode sizes the registry TTL from the producer lease: pull
+    timeout + max(60s, 10%), so the registry outlives the pinned blocks."""
+    worker, fake = _host_reshard_store(supports_ttl=True, pull_timeout=6000)
+    assert worker._reshard_store is not None
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["request_registry_ttl_s"] == 6600.0
+    assert call["store_server_ip"] == "10.0.0.1"
+    assert call["reshard_service_port"] == 27000
+    assert call["raiden_controller_port"] == 27100
+    assert call["raiden_id"].fields == {
+        "job_name": "prefill",
+        "job_replica_id": "prefill-engine",
+        "data_name": "reshard_store",
+        "data_replica_idx": 0,
+    }

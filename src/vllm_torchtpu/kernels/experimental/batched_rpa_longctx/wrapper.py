@@ -185,8 +185,7 @@ def calculate_block_sizes(
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q)
-    aligned_num_q_heads = (aligned_num_q_heads_per_kv_head *
-                           model_cfgs.num_kv_heads)
+    aligned_num_q_heads = aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
 
     if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
@@ -209,11 +208,11 @@ def calculate_block_sizes(
 
         # Calculate size bq & bkv arrays for a single buffer.
         bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
+        vmem_bkv_sz = bkv_sz
         if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            bkv_array_size = ((bkv_sz + 2 * serve_cfgs.page_size) *
-                              aligned_num_kv_heads_x2 * aligned_head_dim)
-        else:
-            bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
+            # Allocate extra buffer to perform lane stitching.
+            vmem_bkv_sz += 2 * serve_cfgs.page_size
+        bkv_array_size = vmem_bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
 
         # Get output buffer size as well - which has same size as query size.
         bo_array_size = bq_array_size
@@ -493,7 +492,7 @@ def ragged_paged_attention(
         lse (only when return_lse=True): [max_num_tokens, num_q_heads].
             Log-sum-exp values (m + log(l)) for each query token and head,
             needed for merging partial attention results in CP.
-  """
+    """
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:

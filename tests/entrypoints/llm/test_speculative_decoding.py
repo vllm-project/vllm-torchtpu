@@ -914,11 +914,13 @@ def test_sd_correctness_greedy_multi_chunk(
         )
 
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        wait_for_tpu_release()
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         spec_llm = LLM(
             model=model_name,
@@ -930,23 +932,26 @@ def test_sd_correctness_greedy_multi_chunk(
             },
             **kwargs,
         )
-        # Force the runner's while-loop in execute_model to iterate at
-        # least twice for any batch larger than 2.
-        spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2, ))
+        try:
+            # Force the runner's while-loop in execute_model to iterate at
+            # least twice for any batch larger than 2.
+            spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap,
+                                               args=(2, ))
 
-        spec_outputs = spec_llm.generate(test_prompts, sampling_config)
+            spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            misses = 0
+            for ref, spec in zip(ref_outputs, spec_outputs):
+                if ref.outputs[0].text != spec.outputs[0].text:
+                    misses += 1
+                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"spec: {spec.outputs[0].text}")
+            assert misses == 0
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 # ---------------------------------------------------------------------------
@@ -1051,64 +1056,68 @@ def test_structured_output_spec_decode_correctness_greedy(
 
         # 1. Reference run: structured outputs, no speculation.
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, params)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        wait_for_tpu_release()
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, params)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. Speculative run with the same structured params.
         spec_llm = LLM(model=model_name,
                        speculative_config=_structured_spec_ngram_config(),
                        **kwargs)
-        if multi_chunk:
-            # Cap=2 with max_num_seqs=4: any batch with >2 reqs splits, so
-            # the bitmask scatter runs its chunk-local path.
-            spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap,
-                                               args=(2, ))
-        spec_outputs = spec_llm.generate(test_prompts, params)
+        try:
+            if multi_chunk:
+                # Cap=2 with max_num_seqs=4: any batch with >2 reqs splits, so
+                # the bitmask scatter runs its chunk-local path.
+                spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap,
+                                                   args=(2, ))
+            spec_outputs = spec_llm.generate(test_prompts, params)
 
-        # (a) Constraint holds on every structured request.
-        for i, spec in enumerate(spec_outputs):
-            if i % 2 == 0:
-                _assert_valid_structured_json(spec.outputs[0].text)
+            # (a) Constraint holds on every structured request.
+            for i, spec in enumerate(spec_outputs):
+                if i % 2 == 0:
+                    _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output. Compared per-group
-        # majority, not row-for-row: the unconstrained rows run the full 64
-        # free tokens, and at this batch size either run can flip one row on
-        # a near-tie (see _assert_no_spec_divergence) -- both directions have
-        # been observed here. Structured and unconstrained rows share a
-        # prompt but not sampling params, so the group key carries the params
-        # too; they must not vote in one majority. Every structured row is
-        # still checked individually by (a) above.
-        ref_texts = [o.outputs[0].text for o in ref_outputs]
-        spec_texts = [o.outputs[0].text for o in spec_outputs]
-        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
-                      for i, prompt in enumerate(test_prompts)]
-        _assert_no_spec_divergence(test_prompts,
-                                   ref_texts,
-                                   spec_texts,
-                                   group_keys=group_keys)
+            # (b) Speculation must not change greedy output. Compared per-group
+            # majority, not row-for-row: the unconstrained rows run the full 64
+            # free tokens, and at this batch size either run can flip one row on
+            # a near-tie (see _assert_no_spec_divergence) -- both directions have
+            # been observed here. Structured and unconstrained rows share a
+            # prompt but not sampling params, so the group key carries the params
+            # too; they must not vote in one majority. Every structured row is
+            # still checked individually by (a) above.
+            ref_texts = [o.outputs[0].text for o in ref_outputs]
+            spec_texts = [o.outputs[0].text for o in spec_outputs]
+            group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
+                          for i, prompt in enumerate(test_prompts)]
+            _assert_no_spec_divergence(test_prompts,
+                                       ref_texts,
+                                       spec_texts,
+                                       group_keys=group_keys)
 
-        # (c) The masked verify path actually saw draft traffic.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == SPEC_DRAFT_METRIC:
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == SPEC_ACCEPTED_METRIC:
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"structured+spec: accepted={num_accepted_tokens} "
-              f"drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, \
-            "no draft tokens proposed under structured outputs"
-        assert num_accepted_tokens > 0, \
-            "no draft tokens accepted under structured outputs"
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            # (c) The masked verify path actually saw draft traffic.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == SPEC_DRAFT_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == SPEC_ACCEPTED_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(f"structured+spec: accepted={num_accepted_tokens} "
+                  f"drafted={num_draft_tokens}")
+            assert num_draft_tokens > 0, \
+                "no draft tokens proposed under structured outputs"
+            assert num_accepted_tokens > 0, \
+                "no draft tokens accepted under structured outputs"
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(1800)
@@ -1155,6 +1164,7 @@ def test_structured_output_spec_decode_non_greedy(
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm
             cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(2400)
@@ -1210,11 +1220,13 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
 
         # 1. Reference run: structured outputs, no speculation.
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, params)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        wait_for_tpu_release()
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, params)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. eagle3 speculative run with the same structured params.
         spec_llm = LLM(model=model_name,
@@ -1225,49 +1237,52 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
                            "draft_tensor_parallel_size": 1,
                        },
                        **kwargs)
-        spec_outputs = spec_llm.generate(test_prompts, params)
+        try:
+            spec_outputs = spec_llm.generate(test_prompts, params)
 
-        # (a) Constraint holds on every structured request.
-        for i, spec in enumerate(spec_outputs):
-            if i % 2 == 0:
-                _assert_valid_structured_json(spec.outputs[0].text)
+            # (a) Constraint holds on every structured request.
+            for i, spec in enumerate(spec_outputs):
+                if i % 2 == 0:
+                    _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output. Compared per-group
-        # majority, not row-for-row: the unconstrained rows run the full 64
-        # free tokens, and at this batch size either run can flip one row on
-        # a near-tie (see _assert_no_spec_divergence) -- both directions have
-        # been observed here. Structured and unconstrained rows share a
-        # prompt but not sampling params, so the group key carries the params
-        # too; they must not vote in one majority. Every structured row is
-        # still checked individually by (a) above.
-        ref_texts = [o.outputs[0].text for o in ref_outputs]
-        spec_texts = [o.outputs[0].text for o in spec_outputs]
-        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
-                      for i, prompt in enumerate(test_prompts)]
-        _assert_no_spec_divergence(test_prompts,
-                                   ref_texts,
-                                   spec_texts,
-                                   group_keys=group_keys)
+            # (b) Speculation must not change greedy output. Compared per-group
+            # majority, not row-for-row: the unconstrained rows run the full 64
+            # free tokens, and at this batch size either run can flip one row on
+            # a near-tie (see _assert_no_spec_divergence) -- both directions have
+            # been observed here. Structured and unconstrained rows share a
+            # prompt but not sampling params, so the group key carries the params
+            # too; they must not vote in one majority. Every structured row is
+            # still checked individually by (a) above.
+            ref_texts = [o.outputs[0].text for o in ref_outputs]
+            spec_texts = [o.outputs[0].text for o in spec_outputs]
+            group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
+                          for i, prompt in enumerate(test_prompts)]
+            _assert_no_spec_divergence(test_prompts,
+                                       ref_texts,
+                                       spec_texts,
+                                       group_keys=group_keys)
 
-        # (c) The masked verify path actually saw draft traffic.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == SPEC_DRAFT_METRIC:
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == SPEC_ACCEPTED_METRIC:
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"structured+eagle3({'async' if async_scheduling else 'sync'}): "
-              f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, \
-            "no draft tokens proposed under structured outputs"
-        assert num_accepted_tokens > 0, \
-            "no draft tokens accepted under structured outputs"
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            # (c) The masked verify path actually saw draft traffic.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == SPEC_DRAFT_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == SPEC_ACCEPTED_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(
+                f"structured+eagle3({'async' if async_scheduling else 'sync'}): "
+                f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
+            assert num_draft_tokens > 0, \
+                "no draft tokens proposed under structured outputs"
+            assert num_accepted_tokens > 0, \
+                "no draft tokens accepted under structured outputs"
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(2400)
@@ -1377,6 +1392,7 @@ def test_structured_output_eagle3_async_adversarial_choice(
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm
             cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(1200)
@@ -1421,48 +1437,54 @@ def test_eagle3_correctness_greedy_multi_chunk(
 
         # 1. Reference run (no speculation).
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        wait_for_tpu_release()
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. Speculative run, forced multi-chunk.
         spec_llm = LLM(model=model_name,
                        speculative_config=speculative_config,
                        **kwargs)
-        # cap=2 with max_num_seqs=4 -> any batch with >2 reqs chunks, so the
-        # draft propose() runs its per-chunk loop for >=2 chunks.
-        spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2, ))
-        spec_outputs = spec_llm.generate(test_prompts, sampling_config)
+        try:
+            # cap=2 with max_num_seqs=4 -> any batch with >2 reqs chunks, so the
+            # draft propose() runs its per-chunk loop for >=2 chunks.
+            spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap,
+                                               args=(2, ))
+            spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
-        # (a) Chunked drafting must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+            # (a) Chunked drafting must not change greedy output.
+            misses = 0
+            for ref, spec in zip(ref_outputs, spec_outputs):
+                if ref.outputs[0].text != spec.outputs[0].text:
+                    misses += 1
+                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"spec: {spec.outputs[0].text}")
+            assert misses == 0
 
-        # (b) The chunked draft actually proposed and got tokens accepted.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == "vllm:spec_decode_num_draft_tokens":
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"multi-chunk eagle3: accepted={num_accepted_tokens} "
-              f"drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, "no draft tokens produced under chunking"
-        assert num_accepted_tokens > 0, \
-            "no draft tokens accepted under chunking"
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            # (b) The chunked draft actually proposed and got tokens accepted.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == "vllm:spec_decode_num_draft_tokens":
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(f"multi-chunk eagle3: accepted={num_accepted_tokens} "
+                  f"drafted={num_draft_tokens}")
+            assert num_draft_tokens > 0, \
+                "no draft tokens produced under chunking"
+            assert num_accepted_tokens > 0, \
+                "no draft tokens accepted under chunking"
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.skipif(_get_tensor_parallel_size() < 2,
@@ -1495,11 +1517,13 @@ def test_eagle3_sharded_draft(
 
         # 1. Reference run (no speculation).
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        wait_for_tpu_release()
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. Sharded eagle3 draft (draft_tp == target tp).
         spec_llm = LLM(
@@ -1512,34 +1536,38 @@ def test_eagle3_sharded_draft(
             },
             **kwargs,
         )
-        spec_outputs = spec_llm.generate(test_prompts, sampling_config)
+        try:
+            spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
-        # (a) Sharded drafting must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+            # (a) Sharded drafting must not change greedy output.
+            misses = 0
+            for ref, spec in zip(ref_outputs, spec_outputs):
+                if ref.outputs[0].text != spec.outputs[0].text:
+                    misses += 1
+                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"spec: {spec.outputs[0].text}")
+            assert misses == 0
 
-        # (b) The sharded draft actually proposed + got tokens accepted.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == "vllm:spec_decode_num_draft_tokens":
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"sharded eagle3 (tp={tp}, draft_tp={tp}): "
-              f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, "no draft tokens produced (sharded draft)"
-        assert num_accepted_tokens > 0, "no draft tokens accepted (sharded draft)"
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            # (b) The sharded draft actually proposed + got tokens accepted.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == "vllm:spec_decode_num_draft_tokens":
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(f"sharded eagle3 (tp={tp}, draft_tp={tp}): "
+                  f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
+            assert num_draft_tokens > 0, \
+                "no draft tokens produced (sharded draft)"
+            assert num_accepted_tokens > 0, \
+                "no draft tokens accepted (sharded draft)"
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 # ---------------------------------------------------------------------------

@@ -493,6 +493,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "k",
         "write_empty_rows",
         "scheduling_group_id",
+        "stage2_scheduling_group_id",
         "return_scores",
     ),
 )
@@ -503,6 +504,7 @@ def sparsecore_topk(
     *,
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
+    stage2_scheduling_group_id: int | None = None,
     return_scores: bool = False,
 ) -> (jax.Array | tuple[jax.Array, jax.Array]
       ):  # i32[b, k] or (i32[b, k], i32[b, k])
@@ -517,10 +519,9 @@ def sparsecore_topk(
   ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
   raw bits either way.
 
-  ``scheduling_group_id`` puts the dominant SparseCore call into that XLA
-  scheduling group. Only stage 1 is annotated; index-mapping glue separates
-  stage 2
-  and XLA has no support for annotation groups with gaps.
+  ``scheduling_group_id`` and ``stage2_scheduling_group_id`` place each stage
+  in an XLA scheduling group, so each can overlap a different caller's
+  TensorCore work. Stage 2 only exists on the two-stage path.
   """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -583,7 +584,12 @@ def sparsecore_topk(
     cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
 
     final_cand_slots, final_cand_scores = _sc_topk_direct(
-        cand_scores, k, cand_lengths, write_empty=write_empty_rows)
+        cand_scores,
+        k,
+        cand_lengths,
+        write_empty=write_empty_rows,
+        scheduling_group_id=stage2_scheduling_group_id,
+    )
 
     # Map candidate slots back to original column indices
     safe_slots = jnp.maximum(final_cand_slots, 0)

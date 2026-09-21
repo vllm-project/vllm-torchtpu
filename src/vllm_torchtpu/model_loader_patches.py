@@ -100,8 +100,7 @@ def _compute_local_expert_ids() -> Optional[set[int]]:
     fetch-time filter and the FusedMoE expert map agree by construction.
     """
     from vllm.config import get_current_vllm_config
-    from vllm.model_executor.model_loader.ep_weight_filter import \
-        compute_local_expert_ids
+    from vllm.model_executor.model_loader import default_loader
 
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
@@ -128,7 +127,10 @@ def _compute_local_expert_ids() -> Optional[set[int]]:
     ep_size = dp_size * pcp_size * tp_size
     ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
 
-    local_ids = compute_local_expert_ids(
+    # Use the loader's symbol instead of importing the base helper directly.
+    # Hierarchical EP replaces this symbol with its chip-aware ownership map,
+    # and the streaming path must fetch the same replicated expert set.
+    local_ids = default_loader.compute_local_expert_ids(
         num_experts,
         ep_size,
         ep_rank,

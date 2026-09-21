@@ -18,19 +18,73 @@ predicate, and the construction of the byte-range request plan from
 safetensors metadata. No TPU, no network: the Run:AI streamer is faked.
 """
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from vllm_torchtpu.model_loader_patches import (
-    _sharded_runai_weights_iterator, _should_skip)
+    _compute_local_expert_ids, _sharded_runai_weights_iterator, _should_skip)
 
 # ---------------------------------------------------------------------------
 # _should_skip
 # ---------------------------------------------------------------------------
 
 _LOCAL = {0, 1, 27}
+
+
+def test_local_expert_ids_use_loader_ownership_mapping():
+    """Run:AI filtering must honor hierarchical EP's loader patch."""
+    model_config = SimpleNamespace(
+        is_moe=True,
+        get_num_experts=lambda: 896,
+    )
+    parallel_config = SimpleNamespace(
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=True,
+        enable_eplb=False,
+        data_parallel_size=1,
+        tensor_parallel_size=32,
+        prefill_context_parallel_size=1,
+        expert_placement_strategy="linear",
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=parallel_config,
+    )
+    chip_aware_ids = set(range(56))
+
+    compute_ids = MagicMock(return_value=chip_aware_ids)
+    vllm = ModuleType("vllm")
+    vllm.__path__ = []
+    config_module = ModuleType("vllm.config")
+    config_module.get_current_vllm_config = MagicMock(return_value=config)
+    model_executor = ModuleType("vllm.model_executor")
+    model_executor.__path__ = []
+    loader_module = ModuleType("vllm.model_executor.model_loader")
+    loader_module.default_loader = SimpleNamespace(
+        compute_local_expert_ids=compute_ids)
+    distributed_module = ModuleType("vllm.distributed")
+    distributed_module.get_dp_group = MagicMock()
+    distributed_module.get_pcp_group = MagicMock()
+    distributed_module.get_tensor_model_parallel_rank = MagicMock(
+        return_value=11)
+    logger_module = ModuleType("vllm.logger")
+    logger_module.init_logger = MagicMock(return_value=MagicMock())
+
+    fake_modules = {
+        "vllm": vllm,
+        "vllm.config": config_module,
+        "vllm.model_executor": model_executor,
+        "vllm.model_executor.model_loader": loader_module,
+        "vllm.distributed": distributed_module,
+        "vllm.logger": logger_module,
+    }
+    with patch.dict(sys.modules, fake_modules):
+        assert _compute_local_expert_ids() == chip_aware_ids
+
+    compute_ids.assert_called_once_with(896, 32, 11, placement="linear")
 
 
 def test_skips_nonlocal_expert_packed_and_scale():

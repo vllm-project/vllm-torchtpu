@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
@@ -310,6 +311,23 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
         return int(value)
 
     return _get_optional_int_env
+
+
+def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
+    """Optional size knob that must be greater than zero when it is set.
+
+    Unset or empty reads as ``None``, meaning the feature is off.
+    """
+    parse_int = env_optional_int(env_name)
+
+    def _get_positive_int_or_none_env() -> int | None:
+        value = parse_int()
+        if value is not None and value <= 0:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be > 0.")
+        return value
+
+    return _get_positive_int_or_none_env
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -607,6 +625,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
+    # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
+    # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
+    # Unset means unchunked: one single pass, no pipelining.
+    "TPU_STREAMIDX_CHUNK_TOKENS":
+    env_positive_int_or_none("TPU_STREAMIDX_CHUNK_TOKENS"),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":

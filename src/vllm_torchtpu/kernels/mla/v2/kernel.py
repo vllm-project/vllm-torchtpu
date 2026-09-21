@@ -326,6 +326,7 @@ def _mla_ragged_paged_attention_kernel(
     transpose_kv_cache: bool,
     two_step_flash_attention: bool,
     p_same_dtype_as_v: bool,
+    use_causal_mask: bool,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     q_scale: float | None = None,
@@ -461,7 +462,8 @@ def _mla_ragged_paged_attention_kernel(
             kv_len = kv_lens_ref[seq_idx]
             q_span = (kv_len - q_len + bq_idx * bq_sz + unsigned_floor_div(
                 lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads))
-            mask = q_span < k_span
+            mask = ((q_span < k_span) if use_causal_mask else jnp.zeros_like(
+                q_span < k_span))
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
             mask_list.append(mask)
@@ -587,7 +589,8 @@ def _mla_ragged_paged_attention_kernel(
             s = soft_cap * jnp.tanh(s / soft_cap)
         s = s.astype(s_dtype)
 
-        if s.shape[0] % num_q_heads == 0 and s.shape[1] % 128 == 0:
+        if (use_causal_mask and s.shape[0] % num_q_heads == 0
+                and s.shape[1] % 128 == 0):
             # Optimized mask logic.
             threshold = (kv_len - q_len + (bq_idx * bq_sz + bq_offset) -
                          bkv_idx * bkv_sz)
@@ -618,7 +621,8 @@ def _mla_ragged_paged_attention_kernel(
                     lax.broadcasted_iota(jnp.int32, s.shape, 0), num_q_heads))
             k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
                 jnp.int32, s.shape, 1)
-            mask = q_span < k_span
+            mask = ((q_span < k_span) if use_causal_mask else jnp.zeros_like(
+                q_span < k_span))
 
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
@@ -2169,6 +2173,7 @@ def prepare_outputs(
         "transpose_kv_cache",
         "two_step_flash_attention",
         "p_same_dtype_as_v",
+        "use_causal_mask",
         "debug_mode",
     ),
     donate_argnames=("cache_kv", ),
@@ -2205,6 +2210,7 @@ def mla_ragged_paged_attention(
     transpose_kv_cache: bool = False,
     two_step_flash_attention: bool = True,
     p_same_dtype_as_v: bool = True,
+    use_causal_mask: bool = True,
     # Debug params.
     debug_mode: bool = False,
 ) -> tuple[
@@ -2498,6 +2504,7 @@ def mla_ragged_paged_attention(
                     transpose_kv_cache=transpose_kv_cache,
                     two_step_flash_attention=two_step_flash_attention,
                     p_same_dtype_as_v=p_same_dtype_as_v,
+                    use_causal_mask=use_causal_mask,
                     debug_mode=debug_mode,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
